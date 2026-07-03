@@ -55,6 +55,7 @@ from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
     KnowledgeSubstance,
     classify_knowledge_acceptance,
+    derive_compute_arm_label_from_payload,
     knowledge_substance_has_durable_compute_grounding,
 )
 from app.models import (
@@ -1134,6 +1135,7 @@ _DISABLE_LLM_COMPUTE_ANALYSIS_ENV = "DISABLE_LLM_COMPUTE_ANALYSIS"
 # log can never blow up the analysis prompt.
 _COMPUTE_LOG_TEXT_CAP = 4000
 _COMPUTE_MAX_CITATIONS = 20
+_COMPUTE_QA_MAX_TOKENS = 800
 
 
 def _enrich_per_arm_cost(
@@ -1174,8 +1176,15 @@ def _enrich_per_arm_cost(
     n_arms = len(per_arm_verdicts)
 
     for arm_name, pav in per_arm_verdicts.items():
-        if total_elapsed > 0 and arm_name in elapsed:
-            arm_cost = total_cost * elapsed[arm_name] / total_elapsed
+        if total_elapsed > 0:
+            # Time-weighted split: only apportion arms that have elapsed data.
+            # Arms without timing (e.g. crashed before finishing) get None so
+            # the timed arms' costs don't over-count beyond the total.
+            arm_cost = (
+                total_cost * elapsed[arm_name] / total_elapsed
+                if arm_name in elapsed
+                else None
+            )
         else:
             arm_cost = total_cost / n_arms if n_arms > 0 else None
         pav["cost_usd"] = arm_cost
@@ -1229,7 +1238,9 @@ def _evaluate_criterion_per_arm(
                     break
 
         value = _coerce_number(raw_value)
-        met = _criterion_met(raw_value, op, threshold)
+        # Distinguish unmeasured (crashed/missing) from failed: None means the
+        # arm didn't report the metric at all, not that it failed the criterion.
+        met = _criterion_met(raw_value, op, threshold) if value is not None else None
         per_arm[str(arm_name)] = {"value": value, "met": met}
 
     return per_arm if per_arm else None
@@ -1446,7 +1457,12 @@ def _build_compute_experiment_document(
             for arm_name, verdict in per_arm_verdicts.items():
                 value = verdict.get("value")
                 met = verdict.get("met")
-                status = "✓ MET" if met else "✗ NOT MET"
+                if met is None:
+                    status = "— UNMEASURED"
+                elif met:
+                    status = "✓ MET"
+                else:
+                    status = "✗ NOT MET"
                 if value is not None:
                     body_lines.append(f"- **{arm_name}:** {status} ({criterion.get('metric')}={value})")
                 else:
@@ -1602,6 +1618,7 @@ async def _gather_compute_evidence(
         return None
 
     metrics: dict[str, Any] = {}
+    arms: Any | None = None
     raw_metrics = (job.polling_metadata or {}).get("result_metrics")
     if isinstance(raw_metrics, dict):
         metrics = {
@@ -1609,6 +1626,7 @@ async def _gather_compute_evidence(
             for k, v in raw_metrics.items()
             if isinstance(v, (int, float)) and not isinstance(v, bool)
         }
+        arms = _extract_experiment_arms(raw_metrics)
 
     artifact_uri: str | None = None
     storage_uri: str | None = None
@@ -1637,12 +1655,15 @@ async def _gather_compute_evidence(
                 except (TypeError, ValueError):
                     file_count = 0
 
-    # The durable artifact location is the canonical evidence pointer. Prefer the
-    # job's own result_reference, then the artifact rows. No durable artifact
-    # location at all (empty / failed job) ⇒ nothing to analyse; fall back.
+    # The durable artifact location is the canonical evidence pointer when one
+    # exists. Metric-only runner/local jobs can still be questioned directly from
+    # their preserved result_metrics even if no artifact row was produced.
     job_reference = (job.result_reference or "").strip() or None
     artifact_uri = artifact_uri or job_reference or storage_uri
-    if artifact_uri is None or not _is_durable_citation(artifact_uri):
+    has_metric_evidence = bool(metrics)
+    if artifact_uri is None and not has_metric_evidence:
+        return None
+    if artifact_uri is not None and not _is_durable_citation(artifact_uri):
         return None
     if file_count <= 0 and not metrics:
         # No durable files survived AND no preserved metric — nothing the LLM can
@@ -1668,9 +1689,15 @@ async def _gather_compute_evidence(
             seen.add(value)
             supplementary.append(value)
 
-    _add_real(artifact_uri)
-    if storage_uri and storage_uri != artifact_uri:
-        _add_real(storage_uri)
+    def _add_metric(value: str | None) -> None:
+        if value and value not in seen:
+            seen.add(value)
+            real_evidence.append(value)
+
+    if artifact_uri is not None:
+        _add_real(artifact_uri)
+        if storage_uri and storage_uri != artifact_uri:
+            _add_real(storage_uri)
 
     # Signed download URLs are transient (they expire); include them in the LLM
     # prompt as supplementary context but NOT in real_evidence so a signed URL
@@ -1685,13 +1712,23 @@ async def _gather_compute_evidence(
 
     # Per-metric references: each preserved numeric metric, pinned to the durable
     # artifact bundle, is a citation resolving to durable measured evidence.
+    metric_root = artifact_uri or job_reference or f"compute-job:{job.id}"
     for name, value in metrics.items():
-        _add_real(f"{artifact_uri}#metric:{name}={value}")
+        _add_metric(f"{metric_root}#metric:{name}={value}")
     if isinstance(criterion, dict):
         c_metric = criterion.get("metric")
         c_value = criterion.get("value")
         if c_metric and c_value is not None:
-            _add_real(f"{artifact_uri}#metric:{c_metric}={c_value}")
+            _add_metric(f"{metric_root}#metric:{c_metric}={c_value}")
+
+    # Per-arm citations: each arm in a multi-arm sweep is a distinct citable unit
+    # so operators can ask "which arm won?" and get a grounded answer.
+    if isinstance(arms, dict):
+        for arm_name in arms:
+            _add_metric(f"{metric_root}#arms:{arm_name}")
+    elif isinstance(arms, list):
+        for i in range(len(arms)):
+            _add_metric(f"{metric_root}#arms:{i}")
 
     if not real_evidence:
         return None
@@ -1732,6 +1769,7 @@ async def _gather_compute_evidence(
         "artifact_uri": artifact_uri,
         "file_count": file_count,
         "metrics": metrics,
+        "arms": arms,
         "citations": citations,
         "real_evidence": real_evidence,
         "log_excerpt": log_excerpt,
@@ -2085,8 +2123,7 @@ async def _persist_compute_knowledge_document(
     payload = task.first_payload or {}
     raw_sweep_id = payload.get("sweep_id") or None
     sweep_id_val = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
-    raw_arm = payload.get("experiment") or payload.get("arm_label") or None
-    arm_label_val = (str(raw_arm).strip()[:256] if raw_arm else None) or None
+    arm_label_val = derive_compute_arm_label_from_payload(payload)
 
     title = document["title"]
     summary = document["summary"]
@@ -2229,6 +2266,7 @@ async def _persist_compute_knowledge_document(
         ),
         "release_evidence": stored_verdict.get("release_evidence"),
         "analysis_fallback_reason": stored_verdict.get("fallback_reason"),
+        "per_arm_verdicts": stored_verdict.get("per_arm_verdicts"),
     }
     task.plan_output = plan_output
     flag_modified(task, "plan_output")
@@ -2560,6 +2598,191 @@ async def _stamp_compute_analysis_unavailable(
     if stamped_doc_id is not None:
         envelope["knowledge_document_id"] = stamped_doc_id
     return envelope
+
+
+def _qa_unavailable(reason: str) -> dict[str, Any]:
+    """Return a ComputeQAResponse-shaped dict for unavailable Q&A."""
+    return {
+        "answer": None,
+        "citations": [],
+        "grounding": {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []},
+        "grounding_miss": True,
+        "fallback_reason": reason,
+    }
+
+
+_QA_HISTORY_MAX_TURNS = 6
+_QA_HISTORY_TURN_MAX_CHARS = 1000
+
+
+def _build_compute_qa_prompt(
+    task: Task,
+    *,
+    question: str,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    evidence: dict[str, Any],
+    history: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build a grounded Q&A prompt for a single question about a compute run."""
+    payload = task.first_payload or {}
+    identity = (
+        str(payload.get("experiment") or "").strip()
+        or str(payload.get("benchmark") or "").strip()
+        or "compute experiment"
+    )
+    metrics_lines = (
+        "\n".join(f"  - {k} = {v}" for k, v in evidence["metrics"].items())
+        or "  (no reported numeric metrics)"
+    )
+    criterion_line = json.dumps(criterion, sort_keys=True) if criterion else "(none)"
+    log_text = evidence.get("command_log_text") or evidence.get("log_excerpt") or ""
+    log_section = f"Command output (excerpt):\n{log_text}\n" if log_text else ""
+    arms = evidence.get("arms")
+    arms_section = (
+        f"Per-arm results:\n{json.dumps(arms, sort_keys=True, default=str)}\n"
+        if arms is not None
+        else ""
+    )
+    allowed = "\n".join(f"  - {c}" for c in evidence["citations"])
+
+    history_section = ""
+    if history:
+        turns = []
+        for turn in history:
+            q = str(turn.get("question") or "")[:_QA_HISTORY_TURN_MAX_CHARS]
+            a = str(turn.get("answer") or "")[:_QA_HISTORY_TURN_MAX_CHARS]
+            if q and a:
+                turns.append(f"Q: {q}\nA: {a}")
+        if turns:
+            history_section = (
+                "## Prior conversation (for context only — NOT evidence; do not cite from it)\n"
+                + "\n---\n".join(turns)
+                + "\n\n"
+            )
+
+    return (
+        "You are answering a question about a completed compute experiment. "
+        "Answer ONLY based on the provided evidence; decline honestly if the "
+        "evidence does not cover the question.\n\n"
+        f"Experiment: {identity}\n"
+        f"Outcome: {outcome}\n"
+        f"Cost (USD): {cost}\n"
+        f"Success criterion: {criterion_line}\n"
+        f"Metrics:\n{metrics_lines}\n"
+        f"{arms_section}"
+        f"{log_section}"
+        f"{history_section}"
+        f"Question: {question[:500]}\n\n"
+        "Choose citations ONLY from this allowed list (copy verbatim):\n"
+        f"{allowed}\n\n"
+        'Respond with ONLY valid JSON: {"answer": "...", "citations": ["..."]}\n'
+    )
+
+
+async def answer_compute_experiment_question(
+    task: Task,
+    *,
+    question: str,
+    outcome: str,
+    cost: float | None,
+    criterion: dict[str, Any] | None,
+    result_reference: str | None,
+    session: AsyncSession,
+    logs: str | None = None,
+    history: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Answer a free-form question grounded in a completed experiment's durable evidence.
+
+    Returns a ComputeQAResponse-shaped dict with answer, citations, grounding stamp,
+    grounding_miss, and fallback_reason. Declines honestly when evidence is insufficient
+    or the LLM is unavailable. Never persists any data — purely ephemeral Q&A.
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1" or not api_key:
+        return _qa_unavailable("llm-disabled")
+    evidence = await _gather_compute_evidence(
+        task,
+        logs=logs,
+        result_reference=result_reference,
+        criterion=criterion,
+        session=session,
+    )
+    if evidence is None:
+        return _qa_unavailable("no-evidence")
+    bounded_history: list[dict[str, Any]] | None = None
+    if history:
+        valid_turns = [
+            t for t in history
+            if isinstance(t, dict)
+            and isinstance(t.get("question"), str)
+            and isinstance(t.get("answer"), str)
+        ]
+        bounded_history = valid_turns[-_QA_HISTORY_MAX_TURNS:]
+    prompt = _build_compute_qa_prompt(
+        task,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        evidence=evidence,
+        question=question,
+        history=bounded_history,
+    )
+    allowed_set = set(evidence.get("citations", []))
+    for attempt in range(2):
+        try:
+            import anthropic as _anthropic
+
+            client = _anthropic.AsyncAnthropic(api_key=api_key)
+            resp = await client.messages.create(
+                model=_COMPUTE_LLM_ANALYSIS_MODEL,
+                max_tokens=_COMPUTE_QA_MAX_TOKENS,
+                timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = resp.content[0].text.strip()
+            data = _parse_compute_analysis_json(raw)
+            if not isinstance(data, dict) or "answer" not in data:
+                raise ValueError("QA response missing 'answer'")
+            raw_cits = data.get("citations") or []
+            grounded_cits = [
+                c.strip()
+                for c in raw_cits
+                if isinstance(c, str) and c.strip() in allowed_set
+            ][:_COMPUTE_MAX_CITATIONS]
+            unresolved_cits = [
+                c.strip()
+                for c in raw_cits
+                if isinstance(c, str) and c.strip() not in allowed_set
+            ]
+            real_evidence_set = set(evidence.get("real_evidence", []))
+            durable_cits = [
+                c for c in grounded_cits if c in real_evidence_set
+            ]
+            grounding_stamp = {
+                "checked": True,
+                "file_citations": len(raw_cits),
+                "grounded": len(durable_cits),
+                "unresolved": unresolved_cits,
+            }
+            miss_reason = None if durable_cits else "no-grounded-citations"
+            return {
+                "answer": str(data["answer"])[:4000],
+                "citations": durable_cits,
+                "grounding": grounding_stamp,
+                "grounding_miss": miss_reason is not None,
+                "fallback_reason": miss_reason,
+            }
+        except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
+            if attempt == 0:
+                logger.info("[COMPUTE] QA parse error %s, retrying", exc)
+                continue
+            break
+        except Exception as exc:  # noqa: BLE001
+            logger.info("[COMPUTE] QA LLM call failed (%s)", exc)
+            break
+    return _qa_unavailable("llm-error")
 
 
 async def _handle_web_research_completion(

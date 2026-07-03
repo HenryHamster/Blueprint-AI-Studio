@@ -453,8 +453,8 @@ async def _spawn_release_merge_grade_task(
         # The ONLY narrative the grader is allowed to see: the frozen goal.
         "version_goal": version_goal,
         # The merged-PR window for this version (same acceptance-window /
-        # merged-PR discovery theme evidence uses); the agent fetches each PR's
-        # diff to grade goal coverage.
+        # merged-PR discovery the blind merge-grade uses); the agent fetches each
+        # PR's diff to grade goal coverage.
         "merged_prs": list(merged_pr_numbers),
         # Explicitly pin to Opus — regression guard against silent downgrade
         # (mirrors release_audit / release_audit_challenge).
@@ -983,6 +983,12 @@ async def _handle_independent_blocker(
         "audit_challenge_spawn_error": qual.get("audit_challenge_spawn_error"),
         "smoketest_task_id": qual.get("smoketest_task_id"),
         "audit_findings": independent_blocker_findings,
+        # Preserve the one-shot stale-keyless consumption marker so the
+        # next sweep can distinguish "same HEAD, already re-qualified once"
+        # from "new HEAD, re-qualification is warranted".
+        "keyless_requalification_consumed_at": qual.get(
+            "keyless_requalification_consumed_at"
+        ),
     }
     version.last_qualification = record
     flag_modified(version, "last_qualification")

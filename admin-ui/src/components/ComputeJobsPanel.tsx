@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -142,6 +142,16 @@ function armComparisonVerdict(arms: ArmRecord[], metricKey: string, direction: M
   return { winnerName: winner.name, winnerValue: winner.value, runnerUpName: runnerUp.name, runnerUpValue: runnerUp.value, margin };
 }
 
+function criterionMet(value: number, operator: string, threshold: number): boolean {
+  if (operator === '>=') return value >= threshold;
+  if (operator === '>') return value > threshold;
+  if (operator === '<=') return value <= threshold;
+  if (operator === '<') return value < threshold;
+  if (operator === '==') return value === threshold;
+  if (operator === '!=') return value !== threshold;
+  return false;
+}
+
 function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
   let criterionMetric: string | null = null;
   const extraKeys = new Set<string>();
@@ -228,6 +238,9 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
               const rm = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
               const arms = normalizeArms(rm?.arms);
               if (!arms) return null;
+              const perArm = job.criterion_verdict?.per_arm;
+              const cvOperator = job.criterion_verdict?.operator;
+              const cvThreshold = job.criterion_verdict?.threshold;
               return (
                 <div key={job.id} className="mb-1.5">
                   <div className="text-ui-sm font-semibold text-neutral-300 font-mono mb-0.5">
@@ -237,6 +250,16 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                     const armExitCode = typeof arm.metrics.exit_code === 'number' ? arm.metrics.exit_code : null;
                     const armError = typeof arm.metrics.error === 'string' ? arm.metrics.error : typeof arm.metrics.reason === 'string' ? arm.metrics.reason : null;
                     const armFailed = (armExitCode !== null && armExitCode !== 0) || armError !== null;
+                    const armCostUsd = typeof arm.metrics.cost_usd === 'number' ? arm.metrics.cost_usd as number : null;
+                    let armPassFail: 'pass' | 'fail' | 'inconclusive' | null = null;
+                    if (perArm && arm.name in perArm && cvOperator && cvThreshold != null) {
+                      const pav = perArm[arm.name];
+                      if (pav == null) {
+                        armPassFail = 'inconclusive';
+                      } else {
+                        armPassFail = criterionMet(pav, cvOperator, cvThreshold) ? 'pass' : 'fail';
+                      }
+                    }
                     return (
                       <div key={arm.name} className={`flex flex-wrap gap-x-3 gap-y-0.5 text-ui-sm font-mono mb-0.5 pl-2`}>
                         <span className={`font-semibold ${armFailed ? 'text-red-300' : 'text-neutral-400'}`}>{arm.name}:</span>
@@ -248,7 +271,29 @@ function RunComparisonMatrix({ group }: { group: ComputeJob[] }) {
                             exit {armExitCode}
                           </span>
                         )}
-                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk)).map(([mk, mv]) => (
+                        {armCostUsd !== null && (
+                          <span
+                            className="rounded border border-neutral-700/50 bg-neutral-800/40 px-1 py-0.5 text-ui-xs text-neutral-300"
+                            data-testid="arm-cost-usd"
+                          >
+                            {fmtUsd(armCostUsd)}
+                          </span>
+                        )}
+                        {armPassFail !== null && (
+                          <span
+                            className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${
+                              armPassFail === 'pass'
+                                ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300'
+                                : armPassFail === 'inconclusive'
+                                ? 'border-amber-500/40 bg-amber-500/15 text-amber-300'
+                                : 'border-red-500/40 bg-red-500/15 text-red-300'
+                            }`}
+                            data-testid="arm-passfail-chip"
+                          >
+                            {armPassFail}
+                          </span>
+                        )}
+                        {Object.entries(arm.metrics).filter(([mk]) => !DIAGNOSTIC_KEYS.has(mk) && mk !== 'cost_usd').map(([mk, mv]) => (
                           <span key={mk}>
                             <span className="text-neutral-500">{mk}:</span>{' '}
                             <span className="text-neutral-300">{String(mv)}</span>
@@ -280,6 +325,16 @@ function SweepKnowledgeGroupsSection({
   const [compareSet, setCompareSet] = useState<Set<string>>(new Set());
   const entries = Object.entries(sweepGroups);
   if (entries.length === 0) return null;
+
+  const verdictLabel = (met: boolean | null | undefined) => met === true ? 'MET' : met === false ? 'NOT MET' : 'UNMEASURED';
+  const gradeLabel = (grade: string | null | undefined) => grade === 'acceptance' ? 'accepted' : grade === 'measured_only' ? 'measured' : '—';
+  const armEvidence = (doc: ComputeSweepGroupsResponse['sweep_groups'][string][number]) => {
+    const verdicts = doc.per_arm_verdicts ? Object.entries(doc.per_arm_verdicts) : [];
+    if (verdicts.length === 0) return doc.criterion?.metric ?? '—';
+    return verdicts
+      .map(([arm, v]) => `${arm}: ${v.value ?? 'n/a'} ${verdictLabel(v.met)}${v.cost_usd != null ? ` (${fmtUsd(v.cost_usd)})` : ''}`)
+      .join(' · ');
+  };
 
   function toggleCompare(sweepId: string) {
     setCompareSet((prev) => {
@@ -330,7 +385,9 @@ function SweepKnowledgeGroupsSection({
                   <thead>
                     <tr>
                       <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Run</th>
-                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Grade</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Verdict</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Criterion</th>
+                      <th className="text-left pr-3 pb-1 text-neutral-500 font-normal">Evidence</th>
                       <th className="text-left pb-1 text-neutral-500 font-normal">Summary</th>
                     </tr>
                   </thead>
@@ -350,7 +407,9 @@ function SweepKnowledgeGroupsSection({
                             <span className="truncate">{(doc.arm_label ?? doc.title).slice(0, 28)}</span>
                           )}
                         </td>
-                        <td className="py-0.5 pr-3 text-neutral-400">{doc.acceptance_grade ?? '—'}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{verdictLabel(doc.criterion_met)} / {gradeLabel(doc.compute_acceptance_grade)}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400">{doc.criterion ? `${doc.criterion.metric} ${doc.criterion.operator} ${doc.criterion.threshold}` : '—'}</td>
+                        <td className="py-0.5 pr-3 text-neutral-400 max-w-xs truncate">{armEvidence(doc)}</td>
                         <td className="py-0.5 text-neutral-400 max-w-xs truncate">{doc.summary?.slice(0, 80) ?? '—'}</td>
                       </tr>
                     ))}
@@ -374,9 +433,9 @@ function SweepKnowledgeGroupsSection({
                         doc.arm_label ?? doc.title
                       )}
                     </span>
-                    {doc.acceptance_grade && (
-                      <span className="shrink-0 rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-ui-xs text-neutral-300">
-                        {doc.acceptance_grade}
+                    {doc.criterion_met !== undefined && (
+                      <span className={`shrink-0 rounded border px-1 py-0.5 text-ui-xs ${doc.criterion_met === true ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : doc.criterion_met === false ? 'border-red-500/40 bg-red-500/15 text-red-300' : 'border-amber-500/40 bg-amber-500/15 text-amber-300'}`}>
+                        {verdictLabel(doc.criterion_met)}
                       </span>
                     )}
                   </div>
@@ -634,6 +693,12 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
+  const [askState, setAskState] = useState<Record<string, {
+    question: string;
+    submitting: boolean;
+    thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
+    error: string | null;
+  }>>({});
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -853,6 +918,32 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
       setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
     }
   }, [rerunState, load]);
+
+  const handleAsk = useCallback(async (jobId: string) => {
+    const q = (askState[jobId]?.question ?? '').trim();
+    if (!q) return;
+    const prevThread = askState[jobId]?.thread ?? [];
+    const history = prevThread.map((t) => ({ question: t.question, answer: t.result.answer ?? '' }));
+    setAskState((prev) => ({
+      ...prev,
+      [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: true, error: null },
+    }));
+    try {
+      const result = await askComputeJob(jobId, q, history.length > 0 ? history : undefined);
+      setAskState((prev) => {
+        const cur = prev[jobId] ?? { question: q, submitting: false, thread: [], error: null };
+        return {
+          ...prev,
+          [jobId]: { ...cur, submitting: false, question: '', thread: [...(cur.thread ?? []), { question: q, result }] },
+        };
+      });
+    } catch (e) {
+      setAskState((prev) => ({
+        ...prev,
+        [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
+      }));
+    }
+  }, [askState]);
 
   if (!projectId) {
     return (
@@ -1328,7 +1419,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                               type="button"
                               onClick={() => onNavigateToKnowledge(doc.id)}
                               className="min-h-[44px] shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-ui-xs font-semibold text-sky-400 hover:text-sky-200 hover:bg-sky-500/15 transition-colors"
-                              title="View in Knowledge Library"
+                              title="View in Knowledge library"
                               data-testid="compute-knowledge-doc-library-link"
                             >
                               <BookOpen className="w-3 h-3" />
@@ -1473,6 +1564,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                             const otherStrings = Object.entries(arm.metrics).filter(
                               ([mk, mv]) => typeof mv === 'string' && !DIAGNOSTIC_KEYS.has(mk),
                             );
+                            const pav = job.per_arm_verdicts?.[arm.name];
                             return (
                               <div
                                 key={arm.name}
@@ -1487,6 +1579,25 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                                     >
                                       exit {exitCodeVal}
                                     </span>
+                                  )}
+                                  {pav != null && pav.met !== null && (
+                                    <span
+                                      className={`rounded border px-1 py-0.5 text-ui-xs font-semibold ${pav.met ? 'border-emerald-500/40 bg-emerald-500/15 text-emerald-300' : 'border-red-500/40 bg-red-500/15 text-red-300'}`}
+                                      data-testid="arm-verdict-chip"
+                                    >
+                                      {pav.met ? 'pass' : 'fail'}
+                                    </span>
+                                  )}
+                                  {pav != null && pav.met === null && (
+                                    <span
+                                      className="rounded border px-1 py-0.5 text-ui-xs font-semibold border-amber-500/40 bg-amber-500/15 text-amber-300"
+                                      data-testid="arm-verdict-chip"
+                                    >
+                                      n/a
+                                    </span>
+                                  )}
+                                  {pav?.cost_usd != null && (
+                                    <span className="text-ui-xs text-neutral-400 font-mono" data-testid="arm-cost">{fmtUsd(pav.cost_usd)}</span>
                                   )}
                                 </div>
                                 {labelVal && (
@@ -1754,6 +1865,166 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     <pre className="rounded border border-neutral-800 bg-neutral-950 px-2 py-1.5 text-ui-xs text-neutral-300 font-mono overflow-x-auto whitespace-pre-wrap break-words max-h-64 overflow-y-auto">
                       {displayLines.join('\n')}
                     </pre>
+                  </div>
+                );
+              })()}
+              {!active && (() => {
+                const ask = askState[job.id] ?? { question: '', submitting: false, thread: [], error: null };
+
+                // Suggest starter questions based on job content
+                const starterQuestions: string[] = [];
+                if (job.criterion_verdict) {
+                  const cv = job.criterion_verdict;
+                  const status = cv.met ? 'pass' : 'fail';
+                  starterQuestions.push(`Why did this ${status} the ${cv.metric} criterion?`);
+                  if (cv.value !== null && cv.threshold !== null) {
+                    starterQuestions.push(`How did the measured ${cv.metric} (${cv.value}) compare to the threshold (${cv.threshold})?`);
+                  }
+                }
+                const metrics = job.polling_metadata?.result_metrics as Record<string, unknown> | undefined;
+                const arms = metrics ? normalizeArms(metrics.arms) : null;
+                if (arms && arms.length > 1) {
+                  starterQuestions.push(`Which arm performed best and why?`);
+                  starterQuestions.push(`What were the per-arm results?`);
+                }
+                if (job.final_cost_usd !== null) {
+                  starterQuestions.push(`Why did this run cost $${job.final_cost_usd.toFixed(2)}?`);
+                }
+                if (!starterQuestions.length && job.status !== 'SUCCEEDED') {
+                  starterQuestions.push(`What went wrong in this run?`);
+                }
+
+                // Helper to parse citations into readable format
+                const formatCitation = (c: string): { label: string; value: string } => {
+                  // Citations are typically "source:identifier" format
+                  // e.g., "result_metrics:accuracy" or "arm:control"
+                  if (c.includes('://')) {
+                    return { label: 'evidence', value: c };
+                  }
+                  const splitAt = c.indexOf(':');
+                  if (splitAt > 0) {
+                    return {
+                      label: c.slice(0, splitAt),
+                      value: c.slice(splitAt + 1),
+                    };
+                  }
+                  return { label: 'evidence', value: c };
+                };
+
+                return (
+                  <div className="mt-1.5" data-testid="compute-ask-section">
+                    <form
+                      onSubmit={(e) => { e.preventDefault(); void handleAsk(job.id); }}
+                      className="flex flex-col gap-1.5"
+                    >
+                      <div className="flex gap-1.5">
+                        <input
+                          type="text"
+                          value={ask.question}
+                          onChange={(e) => setAskState((prev) => ({
+                            ...prev,
+                            [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, thread: [], error: null }), question: e.target.value },
+                          }))}
+                          placeholder={starterQuestions.length > 0 ? starterQuestions[0] : "Ask about this run…"}
+                          disabled={ask.submitting}
+                          className="flex-1 min-w-0 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-ui-sm text-neutral-100 placeholder-neutral-600"
+                          data-testid="compute-ask-input"
+                        />
+                        <button
+                          type="submit"
+                          disabled={ask.submitting || !ask.question.trim()}
+                          className="min-h-[44px] min-w-[44px] rounded bg-indigo-500/20 px-3 text-ui-sm font-semibold text-indigo-200 hover:bg-indigo-500/30 transition-colors disabled:opacity-50"
+                          data-testid="compute-ask-submit"
+                        >
+                          {ask.submitting ? 'Asking…' : 'Ask'}
+                        </button>
+                      </div>
+                      {!ask.question && starterQuestions.length > 0 && (
+                        <div className="flex flex-wrap gap-1">
+                          {starterQuestions.slice(0, 2).map((q) => (
+                            <button
+                              key={q}
+                              type="button"
+                              onClick={() => setAskState((prev) => ({
+                                ...prev,
+                                [job.id]: { ...(prev[job.id] ?? { question: '', submitting: false, thread: [], error: null }), question: q },
+                              }))}
+                              className="min-h-[44px] rounded border border-indigo-500/40 bg-indigo-500/10 px-2 py-1 text-ui-xs text-indigo-300 hover:bg-indigo-500/20 transition-colors"
+                              data-testid="compute-ask-starter"
+                            >
+                              {q}
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </form>
+                    {ask.error && (
+                      <div className="mt-1 text-ui-sm text-red-300" data-testid="compute-ask-error">{ask.error}</div>
+                    )}
+                    {(ask.thread ?? []).length > 0 && (
+                      <div className="mt-1.5 flex flex-col gap-2" data-testid="compute-ask-thread">
+                        {(ask.thread ?? []).map((turn, idx) => {
+                          const result = turn.result;
+                          return (
+                            <div key={idx} className="flex flex-col gap-0.5">
+                              <div className="text-ui-xs text-neutral-500 font-semibold" data-testid="compute-ask-thread-question">Q: {turn.question}</div>
+                              <div className={`rounded border px-2 py-1.5 text-ui-sm ${
+                                result.grounding_miss
+                                  ? 'border-amber-500/30 bg-amber-500/10'
+                                  : 'border-indigo-500/30 bg-indigo-500/10'
+                              }`} data-testid="compute-ask-result">
+                                {result.grounding_miss && (
+                                  <div className="mb-1 flex items-start gap-1.5 text-amber-200/80" data-testid="compute-ask-unverified-caution">
+                                    <AlertTriangle className="w-3 h-3 shrink-0 mt-0.5" />
+                                    <span className="text-ui-xs font-semibold">Unverified answer — no grounding found</span>
+                                  </div>
+                                )}
+                                <div className={`break-words whitespace-pre-wrap ${
+                                  result.grounding_miss ? 'text-amber-200' : 'text-indigo-200'
+                                }`}>{result.answer}</div>
+                                {result.citations.length > 0 && (
+                                  <div className="mt-1 flex flex-col gap-0.5" data-testid="compute-ask-citations">
+                                    <div className={`text-ui-xs font-semibold ${
+                                      result.grounding_miss ? 'text-amber-300/70' : 'text-indigo-300/70'
+                                    }`}>Evidence:</div>
+                                    {result.citations.map((c) => {
+                                      const { label, value } = formatCitation(c);
+                                      return (
+                                        <div key={c} className={`text-ui-xs rounded px-1.5 py-0.5 ${
+                                          result.grounding_miss
+                                            ? 'text-amber-300/80 bg-amber-500/20'
+                                            : 'text-indigo-300/80 bg-indigo-500/20'
+                                        }`}>
+                                          <span className="font-semibold">{label}:</span> {value}
+                                        </div>
+                                      );
+                                    })}
+                                    <div className="mt-0.5 text-ui-xs text-emerald-300/80" data-testid="compute-ask-grounded">✓ Grounded in run data</div>
+                                  </div>
+                                )}
+                                {!result.citations.length && result.grounding_miss && (
+                                  <div className="mt-1 text-ui-xs text-amber-300/70" data-testid="compute-ask-ungrounded">No evidence found for this question</div>
+                                )}
+                                {!result.citations.length && !result.grounding_miss && (
+                                  <div className="mt-1 text-ui-xs text-neutral-400/70 italic" data-testid="compute-ask-no-citation-info">No citations provided</div>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                        <button
+                          type="button"
+                          onClick={() => setAskState((prev) => ({
+                            ...prev,
+                            [job.id]: { question: '', submitting: false, thread: [], error: null },
+                          }))}
+                          className="self-start text-ui-xs text-neutral-500 hover:text-neutral-300 transition-colors"
+                          data-testid="compute-ask-clear"
+                        >
+                          Clear conversation
+                        </button>
+                      </div>
+                    )}
                   </div>
                 );
               })()}

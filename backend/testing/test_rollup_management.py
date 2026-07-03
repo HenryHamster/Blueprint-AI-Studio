@@ -2720,3 +2720,687 @@ async def test_escalation_merge_propagates_landed_to_rollup_children(cleanup_db,
     assert (child2.context or {}).get("landed_on_integration") is True
     assert "_non_merge_unblock_reason" not in (child1.context or {})
     assert "_non_merge_unblock_reason" not in (child2.context or {})
+
+
+@pytest.mark.asyncio
+async def test_propagate_landed_bfs_stamps_grandchildren(cleanup_db):
+    """Variant 2 regression: _propagate_landed_to_staging_merged_descendants must
+    stamp descendants at ANY depth, not only direct children.
+
+    Scenario: an outer rollup lands on integration. Its direct child is a
+    sub-rollup (plan task) whose own child (a create task, grandchild of the outer
+    rollup) merged into the sub-rollup's staging branch but carries
+    landed_on_integration=False.  The BFS sweep from the outer rollup's ID must
+    propagate through the sub-rollup and reach the grandchild.
+
+    Without the BFS (_propagate_landed_to_staging_merged_descendants), only
+    _propagate_landed_to_rollup_children is available — it stamps direct children
+    (the sub-rollup) but never descends to the grandchild, permanently wedging any
+    cross-base dependent that waits on has_landed_signal(grandchild).
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+
+    # Outer rollup parent (a research/plan task)
+    outer_parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+    )
+    # Direct child: a sub-rollup (plan task) that merged into outer parent's staging
+    # branch. _propagate_landed_to_rollup_children would stamp this (it's a DIRECT
+    # child) but would not descend further.
+    sub_rollup = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="plan",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer_parent.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # Grandchild: a create task that merged into the sub-rollup's staging branch.
+    # _propagate_landed_to_rollup_children WOULD NOT reach this task — it only stamps
+    # direct children. The BFS sweep must propagate here so cross-base dependents
+    # waiting on has_landed_signal(grandchild) can dispatch.
+    grandchild = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=sub_rollup.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+
+    # Run the BFS sweep from the outer rollup parent
+    await _propagate_landed_to_staging_merged_descendants(outer_parent.id, cleanup_db)
+    await cleanup_db.commit()
+
+    await cleanup_db.refresh(sub_rollup)
+    await cleanup_db.refresh(grandchild)
+
+    # Sub-rollup (direct child) must be stamped
+    assert has_landed_signal(sub_rollup), (
+        "sub_rollup (direct child) must receive landed signal from BFS sweep"
+    )
+    assert (sub_rollup.context or {}).get("landed_on_integration") is True
+
+    # Grandchild must ALSO be stamped — the key regression assertion.
+    # Without the BFS, grandchild.landed_on_integration would stay False because
+    # _propagate_landed_to_rollup_children alone would miss it.
+    assert has_landed_signal(grandchild), (
+        "grandchild must receive landed signal via BFS — "
+        "_propagate_landed_to_rollup_children alone would miss it"
+    )
+    assert (grandchild.context or {}).get("landed_on_integration") is True
+    assert "_non_merge_unblock_reason" not in (grandchild.context or {})
+
+
+# ---------------------------------------------------------------------------
+# _do_rollup_post_merge_housekeeping: multi-direction refresh
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_post_merge_housekeeping_refreshes_all_directions(mocker):
+    """A rollup spanning TWO member directions must refresh BOTH directions'
+    outcomes — not just the first one.
+
+    Before the fix, `next(...)` returned only the first matching child, so
+    siblings whose direction_id differed were never refreshed, leaving the
+    'direction already merged but 0 tasks in flight' accounting undercount.
+    """
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
+
+    mock_refresh = mocker.patch(
+        "app.direction_outcomes.refresh_direction_outcomes_after_merge",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.github.get_pull_request_diff", new_callable=AsyncMock, return_value="")
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    dir_a = str(uuid.uuid4())
+    dir_b = str(uuid.uuid4())
+    research_a = str(uuid.uuid4())
+    research_b = str(uuid.uuid4())
+
+    def _child(direction_id, research_task_id):
+        c = MagicMock()
+        c.context = {"direction_id": direction_id, "research_task_id": research_task_id}
+        return c
+
+    child_a = _child(dir_a, research_a)
+    child_b = _child(dir_b, research_b)
+    # A second child for dir_a — must NOT trigger a duplicate refresh call.
+    child_a2 = _child(dir_a, research_a)
+
+    parent = MagicMock()
+    parent.id = "parent-id"
+    parent.project_id = "proj-id"
+    parent.context = {}
+
+    session = MagicMock()
+    session.get = AsyncMock(return_value=None)
+    session.commit = AsyncMock()
+    session.add = MagicMock()
+
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=None,
+        session=session,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=1,
+        staging_branch="staging/test",
+        target_branch="main",
+        completed_children=[child_a, child_b, child_a2],
+        completed_count=3,
+        landed=True,
+        terminal=False,
+    )
+
+    # Must have been called exactly once per DISTINCT direction_id.
+    assert mock_refresh.call_count == 2, (
+        f"Expected refresh called for 2 distinct directions, got {mock_refresh.call_count}"
+    )
+    refreshed_children = {call.args[0] for call in mock_refresh.call_args_list}
+    # child_a and child_b must be the representatives; child_a2 is a duplicate.
+    assert child_a in refreshed_children, "direction A representative not refreshed"
+    assert child_b in refreshed_children, "direction B representative not refreshed"
+    assert child_a2 not in refreshed_children, "duplicate direction A child must not be refreshed"
+
+
+def test_check_and_trigger_rollup_refreshes_all_directions_at_every_landed_site():
+    """Every inline landed-rollup path in ``_check_and_trigger_rollup`` must
+    refresh EVERY member direction, not just a single representative child.
+
+    Regression guard for the audit finding: the multi-direction refresh fix was
+    originally applied only to the shared ``_do_rollup_post_merge_housekeeping``
+    helper (covered behaviorally by the test above), while the three inline
+    landed paths inside ``_check_and_trigger_rollup`` still selected one child
+    via ``_dir_child = next(...)`` and refreshed only that direction — leaving
+    the other directions' merged/outcome counts stale.
+
+    Driving those inline branches end-to-end is impractical (each sits behind a
+    large amount of GitHub I/O), so this asserts the structural invariant on the
+    function's AST: (1) the single-representative ``_dir_child`` pattern is gone,
+    and (2) every ``refresh_direction_outcomes_after_merge`` call in the function
+    is fed the per-direction loop variable ``_rep`` produced by iterating over
+    ``_dir_representatives.values()``.
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    from app import rollup_management
+
+    src = textwrap.dedent(
+        inspect.getsource(rollup_management._check_and_trigger_rollup)
+    )
+    func = ast.parse(src).body[0]
+
+    # (1) The single-representative selection pattern must no longer exist.
+    assert "_dir_child" not in src, (
+        "_check_and_trigger_rollup still contains a single-representative "
+        "`_dir_child = next(...)` refresh; every landed path must refresh all "
+        "directions via `_dir_representatives`."
+    )
+
+    # (2) Every direct refresh call must be driven by the per-direction loop var.
+    refresh_calls = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "refresh_direction_outcomes_after_merge"
+    ]
+    assert len(refresh_calls) == 3, (
+        f"expected 3 inline refresh sites, found {len(refresh_calls)}"
+    )
+    for call in refresh_calls:
+        assert call.args and isinstance(call.args[0], ast.Name), (
+            "refresh_direction_outcomes_after_merge must take a name as its "
+            f"first arg, got {ast.dump(call)}"
+        )
+        assert call.args[0].id == "_rep", (
+            "refresh call must pass `_rep` (the per-direction representative), "
+            f"got `{call.args[0].id}`"
+        )
+
+    rep_loops = [
+        node
+        for node in ast.walk(func)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "_rep"
+    ]
+    assert len(rep_loops) == 3, (
+        f"expected 3 per-direction refresh loops, found {len(rep_loops)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_completed_children_merge_evidence_records_every_child(mocker):
+    """The landed-child evidence helper must touch every completed child."""
+    from app.rollup_management import _record_completed_children_merge_evidence
+
+    mock_record = mocker.patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    child_a = MagicMock(id="child-a", project_id="proj-a")
+    child_b = MagicMock(id="child-b", project_id="proj-b")
+    child_c = MagicMock(id="child-c", project_id="proj-c")
+    session = MagicMock()
+
+    await _record_completed_children_merge_evidence(
+        [child_a, child_b, child_c], session
+    )
+
+    assert mock_record.await_count == 3
+    assert [call.args[1] for call in mock_record.await_args_list] == [
+        child_a,
+        child_b,
+        child_c,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_record_completed_children_merge_evidence_skips_force_dropped_children(
+    mocker,
+):
+    """Force-dropped children must not receive merge evidence on landing."""
+    from app.rollup_management import _record_completed_children_merge_evidence
+
+    mock_record = mocker.patch(
+        "app.acceptance_criteria.record_task_merge_evidence",
+        new_callable=AsyncMock,
+        return_value=1,
+    )
+
+    landed_child = MagicMock(
+        id="child-keep",
+        project_id="proj-a",
+        context={"pr_merged": True},
+    )
+    dropped_child = MagicMock(
+        id="child-drop",
+        project_id="proj-b",
+        context={"pr_merged": True, "_non_merge_unblock_reason": "malformed_pr_url"},
+    )
+    session = MagicMock()
+
+    await _record_completed_children_merge_evidence([landed_child, dropped_child], session)
+
+    assert mock_record.await_count == 1
+    assert mock_record.await_args_list[0].args[1] is landed_child
+
+
+# ---------------------------------------------------------------------------
+# Integration test: _do_rollup_post_merge_housekeeping records CriterionEvidence
+# through the REAL production call chain (refresh_direction_outcomes_after_merge
+# left unmocked, real db_session).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_rollup_post_merge_housekeeping_records_criterion_evidence_for_all_children(
+    cleanup_db, mocker
+):
+    """_do_rollup_post_merge_housekeeping records CriterionEvidence rows through
+    the real production call chain for every landed child that carries a proven
+    code-acceptance verdict.
+
+    The sibling test test_post_merge_housekeeping_refreshes_all_directions uses a
+    MagicMock session and mocks refresh_direction_outcomes_after_merge, so the
+    evidence-recording leg is never exercised. This test uses a real SQLite session
+    and leaves refresh_direction_outcomes_after_merge UNMOCKED, driving the full
+    acceptance-criteria pipeline end-to-end from the rollup caller.
+    """
+    from app.models import ReleaseVersion, Task as _Task
+    from app.acceptance_criteria import (
+        create_criterion,
+        get_evidence_for_criterion,
+        compute_criterion_coverage,
+    )
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
+
+    # Mock only the unrelated side-effect collaborators (GitHub I/O, notifications,
+    # broadcast, viewport). Critically, refresh_direction_outcomes_after_merge is
+    # NOT mocked — the evidence-recording leg runs through real production code.
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
+    )
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+    # Create project and open release version in the real DB.
+    project = await _make_project(cleanup_db)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    cleanup_db.add(version)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(version)
+
+    # Author criteria for two same-direction children. Before the fix, only the
+    # first direction representative got evidence; the sibling's criterion was
+    # left uncovered.
+    criterion = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Integration test suite passes green under real merge verdict",
+        created_by="test",
+    )
+    criterion_b = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Sibling child suite passes green under real merge verdict",
+        created_by="test",
+    )
+
+    direction_key = "d-housekeeping-criterion-test"
+    research_task_id = str(uuid.uuid4())
+
+    # Rollup parent task.
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+
+    # Child task with a proven CODE_ACCEPTANCE_VERDICT and criterion linkage.
+    # direction_id and research_task_id are required for the child to be selected
+    # as a direction representative inside _do_rollup_post_merge_housekeeping.
+    child = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "implement feature"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_key,
+            "research_task_id": research_task_id,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "named test ran green under verified merge",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+    )
+    child_b = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "implement sibling feature"}],
+        status=TaskStatus.COMPLETED,
+        context=dict(child.context or {}),
+        criterion_ids=[criterion_b.criterion_key],
+    )
+    cleanup_db.add(child)
+    cleanup_db.add(child_b)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+    await cleanup_db.refresh(child_b)
+
+    # Drive _do_rollup_post_merge_housekeeping with landed=True.
+    # refresh_direction_outcomes_after_merge is NOT mocked — the real function
+    # runs and records CriterionEvidence as a side effect.
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=4242,
+        staging_branch="research/conflict-stg",
+        target_branch="research/conflict-base",
+        completed_children=[child, child_b],
+        completed_count=2,
+        landed=True,
+        terminal=False,
+    )
+
+    # Verify CriterionEvidence rows were recorded end-to-end.
+    evidence = await get_evidence_for_criterion(cleanup_db, criterion.id)
+    assert len(evidence) == 2, (
+        f"Expected 2 CriterionEvidence rows (task_merge + reachability), got {len(evidence)}"
+    )
+    source_kinds = {e.source_kind for e in evidence}
+    assert source_kinds == {"task_merge", "reachability"}, (
+        f"Expected source_kinds {{'task_merge', 'reachability'}}, got {source_kinds!r}"
+    )
+    assert all(e.detail == {"proven": True} for e in evidence), (
+        "All evidence rows must carry detail={'proven': True}"
+    )
+    assert all(str(e.source_id) == str(child.id) for e in evidence), (
+        "All evidence rows must reference the merged child task"
+    )
+
+    # Coverage must be 'covered' (a proven task_merge row is sufficient).
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Expected criterion coverage 'covered', got {coverage!r}"
+    )
+
+    sibling_evidence = await get_evidence_for_criterion(cleanup_db, criterion_b.id)
+    assert len(sibling_evidence) == 2
+    assert {e.source_kind for e in sibling_evidence} == {"task_merge", "reachability"}
+    assert all(str(e.source_id) == str(child_b.id) for e in sibling_evidence)
+    assert compute_criterion_coverage(sibling_evidence) == "covered"
+
+
+@pytest.mark.asyncio
+async def test_rollup_post_merge_housekeeping_no_evidence_when_verdict_not_proven(
+    cleanup_db, mocker
+):
+    """Negative leg: a child whose verdict is NOT proven records no CriterionEvidence.
+
+    Complements test_rollup_post_merge_housekeeping_records_criterion_evidence —
+    exercises the same end-to-end path but with proven=False so that
+    record_task_merge_evidence skips evidence creation, leaving the criterion
+    at 'uncovered'.
+    """
+    from app.models import ReleaseVersion, Task as _Task
+    from app.acceptance_criteria import (
+        create_criterion,
+        get_evidence_for_criterion,
+        compute_criterion_coverage,
+    )
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.rollup_management import _do_rollup_post_merge_housekeeping
+
+    mocker.patch("app.github.delete_branch", new_callable=AsyncMock)
+    mocker.patch(
+        "app.github.get_pull_request_diff", new_callable=AsyncMock, return_value=""
+    )
+    mocker.patch(
+        "app.notification_dispatch.post_pr_merged_message", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.viewport_coverage.update_viewport_coverage_snapshot_from_diff",
+        new_callable=AsyncMock,
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
+    )
+    mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+
+    project = await _make_project(cleanup_db)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    cleanup_db.add(version)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(version)
+
+    criterion = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Negative-leg criterion: unproven verdict leaves no evidence",
+        created_by="test",
+    )
+
+    direction_key = "d-housekeeping-no-evidence-test"
+    research_task_id = str(uuid.uuid4())
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+
+    child = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "direction_id": direction_key,
+            "research_task_id": research_task_id,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": False,
+                "proven": False,
+                "kind": "named_test",
+                "reason": "test failed",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+    )
+    cleanup_db.add(child)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child)
+
+    await _do_rollup_post_merge_housekeeping(
+        parent=parent,
+        project=project,
+        session=cleanup_db,
+        gh_token="tok",
+        owner="owner",
+        repo="repo",
+        rollup_pr_number=4242,
+        staging_branch="research/conflict-stg",
+        target_branch="research/conflict-base",
+        completed_children=[child],
+        completed_count=1,
+        landed=True,
+        terminal=False,
+    )
+
+    evidence = await get_evidence_for_criterion(cleanup_db, criterion.id)
+    assert evidence == [], (
+        f"Expected no CriterionEvidence for unproven verdict, got {evidence!r}"
+    )
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "uncovered", (
+        f"Expected criterion coverage 'uncovered' for unproven verdict, got {coverage!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_gate(
+    cleanup_db,
+):
+    """Multi-child rollup: per-child proven evidence aggregates to full version coverage.
+
+    Two rollup children each cover a distinct version acceptance criterion via a
+    proven merge-test verdict.  After _record_completed_children_merge_evidence
+    runs on both, get_version_coverage_summary must report all criteria covered
+    and compute_composite must NOT fire the criterion_coverage_incomplete gate.
+    """
+    from app.models import ReleaseVersion, Task as _Task
+    from app.acceptance_criteria import (
+        create_criterion,
+        get_version_coverage_summary,
+        compute_criterion_coverage,
+        get_evidence_for_criterion,
+    )
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.rollup_management import _record_completed_children_merge_evidence
+    from app.release_scoring import compute_composite
+
+    project = await _make_project(cleanup_db)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    cleanup_db.add(version)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(version)
+
+    # Two distinct acceptance criteria — one per rollup child.
+    criterion_a = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature A tests pass under merge-test",
+        created_by="test",
+    )
+    criterion_b = await create_criterion(
+        cleanup_db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature B integration verified",
+        created_by="test",
+    )
+
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+
+    proven_verdict = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "named_test",
+        "reason": "merge-test ran green",
+    }
+
+    child_a = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature A"}],
+        status=TaskStatus.COMPLETED,
+        context={CODE_ACCEPTANCE_VERDICT_KEY: proven_verdict},
+        criterion_ids=[criterion_a.criterion_key],
+    )
+    child_b = _Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        payloads=[{"type": "create", "prompt": "feature B"}],
+        status=TaskStatus.COMPLETED,
+        context={CODE_ACCEPTANCE_VERDICT_KEY: proven_verdict},
+        criterion_ids=[criterion_b.criterion_key],
+    )
+    cleanup_db.add(child_a)
+    cleanup_db.add(child_b)
+    await cleanup_db.commit()
+    await cleanup_db.refresh(child_a)
+    await cleanup_db.refresh(child_b)
+
+    # Record evidence for both children — the production path exercised during
+    # rollup post-merge housekeeping.
+    await _record_completed_children_merge_evidence([child_a, child_b], cleanup_db)
+
+    # Both criteria must now be covered.
+    ev_a = await get_evidence_for_criterion(cleanup_db, criterion_a.id)
+    ev_b = await get_evidence_for_criterion(cleanup_db, criterion_b.id)
+    assert compute_criterion_coverage(ev_a) == "covered", (
+        f"criterion_a must be covered after child_a merge evidence; got {ev_a!r}"
+    )
+    assert compute_criterion_coverage(ev_b) == "covered", (
+        f"criterion_b must be covered after child_b merge evidence; got {ev_b!r}"
+    )
+
+    # Version-level summary must reflect full coverage.
+    summary = await get_version_coverage_summary(cleanup_db, version.id)
+    assert summary["total"] == 2
+    assert summary["covered"] == 2
+    assert summary["uncovered"] == 0, (
+        f"Expected 0 uncovered criteria, got {summary['uncovered']}: {summary}"
+    )
+
+    # The release-scoring gate must not fire criterion_coverage_incomplete.
+    result = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=None,
+        policy={"weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}, "threshold": 0.90},
+        smoketest_enabled=False,
+        ci_state="no_checks",
+        ci_required=False,
+        criterion_coverage=summary,
+    )
+    assert result["blocker"] != "criterion_coverage_incomplete", (
+        f"Fully-covered version must not trigger criterion_coverage_incomplete; "
+        f"got blocker={result['blocker']!r}, summary={summary}"
+    )
+    assert result["blocker"] is None, (
+        f"No blocker expected for a fully-covered version; got {result['blocker']!r}"
+    )

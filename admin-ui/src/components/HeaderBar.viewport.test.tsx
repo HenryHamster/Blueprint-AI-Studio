@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { HeaderBar } from './HeaderBar';
+import { HeaderBar, PrimaryTabNav } from './HeaderBar';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt } from '../test/viewport';
-import type { UserLaunchableTaskType } from '../taskCapabilities';
 
 vi.mock('../api', () => ({
   apiFetch: vi.fn(async () => new Response('{}', { status: 200 })),
@@ -14,198 +13,41 @@ vi.mock('../api', () => ({
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
+  getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
   signOut: vi.fn(),
 }));
 
-// AutonomousStatus and SettingsDropdown are complex sub-trees;
-// stub them to keep the test focused on HeaderBar's own mobile layout.
+// AutonomousStatus is a complex sub-tree; stub it to keep the test focused on
+// HeaderBar's own mobile layout.
 vi.mock('./AutonomousStatus', () => ({
   AutonomousStatus: () => <div data-testid="autonomous-status" />,
 }));
-vi.mock('./SettingsDropdown', () => ({
-  SettingsDropdown: () => <div data-testid="settings-dropdown" />,
-}));
 
 const noop = () => {};
-const noopAsync = async () => {};
 
 function makeProps() {
   return {
     tasks: [],
-    runningTasks: [],
-    queuedTasks: [],
-    globalActiveCount: 0,
-    globalEvaluatingCount: 0,
-    globalQueuedCount: 0,
-    maxConcurrentVMs: 4,
-    lastRefresh: null,
     onRefresh: noop,
-    viewMode: 'kanban' as const,
-    onSetViewMode: noop,
     showResearchBrowser: false,
     onToggleResearchBrowser: noop,
     showKnowledgeBrowser: false,
     onToggleKnowledgeBrowser: noop,
-    showArchive: false,
-    onToggleArchive: noop,
-    showMessages: false,
-    onToggleMessages: noop,
     openMessageCount: 0,
     onOpenNewTaskModal: noop,
+    onOpenSettings: noop,
     onSignOut: noop,
     userEmail: 'test@example.com',
     wsRef: { current: null },
-    showSettings: false,
-    onToggleSettings: noop,
-    settingsRef: { current: null },
-    defaultTaskType: 'create' as UserLaunchableTaskType,
-    onUpdateDefaultTaskType: noop,
-    notifyOnComplete: false,
-    onUpdateNotifyOnComplete: noop,
-    notifyOnFail: false,
-    onUpdateNotifyOnFail: noop,
-    notifyOnApprovalNeeded: false,
-    onUpdateNotifyOnApprovalNeeded: noop,
-    soundOnComplete: false,
-    onUpdateSoundOnComplete: noop,
-    notifyOnHighSignalMessage: false,
-    onUpdateNotifyOnHighSignalMessage: noop,
-    maxRetries: 3,
-    maxAutonomousTasksPerHour: 10,
-    requireApprovalGates: false,
-    autoArchiveEnabled: false,
-    autoArchiveTerminalAfterDays: 7,
-    autoArchiveMaxTerminalTasksPerProject: 50,
-    autoArchiveIntervalMinutes: 60,
-    onUpdateAutoArchiveEnabled: noop,
-    onUpdateAutoArchiveTerminalAfterDays: noop,
-    onUpdateAutoArchiveMaxTerminalTasksPerProject: noop,
-    onUpdateAutoArchiveIntervalMinutes: noop,
-    onUpdateMaxVMs: noop,
-    onUpdateRequireApprovalGates: noop,
-    onUpdateMaxRetries: noop,
-    onUpdateMaxAutonomousRate: noop,
-    maxGlobalAutonomousTasksPerHour: 50,
-    onUpdateMaxGlobalAutonomousRate: noop,
-    maxPipelineSlots: 4,
-    onUpdateMaxPipelineSlots: noop,
-    reservedSlotsForTypes: { create: 1, research: 1 },
-    onUpdateReservedSlotsForTypes: noop,
-    evaluatingPipelineTimeoutMinutes: 120,
-    onUpdateEvaluatingPipelineTimeout: noop,
-    evaluatingFailHours: 48,
-    onUpdateEvaluatingFailHours: noop,
-    ciBackstopTimeoutMinutes: 60,
-    onUpdateCiBackstopTimeout: noop,
-    autonomousResearchIntervalMinutes: 30,
-    onUpdateAutonomousResearchInterval: noop,
-    directionCooldownMinutes: 60,
-    onUpdateDirectionCooldownMinutes: noop,
-    strategicResearchFrequency: 5,
-    onUpdateStrategicResearchFrequency: noop,
-    healthCheckUrls: [],
-    onUpdateHealthCheckUrls: noop,
-    githubAccount: null,
-    onConnectGitHub: noop,
-    maxPlanAccounts: [],
-    onToggleAccount: noop,
-    onRemoveAccount: noop,
-    onResetRateLimits: noop,
-    onRefreshAccountModels: noop,
-    onUpdateAccount: noop,
-    newAccountName: '',
-    setNewAccountName: noop,
-    newAccountProvider: 'anthropic' as const,
-    setNewAccountProvider: noop,
-    newAccountAuthMode: 'api_key' as const,
-    setNewAccountAuthMode: noop,
-    newAccountToken: '',
-    setNewAccountToken: noop,
-    newAccountProviderMetadata: {},
-    setNewAccountProviderMetadata: noop,
-    newAccountClaudeConfigJson: '',
-    setNewAccountClaudeConfigJson: noop,
-    newAccountDailyTaskCap: null,
-    setNewAccountDailyTaskCap: noop,
-    newAccountMaxConcurrentTasks: null,
-    setNewAccountMaxConcurrentTasks: noop,
-    newAccountAutoDisableAfterRateLimits: null,
-    setNewAccountAutoDisableAfterRateLimits: noop,
-    onAddAccount: noop,
-    onUpdateAccountCaps: noop,
-    providerTierModelMap: {},
-    taskTypeModelPreferences: {},
-    providers: {},
-    providerSettingsDefaults: {} as import('../types/settings').ProviderSettingsDefaults,
-    taskTypeProviderOverrides: {} as import('../types/settings').TaskTypeProviderOverrides,
-    onUpdateProviderSettingsDefaults: noopAsync,
-    onUpdateTaskTypeProviderOverrides: noopAsync,
-    providerSelectionMode: 'balanced' as const,
-    onUpdateProviderSelectionMode: noopAsync,
-    taskTypeCategories: {},
-    onUpdateTaskTypeCategories: noopAsync,
-    categoryRouting: {},
-    onUpdateCategoryRouting: noopAsync,
-    taskTypeRouting: {},
-    onUpdateTaskTypeRouting: noopAsync,
-    providerSettingsByEffort: {} as import('../types/settings').ProviderSettingsByEffort,
-    onUpdateProviderSettingsByEffort: noopAsync,
-    showMetrics: false,
-    onToggleMetrics: noop,
-    metricsHistory: [],
-    refreshInterval: 10000,
-    onUpdateRefreshInterval: noop,
-    pageSize: 50,
-    onUpdatePageSize: noop,
     apiHealthy: true,
     wsConnected: true,
     lastFetchTime: 0,
-    onRestartOrchestrator: noopAsync,
-    anyAutonomousEnabled: false,
-    onPauseAllAutonomous: noopAsync,
     deployState: null,
-    onPausePipeline: noopAsync,
-    onResumePipeline: noopAsync,
-    onResetHealth: noopAsync,
-    onRollback: noopAsync,
-    onMarkStable: noopAsync,
-    onRepairState: noopAsync,
-    failedRollback: null,
-    zoneHealth: null,
-    showUserManagement: false,
-    onToggleUserManagement: noop,
-    showProjectMembers: false,
-    onToggleProjectMembers: noop,
-    selectedProjectMyRole: null,
-    userRole: null,
-    notificationConfig: {} as import('./SettingsNotificationsSection').NotificationConfig,
-    onUpdateNotificationConfig: noop,
-    dailyCostCeilingUsd: 0,
-    onUpdateDailyCostCeiling: noop,
     selectedProjectId: null,
-    selectedProjectOwner: null,
-    selectedProjectRepo: null,
-    buildConfig: null,
-    onUpdateBuildConfig: noopAsync,
-    onDetectBuildConfig: noopAsync,
-    autoRemediationConfig: null,
-    autoRemediationStats: null,
-    onUpdateAutoRemediationConfig: noopAsync,
-    issueImplementationConfig: null,
-    onUpdateIssueImplementationConfig: noopAsync,
-    autoReviewConfig: null,
-    onUpdateAutoReviewConfig: noopAsync,
-    resourceEnvelopeData: null,
-    resourceEnvelopeLoading: false,
-    resourceEnvelopeError: null,
-    onUpdateResourceEnvelope: noopAsync,
-    integrationBranchData: null,
-    onUpdateIntegrationBranch: noopAsync,
-    promotionTargetData: null,
-    onUpdatePromotionTarget: noopAsync,
     projects: [],
     onSelectProject: noop,
-    activeTab: 'cockpit' as const,
+    activeTab: 'chat' as const,
     onTabChange: noop,
     health: null,
     detailedHealth: null,
@@ -296,17 +138,317 @@ describe('HeaderBar — viewport regression', () => {
     });
   });
 
-  test('desktop activity stream launcher calls its opener', async () => {
+  test('desktop top bar keeps journal, library, and activity out of primary chrome', async () => {
     const onOpenActivityFeed = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
     document.body.appendChild(host);
     const r = createRoot(host);
     root = r;
-    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenActivityFeed={onOpenActivityFeed} />); });
-    const activityButton = host.querySelector<HTMLButtonElement>('button[title="Chronological activity stream"]');
-    expect(activityButton).toBeTruthy();
-    await act(async () => { activityButton?.click(); });
-    expect(onOpenActivityFeed).toHaveBeenCalledOnce();
+    await act(async () => {
+      r.render(
+        <HeaderBar
+          {...makeProps()}
+          showResearchBrowser
+          showKnowledgeBrowser
+          onOpenActivityFeed={onOpenActivityFeed}
+        />,
+      );
+    });
+
+    expect(host.querySelector<HTMLButtonElement>('button[title="Findings journal"]')).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>('button[title="Knowledge library"]')).toBeNull();
+    expect(host.querySelector<HTMLButtonElement>('button[title="Chronological activity stream"]')).toBeNull();
+    expect(host.textContent).not.toContain('Activity stream');
+    expect(onOpenActivityFeed).not.toHaveBeenCalled();
   });
+
+  test('desktop settings and sign-out actions use header callbacks', async () => {
+    const onOpenSettings = vi.fn();
+    const onSignOut = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} onOpenSettings={onOpenSettings} onSignOut={onSignOut} />);
+    });
+
+    const settingsButton = host.querySelector<HTMLButtonElement>('button[title="Runtime settings"]');
+    const signOutButton = host.querySelector<HTMLButtonElement>('button[title="Sign out test@example.com"]');
+    expect(settingsButton).toBeTruthy();
+    expect(signOutButton).toBeTruthy();
+
+    await act(async () => { settingsButton?.click(); });
+    await act(async () => { signOutButton?.click(); });
+
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+    expect(onSignOut).toHaveBeenCalledOnce();
+  });
+
+  test('desktop command search opens the command palette from the global header', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="runtime" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
+    const commandButton = host.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
+    expect(commandButton).toBeTruthy();
+    expect(commandButton?.textContent).toContain('Ctrl K');
+    expect(commandButton?.textContent).not.toContain('Search commands');
+    expect(commandButton?.textContent).not.toContain('Message Strategic');
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
+  test('desktop workspace navigation sits to the right of command search', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenCommandPalette={vi.fn()} />); });
+
+    const commandButton = host.querySelector<HTMLButtonElement>('[data-testid="header-command-search"]');
+    const primaryNav = host.querySelector<HTMLElement>('[data-testid="primary-tab-nav"]');
+    const commandSlot = commandButton?.parentElement;
+    expect(commandButton).toBeTruthy();
+    expect(primaryNav).toBeTruthy();
+    expect(commandSlot?.nextElementSibling).toBe(primaryNav?.parentElement);
+    expect(primaryNav?.parentElement?.className).toContain('ml-auto');
+  });
+
+  test('desktop header keeps the Blueprint brand icon-only and project switcher primary', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+
+    expect(host.textContent).not.toContain('Blueprint');
+    expect(host.querySelector('[aria-label="Blueprint"]')).not.toBeNull();
+  });
+
+  test('primary mode label is Chat, not a duplicate Strategic entry point', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} activeTab="chat" />); });
+
+    const chatTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === 'Chat');
+    expect(chatTab).toBeTruthy();
+    const oldStrategicTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.trim() === 'Strategic');
+    expect(oldStrategicTab).toBeUndefined();
+  });
+
+  test('mobile menu exposes a real command palette launcher outside Chat composer', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="runtime" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Command palette'));
+    expect(commandButton).toBeTruthy();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
+  });
+
+  test('mobile Chat menu leaves command palette to the composer affordance', async () => {
+    const onOpenCommandPalette = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="chat" onOpenCommandPalette={onOpenCommandPalette} />);
+    });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Command palette'));
+    expect(commandButton).toBeUndefined();
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+  });
+
+  test('global header does not expose permanent New task chrome outside Pipeline', async () => {
+    const onOpenNewTaskModal = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} activeTab="chat" onOpenNewTaskModal={onOpenNewTaskModal} />);
+    });
+    const desktopNewTask = host.querySelector<HTMLButtonElement>('button[title="New task"]');
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+    const mobileNewTask = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.trim() === 'New task');
+
+    expect(desktopNewTask).toBeNull();
+    expect(mobileNewTask).toBeUndefined();
+    expect(onOpenNewTaskModal).not.toHaveBeenCalled();
+  });
+
+  test('mobile menu does not duplicate primary mode navigation', async () => {
+    const onTabChange = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onTabChange={onTabChange} />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const menu = hamburger?.nextElementSibling;
+    const modeButtons = Array.from(menu?.querySelectorAll<HTMLButtonElement>('button') ?? [])
+      .filter(button => ['Chat', 'Pipeline', 'Project', 'Runtime'].includes(button.textContent?.trim() ?? ''));
+
+    expect(modeButtons).toHaveLength(0);
+    expect(onTabChange).not.toHaveBeenCalled();
+  });
+
+  test('mobile menu exposes health panel without a separate monitoring surface', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const healthButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
+      .find(button => button.textContent?.includes('Health panel'));
+    expect(healthButton).toBeTruthy();
+    await act(async () => { healthButton?.click(); });
+
+    expect(host.querySelector('[data-testid="orchestrator-health-bar"]')).not.toBeNull();
+    expect(host.textContent).not.toContain('Task stream');
+  });
+
+  test('mobile menu routes settings and sign out through explicit actions', async () => {
+    const onOpenSettings = vi.fn();
+    const onSignOut = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} onOpenSettings={onOpenSettings} onSignOut={onSignOut} />);
+    });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const menuButtons = Array.from(hamburger?.nextElementSibling?.querySelectorAll<HTMLButtonElement>('button') ?? []);
+    const settingsButton = menuButtons.find(button => button.textContent?.trim() === 'Runtime settings');
+    const signOutButton = menuButtons.find(button => button.textContent?.trim() === 'Sign out');
+
+    await act(async () => { settingsButton?.click(); });
+    await act(async () => {
+      hamburger?.click();
+    });
+    const reopenedButtons = Array.from(hamburger?.nextElementSibling?.querySelectorAll<HTMLButtonElement>('button') ?? []);
+    await act(async () => {
+      reopenedButtons.find(button => button.textContent?.trim() === 'Sign out')?.click();
+    });
+
+    expect(settingsButton).toBeTruthy();
+    expect(signOutButton).toBeTruthy();
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+    expect(onSignOut).toHaveBeenCalledOnce();
+  });
+
+  test('mobile menu hides new task while Pipeline owns task creation controls', async () => {
+    const onOpenNewTaskModal = vi.fn();
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    host.style.minHeight = '600px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => { r.render(<HeaderBar {...makeProps()} onOpenNewTaskModal={onOpenNewTaskModal} activeTab="pipeline" />); });
+    const hamburger = host.querySelector<HTMLButtonElement>('button[title="More options"]');
+    await act(async () => { hamburger?.click(); });
+
+    const mobileMenu = hamburger?.nextElementSibling;
+    const mobileNewTaskButton = Array.from(mobileMenu?.querySelectorAll<HTMLButtonElement>('button') ?? [])
+      .find(button => button.textContent?.trim() === 'New task');
+    expect(mobileNewTaskButton).toBeUndefined();
+    expect(onOpenNewTaskModal).not.toHaveBeenCalled();
+  });
+
+  test('mobile primary nav switches modes and shows badges', async () => {
+    const onTabChange = vi.fn();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <PrimaryTabNav
+          activeTab="chat"
+          onTabChange={onTabChange}
+          openMessageCount={3}
+          needsAttentionCount={5}
+          placement="mobile"
+        />,
+      );
+    });
+
+    const buttons = Array.from(host.querySelectorAll<HTMLButtonElement>('button'));
+    expect(buttons.map(button => button.textContent?.trim())).toEqual([
+      'Chat3',
+      'Pipeline5',
+      'Project',
+      'Runtime',
+    ]);
+    await act(async () => { buttons[1].click(); });
+    expect(onTabChange).toHaveBeenCalledWith('pipeline');
+  });
+
+  test('pipeline tab shows attention badge from existing count prop', async () => {
+    host = document.createElement('div');
+    host.style.padding = '12px';
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<HeaderBar {...makeProps()} needsAttentionCount={7} />);
+    });
+
+    const pipelineTab = Array.from(host.querySelectorAll('button'))
+      .find(button => button.textContent?.includes('Pipeline'));
+    expect(pipelineTab?.textContent).toContain('7');
+  });
+
 });

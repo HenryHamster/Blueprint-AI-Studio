@@ -44,7 +44,7 @@ Public API:
       Return a compact dict for embedding the version's phase state in the
       strategic agent's payload.
 
-  build_version_highlights(version, *, merged_count, aggregate_serving_status, acceptance_aggregate)
+  build_version_highlights(version, *, merged_count, aggregate_serving_status)
       Build the shared human-readable ``highlights`` block (headline plus
       at-a-glance metrics) for a version.  The 'serving' word in the headline is
       driven off the aggregate required-artifact serving status, not the scalar
@@ -91,6 +91,28 @@ _PROMOTION_NEARING_TIMEOUT_FRACTION = 0.8
 # merge the reconciler retries after required checks pass.  Exporting one
 # frozenset keeps all guards in agreement by construction.
 PROMOTION_BLOCKING_STATES = frozenset({"promotion_in_flight", "promotion_check_wait"})
+
+# Exhaustive vocabulary of ``state`` values returned by
+# ``summarize_qualification_state``.  Pin this against the function body so
+# callers can assert membership rather than re-declaring their own subsets.
+QUALIFICATION_STATE_VOCAB: frozenset[str] = frozenset(
+    {
+        "qualifying",
+        "audit_crashed",
+        "promotion_check_wait",
+        "promotion_in_flight",
+        "promotion_failed",
+        "required_check_failed",
+        "protection_blocked_review",
+        "not_promoted",
+        "dry_run",
+        "promoted",
+        "promoted_unconfirmed",
+        "promotion_deploy_failed",
+        "promotion_confirmation_timed_out",
+        "deferred_unsynced",
+    }
+)
 
 # Cap on the persisted version ``goal`` — a snapshot of intent.current_focus,
 # which is meant to be a concise statement.  Mirrors _PHASE_REASONING_MAX.
@@ -682,11 +704,13 @@ def summarize_qualification_state(
     and burn whole cycles waiting (incident 2026-06-02). This derives a single
     explicit sub-state from the raw verdict — pure data, no I/O.
 
-    Returns ``{"state", "summary", ...}`` (``state`` ∈ ``qualifying`` |
-    ``audit_crashed`` | ``promotion_in_flight`` | ``promotion_failed`` |
-    ``not_promoted`` | ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
-    ``promotion_confirmation_timed_out`` | ``promotion_deploy_failed``), or
-    ``None`` when unqualified (no verdict yet).
+    Returns ``{"state", "summary", ...}`` where ``state`` ∈
+    ``QUALIFICATION_STATE_VOCAB`` (``qualifying`` | ``audit_crashed`` |
+    ``promotion_check_wait`` | ``promotion_in_flight`` | ``promotion_failed`` |
+    ``required_check_failed`` | ``protection_blocked_review`` | ``not_promoted`` |
+    ``dry_run`` | ``promoted`` | ``promoted_unconfirmed`` |
+    ``promotion_deploy_failed`` | ``promotion_confirmation_timed_out`` |
+    ``deferred_unsynced``), or ``None`` when unqualified (no verdict yet).
 
     Audit-crash reconciliation: when ``status == "pending"`` with no
     ``promotion_pending`` sub-key, the bare result was always ``qualifying``
@@ -762,16 +786,33 @@ def summarize_qualification_state(
                 result["ci_state"] = promo.get("ci_state")
             return result
         if isinstance(promo, dict):
-            armed = promo.get("auto_merge_enabled")
-            summary = (
-                "Audit PASSED; a promotion PR is open and auto-merge is "
-                f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
-                "auditing' — the audit already cleared. Watch the promotion "
-                "PR's CI: if it goes red the version bounces back to "
-                "stabilize and needs a fresh qualify on a synced candidate."
-            )
+            # A bare CLAIM (``claiming`` with no ``pr_number``) is written
+            # under-lock by promote() before its GitHub I/O so a concurrent
+            # re-qualify can't clobber the in-flight promotion — there is NO PR
+            # yet.  Report that honestly rather than as "a promotion PR is open".
+            _is_claim = bool(promo.get("claiming")) and not promo.get("pr_number")
+            if _is_claim:
+                summary = (
+                    "Audit PASSED; a promotion is STARTING — promote() is cutting "
+                    "the release branch and opening the PR (no PR number yet). "
+                    "This is NOT 'still auditing' and is NOT a stuck promotion; it "
+                    "resolves within the promotion I/O window and re-qualification "
+                    "is blocked until then."
+                )
+            else:
+                armed = promo.get("auto_merge_enabled")
+                summary = (
+                    "Audit PASSED; a promotion PR is open and auto-merge is "
+                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                    "auditing' — the audit already cleared. Watch the promotion "
+                    "PR's CI: if it goes red the version bounces back to "
+                    "stabilize and needs a fresh qualify on a synced candidate."
+                )
             freshness = _promotion_in_flight_freshness(promo)
-            if freshness:
+            # Skip the auto-timeout messaging for a bare claim: its GC bound is
+            # the short claim timeout, not the 24h cap _promotion_in_flight_
+            # freshness reports, so that text would misstate the deadline.
+            if freshness and not _is_claim:
                 age_str = _humanize_seconds(freshness["promotion_age_seconds"])
                 cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
                 summary += f" In flight ~{age_str} (auto-timeout cap {cap_str})."
@@ -1008,16 +1049,10 @@ def to_phase_block(
         if artifact_evidence is not None
         else version.deploy_failure_reason
     )
-    acceptance_aggregate = None
-    if isinstance(version.last_qualification, dict):
-        acceptance_aggregate = version.last_qualification.get("acceptance_aggregate")
-    if acceptance_aggregate is None:
-        acceptance_aggregate = getattr(version, "acceptance_aggregate", None)
     block = {
         "version_number": version.version_number,
         "phase": version.phase,
         "goal": version.goal,
-        "theme": version.theme,
         "phase_changed_at": version.phase_changed_at.isoformat()
         if version.phase_changed_at
         else None,
@@ -1036,13 +1071,6 @@ def to_phase_block(
         "served_sha": version.served_sha,
         "served_at": version.served_at.isoformat() if version.served_at else None,
         "deploy_failure_reason": effective_failure_reason,
-        # Version-window acceptance aggregate (proven-vs-merged) — additive and
-        # nullable. The aggregate itself is computed/stored by the acceptance
-        # layer; this read model only passes it through so the strategist reads
-        # the proven claim state ALONGSIDE the raw merged count
-        # (``tasks_merged_this_version``, added by the caller). ``None`` on legacy
-        # rows that predate the aggregate, keeping the payload backward-compatible.
-        "acceptance_aggregate": acceptance_aggregate,
     }
     if artifact_evidence is not None:
         block["artifacts"] = artifact_evidence
@@ -1054,8 +1082,6 @@ def _synthesize_narrative(
     *,
     merged_count: int,
     aggregate_serving_status: str | None,
-    proven: int,
-    total_merged: int,
     confidence: float | None,
     threshold: float | None,
 ) -> str:
@@ -1065,7 +1091,6 @@ def _synthesize_narrative(
     ``build_version_highlights`` so all summary surfaces render identical text.
     """
     task_word = "task" if merged_count == 1 else "tasks"
-    total_word = "task" if total_merged == 1 else "tasks"
 
     if version.status == "promoted":
         if aggregate_serving_status == "serving_confirmed":
@@ -1074,32 +1099,17 @@ def _synthesize_narrative(
             intro = "Promoted."
         if merged_count == 0:
             return f"{intro} No tasks were merged into this version."
-        acceptance_part = (
-            f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
-            if total_merged > 0
-            else ""
-        )
-        return f"{intro} Delivered {merged_count} merged {task_word}.{acceptance_part}"
+        return f"{intro} Delivered {merged_count} merged {task_word}."
 
     if version.status == "abandoned":
         if merged_count == 0:
             return "Abandoned before promotion with no merged work."
-        acceptance_part = (
-            f" Acceptance evidence was proven for {proven} of {total_merged} merged {total_word}."
-            if total_merged > 0
-            else ""
-        )
-        return f"Abandoned before promotion with {merged_count} merged {task_word}.{acceptance_part}"
+        return f"Abandoned before promotion with {merged_count} merged {task_word}."
 
     # open
     if merged_count == 0:
         return f"Open in the {version.phase} phase with no merged work yet."
 
-    acceptance_part = (
-        f" Acceptance evidence proven for {proven} of {total_merged} merged {total_word}."
-        if total_merged > 0
-        else ""
-    )
     qual_part = ""
     if confidence is not None and threshold is not None:
         conf_pct = round(confidence * 100)
@@ -1112,7 +1122,7 @@ def _synthesize_narrative(
 
     return (
         f"Open in the {version.phase} phase with {merged_count} merged {task_word}."
-        f"{acceptance_part}{qual_part}"
+        f"{qual_part}"
     )
 
 
@@ -1121,7 +1131,6 @@ def build_version_highlights(
     *,
     merged_count: int,
     aggregate_serving_status: str | None,
-    acceptance_aggregate: Mapping[str, Any] | None,
 ) -> dict[str, Any]:
     """Build the human-readable ``highlights`` block for a release version.
 
@@ -1136,17 +1145,14 @@ def build_version_highlights(
     ``"promoted & serving"`` only when every required artifact confirms,
     otherwise ``"promoted"``.
 
-    ``acceptance_aggregate`` is the proven-vs-merged bucket mapping (keys
-    ``"proven"`` / ``"total"``); ``None`` on legacy versions that predate the
-    aggregate, in which case both counts default to 0.
-
     Returns a dict with keys ``merged_count``, ``proven``,
     ``total_merged_for_acceptance``, ``qualification_confidence``,
-    ``qualification_threshold`` and ``headline``.
+    ``qualification_threshold`` and ``headline``. The retired acceptance metrics
+    are kept as zero-valued compatibility fields for existing clients.
+
+    Canonical criterion coverage now drives version acceptance qualification;
+    the retired acceptance aggregate no longer contributes to highlights.
     """
-    acceptance = acceptance_aggregate or {}
-    proven = acceptance.get("proven", 0)
-    total_merged = acceptance.get("total", 0)
     qual = version.last_qualification or {}
     confidence = qual.get("confidence")
     threshold = qual.get("threshold")
@@ -1166,16 +1172,14 @@ def build_version_highlights(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving_status,
-        proven=proven,
-        total_merged=total_merged,
         confidence=confidence,
         threshold=threshold,
     )
 
     return {
         "merged_count": merged_count,
-        "proven": proven,
-        "total_merged_for_acceptance": total_merged,
+        "proven": 0,
+        "total_merged_for_acceptance": 0,
         "qualification_confidence": confidence,
         "qualification_threshold": threshold,
         "headline": headline,
@@ -1270,58 +1274,6 @@ def set_version_goal(
         old_goal or "(none)",
         new_goal or "(none)",
         editor_id or "unknown",
-    )
-
-
-_VALID_THEMES = frozenset(
-    {"leanness", "reliability", "performance", "feature", "mixed", "none"}
-)
-_THEME_MAX = 32
-
-
-def set_version_theme(
-    version: ReleaseVersion,
-    theme: str | None,
-    *,
-    editor_id: str | None = None,
-    source: str = "operator",
-) -> None:
-    """Update the delivery theme on an open ``ReleaseVersion`` row.
-
-    Unlike the goal, the theme is a bounded enum
-    (leanness | reliability | performance | feature | mixed | none).
-    Raises ``ValueError`` for unrecognised values.
-
-    No-ops silently when the theme is already set to the requested value.
-    Caller is responsible for ``session.add(version)`` and committing.
-    """
-    new_theme = theme[:_THEME_MAX] if theme else None
-    if new_theme is not None and new_theme not in _VALID_THEMES:
-        raise ValueError(
-            f"Invalid theme '{new_theme}'; must be one of: "
-            + ", ".join(sorted(_VALID_THEMES))
-        )
-    if version.theme == new_theme:
-        logger.debug(
-            "[RELEASE_VERSION] set_version_theme: version v%d project=%s "
-            "already set to same theme — no-op",
-            version.version_number,
-            version.project_id,
-        )
-        return
-    old_theme = version.theme
-    version.theme = new_theme
-    if editor_id:
-        version.theme_editor_info = f"[{source}:{editor_id}]"
-    logger.info(
-        "[RELEASE_VERSION] theme update for version v%d project=%s "
-        "(old: %s) (new: %s) editor=%s source=%s",
-        version.version_number,
-        version.project_id,
-        old_theme or "(none)",
-        new_theme or "(none)",
-        editor_id or "unknown",
-        source,
     )
 
 

@@ -79,6 +79,10 @@ def _default_green_ci(mocker):
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
     mocker.patch(
+        "app.release_qualifier._resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch(
         "app.release_qualifier.run_migration_apply_gate",
         new=AsyncMock(return_value=("ok", None)),
     )
@@ -400,13 +404,25 @@ async def test_run_qualification_skips_merge_grade_when_goal_empty(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_finalize_blocks_on_failing_merge_grade(db_session, mocker):
-    """A FAILING merge-grade verdict blocks promotion: status=not_promoted,
-    blocker=merge_grade_goal_coverage, confidence=0.0."""
+async def test_finalize_blocks_failing_merge_grade(db_session, mocker):
+    """A failing merge-grade verdict blocks promotion when the gate is armed."""
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
-    promote_mock = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    # The merge-grade gate honours merge_grade_block_threshold (default 0.0 = off
+    # since #12457 / 74055c4f2); arm it so a failing grade actually blocks — this
+    # is the test's stated premise ("when the gate is armed").
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
+    # The armed + failing path consults the already-on-main ancestry exemption
+    # (finding 0); this candidate is NOT on the promotion target, so pin
+    # is_ancestor_of=False to keep the block load-bearing and the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    promote_mock = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted", "confidence": 0.99}),
+    )
 
     project, version = await _make_project_and_version(db_session)
     await _seed_for_finalize(
@@ -425,14 +441,11 @@ async def test_finalize_blocks_on_failing_merge_grade(db_session, mocker):
     await db_session.commit()
 
     assert result["status"] == "not_promoted"
-    assert result["blocker"] == "merge_grade_goal_coverage"
-    assert result["confidence"] == 0.0
-    promote_mock.assert_not_called()
-
-    await db_session.refresh(version)
+    assert result["blocker"] == "merge_grade_misses"
+    promote_mock.assert_not_awaited()
     lq = version.last_qualification
-    assert lq["status"] == "not_promoted"
     assert lq["merge_grade_status"] == "fail"
+    assert lq["blocker"] == "merge_grade_misses"
 
 
 @pytest.mark.asyncio

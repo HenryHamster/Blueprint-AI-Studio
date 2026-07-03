@@ -39,7 +39,7 @@ from __future__ import annotations
 import contextlib
 import json
 import uuid
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from sqlalchemy import func as sa_func
@@ -55,8 +55,10 @@ from app.models import (
     Project,
     ProjectMessage,
     QualificationVerdict,
+    CriterionEvidence,
     Task,
     TaskStatus,
+    VersionAcceptanceCriterion,
 )
 
 # Fixed test policy for the compute_composite scoring-math tests.  Weights
@@ -317,33 +319,44 @@ class TestComputeCompositeCiState:
 
 
 class TestComputeCompositeCiRequired:
-    """ci_required gates whether an UNRESOLVED candidate CI hard-blocks.
+    """ci_required gates only definitive absent candidate CI.
 
-    A project that relaxed per-PR CI on its integration branch
-    (``requires_ci_checks=False`` — e.g. ``automain`` pushes carry zero
-    check-runs) has no candidate-level CI signal to resolve, so an unresolved
-    state must NOT wedge promotion; the promotion PR -> ``main`` carries the
-    real, still-strict CI gate. A confirmed red still blocks regardless.
+    A topology-safe integration-branch candidate with a definitive
+    ``no_checks`` state may fall through to the score. Pending/API-error CI
+    stays unresolved, and confirmed red still blocks regardless.
     """
 
-    def test_unresolved_not_blocking_when_ci_not_required(self):
-        """ci_required=False + pending → NO ci_unresolved block; promotes on score."""
-        for state in ("pending", "no_checks"):
-            result = rq.compute_composite(
-                ci_green=False,
-                audit_score=1.0,
-                test_erosion=1.0,
-                smoketest_score=1.0,
-                policy=_POLICY,
-                ci_state=state,
-                ci_required=False,
-            )
-            assert result["blocker"] is None, (
-                f"unexpected blocker for ci_state={state!r} ci_required=False"
-            )
-            # Sub-scores are perfect → confidence clears the 0.75 threshold.
-            assert result["promote"] is True
-            assert result["confidence"] >= _POLICY["threshold"]
+    def test_no_checks_not_blocking_when_ci_not_required(self):
+        """ci_required=False + no_checks → promotes on score."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state="no_checks",
+            ci_required=False,
+        )
+        assert result["blocker"] is None
+        # Sub-scores are perfect → confidence clears the 0.75 threshold.
+        assert result["promote"] is True
+        assert result["confidence"] >= _POLICY["threshold"]
+
+    @pytest.mark.parametrize("ci_state", ["pending", "api_error"])
+    def test_unresolved_still_blocks_when_ci_not_required(self, ci_state):
+        """ci_required=False must not mask pending/API-error CI."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            ci_state=ci_state,
+            ci_required=False,
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "ci_unresolved"
 
     def test_red_still_blocks_even_when_ci_not_required(self):
         """A confirmed red build is ALWAYS a blocker, even with ci_required=False."""
@@ -381,7 +394,7 @@ class TestComputeCompositeCiRequired:
             test_erosion=None,
             smoketest_score=1.0,
             policy=_POLICY,
-            ci_state="pending",
+            ci_state="no_checks",
             ci_required=False,
         )
         assert result["promote"] is False
@@ -636,6 +649,162 @@ def _point_policy_at(mocker, tmp_path, content: str | None):
     # else: leave the file absent so read_text raises FileNotFoundError.
     mocker.patch.object(rq, "_POLICY_PATH", target)
     return target
+
+
+class TestPolicyFromBuildConfig:
+    """Per-project promotion rubric via ``Project.build_config`` (Fix 5): a repo
+    that legitimately promotes at a different bar rides the existing build_config
+    seam — no new setting, no migration — and cannot set a gate-disabling bar."""
+
+    @staticmethod
+    def _proj(build_config):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(id="proj-1", build_config=build_config)
+
+    def test_build_config_override_wins(self):
+        proj = self._proj(
+            {
+                "promotion_threshold": 0.75,
+                "promotion_weights": {
+                    "audit": 0.5,
+                    "test_erosion": 0.3,
+                    "smoketest": 0.2,
+                },
+            }
+        )
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.75)
+        assert policy["weights"]["audit"] == pytest.approx(0.5)
+        # _load_policy threads the project through too.
+        assert rq._load_policy(proj)["threshold"] == pytest.approx(0.75)
+
+    def test_threshold_clamped_to_floor(self):
+        # A project cannot set a near-zero bar. With default weights (audit 0.4)
+        # the threshold clamps up to the audit-veto floor (1 - audit_weight +
+        # margin), which sits above the plain 0.5 safety floor.
+        proj = self._proj({"promotion_threshold": 0.2})
+        policy = rq._load_policy(proj)
+        expected = max(
+            rq._SAFE_PROMOTION_THRESHOLD_FLOOR,
+            1.0 - rq._DEFAULT_POLICY["weights"]["audit"] + rq._AUDIT_VETO_MARGIN,
+        )
+        assert policy["threshold"] == pytest.approx(expected)
+        assert policy["threshold"] >= rq._SAFE_PROMOTION_THRESHOLD_FLOOR
+
+    def test_audit_can_always_veto(self):
+        # Finding B: the audit-weight floor and threshold floor are independent,
+        # so at their joint minimum a zero-audit candidate could promote. The
+        # threshold clamp must guarantee that a present-but-terrible (0.0) audit
+        # always fails: a 0-audit candidate scores at most (1 - audit_weight), so
+        # the clamped threshold must strictly exceed that for any rubric.
+        for weights in (
+            {"audit": 0.2, "test_erosion": 0.4, "smoketest": 0.4},
+            {"audit": 0.5, "test_erosion": 0.25, "smoketest": 0.25},
+        ):
+            proj = self._proj(
+                {"promotion_threshold": 0.5, "promotion_weights": weights}
+            )
+            policy = rq._load_policy(proj)
+            assert policy["threshold"] > 1.0 - weights["audit"]
+
+    def test_threshold_only_uses_default_weights(self):
+        proj = self._proj({"promotion_threshold": 0.85})
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.85)
+        assert policy["weights"] == rq._DEFAULT_POLICY["weights"]
+
+    def test_invalid_weights_fall_through(self):
+        # Weights that don't sum to ~1.0 would break the gate math — ignored.
+        proj = self._proj(
+            {"promotion_weights": {"audit": 0.9, "test_erosion": 0.9, "smoketest": 0.9}}
+        )
+        assert rq._policy_from_build_config(proj) is None
+
+    def test_no_override_falls_through(self):
+        assert rq._policy_from_build_config(self._proj({})) is None
+        assert rq._policy_from_build_config(self._proj(None)) is None
+        assert rq._policy_from_build_config(None) is None
+
+    def test_audit_weight_floor_rejects(self):
+        # A rubric that zeroes/near-zeroes the audit dimension is rejected —
+        # compute_composite only hard-blocks a MISSING audit, so a near-zero audit
+        # weight would let a terrible-but-present audit promote.
+        proj = self._proj(
+            {
+                "promotion_weights": {
+                    "audit": 0.1,
+                    "test_erosion": 0.45,
+                    "smoketest": 0.45,
+                }
+            }
+        )
+        assert rq._policy_from_build_config(proj) is None
+
+    def test_build_config_schema_persists_promotion_keys(self):
+        # The review's HIGH finding: the keys must be DECLARED fields on the
+        # BuildConfig schema, or model_dump (run on every save/PATCH/re-detect)
+        # silently strips them and the override never persists.
+        from app.schemas import BuildConfig
+
+        dumped = BuildConfig(
+            promotion_threshold=0.75,
+            promotion_weights={"audit": 0.5, "test_erosion": 0.3, "smoketest": 0.2},
+            smoketest_enabled=True,
+        ).model_dump(exclude_none=True)
+        assert dumped["promotion_threshold"] == 0.75
+        assert dumped["promotion_weights"] == {
+            "audit": 0.5,
+            "test_erosion": 0.3,
+            "smoketest": 0.2,
+        }
+        assert dumped["smoketest_enabled"] is True
+
+    def test_redetect_preserves_promotion_keys(self):
+        # A fresh re-detect can't recover these operator-owned keys, so
+        # apply_operator_build_config_overrides must carry them forward or an
+        # unrelated re-detect silently reverts the project to the fleet rubric.
+        from app.build_config_detection import apply_operator_build_config_overrides
+
+        existing = {
+            "promotion_threshold": 0.7,
+            "promotion_weights": {"audit": 0.5, "test_erosion": 0.3, "smoketest": 0.2},
+            "smoketest_enabled": True,
+        }
+        merged = apply_operator_build_config_overrides({}, existing)
+        assert merged["promotion_threshold"] == 0.7
+        assert merged["promotion_weights"] == {
+            "audit": 0.5,
+            "test_erosion": 0.3,
+            "smoketest": 0.2,
+        }
+        assert merged["smoketest_enabled"] is True
+
+    def test_override_preserves_merge_grade_block_threshold(self, mocker):
+        # A per-project threshold override must NOT drop fleet-only keys like
+        # merge_grade_block_threshold (which arms the goal-coverage blocker) —
+        # the override overlays the fleet policy, it does not replace it.
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": {
+                    "audit": 0.4,
+                    "test_erosion": 0.3,
+                    "smoketest": 0.3,
+                },
+                "merge_grade_block_threshold": 0.5,
+            },
+            clear=False,
+        )
+        proj = self._proj({"promotion_threshold": 0.75})
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.75)
+        # Inherited from the fleet policy, not dropped by the override.
+        assert policy.get("merge_grade_block_threshold") == pytest.approx(0.5)
 
 
 class TestLoadPolicy:
@@ -921,38 +1090,6 @@ class TestLoadPolicyProvenance:
             "test_erosion": 0.30,
             "smoketest": 0.30,
         }
-
-    def test_runtime_config_includes_theme_thresholds_when_seeded(self, mocker):
-        """theme_warn/block thresholds seeded in runtime_config pass through _policy_from_runtime_config.
-
-        This guards against the regression where _policy_from_runtime_config returns
-        early (runtime_config has promotion_threshold/weights) without including
-        theme thresholds, making the operator arming knob inert in production.
-        """
-        mocker.patch.dict(
-            rq._runtime_config,
-            {
-                "promotion_threshold": 0.90,
-                "promotion_weights": {
-                    "audit": 0.40,
-                    "test_erosion": 0.30,
-                    "smoketest": 0.30,
-                },
-                "theme_warn_threshold": 0.70,
-                "theme_block_threshold": 0.5,
-            },
-            clear=False,
-        )
-
-        policy = rq._policy_from_runtime_config()
-        assert policy is not None
-        assert policy.get("theme_warn_threshold") == pytest.approx(0.70), (
-            "theme_warn_threshold must pass through _policy_from_runtime_config; "
-            "without this the operator arming knob is inert in production"
-        )
-        assert policy.get("theme_block_threshold") == pytest.approx(0.5), (
-            "theme_block_threshold must pass through _policy_from_runtime_config"
-        )
 
 
 # ===========================================================================
@@ -5107,8 +5244,20 @@ async def test_resolve_candidate_ci_no_checks_resolves_via_pr_head(mocker):
 
 
 @pytest.mark.asyncio
-async def test_resolve_candidate_ci_no_checks_no_prs_returns_pending(mocker):
-    """Candidate has no check-runs and no associated PRs → pending (not-green)."""
+async def test_resolve_candidate_ci_no_checks_no_prs_returns_no_checks(mocker):
+    """Candidate has no check-runs and no associated PRs → definitive no_checks."""
+    class _MockResponse:
+        def __init__(self, status_code, json_data=None, text=""):
+            self.status_code = status_code
+            self._json_data = json_data if json_data is not None else {}
+            self.text = text
+            self.headers = {}
+            self.links = {}
+
+        def json(self):
+            return self._json_data
+
+
     mocker.patch(
         "app.github.get_check_runs_cached",
         new=AsyncMock(
@@ -5119,9 +5268,54 @@ async def test_resolve_candidate_ci_no_checks_no_prs_returns_pending(mocker):
         "app.github.list_pull_requests_for_commit",
         new=AsyncMock(return_value=[]),
     )
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=_MockResponse(200, [])),
+    )
     result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate111")
     assert result["ci_green"] is False
+    assert result["state"] == rq._CI_NO_CHECKS
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_list_error_returns_pending(mocker):
+    """A collapsed PR-list lookup failure stays pending instead of no_checks."""
+
+    class _MockResponse:
+        def __init__(self, status_code, json_data=None, text=""):
+            self.status_code = status_code
+            self._json_data = json_data if json_data is not None else {}
+            self.text = text
+            self.headers = {}
+            self.links = {}
+
+        def json(self):
+            return self._json_data
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_lookup_error":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise AssertionError("PR head check-runs should not run on PR-list failure")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github._github_request",
+        new=AsyncMock(return_value=_MockResponse(500, {"message": "boom"}, text="boom")),
+    )
+
+    result = await rq._resolve_candidate_ci(
+        "tok", "owner", "repo", "candidate_lookup_error"
+    )
+
+    assert result["ci_green"] is False
     assert result["state"] == rq._CI_PENDING
+    assert result["resolved_sha"] is None
 
 
 @pytest.mark.asyncio
@@ -5132,6 +5326,36 @@ async def test_resolve_candidate_ci_check_runs_fetch_error_returns_pending(mocke
         new=AsyncMock(side_effect=RuntimeError("transient network error")),
     )
     result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate222")
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_pr_head_fetch_error_returns_pending(mocker):
+    """Candidate no_checks is not definitive when PR-head lookup errors."""
+    pr_head_sha = "pr_head_api_error"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_api_error":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise RuntimeError("transient PR-head check-runs error")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 9,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_api_error")
     assert result["ci_green"] is False
     assert result["state"] == rq._CI_PENDING
 
@@ -5195,6 +5419,74 @@ async def test_resolve_candidate_ci_no_checks_pr_head_pending_returns_pending(mo
     result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_pend")
     assert result["ci_green"] is False
     assert result["state"] == rq._CI_PENDING
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_heads_all_absent_returns_no_checks(
+    mocker,
+):
+    """Every candidate/PR-head probe cleanly absent → definitive no_checks."""
+    pr_head_sha = "pr_head_absent01"
+
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "no_checks", "conclusion": None, "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 9,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_abs")
+
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_NO_CHECKS
+    assert result["resolved_sha"] is None
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_ci_no_checks_pr_head_fetch_error_returns_pending(
+    mocker,
+):
+    """A PR-head I/O failure is degraded/pending, not definitive absence."""
+    pr_head_sha = "pr_head_error01"
+
+    async def _check_runs_side_effect(token, owner, repo, sha, **kwargs):
+        if sha == "candidate_err":
+            return {"status": "no_checks", "conclusion": None, "details": []}
+        raise RuntimeError("check-runs degraded")
+
+    mocker.patch(
+        "app.github.get_check_runs_cached", side_effect=_check_runs_side_effect
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(
+            return_value=[
+                {
+                    "number": 12,
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": pr_head_sha},
+                }
+            ]
+        ),
+    )
+
+    result = await rq._resolve_candidate_ci("tok", "owner", "repo", "candidate_err")
+
+    assert result["ci_green"] is False
+    assert result["state"] == rq._CI_PENDING
+    assert "fetch failed" in result["detail"]
 
 
 @pytest.mark.asyncio
@@ -5449,7 +5741,14 @@ def _qualifier_ci_resolves_green(mocker):
     )
     mocker.patch(
         "app.github.list_pull_requests_for_commit",
-        new=AsyncMock(return_value=[]),
+        new=AsyncMock(
+            return_value=[
+                {
+                    "merged_at": "2026-01-01T00:00:00Z",
+                    "head": {"sha": "feedface" * 5},
+                }
+            ]
+        ),
     )
     # Default the qualify-on-synced gate to SYNCED so the overwhelming majority
     # of run_qualification tests (which assume the candidate is promotable)
@@ -5481,6 +5780,10 @@ def _qualifier_ci_resolves_green(mocker):
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value="\"\"\"test migration body\"\"\"\n"),
     )
     # Default the finalize-time scratch-DB migration-APPLY gate to CLEAN.
     # _finalize_qualification calls run_migration_apply_gate, which in production
@@ -6837,6 +7140,592 @@ async def test_run_qualification_dry_run_but_automain_moved_runs_fresh(
 
 
 @pytest.mark.asyncio
+class TestComputeAuditedSurfaceHash:
+    """The audited-surface content hash excludes mechanically-regenerated
+    artifacts (CI workflows, __fixtures__ snapshots, size-limit config, docs) so
+    a candidate that differs from a prior audited candidate ONLY in those files
+    reuses its verdict — while any real app-code OR test-logic change re-audits."""
+
+    def test_excluded_files_do_not_change_hash(self):
+        base = [
+            {"path": "backend/app/x.py", "size": 1, "sha": "a"},
+            {"path": ".github/workflows/ci.yml", "size": 1, "sha": "w1"},
+            {"path": "backend/testing/__fixtures__/snap.json", "size": 1, "sha": "f1"},
+            {"path": "docs/readme.md", "size": 1, "sha": "d1"},
+            {"path": "backend/testing/module_size_limits.json", "size": 1, "sha": "m1"},
+        ]
+        changed_excluded_only = [
+            {"path": "backend/app/x.py", "size": 1, "sha": "a"},
+            {"path": ".github/workflows/ci.yml", "size": 1, "sha": "w2"},
+            {"path": "backend/testing/__fixtures__/snap.json", "size": 1, "sha": "f2"},
+            {"path": "docs/readme.md", "size": 1, "sha": "d2"},
+            {"path": "backend/testing/module_size_limits.json", "size": 1, "sha": "m2"},
+        ]
+        assert rq.compute_audited_surface_hash(base) == rq.compute_audited_surface_hash(
+            changed_excluded_only
+        )
+
+    def test_app_code_change_changes_hash(self):
+        base = [{"path": "backend/app/x.py", "size": 1, "sha": "a"}]
+        changed = [{"path": "backend/app/x.py", "size": 1, "sha": "b"}]
+        assert rq.compute_audited_surface_hash(base) != rq.compute_audited_surface_hash(
+            changed
+        )
+
+    def test_test_logic_is_in_the_surface(self):
+        # Test files (NOT fixtures) are audited surface — a test change re-audits.
+        base = [{"path": "backend/testing/test_foo.py", "size": 1, "sha": "a"}]
+        changed = [{"path": "backend/testing/test_foo.py", "size": 1, "sha": "b"}]
+        assert rq.compute_audited_surface_hash(base) != rq.compute_audited_surface_hash(
+            changed
+        )
+
+    def test_none_or_all_excluded_returns_none(self):
+        assert rq.compute_audited_surface_hash(None) is None
+        assert rq.compute_audited_surface_hash([]) is None
+        assert (
+            rq.compute_audited_surface_hash(
+                [{"path": ".github/x.yml", "size": 1, "sha": "z"}]
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocker):
+    """Content-hash cross-SHA reuse for a non-not_promoted verdict: when automain
+    HEAD advances to a NEW commit whose audited surface is byte-identical to a
+    prior dry_run candidate (differs only in an excluded fixture),
+    run_qualification reuses that verdict instead of re-auditing. Cross-SHA reuse
+    is restricted to promoted/dry_run (whose outcome IS determined by the audited
+    surface); not_promoted is excluded (it can be blocked on external state)."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [
+            {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            {"path": "backend/app/foo.py", "size": 50, "sha": "blobfoo"},
+            {
+                "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                "size": 10,
+                "sha": "blobfixtureOLD",
+            },
+        ]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldshaaa" * 5
+    new_sha = "newshaaa" * 5  # HEAD advanced to a different commit
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": old_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": True,
+        "confidence": 0.95,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=new_sha))
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # The NEW commit's tree hashes to the SAME audited surface (only the EXCLUDED
+    # fixture blob changed), so reuse must fire despite the different SHA.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+                {"path": "backend/app/foo.py", "size": 50, "sha": "blobfoo"},
+                {
+                    "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                    "size": 11,
+                    "sha": "blobfixtureNEW",
+                },
+            ]
+        ),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "dry_run"
+    await db_session.refresh(version)
+    # No re-audit: attempts unchanged and no child tasks spawned.
+    assert version.qualification_attempts == attempts_before
+    from sqlmodel import select
+
+    tasks = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()
+    )
+    assert len(list(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_ci_blocked_not_promoted_not_reused_cross_sha(
+    db_session, mocker
+):
+    """Content-hash cross-SHA reuse must NOT fire for a not_promoted verdict.
+
+    A not_promoted can be blocked on state OUTSIDE the audited-surface hash — CI
+    (.github/), operator criterion attestation, migration-apply drift, an
+    operator-lowered merge-grade threshold — all fixable without changing the
+    hash. Reusing such a verdict cross-SHA would wedge the version not_promoted
+    even after the real fix lands (round-2 review finding A; the CI blocker here
+    is one instance). A fresh qualification must run instead — verified via a
+    CI-blocked not_promoted whose CI is now green on a same-surface new SHA."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "ciblokd0" * 5
+    new_sha = "cifixed0" * 5  # HEAD advanced after a ci.yml fix (excluded from hash)
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+        "candidate_sha": old_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": False,
+        "confidence": 0.55,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=new_sha))
+    # CI is now GREEN (the .github/ fix worked).
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # Same audited surface (only the excluded ci.yml changed).
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Must NOT reuse the stale CI-blocked verdict — a fresh qualification runs.
+    assert result["status"] != "cached_verdict"
+    assert result["status"] == "spawned"
+
+
+def _promotion_failed_record(
+    *,
+    candidate_sha: str,
+    surface_hash: str,
+    promotion_failure_count: int = 1,
+    confidence: float = 0.96,
+    threshold: float = 0.90,
+):
+    """A representative ``promotion_failed`` last_qualification record.
+
+    A promotion_failed verdict is the PASSING would-promote base_record PLUS the
+    promotion-outcome keys (status/error/promotion_failure_count) — see
+    ``_record_promotion_failure``.  Carries ``candidate_diff_hash`` so the
+    passing-audit reuse gate can compare it to the live audited surface.
+    """
+    return {
+        "status": "promotion_failed",
+        "error": "ci_red",
+        "promotion_failure_count": promotion_failure_count,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "ci_green": True},
+        "confidence": confidence,
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+        "blocker": None,
+        "threshold": threshold,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-01T00:00:00",
+        "finalized_at": "2026-07-01T00:05:00",
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
+    db_session, mocker
+):
+    """promotion_failed + UNCHANGED audited surface → RE-PROMOTE without re-audit.
+
+    A promotion_failed verdict ALWAYS means the audit PASSED and only the
+    promotion step failed.  When the harvested fix landed in an EXCLUDED path
+    (here: only the excluded fixture blob changed), the live audited surface is
+    byte-identical to the passing candidate, so run_qualification re-attempts the
+    promotion on the CURRENT candidate WITHOUT re-running the audit — it spawns NO
+    audit child and calls promote() with the composite reconstructed from the
+    passing verdict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [
+            {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            {
+                "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                "size": 10,
+                "sha": "blobfixtureOLD",
+            },
+        ]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5  # 40-char placeholder — the SHA that failed to promote
+    new_sha = "fixedsha" * 5  # automain advanced after the CI/fixture-only fix
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    # automain advanced to new_sha; its tree hashes to the SAME audited surface
+    # (only the EXCLUDED fixture blob changed).
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="postmerg" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+                {
+                    "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                    "size": 11,
+                    "sha": "blobfixtureNEW",
+                },
+            ]
+        ),
+    )
+    # promote() GitHub surface.
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 91, "html_url": "http://pr/91"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    # A reuse must NOT spawn an audit child.
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    # Isolate the promote — no post-commit strategic re-trigger / conflict recon.
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+        # The synchronous reuse-promote fires only from the safe sweep re-driver
+        # context (review finding 1); other callers defer. This test exercises the
+        # sweep path.
+        allow_synchronous_reuse_promote=True,
+    )
+    await db_session.commit()
+
+    # A promotion outcome, NOT "spawned" — the audit was reused.
+    assert result["status"] == "promoted"
+    assert result.get("reused_audit") is True
+    # The CURRENT candidate (the one carrying the fix) was promoted.
+    assert result["promoted_sha"] == "postmerg" * 5
+    # No audit child spawned; qualification_attempts NOT bumped (no fresh spawn).
+    audit_spawn.assert_not_called()
+    merge_mock.assert_awaited()
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.qualification_attempts == attempts_before
+    # A fresh open v2 was created — the promotion actually landed.
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuse_defers_without_flag(
+    db_session, mocker
+):
+    """Default (allow_synchronous_reuse_promote=False): a promotion_failed +
+    unchanged surface DEFERS the reuse-promote to the sweep re-driver instead of
+    promoting synchronously (review finding 1 — a synchronous promote inside a
+    lock-holding strategic caller could hang on staged-direction activation). It
+    must NOT re-audit (no treadmill) and NOT open a PR here."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha="oldfaild" * 5, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain="fixedsha" * 5)
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}
+            ]
+        ),
+    )
+    create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    # No allow_synchronous_reuse_promote → defer to the sweep.
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promotion_failed_reuse_deferred"
+    create_mock.assert_not_called()  # no synchronous promote / PR opened here
+    audit_spawn.assert_not_called()  # and NOT a re-audit either (no treadmill)
+    await db_session.refresh(version)
+    # Version untouched — still promotion_failed, awaiting the sweep's re-drive.
+    assert version.last_qualification["status"] == "promotion_failed"
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_changed_surface_reaudits(
+    db_session, mocker
+):
+    """promotion_failed + CHANGED audited surface → normal re-audit (NO reuse).
+
+    When the fix touched APP CODE (an in-surface blob differs), the audit no
+    longer holds — reusing it would ship un-audited code.  run_qualification must
+    fall through to a fresh qualification (spawns an audit), NOT re-promote."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmainOLD"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5
+    new_sha = "appfixed" * 5  # automain advanced after an APP-CODE fix
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="main0000" * 5),
+    )
+    # The app-code blob changed → the audited surface hash DIFFERS.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmainNEW"},
+            ]
+        ),
+    )
+    # Spy on the reuse chokepoint — it must NOT be reached for a changed surface.
+    reuse_spy = mocker.patch(
+        "app.release_qualifier._reattempt_promotion_failed_in_dedicated_session",
+        new=AsyncMock(),
+    )
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    # A fresh qualification runs — NOT a reuse, NOT a promotion.
+    assert result["status"] == "spawned"
+    assert result.get("reused_audit") is None
+    reuse_spy.assert_not_called()
+    audit_spawn.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuse_capped(db_session, mocker):
+    """promotion_failure_count at the cap → does NOT reuse (no infinite re-promote).
+
+    The circuit breaker caps autonomous promotion attempts.  With the count at
+    ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS`` the reuse gate must NOT fire even
+    on an UNCHANGED surface — it falls through to the normal path instead of
+    re-promoting a persistently-red candidate forever."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5
+    new_sha = "cappedsh" * 5
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha,
+        surface_hash=surface_hash,
+        # At the cap — the breaker must refuse another autonomous re-promote.
+        promotion_failure_count=rq._MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="main0000" * 5),
+    )
+    # SAME audited surface — so ONLY the cap prevents the reuse.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            ]
+        ),
+    )
+    reuse_spy = mocker.patch(
+        "app.release_qualifier._reattempt_promotion_failed_in_dedicated_session",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    # The cap blocks the reuse — the chokepoint is never reached, and no
+    # promotion happened.
+    reuse_spy.assert_not_called()
+    assert result.get("reused_audit") is None
+    assert result["status"] != "promoted"
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
 async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
     db_session, mocker
 ):
@@ -6894,6 +7783,63 @@ async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
         .all()
     )
     assert len(tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_ci_unresolved_bypasses_cached_verdict(
+    db_session, mocker
+):
+    """A same-SHA not_promoted/ci_unresolved verdict is transient, not cached."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
 
 
 @pytest.mark.asyncio
@@ -7155,6 +8101,933 @@ async def _seed_qualification_children(
     await db_session.commit()
     await db_session.refresh(version)
     return audit_task, smoke_task
+
+
+async def _add_version_criterion(
+    db_session,
+    project,
+    version,
+    *,
+    key: str,
+    text: str,
+    source_kind: str | None = None,
+):
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=key,
+        text=text,
+        created_by="test",
+    )
+    db_session.add(criterion)
+    await db_session.flush()
+    if source_kind is not None:
+        detail = {"verdict": "merge-test"}
+        if source_kind == "task_merge":
+            detail["proven"] = True
+        db_session.add(
+            CriterionEvidence(
+                project_id=project.id,
+                criterion_id=criterion.id,
+                source_kind=source_kind,
+                source_id=f"merge-test-{key}",
+                detail=detail,
+            )
+        )
+    await db_session.commit()
+    await db_session.refresh(criterion)
+    return criterion
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_incomplete_blocks_qualification(
+    db_session, mocker
+):
+    """Uncovered canonical criteria hard-block qualification via coverage summary."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered1",
+        text="Merge-test evidence exists",
+        source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-missing1",
+        text="Reachability evidence missing",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "criterion_coverage_incomplete"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] == "criterion_coverage_incomplete"
+    assert version.last_qualification["criterion_coverage"]["total"] == 2
+    assert version.last_qualification["criterion_coverage"]["covered"] == 1
+    assert version.last_qualification["criterion_coverage"]["uncovered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_criterion_coverage_all_covered_passes_qualification(
+    db_session, mocker
+):
+    """All criteria covered by task-merge evidence lets the normal decision pass."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered1",
+        text="First merge-test criterion",
+        source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered2",
+        text="Second merge-test criterion",
+        source_kind="task_merge",
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] is None
+    assert version.last_qualification["criterion_coverage"]["total"] == 2
+    assert version.last_qualification["criterion_coverage"]["covered"] == 2
+    assert version.last_qualification["criterion_coverage"]["uncovered"] == 0
+    promote_spy.assert_not_called()
+
+
+def _clean_finalize_pre_gates(
+    ci_state: str,
+    *,
+    ci_green: bool = False,
+    ci_required: bool = True,
+    include_ci_required: bool = True,
+    integration_branch_topology: dict | None = None,
+) -> dict:
+    ci_resolution: dict = {
+        "state": ci_state,
+        "resolved_sha": None,
+        "detail": f"test {ci_state}",
+    }
+    if integration_branch_topology is not None:
+        ci_resolution["integration_branch_topology"] = integration_branch_topology
+    pre_gates = {
+        "ci_green": ci_green,
+        "ci_resolution": ci_resolution,
+        "migration_verdict": "ok",
+        "migration_detail": None,
+        "apply_verdict": "ok",
+        "apply_detail": None,
+    }
+    if include_ci_required:
+        pre_gates["ci_required"] = ci_required
+    return pre_gates
+
+
+async def _seed_relaxed_ci_clean_qualification(db_session):
+    project, version = await _make_project_and_version(db_session)
+    project.build_config = {
+        "requires_ci_checks": False,
+        "has_ci": True,
+        "ci_required_branches": ["main"],
+    }
+    db_session.add(project)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    return project, version
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_self_clears_when_pre_gates_omit_ci_required(
+    db_session, mocker
+):
+    """Pre-gates without ci_required → _ci_required_for_finalize reads topology."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            include_ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": True,
+                "detail": "candidate is reachable from integration branch",
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert result.get("blocker") is None
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] is None
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_stays_blocked_when_not_ancestor(
+    db_session, mocker
+):
+    """A definitive no_checks candidate outside the relaxed branch stays blocked."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            include_ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": False,
+                "detail": "candidate is not reachable from integration branch",
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] == "ci_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_stays_blocked_when_branch_rejected(
+    db_session, mocker
+):
+    """A topology-safe candidate still blocks when the branch policy rejects it."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+
+    proceed_spy = mocker.patch(
+        "app.release_qualifier.proceed_on_no_checks", return_value=False
+    )
+    mocker.patch(
+        "app.release_qualifier._candidate_already_on_main",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            include_ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": True,
+                "detail": "candidate is reachable from integration branch",
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert result["confidence"] == 0.0
+    promote_spy.assert_not_called()
+    proceed_spy.assert_called_once()
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] == "ci_unresolved"
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_self_clears_when_head_advances(
+    db_session, mocker
+):
+    """A candidate still reachable from a newer integration head can still relax no_checks."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    candidate_sha = version.last_qualification["candidate_sha"]
+    current_integration_head_sha = "f" * 40
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(
+            rq._CI_NO_CHECKS,
+            ci_required=False,
+            include_ci_required=False,
+            integration_branch_topology={
+                "integration_branch": "automain",
+                "promotion_target": "main",
+                "candidate_reachable_from_integration": True,
+                "detail": "candidate is reachable from integration branch",
+            },
+        ),
+    )
+    await db_session.commit()
+
+    assert candidate_sha != current_integration_head_sha
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert result.get("blocker") is None
+    promote_spy.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["blocker"] is None
+
+
+@pytest.mark.parametrize(
+    ("ci_state", "blocker"),
+    [(rq._CI_PENDING, "ci_unresolved"), (rq._CI_RED, "ci_not_green")],
+)
+@pytest.mark.asyncio
+async def test_finalize_non_absent_candidate_ci_blocks_under_relaxed_no_checks_policy(
+    db_session, mocker, ci_state, blocker
+):
+    """Pending/API-error and confirmed-red candidate CI remain strict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_clean_finalize_pre_gates(ci_state),
+    )
+    await db_session.commit()
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == blocker
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_precomputes_relaxed_no_checks_topology_before_finalize(
+    db_session, mocker
+):
+    """The row-lock owner must precompute ci_required from topology pre-lock."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    fq_entered = [False]
+
+    # _resolve_ci_at_finalize returns topology already annotated (as the real
+    # implementation does via _annotate_absent_ci_integration_topology).
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                False,
+                {
+                    "state": rq._CI_NO_CHECKS,
+                    "resolved_sha": None,
+                    "detail": "forced no_checks for test",
+                    "integration_branch_topology": {
+                        "integration_branch": "automain",
+                        "promotion_target": "main",
+                        "candidate_reachable_from_integration": True,
+                        "detail": "candidate is reachable from integration branch",
+                    },
+                },
+            )
+        ),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        assert _pre_gates is not None
+        # ci_required must be computed from topology pre-lock, not deferred.
+        assert _pre_gates["ci_required"] is False
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch("app.release_qualifier._finalize_qualification", side_effect=tracking_fq)
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "dry_run"
+    assert result["would_promote"] is True
+    assert fq_entered[0], "tracking_fq was never entered"
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_locked_version_keeps_relaxed_no_checks_strict_when_topology_unavailable(
+    db_session, mocker
+):
+    """Absent topology in ci_resolution keeps no_checks strict and blocks finalize."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    _project, version = await _seed_relaxed_ci_clean_qualification(db_session)
+    fq_entered = [False]
+
+    # No integration_branch_topology in the ci_resolution → _ci_required_for_finalize
+    # stays strict without calling is_ancestor_of.
+    mocker.patch.object(
+        rq,
+        "_resolve_ci_at_finalize",
+        new=AsyncMock(
+            return_value=(
+                False,
+                {
+                    "state": rq._CI_NO_CHECKS,
+                    "resolved_sha": None,
+                    "detail": "forced no_checks for test",
+                },
+            )
+        ),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_identity_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+    mocker.patch.object(
+        rq,
+        "_resolve_migration_apply_at_finalize",
+        new=AsyncMock(return_value=("ok", None)),
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=AssertionError("branch head lookup should not run")),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    orig_fq = rq._finalize_qualification
+
+    async def tracking_fq(session, version, *, _pre_gates=None):
+        fq_entered[0] = True
+        assert _pre_gates is not None
+        # No topology → ci_required must remain strict (True).
+        assert _pre_gates["ci_required"] is True
+        return await orig_fq(session, version, _pre_gates=_pre_gates)
+
+    mocker.patch("app.release_qualifier._finalize_qualification", side_effect=tracking_fq)
+
+    factory = _shared_session_factory(db_session)
+    result = await rq._finalize_in_dedicated_session(
+        version.id, timeout_now=None, session_factory=factory
+    )
+    await db_session.commit()
+
+    assert result is not None
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    assert fq_entered[0], "tracking_fq was never entered"
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_no_criteria_no_criterion_blocker(db_session, mocker):
+    """Versions with no criteria skip the criterion coverage gate."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    assert version.last_qualification["blocker"] is None
+    assert version.last_qualification["criterion_coverage"] == {
+        "total": 0,
+        "covered": 0,
+        "partial": 0,
+        "uncovered": 0,
+        "stuck_count": 0,
+        "criteria": [],
+    }
+    promote_spy.assert_not_called()
+
+
+async def _seed_green_finalize_candidate(db_session, project, version):
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 1.0,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "startup", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="merge-test-ci-self-clear",
+        text="Release candidate has merge-test evidence.",
+        source_kind="task_merge",
+    )
+    await db_session.refresh(version)
+
+
+def _patch_finalize_ci_test_incidental_gates(mocker):
+    """Keep non-CI finalize gates clean so tests reach the CI composite."""
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=AsyncMock(return_value=[]),
+    )
+    # When list_pull_requests_for_commit returns [], the code makes a raw
+    # _github_request to verify the result is not a transient API failure.
+    # Return 200+[] so _resolve_candidate_ci reaches _CI_NO_CHECKS rather
+    # than degrading to _CI_PENDING on the fake "gh-token" 401.
+    _mock_pr_resp = MagicMock()
+    _mock_pr_resp.status_code = 200
+    _mock_pr_resp.json.return_value = []
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=_mock_pr_resp))
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_integration_branch_candidate_ci_self_clears_ci_unresolved(
+    db_session,
+    mocker,
+):
+    """Definitive no_checks on a reachable integration candidate is non-blocking."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    _patch_finalize_ci_test_incidental_gates(mocker)
+    project, version = await _make_project_and_version(db_session)
+    project.build_config = {
+        "requires_ci_checks": False,
+        "has_ci": True,
+        "ci_required_branches": ["main"],
+    }
+    db_session.add(project)
+    await _seed_green_finalize_candidate(db_session, project, version)
+    candidate_sha = version.last_qualification["candidate_sha"]
+
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "no_checks", "conclusion": None, "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+    # Mock the raw PR-verification request that runs when list_pull_requests_for_commit
+    # returns [] — ensures _resolve_candidate_ci reaches _CI_NO_CHECKS, not _CI_PENDING.
+    _mock_pr_resp = MagicMock()
+    _mock_pr_resp.status_code = 200
+    _mock_pr_resp.json.return_value = []
+    mocker.patch("app.github._github_request", new=AsyncMock(return_value=_mock_pr_resp))
+
+    async def _is_ancestor(token, owner, repo, ancestor, descendant, **kwargs):
+        if descendant == "automain":
+            return True
+        return False  # main idempotency check should not be reached in dry_run path
+
+    ancestry = mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(side_effect=_is_ancestor),
+    )
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run", result
+    ancestry.assert_awaited_once_with(
+        "gh-token",
+        "acme",
+        "widget",
+        candidate_sha,
+        "automain",
+        project_id=str(project.id),
+    )
+    promote_spy.assert_not_called()
+
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "dry_run"
+    assert version.last_qualification["blocker"] is None
+    assert version.last_qualification["ci_green"] is False
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["ci_resolution"][
+        "integration_branch_topology"
+    ] == {
+        "integration_branch": "automain",
+        "promotion_target": "main",
+        "candidate_reachable_from_integration": True,
+        "detail": "candidate is reachable from integration branch",
+    }
+    verdict = (
+        (
+            await db_session.execute(
+                select(QualificationVerdict).where(
+                    QualificationVerdict.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert verdict.blocker is None
+    assert verdict.would_promote is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("check_result", "ancestry_result", "expected_state", "expected_blocker"),
+    [
+        (
+            {"status": "completed", "conclusion": "failure", "details": []},
+            True,
+            rq._CI_RED,
+            "ci_not_green",
+        ),
+        (
+            {"status": "in_progress", "conclusion": None, "details": []},
+            True,
+            rq._CI_PENDING,
+            "ci_unresolved",
+        ),
+        (
+            {"status": "no_checks", "conclusion": None, "details": []},
+            False,
+            rq._CI_NO_CHECKS,
+            "ci_unresolved",
+        ),
+        (
+            {"status": "no_checks", "conclusion": None, "details": []},
+            None,
+            rq._CI_NO_CHECKS,
+            "ci_unresolved",
+        ),
+    ],
+)
+async def test_finalize_integration_candidate_ci_strict_cases(
+    db_session,
+    mocker,
+    check_result,
+    ancestry_result,
+    expected_state,
+    expected_blocker,
+):
+    """Red, pending, non-ancestor, and indeterminate topology remain strict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    _patch_finalize_ci_test_incidental_gates(mocker)
+    project, version = await _make_project_and_version(db_session)
+    project.build_config = {"requires_ci_checks": False}
+    db_session.add(project)
+    await _seed_green_finalize_candidate(db_session, project, version)
+
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value=check_result),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+
+    async def _is_ancestor(token, owner, repo, ancestor, descendant, **kwargs):
+        if descendant == "automain":
+            return ancestry_result
+        return False
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
+    promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == expected_blocker
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == expected_state
+    promote_spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_candidate_ci_stays_strict_when_topology_raises(
+    db_session,
+    mocker,
+):
+    """Topology exceptions are recorded as unavailable and keep ci_unresolved."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    _patch_finalize_ci_test_incidental_gates(mocker)
+    project, version = await _make_project_and_version(db_session)
+    project.build_config = {"requires_ci_checks": False}
+    db_session.add(project)
+    await _seed_green_finalize_candidate(db_session, project, version)
+
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "no_checks", "conclusion": None, "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+
+    async def _is_ancestor(token, owner, repo, ancestor, descendant, **kwargs):
+        if descendant == "automain":
+            raise RuntimeError("compare unavailable")
+        return False
+
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(side_effect=_is_ancestor))
+
+    result = await rq._finalize_qualification(db_session, version)
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    topology = version.last_qualification["ci_resolution"][
+        "integration_branch_topology"
+    ]
+    assert topology["candidate_reachable_from_integration"] is None
+    assert "compare unavailable" in topology["detail"]
+
+
+@pytest.mark.asyncio
+async def test_finalize_absent_candidate_ci_stays_strict_for_single_branch_project(
+    db_session,
+    mocker,
+):
+    """no_checks does not self-clear when integration branch is promotion target."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+    _patch_finalize_ci_test_incidental_gates(mocker)
+    project, version = await _make_project_and_version(db_session)
+    project.integration_branch = "main"
+    project.promotion_target = "main"
+    project.build_config = {"requires_ci_checks": False}
+    db_session.add(project)
+    await _seed_green_finalize_candidate(db_session, project, version)
+
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={"status": "no_checks", "conclusion": None, "details": []}
+        ),
+    )
+    mocker.patch(
+        "app.github.list_pull_requests_for_commit",
+        new=AsyncMock(return_value=[]),
+    )
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=False),
+    )
+
+    result = await rq._finalize_qualification(db_session, version)
+
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "ci_unresolved"
+    await db_session.refresh(version)
+    assert version.last_qualification["ci_resolution"]["state"] == rq._CI_NO_CHECKS
+    assert version.last_qualification["ci_resolution"][
+        "integration_branch_topology"
+    ] == {
+        "integration_branch": "main",
+        "promotion_target": "main",
+        "candidate_reachable_from_integration": None,
+        "detail": "integration branch equals promotion target",
+    }
 
 
 async def _seed_completed_challenge_without_artifact(db_session, project, version):
@@ -8814,21 +10687,19 @@ async def test_finalize_blocks_on_migration_apply_drift(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mocker):
-    """The blind merge-grade gate (dir d-c0fe439f) blocks stabilize->qualify
-    promotion unless the merged diffs cover the version goal.
+    """The blind merge-grade artifact blocks only when its gate is armed.
 
-    Three scenarios prove the gate is load-bearing AND unskippable — an
-    otherwise-clean candidate (audit 1.0 / smoke green / no migration drift)
-    that would promote is decided ONLY by the merge-grade verdict:
-      (a) a FAILING merge-grade -> not_promoted, blocker merge_grade_goal_coverage,
-          version stays stabilize/open (the hard block).
+    Four scenarios prove the artifact is still unskippable, while the
+    merge-grade miss gate remains default-off:
+      (a) a FAILING merge-grade -> promote proceeds while the gate is unarmed.
       (b) the required merge-grade artifact MISSING -> held (infra_failure),
           NOT promoted (the gate cannot be skipped).
       (c) a PASSING merge-grade with everything else green -> promote proceeds.
+      (d) a FAILING merge-grade -> not_promoted when the gate is armed.
     """
     from app import shared_state
 
-    shared_state.runtime_config["promotion_enabled"] = True
+    mocker.patch.dict(shared_state.runtime_config, {"promotion_enabled": True})
 
     clean_audit = {
         "audit_score": 1.0,
@@ -8845,7 +10716,9 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     }
     goal = "Deliver the blind merge-grade qualification gate on stabilize->qualify"
 
-    # --- (a) FAILING merge-grade -> hard block, cannot promote --------------
+    # --- (a) FAILING merge-grade, unarmed threshold (default 0.0) -> promote proceeds
+    # merge_grade_block_threshold is not set here (defaults to 0.0), so the gate
+    # is not armed and a failing merge grade does NOT block promotion.
     project_a, version_a = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -8862,41 +10735,15 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
             "candidate_sha": "feed" * 10,
         },
     )
-    promote_a = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    promote_a = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
     result_a = await rq._finalize_qualification(db_session, version_a)
     await db_session.commit()
 
-    assert result_a["status"] == "not_promoted"
-    assert result_a["blocker"] == "merge_grade_goal_coverage"
-    assert result_a["confidence"] == 0.0
-    promote_a.assert_not_called()
-
-    await db_session.refresh(version_a)
-    lq_a = version_a.last_qualification
-    assert lq_a["status"] == "not_promoted"
-    assert lq_a["blocker"] == "merge_grade_goal_coverage"
-    assert lq_a["confidence"] == 0.0
-    assert lq_a["merge_grade_status"] == "fail"
-    assert "never wired" in lq_a["merge_grade_biggest_gap"]
-    # The gate did NOT finalize to promotion: version stays in stabilize, open.
-    assert version_a.phase == "stabilize"
-    assert version_a.status == "open"
-    # The durable verdict row carries the merge-grade columns + blocker.
-    vrow_a = (
-        (
-            await db_session.execute(
-                select(QualificationVerdict).where(
-                    QualificationVerdict.release_version_id == version_a.id
-                )
-            )
-        )
-        .scalars()
-        .first()
-    )
-    assert vrow_a is not None
-    assert vrow_a.merge_grade_status == "fail"
-    assert vrow_a.blocker == "merge_grade_goal_coverage"
-    assert "never wired" in (vrow_a.merge_grade_biggest_gap or "")
+    promote_a.assert_called_once()
+    assert result_a == {"status": "promoted"}
 
     # --- (b) MISSING merge-grade artifact -> infra hold, cannot be skipped --
     project_b, version_b = await _make_project_and_version(db_session)
@@ -8948,6 +10795,45 @@ async def test_finalize_cannot_promote_without_merge_grade_pass(db_session, mock
     promote_c.assert_called_once()
     assert result_c == {"status": "promoted"}
 
+    # --- (d) FAILING merge-grade + armed threshold -> hard blocker ----------
+    mocker.patch.dict(
+        shared_state.runtime_config,
+        {"promotion_enabled": True, "merge_grade_block_threshold": 0.1},
+    )
+    # An armed + failing merge-grade consults the already-on-main ancestry
+    # exemption (finding 0). This candidate is NOT on the promotion target, so
+    # the block persists — pin is_ancestor_of=False to keep the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    project_d, version_d = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project_d,
+        version_d,
+        audit_logs=clean_audit,
+        smoke_logs=clean_smoke,
+        version_goal=goal,
+        seed_merge_grade=True,
+        merge_grade_logs={
+            "covers_goal": False,
+            "coverage_score": 0.1,
+            "biggest_gap": "The merged work still misses the stated goal.",
+            "candidate_sha": "feed" * 10,
+        },
+    )
+    promote_d = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
+    result_d = await rq._finalize_qualification(db_session, version_d)
+    await db_session.commit()
+
+    promote_d.assert_not_called()
+    assert result_d["status"] == "not_promoted"
+    assert result_d["blocker"] == "merge_grade_misses"
+    await db_session.refresh(version_d)
+    assert version_d.last_qualification["blocker"] == "merge_grade_misses"
+    assert version_d.last_qualification["merge_grade_misses"] is True
+
 
 @pytest.mark.asyncio
 async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
@@ -8958,14 +10844,24 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
     is suppressed even when covers_goal=False.  A fresh version that never had
     qualification_superseded still blocks.
 
-    Scenarios:
+    Scenarios (with the merge-grade gate ARMED via merge_grade_block_threshold):
       (a) prior_superseded=True + failing merge-grade -> NOT blocked, promote proceeds
-      (b) prior_superseded absent/False + failing merge-grade -> hard block (gate
-          remains load-bearing for never-promoted versions)
+      (b) prior_superseded absent/False + failing merge-grade (candidate NOT on
+          main) -> hard block (gate remains load-bearing for never-promoted
+          versions)
     """
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    # Arm the merge-grade gate — since the gate honours merge_grade_block_threshold
+    # (default 0.0 = off), a failing grade only blocks when the threshold is raised.
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
+    # The armed + failing merge-grade path consults the already-on-main ancestry
+    # exemption (finding 0); these candidates are NOT on the promotion target, so
+    # pin is_ancestor_of=False to keep the block load-bearing and the test hermetic.
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
 
     clean_audit = {
         "audit_score": 1.0,
@@ -9022,7 +10918,7 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         f"Expected promotion for superseded version but got: {result_a}"
     )
 
-    # --- (b) prior_superseded absent -> gate still fires for a fresh version ---
+    # --- (b) prior_superseded absent -> fresh versions still block -----------
     project_b, version_b = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -9035,36 +10931,44 @@ async def test_finalize_merge_grade_suppressed_for_prior_superseded_version(
         merge_grade_logs=failing_merge_grade,
     )
     # Do NOT set prior_superseded — version_b is a never-promoted fresh version.
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    promote_b = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
+    )
     result_b = await rq._finalize_qualification(db_session, version_b)
     await db_session.commit()
 
-    assert result_b["status"] == "not_promoted"
-    assert result_b["blocker"] == "merge_grade_goal_coverage"
     promote_b.assert_not_called()
+    assert result_b["status"] == "not_promoted"
+    assert result_b["blocker"] == "merge_grade_misses"
     await db_session.refresh(version_b)
-    assert version_b.last_qualification["status"] == "not_promoted"
-    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+    assert version_b.last_qualification["blocker"] == "merge_grade_misses"
+    assert version_b.last_qualification["merge_grade_status"] == "fail"
 
 
 @pytest.mark.asyncio
-async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
+async def test_finalize_merge_grade_exempts_candidate_already_on_main(
     db_session, mocker
 ):
-    """Direct GitHub ancestry fallback: when prior_superseded is NOT set (e.g.
-    GitHub-cred outage let the 6h timeout beat the supersession reconciler),
-    the merge-grade block is still suppressed when _candidate_already_on_main
-    returns True.
+    """Finding 0: an armed + failing merge-grade must NOT wedge a candidate that
+    has already landed on the promotion target.
 
-    Scenarios:
-      (a) _candidate_already_on_main=True + prior_superseded absent -> suppressed,
-          promote proceeds
-      (b) _candidate_already_on_main=False + prior_superseded absent -> gate fires,
-          merge_grade_goal_coverage blocker set
+    An out-of-band force-promoted candidate never gets the prior_superseded flag
+    (that is only set on the version-cut path), so without an ancestry exemption
+    the restored hard merge-grade gate would keep writing not_promoted /
+    merge_grade_misses forever with no reconciler to clear it. When the candidate
+    is already reachable from main, the grade is exempted and promotion proceeds.
+
+    Control: the SAME armed + failing grade with the candidate NOT on main still
+    hard-blocks (the exemption is scoped to already-landed candidates only).
     """
     from app import shared_state
 
     shared_state.runtime_config["promotion_enabled"] = True
+    # Arm the gate so a failing merge-grade is load-bearing.
+    mocker.patch.dict(
+        shared_state.runtime_config, {"merge_grade_block_threshold": 1.0}
+    )
 
     clean_audit = {
         "audit_score": 1.0,
@@ -9082,12 +10986,13 @@ async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
     failing_merge_grade = {
         "covers_goal": False,
         "coverage_score": 0.05,
-        "biggest_gap": "Stabilization-only tail commits; feature content already on main.",
+        "biggest_gap": "Feature content already merged straight to main.",
         "candidate_sha": "feed" * 10,
     }
-    goal = "Deliver the direct on-main ancestry exemption"
+    goal = "Deliver the already-on-main merge-grade exemption"
 
-    # --- (a) _candidate_already_on_main=True -> block suppressed, promote ---
+    # --- Candidate ALREADY on main -> exempted, promote proceeds -------------
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
     project_a, version_a = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -9098,25 +11003,6 @@ async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
         version_goal=goal,
         seed_merge_grade=True,
         merge_grade_logs=failing_merge_grade,
-    )
-    # Stamp blocker='qualification_timeout' WITHOUT prior_superseded (simulates
-    # cred-outage timeout race winning over the supersession reconciler).
-    version_a.last_qualification = {
-        **version_a.last_qualification,
-        "blocker": "qualification_timeout",
-        # prior_superseded intentionally absent
-    }
-    db_session.add(version_a)
-    await db_session.commit()
-    await db_session.refresh(version_a)
-
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=True),
     )
     promote_a = mocker.patch(
         "app.release_qualifier.promote",
@@ -9125,12 +11011,16 @@ async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
     result_a = await rq._finalize_qualification(db_session, version_a)
     await db_session.commit()
 
+    # promote() is only reached because the failing grade was exempted; the
+    # base_record it receives records the exemption (provenance), not a pass.
     promote_a.assert_called_once()
-    assert result_a == {"status": "promoted"}, (
-        f"Expected promotion via direct on-main check but got: {result_a}"
-    )
+    assert result_a == {"status": "promoted"}
+    _base_record_a = promote_a.call_args.kwargs["base_record"]
+    assert _base_record_a["merge_grade_status"] == "already_on_main_exempt"
+    assert _base_record_a["merge_grade_misses"] is False
 
-    # --- (b) _candidate_already_on_main=False -> gate still fires ---
+    # --- Control: candidate NOT on main -> the armed failing grade blocks ----
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
     project_b, version_b = await _make_project_and_version(db_session)
     await _seed_qualification_children(
         db_session,
@@ -9142,223 +11032,102 @@ async def test_finalize_merge_grade_suppressed_via_direct_on_main_check(
         seed_merge_grade=True,
         merge_grade_logs=failing_merge_grade,
     )
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    promote_b = mocker.patch(
+        "app.release_qualifier.promote",
+        new=AsyncMock(return_value={"status": "promoted"}),
     )
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=False),
-    )
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
     result_b = await rq._finalize_qualification(db_session, version_b)
     await db_session.commit()
 
+    promote_b.assert_not_called()
     assert result_b["status"] == "not_promoted"
-    assert result_b["blocker"] == "merge_grade_goal_coverage"
-    promote_b.assert_not_called()
-    await db_session.refresh(version_b)
-    assert version_b.last_qualification["blocker"] == "merge_grade_goal_coverage"
+    assert result_b["blocker"] == "merge_grade_misses"
 
 
 @pytest.mark.asyncio
-async def test_finalize_already_on_main_resolved_pre_lock(db_session, mocker):
-    """_candidate_already_on_main is resolved BEFORE the FOR UPDATE lock.
-
-    Verifies the pre-gates refactor: the direct already-on-main ancestry check
-    (merge-grade exemption fallback) is hoisted out of _finalize_qualification
-    (which runs under the lock) into the pre-lock block in _finalize_locked_version.
-
-    Scenarios tested:
-      (a) pre_merge_grade_already_on_main=True in _pre_gates → block suppressed,
-          no second call to _candidate_already_on_main under the lock.
-      (b) pre_merge_grade_already_on_main=False in _pre_gates → gate still fires,
-          merge_grade_goal_coverage blocker set.
-      (c) Direct call with _pre_gates=None → inline fallback path still works
-          (fail-closed preserved for direct/timeout callers).
-    """
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = True
-
-    clean_audit = {
-        "audit_score": 1.0,
-        "test_erosion": {
-            "deleted_test_files": [],
-            "assertion_delta": 5,
-            "test_count_delta": 2,
-        },
-    }
-    clean_smoke = {
-        "passed": True,
-        "tests": [{"name": "a", "status": "pass"}],
-        "suites": {"startup": {"passed": True}},
-    }
-    failing_merge_grade = {
-        "covers_goal": False,
-        "coverage_score": 0.05,
-        "biggest_gap": "Feature content already on main.",
-        "candidate_sha": "feed" * 10,
-    }
-    goal = "Deliver the pre-lock ancestry refactor"
-
-    # ── (a) Pre-gates path: _candidate_already_on_main called before lock, ──
-    #        block suppressed, NOT re-called inside _finalize_qualification.
-    project_a, version_a = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_a,
-        version_a,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_a)
-
-    call_log: list[str] = []
-    fq_entered = [False]
-    orig_fq = rq._finalize_qualification
-
-    async def tracking_fq_a(session, version, *, _pre_gates=None):
-        fq_entered[0] = True
-        call_log.append("finalize_qualification")
-        return await orig_fq(session, version, _pre_gates=_pre_gates)
-
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-
-    ancestry_call_count = [0]
-
-    async def tracked_already_on_main(*args, **kwargs):
-        if fq_entered[0]:
-            raise AssertionError(
-                "_candidate_already_on_main called inside _finalize_qualification "
-                "(under the lock) — must be called pre-lock only"
-            )
-        ancestry_call_count[0] += 1
-        call_log.append("already_on_main")
-        return True
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        side_effect=tracked_already_on_main,
-    )
-    mocker.patch(
-        "app.release_qualifier._finalize_qualification",
-        side_effect=tracking_fq_a,
-    )
-    promote_a = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
-
-    factory = _shared_session_factory(db_session)
-    result_a = await rq._finalize_in_dedicated_session(
-        version_a.id, timeout_now=None, session_factory=factory
-    )
-    await db_session.commit()
-
-    assert "already_on_main" in call_log, (
-        "_candidate_already_on_main was not called pre-lock"
-    )
-    assert "finalize_qualification" in call_log, (
-        "_finalize_qualification was not called"
-    )
-    assert call_log.index("already_on_main") < call_log.index("finalize_qualification"), (
-        f"_candidate_already_on_main called AFTER _finalize_qualification: {call_log}"
-    )
-    promote_a.assert_called_once()
-    assert result_a == {"status": "promoted"}, (
-        f"Expected promotion via pre-lock ancestry check but got: {result_a}"
-    )
-
-    # ── (b) Pre-gates path: _candidate_already_on_main=False → gate fires ──
-    project_b, version_b = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_b,
-        version_b,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_b)
-
-    fq_entered[0] = False
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=False),
-    )
-    mocker.patch(
-        "app.release_qualifier._finalize_qualification",
-        side_effect=tracking_fq_a,
-    )
-    promote_b = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-    result_b = await rq._finalize_in_dedicated_session(
-        version_b.id, timeout_now=None, session_factory=factory
-    )
-    await db_session.commit()
-
-    assert result_b is not None and result_b.get("blocker") == "merge_grade_goal_coverage", (
-        f"Expected merge_grade_goal_coverage blocker when already_on_main=False, got: {result_b}"
-    )
-    promote_b.assert_not_called()
-
-    # ── (c) Direct call with _pre_gates=None → inline fallback path still works ──
-    project_c, version_c = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project_c,
-        version_c,
-        audit_logs=clean_audit,
-        smoke_logs=clean_smoke,
-        version_goal=goal,
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
-    )
-    await db_session.commit()
-    await db_session.refresh(version_c)
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        new=AsyncMock(return_value=True),
-    )
-    promote_c = mocker.patch(
-        "app.release_qualifier.promote",
-        new=AsyncMock(return_value={"status": "promoted"}),
-    )
-
-    result_c = await rq._finalize_qualification(db_session, version_c, _pre_gates=None)
-    await db_session.commit()
-
-    promote_c.assert_called_once()
-    assert result_c == {"status": "promoted"}, (
-        f"Direct call with _pre_gates=None: expected promotion via inline fallback, got: {result_c}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_finalize_rolls_back_after_pre_lock_already_on_main_failure(
+async def test_finalize_not_promoted_carries_keyless_requalification_marker(
     db_session, mocker
 ):
-    """A fail-closed pre-lock ancestry check must leave the session usable.
+    """Finding 1: the not_promoted record must carry the one-shot
+    ``keyless_requalification_consumed_at`` marker forward from the prior
+    (pending) qualification.
 
-    Production regression: the pre-lock already-on-main check swallowed an
-    exception from DB-backed GitHub credential resolution, then continued with
-    the same aborted SQLAlchemy transaction. The later FOR UPDATE/commit raised
-    PendingRollbackError and the sweep eventually force-finalized the release as
-    sweep_finalize_crash_loop. The pre-lock phase is read-only, so rollback is
-    the correct recovery before taking the finalize lock.
+    The sweep's same-SHA keyless re-drive bounds itself to exactly-once by
+    checking this marker on the not_promoted record. Because base_record REPLACES
+    last_qualification wholesale, dropping the marker would break the exactly-once
+    bound and let heavy re-qualification loop on an unchanged HEAD.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    # A clean audit but a DELETED test file classified as genuine_erosion -> a
+    # deterministic test_file_deleted hard blocker, so finalize takes the
+    # not_promoted path without any merge-grade / GitHub ancestry interaction.
+    # (_score_audit reads the deleted set from test_erosion and the per-file
+    # classification from the report-level deleted_test_file_classifications.)
+    eroding_audit = {
+        "audit_score": 1.0,
+        "test_erosion": {
+            "deleted_test_files": ["backend/testing/test_gone.py"],
+        },
+        "deleted_test_file_classifications": [
+            {
+                "path": "backend/testing/test_gone.py",
+                "classification": "genuine_erosion",
+            }
+        ],
+    }
+    clean_smoke = {
+        "passed": True,
+        "tests": [{"name": "a", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs=eroding_audit,
+        smoke_logs=clean_smoke,
+    )
+    # Stamp the one-shot keyless marker on the pending record, exactly as
+    # run_qualification carries it forward from the prior verdict.
+    marker = "2026-06-30T00:00:00+00:00"
+    version.last_qualification = {
+        **version.last_qualification,
+        "keyless_requalification_consumed_at": marker,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    promote = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    promote.assert_not_called()
+    assert result["status"] == "not_promoted"
+    assert result["blocker"] == "test_file_deleted"
+    await db_session.refresh(version)
+    # The marker survives the base_record replacement (finding 1 fix).
+    assert (
+        version.last_qualification["keyless_requalification_consumed_at"] == marker
+    )
+
+
+@pytest.mark.asyncio
+async def test_finalize_rolls_back_after_pre_lock_phase(
+    db_session, mocker
+):
+    """The pre-lock phase must rollback the session before taking the FOR UPDATE.
+
+    Regression guard: a swallowed DBAPI error inside a fail-closed pre-lock
+    helper (e.g. _resolve_ci_at_finalize catching Exception) leaves the
+    SQLAlchemy transaction aborted. Without the post-pre-lock rollback the later
+    FOR UPDATE/commit surfaces as PendingRollbackError and the sweep
+    misclassifies the qualification as a finalizer crash.
     """
     from app import shared_state
 
@@ -9376,12 +11145,6 @@ async def test_finalize_rolls_back_after_pre_lock_already_on_main_failure(
         "passed": True,
         "tests": [{"name": "a", "status": "pass"}],
         "suites": {"startup": {"passed": True}},
-    }
-    failing_merge_grade = {
-        "covers_goal": False,
-        "coverage_score": 0.05,
-        "biggest_gap": "Feature content is not on main.",
-        "candidate_sha": "feed" * 10,
     }
 
     project, version = await _make_project_and_version(db_session)
@@ -9391,25 +11154,10 @@ async def test_finalize_rolls_back_after_pre_lock_already_on_main_failure(
         version,
         audit_logs=clean_audit,
         smoke_logs=clean_smoke,
-        version_goal="Deliver rollback recovery for pre-lock ancestry checks",
-        seed_merge_grade=True,
-        merge_grade_logs=failing_merge_grade,
+        version_goal="Deliver rollback recovery for pre-lock phase",
     )
     await db_session.commit()
     await db_session.refresh(version)
-
-    mocker.patch(
-        "app.release_qualifier._resolve_github_with_session",
-        new=AsyncMock(return_value=("tok", "owner", "repo")),
-    )
-
-    async def fail_already_on_main(*args, **kwargs):
-        raise RuntimeError("simulated aborted pre-lock credential lookup")
-
-    mocker.patch(
-        "app.release_qualifier._candidate_already_on_main",
-        side_effect=fail_already_on_main,
-    )
 
     rollback_calls = 0
     original_rollback = db_session.rollback
@@ -9430,8 +11178,6 @@ async def test_finalize_rolls_back_after_pre_lock_already_on_main_failure(
 
     assert rollback_calls >= 1
     assert result is not None
-    assert result["status"] == "not_promoted"
-    assert result["blocker"] == "merge_grade_goal_coverage"
 
 
 @pytest.mark.asyncio
@@ -10720,6 +12466,185 @@ async def test_promote_success_opens_next_version(db_session, mocker):
     # promoted_sha is the re-resolved main HEAD (the merge commit), not the
     # candidate — merge_method="merge" produced a new commit.
     assert version.promoted_sha == merge_sha
+
+
+@pytest.mark.asyncio
+async def test_force_promote_current_version_skips_audit_and_promotes(
+    db_session, mocker
+):
+    """Operator FORCE-promote SKIPS the audit gate but still cuts the release
+    branch, opens the PR, and (CI mocked green) merges — NO audit/qualify children
+    are spawned. 'force' skips the AUDIT, not CI. The verdict records the forced
+    provenance."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate = "facec0de" * 5  # 40-char candidate sha
+    merge_sha = "mainnew" * 5 + "00000"
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate, main=merge_sha),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    create_mock = mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 7, "html_url": "http://pr/7"}),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="operator-1",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promoted"
+    # The AUDIT gate was skipped — no audit child spawned.
+    spawn_mock.assert_not_called()
+    # But the promotion PR was still opened release-vN → main (CI still gates it).
+    assert create_mock.call_args.kwargs["base"] == "main"
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.last_qualification.get("forced_promote") is True
+    assert version.last_qualification.get("forced_promote_by") == "operator-1"
+
+
+@pytest.mark.asyncio
+async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker):
+    """Force-promote refuses when a promotion is already in flight (an audit-passed
+    PR open, or the Fix-3 claim) — mirrors /qualify + the version-cut lever, so all
+    levers over an in-flight promotion agree. No second PR is opened."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "http://pr/42",
+            "enabled_at": "2026-07-02T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain="facec0de" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promotion_in_flight"
+    create_mock.assert_not_called()  # no second promotion PR opened
+    await db_session.refresh(version)
+    # The in-flight promotion record is untouched.
+    assert version.last_qualification["promotion_pending"]["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_promote_writes_claim_before_pr_io(db_session, mocker):
+    """promote() must persist a promotion CLAIM under the row lock BEFORE it
+    releases the lock for its GitHub I/O.
+
+    Without the claim, a concurrent ``run_qualification`` on a newer HEAD
+    acquires the freed lock during the 30-120s I/O window, sees no
+    ``promotion_pending``, sails past Guard 2b, re-cuts, and clobbers the
+    in-flight promotion's record (the PR #12492 incident). This asserts the fix
+    by observing the COMMITTED DB row at the moment ``create_pull_request`` runs:
+    the claim (``promotion_pending.claiming``) must already be durable then, so a
+    concurrent qualifier in that window would see it and refuse."""
+    _project, version = await _make_project_and_version(db_session)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(main="mainnew" * 5 + "00000"),
+    )
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+
+    captured: dict = {}
+
+    async def _capture_claim_then_open_pr(*args, **kwargs):
+        # Re-read the version row from the DB (populate_existing bypasses the
+        # identity-map cache) to observe the COMMITTED state at PR-open time —
+        # this is exactly what a concurrent qualifier's FOR UPDATE read sees.
+        obj = (
+            (
+                await db_session.execute(
+                    select(rv.ReleaseVersion)
+                    .where(rv.ReleaseVersion.id == version.id)
+                    .execution_options(populate_existing=True)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        captured["promotion_pending"] = (obj.last_qualification or {}).get(
+            "promotion_pending"
+        )
+        return {"number": 5, "html_url": "http://pr/5"}
+
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(side_effect=_capture_claim_then_open_pr),
+    )
+    mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+
+    result = await rq.promote(
+        db_session, version, "1234" * 10, composite={"confidence": 0.88}
+    )
+    await db_session.commit()
+
+    assert result["status"] == "promoted"
+    # The claim was durable in the committed DB row when the PR I/O ran, so a
+    # concurrent re-qualify in that window would have seen it and refused.
+    assert captured["promotion_pending"] is not None, (
+        "no promotion_pending was committed before create_pull_request ran — "
+        "the claim must be written under-lock before the I/O"
+    )
+    assert captured["promotion_pending"]["claiming"] is True
+    assert captured["promotion_pending"]["candidate_sha"] == "1234" * 10
 
 
 @pytest.mark.asyncio
@@ -14865,6 +16790,110 @@ async def test_sweep_leaves_not_promoted_when_head_unchanged(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_sweep_requalifies_ci_unresolved_when_ci_now_green(db_session, mocker):
+    """A quiescent ci_unresolved verdict requalifies once same-SHA CI is green."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "audit_findings": [],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_sweep_ci_unresolved_noop_when_still_pending(db_session, mocker):
+    """A same-SHA ci_unresolved verdict remains untouched while CI is pending."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "ciunres0" * 5
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "ci_unresolved",
+        "ci_green": False,
+        "ci_resolution": {"state": "pending", "ci_green": False},
+        "confidence": 0.0,
+        "audit_findings": [],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "pending",
+                "ci_green": False,
+                "resolved_sha": candidate_sha,
+                "detail": "checks pending",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["blocker"] == "ci_unresolved"
+    assert await _audit_tasks(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_auto_stale_writes_stale_rows_when_head_advanced(db_session, mocker):
     """When automain has advanced past the not_promoted candidate SHA and a
     gating finding has no ledger row, the sweep auto-stales it and the version
@@ -15426,7 +17455,9 @@ async def test_auto_stale_clears_keyless_challenger_independent_blocker(
 
 
 @pytest.mark.asyncio
-async def test_keyless_blocker_on_current_head_does_not_strand(db_session, mocker):
+async def test_keyless_blocker_on_current_head_spawns_bounded_requalification(
+    db_session, mocker
+):
     """Keyless gating finding on the CURRENT HEAD (HEAD == candidate_sha) is
     auto-staled by the sweep, unblocking re-qualification.
 
@@ -15522,21 +17553,189 @@ async def test_keyless_blocker_on_current_head_does_not_strand(db_session, mocke
     assert ledger_rows[0].finding_key == _KEYLESS_FINDING_SENTINEL
     assert ledger_rows[0].state == "stale"
 
-    # After the stale row is written, requalification_ready flips to True —
-    # this is the "does not strand" proof: an operator-triggered or next-HEAD-
-    # advance re-drive is no longer permanently blocked.
+    # After the stale row is written, requalification_ready flips to True.
     after = await compute_requalification_readiness(db_session, project.id)
     assert after["requalification_ready"], (
         "expected requalification_ready=True after auto-stale of keyless finding — "
         f"got: {after}"
     )
 
-    # count=0 is expected: HEAD == candidate_sha means run_qualification returns
-    # cached_verdict (no new spawn on same SHA).  The fix is that the ledger row
-    # was written so the NEXT sweep after HEAD advances will fire the re-drive.
-    # (Without the fix, the stale row would never be written and the ledger gate
-    # would block re-qualification permanently.)
-    _ = count  # unused — re-drive deferred to next HEAD-advance sweep
+    # The same sweep must re-drive once the keyless blocker is stale, even though
+    # HEAD == candidate_sha. This is bounded: the stale not_promoted record is
+    # overwritten with a pending qualification, so the next sweep sees an
+    # in-flight/current qualification instead of repeatedly spawning.
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == current_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_keyless_blocker_requalification_is_consumed_once(
+    db_session, mocker
+):
+    """A stale keyless blocker may re-drive once, then stops after settling.
+
+    This protects against the sweep loop where a stale sentinel survives a
+    completed requalification and would otherwise keep re-opening the same SHA
+    forever.
+    """
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        apply_finding_resolution,
+        compute_requalification_readiness,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    current_sha = "cursha1" * 5 + "00000"
+    blocker_findings = [
+        {
+            "severity": "high",
+            "summary": "Challenger confirmed independent blocker (no key)",
+        },
+    ]
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "audit_challenge_independent_blocker",
+        "candidate_sha": current_sha,
+        "audit_findings": blocker_findings,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        _KEYLESS_FINDING_SENTINEL,
+        "stale",
+        severity="high",
+        note="seeded stale blocker",
+        verified_against_sha=current_sha,
+    )
+    await db_session.commit()
+
+    before = await compute_requalification_readiness(db_session, project.id)
+    assert before["requalification_ready"], f"expected ready state, got {before}"
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "acme", "widget")),
+    )
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=current_sha))
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=type("SpawnedTask", (), {"id": uuid.uuid4()})()),
+    )
+
+    first = await rq._redrive_not_promoted_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+    assert first is True
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+    # Simulate the completed requalification settling back to not_promoted via
+    # the real finalize helper, which must preserve the consumed marker.
+    pending_qual = dict(version.last_qualification)
+    mocker.patch("app.release_qualifier._notify_operator", new=AsyncMock())
+    await rq._handle_independent_blocker(
+        db_session, version, pending_qual, blocker_findings
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+    second = await rq._redrive_not_promoted_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+    assert second is False
+    assert spawn_mock.await_count == 1
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.last_qualification["keyless_requalification_consumed_at"]
+
+
+@pytest.mark.asyncio
+async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
+    db_session, mocker
+):
+    """A consumed keyless blocker still re-drives when automain advances.
+
+    The consumed marker only suppresses the same-HEAD re-drive.  Once the
+    integration branch moves to a new SHA, run_qualification must be allowed
+    to re-snapshot and spawn a fresh qualification for the new candidate.
+    """
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        apply_finding_resolution,
+        compute_requalification_readiness,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "cursha2" * 5 + "00000"
+    pending_qual = {
+        "status": "pending",
+        "candidate_sha": old_sha,
+        "ci_green": True,
+        "smoketest_enabled": True,
+        "started_at": "2026-06-30T00:00:00+00:00",
+        "audit_task_id": str(uuid.uuid4()),
+        "audit_challenge_task_id": str(uuid.uuid4()),
+        "smoketest_task_id": None,
+        "keyless_requalification_consumed_at": "2026-06-30T00:00:00+00:00",
+    }
+    blocker_findings = [
+        {
+            "severity": "high",
+            "summary": "Challenger confirmed independent blocker (no key)",
+        },
+    ]
+
+    mocker.patch("app.release_qualifier._notify_operator", new=AsyncMock())
+    await rq._handle_independent_blocker(
+        db_session, version, pending_qual, blocker_findings
+    )
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await apply_finding_resolution(
+        db_session,
+        project.id,
+        version.id,
+        _KEYLESS_FINDING_SENTINEL,
+        "stale",
+        severity="high",
+        note="seeded stale blocker",
+        verified_against_sha=old_sha,
+    )
+    await db_session.commit()
+
+    before = await compute_requalification_readiness(db_session, project.id)
+    assert before["requalification_ready"], f"expected ready state, got {before}"
+
+    new_sha = "automn1" * 5 + "00000"
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=type("SpawnedTask", (), {"id": uuid.uuid4()})()),
+    )
+
+    result = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.refresh(version)
+
+    assert result == 1
+    assert spawn_mock.await_count == 1
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == new_sha
 
 
 @pytest.mark.asyncio
@@ -20383,7 +22582,6 @@ class TestFormatQualificationForApi:
             "promotion_pr_url": "https://example.com/pr/123",
             "promotion_conflict": True,
             "promotion_error_detail": "merge conflict",
-            "theme_delivery": {"theme_class": "leanness", "assessed_grade": 1.0},
             "goal_alignment": {
                 "state": "aligned",
                 "assessed_grade": 0.85,
@@ -20411,8 +22609,26 @@ class TestFormatQualificationForApi:
         assert out["promotion_pr_url"] == "https://example.com/pr/123"
         assert out["promotion_conflict"] is True
         assert out["promotion_error_detail"] == "merge conflict"
-        assert out["theme_delivery"] == qual["theme_delivery"]
         assert out["goal_alignment"] == qual["goal_alignment"]
+
+    def test_smoketest_enabled_false_is_exposed(self):
+        """format_qualification_for_api surfaces smoketest_enabled=False so consumers
+        know the smoketest dimension was disabled and the 0.0 sub-score is a
+        placeholder, not an active release-hardening lane."""
+        qual = {"status": "not_promoted", "smoketest_enabled": False}
+        out = rq.format_qualification_for_api(qual)
+        assert out["smoketest_enabled"] is False
+
+    def test_smoketest_enabled_true_is_exposed(self):
+        qual = {"status": "not_promoted", "smoketest_enabled": True}
+        out = rq.format_qualification_for_api(qual)
+        assert out["smoketest_enabled"] is True
+
+    def test_smoketest_enabled_absent_returns_none(self):
+        """Legacy qualification records without smoketest_enabled return None
+        so callers can distinguish 'disabled' from 'unknown'."""
+        out = rq.format_qualification_for_api({"status": "pending"})
+        assert out["smoketest_enabled"] is None
 
 
 # ===========================================================================
@@ -20924,14 +23140,29 @@ async def _seed_clean_streak(db_session, project, version, *, n: int = 6):
         )
 
 
+_RETIRED_READINESS_ACCEPTANCE_KEYS = {
+    "acceptance_proven",
+    "acceptance_satisfied_unproven",
+    "acceptance_declared_unsatisfied",
+    "acceptance_undeclared",
+    "acceptance_merged_unverified_degraded",
+    "acceptance_malformed",
+    "acceptance_unproven_present",
+    "acceptance_caveat",
+    "acceptance_aggregate",
+}
+
+
+def _assert_retired_acceptance_keys_absent(out: dict):
+    for key in _RETIRED_READINESS_ACCEPTANCE_KEYS:
+        assert key not in out
+
+
 @pytest.mark.asyncio
-async def test_readiness_declared_unsatisfied_raises_caveat_without_flipping_ready(
+async def test_readiness_declared_unsatisfied_omits_retired_acceptance_keys(
     db_session,
 ):
-    """A version window containing a merged task whose DECLARED acceptance
-    evidence did not pass surfaces an advisory caveat and the
-    ``acceptance_unproven_present`` flag — but readiness stays driven by the
-    existing thresholds (not hard-flipped)."""
+    """Readiness no longer emits advisory acceptance aggregate/caveat keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20939,23 +23170,14 @@ async def test_readiness_declared_unsatisfied_raises_caveat_without_flipping_rea
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
-    # The existing self-approval thresholds still drive readiness.
     assert out["ready"] is True, out["reason"]
-    # Additive signal reflects the unproven work.
-    assert out["acceptance_declared_unsatisfied"] == 1
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is True
-    assert "acceptance_caveat" in out
-    assert "not fully proven" in out["acceptance_caveat"]
-    # The caveat is appended to the operator-facing reason.
-    assert "not fully proven" in out["reason"]
+    _assert_retired_acceptance_keys_absent(out)
+    assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
 async def test_readiness_undeclared_only_is_unaffected(db_session):
-    """A version window with only undeclared (no-verdict) merged tasks must NOT
-    raise a caveat or set ``acceptance_unproven_present`` — undeclared/legacy
-    work never counts against readiness."""
+    """Undeclared merged work no longer adds retired acceptance keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20965,18 +23187,13 @@ async def test_readiness_undeclared_only_is_unaffected(db_session):
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_undeclared"] == 2
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
     assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
 async def test_readiness_proven_only_has_no_caveat(db_session):
-    """A version window with only satisfied (proven) merged tasks raises no
-    caveat — proven work is exactly what the qualifier wants."""
+    """Proven-only merged work no longer adds retired acceptance keys."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -20984,19 +23201,15 @@ async def test_readiness_proven_only_has_no_caveat(db_session):
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
-    assert out["acceptance_proven"] == 1
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
     assert "not fully proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
-async def test_readiness_satisfied_unproven_raises_caveat_without_flipping_ready(
+async def test_readiness_satisfied_unproven_omits_retired_acceptance_keys(
     db_session,
 ):
-    """Soft satisfied evidence is advisory unproven work, not strict proof."""
+    """Soft satisfied evidence no longer emits acceptance caveats."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -21011,39 +23224,27 @@ async def test_readiness_satisfied_unproven_raises_caveat_without_flipping_ready
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_proven"] == 0
-    assert out["acceptance_satisfied_unproven"] == 1
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_unproven_present"] is True
-    assert "satisfied-but-not-machine-proven" in out["acceptance_caveat"]
-    assert "satisfied-but-not-machine-proven" in out["reason"]
+    _assert_retired_acceptance_keys_absent(out)
+    assert "satisfied-but-not-machine-proven" not in out["reason"]
 
 
 @pytest.mark.asyncio
-async def test_readiness_empty_history_carries_acceptance_keys(db_session):
-    """The no-verdict (empty-history) readiness path still carries the additive
-    acceptance keys so the dict shape is stable for every consumer."""
+async def test_readiness_empty_history_omits_retired_acceptance_keys(db_session):
+    """The no-verdict path omits retired acceptance aggregate/caveat keys."""
     project, _version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
 
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["verdicts_evaluated"] == 0
-    assert out["acceptance_proven"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_undeclared"] == 0
-    assert out["acceptance_merged_unverified_degraded"] == 0
-    assert out["acceptance_malformed"] == 0
-    assert out["acceptance_unproven_present"] is False
+    _assert_retired_acceptance_keys_absent(out)
 
 
 @pytest.mark.asyncio
-async def test_readiness_acceptance_aggregate_failure_degrades_safely(
+async def test_readiness_does_not_query_acceptance_aggregate(
     db_session, mocker
 ):
-    """If the acceptance aggregate query raises, readiness degrades to zero
-    acceptance counts and is otherwise unaffected (fail-safe, never blocks)."""
+    """Readiness no longer depends on the retired acceptance aggregate query."""
     project, version = await _make_project_and_version(db_session)
     await _ensure_verdict_table(db_session)
     await _seed_clean_streak(db_session, project, version)
@@ -21057,10 +23258,7 @@ async def test_readiness_acceptance_aggregate_failure_degrades_safely(
     out = await rq.compute_promotion_readiness(db_session, project.id)
 
     assert out["ready"] is True, out["reason"]
-    assert out["acceptance_declared_unsatisfied"] == 0
-    assert out["acceptance_satisfied_unproven"] == 0
-    assert out["acceptance_unproven_present"] is False
-    assert "acceptance_caveat" not in out
+    _assert_retired_acceptance_keys_absent(out)
 
 
 async def _seed_promoted_verdict(
@@ -21620,13 +23818,11 @@ async def test_check_promotion_readiness_messaging_failure_is_nonfatal(
 
 
 @pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
+async def test_finalize_omits_version_acceptance_aggregate(
     db_session, mocker
 ):
-    """A mixed merged window persists the version-window acceptance aggregate
-    on both last_qualification and the immutable verdict row."""
+    """Finalize no longer writes retired acceptance_aggregate payloads."""
     from app import shared_state
-    from app.models import QualificationVerdict
 
     shared_state.runtime_config["promotion_enabled"] = False
 
@@ -21649,85 +23845,15 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
             "suites": {"startup": {"passed": True}},
         },
     )
-
-    db_session.add_all(
-        [
-            Task(
-                project_id=project.id,
-                title="proven-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {
-                        "satisfied": True,
-                        "proven": True,
-                    },
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="soft-satisfied-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {
-                        "satisfied": True,
-                        "proven": False,
-                        "kind": "observable_behavior",
-                    },
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="declared-unsatisfied",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "code_acceptance_verdict": {"satisfied": False},
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="degraded-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={
-                    "pr_merged": True,
-                    "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
-                },
-            ),
-            Task(
-                project_id=project.id,
-                title="undeclared-merge",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-        ]
-    )
-    await db_session.commit()
+    await _seed_landed_acceptance_task(db_session, project.id, satisfied=False)
 
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    expected = {
-        "total": 5,
-        "proven": 1,
-        "satisfied_unproven": 1,
-        "declared_unsatisfied": 1,
-        "merged_unverified_degraded": 1,
-        "undeclared": 1,
-        "malformed": 0,
-        "proven_rate": 0.2,
-        "satisfied_rate": 0.4,
-    }
     assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in result
     await db_session.refresh(version)
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in version.last_qualification
 
     rows = (
         (
@@ -21741,153 +23867,7 @@ async def test_finalize_records_version_acceptance_aggregate_for_mixed_window(
         .all()
     )
     assert len(rows) == 1
-    assert rows[0].sub_scores["acceptance_aggregate"] == expected
-
-
-@pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_for_undeclared_window(
-    db_session, mocker
-):
-    """An all-undeclared merged window stays neutral and records no proven
-    acceptance credit."""
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project,
-        version,
-        audit_logs={
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 3,
-                "test_count_delta": 1,
-            },
-        },
-        smoke_logs={
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        },
-    )
-
-    db_session.add_all(
-        [
-            Task(
-                project_id=project.id,
-                title="undeclared-1",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-            Task(
-                project_id=project.id,
-                title="undeclared-2",
-                payloads=[{"type": "create", "prompt": "x"}],
-                status=TaskStatus.COMPLETED,
-                context={"pr_merged": True},
-            ),
-        ]
-    )
-    await db_session.commit()
-
-    result = await rq._finalize_qualification(db_session, version)
-    await db_session.commit()
-
-    expected = {
-        "total": 2,
-        "proven": 0,
-        "satisfied_unproven": 0,
-        "declared_unsatisfied": 0,
-        "merged_unverified_degraded": 0,
-        "undeclared": 2,
-        "malformed": 0,
-        "proven_rate": 0.0,
-        "satisfied_rate": 0.0,
-    }
-    assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
-
-
-@pytest.mark.asyncio
-async def test_finalize_records_version_acceptance_aggregate_ignores_post_terminal_updates(
-    db_session, mocker
-):
-    """A later non-terminal task write must not reopen the qualification window."""
-    from datetime import timedelta
-    from unittest.mock import patch
-
-    from app import shared_state
-
-    shared_state.runtime_config["promotion_enabled"] = False
-
-    project, version = await _make_project_and_version(db_session)
-    await _seed_qualification_children(
-        db_session,
-        project,
-        version,
-        audit_logs={
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 1,
-                "test_count_delta": 1,
-            },
-        },
-        smoke_logs={
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        },
-    )
-
-    window_opened_at = rq._utcnow()
-    old_completed_at = window_opened_at - timedelta(days=1)
-    post_terminal_message_at = window_opened_at + timedelta(days=1)
-
-    old_task = Task(
-        project_id=project.id,
-        title="old-merge",
-        payloads=[{"type": "create", "prompt": "x"}],
-        status=TaskStatus.QUEUED,
-        context={},
-        created_at=old_completed_at,
-        updated_at=old_completed_at,
-    )
-    db_session.add(old_task)
-    await db_session.commit()
-
-    with patch("app.models._utcnow", return_value=old_completed_at):
-        old_task.status = TaskStatus.COMPLETED
-        old_task.context = {"pr_merged": True}
-        await db_session.commit()
-
-    version.opened_at = window_opened_at
-    await db_session.commit()
-
-    with patch("app.models._utcnow", return_value=post_terminal_message_at):
-        old_task.latest_status_message = "Post-terminal context update"
-        await db_session.commit()
-
-    result = await rq._finalize_qualification(db_session, version)
-    await db_session.commit()
-
-    expected = {
-        "total": 0,
-        "proven": 0,
-        "satisfied_unproven": 0,
-        "declared_unsatisfied": 0,
-        "merged_unverified_degraded": 0,
-        "undeclared": 0,
-        "malformed": 0,
-        "proven_rate": None,
-        "satisfied_rate": None,
-    }
-    assert result["status"] == "dry_run"
-    assert version.last_qualification["acceptance_aggregate"] == expected
+    assert "acceptance_aggregate" not in (rows[0].sub_scores or {})
 
 
 @pytest.mark.asyncio
@@ -24708,13 +26688,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     latest last_qualification overwrite."""
     import uuid
 
-    _theme_cert = {
-        "theme_class": "leanness",
-        "assessed_grade": 0.0,
-        "net_loc": 120,
-        "directional_contradiction": True,
-        "state": "blocked",
-    }
     verdict = QualificationVerdict(
         project_id=uuid.uuid4(),
         release_version_id=uuid.uuid4(),
@@ -24754,7 +26727,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         promotion_pr_url="https://example.com/pr/7",
         promotion_conflict=True,
         promotion_error_detail="merge conflict",
-        theme_delivery=_theme_cert,
         goal_alignment={
             "state": "aligned",
             "assessed_grade": 0.9,
@@ -24783,8 +26755,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
     assert out["promotion_pr_url"] == "https://example.com/pr/7"
     assert out["promotion_conflict"] is True
     assert out["promotion_error_detail"] == "merge conflict"
-    # Theme-delivery cert surfaces from migration-0305 column.
-    assert out["theme_delivery"] == _theme_cert
     # Goal-alignment cert surfaces from migration-0328 column.
     assert out["goal_alignment"] == {
         "state": "aligned",
@@ -24792,7 +26762,7 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         "biggest_gap": None,
         "reasoning_summary": "Goal delivered.",
     }
-    # Legacy rows (no theme_delivery set) must return None, not raise.
+    # Legacy rows must return None for optional certs, not raise.
     verdict_legacy = QualificationVerdict(
         project_id=uuid.uuid4(),
         release_version_id=uuid.uuid4(),
@@ -24806,7 +26776,6 @@ def test_format_verdict_for_api_surfaces_durable_evidence():
         threshold=0.8,
     )
     out_legacy = rq.format_verdict_for_api(verdict_legacy)
-    assert out_legacy["theme_delivery"] is None
     assert out_legacy["goal_alignment"] is None
 
 
@@ -25044,9 +27013,8 @@ def test_format_verdict_for_api_surfaces_acceptance_window_signal_without_changi
     assert out_legacy["sub_scores"] is None
 
 
-def test_format_verdict_for_api_includes_acceptance_aggregate():
-    """format_verdict_for_api surfaces the stored per-verdict acceptance aggregate
-    additively (via the release_qualifier re-export), preserving the raw fields."""
+def test_format_verdict_for_api_omits_acceptance_aggregate():
+    """format_verdict_for_api no longer promotes retired acceptance aggregates."""
     import uuid
 
     verdict = QualificationVerdict(
@@ -25074,25 +27042,15 @@ def test_format_verdict_for_api_includes_acceptance_aggregate():
         },
     )
     out = rq.format_verdict_for_api(verdict)
-    assert out["acceptance_aggregate"] == {
-        "total": 4,
-        "proven": 3,
-        "satisfied_unproven": 1,
-        "declared_unsatisfied": 0,
-        "undeclared": 0,
-        "merged_unverified_degraded": 0,
-        "malformed": 0,
-        "satisfied_rate": 1.0,
-        "proven_rate": 0.75,
-    }
+    assert "acceptance_aggregate" not in out
     # Raw evidence fields stay intact.
     assert out["candidate_sha"] == "agg123"
     assert out["would_promote"] is True
+    assert "acceptance_aggregate" not in (out["sub_scores"] or {})
 
 
-def test_format_verdict_for_api_acceptance_aggregate_none_on_legacy():
-    """A legacy verdict with no stored aggregate yields acceptance_aggregate=None;
-    the additive key is always present."""
+def test_format_verdict_for_api_acceptance_aggregate_absent_on_legacy():
+    """Legacy rows also omit the retired acceptance_aggregate response key."""
     import uuid
 
     verdict = QualificationVerdict(
@@ -25105,8 +27063,66 @@ def test_format_verdict_for_api_acceptance_aggregate_none_on_legacy():
         terminal_status="not_promoted",
     )
     out = rq.format_verdict_for_api(verdict)
-    assert "acceptance_aggregate" in out
-    assert out["acceptance_aggregate"] is None
+    assert "acceptance_aggregate" not in out
+
+
+def test_format_verdict_for_api_smoketest_enabled_false():
+    """format_verdict_for_api surfaces smoketest_enabled=False from sub_scores
+    so consumers know the smoketest dimension was disabled and the 0.0 placeholder
+    should not be rendered as an active release-hardening lane."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.88,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.0, "smoketest_enabled": False},
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        threshold=0.9,
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert out["smoketest_enabled"] is False
+
+
+def test_format_verdict_for_api_smoketest_enabled_true():
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="abc123",
+        confidence=0.91,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.80, "smoketest_enabled": True},
+        would_promote=True,
+        promotion_enabled=False,
+        terminal_status="dry_run",
+        threshold=0.9,
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert out["smoketest_enabled"] is True
+
+
+def test_format_verdict_for_api_smoketest_enabled_none_on_legacy():
+    """Legacy verdict rows without smoketest_enabled in sub_scores return None
+    so callers can distinguish 'disabled' from 'unknown'."""
+    import uuid
+
+    verdict = QualificationVerdict(
+        project_id=uuid.uuid4(),
+        release_version_id=uuid.uuid4(),
+        candidate_sha="legacy2",
+        confidence=0.85,
+        sub_scores={"audit": 0.90, "test_erosion": 0.85, "smoketest": 0.75},
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+    )
+    out = rq.format_verdict_for_api(verdict)
+    assert "smoketest_enabled" in out
+    assert out["smoketest_enabled"] is None
 
 
 def test_get_latest_qualification_audit_findings_prefers_verdict_row():
@@ -26279,6 +28295,72 @@ class TestRecoverConfidenceFromCiUnresolved:
         assert out.get("confidence_recovered_from_ci_unresolved") is True
         assert out["confidence"] > 0.0
 
+    def test_ci_unresolved_preserves_criterion_coverage_blocker(self):
+        """Recovery keeps criterion_coverage_incomplete when uncovered criteria exist."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "criterion_coverage": {
+                "total": 2,
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 1,
+            },
+        }
+        out = self._fn(record)
+        assert out["blocker"] == "criterion_coverage_incomplete"
+        assert out["confidence"] == 0.0
+
+    def test_ci_unresolved_preserves_migration_blocker(self):
+        """Recovery keeps deterministic migration blockers masked by CI."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "migration_safety": "block",
+        }
+        out = self._fn(record)
+        assert out["blocker"] == "migration_identity_collision"
+        assert out["confidence"] == 0.0
+
+    def test_ci_unresolved_preserves_armed_merge_grade_misses(self):
+        """Recovery keeps an armed failing merge-grade blocked even with empty criterion_coverage."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "criterion_coverage": {
+                "total": 0,
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "merge_grade_status": "fail",
+            "merge_grade": {"blocked": True},
+        }
+        out = self._fn(record, policy={**_POLICY, "merge_grade_block_threshold": 0.1})
+        assert out["blocker"] == "merge_grade_misses"
+        assert out["confidence"] == 0.0
+
+    def test_ci_unresolved_default_off_merge_grade_misses_recovers(self):
+        """Recovery does not hard-block a failing merge-grade while the gate is off."""
+        record = {
+            "blocker": "ci_unresolved",
+            "confidence": 0.0,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0, "smoketest": 1.0},
+            "smoketest_enabled": True,
+            "merge_grade_status": "fail",
+            "merge_grade": {"blocked": True},
+        }
+        out = self._fn(record, policy=_POLICY)
+        assert out["blocker"] is None
+        assert out["confidence"] > 0.0
+
+
 
 # ===========================================================================
 # SITE B lock-window fix: GitHub-bound gates run BEFORE FOR UPDATE
@@ -26710,327 +28792,6 @@ async def test_timed_out_qualification_requalifies_same_sha(db_session, mocker):
 
 
 # ===========================================================================
-# Theme-delivery certification
-# ===========================================================================
-
-
-class TestThemeDeliveryCertification:
-    """Theme-delivery evidence layer: classify, evidence, cert, and qualify gate."""
-
-    # --- Unit tests: theme_delivery module ----------------------------------
-
-    def test_classify_theme_leanness(self):
-        """Goal containing a leanness keyword → theme_class=leanness, falsifiable=True."""
-        from app import theme_delivery
-
-        result = theme_delivery.classify_theme(
-            "STABILIZE — lean the product code surface"
-        )
-        assert result["theme_class"] == "leanness"
-        assert result["falsifiable"] is True
-
-    def test_classify_theme_unknown(self):
-        """Goal with no recognized keyword → theme_class=unknown, falsifiable=False."""
-        from app import theme_delivery
-
-        result = theme_delivery.classify_theme("Improve the new dashboard widgets")
-        assert result["theme_class"] == "unknown"
-        assert result["falsifiable"] is False
-
-    def test_build_cert_dark_threshold_never_blocks(self):
-        """Default threshold=0.0 (ships dark): directional contradiction never blocks."""
-        from app import theme_delivery
-
-        evidence = {
-            "net_loc": 4443,
-            "per_module_deltas": {"reaper.py": 4443},
-            "named_targets": [],
-            "theme_class": "leanness",
-            "falsifiable": True,
-        }
-        cert = theme_delivery.build_theme_delivery_cert(
-            "lean the code",
-            evidence,
-            {"theme_warn_threshold": 0.70, "theme_block_threshold": 0.0},
-        )
-        # directional_contradiction is True but threshold=0.0 → grade(0.0) < 0.0 is False
-        assert cert["directional_contradiction"] is True
-        assert cert["state"] != "blocked", (
-            f"threshold=0.0 must never block; got state={cert['state']!r}"
-        )
-
-    def test_build_cert_directional_contradiction_blocks_when_threshold_armed(self):
-        """Armed threshold (>0.0) + net-additive LOC → state=blocked."""
-        from app import theme_delivery
-
-        evidence = {
-            "net_loc": 4443,
-            "per_module_deltas": {"reaper.py": 4443},
-            "named_targets": [],
-            "theme_class": "leanness",
-            "falsifiable": True,
-        }
-        cert = theme_delivery.build_theme_delivery_cert(
-            "lean the code",
-            evidence,
-            {"theme_warn_threshold": 0.70, "theme_block_threshold": 0.5},
-        )
-        assert cert["directional_contradiction"] is True
-        assert cert["state"] == "blocked"
-        assert cert["deterministic_grade"] == 0.0
-
-    # --- Unit test: compute_composite integration ---------------------------
-
-    def test_compute_composite_theme_delivery_blocked(self):
-        """theme_delivery_blocked=True forces confidence=0.0 and blocker=theme_delivery_shortfall."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            theme_delivery_blocked=True,
-        )
-        assert result["confidence"] == 0.0
-        assert result["promote"] is False
-        assert result["blocker"] == "theme_delivery_shortfall"
-
-    def test_compute_composite_theme_delivery_blocked_default_false(self):
-        """Backward compat: omitting theme_delivery_blocked does not block."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-        )
-        assert result["blocker"] is None
-        assert result["promote"] is True
-
-    # --- Integration test: _finalize_qualification gate --------------------
-
-    @pytest.mark.asyncio
-    async def test_theme_delivery_certification(self, db_session, mocker):
-        """ACCEPTANCE: directional contradiction hard-blocks qualify when threshold is armed.
-
-        Case 1: leanness goal + armed threshold + +4443 net LOC
-                → status=not_promoted, blocker=theme_delivery_shortfall,
-                  confidence=0.0, promote not called, state=blocked.
-
-        Case 2: same goal + armed threshold + -1000 net LOC
-                → no theme block (directional_contradiction=False, state=certified).
-        """
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        # Arm the block threshold so directional contradiction becomes a hard gate.
-        _armed_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.90,
-            "theme_warn_threshold": 0.70,
-            "theme_block_threshold": 0.5,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_armed_policy)
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        # --- Case 1: +4443 net LOC contradicts leanness → hard block --------
-        project, version = await _make_project_and_version(db_session)
-        version.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": 4443,
-                    "per_module_deltas": {"reaper.py": 4443},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-        promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        assert result["status"] == "not_promoted", (
-            f"expected not_promoted (theme hard-blocked), got {result!r}"
-        )
-        assert result["blocker"] == "theme_delivery_shortfall", (
-            f"expected theme_delivery_shortfall blocker, got {result.get('blocker')!r}"
-        )
-        assert result["confidence"] == 0.0
-        promote_spy.assert_not_called()
-
-        lq = version.last_qualification
-        assert lq["theme_delivery"]["directional_contradiction"] is True, (
-            "directional_contradiction must be True when leanness goal has net-additive LOC"
-        )
-        assert lq["theme_delivery"]["state"] == "blocked", (
-            f"expected cert state=blocked, got {lq['theme_delivery']['state']!r}"
-        )
-
-        # --- Case 2: -1000 net LOC is consistent with leanness → passes ----
-        project2, version2 = await _make_project_and_version(db_session)
-        version2.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        await _seed_qualification_children(
-            db_session,
-            project2,
-            version2,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": -1000,
-                    "per_module_deltas": {"reaper.py": -1000},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-
-        await rq._finalize_qualification(db_session, version2)
-        await db_session.commit()
-        await db_session.refresh(version2)
-
-        lq2 = version2.last_qualification
-        assert lq2.get("blocker") != "theme_delivery_shortfall", (
-            f"reductive LOC must not theme-block; got blocker={lq2.get('blocker')!r}"
-        )
-        assert lq2["theme_delivery"]["directional_contradiction"] is False
-        assert lq2["theme_delivery"]["state"] == "certified"
-
-    @pytest.mark.asyncio
-    async def test_theme_delivery_shortfall_warn_notification(self, db_session, mocker):
-        """WARN tier: shortfall state fires theme_delivery_shortfall operator notification.
-
-        Default theme_block_threshold=0.0 ships dark (no hard block), but
-        assessed_grade=0.0 < theme_warn_threshold=0.70 puts cert in 'shortfall' state
-        and must fire a theme_delivery_shortfall notification so operators can observe
-        the advisory signal even before arming the hard block.
-        """
-        from app import shared_state
-
-        shared_state.runtime_config["promotion_enabled"] = False
-
-        # Dark threshold: warn fires, hard block does NOT.
-        _dark_policy = {
-            "weights": {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30},
-            "threshold": 0.90,
-            "theme_warn_threshold": 0.70,
-            "theme_block_threshold": 0.0,
-        }
-        mocker.patch("app.release_qualifier._load_policy", return_value=_dark_policy)
-
-        _clean_audit_logs = {
-            "audit_score": 1.0,
-            "test_erosion": {
-                "deleted_test_files": [],
-                "assertion_delta": 5,
-                "test_count_delta": 2,
-            },
-        }
-        _clean_smoke_logs = {
-            "passed": True,
-            "tests": [{"name": "a", "status": "pass"}],
-            "suites": {"startup": {"passed": True}},
-        }
-
-        project, version = await _make_project_and_version(db_session)
-        version.goal = "STABILIZE — lean the product code surface"
-        db_session.add(version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        await _seed_qualification_children(
-            db_session,
-            project,
-            version,
-            audit_logs=_clean_audit_logs,
-            smoke_logs=_clean_smoke_logs,
-        )
-
-        # Net-additive LOC: shortfall (assessed_grade=0.0 < warn=0.70) but dark block
-        mocker.patch(
-            "app.release_qualifier._fetch_version_theme_evidence",
-            new=AsyncMock(
-                return_value={
-                    "net_loc": 4443,
-                    "per_module_deltas": {"reaper.py": 4443},
-                    "named_targets": [],
-                    "theme_class": "leanness",
-                    "falsifiable": True,
-                }
-            ),
-        )
-
-        notify_spy = mocker.patch(
-            "app.release_qualifier._notify_operator", new=AsyncMock()
-        )
-
-        result = await rq._finalize_qualification(db_session, version)
-        await db_session.commit()
-        await db_session.refresh(version)
-
-        # With dark threshold the cert is "shortfall" (not "blocked") — version
-        # is not hard-blocked by theme but the advisory notification must fire.
-        lq = version.last_qualification
-        assert lq["theme_delivery"]["state"] == "shortfall", (
-            f"expected shortfall with dark threshold; got {lq['theme_delivery']['state']!r}"
-        )
-        assert result.get("blocker") != "theme_delivery_shortfall", (
-            "dark threshold must not produce a hard block"
-        )
-
-        # Verify the WARN notification was emitted
-        theme_notify_calls = [
-            call
-            for call in notify_spy.call_args_list
-            if len(call.args) >= 3 and call.args[2] == "theme_delivery_shortfall"
-        ]
-        assert len(theme_notify_calls) >= 1, (
-            "expected at least one theme_delivery_shortfall notification; "
-            f"got notify calls: {[c.args[2] for c in notify_spy.call_args_list]}"
-        )
-
-
-# ===========================================================================
 # evaluate_merge_grade — pure scoring function unit tests
 # ===========================================================================
 
@@ -27194,22 +28955,46 @@ class TestBlindMergeGradeBlock:
 
     # --- Unit tests: compute_composite integration --------------------------
 
-    def test_compute_composite_merge_grade_blocked_fires(self):
-        """merge_grade_blocked=True forces confidence=0.0 and the merge_grade blocker label."""
+    def test_compute_composite_criterion_coverage_incomplete_fires(self):
+        """Uncovered criteria force confidence=0.0 and the criterion blocker label."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            merge_grade_blocked=True,
+            criterion_coverage={
+                "total": 2,
+                "covered": 1,
+                "partial": 0,
+                "uncovered": 1,
+            },
         )
         assert result["confidence"] == 0.0
         assert result["promote"] is False
-        assert result["blocker"] == "merge_grade_goal_coverage"
+        assert result["blocker"] == "criterion_coverage_incomplete"
 
-    def test_compute_composite_merge_grade_blocked_default_false(self):
-        """Backward compat: omitting merge_grade_blocked does not block."""
+    def test_compute_composite_criterion_coverage_partial_only_fires(self):
+        """Partial-only coverage also blocks because the criterion is not covered."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            criterion_coverage={
+                "total": 1,
+                "covered": 0,
+                "partial": 1,
+                "uncovered": 0,
+            },
+        )
+        assert result["confidence"] == 0.0
+        assert result["promote"] is False
+        assert result["blocker"] == "criterion_coverage_incomplete"
+
+    def test_compute_composite_criterion_coverage_default_skips_gate(self):
+        """Backward compat: omitting criterion_coverage does not block."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
@@ -27219,19 +29004,6 @@ class TestBlindMergeGradeBlock:
         )
         assert result["blocker"] is None
         assert result["promote"] is True
-
-    def test_compute_composite_blocker_precedence_theme_before_merge_grade(self):
-        """theme_delivery_blocked fires before merge_grade_blocked in the chain."""
-        result = rq.compute_composite(
-            ci_green=True,
-            audit_score=1.0,
-            test_erosion=1.0,
-            smoketest_score=1.0,
-            policy=_POLICY,
-            theme_delivery_blocked=True,
-            merge_grade_blocked=True,
-        )
-        assert result["blocker"] == "theme_delivery_shortfall"
 
     def test_compute_composite_merge_grade_misses_label(self):
         """merge_grade_misses=True emits the merge_grade_misses blocker label."""
@@ -27247,18 +29019,23 @@ class TestBlindMergeGradeBlock:
         assert result["promote"] is False
         assert result["blocker"] == "merge_grade_misses"
 
-    def test_compute_composite_merge_grade_goal_coverage_label(self):
-        """merge_grade_blocked=True (child-task gate) emits merge_grade_goal_coverage."""
+    def test_compute_composite_criterion_coverage_no_criteria_skips_gate(self):
+        """A version with no criteria does not emit the criterion blocker."""
         result = rq.compute_composite(
             ci_green=True,
             audit_score=1.0,
             test_erosion=1.0,
             smoketest_score=1.0,
             policy=_POLICY,
-            merge_grade_blocked=True,
+            criterion_coverage={
+                "total": 0,
+                "covered": 0,
+                "partial": 0,
+                "uncovered": 0,
+            },
         )
-        assert result["confidence"] == 0.0
-        assert result["blocker"] == "merge_grade_goal_coverage"
+        assert result["blocker"] is None
+        assert result["promote"] is True
 
 
 @pytest.mark.asyncio
@@ -27521,3 +29298,276 @@ async def test_record_promotion_failure_increments_count(db_session, mocker):
         lock_released=False,
     )
     assert version.last_qualification["promotion_failure_count"] == 2
+
+
+class TestComputeGoalCoverageDrift:
+    """Unit tests for the pure compute_goal_coverage_drift scorer."""
+
+    def test_not_applicable_empty_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "",
+            merge_grade_status="pass",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_not_applicable_none_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            None,
+            merge_grade_status="pass",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_not_applicable_contentless_goal(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        for placeholder in ("test", "n/a", "tbd", "placeholder"):
+            result = compute_goal_coverage_drift(
+                placeholder,
+                merge_grade_status="pass",
+                merges_since_grade=0,
+            )
+            assert result["signal"] == "not_applicable", f"Expected not_applicable for '{placeholder}'"
+
+    def test_no_grade_yet_when_status_none(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=3,
+        )
+        assert result["signal"] == "no_grade_yet"
+        assert result["coverage"] is None
+
+    def test_ungraded_statuses_do_not_look_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        for status in ("not_applicable", "superseded_exempt"):
+            result = compute_goal_coverage_drift(
+                "Improve authentication coverage",
+                merge_grade_status=status,
+                merge_grade_coverage=0.91,
+                merges_since_grade=0,
+            )
+            assert result["signal"] == status
+            assert "passed" not in result["detail"].lower()
+
+    def test_on_track_pass_grade_low_delta(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Harden the release gate",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.85,
+            merge_grade_biggest_gap=None,
+            merges_since_grade=2,
+        )
+        assert result["signal"] == "on_track"
+        assert result["stale"] is False
+        assert result["coverage"] == pytest.approx(0.85)
+        assert result["merges_since_grade"] == 2
+
+    def test_drifting_when_fail_grade(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve test reliability",
+            merge_grade_status="fail",
+            merge_grade_coverage=0.3,
+            merge_grade_biggest_gap="Integration tests not updated",
+            merges_since_grade=1,
+        )
+        assert result["signal"] == "drifting"
+        assert result["biggest_gap"] == "Integration tests not updated"
+        assert result["coverage"] == pytest.approx(0.3)
+
+    def test_drifting_stale_when_material_new_work(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Performance optimization",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.9,
+            merges_since_grade=5,  # at threshold
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 5
+
+    def test_stale_threshold_boundary(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        # 4 merges = not stale
+        result_ok = compute_goal_coverage_drift(
+            "Some real goal",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.8,
+            merges_since_grade=4,
+        )
+        assert result_ok["signal"] == "on_track"
+        assert result_ok["stale"] is False
+
+        # 5 merges = stale -> drifting
+        result_stale = compute_goal_coverage_drift(
+            "Some real goal",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.8,
+            merges_since_grade=5,
+        )
+        assert result_stale["signal"] == "drifting"
+        assert result_stale["stale"] is True
+
+    def test_biggest_gap_falls_back_to_goal_alignment(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Fix auth layer",
+            merge_grade_status="fail",
+            merge_grade_biggest_gap=None,
+            goal_alignment={"biggest_gap": "Auth not addressed", "state": "shortfall"},
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "drifting"
+        assert result["biggest_gap"] == "Auth not addressed"
+
+    def test_biggest_gap_merge_grade_takes_precedence(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Fix auth layer",
+            merge_grade_status="fail",
+            merge_grade_biggest_gap="Missing rate limiting",
+            goal_alignment={"biggest_gap": "Auth not addressed"},
+            merges_since_grade=0,
+        )
+        assert result["biggest_gap"] == "Missing rate limiting"
+
+    def test_no_grade_yet_below_threshold(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=4,
+        )
+        assert result["signal"] == "no_grade_yet"
+        assert result["stale"] is False
+        assert result["merges_since_grade"] == 4
+
+    def test_drifting_at_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 5
+        assert result["coverage"] is None
+
+    def test_drifting_above_threshold_when_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status=None,
+            merges_since_grade=10,
+        )
+        assert result["signal"] == "drifting"
+        assert result["stale"] is True
+        assert result["merges_since_grade"] == 10
+        assert result["coverage"] is None
+
+    def test_not_applicable_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "not_applicable"
+        assert result["stale"] is False
+
+    def test_not_applicable_status_stale_not_drifting(self):
+        """stale semantics do not apply to not_applicable — must stay not_applicable."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="not_applicable",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "not_applicable"
+
+    def test_superseded_exempt_status_non_stale(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "superseded_exempt"
+        assert result["stale"] is False
+
+    def test_superseded_exempt_status_stale_not_drifting(self):
+        """stale semantics do not apply to superseded_exempt — must stay superseded_exempt."""
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="superseded_exempt",
+            merges_since_grade=5,
+        )
+        assert result["signal"] == "superseded_exempt"
+
+    def test_unparseable_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="unparseable",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_unknown_future_status_returns_no_grade_yet(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="future_status",
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "no_grade_yet"
+
+    def test_pass_status_non_stale_returns_on_track(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="pass",
+            merge_grade_coverage=0.9,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "on_track"
+
+    def test_fail_status_returns_drifting(self):
+        from app.release_scoring import compute_goal_coverage_drift
+
+        result = compute_goal_coverage_drift(
+            "Improve authentication coverage",
+            merge_grade_status="fail",
+            merge_grade_coverage=0.4,
+            merges_since_grade=0,
+        )
+        assert result["signal"] == "drifting"

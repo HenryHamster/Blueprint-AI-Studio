@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -4221,6 +4221,81 @@ describe('bootstrapPoolMode', () => {
     expect(_getActiveCredentialStateSourceForTesting()).toBe('boot');
   });
 
+  it('re-anchors a backend-supplied ~/.claude.json under the ACTUAL $HOME (sandbox HOME=/home)', () => {
+    // Fleet-runner bwrap sandbox: fresh tmpfs HOME=/home, no host $HOME bind.
+    // The backend manifest still hardcodes the cloud-VM path
+    // /home/agent/.claude.json, but the Claude CLI reads ~/.claude.json from the
+    // live HOME (=/home). The write MUST be re-anchored to /home/.claude.json or
+    // auth fails.
+    const savedHome = process.env.HOME;
+    const savedVmId = process.env.VM_INSTANCE_ID;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home';
+      // Real (non-'local') VM id → the poisoned-VM presence guard is active; it
+      // must validate the RESOLVED location, so mark /home/.claude.json present.
+      process.env.VM_INSTANCE_ID = 'sandbox-vm';
+      vi.mocked(fs.existsSync).mockImplementation((p) => p === '/home/.claude.json');
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: {
+          PROVIDER: 'anthropic',
+          AUTH_MODE: 'oauth',
+          CLAUDE_CODE_OAUTH_TOKEN: 'sandbox-claude-token',
+        },
+        files: [
+          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+        ],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: sandbox-reanchor');
+
+      const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
+      // Written where the CLI actually reads it…
+      expect(vi.mocked(fs.writeFileSync).mock.calls).toEqual(expect.arrayContaining([
+        ['/home/.claude.json', '{"hasCompletedOnboarding":true}', expect.objectContaining({ mode: 0o600 })],
+      ]));
+      // …and NOT at the backend's hardcoded /home/agent path.
+      expect(writePaths).not.toContain('/home/agent/.claude.json');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+      if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
+      vi.mocked(fs.existsSync).mockReturnValue(false);
+      _resetCredentialStateForTesting();
+    }
+  });
+
+  it('keeps the cloud-VM path byte-identical when HOME=/home/agent (re-anchor is a no-op)', () => {
+    const savedHome = process.env.HOME;
+    const savedVmId = process.env.VM_INSTANCE_ID;
+    try {
+      _resetCredentialStateForTesting();
+      process.env.HOME = '/home/agent';
+      process.env.VM_INSTANCE_ID = 'local'; // bypass the presence guard; assert the write path only
+      vi.mocked(fs.writeFileSync).mockClear();
+
+      _materializeClaimCredentialStateForTesting({
+        env: {
+          PROVIDER: 'anthropic',
+          AUTH_MODE: 'oauth',
+          CLAUDE_CODE_OAUTH_TOKEN: 'vm-claude-token',
+        },
+        files: [
+          { path: '/home/agent/.claude.json', content: '{"hasCompletedOnboarding":true}', mode: '0600' },
+        ],
+        metadata: { retarget: true, provider: 'anthropic', auth_mode: 'oauth' },
+      }, 'test: vm-parity');
+
+      const writePaths = vi.mocked(fs.writeFileSync).mock.calls.map(c => c[0]);
+      expect(writePaths).toContain('/home/agent/.claude.json');
+      expect(writePaths).not.toContain('/home/.claude.json');
+    } finally {
+      if (savedHome !== undefined) process.env.HOME = savedHome; else delete process.env.HOME;
+      if (savedVmId !== undefined) process.env.VM_INSTANCE_ID = savedVmId; else delete process.env.VM_INSTANCE_ID;
+      _resetCredentialStateForTesting();
+    }
+  });
+
   it('fails hard on a malformed secret manifest instead of leaving prior credentials active', async () => {
     process.env.CLAUDE_CODE_OAUTH_TOKEN = 'boot-claude-token';
     refreshRuntimeState();
@@ -6888,6 +6963,40 @@ describe('heartbeat 409 task-terminal detection', () => {
     // No curl terminal POST
     const curlCall = vi.mocked(execFileSync).mock.calls.find(([cmd]) => cmd === 'curl');
     expect(curlCall).toBeUndefined();
+  });
+});
+
+// ── Live tool-execution diagnostics in heartbeat status ─────────────────────
+describe('_buildHeartbeatStatusForTesting', () => {
+  it('returns plain status when no tool is in flight', () => {
+    const statusRef = { value: 'Codex thinking' };
+    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Codex thinking');
+  });
+
+  it('includes elapsed time in seconds when tool has been running under 60s', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 42_000, lastProgressAt: now - 5_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: Bash (42s elapsed, last sub-progress 5s ago)');
+  });
+
+  it('formats elapsed time as Xm Ys when tool has been running over 60s', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: now - 252_000, lastProgressAt: now - 43_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: Bash (4m 12s elapsed, last sub-progress 43s ago)');
+  });
+
+  it('omits sub-progress clause when lastProgressAt is not set', () => {
+    const now = 1_000_000;
+    const statusRef = { value: 'Using tool: TodoWrite', toolStartedAt: now - 10_000 };
+    const msg = _buildHeartbeatStatusForTesting(statusRef, now);
+    expect(msg).toBe('Using tool: TodoWrite (10s elapsed)');
+  });
+
+  it('returns plain status once toolStartedAt is cleared (tool complete)', () => {
+    const statusRef = { value: 'Using tool: Bash', toolStartedAt: undefined, lastProgressAt: undefined };
+    expect(_buildHeartbeatStatusForTesting(statusRef, 1_000_000)).toBe('Using tool: Bash');
   });
 });
 

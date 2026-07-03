@@ -16,6 +16,10 @@ from pathlib import Path
 
 import pytest
 
+BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
 # auth.py raises ValueError at module load if these are absent; keeping them
 # here lets the route-table invariant run in standalone mode without the
 # backend test conftest.
@@ -560,7 +564,7 @@ class TestSchemaRevisionSync:
         import glob as globmod
 
         from app.main import EXPECTED_SCHEMA_REVISION
-        from app.migration_chain import build_migration_chain, find_heads
+        from app.migration_chain import validate_standalone_chain
 
         migrations_dir = os.path.join(
             os.path.dirname(__file__), "..", "alembic", "versions"
@@ -573,16 +577,12 @@ class TestSchemaRevisionSync:
             with open(f) as fh:
                 sources[os.path.basename(f)] = fh.read()
 
-        chain, _dups, _unp = build_migration_chain(sources)
-        heads = find_heads(chain)
-        assert len(heads) == 1, (
-            f"Migration chain has {len(heads)} structural heads: {heads}. "
-            "Cannot determine EXPECTED_SCHEMA_REVISION until the chain is linear."
+        errors = validate_standalone_chain(
+            sources, expected_schema_revision=EXPECTED_SCHEMA_REVISION
         )
-        structural_head = heads[0]
-        assert structural_head == EXPECTED_SCHEMA_REVISION, (
-            f"EXPECTED_SCHEMA_REVISION is '{EXPECTED_SCHEMA_REVISION}' but structural "
-            f"chain head is '{structural_head}'. Bump EXPECTED_SCHEMA_REVISION in main.py."
+        assert not errors, (
+            "Migration chain invariant violations detected:\n"
+            + "\n".join(f"  • {e}" for e in errors)
         )
 
     def test_task_context_size_constraint_exists_in_migration(self):
@@ -1806,23 +1806,23 @@ class TestChainInvariantSeedFixtures:
     def test_gapped_linear_chain_validates_clean(self):
         """A single-head chain with non-contiguous revision numbers (gap) is valid.
 
-        The v20 audit flagged the 0334->0347 Alembic numbering gap as suspicious.
+        The v20 audit flagged 0334->0347, and the v21 audit flagged
+        0354->0365, as suspicious Alembic numbering gaps.
         Gaps are a normal branch-cut artifact: tasks reserve numbers at cut time
         and merge-time reconciliation fills them.  validate_standalone_chain must
         accept a gapped-but-linear chain without error.
         """
         from app.migration_chain import validate_standalone_chain
 
-        # 0001 -> 0009 -> 0047: two deliberate gaps, but a single linear head.
+        # 0354 -> 0365: a deliberate branch-cut gap, but a single linear head.
         sources = {
-            "0001_root.py": self._src("0001", None),
-            "0009_mid.py": self._src("0009", "0001"),
-            "0047_tip.py": self._src("0047", "0009"),
+            "0354_acceptance_criteria.py": self._src("0354", None),
+            "0365_criterionevidence_unique.py": self._src("0365", "0354"),
         }
         errors = validate_standalone_chain(sources)
         assert not errors, (
             "validate_standalone_chain incorrectly rejected a gapped-but-linear "
-            f"chain (0001->0009->0047); errors: {errors}"
+            f"chain (0354->0365); errors: {errors}"
         )
 
     def test_validate_standalone_chain_aggregates_all_detectors(self):
@@ -4280,33 +4280,20 @@ class TestBaseBranchFallback:
 
     def test_no_hardcoded_main_branch_fallbacks(self):
         """No production module under backend/app/ may use defensive 'main' fallbacks."""
-        import os
+        from app.branch_literal_compliance import scan_branch_literal_surface
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        allow_list = {"payload_schemas.py", "admin.py"}
-        patterns = [
-            re.compile(r'else\s+["\']main["\']'),
-            re.compile(r'else\s+["\']master["\']'),
-            re.compile(
-                r'runtime_config\.get\(["\'](?:integration_branch|promotion_target)["\'],\s*["\']main["\']\)'
-            ),
-            re.compile(r'\bbranch\s*=\s*["\']main["\']'),
+        app_dir = Path(__file__).resolve().parents[1] / "app"
+        result = scan_branch_literal_surface("backend", app_dir)
+        offenders = [
+            f"  {o.path}:{o.line}: {o.snippet}"
+            for o in result.offenders
+            if o.pattern in {
+                "assign-branch-main",
+                "python-else-main",
+                "python-else-master",
+                "runtime-config-main",
+            }
         ]
-        offenders: list[str] = []
-        for root, _dirs, files in os.walk(app_dir):
-            for fname in files:
-                if not fname.endswith(".py"):
-                    continue
-                if fname in allow_list:
-                    continue
-                fpath = os.path.join(root, fname)
-                with open(fpath, encoding="utf-8") as f:
-                    for lineno, line in enumerate(f, start=1):
-                        if line.lstrip().startswith("#") or "# noqa" in line:
-                            continue
-                        if any(pattern.search(line) for pattern in patterns):
-                            rel = os.path.relpath(fpath, app_dir)
-                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
         assert not offenders, (
             "Found hardcoded branch fallbacks in backend/app/.\n"
             "Replace defensive 'main' defaults with project-aware resolution.\n"
@@ -4326,31 +4313,15 @@ class TestBaseBranchFallback:
         Log format strings are intentionally excluded — they are internal and
         not shown to operators in the UI.
         """
-        import os
+        from app.branch_literal_compliance import scan_branch_literal_surface
 
-        app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
-        # Match literal 'main...' or 'main -> automain' in task display field assignments.
-        patterns = [
-            re.compile(
-                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\.\.\."""
-            ),
-            re.compile(
-                r"""(?:title|description|message)\s*=\s*f?['""][^'"]*\bmain\s*->\s*automain"""
-            ),
+        app_dir = Path(__file__).resolve().parents[1] / "app"
+        result = scan_branch_literal_surface("backend", app_dir)
+        offenders = [
+            f"  {o.path}:{o.line}: {o.snippet}"
+            for o in result.offenders
+            if o.pattern in {"display-main-automain", "display-main-range"}
         ]
-        offenders: list[str] = []
-        for root, _dirs, files in os.walk(app_dir):
-            for fname in files:
-                if not fname.endswith(".py"):
-                    continue
-                fpath = os.path.join(root, fname)
-                with open(fpath, encoding="utf-8") as f:
-                    for lineno, line in enumerate(f, start=1):
-                        if line.lstrip().startswith("#") or "# noqa" in line:
-                            continue
-                        if any(pattern.search(line) for pattern in patterns):
-                            rel = os.path.relpath(fpath, app_dir)
-                            offenders.append(f"  {rel}:{lineno}: {line.rstrip()}")
         assert not offenders, (
             "Found hardcoded branch names in task display fields (title=/description=/message=) "
             "in backend/app/.\n"
@@ -4358,6 +4329,48 @@ class TestBaseBranchFallback:
             "instead of embedding literal 'main...' or 'main -> automain'.\n"
             "Offenders:\n" + "\n".join(offenders)
         )
+
+
+class TestBranchLiteralComplianceScanner:
+    def test_scanner_reports_structured_offenders_across_backend_agent_frontend(
+        self, tmp_path
+    ):
+        from app.branch_literal_compliance import scan_branch_literal_compliance
+
+        backend_app = tmp_path / "backend" / "app"
+        agent_src = tmp_path / "agent" / "src"
+        admin_src = tmp_path / "admin-ui" / "src"
+        backend_app.mkdir(parents=True)
+        agent_src.mkdir(parents=True)
+        admin_src.mkdir(parents=True)
+
+        (backend_app / "worker.py").write_text(
+            'branch = "main"\n'
+            'description="audit main -> automain back-merge"\n',
+            encoding="utf-8",
+        )
+        (agent_src / "runner.ts").write_text(
+            "const baseBranch = task.baseBranch ?? 'main';\n",
+            encoding="utf-8",
+        )
+        (admin_src / "Panel.tsx").write_text(
+            "const promotionTarget = project.promotionTarget || 'automain';\n",
+            encoding="utf-8",
+        )
+
+        offenders = [
+            offender
+            for result in scan_branch_literal_compliance(tmp_path)
+            for offender in result.offenders
+        ]
+
+        assert [(o.surface, o.path, o.line, o.pattern) for o in offenders] == [
+            ("backend", "worker.py", 1, "assign-branch-main"),
+            ("backend", "worker.py", 2, "display-main-automain"),
+            ("agent", "runner.ts", 1, "fallback-main"),
+            ("admin-ui", "Panel.tsx", 1, "fallback-main"),
+        ]
+        assert offenders[0].snippet == 'branch = "main"'
 
 
 # ── Self-repo branch resolution guard ──────────────────────────────────────
@@ -4725,7 +4738,7 @@ class TestBackendModuleSizeGuardrails:
     def _check_module(self, relative_path: str) -> None:
         max_lines = MODULE_SIZE_LIMITS[relative_path]
         path = os.path.join(os.path.dirname(__file__), "..", "app", relative_path)
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             count = len(f.readlines())
         assert count <= max_lines, _size_breach_message(
             relative_path, count, max_lines, "backend"
@@ -6158,7 +6171,7 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
 
     counts: dict[str, int] = {}
     for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
-        with open(py_file) as fh:
+        with open(py_file, encoding="utf-8") as fh:
             source = fh.read()
         try:
             tree = ast.parse(source, filename=py_file)
@@ -6175,7 +6188,7 @@ def _ast_count_attr_assignments(app_dir: str, attr_name: str) -> dict[str, int]:
                         if isinstance(t, ast.Attribute) and t.attr == attr_name:
                             count += 1
         if count > 0:
-            rel = os.path.relpath(py_file, app_dir)
+            rel = os.path.relpath(py_file, app_dir).replace(os.sep, "/")
             counts[rel] = count
     return counts
 
@@ -6187,7 +6200,7 @@ def _file_contains_lock_pattern(file_path: str, patterns: list[str]) -> bool:
     Returns True if any pattern is found, False otherwise.
     """
     try:
-        with open(file_path) as f:
+        with open(file_path, encoding="utf-8") as f:
             source = f.read()
     except (IOError, OSError):
         return False

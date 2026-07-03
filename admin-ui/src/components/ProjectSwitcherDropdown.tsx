@@ -30,15 +30,15 @@ export function ProjectSwitcherDropdown({
   }, [open]);
 
   return (
-    <div ref={ref} className="relative shrink-0">
+    <div ref={ref} className="relative min-w-0 shrink">
       <button
         onClick={() => setOpen(o => !o)}
-        className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800/60 transition-colors min-h-11"
+        className="flex min-h-11 max-w-[calc(100vw-7.5rem)] items-center gap-1.5 rounded-md border border-neutral-800 bg-[#05080d] px-2.5 py-2 text-sm font-medium text-neutral-300 transition-colors hover:border-neutral-700 hover:bg-neutral-900 hover:text-neutral-100 md:h-7 md:min-h-0 md:max-w-[18rem] md:px-2.5 md:py-0 md:text-xs"
         aria-haspopup="listbox"
         aria-expanded={open}
       >
         <FolderKanban className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
-        <span className="max-w-[160px] truncate">{label}</span>
+        <span className="min-w-0 max-w-[13rem] truncate">{label}</span>
         <ChevronDown className="w-3.5 h-3.5 text-neutral-500 shrink-0" />
       </button>
 

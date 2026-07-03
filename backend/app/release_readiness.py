@@ -34,7 +34,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import release_version
-from app.acceptance_gate import ACCEPTANCE_AGGREGATE_BUCKETS
 from app.models import (
     AuditFindingResolution,
     QualificationVerdict,
@@ -199,39 +198,6 @@ PROMOTION_READINESS_METRIC_MANIFEST: dict[str, dict] = {
         "ground_truth": "_readiness_caveat(validated): 'self-approval only' when ground_truth_validated is False; 'validated precision N%' otherwise",
         "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
     },
-    # ── acceptance signal (advisory, never flips ready) ──
-    "acceptance_proven": {
-        "ground_truth": "count of merged tasks whose declared acceptance evidence was machine-verified (TaskAcceptanceRecord.bucket == 'proven')",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_satisfied_unproven": {
-        "ground_truth": "TaskAcceptanceRecord.bucket == 'satisfied_unproven' for tasks in the open version window",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_declared_unsatisfied": {
-        "ground_truth": "TaskAcceptanceRecord.bucket == 'declared_unsatisfied' for tasks in the open version window",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_undeclared": {
-        "ground_truth": "TaskAcceptanceRecord.bucket == 'undeclared' (legacy or undeclared work, never counts against readiness)",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_merged_unverified_degraded": {
-        "ground_truth": "TaskAcceptanceRecord.bucket == 'merged_unverified_degraded' (degraded merge, could not verify acceptance)",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_malformed": {
-        "ground_truth": "TaskAcceptanceRecord.bucket == 'malformed' (unparseable acceptance record)",
-        "consumer": "admin_release_version router (readiness API response)",
-    },
-    "acceptance_unproven_present": {
-        "ground_truth": "acceptance_satisfied_unproven + acceptance_declared_unsatisfied + acceptance_merged_unverified_degraded + acceptance_malformed > 0",
-        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel (advisory caveat gate)",
-    },
-    "acceptance_caveat": {
-        "ground_truth": "_acceptance_caveat(): non-None when any unproven/unsatisfied/degraded/malformed tasks are present in the open version (conditional field — omitted when no caveat)",
-        "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
-    },
     # ── regime annotation (_annotate_regime) ──
     "promotion_enabled": {
         "ground_truth": "resolve_project_promotion_enabled(project_id) — runtime config flag",
@@ -273,98 +239,6 @@ def _readiness_caveat(validated: dict[str, Any]) -> str:
             f"measured precision"
         )
     return _READINESS_GROUND_TRUTH_CAVEAT
-
-
-# Zero-count acceptance aggregate — the fail-safe value used both for the
-# no-open-version path and whenever the aggregate query degrades. With zero
-# declared-unsatisfied tasks the readiness signal is unaffected (additive,
-# never a hard block).
-_EMPTY_ACCEPTANCE_AGGREGATE: dict[str, int] = {
-    **{bucket: 0 for bucket in ACCEPTANCE_AGGREGATE_BUCKETS},
-    "total": 0,
-}
-
-
-async def _compute_acceptance_aggregate(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> dict[str, int]:
-    """Resolve the open version's acceptance aggregate, fail-safe.
-
-    Returns the per-version canonical acceptance bucket counts over the open
-    version's window, or all-zeros when there is no open version or the query
-    fails.  Never raises — any failure degrades to zero-counts so a transient
-    aggregate error can never lower or hard-block readiness.
-    """
-    try:
-        version = await release_version.current_open_version(session, project_id)
-        if version is None or version.opened_at is None:
-            return dict(_EMPTY_ACCEPTANCE_AGGREGATE)
-        agg = await release_version.compute_version_acceptance_aggregate(
-            session, project_id, since=version.opened_at
-        )
-        return {
-            **{
-                bucket: int(agg.get(bucket, 0))
-                for bucket in ACCEPTANCE_AGGREGATE_BUCKETS
-            },
-            "total": int(agg.get("total", 0)),
-        }
-    except Exception:  # noqa: BLE001 — defensive: any failure must not block readiness
-        logger.warning(
-            "[RELEASE_READINESS] acceptance aggregate failed for project %s; "
-            "degrading to zero-counts (readiness unaffected)",
-            project_id,
-            exc_info=True,
-        )
-        return dict(_EMPTY_ACCEPTANCE_AGGREGATE)
-
-
-def _acceptance_keys(aggregate: dict[str, int]) -> dict[str, Any]:
-    """Additive readiness keys derived from an acceptance aggregate.
-
-    Strictly fail-safe: undeclared / legacy tasks never count against readiness.
-    The keys are advisory — they augment the readiness dict but never flip
-    ``ready`` (mirroring how ``validated_precision`` augments, never replaces,
-    the self-approval signal).
-    """
-    satisfied_unproven = int(aggregate.get("satisfied_unproven", 0))
-    declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
-    degraded = int(aggregate.get("merged_unverified_degraded", 0))
-    malformed = int(aggregate.get("malformed", 0))
-    return {
-        "acceptance_proven": int(aggregate.get("proven", 0)),
-        "acceptance_satisfied_unproven": satisfied_unproven,
-        "acceptance_declared_unsatisfied": declared_unsatisfied,
-        "acceptance_undeclared": int(aggregate.get("undeclared", 0)),
-        "acceptance_merged_unverified_degraded": degraded,
-        "acceptance_malformed": malformed,
-        "acceptance_unproven_present": (
-            satisfied_unproven + declared_unsatisfied + degraded + malformed
-        )
-        > 0,
-    }
-
-
-def _acceptance_caveat(aggregate: dict[str, int]) -> str | None:
-    """Advisory caveat when the open version contains unproven work.
-
-    Returns ``None`` for empty, proven-only, or undeclared-only windows.
-    """
-    satisfied_unproven = int(aggregate.get("satisfied_unproven", 0))
-    declared_unsatisfied = int(aggregate.get("declared_unsatisfied", 0))
-    degraded = int(aggregate.get("merged_unverified_degraded", 0))
-    malformed = int(aggregate.get("malformed", 0))
-    if satisfied_unproven + declared_unsatisfied + degraded + malformed <= 0:
-        return None
-    return (
-        "acceptance not fully proven — this version contains "
-        f"{satisfied_unproven} satisfied-but-not-machine-proven task(s), "
-        f"{declared_unsatisfied} declared-unsatisfied task(s), {degraded} "
-        f"degraded-unverified merge(s), and {malformed} malformed recorded "
-        "verdict(s) (advisory: claimed-but-not-machine-proven work does not "
-        "hard-block promotion)"
-    )
 
 
 async def _compute_validated_precision(
@@ -478,12 +352,16 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         ),
         "test_erosion_detail": qual.get("test_erosion_detail"),
         "smoketest_detail": qual.get("smoketest_detail"),
+        # Per-attempt smoketest enablement flag — False when the smoketest
+        # dimension was disabled for this run (the sub_score is then
+        # zero-weighted and the 0.0 placeholder should not be shown as an
+        # active lane).  None on legacy records that predate this field.
+        "smoketest_enabled": qual.get("smoketest_enabled"),
         "audit_reconciliation": _recon_out,
         "audit_leg_proof": _audit_leg_proof,
         "promotion_pr_url": qual.get("promotion_pr_url"),
         "promotion_conflict": qual.get("promotion_conflict"),
         "promotion_error_detail": qual.get("promotion_error_detail"),
-        "theme_delivery": qual.get("theme_delivery"),
         "goal_alignment": qual.get("goal_alignment"),
         "blind_merge_grade": qual.get("blind_merge_grade"),
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f): the operator
@@ -511,12 +389,6 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     evidence keys are additive and may be ``None`` on legacy rows that predate
     the evidence columns.
     """
-    acceptance_aggregate = None
-    sub_scores = verdict.sub_scores or {}
-    if isinstance(sub_scores, dict):
-        acceptance_aggregate = sub_scores.get("acceptance_aggregate")
-    if acceptance_aggregate is None:
-        acceptance_aggregate = getattr(verdict, "acceptance_aggregate", None)
     _vrecon = verdict.audit_reconciliation
     _v_audit_leg_proof = (
         _vrecon.get("audit_leg_proof") if isinstance(_vrecon, dict) else None
@@ -526,12 +398,17 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         if isinstance(_vrecon, dict)
         else _vrecon
     )
+    sub_scores = verdict.sub_scores
+    if isinstance(sub_scores, dict):
+        sub_scores = {
+            k: v for k, v in sub_scores.items() if k != "acceptance_aggregate"
+        }
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
         "candidate_sha": verdict.candidate_sha,
         "confidence": verdict.confidence,
-        "sub_scores": verdict.sub_scores,
+        "sub_scores": sub_scores,
         "blocker": verdict.blocker,
         "audit_missing_reason": verdict.audit_missing_reason,
         "would_promote": verdict.would_promote,
@@ -565,6 +442,11 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "challenger_refuted_audit_findings": verdict.challenger_refuted_audit_findings,
         "test_erosion_detail": verdict.test_erosion_detail,
         "smoketest_detail": verdict.smoketest_detail,
+        # Per-attempt smoketest enablement flag read from sub_scores JSON
+        # (embedded at verdict-recording time).  None on legacy rows that
+        # predate the field; False means the dimension was disabled and the
+        # 0.0 sub-score placeholder should not be rendered as an active lane.
+        "smoketest_enabled": _sub(verdict, "smoketest_enabled"),
         "audit_reconciliation": _vrecon_out,
         "audit_leg_proof": _v_audit_leg_proof,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f).
@@ -581,14 +463,6 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "acceptance_window_total": _sub(verdict, "acceptance_window_total"),
         "acceptance_window_verified": _sub(verdict, "acceptance_window_verified"),
         "acceptance_window_fraction": _sub(verdict, "acceptance_window_fraction"),
-        # Version-window acceptance aggregate (proven-vs-merged) recorded for this
-        # verdict's evaluated candidate — additive and nullable. Computed/stored
-        # by the acceptance layer; surfaced here so each verdict row carries the
-        # proven claim state next to the raw merged counts. ``None`` on legacy
-        # rows that predate the aggregate.
-        "acceptance_aggregate": acceptance_aggregate,
-        # Theme-delivery cert (additive; None on legacy rows predating migration 0305).
-        "theme_delivery": verdict.theme_delivery,
         # Goal-alignment cert (additive; None on legacy rows predating migration 0328).
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
@@ -750,9 +624,6 @@ async def compute_promotion_readiness(
     verdicts = list((await session.execute(stmt)).scalars().all())
 
     validated = await _compute_validated_precision(session, project_id)
-    acceptance = await _compute_acceptance_aggregate(session, project_id)
-    acceptance_keys = _acceptance_keys(acceptance)
-    acceptance_caveat = _acceptance_caveat(acceptance)
 
     evaluated = len(verdicts)
     if evaluated == 0:
@@ -762,9 +633,6 @@ async def compute_promotion_readiness(
             consecutive_infra_errors=consecutive_infra_errors,
             validated=validated,
         )
-        out.update(acceptance_keys)
-        if acceptance_caveat:
-            out["acceptance_caveat"] = acceptance_caveat
         if infra_failure_count:
             out["reason"] = (
                 "recent qualifications have been infrastructure failures, not quality findings"
@@ -836,14 +704,6 @@ async def compute_promotion_readiness(
     else:
         reason = "; ".join(reasons)
 
-    # Acceptance signal is additive and advisory: when the open version contains
-    # merged tasks whose DECLARED acceptance evidence did not pass, surface a
-    # caveat on the reason so operators/strategist see the version is not fully
-    # proven. It never flips ``ready`` (mirrors validated_precision: augment,
-    # never replace) and undeclared/legacy work never contributes.
-    if acceptance_caveat:
-        reason = f"{reason} NOTE: {acceptance_caveat}"
-
     out = {
         "ready": ready,
         "reason": reason,
@@ -870,9 +730,6 @@ async def compute_promotion_readiness(
         "ground_truth_validated": validated["ground_truth_validated"],
         "caveat": _readiness_caveat(validated),
     }
-    out.update(acceptance_keys)
-    if acceptance_caveat:
-        out["acceptance_caveat"] = acceptance_caveat
     return _annotate_regime(out, promotion_enabled)
 
 
@@ -1191,3 +1048,102 @@ async def compute_requalification_readiness(
         "reason": reason,
         "findings": gating,
     }
+
+
+async def compute_goal_coverage_drift_signal(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any] | None:
+    """Compute a cheap goal-coverage divergence signal for the open version.
+
+    Best-effort and fail-safe: any failure returns None (caller degrades
+    gracefully). Reads persisted merge-grade fields from the latest
+    QualificationVerdict + a cheap COUNT of tasks merged since that verdict,
+    then delegates to the pure ``compute_goal_coverage_drift`` scorer.
+
+    Returns a dict with keys ``signal``, ``coverage``, ``biggest_gap``,
+    ``merges_since_grade``, ``stale``, ``detail`` — or None on any error.
+    """
+    from app.release_scoring import compute_goal_coverage_drift  # noqa: PLC0415
+    from app import release_version as _rv  # noqa: PLC0415
+
+    try:
+        version = (
+            (
+                await session.execute(
+                    select(ReleaseVersion)
+                    .where(
+                        ReleaseVersion.project_id == project_id,
+                        ReleaseVersion.status == "open",
+                    )
+                    .order_by(ReleaseVersion.opened_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if version is None:
+            return None
+
+        goal = version.goal
+
+        # Find the latest verdict that carries a merge-grade result.
+        verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == version.id,
+                        QualificationVerdict.merge_grade_status.is_not(None),
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+        if verdict is None:
+            merges_since_open: int = 0
+            if version.opened_at is not None:
+                try:
+                    merges_since_open = await _rv.count_merged_since(
+                        session, project_id, version.opened_at
+                    )
+                except Exception:
+                    logger.exception(
+                        "[DRIFT] count_merged_since(opened_at) failed for project %s",
+                        project_id,
+                    )
+            return compute_goal_coverage_drift(
+                goal,
+                merge_grade_status=None,
+                merges_since_grade=merges_since_open,
+            )
+
+        merges_since: int = 0
+        if verdict.finalized_at is not None:
+            try:
+                merges_since = await _rv.count_merged_since(
+                    session, project_id, verdict.finalized_at
+                )
+            except Exception:
+                logger.exception(
+                    "[DRIFT] count_merged_since failed for project %s", project_id
+                )
+
+        return compute_goal_coverage_drift(
+            goal,
+            merge_grade_status=verdict.merge_grade_status,
+            merge_grade_coverage=verdict.merge_grade_coverage,
+            merge_grade_biggest_gap=verdict.merge_grade_biggest_gap,
+            goal_alignment=verdict.goal_alignment,
+            merges_since_grade=merges_since,
+        )
+    except Exception:
+        logger.exception(
+            "[DRIFT] goal_coverage_drift compute failed for project %s", project_id
+        )
+        return None

@@ -50,6 +50,10 @@ from app.runtime_config_state import (
 from app.schemas import ResourceEnvelope as ResourceEnvelopeSchema
 from app.task_locking import lock_project_or_429, with_design_doc_locked
 from app.playbook_storage import archive_playbook_entry
+from app.alert_policy import (
+    apply_project_alert_domain_updates,
+    serialize_project_alert_domains,
+)
 from app.shared_state import (
     backfill_branch_columns,
     backfill_task_branch_namespace,
@@ -1374,6 +1378,56 @@ async def update_resource_envelope_config(
         active_vm_count=active_vm_count,
         spend_breakdown=spend_breakdown,
     )
+
+
+# ---------------------------------------------------------------------------
+# Alert-domain config endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get("/projects/{project_id}/alert-domains")
+async def get_alert_domains_config(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return reusable alert-domain enablement for a project."""
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    return serialize_project_alert_domains(project)
+
+
+@router.patch("/projects/{project_id}/alert-domains")
+async def update_alert_domains_config(
+    project_id: uuid.UUID,
+    body: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Enable, disable, or reset project-specific alert domains.
+
+    Body shape:
+      {"domains": {"warm_pool": {"enabled": true}, "sr_quality": null}}
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    if "domains" not in body or not isinstance(body["domains"], dict):
+        raise HTTPException(
+            status_code=422,
+            detail="Request body must include object field 'domains'",
+        )
+    project = await lock_project_or_429(session, project_id)
+    try:
+        response = apply_project_alert_domain_updates(project, body["domains"])
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    flag_modified(project, "build_config")
+    session.add(project)
+    await session.commit()
+    await session.refresh(project)
+    return response
 
 
 # ---------------------------------------------------------------------------

@@ -125,4 +125,47 @@ describe('parseTimestamp guard: prevent direct new Date(apiString)', () => {
     expect(file).not.toContain('new Date(lastFiredAt)');
     expect(file).not.toContain("v + 'Z'");
   });
+
+  it('MessagesPanel.tsx uses parseTimestamp for Strategic session freshness', () => {
+    const file = readFileSync(
+      path.join(__dirname, '../components/MessagesPanel.tsx'),
+      'utf-8'
+    );
+    expect(file).toContain('parseTimestamp(sessionFreshTs)');
+    expect(file).not.toContain('new Date(sessionFreshTs)');
+  });
+
+  it('strategicContextDescriptor.ts imports parseTimestamp', () => {
+    const file = readFileSync(
+      path.join(__dirname, './strategicContextDescriptor.ts'),
+      'utf-8'
+    );
+    expect(file).toContain("import { parseTimestamp } from './time'");
+  });
+
+  it('strategicContextDescriptor.ts uses parseTimestamp for session freshness', () => {
+    const file = readFileSync(
+      path.join(__dirname, './strategicContextDescriptor.ts'),
+      'utf-8'
+    );
+    expect(file).toContain('parseTimestamp(ts)');
+    expect(file).not.toContain('new Date(ts)');
+  });
+
+  it('strategicWorkbenchSession.ts imports parseTimestamp', () => {
+    const file = readFileSync(
+      path.join(__dirname, './strategicWorkbenchSession.ts'),
+      'utf-8'
+    );
+    expect(file).toContain("import { parseTimestamp } from './time'");
+  });
+
+  it('strategicWorkbenchSession.ts uses parseTimestamp for stale-base detection', () => {
+    const file = readFileSync(
+      path.join(__dirname, './strategicWorkbenchSession.ts'),
+      'utf-8'
+    );
+    expect(file).toContain('parseTimestamp(ts)');
+    expect(file).not.toContain('new Date(ts)');
+  });
 });

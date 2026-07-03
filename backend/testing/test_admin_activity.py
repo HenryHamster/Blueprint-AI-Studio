@@ -1,9 +1,19 @@
 """Tests for /api/admin/activity PR impact annotations on TASK_COMPLETED events."""
 
+from datetime import timedelta
+
 import pytest
 from httpx import AsyncClient
 
-from app.models import Project, ProjectMember, Task, TaskStatus, Artifact, ArtifactType
+from app.models import (
+    Project,
+    ProjectMember,
+    Task,
+    TaskStatus,
+    Artifact,
+    ArtifactType,
+    _utcnow,
+)
 
 
 TEST_USER_ID = "test-user-123"
@@ -80,6 +90,84 @@ async def test_completed_task_missing_context_fields_are_none(
     assert ev["scope"] is None
     assert ev["direction_id"] is None
     assert ev["review_iterations"] is None
+
+
+@pytest.mark.parametrize(
+    ("task_status", "event_type"),
+    [
+        (TaskStatus.COMPLETED, "TASK_COMPLETED"),
+        (TaskStatus.FAILED, "TASK_FAILED"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_task_created_before_window_uses_completed_at(
+    task_status: TaskStatus,
+    event_type: str,
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    completed_at = now - timedelta(minutes=5)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "long running"}],
+        status=task_status,
+        title="Long running task",
+        created_at=now - timedelta(days=14),
+        started_at=now - timedelta(days=14),
+        completed_at=completed_at,
+        status_log=[
+            {
+                "s": task_status.value,
+                "t": completed_at.isoformat(),
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+
+    assert resp.status_code == 200
+    terminal_events = [e for e in resp.json()["events"] if e["type"] == event_type]
+    assert [event["task_id"] for event in terminal_events] == [str(task.id)]
+    assert terminal_events[0]["timestamp"] == completed_at.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_terminal_task_without_completed_at_uses_updated_at_not_status_log(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    now = _utcnow()
+    updated_at = now - timedelta(minutes=3)
+    old_terminal_at = now - timedelta(days=10)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "legacy terminal row"}],
+        status=TaskStatus.COMPLETED,
+        title="Legacy terminal task",
+        created_at=now - timedelta(days=14),
+        started_at=now - timedelta(days=14),
+        completed_at=None,
+        updated_at=updated_at,
+        status_log=[
+            {
+                "s": TaskStatus.COMPLETED.value,
+                "t": old_terminal_at.isoformat(),
+            }
+        ],
+    )
+    task.updated_at = updated_at
+    db_session.add(task)
+    await db_session.commit()
+
+    resp = await client.get("/api/admin/activity")
+
+    assert resp.status_code == 200
+    completed = [e for e in resp.json()["events"] if e["type"] == "TASK_COMPLETED"]
+    assert [event["task_id"] for event in completed] == [str(task.id)]
+    assert completed[0]["timestamp"] == updated_at.isoformat()
 
 
 @pytest.mark.asyncio

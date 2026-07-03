@@ -4,6 +4,7 @@ import { DetailsTab } from './TaskDetailDrawerMeta';
 import type { Task } from '../types/task';
 import { authGet, fetchComputeJobs, resolveArtifactDownloadUrl, resolveViewportFailureDownloadUrl, resolveViewportShotDownloadUrl } from '../api';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
+import { formatAbsolute } from '../utils/time';
 
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
@@ -13,17 +14,20 @@ vi.mock('../firebase', () => ({
   onAuthChange: vi.fn(() => () => {}),
 }));
 
-vi.mock('../api', () => ({
-  authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
-  apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
-  API_BASE_URL: 'http://localhost:8000',
-  fetchComputeJobs: vi.fn(async () => ({ jobs: [], hasMore: false, summary: { total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 }, limit: 50, offset: 0 })),
-  fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
-  resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
-  resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
-  resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
-  fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(async () => new Response(JSON.stringify({ stats: {} }), { status: 200 })),
+    apiFetch: vi.fn(async () => new Response(JSON.stringify({ task_id: 'task-1', fix_loop_history: {}, summary: {} }), { status: 200 })),
+    API_BASE_URL: 'http://localhost:8000',
+    fetchComputeJobs: vi.fn(async () => ({ jobs: [], hasMore: false, summary: { total_jobs: 0, active_jobs: 0, terminal_jobs: 0, total_spend_usd: 0, outcome_breakdown: {}, criterion_measured: 0, criterion_met: 0 }, limit: 50, offset: 0 })),
+    fetchKnowledgeDocument: vi.fn(async () => ({ id: 'doc-1', body: '# Full body\n\nDetailed markdown.' })),
+    resolveArtifactDownloadUrl: vi.fn(async () => 'https://signed.example.com/tasks/task-1/result.json'),
+    resolveViewportFailureDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport/screenshot.png'),
+    resolveViewportShotDownloadUrl: vi.fn(async () => 'https://signed.example.com/viewport-shots/shot.png'),
+    fetchTaskSerialConsole: vi.fn(async () => ({ serial_log: '', source: 'cached', vm_status: 'TERMINATED', vm_instance_id: 'test' })),
+  });
+});
 
 function wrapJobs(jobs: ComputeJob[], hasMore = false): ComputeJobsListResponse {
   return {
@@ -60,6 +64,185 @@ function makeTask(overrides: Partial<Task> = {}): Task {
 function mergeTestArtifact(verdict: Record<string, unknown>, iteration = 1) {
   return { artifact_type: 'MERGE_TEST_RESULT', logs: JSON.stringify(verdict), iteration };
 }
+
+describe('DetailsTab — sideboard context', () => {
+  afterEach(() => {
+    vi.mocked(authGet).mockResolvedValue(new Response(JSON.stringify({ stats: {} }), { status: 200 }));
+    cleanup();
+  });
+
+  it('renders bounded task sideboard context', () => {
+    const onNavigateToTask = vi.fn();
+    render(
+      <DetailsTab
+        task={makeTask({
+          id: 'task-sideboard',
+          project_id: 'proj-1',
+          sideboard_context: {
+            project: { id: 'proj-1', name: 'Blueprint', repo: 'HenryHamster/BlueprintAIStudio' },
+            purpose: 'Task sideboard integration',
+            strategic: {
+              direction: {
+                id: 'd-active',
+                text: 'Keep active work tied to the operator sideboard.',
+                priority: 'high',
+                status: 'active',
+              },
+              cycle: { id: 'sc-1', phase: 'strategic_review', outcome: 'phase2_running' },
+              parent_strategic_task_id: 'sc-1',
+            },
+            pipeline: {
+              parent_task_id: 'parent-task-123456',
+              child_count: 2,
+              dependency_count: 1,
+              blocked_reason: 'Waiting for reviewer feedback.',
+            },
+            artifacts: {
+              total: 1,
+              by_type: { PULL_REQUEST: 1 },
+              primary_pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
+              primary_commit: 'abcdef1234567890',
+            },
+            messages: {
+              total_recent: 3,
+              items: [
+                {
+                  id: 'msg-1',
+                  project_id: 'proj-1',
+                  message_type: 'NOTE',
+                  from_type: 'agent',
+                  from_task_id: 'task-sideboard',
+                  content: 'Recent task update',
+                  context: {},
+                  status: 'open',
+                  resolution: null,
+                  resolved_at: null,
+                  created_at: '2026-06-29T12:00:00Z',
+                },
+                {
+                  id: 'msg-2',
+                  project_id: 'proj-1',
+                  message_type: 'STATUS',
+                  from_type: 'agent',
+                  from_task_id: 'task-sideboard',
+                  content: 'Second bounded task update',
+                  context: {},
+                  status: 'open',
+                  resolution: null,
+                  resolved_at: null,
+                  created_at: '2026-06-29T12:02:00Z',
+                },
+              ],
+            },
+            links: [
+              { id: 'pipeline', label: 'Pipeline', target: { surface: 'pipeline', id: 'task-sideboard', task_id: 'task-sideboard' } },
+              { id: 'linked-task', label: 'Linked task', target: { surface: 'task', id: 'legacy-linked-task-id', task_id: 'linked-task-abcdef' } },
+              { id: 'direction', label: 'Direction', target: { surface: 'project', section: 'directions', id: 'd-active', direction_id: 'd-active' } },
+              { id: 'pull_request', label: 'PR', target: { surface: 'external', id: 'legacy-pr-url', url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/42' } },
+            ],
+          },
+        })}
+        onNavigateToTask={onNavigateToTask}
+      />,
+    );
+
+    expect(screen.getByText('Context')).toBeInTheDocument();
+    expect(screen.getByText('HenryHamster/BlueprintAIStudio')).toBeInTheDocument();
+    expect(screen.getByText('Task sideboard integration')).toBeInTheDocument();
+    expect(screen.getByText('Keep active work tied to the operator sideboard.')).toBeInTheDocument();
+    expect(screen.getByText('sc-1')).toBeInTheDocument();
+    expect(screen.getByText('strategic review')).toBeInTheDocument();
+    expect(screen.getByText('phase2_running')).toBeInTheDocument();
+    const dependenciesStat = screen.getByText('Dependencies').parentElement;
+    const childrenStat = screen.getByText('Children').parentElement;
+    expect(dependenciesStat).toHaveTextContent('1');
+    expect(childrenStat).toHaveTextContent('2');
+    expect(screen.getByText('Waiting for reviewer feedback.')).toBeInTheDocument();
+    expect(screen.getByText('pull request 1')).toBeInTheDocument();
+    expect(screen.getByText('abcdef123456')).toBeInTheDocument();
+    expect(screen.getByText('Recent task update')).toBeInTheDocument();
+    expect(screen.getByText('Second bounded task update')).toBeInTheDocument();
+    expect(screen.getByText('+1 more recent message')).toBeInTheDocument();
+    expect(screen.getAllByText('task-sideboard').length).toBeGreaterThan(0);
+    expect(screen.getByText('linked-task-abcdef')).toBeInTheDocument();
+    expect(screen.getByText('direction d-active')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'PR github.com/HenryHamster/BlueprintAIStudio/pull/42' })).toHaveAttribute(
+      'href',
+      'https://github.com/HenryHamster/BlueprintAIStudio/pull/42',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'parent parent-task-123456' }));
+    expect(onNavigateToTask).toHaveBeenCalledWith('parent-task-123456');
+    fireEvent.click(screen.getByRole('button', { name: 'Linked task linked-task-abcdef' }));
+    expect(onNavigateToTask).toHaveBeenCalledWith('linked-task-abcdef');
+  });
+
+  it('guards sideboard external links while preserving legacy id URLs', () => {
+    render(
+      <DetailsTab
+        task={makeTask({
+          sideboard_context: {
+            project: { id: 'proj-1', name: 'Blueprint', repo: null },
+            purpose: null,
+            strategic: { direction: null, cycle: null },
+            pipeline: { parent_task_id: null, child_count: 0, dependency_count: 0, blocked_reason: null },
+            artifacts: { total: 0, by_type: {}, primary_pr_url: 'javascript:alert(1)', primary_commit: null },
+            messages: { total_recent: 0, items: [] },
+            links: [
+              {
+                id: 'legacy_pr',
+                label: 'Legacy PR',
+                target: {
+                  surface: 'external',
+                  id: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/43',
+                },
+              },
+              {
+                id: 'unsafe_pr',
+                label: 'Unsafe PR',
+                target: {
+                  surface: 'external',
+                  id: 'legacy-unsafe-url',
+                  url: 'javascript:alert(1)',
+                },
+              },
+            ],
+          },
+        })}
+      />,
+    );
+
+    expect(screen.queryByRole('link', { name: 'pull request' })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Legacy PR github.com/HenryHamster/BlueprintAIStudio/pull/43' })).toHaveAttribute(
+      'href',
+      'https://github.com/HenryHamster/BlueprintAIStudio/pull/43',
+    );
+    expect(screen.getByText('Unsafe PR').closest('a')).toBeNull();
+  });
+
+  it('falls back to legacy direction lookup when sideboard context is absent', async () => {
+    vi.mocked(authGet).mockImplementation(async (url: string) => {
+      if (url.includes('/directions')) {
+        return new Response(JSON.stringify({
+          directions: [{ id: 'd-legacy', text: 'Legacy direction text' }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ stats: {} }), { status: 200 });
+    });
+
+    render(
+      <DetailsTab
+        task={makeTask({
+          project_id: 'proj-legacy',
+          context: { direction_id: 'd-legacy' },
+        })}
+      />,
+    );
+
+    expect(await screen.findByText('Legacy direction text')).toBeInTheDocument();
+    expect(screen.getByText('d-legacy')).toBeInTheDocument();
+  });
+});
 
 describe('DetailsTab — parked wake registration', () => {
   afterEach(() => cleanup());
@@ -110,8 +293,8 @@ describe('DetailsTab — parked wake registration', () => {
     expect(screen.getByText('job-123')).toBeInTheDocument();
     expect(screen.getByText('Delivery')).toBeInTheDocument();
     expect(screen.getByText('Delivered')).toBeInTheDocument();
-    expect(screen.getByText(/12:10:00 PM/)).toBeInTheDocument();
-    expect(screen.getByText(/01:00:00 PM/)).toBeInTheDocument();
+    expect(screen.getByText(formatAbsolute('2026-06-01T12:10:00Z'))).toBeInTheDocument();
+    expect(screen.getByText(formatAbsolute('2026-06-01T13:00:00Z'))).toBeInTheDocument();
     expect(screen.getByText('resumed: Task re-queued after compute job completed')).toBeInTheDocument();
   });
 });

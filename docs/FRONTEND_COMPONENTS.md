@@ -13,7 +13,7 @@ Components are organized by feature area:
 - **Dashboards** — DashboardHome, MetricsDashboard, KanbanBoard
 - **Autonomous Mode** — DirectionsPanel, DirectionCard, AutonomousStatus
 - **Analytics** — ProviderCostPanel, SrTrendBreakdown, PipelineRegressionsPanel
-- **Settings** — SettingsDropdown, ProjectAutoReviewSection
+- **Settings** — SettingsSectionRouter, runtime/project settings section components
 - **Utilities** — Pagination, ColumnsPicker, ConfirmDialog
 
 ---
@@ -37,7 +37,7 @@ Top navigation bar with project selector, alerts, and settings.
 - Real-time alert badge
 - Breadcrumb navigation
 - GitHub status indicator
-- Settings dropdown
+- Settings entry point into the routed Runtime Settings workspace
 
 ---
 
@@ -320,28 +320,33 @@ Metrics on "medium scope" changes (100-500 line diffs).
 
 ## Settings Components
 
-### SettingsDropdown
+Settings are routed through workspace-hosted sections. The HeaderBar gear opens
+Runtime Settings, and Project Manage hosts project-scoped settings.
 
-Gear icon menu with admin-only options.
+`settingsSections.ts` defines the canonical `SectionId` union. Runtime IDs are
+`general`, `provider-routing`, `provider-settings`, `orchestrator`, `deploy`,
+`accounts`, `notifications`, and `advanced`; project IDs are `build-config`,
+`branches`, `auto-review`, `resource-envelope`, `auto-remediation`,
+`issue-implementation`, `alert-domains`, and `access`.
 
-**Options:**
-- GitHub connection status + "Reconnect"
-- Autonomous mode toggle + settings
-- Max plan accounts (paste OAuth token)
-- Database health check
-- Logs export
+`OperatorWorkspaceSections.ts` maps those IDs into `PROJECT_MANAGE_SECTIONS`,
+`RUNTIME_SECTIONS`, `RUNTIME_SETTINGS_SECTIONS`, and `SETTINGS_SECTION_HOMES`
+for command and strategic-context routing.
 
----
+`SettingsSectionRouter.tsx` renders the active `SectionId` body. Runtime bodies
+include `SettingsGeneralSection`, `SettingsOrchestratorSection`, `DeploySection`,
+`ProviderCategoriesPanel`, `ProviderSettingsPanel`, `SettingsAccountsSection`,
+`SettingsNotificationsSection`, and `SettingsAdvancedSection`; project bodies
+include `ProjectBuildConfigSection`, `ProjectBranchesSection`,
+`ProjectAutoReviewSection`, `ProjectResourceEnvelopeSection`,
+`ProjectAutoRemediationSection`, `ProjectIssueImplementationSection`,
+`ProjectAlertDomainsSection`, and router-rendered `access` actions.
 
-### ProjectAutoReviewSection
-
-Configure auto-review behavior for a project.
-
-**Settings:**
-- Enable/disable auto-review
-- Review focus areas (checkboxes)
-- Max review iterations
-- Confidence threshold
+Viewport coverage lives in `SettingsSectionRouter.viewport.test.tsx` plus
+focused viewport tests for representative section bodies such as
+`SettingsGeneralSection`, `SettingsAdvancedSection`, `SettingsDeploySection`,
+`ProjectBuildConfigSection`, `ProjectBranchesSection`, and
+`ProjectAutoReviewSection`.
 
 ---
 

@@ -492,6 +492,14 @@ export function buildUserPausedSection(
 }
 
 const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+// Derived qualification states that mean an audit / promotion run is actively
+// in flight for the current candidate. When the effective status is any of
+// these, the agent must NOT emit `qualify_request` — a run is already going.
+// `'pending'` is the raw stamp; `'qualifying'` is the derived state the backend
+// surfaces while the audit is actually executing. Missing `'qualifying'` here
+// was the wait-guard regression: the pending warning was silently dropped once
+// the raw status was superseded by the derived `'qualifying'` state.
+const AUDIT_IN_PROGRESS_STATES = new Set(['pending', 'qualifying']);
 const QUALIFICATION_SEVERITY_ORDER: Record<string, number> = {
   blocker: 0,
   critical: 1,
@@ -718,6 +726,52 @@ function formatQualificationDetails(qualification: Record<string, unknown>): str
   return lines;
 }
 
+function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[] {
+  const coverageRaw = versionPhase.criterion_coverage;
+  if (!coverageRaw || typeof coverageRaw !== 'object' || Array.isArray(coverageRaw)) return [];
+
+  const coverage = coverageRaw as Record<string, unknown>;
+  const total = typeof coverage.total === 'number' ? coverage.total : null;
+  const covered = typeof coverage.covered === 'number' ? coverage.covered : null;
+  const partial = typeof coverage.partial === 'number' ? coverage.partial : null;
+  const uncovered = typeof coverage.uncovered === 'number' ? coverage.uncovered : null;
+  if (total === null || total <= 0 || covered === null || partial === null || uncovered === null) return [];
+
+  const lines = [
+    `**Acceptance criteria coverage (canonical): ${covered}/${total} covered, ${partial} partial, ${uncovered} uncovered.**`,
+    `Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence; legacy goal/proven heuristics below are secondary context only.`,
+  ];
+
+  if (Array.isArray(coverage.criteria)) {
+    const criteriaLines: string[] = [];
+    for (const item of coverage.criteria) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+      const criterion = item as Record<string, unknown>;
+      const criterionCoverage = typeof criterion.coverage === 'string' ? criterion.coverage.trim() : '';
+      if (criterionCoverage !== 'uncovered' && criterionCoverage !== 'partial') continue;
+
+      const key = typeof criterion.criterion_key === 'string' && criterion.criterion_key.trim()
+        ? criterion.criterion_key.trim()
+        : null;
+      const text = typeof criterion.text === 'string' && criterion.text.trim()
+        ? criterion.text.trim()
+        : null;
+      if (!key || !text) continue;
+
+      const evidenceCount = typeof criterion.evidence_count === 'number'
+        ? `, evidence=${criterion.evidence_count}`
+        : '';
+      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount} — ${text}`);
+    }
+    if (criteriaLines.length > 0) {
+      lines.push(`Acceptance criteria needing evidence:`);
+      lines.push(...criteriaLines);
+    }
+  }
+
+  return lines;
+}
+
 /**
  * Builds the version-phase status block for the strategic thinker prompt.
  * Explains the current phase, what each phase means, and instructs the agent
@@ -734,10 +788,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     ? versionPhase.tasks_merged_this_version : null;
   const goal = typeof versionPhase.goal === 'string' && versionPhase.goal.trim()
     ? versionPhase.goal.trim() : null;
-  const theme = typeof versionPhase.theme === 'string' && versionPhase.theme.trim()
-    ? versionPhase.theme.trim() : null;
   const goalNeeded = versionPhase.goal_needed === true;
-  const themeNeeded = versionPhase.theme_needed === true;
   // The backend always sends last_qualification as an object (the structured
   // qualification record: {status, candidate_sha, confidence, blocker, ...}) or
   // null — never a string. Render a compact summary line so the agent can see
@@ -749,7 +800,15 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const qualStatus = lastQualification && typeof lastQualification.status === 'string'
     ? lastQualification.status
     : null;
-  const qualificationPending = qualStatus === 'pending';
+  const qualificationStateRaw = versionPhase.qualification_state;
+  const qualificationState = qualificationStateRaw && typeof qualificationStateRaw === 'object' && !Array.isArray(qualificationStateRaw)
+    ? qualificationStateRaw as Record<string, unknown>
+    : null;
+  const effectiveQualStatus = qualStatus === 'pending' && typeof qualificationState?.state === 'string'
+    ? qualificationState.state
+    : qualStatus;
+  const qualificationPending = typeof effectiveQualStatus === 'string'
+    && AUDIT_IN_PROGRESS_STATES.has(effectiveQualStatus);
   // A finalized conclusive verdict (dry_run, not_promoted, or promoted) means
   // the candidate has been fully evaluated and the outcome is settled. In the
   // shipped-dark default (promotion_enabled=False) a passing candidate records
@@ -768,11 +827,6 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   } else if (goalNeeded) {
     parts.push(`**ACTION NEEDED: Author the version goal.** Emit \`new_version_goal\` in Section 6 problem_model update (a one-sentence statement of what this version is for).`);
   }
-  if (theme) {
-    parts.push(`Theme: ${theme}`);
-  } else if (themeNeeded) {
-    parts.push(`**ACTION NEEDED: Author the version theme.** Emit \`new_version_theme\` in Section 6 problem_model update (one of: leanness, reliability, performance, feature, mixed, none).`);
-  }
 
   if (phaseChangedAt) {
     parts.push(`Phase entered: ${phaseChangedAt}`);
@@ -780,12 +834,13 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   if (tasksMergedThisVersion !== null) {
     parts.push(`Tasks merged this version: ${tasksMergedThisVersion}`);
   }
+  parts.push(...formatCriterionCoverage(versionPhase));
   if (lastQualification) {
     // Compact one-line summary: status, then confidence / candidate_sha /
     // blocker when present. Keeps the prompt small while surfacing whether a
     // qualification is already running (status='pending').
     const qualBits: string[] = [];
-    qualBits.push(`status=${qualStatus ?? 'unknown'}`);
+    qualBits.push(`status=${effectiveQualStatus ?? 'unknown'}`);
     if (typeof lastQualification.confidence === 'number') {
       qualBits.push(`confidence=${lastQualification.confidence}`);
     }
@@ -816,6 +871,60 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
         `(i.e. the candidate commit has changed). Re-qualifying the same ` +
         `already-scored candidate just re-spawns agent VMs and is ignored.`,
       );
+    }
+  }
+
+  // Version-phase candidate currency: is the last qualification's candidate SHA still HEAD?
+  const lqCurrencyRaw = versionPhase.last_qualification_candidate_currency;
+  if (lqCurrencyRaw && typeof lqCurrencyRaw === 'object' && !Array.isArray(lqCurrencyRaw)) {
+    const lqc = lqCurrencyRaw as Record<string, unknown>;
+    const isCurrent = lqc.current === true;
+    const candidateSha = typeof lqc.candidate_sha === 'string' && lqc.candidate_sha
+      ? lqc.candidate_sha.slice(0, 12) : '?';
+    const headSha = typeof lqc.head_sha === 'string' && lqc.head_sha
+      ? lqc.head_sha.slice(0, 12) : '?';
+    if (isCurrent) {
+      parts.push(`Qualification candidate currency: CURRENT — candidate \`${candidateSha}\` matches integration HEAD. Audit findings reflect live HEAD.`);
+    } else {
+      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+    }
+  }
+
+  // Goal-coverage drift signal (continuous BUILD/STABILIZE early-warning).
+  const driftRaw = versionPhase.goal_coverage_drift;
+  if (driftRaw && typeof driftRaw === 'object' && !Array.isArray(driftRaw)) {
+    const drift = driftRaw as Record<string, unknown>;
+    const driftSignal = typeof drift.signal === 'string' ? drift.signal : null;
+    if (driftSignal) {
+      const driftBits: string[] = [`signal=${driftSignal}`];
+      if (typeof drift.coverage === 'number') driftBits.push(`coverage=${drift.coverage}`);
+      if (typeof drift.biggest_gap === 'string' && drift.biggest_gap) driftBits.push(`biggest_gap=${drift.biggest_gap}`);
+      if (typeof drift.merges_since_grade === 'number') driftBits.push(`merges_since_grade=${drift.merges_since_grade}`);
+      if (drift.stale === true) driftBits.push(`stale=true`);
+      const driftDetail = typeof drift.detail === 'string' && drift.detail ? drift.detail : null;
+      const driftLine = `Legacy heuristic - Goal-coverage drift: ${driftBits.join(', ')}`;
+      if (driftSignal === 'drifting') {
+        parts.push(`**${driftLine}** ← accumulated work diverging from version goal; course-correct or propose a goal amendment before qualification deadlock`);
+      } else {
+        parts.push(driftLine);
+      }
+      if (driftDetail) parts.push(`  Drift detail: ${driftDetail}`);
+    }
+  }
+
+  // Goal-alignment verdict from the last qualification (carried inside last_qualification.goal_alignment).
+  if (lastQualification) {
+    const goalAlignmentRaw = lastQualification.goal_alignment;
+    if (goalAlignmentRaw && typeof goalAlignmentRaw === 'object' && !Array.isArray(goalAlignmentRaw)) {
+      const ga = goalAlignmentRaw as Record<string, unknown>;
+      const gaStatus = typeof ga.status === 'string' ? ga.status : (typeof ga.state === 'string' ? ga.state : null);
+      if (gaStatus) {
+        const gaBits: string[] = [`status=${gaStatus}`];
+        if (typeof ga.coverage === 'number') gaBits.push(`coverage=${ga.coverage}`);
+        if (typeof ga.biggest_gap === 'string' && ga.biggest_gap) gaBits.push(`biggest_gap=${ga.biggest_gap}`);
+        if (typeof ga.goal_alignment === 'string' && ga.goal_alignment) gaBits.push(`alignment=${ga.goal_alignment}`);
+        parts.push(`Legacy heuristic - Last qualification goal alignment: ${gaBits.join(', ')}`);
+      }
     }
   }
 
@@ -904,7 +1013,7 @@ If you decide to flip the phase, emit a \`version_phase_decision\` field in your
 If you are staying in the current phase, do NOT emit \`version_phase_decision\` — omitting it means "no change."
 
 **Requesting qualification (stabilize only):**
-When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the qualification criteria look achievable — request qualification. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
+When the version is in **stabilize** and you judge it ready for release — hardening is sufficient, known issues are addressed, and the canonical acceptance criteria above are covered or have a credible closure path — request qualification. Treat uncovered or partial acceptance criteria as the primary release-readiness work queue; legacy goal-alignment and drift heuristics are secondary context. The orchestrator then snapshots the integration branch and runs the automated release qualifier (CI, test-erosion, audit, smoketest). Emit a \`qualify_request\` field in your Section 6 problem_model update (a top-level JSON field alongside the model):
 \`\`\`json
 {
   "qualify_request": {
@@ -920,10 +1029,9 @@ Only request qualification from the **stabilize** phase — it is ignored in **b
 
 **Do NOT re-request after a dry-run of the same candidate.** If the "Last qualification" line shows \`status=dry_run\`, the qualifier already ran end-to-end (CI, test-erosion, audit, smoketest) on that candidate commit and recorded the result — a dry-run means the candidate would promote but promotion currently ships dark, so the version stays open in \`stabilize\`. Re-emitting \`qualify_request\` for the SAME candidate re-spawns two agent VMs to re-score an identical, already-evaluated commit; the orchestrator's already-dry-run guard ignores it. Only emit \`qualify_request\` again once new work has merged onto the integration branch since that dry-run — i.e. the candidate commit has actually changed. If nothing has merged since the \`dry_run\` line above, do NOT re-request.
 
-**Four distinct version-authoring concepts — keep them separate:**
+**Three distinct version-authoring concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions — never change it here.
 - \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
-- \`version.theme\` = the falsifiable DELIVERY SHAPE (leanness | reliability | performance | feature | mixed | none).
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
 **Authoring the version goal (when none is set):**
@@ -933,17 +1041,7 @@ If the open version has no Goal shown above, you may propose one by emitting a \
   "new_version_goal": "One concise sentence stating what this version is for."
 }
 \`\`\`
-Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.
-
-**Authoring the version theme (when none is set):**
-If the open version has no Theme shown above, you may propose one by emitting a \`new_version_theme\` field as a top-level sibling in your Section 6 problem_model update:
-\`\`\`json
-{
-  "new_version_theme": "leanness"
-}
-\`\`\`
-Allowed values: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`. Any other value is silently ignored.
-Only emit \`new_version_theme\` when the Theme is currently unset — once authored, the theme is frozen and a re-emit is silently ignored. \`new_version_theme\` is independent of all other siblings — you may emit any combination.`);
+Only emit \`new_version_goal\` when the Goal is currently unset — once authored, the goal is frozen and a re-emit is silently ignored. Keep it under 500 characters and avoid placeholder or generic text. \`new_version_goal\` is independent of \`version_phase_decision\` and \`qualify_request\` — you may emit any combination.`);
 
   return parts.join('\n');
 }
@@ -1352,17 +1450,27 @@ export function buildPortfolioComposition(
 
   const pct = (n: number) => total > 0 ? Math.round((n / total) * 100) : 0;
   const productPct = pct(catCounts.product);
+  // The shipped detail list is incomplete when fewer active rows shipped than
+  // the authoritative total — i.e. some active directions were trimmed.
+  const listIncomplete = shipped < total;
   const lines: string[] = [];
   // When the shipped rows are fewer than the authoritative total, the category
   // mix is computed from the shipped subset but percentages divide by the true
   // total — flag that so the reader does not mistake a partial mix for the whole.
-  if (shipped < total) {
+  if (listIncomplete) {
     lines.push(`_Category mix below computed from ${shipped} of ${total} active directions shipped this cycle (${total - shipped} trimmed for budget — fetch with \`./fetch direction <id>\`); percentages use the authoritative total of ${total}._`);
   }
   const catParts = (['product', 'structural', 'mixed', 'uncategorized'] as const)
     .filter(c => catCounts[c] > 0)
     .map(c => `${c}=${catCounts[c]} (${pct(catCounts[c])}%)`);
-  const productFlag = productPct < 30 ? ' [LOW PRODUCT RATIO — <30%]' : '';
+  // When the direction list is trimmed the category counts only cover the shipped
+  // subset, so a definitive low-product alarm is misleading — trimmed-away
+  // product directions could bring the full-portfolio ratio above 30%.
+  const productFlag = productPct < 30
+    ? (listIncomplete
+        ? ' [LOW PRODUCT RATIO IN SHOWN SUBSET — <30%; omitted directions may alter the full mix]'
+        : ' [LOW PRODUCT RATIO — <30%]')
+    : '';
   lines.push(`Category mix: ${catParts.join(', ')}${productFlag}`);
 
   // Per-system signals (coverage gaps + concentration risk). Prefer the
@@ -1376,9 +1484,6 @@ export function buildPortfolioComposition(
   const effectiveSystemCounts: Record<string, number> = hasAuthSystemCounts
     ? authoritativeSystemCounts
     : systemCounts;
-  // The shipped detail list is incomplete when fewer active rows shipped than
-  // the authoritative total — i.e. some active directions were trimmed.
-  const listIncomplete = shipped < total;
 
   const allSystems = systems.filter(s => typeof s.id === 'string').map(s => ({
     id: s.id as string,

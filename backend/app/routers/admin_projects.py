@@ -7,15 +7,15 @@ operator overrides for branch naming, cleanup prefixes, Git identity, and
 self-improvement flags.
 """
 
+import logging
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select, delete
-from sqlalchemy import update
+from sqlalchemy import func, update
 from typing import Dict, Any, List
 import uuid
 from datetime import timedelta
-from sqlalchemy import func
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -41,6 +41,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
+from app.task_direction_refs import task_primary_direction_ids
 from app.onboarding_proof import build_onboarding_proof_block
 
 router = APIRouter(
@@ -48,6 +49,9 @@ router = APIRouter(
     tags=["admin-projects"],
     dependencies=[Depends(get_current_user)],
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _redact_build_config(build_config: dict, role: str) -> dict:
@@ -83,6 +87,7 @@ def _build_capability_proof_summary(proof_records: Dict[str, Any]) -> Dict[str, 
             "latest_commit_sha": latest.get("commit_sha"),
         }
     return summary
+
 
 
 @router.get("/projects")
@@ -169,8 +174,10 @@ async def get_all_projects(
                     "running": 0,
                     "evaluating": 0,
                     "blocked": 0,
+                    "parked": 0,
                     "failed": 0,
                     "completed": 0,
+                    "cancelled": 0,
                     "total": 0,
                 }
             bucket = task_status_counts[proj_key]
@@ -184,18 +191,24 @@ async def get_all_projects(
                 bucket["evaluating"] += n
             elif status == TaskStatus.BLOCKED:
                 bucket["blocked"] += n
+            elif status == TaskStatus.PARKED:
+                bucket["parked"] += n
             elif status == TaskStatus.FAILED:
                 bucket["failed"] += n
             elif status == TaskStatus.COMPLETED:
                 bucket["completed"] += n
+            elif status == TaskStatus.CANCELLED:
+                bucket["cancelled"] += n
 
     _empty_counts = {
         "queued": 0,
         "running": 0,
         "evaluating": 0,
         "blocked": 0,
+        "parked": 0,
         "failed": 0,
         "completed": 0,
+        "cancelled": 0,
         "total": 0,
     }
     return {
@@ -268,8 +281,11 @@ async def get_project(
         try:
             pm = ProblemModel(**problem_model_dict)
             size_health = compute_model_size_signal(pm)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[STRATEGIC_STATE] problem model size signal skipped: %s",
+                exc,
+            )
     return {
         "id": str(project.id),
         "name": project.name,
@@ -306,6 +322,8 @@ async def get_project(
         "my_role": role,
         "onboarding_proof": build_onboarding_proof_block(project),
     }
+
+
 
 
 class ProjectUpdate(BaseModel):
@@ -1265,6 +1283,7 @@ async def get_direction_task_counts(
                 Task.status,
                 Task.payloads,
                 Task.context,
+                Task.plan_output,
                 Task.title,
                 Task.latest_status_message,
                 raiseload=True,
@@ -1279,22 +1298,7 @@ async def get_direction_task_counts(
     active_tasks: Dict[str, list[dict]] = {}
     for task in tasks:
         payload = task.first_payload
-        # Primary: context.direction_id (matches admin_digest.py behavior).
-        # Fallback: payload.current_direction_id, then payload.directions[].id
-        # (for older tasks without context).
-        dir_ids: list[str] = []
-        ctx_did = (task.context or {}).get("direction_id")
-        if ctx_did:
-            dir_ids.append(ctx_did)
-        else:
-            current_did = payload.get("current_direction_id")
-            if current_did:
-                dir_ids.append(current_did)
-            else:
-                for direction in payload.get("directions", []):
-                    d_id = direction.get("id")
-                    if d_id:
-                        dir_ids.append(d_id)
+        dir_ids = task_primary_direction_ids(task)
         if not dir_ids:
             continue
         task_type = payload.get("type") or "unknown"

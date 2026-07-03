@@ -2,11 +2,12 @@ import { describe, test, expect, vi, afterEach, beforeEach } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { render, waitFor } from '@testing-library/react';
-import { MessagesPanel } from './MessagesPanel';
+import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import { classifySignalLevel, effectiveSignal, loadEventPrefs, saveEventPrefs, EVENT_PREFS_KEY, eventPrefsKey, groupRoutineMessages, outcomeBreakdown, isFailingGroup, getToastSeverity, isCriticalSeverity, loadTemporaryMutes, saveTemporaryMutes, isEventTypeTemporarilyMuted } from './MessagesPanel.utils';
 import type { ProjectMessage } from './MessageBubble';
 import type { SavedView } from './MessagesPanel.utils';
 import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
+import type { StrategicStateResponse } from '../strategicStateApi';
 
 // Full replacement (NOT a partial mock): the real `../firebase` calls
 // initializeApp()/getAuth() at module load, which we must not run in jsdom.
@@ -14,7 +15,10 @@ import { armingToastCopy, armingHintCopy, parseArmingOutcome, type ArmingOutcome
 // preserve here, and the only export this suite reads is `auth.currentUser`.
 vi.mock('../firebase', () => ({
   auth: { currentUser: { email: 'test-user@example.com' } },
+  signInWithGoogle: vi.fn(),
   getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 // Partial mock — `MessagesPanel.tsx` imports `authHeaders` (and `API_BASE_URL`)
@@ -66,6 +70,25 @@ function _setupApiFetchMock(opts: {
     if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
       return new Response(JSON.stringify({ last_seen_at: lastSeenAt }), { status: 200 });
     }
+    if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+      const msgs = queue
+        ? queue[Math.min(qIdx, queue.length - 1)]
+        : defaultMessages;
+      if (queue) qIdx += 1;
+      return new Response(JSON.stringify({
+        conversation: {
+          limit: 20,
+          has_more: false,
+          order: 'oldest_first',
+          items: msgs,
+        },
+        recent_outputs: [],
+        session: {},
+        status: 'unavailable',
+        location: 'unavailable',
+        status_reason: 'no_runner',
+      }), { status: 200 });
+    }
     if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
       const msgs = queue
         ? queue[Math.min(qIdx, queue.length - 1)]
@@ -106,6 +129,27 @@ function _messagesGetCalls(): unknown[][] {
     const url = String(c[0]);
     const init = c[1] as RequestInit | undefined;
     return /\/api\/admin\/messages(\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+  });
+}
+function _messagesPostCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/messages$/.test(url) && init?.method === 'POST';
+  });
+}
+function _strategicSessionGetCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(url) && (!init?.method || init.method === 'GET');
+  });
+}
+function _strategicSessionMessagePostCalls(): unknown[][] {
+  return vi.mocked(apiFetch).mock.calls.filter((c) => {
+    const url = String(c[0]);
+    const init = c[1] as RequestInit | undefined;
+    return /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(url) && init?.method === 'POST';
   });
 }
 
@@ -431,6 +475,1113 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
     ...overrides,
   };
 }
+
+function makeStrategicState(overrides: Partial<StrategicStateResponse> = {}): StrategicStateResponse {
+  return {
+    project_id: 'proj-1',
+    strategic: {
+      active_cycle: null,
+      active_task: null,
+      active_phase: null,
+      latest_cycle: null,
+      refresh: {
+        pending: null,
+        last_fired_at: null,
+        last_fired_origin: null,
+      },
+    },
+    running_update: {
+      excerpt: null,
+      char_count: 0,
+      acknowledged_at: null,
+    },
+    problem_model: {
+      active_gap_count: 0,
+      capability_count: 0,
+      pending_confirmation_count: 0,
+      top_gap: null,
+    },
+    directions: {
+      total_count: 0,
+      active_count: 0,
+      paused_count: 0,
+      primary: null,
+    },
+    messages: {
+      counts: { open: 0, linked: 0 },
+      items: [],
+    },
+    tasks: {
+      counts: {
+        queued: 5,
+        running: 3,
+        evaluating: 0,
+        blocked: 0,
+        parked: 0,
+        failed: 0,
+        completed: 12,
+        total: 20,
+      },
+      cumulative_estimated_cost_usd: 1.25,
+    },
+    attention: {
+      level: 'needs_operator',
+      summary: '1 operator item needs attention',
+      last_seen_at: null,
+      counts: {
+        needs_operator: 1,
+        watch: 2,
+        unread: 1,
+        questions: 1,
+        blockers: 0,
+        approvals: 0,
+        manual_directions: 0,
+        failed_tasks: 0,
+        blocked_tasks: 0,
+        parked_tasks: 0,
+      },
+      items: [
+        {
+          id: 'message:msg-1',
+          kind: 'message',
+          severity: 'needs_operator',
+          reason: 'question',
+          label: 'Question waiting',
+          ref: { kind: 'message', id: 'msg-1', project_id: 'proj-1' },
+        },
+      ],
+    },
+    context_package: {
+      id: 'strategic-context:proj-1',
+      title: 'Workbench context',
+      status: 'ready',
+      item_count: 18,
+      token_count: null,
+      canvas: null,
+      sources: [],
+      drilldowns: [],
+    },
+    workbench: {
+      version: 1,
+      interaction_mode: 'check_in',
+      active_surface: 'strategic',
+      selected_refs: [],
+      session_started_at: null,
+      last_interaction_at: null,
+    },
+    design: {
+      has_design_doc: false,
+      revision: null,
+    },
+    ...overrides,
+  };
+}
+
+describe('MessagesPanel chrome modes', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    localStorage.clear();
+    vi.clearAllMocks();
+  });
+
+  async function mountPanel(props: Partial<MessagesPanelProps> = {}) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  async function renderPanel(props: Partial<MessagesPanelProps> = {}, messages: _MockMsg[] = []) {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetch(messages);
+    return mountPanel(props);
+  }
+
+  function filterToggle(el: HTMLElement): HTMLButtonElement | undefined {
+    return [...el.querySelectorAll('button')]
+      .find(button => button.title === 'Show filters and saved views' || button.title === 'Hide filters and saved views') as HTMLButtonElement | undefined;
+  }
+
+  test('page default omits close chrome and collapses filters', async () => {
+    const el = await renderPanel();
+
+    expect(el.querySelector('[aria-label="Close messages panel"]')).toBeNull();
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
+
+    const toggle = filterToggle(el);
+    if (!toggle) throw new Error('filter toggle not found');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+
+    await act(async () => { toggle.click(); });
+
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeTruthy();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeTruthy();
+    expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('true');
+  });
+
+  test('compact message chrome renders one filter command surface without duplicate controls', async () => {
+    const el = await renderPanel({ variant: 'page', filterChrome: 'compact' }, [
+      makeMsg({ id: 'critical', message_type: 'BLOCKER', from_type: 'agent', content: 'Critical blocker' }),
+    ]);
+
+    const collapsedButtons = [...el.querySelectorAll('button')];
+    expect(collapsedButtons.filter(button => button.title === 'Show filters and saved views')).toHaveLength(1);
+    expect(el.querySelectorAll('input[placeholder="Search messages..."]')).toHaveLength(0);
+    expect(el.querySelectorAll('[data-testid="saved-views-tab-strip"]')).toHaveLength(0);
+
+    const toggle = filterToggle(el);
+    if (!toggle) throw new Error('filter toggle not found');
+    await act(async () => { toggle.click(); });
+
+    const expandedButtons = [...el.querySelectorAll('button')];
+    expect(expandedButtons.filter(button => button.title === 'Hide filters and saved views')).toHaveLength(1);
+    expect(el.querySelectorAll('input[placeholder="Search messages..."]')).toHaveLength(1);
+    expect(el.querySelectorAll('[data-testid="saved-views-tab-strip"]')).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title === 'Toggle sort order')).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Critical only'))).toHaveLength(1);
+    expect(expandedButtons.filter(button =>
+      button.title?.includes('Only new since') ||
+      button.title?.includes('Show all messages') ||
+      button.title?.includes('No messages to filter')
+    )).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Save current filters'))).toHaveLength(1);
+    expect(expandedButtons.filter(button => button.title?.includes('Event type visibility'))).toHaveLength(1);
+  });
+
+  test('compact chrome leaves Ctrl+K to the app shortcut without duplicating command controls', async () => {
+    const onOpenCommandPalette = vi.fn();
+    const el = await renderPanel({ variant: 'page', filterChrome: 'compact', onOpenCommandPalette });
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    expect(document.activeElement).not.toBe(textarea);
+
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+
+    expect(document.activeElement).not.toBe(textarea);
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+    expect(el.querySelectorAll('button[title="Open command palette (Ctrl+K)"]')).toHaveLength(0);
+  });
+
+  test('minimal chat composer command button opens the Strategic command surface and focuses composer', async () => {
+    const onOpenCommandPalette = vi.fn();
+    const el = await renderPanel({ filterChrome: 'minimal', onOpenCommandPalette });
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
+    expect(textarea).not.toBeNull();
+    const commandButton = el.querySelector<HTMLButtonElement>('button[title="Open command palette (Ctrl+K)"]');
+    expect(commandButton).not.toBeNull();
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+
+    await act(async () => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'k', ctrlKey: true, bubbles: true, cancelable: true }));
+    });
+
+    expect(document.activeElement).not.toBe(textarea);
+    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+
+    await act(async () => {
+      commandButton?.click();
+    });
+
+    await waitFor(() => expect(document.activeElement).toBe(textarea));
+    expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
+  });
+
+  test('legacy onClose usage keeps full controls and close action', async () => {
+    const onClose = vi.fn();
+    const el = await renderPanel({ onClose });
+
+    const closeButton = el.querySelector('[aria-label="Close messages panel"]') as HTMLButtonElement | null;
+    if (!closeButton) throw new Error('close button not found');
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeTruthy();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeTruthy();
+    expect(filterToggle(el)).toBeUndefined();
+
+    await act(async () => { closeButton.click(); });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  test('page variant uses page chrome even when onClose is provided', async () => {
+    const el = await renderPanel({ onClose: vi.fn(), variant: 'page' });
+
+    expect(el.querySelector('[aria-label="Close messages panel"]')).toBeNull();
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(filterToggle(el)?.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  test('minimal chat loads conversation from the Strategic session facade', async () => {
+    const strategic = makeMsg({
+      id: 'strategic-session-message',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'Session-backed Strategic reply',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'minimal' }, [strategic]);
+
+    expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1);
+    expect(_messagesGetCalls()).toHaveLength(0);
+    expect(el.textContent).toContain('Session-backed Strategic reply');
+  });
+
+  test('full message chrome still loads from the generic messages endpoint', async () => {
+    await renderPanel({}, [
+      makeMsg({ id: 'generic-message', content: 'Generic triage message' }),
+    ]);
+
+    expect(_messagesGetCalls().length).toBeGreaterThanOrEqual(1);
+    expect(_strategicSessionGetCalls()).toHaveLength(0);
+  });
+
+  test('realtime refresh signal immediately reloads generic messages', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetchSequence([
+      [makeMsg({ id: 'initial-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Initial message copy' })],
+      [makeMsg({ id: 'realtime-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Realtime message copy' })],
+    ]);
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(el.textContent).toContain('Initial message copy'));
+    const callsBefore = _messagesGetCalls().length;
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+
+    await waitFor(() => expect(_messagesGetCalls().length).toBeGreaterThan(callsBefore));
+    await waitFor(() => expect(el.textContent).toContain('Realtime message copy'));
+  });
+
+  test('realtime refresh applies same-id message content updates', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _mockMessagesFetchSequence([
+      [makeMsg({ id: 'same-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Original message copy' })],
+      [makeMsg({ id: 'same-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Updated message copy' })],
+    ]);
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(el.textContent).toContain('Original message copy'));
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+
+    await waitFor(() => expect(el.textContent).toContain('Updated message copy'));
+    expect(el.textContent).not.toContain('Original message copy');
+  });
+
+  test('late polling responses do not overwrite fresher realtime message loads', async () => {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    const messageResolvers: Array<(response: Response) => void> = [];
+    vi.mocked(apiFetch).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Promise<Response>(resolve => { messageResolvers.push(resolve); });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    const addToast = vi.fn();
+    const onMessageCountChange = vi.fn();
+
+    const el = await mountPanel({ addToast, onMessageCountChange, realtimeRefreshSignal: 0 });
+    await waitFor(() => expect(messageResolvers).toHaveLength(1));
+
+    await act(async () => {
+      root?.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={addToast}
+          onMessageCountChange={onMessageCountChange}
+          realtimeRefreshSignal={1}
+        />,
+      );
+    });
+    await waitFor(() => expect(messageResolvers).toHaveLength(2));
+
+    await act(async () => {
+      messageResolvers[1](new Response(JSON.stringify({
+        messages: [makeMsg({ id: 'fresh-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Fresh realtime message' })],
+      }), { status: 200 }));
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(el.textContent).toContain('Fresh realtime message'));
+
+    await act(async () => {
+      messageResolvers[0](new Response(JSON.stringify({
+        messages: [makeMsg({ id: 'stale-message', message_type: 'BLOCKER', from_type: 'agent', content: 'Stale polling message' })],
+      }), { status: 200 }));
+      await Promise.resolve();
+    });
+
+    expect(el.textContent).toContain('Fresh realtime message');
+    expect(el.textContent).not.toContain('Stale polling message');
+  });
+
+  test('minimal chat chrome hides the ready-only Strategic context package strip', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      contextPackage: {
+        id: 'strategic-context:proj-1',
+        title: 'Workbench context',
+        status: 'ready',
+        item_count: 18,
+        token_count: null,
+        canvas: {
+          id: 'strategic-canvas:proj-1',
+          title: 'Strategic context map',
+          kind: 'strategic_context',
+          node_count: null,
+        },
+        sources: [{ kind: 'messages', count: 2 }],
+        drilldowns: [],
+      },
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip).toBeNull();
+  });
+
+  test('minimal chat chrome can render the Strategic work session strip from read model state', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Strategic');
+    expect(strip?.textContent).toContain('Check-in');
+    expect(strip?.textContent).toContain('1 needs attention');
+    expect(strip?.textContent).not.toContain('Workbench context');
+    expect(strip?.textContent).not.toContain('ready');
+    expect(strip?.textContent).not.toContain('18 items');
+    expect(strip?.textContent).not.toContain('Question waiting');
+    expect(strip?.textContent).not.toContain('3 running / 5 queued');
+  });
+
+  test('minimal chat composer shows live Strategic context and opens the sideboard', async () => {
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const onOpenStrategicContextWorkspace = vi.fn();
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      onOpenStrategicContextWorkspace,
+      strategicState: makeStrategicState({
+        context_package: {
+          id: 'strategic-context:proj-1',
+          title: 'Workbench context',
+          status: 'ready',
+          item_count: 18,
+          token_count: null,
+          sources: [],
+          drilldowns: [],
+          resources: [],
+          canvas: {
+            id: 'strategic-canvas:proj-1',
+            node_count: 8,
+            edge_count: 7,
+            nodes: [],
+            edges: [],
+          },
+        },
+        work_session: {
+          version: 1,
+          id: 'strategic-session:proj-1:2026-06-29T01:00:00Z',
+          mode: 'continuous',
+          active_surface: 'strategic',
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
+          context_package_id: 'strategic-context:proj-1',
+          attention_level: 'needs_operator',
+          selected_refs: [
+            { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+          ],
+          selected_ref_descriptors: [
+            {
+              kind: 'knowledge_document',
+              id: 'knowledge:kdoc-1',
+              label: 'Operator notes',
+              status: 'active',
+            },
+          ],
+          curated_metrics: [],
+        },
+      }),
+      strategicWorkbenchState: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:operator-context-report', label: 'Latest context report' },
+        ],
+        session_started_at: sessionStartedAt,
+        last_interaction_at: lastInteractionAt,
+      },
+    });
+
+    const descriptor = el.querySelector('[data-testid="strategic-context-descriptor"]') as HTMLButtonElement | null;
+    expect(descriptor).not.toBeNull();
+    expect(descriptor?.textContent).toContain('Workbench context');
+    expect(descriptor?.textContent).toContain('Workday');
+    expect(descriptor?.textContent).toContain('Context ready');
+    expect(descriptor?.textContent).toContain('Latest context report');
+    expect(descriptor?.textContent).not.toContain('1 ref');
+    expect(descriptor?.textContent).not.toContain('8 nodes / 7 links');
+    expect(descriptor?.textContent).not.toContain('18 items');
+
+    await act(async () => {
+      descriptor?.click();
+    });
+    expect(onOpenStrategicContextWorkspace).toHaveBeenCalledTimes(1);
+  });
+
+  test('minimal chat composer hides stale Strategic workbench context', async () => {
+    const staleNaive = new Date(Date.now() - 5 * 3600_000).toISOString().replace('Z', '');
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState({
+        context_package: null,
+        work_session: {
+          version: 1,
+          id: 'strategic-session:proj-1',
+          mode: 'continuous',
+          active_surface: 'pipeline',
+          session_started_at: staleNaive,
+          last_interaction_at: null,
+          context_package_id: null,
+          attention_level: 'clear',
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+          ],
+          selected_ref_descriptors: [],
+          curated_metrics: [],
+        },
+      }),
+      strategicWorkbenchState: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'pipeline',
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+        ],
+        session_started_at: staleNaive,
+        last_interaction_at: null,
+      },
+    });
+
+    expect(el.querySelector('[data-testid="strategic-context-descriptor"]')).toBeNull();
+    expect(el.textContent).not.toContain('Stale ref');
+  });
+
+  test('minimal chat context receipts are passive when useful context is attached', async () => {
+    const onOpenStrategicContextWorkspace = vi.fn();
+    const operator = makeMsg({
+      id: 'operator-context',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'Use this context.',
+      context: {
+        strategic_session: {
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'project',
+          context_package_id: 'strategic-context:proj-1',
+          selected_refs: [
+            { kind: 'task', id: 'task-1', label: 'Old task label' },
+          ],
+          selected_ref_descriptors: [
+            {
+              kind: 'task',
+              id: 'task-1',
+              label: 'Review active wave',
+              summary: 'Reviewing context descriptors.',
+              status: 'IN_PROGRESS',
+            },
+          ],
+          captured_at: '2026-06-29T12:00:00Z',
+        },
+      },
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      onOpenStrategicContextWorkspace,
+    }, [operator]);
+
+    const receipt = el.querySelector('[data-testid="strategic-context-receipt"]') as HTMLElement | null;
+    expect(receipt).not.toBeNull();
+    expect(receipt?.tagName.toLowerCase()).toBe('div');
+    expect(receipt?.textContent).toContain('Refs attached');
+    expect(receipt?.textContent).toContain('Review active wave');
+    await act(async () => {
+      receipt?.click();
+    });
+    expect(onOpenStrategicContextWorkspace).not.toHaveBeenCalled();
+  });
+
+  test('minimal chat chrome shows conversation messages chronologically without routine alerts', async () => {
+    const routine = makeMsg({
+      id: 'routine',
+      from_type: 'system',
+      message_type: 'NOTE',
+      content: 'pr merged successfully',
+      context: { event_type: 'pr_merged' },
+      created_at: '2026-06-01T10:03:00Z',
+    });
+    const strategicRoutine = makeMsg({
+      id: 'strategic-routine',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'cycle summary should stay out of chat',
+      context: { event_type: 'cycle_summary' },
+      created_at: '2026-06-01T10:04:00Z',
+    });
+    const strategic = makeMsg({
+      id: 'strategic',
+      from_type: 'strategist',
+      message_type: 'NOTE',
+      content: 'Strategic reply',
+      created_at: '2026-06-01T10:02:00Z',
+    });
+    const operator = makeMsg({
+      id: 'operator',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'Operator steering',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const question = makeMsg({
+      id: 'question',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep this path?',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const feedback = makeMsg({
+      id: 'feedback',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Convert this only in the triage surface.',
+      created_at: '2026-06-01T10:05:00Z',
+    });
+    const blocker = makeMsg({
+      id: 'blocker',
+      from_type: 'agent',
+      message_type: 'BLOCKER',
+      content: 'Investigate this only in the triage surface.',
+      created_at: '2026-06-01T10:06:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'minimal' }, [routine, strategicRoutine, strategic, operator, question, feedback, blocker]);
+
+    const text = el.textContent ?? '';
+    expect(text).toContain('Operator steering');
+    expect(text).toContain('Should I keep this path?');
+    expect(text).toContain('Strategic reply');
+    expect(text).toContain('Convert this only in the triage surface.');
+    expect(text).toContain('Investigate this only in the triage surface.');
+    expect(text).not.toContain('pr merged successfully');
+    expect(text).not.toContain('cycle summary should stay out of chat');
+    expect(text).not.toContain('routine ops');
+    expect(text).not.toContain('Pinned · Blockers');
+    expect(text).not.toContain('Awaiting reply · Questions');
+    expect(el.querySelector('input[placeholder="Search messages..."]')).toBeNull();
+    expect(el.querySelector('[data-testid="saved-views-tab-strip"]')).toBeNull();
+    expect(filterToggle(el)).toBeUndefined();
+    expect(el.querySelector('button[title="Copy message ref"]')).toBeNull();
+    const questionReply = el.querySelector<HTMLButtonElement>('[data-message-id="question"] button[title="Reply"]');
+    expect(el.querySelector('[data-message-id="strategic"] button[title="Reply"]')).not.toBeNull();
+    expect(questionReply).not.toBeNull();
+    expect(el.querySelector('button[title="Resolve"]')).toBeNull();
+    expect(el.querySelector('button[title="Delete"]')).toBeNull();
+    expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
+    expect(el.querySelector('button[title="Investigate"]')).toBeNull();
+    expect(text.indexOf('Operator steering')).toBeLessThan(text.indexOf('Should I keep this path?'));
+    expect(text.indexOf('Should I keep this path?')).toBeLessThan(text.indexOf('Strategic reply'));
+
+    await act(async () => { questionReply?.click(); });
+    expect(el.textContent).toContain('Replying to Agent');
+    expect(el.textContent).toContain('Should I keep this path?');
+  });
+
+  test('full message chrome keeps triage actions available', async () => {
+    const feedback = makeMsg({
+      id: 'feedback-action',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Turn this into a direction.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const blocker = makeMsg({
+      id: 'blocker-action',
+      from_type: 'agent',
+      message_type: 'BLOCKER',
+      content: 'Investigate this blocker.',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    const el = await renderPanel({ filterChrome: 'full' }, [feedback, blocker]);
+
+    expect(el.querySelector('button[title="Create Direction"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Investigate"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Resolve"]')).not.toBeNull();
+    expect(el.querySelector('button[title="Delete"]')).not.toBeNull();
+  });
+
+  test('minimal chat hides cycle completion receipt banner chrome', async () => {
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      lastCycleCompletion: {
+        status: 'completed',
+        created_count: 2,
+        tasks_spawned: 1,
+        running_update_changed: true,
+      },
+    });
+
+    const text = el.textContent ?? '';
+    expect(text).not.toContain('Cycle complete');
+    expect(text).not.toContain('+2 directions');
+    expect(text).not.toContain('1 task spawned');
+    expect(text).not.toContain('running update written');
+  });
+
+  test('minimal chat hides leaked batch action state after switching from full chrome', async () => {
+    const first = makeMsg({
+      id: 'feedback-a',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'First selected feedback.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const second = makeMsg({
+      id: 'feedback-b',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Second selected feedback.',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({ filterChrome: 'full' }, [first, second]);
+    const selectButton = [...el.querySelectorAll('button')]
+      .find(button => button.textContent?.trim() === 'Select') as HTMLButtonElement | undefined;
+    if (!selectButton) throw new Error('select button not found');
+
+    await act(async () => { selectButton.click(); });
+    expect(el.textContent).toContain('2 selected');
+    expect(el.textContent).toContain('Create Directions');
+
+    const mountedRoot = root;
+    if (!mountedRoot) throw new Error('panel root not mounted');
+    await act(async () => {
+      mountedRoot.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    expect(el.textContent).not.toContain('2 selected');
+    expect(el.textContent).not.toContain('Create Directions');
+  });
+
+  test('minimal chat hides a stale convert modal after switching from full chrome', async () => {
+    const feedback = makeMsg({
+      id: 'feedback-convert',
+      from_type: 'agent',
+      message_type: 'FEEDBACK',
+      content: 'Convert me in triage mode.',
+      created_at: '2026-06-01T10:00:00Z',
+    });
+    const el = await renderPanel({ filterChrome: 'full' }, [feedback]);
+    const createDirection = el.querySelector('button[title="Create Direction"]') as HTMLButtonElement | null;
+    if (!createDirection) throw new Error('create direction button not found');
+
+    await act(async () => { createDirection.click(); });
+    expect(el.textContent).toContain('Create direction from message');
+
+    const mountedRoot = root;
+    if (!mountedRoot) throw new Error('panel root not mounted');
+    await act(async () => {
+      mountedRoot.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    expect(el.textContent).not.toContain('Create direction from message');
+    expect(el.querySelector('button[title="Create Direction"]')).toBeNull();
+  });
+
+  test('minimal chat target primes reply for an open question and highlights it', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const scrollTo = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    HTMLElement.prototype.scrollTo = scrollTo;
+    const question = makeMsg({
+      id: 'question-target',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep the local runner online?',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'question-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [question]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      const bubble = el.querySelector('[data-message-id="question-target"]');
+      expect(bubble?.className).toContain('ring-1');
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(scrollTo).not.toHaveBeenCalled();
+      expect(el.textContent).toContain('Replying to Agent');
+      expect(el.textContent).toContain('Should I keep the local runner online?');
+      const sessionCallUrl = String(_strategicSessionGetCalls()[0]?.[0] ?? '');
+      expect(sessionCallUrl).toContain('include_message_id=question-target');
+
+      const mountedRoot = root;
+      if (!mountedRoot) throw new Error('panel root not mounted');
+      await act(async () => {
+        mountedRoot.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            addToast={() => {}}
+            onMessageCountChange={() => {}}
+            filterChrome="minimal"
+            onTargetMessageHandled={onTargetMessageHandled}
+          />,
+        );
+      });
+      await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(2));
+      const followUpSessionCallUrl = String(_strategicSessionGetCalls().at(-1)?.[0] ?? '');
+      expect(followUpSessionCallUrl).toContain('include_message_id=question-target');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+    }
+  });
+
+  test('minimal chat target primes reply for an open Strategic message', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const strategic = makeMsg({
+      id: 'strategic-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'I can compare those two plans.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'strategic-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [strategic]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      const bubble = el.querySelector('[data-message-id="strategic-target"]');
+      expect(bubble?.className).toContain('ring-1');
+      expect(scrollIntoView).toHaveBeenCalled();
+      expect(el.textContent).toContain('Replying to Strategic');
+      expect(el.textContent).toContain('I can compare those two plans.');
+      const sessionCallUrl = String(_strategicSessionGetCalls()[0]?.[0] ?? '');
+      expect(sessionCallUrl).toContain('include_message_id=strategic-target');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test('minimal chat target keeps non-replyable messages highlight-only', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const operator = makeMsg({
+      id: 'operator-target',
+      from_type: 'user',
+      message_type: 'FEEDBACK',
+      content: 'I already chose the smaller plan.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'operator-target', action: 'reply' },
+      onTargetMessageHandled,
+    }, [operator]);
+
+    await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+    const bubble = el.querySelector('[data-message-id="operator-target"]');
+    expect(bubble?.className).toContain('ring-1');
+    expect(el.textContent).not.toContain('Replying to Operator');
+    expect(el.querySelector('textarea')?.value).toBe('');
+  });
+
+  test('minimal chat target does not prime replies for filtered Strategic routine messages', async () => {
+    const onTargetMessageHandled = vi.fn();
+    const scrollIntoView = vi.fn();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = scrollIntoView;
+    const routine = makeMsg({
+      id: 'strategic-routine-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'cycle summary should stay out of chat',
+      context: { event_type: 'cycle_summary' },
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+
+    try {
+      const el = await renderPanel({
+        filterChrome: 'minimal',
+        targetMessage: { messageId: 'strategic-routine-target', action: 'reply' },
+        onTargetMessageHandled,
+      }, [routine]);
+
+      await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
+      expect(el.querySelector('[data-message-id="strategic-routine-target"]')).toBeNull();
+      expect(scrollIntoView).not.toHaveBeenCalled();
+      expect(el.textContent).not.toContain('Replying to Strategic');
+      expect(el.textContent).not.toContain('cycle summary should stay out of chat');
+      expect(el.querySelector('textarea')?.value).toBe('');
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+    }
+  });
+
+  test('minimal chat question replies still resolve through the generic message patch', async () => {
+    const question = makeMsg({
+      id: 'question-target',
+      from_type: 'agent',
+      message_type: 'QUESTION',
+      content: 'Should I keep the local runner online?',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'question-target', action: 'reply' },
+    }, [question]);
+
+    const { fireEvent } = await import('@testing-library/react');
+    await waitFor(() => expect(el.textContent).toContain('Replying to Agent'));
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+    const sendButton = [...el.querySelectorAll('button')]
+      .find(button => button.getAttribute('aria-label') === 'Send message') as HTMLButtonElement | undefined;
+    if (!sendButton) throw new Error('Expected send button');
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Keep it online.' } });
+    });
+    await act(async () => {
+      sendButton.click();
+    });
+
+    await waitFor(() => {
+      const patchCall = vi.mocked(apiFetch).mock.calls.find(call => {
+        const url = String(call[0]);
+        const init = call[1] as RequestInit | undefined;
+        return url.includes('/api/admin/messages/question-target') && init?.method === 'PATCH';
+      });
+      expect(patchCall).toBeTruthy();
+    });
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(0);
+  });
+
+  test('minimal chat non-question replies send through the Strategic session facade', async () => {
+    const strategic = makeMsg({
+      id: 'strategic-reply-target',
+      from_type: 'strategic',
+      message_type: 'NOTE',
+      content: 'I can compare those two plans.',
+      status: 'open',
+      created_at: '2026-06-01T10:01:00Z',
+    });
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      targetMessage: { messageId: 'strategic-reply-target', action: 'reply' },
+    }, [strategic]);
+
+    const { fireEvent } = await import('@testing-library/react');
+    await waitFor(() => expect(el.textContent).toContain('Replying to Strategic'));
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+    const sendButton = [...el.querySelectorAll('button')]
+      .find(button => button.getAttribute('aria-label') === 'Send message') as HTMLButtonElement | undefined;
+    if (!sendButton) throw new Error('Expected send button');
+
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'Compare the smaller plan.' } });
+    });
+    await act(async () => {
+      sendButton.click();
+    });
+
+    await waitFor(() => expect(_strategicSessionMessagePostCalls()).toHaveLength(1));
+    expect(_messagesPostCalls()).toHaveLength(0);
+    const postBody = JSON.parse(String((_strategicSessionMessagePostCalls()[0][1] as RequestInit).body ?? '{}'));
+    expect(postBody).toMatchObject({
+      message_type: 'FEEDBACK',
+      content: 'Compare the smaller plan.',
+      context: {
+        reply_to: 'strategic-reply-target',
+        reply_preview: 'I can compare those two plans.',
+      },
+    });
+  });
+
+  test('minimal chat chrome keeps queued and working state in the compact strip only', async () => {
+    const base = makeStrategicState();
+    const queuedState = makeStrategicState({
+      strategic: {
+        ...base.strategic,
+        refresh: {
+          pending: {
+            requested_at: '2026-06-01T10:00:00Z',
+            origin: 'operator',
+            reason: 'operator_message',
+            count: 1,
+          },
+          last_fired_at: null,
+          last_fired_origin: null,
+        },
+      },
+    });
+    const queuedEl = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: queuedState,
+    });
+
+    const queuedStrip = queuedEl.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(queuedStrip?.textContent).toContain('Steer queued');
+    expect(queuedEl.textContent).not.toContain('Strategic steer queued');
+    expect(queuedEl.textContent).not.toContain('Cancel');
+
+    await act(async () => { root?.unmount(); });
+    root = null;
+    host?.remove();
+    host = null;
+
+    const workingEl = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: makeStrategicState(),
+      strategistActive: true,
+      cycleProgress: { task_id: 't1', phase_label: 'Reviewing context' },
+    });
+    const workingStrip = workingEl.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(workingStrip?.textContent).toContain('Reviewing context');
+    expect(workingEl.textContent).not.toContain('Strategist: Reviewing context');
+    expect(workingEl.textContent).not.toContain('Strategic is working');
+  });
+
+  test('minimal chat chrome shows recent steer receipt in the compact strip', async () => {
+    const base = makeStrategicState();
+    const state = makeStrategicState({
+      strategic: {
+        ...base.strategic,
+        refresh: {
+          pending: null,
+          last_fired_at: new Date(Date.now() - 5 * 60_000).toISOString(),
+          last_fired_origin: 'operator',
+        },
+      },
+    });
+
+    const el = await renderPanel({
+      filterChrome: 'minimal',
+      strategicState: state,
+    });
+
+    const strip = el.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip?.textContent).toContain('Steer picked up');
+    expect(el.textContent).not.toContain('strategic cycle ran');
+  });
+
+  test('compact/full message chrome keeps the context package out of the legacy surface', async () => {
+    const el = await renderPanel({
+      filterChrome: 'compact',
+      contextPackage: {
+        id: 'strategic-context:proj-1',
+        title: 'Workbench context',
+        status: 'ready',
+      },
+    });
+
+    expect(el.querySelector('[data-testid="strategic-context-package-strip"]')).toBeNull();
+  });
+});
 
 describe('MessagesPanel grouping', () => {
   let root: Root | null = null;
@@ -3434,10 +4585,38 @@ describe('MessagesPanel send arming receipt', () => {
     vi.clearAllMocks();
   });
 
+  function backendLikeSendResponse(postBody: Record<string, unknown>): Record<string, unknown> {
+    const arming = typeof postBody.arming === 'string' ? postBody.arming : null;
+    const messageId = typeof postBody.id === 'string' ? postBody.id : 'm-send-response';
+    const messageOverride = postBody.message && typeof postBody.message === 'object'
+      ? postBody.message as Record<string, unknown>
+      : {};
+    const response: Record<string, unknown> = {
+      id: messageId,
+      status: arming === 'duplicate' ? 'duplicate' : 'created',
+      message: {
+        id: messageId,
+        project_id: 'proj-1',
+        message_type: 'FEEDBACK',
+        from_type: 'user',
+        from_task_id: null,
+        content: 'Operator message',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-07-01T12:00:00Z',
+        ...messageOverride,
+      },
+      ...postBody,
+    };
+    return response;
+  }
+
   // Serves the panel's mount-time GETs normally (empty message list, no
-  // last-seen, 404'd sync endpoints) and returns `postBody` as the JSON body of
-  // POST /api/admin/messages — the response the send handler parses its arming
-  // decision from. Pass `{}` to model an older server that omits the field.
+  // last-seen, 404'd sync endpoints) and returns a backend-like create response
+  // for POST /api/admin/messages. Pass `{}` to model an older server that omits
+  // the `arming` field while still returning the durable message envelope.
   function _setupSendMock(postBody: Record<string, unknown>): void {
     (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
       const urlStr = String(url);
@@ -3446,7 +4625,7 @@ describe('MessagesPanel send arming receipt', () => {
         return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'POST') {
-        return new Response(JSON.stringify(postBody), { status: 200 });
+        return new Response(JSON.stringify(backendLikeSendResponse(postBody)), { status: 200 });
       }
       if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
         return new Response(JSON.stringify({ messages: [] }), { status: 200 });
@@ -3463,9 +4642,36 @@ describe('MessagesPanel send arming receipt', () => {
     });
   }
 
+  function _setupQuestionAnswerMock(question: ProjectMessage, patchBodies: unknown[] = []): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (urlStr.includes(`/api/admin/messages/${question.id}`) && method === 'PATCH') {
+        patchBodies.push(JSON.parse(String((init as RequestInit | undefined)?.body ?? '{}')));
+        return new Response(JSON.stringify({ status: 'ok' }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [question] }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
   async function renderPanel(
     addToast: (msg: string, level: string) => void,
     strategistActive = false,
+    props: Partial<MessagesPanelProps> = {},
   ) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     host = document.createElement('div');
@@ -3480,6 +4686,7 @@ describe('MessagesPanel send arming receipt', () => {
           addToast={addToast as never}
           onMessageCountChange={() => {}}
           strategistActive={strategistActive}
+          {...props}
         />,
       );
     });
@@ -3487,9 +4694,9 @@ describe('MessagesPanel send arming receipt', () => {
     return host as HTMLDivElement;
   }
 
-  // The composer hint <p> always renders one of the four ArmingOutcome hint
+  // The composer hint <p> always renders one of the send-result ArmingOutcome hint
   // strings; locate it by matching its text against that closed set.
-  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed'] as ArmingOutcome[])
+  const ALL_HINTS = (['steering', 'passive_note', 'routine_event', 'not_armed', 'duplicate'] as ArmingOutcome[])
     .map(armingHintCopy);
   function hintText(el: HTMLElement): string | null {
     const p = [...el.querySelectorAll('p')].find(p => ALL_HINTS.includes(p.textContent ?? ''));
@@ -3530,6 +4737,150 @@ describe('MessagesPanel send arming receipt', () => {
     expect(hintText(el)).toBe(armingHintCopy('steering'));
   });
 
+  test('steering send refreshes Strategic state and shows pending badge immediately', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+  });
+
+  test('fresh optimistic steering badge survives a stale read-model response', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(el.textContent).toContain('Strategic cycle pending'));
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState()}
+          onStrategicStateRefresh={onStrategicStateRefresh}
+        />,
+      );
+    });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+  });
+
+  test('fresh optimistic steering badge survives an older read-model marker', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const staleMarkerAt = new Date(Date.now() - 60_000).toISOString();
+    const onStrategicStateRefresh = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+      onStrategicStateRefresh,
+    });
+
+    await typeAndSend(el, 'please prioritize the migration work');
+    await waitFor(() => expect(el.textContent).toContain('please prioritize the migration work'));
+
+    await act(async () => {
+      root!.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          strategicState={makeStrategicState({
+            strategic: {
+              ...makeStrategicState().strategic,
+              refresh: {
+                pending: {
+                  requested_at: staleMarkerAt,
+                  origin: 'operator',
+                  excerpt: 'older pre-send marker',
+                  operator_count: 1,
+                },
+                last_fired_at: null,
+                last_fired_origin: null,
+              },
+            },
+          })}
+          onStrategicStateRefresh={onStrategicStateRefresh}
+        />,
+      );
+    });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('please prioritize the migration work');
+    expect(el.textContent).not.toContain('older pre-send marker');
+  });
+
+  test('answering a question refreshes Strategic state for attention counts', async () => {
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
+    const question = makeMsg({
+      id: 'q-refresh',
+      message_type: 'QUESTION',
+      from_type: 'agent',
+      content: 'Should we keep the local runner active?',
+      status: 'open',
+    });
+    const patchBodies: unknown[] = [];
+    _setupQuestionAnswerMock(question, patchBodies);
+    const addToast = vi.fn();
+    const onStrategicStateRefresh = vi.fn();
+    const onStrategicInteraction = vi.fn();
+    const el = await renderPanel(addToast, false, {
+      strategicState: makeStrategicState(),
+        strategicWorkbenchState: {
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'strategic',
+          selected_refs: [
+            { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+          ],
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
+        },
+      onStrategicStateRefresh,
+      onStrategicInteraction,
+    });
+
+    const replyBtn = [...el.querySelectorAll('button')].find(button => button.title === 'Reply');
+    expect(replyBtn).toBeTruthy();
+    await act(async () => { (replyBtn as HTMLButtonElement).click(); });
+    await typeAndSend(el, 'yes, keep it active');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledWith('Question answered', 'success'));
+    expect(patchBodies[0]).toMatchObject({
+      resolution: 'yes, keep it active',
+      workbench_context: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        selected_refs: [
+          { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+        ],
+        session_started_at: sessionStartedAt,
+      },
+    });
+    expect(onStrategicStateRefresh).toHaveBeenCalledTimes(1);
+    expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
+  });
+
   test('passive_note send shows a success "won’t wake" toast', async () => {
     _setupSendMock({ arming: 'passive_note' });
     const addToast = vi.fn();
@@ -3542,6 +4893,18 @@ describe('MessagesPanel send arming receipt', () => {
     expect(text).toContain('won’t wake the strategist');
     expect(severity).toBe('success');
     expect(hintText(el)).toBe(armingHintCopy('passive_note'));
+  });
+
+  test('successful send records the Strategic interaction', async () => {
+    _setupSendMock({ arming: 'passive_note' });
+    const addToast = vi.fn();
+    const onStrategicInteraction = vi.fn();
+    const el = await renderPanel(addToast, false, { onStrategicInteraction });
+
+    await typeAndSend(el, 'record this in the current session');
+
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicInteraction).toHaveBeenCalledTimes(1);
   });
 
   test('routine_event send shows a success "won’t wake" routine toast', async () => {
@@ -3703,6 +5066,65 @@ describe('MessagesPanel send arming receipt', () => {
     expect(postKeys.length).toBe(3);
     expect(postKeys[2]).toBeTruthy();
     expect(postKeys[2]).not.toBe(postKeys[0]);
+  });
+
+  test('refreshes strategic state after steering message mutation', async () => {
+    _setupSendMock({ arming: 'steering' });
+    const addToast = vi.fn();
+    const onStrategicRefresh = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          onStrategicRefresh={onStrategicRefresh}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    expect(onStrategicRefresh).not.toHaveBeenCalled();
+    await typeAndSend(el, 'steer: focus on the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  test('refreshes strategic state once after duplicate steering replay', async () => {
+    _setupSendMock({ arming: 'duplicate' });
+    const addToast = vi.fn();
+    const onStrategicRefresh = vi.fn();
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={addToast as never}
+          onMessageCountChange={() => {}}
+          onStrategicRefresh={onStrategicRefresh}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    await typeAndSend(el, 'steer: focus on the migration work');
+    await waitFor(() => expect(addToast).toHaveBeenCalledTimes(1));
+    expect(addToast).toHaveBeenCalledWith(armingToastCopy('duplicate'), 'success');
+    expect(hintText(el)).toBe(armingHintCopy('duplicate'));
+    expect(onStrategicRefresh).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -3921,7 +5343,11 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
     });
   }
 
-  async function renderPanel(vision: Record<string, unknown> | null, strategistActive = false) {
+  async function renderPanel(
+    vision: Record<string, unknown> | null,
+    strategistActive = false,
+    props: Partial<MessagesPanelProps> = {},
+  ) {
     _suppressSinceLastVisit('test-user@example.com', 'proj-1');
     _mockWithVision(vision);
     host = document.createElement('div');
@@ -3936,6 +5362,7 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
           addToast={() => {}}
           onMessageCountChange={() => {}}
           strategistActive={strategistActive}
+          {...props}
         />,
       );
     });
@@ -3954,6 +5381,45 @@ describe('MessagesPanel strategic-refresh pending badge', () => {
   test('hides pending badge when no marker is present', async () => {
     const el = await renderPanel({});
     expect(el.textContent).not.toContain('Strategic cycle pending');
+  });
+
+  test('falls back to legacy project vision while Strategic read model is loading', async () => {
+    const el = await renderPanel(
+      {
+        _strategic_refresh: {
+          requested_at: new Date(Date.now() - 60_000).toISOString(),
+          origin: 'operator',
+        },
+      },
+      false,
+      { strategicState: null },
+    );
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('operator');
+  });
+
+  test('shows pending badge from populated Strategic read model', async () => {
+    const state = makeStrategicState({
+      strategic: {
+        ...makeStrategicState().strategic,
+        refresh: {
+          pending: {
+            requested_at: new Date(Date.now() - 60_000).toISOString(),
+            origin: 'operator',
+            excerpt: 'Refresh from Strategic read model',
+            operator_count: 2,
+          },
+          last_fired_at: null,
+          last_fired_origin: null,
+        },
+      },
+    });
+    const el = await renderPanel({}, false, { strategicState: state });
+
+    expect(el.textContent).toContain('Strategic cycle pending');
+    expect(el.textContent).toContain('Refresh from Strategic read model');
+    expect(el.textContent).toContain('+1 steer coalesced');
   });
 
   test('hides pending badge once the cycle is running (strategistActive)', async () => {
@@ -4168,6 +5634,28 @@ describe('MessagesPanel composer draft persistence', () => {
     expect(typeof parsed.type).toBe('string');
   });
 
+  test('composer is explicitly disabled when no project is selected', async () => {
+    _mockMessagesFetch([]);
+    const { container, getByText } = render(
+      <MessagesPanel
+        selectedProjectId={null}
+        onClose={() => {}}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+      />,
+    );
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    const sendBtn = container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+
+    expect(textarea).toBeTruthy();
+    expect(textarea.disabled).toBe(true);
+    expect(textarea.placeholder).toBe('Select a project to message Strategic');
+    expect(sendBtn).toBeTruthy();
+    expect(sendBtn.disabled).toBe(true);
+    expect(getByText('Select a project to message Strategic')).toBeTruthy();
+  });
+
   test('draft is restored into the textarea when component remounts', async () => {
     // Pre-seed a draft for the project
     const draftKey = `messages_composer_draft:test-user@example.com:proj-draft`;
@@ -4232,6 +5720,248 @@ describe('MessagesPanel composer draft persistence', () => {
     await waitFor(() => {
       expect(localStorage.getItem(draftKey)).toBeNull();
     });
+  });
+
+  test('minimal chat restores draft content but sends through the Strategic steer path', async () => {
+    const draftKey = 'messages_composer_draft:test-user@example.com:proj-draft';
+    localStorage.setItem(draftKey, JSON.stringify({ type: 'BLOCKER', content: 'use the clean chat path' }));
+    const postedBodies: unknown[] = [];
+    const sessionStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+    const lastInteractionAt = new Date(Date.now() - 5 * 60_000).toISOString();
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
+        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
+    const { container, getAllByRole } = render(
+      <MessagesPanel
+        selectedProjectId="proj-draft"
+        variant="page"
+        filterChrome="minimal"
+        showCloseButton={false}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState({
+          project_id: 'proj-draft',
+          context_package: {
+            id: 'strategic-context:proj-draft',
+            title: 'Draft workbench context',
+            status: 'ready',
+            summary: 'Pointer-safe package summary.',
+            item_count: 3,
+            token_count: null,
+            sources: [],
+            drilldowns: [],
+            resources: [],
+            canvas: {
+              id: 'strategic-canvas:proj-draft',
+              node_count: 2,
+              edge_count: 1,
+              nodes: [{ id: 'node-1', kind: 'task', label: 'Heavy canvas node' }],
+              edges: [],
+            },
+          },
+          work_session: {
+            version: 1,
+            id: 'strategic-session:proj-draft:2026-06-29T01:00:00Z',
+            mode: 'continuous',
+            active_surface: 'strategic',
+            session_started_at: sessionStartedAt,
+            last_interaction_at: lastInteractionAt,
+            context_package_id: 'strategic-context:proj-draft',
+            attention_level: 'watch',
+            selected_refs: [
+              { kind: 'knowledge_document', id: 'knowledge:kdoc-1', label: 'Operator notes' },
+            ],
+            selected_ref_descriptors: [
+              {
+                kind: 'artifact',
+                id: 'artifact:latest-context',
+                label: 'Latest context report',
+                summary: 'Short pointer summary.',
+                status: 'active',
+              },
+            ],
+            curated_metrics: [],
+          },
+        })}
+        strategicWorkbenchState={{
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'strategic',
+          preferred_runner_id: null,
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+          ],
+          session_started_at: sessionStartedAt,
+          last_interaction_at: lastInteractionAt,
+        }}
+      />,
+    );
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('use the clean chat path');
+    const sendButton = getAllByRole('button', { name: 'Send message' })
+      .find((button): button is HTMLButtonElement => button instanceof HTMLButtonElement && !button.disabled);
+    if (!sendButton) throw new Error('Expected enabled Strategic send button');
+    expect(sendButton).toHaveAttribute('type', 'button');
+    expect(container.textContent).not.toContain('Blocker');
+
+    await act(async () => {
+      sendButton?.click();
+    });
+
+    await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(1);
+    expect(postedBodies[0]).toMatchObject({
+      message_type: 'FEEDBACK',
+      content: 'use the clean chat path',
+      workbench_context: {
+        version: 1,
+        interaction_mode: 'continuous',
+        active_surface: 'strategic',
+        preferred_runner_id: null,
+        selected_refs: [
+          { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+        ],
+        selected_ref_descriptors: [
+          {
+            kind: 'artifact',
+            id: 'artifact:latest-context',
+            label: 'Latest context report',
+            summary: 'Short pointer summary.',
+            status: 'active',
+          },
+        ],
+        session_started_at: sessionStartedAt,
+        context_package_id: 'strategic-context:proj-draft',
+        context_package_descriptor: {
+          id: 'strategic-context:proj-draft',
+          title: 'Draft workbench context',
+          status: 'ready',
+          summary: 'Pointer-safe package summary.',
+        },
+      },
+    });
+    expect(JSON.stringify(postedBodies[0])).not.toContain('Heavy canvas node');
+    expect(postedBodies[0]).not.toHaveProperty('project_id');
+  });
+
+  test('stale Strategic workbench state does not keep routing workbench_context', async () => {
+    const staleNaive = new Date(Date.now() - 5 * 3600_000).toISOString().replace('Z', '');
+    const postedBodies: unknown[] = [];
+
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const initObj = init as RequestInit | undefined;
+      const method = initObj?.method ?? 'GET';
+      if (method === 'POST' && /\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr)) {
+        postedBodies.push(JSON.parse(String(initObj?.body ?? '{}')));
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (method === 'GET' && /\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr)) {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/messages(\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({ messages: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-draft');
+    const { container } = render(
+      <MessagesPanel
+        selectedProjectId="proj-draft"
+        variant="page"
+        filterChrome="minimal"
+        showCloseButton={false}
+        addToast={() => {}}
+        onMessageCountChange={() => {}}
+        strategicState={makeStrategicState({
+          context_package: null,
+          work_session: {
+            version: 1,
+            id: 'strategic-session:proj-draft',
+            mode: 'continuous',
+            active_surface: 'pipeline',
+            session_started_at: staleNaive,
+            last_interaction_at: null,
+            context_package_id: null,
+            attention_level: 'clear',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+            ],
+            selected_ref_descriptors: [],
+            curated_metrics: [],
+          },
+        })}
+        strategicWorkbenchState={{
+          version: 1,
+          interaction_mode: 'continuous',
+          active_surface: 'pipeline',
+          selected_refs: [
+            { kind: 'artifact', id: 'artifact:stale', label: 'Stale ref' },
+          ],
+          session_started_at: staleNaive,
+          last_interaction_at: null,
+        }}
+      />,
+    );
+    await waitFor(() => expect(_strategicSessionGetCalls().length).toBeGreaterThanOrEqual(1));
+
+    const textarea = container.querySelector('textarea') as HTMLTextAreaElement;
+    expect(textarea.value).toBe('');
+
+    const { fireEvent } = await import('@testing-library/react');
+    await act(async () => {
+      fireEvent.change(textarea, { target: { value: 'stale workbench should not route' } });
+    });
+
+    const sendButton = container.querySelector('button[aria-label="Send message"]') as HTMLButtonElement | null;
+    if (!sendButton) throw new Error('Expected send button');
+    await act(async () => {
+      sendButton.click();
+    });
+
+    await waitFor(() => expect(postedBodies).toHaveLength(1));
+    expect(_strategicSessionMessagePostCalls()).toHaveLength(1);
+    expect(postedBodies[0]).not.toHaveProperty('workbench_context');
+    expect(postedBodies[0]).not.toHaveProperty('project_id');
   });
 
   test('draft is scoped per project — switching projects loads the new project draft', async () => {

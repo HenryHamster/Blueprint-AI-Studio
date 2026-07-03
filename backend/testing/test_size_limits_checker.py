@@ -8,6 +8,7 @@ clean; section scoping works; absent-tree sections are skipped not errored.
 
 import json
 import os
+import sys
 
 from app.size_limit_policy import bump_size_limit
 from testing import check_size_limits as csl
@@ -253,6 +254,51 @@ def test_frontend_test_files_excluded_from_uncapped_scan(tmp_path):
         str(root), {}, (".ts", ".tsx"), csl._is_frontend_excluded
     )
     assert [rec["rel"] for rec in offenders] == ["Real.tsx"]
+
+
+def test_explicit_repo_root_uncapped_scan_ignores_admin_ui_src_override(
+    tmp_path, monkeypatch, capsys
+):
+    repo, jp = _build_repo(tmp_path, frontend={"App.tsx": (10, 100)})
+    override_root = tmp_path / "admin-ui-override" / "src"
+    _write_lines(str(override_root / "Leaked.tsx"), 1600)
+    monkeypatch.setenv("ADMIN_UI_SRC", str(override_root))
+
+    rc = _run(jp, repo, "--sections", "frontend")
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Leaked.tsx" not in out
+    assert "[uncapped]" not in out
+
+
+def test_cli_explicit_repo_root_ignores_admin_ui_src_override(
+    tmp_path, monkeypatch, capsys
+):
+    repo, jp = _build_repo(tmp_path, frontend={"App.tsx": (10, 100)})
+    override_root = tmp_path / "admin-ui-override" / "src"
+    _write_lines(str(override_root / "Leaked.tsx"), 1600)
+    monkeypatch.setenv("ADMIN_UI_SRC", str(override_root))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "check_size_limits.py",
+            "--json",
+            jp,
+            "--repo-root",
+            repo,
+            "--sections",
+            "frontend",
+        ],
+    )
+
+    rc = csl.main()
+
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Leaked.tsx" not in out
+    assert "[uncapped]" not in out
 
 
 def test_uncapped_scan_skips_already_capped_files(tmp_path):

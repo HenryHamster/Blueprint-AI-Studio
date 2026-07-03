@@ -10,11 +10,11 @@ import { type TemporaryMutes, loadTemporaryMutes, saveTemporaryMutes } from './t
 import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messageGrouping';
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
-import { type ProjectMessage } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
-import { MessagesPanelHeader, type WebhookStats } from './MessagesPanelHeader';
+import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
 import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
@@ -23,13 +23,24 @@ import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { StrategicChallengeChip } from './StrategicChallengeChip';
 import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
+import {
+  createStrategicSessionMessage,
+  fetchStrategicSession,
+  type StrategicContextPackageDescriptor,
+  type StrategicMessageTarget,
+  type StrategicStateResponse,
+  type StrategicWorkbenchState,
+} from '../strategicStateApi';
+import { buildStrategicContextDescriptor, SESSION_IDLE_TTL_MS } from '../utils/strategicContextDescriptor';
 
 const DEFAULT_VIEW_ID = '__default__';
+const MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT = 8;
 
 // Receipt shown for at most 2 hours after a steer fires, preventing stale "picked up"
 // messages that grow without bound, and blocking stale receipts from resurfacing after
 // an operator cancels a fresh steer.
 const STEER_RECEIPT_MAX_AGE_MS = 7_200_000;
+const OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS = 45_000;
 
 function getCompletionReceiptTone(status?: string | null): {
   banner: string;
@@ -88,6 +99,136 @@ function viewSummaryLine(query: string, prefs: Record<string, EventPref>, sort: 
   return parts.join(' · ');
 }
 
+function contextPackageTextTone(status?: string | null): string {
+  if (status === 'building') return 'text-cyan-300';
+  if (status === 'stale') return 'text-amber-300';
+  return 'text-emerald-300';
+}
+
+function workbenchModeLabel(mode?: string | null): string {
+  if (mode === 'check_in') return 'Check-in';
+  if (mode === 'monitor') return 'Monitor';
+  if (mode === 'continuous') return 'Workday';
+  return 'Chat';
+}
+
+function attentionTextTone(level?: string | null): string {
+  if (level === 'needs_operator') return 'text-amber-300';
+  if (level === 'watch') return 'text-neutral-300';
+  return 'text-emerald-300';
+}
+
+function messageReplyFromLabel(msg: ProjectMessage): string {
+  const fromType = (msg.from_type || '').toLowerCase();
+  if (fromType === 'strategic' || fromType === 'strategist') return 'Strategic';
+  if (fromType === 'agent') return 'Agent';
+  if (fromType === 'system') return 'System';
+  return 'Operator';
+}
+
+function canPrimeStrategicChatReply(msg: ProjectMessage): boolean {
+  const fromType = (msg.from_type || '').toLowerCase();
+  return (
+    msg.status === 'open'
+    && (fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist')
+  );
+}
+
+function isConversationMessage(
+  msg: ProjectMessage,
+  eventPrefs: Record<string, EventPref>,
+  tempMutes: TemporaryMutes,
+): boolean {
+  const fromType = (msg.from_type || '').toLowerCase();
+  const eventType = msg.context?.event_type;
+  const strategicOrigin = fromType === 'strategic' || fromType === 'strategist';
+  if (fromType === 'user' || fromType === 'operator') return true;
+  if (strategicOrigin && !eventType) return true;
+  if (msg.message_type === 'QUESTION' || msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT' || msg.message_type === 'FEEDBACK') return true;
+  if (eventType === 'question_answer' || eventType === 'feedback_acknowledgment') return true;
+  return effectiveSignal(msg, eventPrefs, tempMutes) === 'high';
+}
+
+function buildMessageWorkbenchContext(
+  state?: StrategicStateResponse | null,
+  workbenchOverride?: StrategicWorkbenchState | null,
+): Record<string, unknown> | null {
+  const session = state?.work_session ?? null;
+  const workbench = workbenchOverride ?? state?.workbench ?? null;
+  if (!session && !workbench && !state?.context_package?.id) return null;
+  const selectedRefs = workbench?.selected_refs ?? session?.selected_refs ?? [];
+  const interactionMode = workbench?.interaction_mode ?? session?.mode ?? 'chat';
+  const activeSurface = workbench?.active_surface ?? session?.active_surface ?? 'strategic';
+  const sessionStartedAt = workbench?.session_started_at ?? session?.session_started_at ?? null;
+  const lastInteractionAt = workbench?.last_interaction_at ?? session?.last_interaction_at ?? null;
+  const contextPackageId = session?.context_package_id ?? state?.context_package?.id ?? null;
+  const sessionFreshTs = lastInteractionAt ?? sessionStartedAt;
+  const sessionIsFresh = sessionFreshTs != null && (() => {
+    const parsed = parseTimestamp(sessionFreshTs);
+    return !isNaN(parsed.getTime()) && Date.now() - parsed.getTime() <= SESSION_IDLE_TTL_MS;
+  })();
+  if (!sessionIsFresh) {
+    return contextPackageId ? { version: 1, context_package_id: contextPackageId } : null;
+  }
+  const selectedRefKeys = new Set(
+    selectedRefs
+      .map(ref => `${ref.kind}:${ref.id}`)
+      .filter(key => key.length > 1),
+  );
+  const selectedRefDescriptors = (session?.selected_ref_descriptors ?? [])
+    .filter(ref => selectedRefKeys.has(`${ref.kind}:${ref.id}`))
+    .slice(0, MESSAGE_CONTEXT_SELECTED_REF_DESCRIPTOR_LIMIT)
+    .map(ref => ({
+      kind: ref.kind,
+      id: ref.id,
+      label: ref.label,
+      ...(ref.summary ? { summary: ref.summary } : {}),
+      ...(ref.status ? { status: ref.status } : {}),
+      ...(ref.target ? { target: ref.target } : {}),
+    }));
+  const contextPackage = state?.context_package ?? null;
+  const contextPackageDescriptor = contextPackage
+    ? {
+        id: contextPackage.id,
+        title: contextPackage.title,
+        ...(contextPackage.label ? { label: contextPackage.label } : {}),
+        ...(contextPackage.status ? { status: contextPackage.status } : {}),
+        ...(contextPackage.summary ? { summary: contextPackage.summary } : {}),
+      }
+    : null;
+  return {
+    version: 1,
+    interaction_mode: interactionMode,
+    active_surface: activeSurface,
+    ...(workbench && Object.prototype.hasOwnProperty.call(workbench, 'preferred_runner_id')
+      ? { preferred_runner_id: workbench.preferred_runner_id ?? null }
+      : {}),
+    selected_refs: selectedRefs,
+    ...(selectedRefDescriptors.length ? { selected_ref_descriptors: selectedRefDescriptors } : {}),
+    session_started_at: sessionStartedAt,
+    context_package_id: contextPackageId,
+    ...(contextPackageDescriptor ? { context_package_descriptor: contextPackageDescriptor } : {}),
+  };
+}
+
+function strategicRefreshFromReadModel(
+  state?: StrategicStateResponse | null,
+): StrategicRefreshMarker | null {
+  if (!state) return null;
+  const refresh = state.strategic.refresh;
+  if (refresh.pending) return refresh.pending;
+  if (refresh.last_fired_at && refresh.last_fired_origin === 'operator') {
+    const ageMs = Date.now() - parseTimestamp(refresh.last_fired_at).getTime();
+    if (!Number.isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+      return {
+        last_fired_at: refresh.last_fired_at,
+        last_fired_origin: refresh.last_fired_origin,
+      };
+    }
+  }
+  return null;
+}
+
 function viewMatches(
   view: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
   state: { query: string; prefs: Record<string, EventPref>; sort: 'importance' | 'recent'; showResolved: boolean; routineExpanded: boolean; showOnlyNew: boolean },
@@ -106,21 +247,59 @@ function viewMatches(
   return true;
 }
 
-interface MessagesPanelProps {
+export type MessagesPanelVariant = 'modal' | 'page';
+
+export interface MessagesPanelProps {
   selectedProjectId: string | null;
   githubRepo?: string | null;
   defaultBranch?: string;
-  onClose: () => void;
+  onClose?: () => void;
   addToast: (message: string, type: 'success' | 'error' | 'info') => void;
   onMessageCountChange?: (count: number) => void;
   onOpenTask?: (taskId: string) => void;
   notifyOnHighSignalMessage?: boolean;
+  /**
+   * `modal` preserves the legacy full header when `onClose` is supplied.
+   * `page` makes MessagesPanel suitable as a primary page: no close button by
+   * default and compact filter/saved-view chrome unless overridden below.
+   */
+  variant?: MessagesPanelVariant;
+  /** Controls whether filter/search/saved-view tools are always visible or collapsed behind a header toggle. */
+  filterChrome?: MessagesPanelFilterChrome;
+  /** Overrides the close button default derived from `variant` and `onClose`. */
+  showCloseButton?: boolean;
   /** Live signal: whether a strategic cycle is currently running for this project. */
   strategistActive?: boolean;
   /** Phase-level detail about the currently running cycle, if any. */
   cycleProgress?: StrategicCycleProgress | null;
   /** Outcome receipt from the most recently completed cycle, shown until the next cycle begins. */
   lastCycleCompletion?: StrategicCycleCompletion | null;
+  /** Incrementing signal from the workbench shell to focus the Strategic composer. */
+  focusComposerSignal?: number;
+  /** Incrementing signal from realtime events to refresh messages immediately. */
+  realtimeRefreshSignal?: number;
+  /** Compact Strategic context descriptor, shown only in the minimal chat surface. */
+  contextPackage?: StrategicContextPackageDescriptor | null;
+  /** Strategic workbench read model, used by the minimal chat surface. */
+  strategicState?: StrategicStateResponse | null;
+  /** Optimistic workbench session state from the shell; overrides stale read-model workbench refs. */
+  strategicWorkbenchState?: StrategicWorkbenchState | null;
+  /** One-shot target from the Strategic rail, used to reveal/reply to a specific message. */
+  targetMessage?: StrategicMessageTarget | null;
+  /** Called once the panel has consumed targetMessage. */
+  onTargetMessageHandled?: () => void;
+  /** Refresh the Strategic read model after a chat action changes Strategic state. */
+  onStrategicStateRefresh?: () => void | Promise<void>;
+  /** Record a successful operator interaction with Strategic workbench state. */
+  onStrategicInteraction?: () => void | Promise<void>;
+  /** Open the Strategic context workspace from the minimal Strategic composer. */
+  onOpenStrategicContextWorkspace?: () => void;
+  /** Open the global command palette from the Strategic composer. */
+  onOpenCommandPalette?: () => void;
+  /** Backwards-compatible alias for older call sites. */
+  onOpenStrategicContextCommands?: () => void;
+  /** Legacy refresh callback kept for callers that still wire the old prop name. */
+  onStrategicRefresh?: () => void;
 }
 
 type MessagesPanelPrefs = { version: 1; routineExpanded: boolean; showResolved: boolean; criticalOnly: boolean };
@@ -194,7 +373,50 @@ async function postBackendLastSeen(projectId: string, timestamp: number): Promis
   } catch { /* ignore — localStorage already saved */ }
 }
 
-export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, strategistActive, cycleProgress, lastCycleCompletion }: MessagesPanelProps) {
+function messagesEqual(a: ProjectMessage, b: ProjectMessage): boolean {
+  return a.id === b.id
+    && a.project_id === b.project_id
+    && a.message_type === b.message_type
+    && a.from_type === b.from_type
+    && a.from_task_id === b.from_task_id
+    && a.content === b.content
+    && a.status === b.status
+    && a.resolution === b.resolution
+    && a.resolved_at === b.resolved_at
+    && a.created_at === b.created_at
+    && JSON.stringify(a.context ?? {}) === JSON.stringify(b.context ?? {});
+}
+
+function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
+  return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
+}
+
+export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh }: MessagesPanelProps) {
+  const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
+  const resolvedFilterChrome = filterChrome ?? (resolvedVariant === 'page' ? 'compact' : 'full');
+  const resolvedShowCloseButton = showCloseButton ?? (resolvedVariant !== 'page' && Boolean(onClose));
+  const conversationMode = resolvedFilterChrome === 'minimal';
+  const currentStrategicState = strategicState?.project_id === selectedProjectId ? strategicState : null;
+  const usesStrategicReadModel = currentStrategicState != null;
+  const effectiveContextPackage = contextPackage ?? currentStrategicState?.context_package ?? null;
+  const workbenchState = strategicWorkbenchState ?? currentStrategicState?.workbench ?? null;
+  const strategicAttention = currentStrategicState?.attention ?? null;
+  const refreshStrategicState = onStrategicStateRefresh ?? onStrategicRefresh;
+  const recordStrategicInteraction = useCallback(() => {
+    if (!onStrategicInteraction) return;
+    Promise.resolve(onStrategicInteraction()).catch(() => {});
+  }, [onStrategicInteraction]);
+  const selectedProjectIdRef = useRef(selectedProjectId);
+  selectedProjectIdRef.current = selectedProjectId;
+  const conversationModeRef = useRef(conversationMode);
+  conversationModeRef.current = conversationMode;
+  const targetMessageId = targetMessage?.messageId ?? null;
+  const targetMessageIdRef = useRef<string | null>(targetMessageId);
+  targetMessageIdRef.current = targetMessageId;
+  const strategicSessionPinnedTargetRef = useRef<{ projectId: string; messageId: string } | null>(null);
+  const usesStrategicReadModelRef = useRef(usesStrategicReadModel);
+  usesStrategicReadModelRef.current = usesStrategicReadModel;
+  const attentionNeeds = strategicAttention?.counts.needs_operator ?? 0;
   const [messages, setMessages] = useState<ProjectMessage[]>([]);
   const [loading, setLoading] = useState(true);
   // Compose — initialized from the per-project draft (if any) so a reload restores it.
@@ -209,11 +431,27 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // server idempotency key is the backstop for retries that do reach it).
   const submittingRef = useRef(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(null);
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
   // to a fresh type-based prediction).
   const [lastArming, setLastArming] = useState<ArmingOutcome | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const focusComposerTextarea = useCallback(() => {
+    window.setTimeout(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      if (!el.disabled) {
+        try {
+          el.setSelectionRange(el.value.length, el.value.length);
+        } catch {
+          // Ignore selection failures in non-browser test environments.
+        }
+      }
+    }, 0);
+  }, []);
+  const effectiveNewType = conversationMode ? 'FEEDBACK' : newType;
   // Idempotency key for the in-flight draft. Generated once per draft and
   // reused across retries / a rapid double-submit so the backend collapses
   // them to one logical message; cleared after a successful send so the next
@@ -248,6 +486,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const scrollRef = useRef<HTMLDivElement>(null);
   const [showScrollDown, setShowScrollDown] = useState(false);
   const prevMessageCountRef = useRef(0);
+  const fetchMessagesRequestSeqRef = useRef(0);
+  const lastStrategicSessionTargetFetchRef = useRef<string | null>(null);
+  const lastRealtimeRefreshSignalRef = useRef<number | null>(null);
+  const getStrategicSessionIncludeMessageId = useCallback((projectId: string | null, currentTargetMessageId: string | null): string | null => {
+    if (!projectId) return null;
+    if (currentTargetMessageId) return currentTargetMessageId;
+    const pinnedTarget = strategicSessionPinnedTargetRef.current;
+    return pinnedTarget?.projectId === projectId ? pinnedTarget.messageId : null;
+  }, []);
 
   // Collapsed resolved
   const [showResolved, setShowResolved] = useState(() => loadMessagesPanelPrefs(auth.currentUser?.email).showResolved);
@@ -269,6 +516,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // operator steering arms a cycle, cleared backend-side once the autonomous loop
   // consumes it. Drives the "strategic cycle pending" badge until then.
   const [strategicRefresh, setStrategicRefresh] = useState<StrategicRefreshMarker | null>(null);
+  const optimisticStrategicRefreshRef = useRef<StrategicRefreshMarker | null>(null);
   const completionReceiptTone = lastCycleCompletion ? getCompletionReceiptTone(lastCycleCompletion.status) : null;
   // In-flight guard for the "cancel armed steer" affordance on the pending badge.
   const [cancellingRefresh, setCancellingRefresh] = useState(false);
@@ -294,6 +542,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const [openKebabId, setOpenKebabId] = useState<string | null>(null);
   const kebabRef = useRef<HTMLDivElement>(null);
 
+  const openMessageCommandSurface = useCallback(() => {
+    focusComposerTextarea();
+    if (conversationMode) onOpenCommandPalette?.();
+  }, [conversationMode, focusComposerTextarea, onOpenCommandPalette]);
+
   // Last-seen tracking: dividerTime is the threshold; when operator scrolls past or timeout fires, we persist it
   const [dividerTime, setDividerTime] = useState<number | null>(null);
   const dividerTimeRef = useRef<number | null>(null);
@@ -311,6 +564,57 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       dividerDismissedRef.current = true;
     }
   }, [selectedProjectId]);
+
+  useEffect(() => {
+    if (!usesStrategicReadModel) return;
+    const readModelRefresh = strategicRefreshFromReadModel(currentStrategicState);
+    const optimisticRefresh = optimisticStrategicRefreshRef.current;
+    if (optimisticRefresh?.requested_at) {
+      const optimisticAgeMs = Date.now() - parseTimestamp(optimisticRefresh.requested_at).getTime();
+      const optimisticTime = parseTimestamp(optimisticRefresh.requested_at).getTime();
+      const readModelTime = readModelRefresh?.requested_at
+        ? parseTimestamp(readModelRefresh.requested_at).getTime()
+        : readModelRefresh?.last_fired_at
+          ? parseTimestamp(readModelRefresh.last_fired_at).getTime()
+          : NaN;
+      const keepFreshOptimistic =
+        !Number.isNaN(optimisticAgeMs) &&
+        optimisticAgeMs <= OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS &&
+        !Number.isNaN(optimisticTime) &&
+        (Number.isNaN(readModelTime) || readModelTime < optimisticTime);
+      if (keepFreshOptimistic) {
+        setStrategicRefresh(optimisticRefresh);
+        return;
+      }
+      optimisticStrategicRefreshRef.current = null;
+    }
+    setStrategicRefresh(readModelRefresh);
+  }, [currentStrategicState, usesStrategicReadModel]);
+
+  useEffect(() => {
+    const optimisticRefresh = optimisticStrategicRefreshRef.current;
+    if (!optimisticRefresh?.requested_at || strategicRefresh !== optimisticRefresh) return;
+    const requestedAt = parseTimestamp(optimisticRefresh.requested_at).getTime();
+    if (Number.isNaN(requestedAt)) {
+      optimisticStrategicRefreshRef.current = null;
+      setStrategicRefresh(strategicRefreshFromReadModel(currentStrategicState));
+      return;
+    }
+    const delayMs = Math.max(
+      0,
+      requestedAt + OPTIMISTIC_STRATEGIC_REFRESH_MAX_AGE_MS - Date.now(),
+    );
+    const timer = window.setTimeout(() => {
+      if (optimisticStrategicRefreshRef.current !== optimisticRefresh) return;
+      optimisticStrategicRefreshRef.current = null;
+      setStrategicRefresh(previous =>
+        previous === optimisticRefresh
+          ? strategicRefreshFromReadModel(currentStrategicState)
+          : previous,
+      );
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [currentStrategicState, strategicRefresh]);
 
   const handleShowOnlyNew = useCallback(() => {
     setShowOnlyNew(true);
@@ -356,7 +660,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setEventPrefs(localPrefs);
     setTempMutes(loadTemporaryMutes(auth.currentUser?.email, selectedProjectId));
     setWebhookStats(null);
-    setStrategicRefresh(null);
+    optimisticStrategicRefreshRef.current = null;
+    if (!usesStrategicReadModelRef.current) setStrategicRefresh(null);
     setMuteWindow(loadMuteWindow(auth.currentUser?.email, selectedProjectId));
     const lastSeen = loadLastSeen(auth.currentUser?.email, selectedProjectId);
     setDividerTime(lastSeen);
@@ -442,6 +747,11 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, [openKebabId]);
 
+  useEffect(() => {
+    if (!focusComposerSignal) return;
+    focusComposerTextarea();
+  }, [focusComposerSignal, focusComposerTextarea]);
+
   // Memoized message-list derivation: open/resolved split, high-signal vs routine,
   // pinned blockers/questions, auto-promoted failing groups, visible-resolved, and
   // new-message counts — all behind one pure hook so the panel stays focused on
@@ -484,8 +794,89 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   // surfaced types are included — matching App.tsx's closed-panel count exactly so the
   // badge does not jump when the operator opens the panel.
   const highSignalCount = countHighSignalMessages(messages, eventPrefs, tempMutes);
+  const conversationMessages = useMemo(() => {
+    return messages
+      .filter(msg => isConversationMessage(msg, eventPrefs, tempMutes))
+      .slice()
+      .sort((a, b) => {
+        const aTime = a.created_at ? parseTimestamp(a.created_at).getTime() : 0;
+        const bTime = b.created_at ? parseTimestamp(b.created_at).getTime() : 0;
+        return aTime - bTime;
+      });
+  }, [messages, eventPrefs, tempMutes]);
+  const showStrategicStatusStrip = conversationMode && Boolean(
+    strategistActive
+      || strategicRefresh
+      || (effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready')
+      || (strategicAttention?.level === 'needs_operator' && attentionNeeds > 0),
+  );
+  const strategicComposerContext = useMemo(
+    () => conversationMode
+      ? buildStrategicContextDescriptor(currentStrategicState, strategicWorkbenchState)
+      : null,
+    [conversationMode, currentStrategicState, strategicWorkbenchState],
+  );
 
   const mutedCount = Object.values(eventPrefs).filter(v => v === 'mute').length;
+
+  useEffect(() => {
+    if (!selectedProjectId) {
+      strategicSessionPinnedTargetRef.current = null;
+      lastStrategicSessionTargetFetchRef.current = null;
+      return;
+    }
+    if (strategicSessionPinnedTargetRef.current?.projectId !== selectedProjectId) {
+      strategicSessionPinnedTargetRef.current = null;
+    }
+    if (targetMessageId) {
+      strategicSessionPinnedTargetRef.current = { projectId: selectedProjectId, messageId: targetMessageId };
+    }
+    lastStrategicSessionTargetFetchRef.current = null;
+  }, [selectedProjectId, targetMessageId]);
+
+  useEffect(() => {
+    if (!targetMessageId) return;
+    if (!conversationMode) {
+      onTargetMessageHandled?.();
+      return;
+    }
+    const visibleTarget = conversationMessages.find(msg => msg.id === targetMessageId) ?? null;
+    const target = visibleTarget ?? messages.find(msg => msg.id === targetMessageId) ?? null;
+    if (!target) {
+      if (!loading && lastStrategicSessionTargetFetchRef.current === targetMessageId) {
+        onTargetMessageHandled?.();
+      }
+      return;
+    }
+    setHighlightedMessageId(target.id);
+    const node = scrollRef.current?.querySelector(`[data-message-id="${target.id}"]`);
+    node?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (targetMessage?.action === 'reply' && visibleTarget && canPrimeStrategicChatReply(visibleTarget)) {
+      setReplyTo({
+        id: visibleTarget.id,
+        content: visibleTarget.content,
+        from: messageReplyFromLabel(visibleTarget),
+        message_type: visibleTarget.message_type,
+        status: visibleTarget.status,
+      });
+      textareaRef.current?.focus();
+    }
+    onTargetMessageHandled?.();
+  }, [
+    conversationMessages,
+    conversationMode,
+    loading,
+    messages,
+    onTargetMessageHandled,
+    targetMessage?.action,
+    targetMessageId,
+  ]);
+
+  useEffect(() => {
+    if (!highlightedMessageId) return;
+    const timer = window.setTimeout(() => setHighlightedMessageId(null), 4000);
+    return () => window.clearTimeout(timer);
+  }, [highlightedMessageId]);
 
   // Persist + apply a mute-window change (arm/extend pass a window, clear passes null).
   // MuteWindowMenu owns its own open/close UI state and pushes changes back through here.
@@ -682,16 +1073,53 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       setTempMutes(cleaned);
       saveTemporaryMutes(auth.currentUser?.email, selectedProjectId, cleaned);
     }
-  }, [selectedProjectId]);
+  }, [selectedProjectId, tempMutes]);
 
   const fetchMessages = useCallback(async () => {
+    const requestSeq = fetchMessagesRequestSeqRef.current + 1;
+    fetchMessagesRequestSeqRef.current = requestSeq;
     if (!selectedProjectId) { setLoading(false); return; }
+    const requestProjectId = selectedProjectId;
+    const requestConversationMode = conversationMode;
+    const isCurrentRequest = () => (
+      fetchMessagesRequestSeqRef.current === requestSeq
+      && selectedProjectIdRef.current === requestProjectId
+      && conversationModeRef.current === requestConversationMode
+    );
     try {
+      if (conversationMode) {
+        const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
+        const session = await fetchStrategicSession(selectedProjectId, includeMessageId);
+        const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
+          selectedProjectIdRef.current,
+          targetMessageIdRef.current,
+        );
+        if (
+          selectedProjectIdRef.current !== selectedProjectId
+          || !isCurrentRequest()
+          || currentIncludeMessageId !== includeMessageId
+        ) {
+          return;
+        }
+        lastStrategicSessionTargetFetchRef.current = includeMessageId;
+        const sessionMessages = session.conversation?.items ?? [];
+        sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
+        hasInitiallyLoadedRef.current = true;
+        setMessages(prev => {
+          if (messageListsEqual(prev, sessionMessages)) return prev;
+          return sessionMessages;
+        });
+        if (!usesStrategicReadModelRef.current) {
+          onMessageCountChange?.(countHighSignalMessages(sessionMessages, eventPrefsRef.current, tempMutesRef.current));
+        }
+        return;
+      }
       const params = new URLSearchParams({ project_id: selectedProjectId, status: 'all', limit: searchQuery.trim() ? '200' : '100' });
       if (searchQuery.trim()) params.set('q', searchQuery.trim());
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
+      if (!isCurrentRequest()) return;
       const msgs: ProjectMessage[] = data.messages ?? [];
 
       // Detect new high-signal messages for toast alerts
@@ -739,14 +1167,17 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       // Only update state if messages actually changed — prevents scroll jumps from polling
       setMessages(prev => {
-        if (prev.length === msgs.length && prev.every((m, i) => m.id === msgs[i].id && m.status === msgs[i].status)) return prev;
+        if (messageListsEqual(prev, msgs)) return prev;
         return msgs;
       });
       onMessageCountChange?.(countHighSignalMessages(msgs, eventPrefsRef.current, tempMutesRef.current));
       // Fetch webhook delivery stats (non-critical — errors are silently ignored)
       try {
         const statsRes = await apiFetch(`${API_BASE_URL}/api/admin/notification-dispatch/stats?project_id=${selectedProjectId}`);
-        if (statsRes.ok) setWebhookStats(await statsRes.json());
+        if (statsRes.ok) {
+          const stats = await statsRes.json();
+          if (isCurrentRequest()) setWebhookStats(stats);
+        }
       } catch { /* ignore */ }
       // Pending strategic-refresh marker — surfaced as a "strategic cycle pending"
       // badge until the autonomous loop consumes it (when it clears backend-side).
@@ -754,44 +1185,57 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // AND fired within STEER_RECEIPT_MAX_AGE_MS (prevents stale receipts that grow without
       // bound, and prevents a just-cancelled steer from showing an old "picked up" receipt).
       // Non-critical: errors leave the prior marker state untouched.
-      try {
-        const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
-        if (visRes.ok) {
-          const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
-          const marker = proj.vision?._strategic_refresh;
-          const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
-          const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
-          // Build marker state: include pending marker if present, or add receipt if it was
-          // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
-          if (marker && typeof marker === 'object') {
-            setStrategicRefresh(marker);
-          } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
-            const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
-            if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
-              setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+      if (!usesStrategicReadModel) {
+        try {
+          const visRes = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`);
+          if (visRes.ok) {
+            const proj = await visRes.json() as { vision?: { _strategic_refresh?: StrategicRefreshMarker | null; _strategic_refresh_last_fired_at?: string; _strategic_refresh_last_fired_origin?: string } };
+            if (usesStrategicReadModelRef.current || selectedProjectIdRef.current !== selectedProjectId || !isCurrentRequest()) return;
+            const marker = proj.vision?._strategic_refresh;
+            const lastFiredAt = proj.vision?._strategic_refresh_last_fired_at;
+            const lastFiredOrigin = proj.vision?._strategic_refresh_last_fired_origin;
+            // Build marker state: include pending marker if present, or add receipt if it was
+            // operator-origin AND fired recently (within STEER_RECEIPT_MAX_AGE_MS).
+            if (marker && typeof marker === 'object') {
+              setStrategicRefresh(marker);
+            } else if (lastFiredAt && typeof lastFiredAt === 'string' && lastFiredOrigin === 'operator') {
+              const ageMs = Date.now() - parseTimestamp(lastFiredAt).getTime();
+              if (!isNaN(ageMs) && ageMs <= STEER_RECEIPT_MAX_AGE_MS) {
+                setStrategicRefresh({ last_fired_at: lastFiredAt, last_fired_origin: lastFiredOrigin });
+              } else {
+                setStrategicRefresh(null);
+              }
             } else {
               setStrategicRefresh(null);
             }
-          } else {
-            setStrategicRefresh(null);
           }
-        }
-      } catch { /* ignore */ }
+        } catch { /* ignore */ }
+      }
     } catch {
-      addToastRef.current('Failed to load messages', 'error');
+      if (isCurrentRequest()) addToastRef.current('Failed to load messages', 'error');
     } finally {
-      setLoading(false);
+      if (isCurrentRequest()) setLoading(false);
     }
-  }, [selectedProjectId, onMessageCountChange, eventPrefs, searchQuery]);
+  }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
+
+  useEffect(() => {
+    if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;
+    lastRealtimeRefreshSignalRef.current = realtimeRefreshSignal;
+    void fetchMessages();
+  }, [fetchMessages, realtimeRefreshSignal]);
 
   // Auto-scroll to bottom only on initial load or when user sends a new message
   // (new message = count increased AND user is near the bottom)
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    if (conversationMode && targetMessageId) {
+      prevMessageCountRef.current = currentCount;
+      return;
+    }
     const isInitialLoad = prevMessageCountRef.current === 0 && currentCount > 0;
     if (isInitialLoad) {
       // First load — jump to bottom instantly
@@ -805,14 +1249,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [highSignalOpen, routineOpen, visibleResolved]);
+  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved]);
 
   // Update parent with the high-signal count for the tab-title badge. highSignalCount is
   // countHighSignalMessages(messages), identical to the fetch callback and the closed-panel
   // App.tsx path, so the badge stays stable across open/closed transitions.
   useEffect(() => {
+    if (conversationMode && usesStrategicReadModel) return;
     onMessageCountChange?.(highSignalCount);
-  }, [highSignalCount, onMessageCountChange]);
+  }, [conversationMode, highSignalCount, onMessageCountChange, usesStrategicReadModel]);
 
   // Track scroll position for "scroll to bottom" button
   useEffect(() => {
@@ -863,10 +1308,14 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // via PATCH — the backend posts a question_answer NOTE (linked back to the
       // question) and marks the question resolved so the strategist sees it answered.
       if (replyTo && replyTo.message_type === 'QUESTION' && replyTo.status === 'open') {
+        const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
         const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${replyTo.id}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ resolution: newContent.trim() }),
+          body: JSON.stringify({
+            resolution: newContent.trim(),
+            ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+          }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         idempotencyKeyRef.current = null;
@@ -876,6 +1325,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         setLastArming(null);
         if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast('Question answered', 'success');
+        void refreshStrategicState?.();
+        recordStrategicInteraction();
         await fetchMessages();
         return;
       }
@@ -884,20 +1335,62 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         context.reply_to = replyTo.id;
         context.reply_preview = replyTo.content.slice(0, 120);
       }
+      const workbenchContext = buildMessageWorkbenchContext(currentStrategicState, strategicWorkbenchState);
       // Reuse the draft's key across a double-submit / retry so the backend
       // dedups; only mint a new one when the previous send fully succeeded.
       if (!idempotencyKeyRef.current) {
         idempotencyKeyRef.current = generateIdempotencyKey();
+      }
+      const submittedContent = newContent.trim();
+      if (conversationMode) {
+        const data = await createStrategicSessionMessage(selectedProjectId, {
+          message_type: effectiveNewType,
+          content: submittedContent,
+          idempotency_key: idempotencyKeyRef.current,
+          ...(Object.keys(context).length > 0 ? { context } : {}),
+          ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
+        });
+        const arming = parseArmingOutcome(data?.arming);
+        idempotencyKeyRef.current = null;
+        setNewContent('');
+        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
+        setReplyTo(null);
+        setLastArming(arming);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
+        addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+        let didRefreshStrategicState = false;
+        if (arming === 'steering') {
+          const optimisticRefresh = {
+            requested_at: new Date().toISOString(),
+            origin: 'operator',
+            reason: 'operator_message',
+            count: 1,
+            operator_count: 1,
+            excerpt: submittedContent,
+          };
+          optimisticStrategicRefreshRef.current = optimisticRefresh;
+          setStrategicRefresh(optimisticRefresh);
+          void refreshStrategicState?.();
+          didRefreshStrategicState = true;
+        } else if (arming === 'duplicate') {
+          void refreshStrategicState?.();
+          didRefreshStrategicState = true;
+        }
+        await fetchMessages();
+        if (!didRefreshStrategicState) void refreshStrategicState?.();
+        recordStrategicInteraction();
+        return;
       }
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           project_id: selectedProjectId,
-          message_type: newType,
-          content: newContent.trim(),
+          message_type: effectiveNewType,
+          content: submittedContent,
           idempotency_key: idempotencyKeyRef.current,
           ...(Object.keys(context).length > 0 ? { context } : {}),
+          ...(workbenchContext ? { workbench_context: workbenchContext } : {}),
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -922,7 +1415,27 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // partial outcome — the message saved, but the strategist was not woken.
       // Surface it as info, not a green success, so the receipt is truthful.
       addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
+      let didRefreshStrategicState = false;
+      if (arming === 'steering') {
+        const optimisticRefresh = {
+          requested_at: new Date().toISOString(),
+          origin: 'operator',
+          reason: 'operator_message',
+          count: 1,
+          operator_count: 1,
+          excerpt: submittedContent,
+        };
+        optimisticStrategicRefreshRef.current = optimisticRefresh;
+        setStrategicRefresh(optimisticRefresh);
+        void refreshStrategicState?.();
+        didRefreshStrategicState = true;
+      } else if (arming === 'duplicate') {
+        void refreshStrategicState?.();
+        didRefreshStrategicState = true;
+      }
       await fetchMessages();
+      if (!didRefreshStrategicState) void refreshStrategicState?.();
+      recordStrategicInteraction();
     } catch {
       addToast('Failed to send message', 'error');
     } finally {
@@ -941,7 +1454,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/cancel-strategic-refresh`, { method: 'POST' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      optimisticStrategicRefreshRef.current = null;
       setStrategicRefresh(null);
+      void refreshStrategicState?.();
       addToast('Strategic steer cancelled', 'success');
       await fetchMessages();
     } catch {
@@ -1012,6 +1527,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       directionIdempotencyKeysRef.current.delete(msg.id);
       if (!silent) addToast('Direction created', 'success');
       await fetchMessages();
+      void refreshStrategicState?.();
       return true;
     } catch {
       addToast('Failed to create direction', 'error');
@@ -1066,6 +1582,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       convertForm.resetAddForm();
       addToast('Direction created', 'success');
       await fetchMessages();
+      void refreshStrategicState?.();
     } catch {
       convertForm.markAddAttemptFailed();
       addToast('Failed to create direction', 'error');
@@ -1172,6 +1689,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }
 
   const bubbleProps = {
+    actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
     deletingIds,
@@ -1195,6 +1713,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       setReplyTo(replyTo);
       textareaRef.current?.focus();
     },
+    onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
   };
 
   return (
@@ -1244,13 +1763,50 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         }}
         onOpenMutedPrefs={() => setShowPrefsPanel(true)}
         onClose={onClose}
+        showCloseButton={resolvedShowCloseButton}
+        filterChrome={resolvedFilterChrome}
       />
+
+      {showStrategicStatusStrip && (
+        <div className="shrink-0 border-b border-workbench-border bg-workbench-base px-3 py-1.5 md:px-4" data-testid="strategic-context-package-strip">
+          <div className="mx-auto flex w-full max-w-[940px] min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs text-neutral-500" aria-label="Strategic chat status">
+            <span className="shrink-0 font-semibold text-neutral-200">Strategic</span>
+            <span className="shrink-0 text-neutral-400">{workbenchModeLabel(workbenchState?.interaction_mode)}</span>
+            {strategistActive && (
+              <span className="text-cyan-300">{cycleProgress?.phase_label ?? 'Working'}</span>
+            )}
+            {!strategistActive && strategicRefresh?.requested_at && (
+              <span className="text-amber-300">Steer queued</span>
+            )}
+            {!strategistActive && !strategicRefresh?.requested_at && strategicRefresh?.last_fired_at && (
+              <span className="text-emerald-300">Steer picked up · {timeAgo(strategicRefresh.last_fired_at)}</span>
+            )}
+            {effectiveContextPackage?.status && effectiveContextPackage.status !== 'ready' && (
+              <span className={contextPackageTextTone(effectiveContextPackage.status)}>
+                Context {effectiveContextPackage.status}
+              </span>
+            )}
+            {effectiveContextPackage?.status === 'stale' && currentStrategicState?.sha_freshness?.verdict === 'stale' && (() => {
+              const cSha = currentStrategicState.sha_freshness?.active_candidate_sha?.slice(0, 7);
+              const iSha = currentStrategicState.sha_freshness?.integration_head_sha?.slice(0, 7);
+              if (cSha && iSha) return <span className="text-amber-500/70">sha diverged: @{cSha} vs @{iSha}</span>;
+              if (cSha || iSha) return <span className="text-amber-500/70">sha diverged</span>;
+              return null;
+            })()}
+            {strategicAttention?.level === 'needs_operator' && attentionNeeds > 0 && (
+              <span className={attentionTextTone(strategicAttention.level)}>
+                {attentionNeeds} needs attention
+              </span>
+            )}
+          </div>
+        </div>
+      )}
 
       {/* Strategic-refresh indicator: either pending (armed but not yet fired) or
           a receipt showing when a prior steer was picked up and acted upon. Hidden
           once the cycle starts (strategistActive), at which point "Strategist working…"
           takes over. Displays the queued directive excerpt and coalesce count. */}
-      {strategicRefresh && !strategistActive && (
+      {strategicRefresh && !strategistActive && !conversationMode && (
         <div className={`px-4 md:px-6 py-2 border-b ${strategicRefresh.requested_at ? 'border-neutral-800 bg-amber-950/40' : 'border-green-800 bg-emerald-950/40'} flex items-center gap-2 shrink-0`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full ${strategicRefresh.requested_at ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs font-medium ${strategicRefresh.requested_at ? 'text-amber-300' : 'text-emerald-300'}`}>
@@ -1291,7 +1847,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Live strategist activity indicator — driven by strategic_cycle_started/completed
           WS events. Shows phase label and steering excerpt when the enriched event payload
           is available, otherwise falls back to the minimal "working" text. */}
-      {strategistActive && (
+      {strategistActive && !conversationMode && (
         <div className="px-4 md:px-6 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">
           <span className="w-2 h-2 rounded-full bg-indigo-400 animate-pulse mt-0.5 shrink-0" aria-hidden="true" />
           <span className="text-xs text-indigo-300 font-medium min-w-0">
@@ -1307,41 +1863,44 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Cycle completion receipt — shown after a cycle finishes until the next one begins.
           Summarises what changed: direction counts, running-update, problem-model. */}
-      {lastCycleCompletion && !strategistActive && (
+      {lastCycleCompletion && !strategistActive && !conversationMode && (
         <div className={`px-4 md:px-6 py-2 border-b border-neutral-800 flex items-start gap-2 shrink-0 ${completionReceiptTone?.banner ?? 'bg-emerald-950/30'}`} role="status" aria-live="polite">
           <span className={`w-2 h-2 rounded-full mt-0.5 shrink-0 ${completionReceiptTone?.dot ?? 'bg-emerald-400'}`} aria-hidden="true" />
           <span className={`text-xs min-w-0 ${completionReceiptTone?.text ?? 'text-emerald-300'}`}>
             <span className="font-medium">
               {completionReceiptTone?.label ?? 'Cycle complete'}
             </span>
-            {lastCycleCompletion.failure_reason && (
+            {conversationMode && lastCycleCompletion.failure_reason && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
             )}
-            {(lastCycleCompletion.created_count ?? 0) > 0 && (
+            {!conversationMode && lastCycleCompletion.failure_reason && (
+              <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'}`}>{lastCycleCompletion.failure_reason.slice(0, 80)}</span>
+            )}
+            {!conversationMode && (lastCycleCompletion.created_count ?? 0) > 0 && (
               <span className="ml-1.5">· +{lastCycleCompletion.created_count} direction{lastCycleCompletion.created_count !== 1 ? 's' : ''}</span>
             )}
-            {(lastCycleCompletion.retired_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.retired_count ?? 0) > 0 && (
               <span className="ml-1.5">· −{lastCycleCompletion.retired_count} retired</span>
             )}
-            {(lastCycleCompletion.staged_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.staged_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.staged_count} direction{lastCycleCompletion.staged_count !== 1 ? 's' : ''} staged</span>
             )}
-            {(lastCycleCompletion.updated_count ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.updated_count ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.updated_count} updated</span>
             )}
-            {(lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
+            {!conversationMode && (lastCycleCompletion.tasks_spawned ?? 0) > 0 && (
               <span className="ml-1.5">· {lastCycleCompletion.tasks_spawned} task{lastCycleCompletion.tasks_spawned !== 1 ? 's' : ''} spawned</span>
             )}
-            {lastCycleCompletion.running_update_changed && (
+            {!conversationMode && lastCycleCompletion.running_update_changed && (
               <span className="ml-1.5">· running update written</span>
             )}
-            {lastCycleCompletion.problem_model_changed && (
+            {!conversationMode && lastCycleCompletion.problem_model_changed && (
               <span className="ml-1.5">· problem model updated</span>
             )}
-            {lastCycleCompletion.status_message && (
+            {!conversationMode && lastCycleCompletion.status_message && (
               <span className={`ml-1.5 ${completionReceiptTone?.message ?? 'text-emerald-400/80'} italic`}>{lastCycleCompletion.status_message.slice(0, 80)}</span>
             )}
-            {lastCycleCompletion.strategic_judgment_challenge && (
+            {!conversationMode && lastCycleCompletion.strategic_judgment_challenge && (
               <span className="ml-1.5 align-middle">
                 <StrategicChallengeChip summary={lastCycleCompletion.strategic_judgment_challenge} />
               </span>
@@ -1368,12 +1927,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
 
       {/* Messages list — chat-style scroll area */}
       <MessagesListView
+        presentation={conversationMode ? 'conversation' : 'triage'}
         scrollRef={scrollRef}
         blockersRefEl={blockersRefEl}
         questionsRefEl={questionsRefEl}
         routineRefEl={routineRefEl}
         dividerDismissedRef={dividerDismissedRef}
-        messages={messages}
+        messages={conversationMode ? conversationMessages : messages}
         loading={loading}
         dividerTime={dividerTime}
         totalNewCount={totalNewCount}
@@ -1402,6 +1962,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         expandedGroupKeys={expandedGroupKeys}
         tempMutes={tempMutes}
         bubbleProps={bubbleProps}
+        highlightedMessageId={highlightedMessageId}
         onDismissDivider={dismissDivider}
         onShowOnlyNew={handleShowOnlyNew}
         setExpandedGroupKeys={setExpandedGroupKeys}
@@ -1416,7 +1977,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       />
 
       {/* Batch action bar */}
-      {selectMode && selectedIds.size > 0 && (
+      {!conversationMode && selectMode && selectedIds.size > 0 && (
         <MessagesBatchActionBar
           selectedCount={selectedIds.size}
           batchCreating={batchCreating}
@@ -1425,7 +1986,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       )}
 
       {/* Convert-to-direction modal */}
-      {pendingConvertMsg && (
+      {!conversationMode && pendingConvertMsg && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" role="dialog" aria-modal="true" aria-label="Create direction from message">
           <div className="bg-neutral-950 border border-neutral-800 rounded-lg shadow-xl w-full max-w-lg mx-4 flex flex-col max-h-[90vh]">
             <div className="px-5 py-3 border-b border-neutral-800 flex items-center justify-between shrink-0">
@@ -1470,16 +2031,21 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       {/* Compose area — bottom, chat-style */}
       <MessagesComposer
         textareaRef={textareaRef}
-        newType={newType}
+        newType={effectiveNewType}
         newContent={newContent}
         submitting={submitting}
         replyTo={replyTo}
         lastArming={lastArming}
         strategistBusy={strategistActive}
+        disabledReason={selectedProjectId ? null : 'Select a project to message Strategic'}
         onChangeType={(value) => { setNewType(value); setLastArming(null); if (newContent) saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: value, content: newContent }); }}
-        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: newType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
+        onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
+        chrome={conversationMode ? 'minimal' : 'full'}
+        strategicContext={strategicComposerContext}
+        onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}
+        onOpenCommandPalette={conversationMode ? openMessageCommandSurface : undefined}
       />
     </div>
   );

@@ -22,6 +22,7 @@ const computeDoc = {
   knowledge_acceptance_evidence: true,
   compute_acceptance_grade: 'acceptance',
   compute_acceptance_reason: 'llm_artifact_cited',
+  criterion_met: true,
   forward_quality_verdict: {
     passed: true,
     reason: 'Artifact-cited analysis passed acceptance gate.',
@@ -60,6 +61,7 @@ const measuredOnlyComputeDoc = {
   compute_acceptance_reason: 'analysis_mode_not_llm',
   unavailable_cause: 'analysis-disabled',
   analysis_fallback_reason: 'precondition-not-met',
+  criterion_met: false,
   forward_quality_verdict: {
     passed: true,
     reason: 'Deterministic fallback persisted as measured knowledge.',
@@ -101,18 +103,67 @@ const webResearchDoc = {
   },
 };
 
-vi.mock('../api', () => ({
-  API_BASE_URL: '',
-  authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
-  authHeaders: vi.fn(() => Promise.resolve({})),
-  fetchKnowledgeDocuments: vi.fn(() =>
-    Promise.resolve({ documents: [webResearchDoc], total: 1, limit: 50, offset: 0 }),
-  ),
-  fetchKnowledgeDocument: vi.fn(() =>
-    Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
-  ),
-  resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(() => Promise.resolve({ ok: false, status: 503, json: () => Promise.resolve({}) })),
+    authHeaders: vi.fn(() => Promise.resolve({})),
+    fetchKnowledgeDocuments: vi.fn(() =>
+      Promise.resolve({ documents: [computeDoc, webResearchDoc], total: 2, limit: 50, offset: 0 }),
+    ),
+    fetchKnowledgeDocument: vi.fn(() =>
+      Promise.resolve({ ...webResearchDoc, body: '# Body\n\nMarkdown body.' }),
+    ),
+    resolveArtifactDownloadUrl: vi.fn(() => Promise.resolve('https://signed.example.com/knowledge/doc-web-research-grounded')),
+  });
+});
+
+describe('KnowledgeBrowser — routed direction filter', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+  });
+
+  test('updates the visible direction filter when the routed prop changes while open', async () => {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          initialDirectionId="direction-alpha"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+    expect(host.textContent).toContain('direction: direction-alpha');
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          initialDirectionId="direction-beta"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+        />,
+      );
+    });
+
+    expect(host.textContent).toContain('direction: direction-beta');
+    expect(host.textContent).not.toContain('direction: direction-alpha');
+  });
+});
 
 describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
   let root: Root | null = null;
@@ -214,6 +265,144 @@ describe('KnowledgeBrowser — acceptance-probe grounding wording', () => {
     const text = (host as HTMLDivElement).textContent ?? '';
     expect(text).toContain('null');
     expect(text).toContain('https://example.com/live');
+  });
+});
+
+describe('KnowledgeBrowser — criterion verdict badge', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  test('renders criterion MET badge for compute_experiment documents', async () => {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+
+    const metDoc = { ...computeDoc, criterion_met: true };
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: [metDoc],
+      total: 1,
+      limit: 50,
+      offset: 0
+    });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({
+      ...metDoc,
+      body: '# Results\n\nCriterion was met.'
+    } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU benchmark'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected document button');
+    await act(async () => { docButton.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Criterion MET');
+  });
+
+  test('renders criterion NOT MET badge for compute_experiment documents', async () => {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+
+    const notMetDoc = { ...measuredOnlyComputeDoc, criterion_met: false };
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: [notMetDoc],
+      total: 1,
+      limit: 50,
+      offset: 0
+    });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({
+      ...notMetDoc,
+      body: '# Results\n\nCriterion was not met.'
+    } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('deterministic'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected document button');
+    await act(async () => { docButton.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Criterion NOT MET');
+  });
+
+  test('renders criterion UNMEASURED badge when criterion_met is null', async () => {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+
+    const unmeasuredDoc = { ...computeDoc, id: 'doc-compute-unmeasured', criterion_met: null };
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: [unmeasuredDoc],
+      total: 1,
+      limit: 50,
+      offset: 0
+    });
+    vi.mocked(fetchKnowledgeDocument).mockResolvedValue({
+      ...unmeasuredDoc,
+      body: '# Results'
+    } as never);
+
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+
+    const docButton = Array.from((host as HTMLDivElement).querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('GPU benchmark'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected document button');
+    await act(async () => { docButton.click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+    const text = (host as HTMLDivElement).textContent ?? '';
+    expect(text).toContain('Criterion UNMEASURED');
   });
 });
 

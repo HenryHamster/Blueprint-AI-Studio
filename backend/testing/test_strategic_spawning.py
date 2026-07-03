@@ -17,11 +17,12 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 from unittest.mock import AsyncMock, call, patch
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import app.drift_detection  # noqa: F401 — registers DirectionDriftSnapshot in SQLModel.metadata for create_all
 import app.shared_state as _shared_state
 from app.models import (
+    LocalRunner,
     Project,
     Task,
     TaskStatus,
@@ -30,6 +31,13 @@ from app.models import (
     RECOMMENDED_MODE_META_KEY,
 )
 from app.strategic_trigger import ORIGIN_OPERATOR, ORIGIN_QUALIFICATION
+from app.workbench_state import (
+    SESSION_IDLE_TTL_SECONDS,
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from app.autonomous_research import _spawn_research_task
 from app.strategic_spawning import (
     _spawn_design_doc_update,
@@ -46,7 +54,9 @@ from app.strategic_spawning import (
     _design_doc_index,
     _summarize_design_doc_index,
     _DESIGN_DOC_INDEX_SUMMARY_CHARS,
+    _OPERATOR_CONTEXT_REFS_KEEP,
 )
+from app.task_completion import _phase_runner_affinity
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.capability_demand import collect_missing_capability_demand
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -58,6 +68,18 @@ from app.task_evaluators import (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
+
+
+def _assert_generated_at_iso_utc(payload: dict) -> None:
+    generated_at = payload.get("generated_at")
+    assert isinstance(generated_at, str) and generated_at
+    parsed = datetime.fromisoformat(generated_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset().total_seconds() == 0
+
+
+def _utcnow_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 # ── Account pool fixture (required by _spawn_research_task) ───────────────────
@@ -103,6 +125,34 @@ def _make_project(**kwargs) -> Project:
     }
     defaults.update(kwargs)
     return Project(**defaults)
+
+
+def _local_continuation_marker(**overrides) -> dict:
+    marker = {
+        "version": 1,
+        "active": True,
+        "operator_user_id": "test-user-123",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    marker.update(overrides)
+    return marker
+
+
+def _make_local_runner(project_id: uuid.UUID, **overrides) -> LocalRunner:
+    defaults = {
+        "project_id": project_id,
+        "token_hash": uuid.uuid4().hex + uuid.uuid4().hex,
+        "status": "active",
+        "capabilities": {
+            "task_types": "all",
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        "last_seen_at": datetime.now(timezone.utc).replace(tzinfo=None),
+    }
+    defaults.update(overrides)
+    return LocalRunner(**defaults)
 
 
 async def _seed_legacy_cycles(session, project: Project) -> None:
@@ -739,6 +789,9 @@ async def test_spawn_review_includes_knowledge_index_when_docs_exist(db_session)
         "compute_acceptance_grade",
         "compute_acceptance_reason",
         "unavailable_cause",
+        "criterion_met",
+        "criterion",
+        "per_arm_verdicts",
         "origin_provenance",
         "sweep_id",
         "arm_label",
@@ -769,21 +822,44 @@ async def test_spawn_review_omits_knowledge_index_when_none(db_session):
 
 
 async def _seed_sweep_arm(
-    session, project, *, sweep_id, arm_label, title="Arm doc"
+    session,
+    project,
+    *,
+    sweep_id,
+    arm_label,
+    title="Arm doc",
+    criterion_met=True,
+    direction_id=None,
+    persist_doc=True,
 ):
-    """Persist one compute_experiment KnowledgeDocument carrying sweep identity."""
+    """Persist one compute_experiment KnowledgeDocument carrying sweep identity.
+
+    criterion_met (True/False/None) is stored in forward_quality_verdict so
+    that _knowledge_index_entry surfaces the true success-criterion verdict.
+    """
     from app.models import KnowledgeDocument
 
     task = Task(
         project_id=project.id,
         title="compute src",
         status=TaskStatus.COMPLETED,
-        payloads=[{"type": "compute_experiment", "base_branch": "main"}],
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": arm_label,
+            }
+        ],
+        context=({"direction_id": direction_id} if direction_id else {}),
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
     )
     session.add(task)
     await session.commit()
     await session.refresh(task)
+    if not persist_doc:
+        return None
+    forward_quality_verdict = {"analysis_mode": "deterministic", "criterion_met": criterion_met}
     doc = KnowledgeDocument(
         project_id=project.id,
         source_task_id=task.id,
@@ -794,6 +870,7 @@ async def _seed_sweep_arm(
         source_kind="compute_experiment",
         sweep_id=sweep_id,
         arm_label=arm_label,
+        forward_quality_verdict=forward_quality_verdict,
     )
     session.add(doc)
     await session.commit()
@@ -862,6 +939,73 @@ async def test_spawn_review_omits_sweep_groups_when_none(db_session):
         if t.payloads[0]["type"] == "strategic_review"
     )
     assert "compute_experiment_sweeps" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_omits_incomplete_planned_sweep(db_session):
+    """A planned arm without a usable document keeps the sweep out of payloads."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-incomplete", arm_label="baseline"
+    )
+    await _seed_sweep_arm(
+        db_session,
+        project,
+        sweep_id="sw-incomplete",
+        arm_label="treatment",
+        persist_doc=False,
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" not in payload
+
+
+@pytest.mark.asyncio
+async def test_spawn_review_sweep_entries_carry_criterion_met(db_session):
+    """strategic_review sweep entries expose criterion_met from forward_quality_verdict,
+    not from the acceptance grade — ensuring the strategist sees the true verdict."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+    # Two arms: one met (True), one not met (False). Both use measured_only grade
+    # (no source_citations, no llm analysis) to prove verdict is criterion_met-derived.
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-crit", arm_label="met", criterion_met=True
+    )
+    await _seed_sweep_arm(
+        db_session, project, sweep_id="sw-crit", arm_label="not_met", criterion_met=False
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = next(
+        t.payloads[0]
+        for t in result.scalars().all()
+        if t.payloads[0]["type"] == "strategic_review"
+    )
+    assert "compute_experiment_sweeps" in payload
+    groups = payload["compute_experiment_sweeps"]
+    assert "sw-crit" in groups
+    by_label = {e["arm_label"]: e for e in groups["sw-crit"]}
+    # Met arm: criterion_met=True, grade is NOT acceptance.
+    assert by_label["met"]["criterion_met"] is True
+    assert by_label["met"]["compute_acceptance_grade"] != "acceptance"
+    # Not-met arm: criterion_met=False.
+    assert by_label["not_met"]["criterion_met"] is False
 
 
 @pytest.mark.asyncio
@@ -1255,6 +1399,16 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
                 # Predates the acceptance aggregates — no acceptance_* fields.
                 "research_history": [{"prs_merged": 2, "prs_rejected": 0}],
             },
+            {
+                "id": "d-badge01",
+                "status": "active",
+                "text": "Direction with badge-only merges",
+                "priority": "medium",
+                # 3 raw merges, only 1 verified → badge_only = max(0, 3 - 1) = 2.
+                "research_history": [
+                    {"prs_merged": 3, "prs_rejected": 0, "verified_prs_merged": 1}
+                ],
+            },
         ],
         vision={"purpose": "test purpose"},
     )
@@ -1278,12 +1432,18 @@ async def test_direction_stat_surfaces_proven_and_declaration_coverage(db_sessio
     assert proven["proven_prs_merged"] <= proven["verified_prs_merged"]
     assert proven["consumed_prs_merged"] <= proven["proven_prs_merged"]
     assert proven["acceptance_declaration_coverage"] == round(3 / 4, 3)
+    # All merges were verified — no badge-only gap.
+    assert proven["badge_only_prs_merged"] == 0
 
     legacy = next(s for s in payload["directions_summary"] if s["id"] == "d-legacy01")
     # Legacy fallback: nothing retroactively claimed proven, no coverage denom.
     assert legacy["proven_prs_merged"] == 0
     assert legacy["consumed_prs_merged"] == 0
     assert legacy["acceptance_declaration_coverage"] is None
+
+    badge = next(s for s in payload["directions_summary"] if s["id"] == "d-badge01")
+    # badge_only = max(0, raw_prs_merged - verified_prs_merged) = max(0, 3 - 1) = 2.
+    assert badge["badge_only_prs_merged"] == 2
 
 
 @pytest.mark.asyncio
@@ -2594,6 +2754,385 @@ async def test_spawn_strategic_review_task_context_includes_cycle_id(
     result = await db_session.execute(select(Task).where(Task.project_id == project.id))
     tasks = result.scalars().all()
     assert tasks[0].context.get("strategic_cycle_id") == cycle_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_records_preferred_runner_without_pin(
+    db_session, mocker
+):
+    """Preferred runner affinity is advisory context, not an authoritative pin."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    cycle_id = "sc-runner-pref"
+    preferred_runner_id = str(uuid.uuid4())
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_strategic_review(
+        project,
+        db_session,
+        cycle_id=cycle_id,
+        preferred_runner_target_id=preferred_runner_id,
+    )
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.context.get("strategic_cycle_id") == cycle_id
+    assert task.context.get("preferred_runner_target_id") == preferred_runner_id
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_design_doc_update_uses_live_local_continuation_runner_affinity(
+    db_session, mocker
+):
+    """Continuous local Strategic mode makes Phase 1 local-required."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["design_doc_update"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    spawned = await _spawn_design_doc_update(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "design_doc_update"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert task.context.get("preferred_runner_target_id") == str(runner.id)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_strategic_review_uses_live_local_continuation_runner_affinity(
+    db_session, mocker
+):
+    """Strategy-only Strategic reviews also become local-required."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    stale_runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+        last_seen_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=1),
+    )
+    live_runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(stale_runner)
+    db_session.add(live_runner)
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert task.context.get("preferred_runner_target_id") == str(live_runner.id)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_affinity_omitted_when_stale_or_incapable(
+    db_session, mocker
+):
+    """Stale continuation markers and incompatible runners do not bias dispatch."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    stale_at = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
+    ).isoformat()
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                updated_at=stale_at,
+                last_seen_at=stale_at,
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        _make_local_runner(
+            project.id,
+            capabilities={
+                "task_types": ["compute_experiment"],
+                "has_gpu": True,
+                "max_concurrent": 1,
+            },
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_requires_local_even_without_live_runner(
+    db_session, mocker
+):
+    """Fresh continuous local mode must not lose hard local intent while offline."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    db_session.add(
+        _make_local_runner(
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+            status="inactive",
+            last_seen_at=datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(hours=1),
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+    assert not (task.vm_instance_id or "").startswith("runner:")
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_workday_ttl_outlives_idle_workbench_ttl(
+    db_session, mocker
+):
+    """Workday local intent remains hard local after the UI idle TTL."""
+    assert STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS > SESSION_IDLE_TTL_SECONDS
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    workday_at = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=SESSION_IDLE_TTL_SECONDS + 60)
+    ).isoformat()
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                updated_at=workday_at,
+                last_seen_at=workday_at,
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
+    assert "runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_requires_local_for_fresh_foreign_owner_marker(
+    db_session, mocker
+):
+    """The compact project marker is intentionally project-level at spawn time."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(
+                operator_user_id="other-operator",
+                owner_session_started_at=(
+                    datetime.now(timezone.utc) - timedelta(minutes=10)
+                ).isoformat(),
+            ),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert task.payloads[0]["type"] == "strategic_review"
+    assert task.context.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert (
+        task.context.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "preferred_runner_target_id" not in task.context
+
+
+@pytest.mark.asyncio
+async def test_local_continuation_affinity_reads_current_db_marker(
+    db_session, mocker
+):
+    """A stale in-memory Project marker must not bias strategy-only dispatch."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            STRATEGIC_LOCAL_CONTINUATION_KEY: _local_continuation_marker(),
+        }
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = _make_local_runner(
+        project.id,
+        capabilities={
+            "task_types": ["strategic_review"],
+            "has_gpu": False,
+            "max_concurrent": 2,
+        },
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    await db_session.execute(
+        update(Project)
+        .where(Project.id == project.id)
+        .values(vision={"purpose": "test purpose"})
+        .execution_options(synchronize_session=False)
+    )
+    await db_session.commit()
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY in (project.vision or {})
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    task = result.scalars().one()
+    assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in task.context
+    assert "preferred_runner_target_id" not in task.context
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in task.payloads[0]["vision"]
+
+
+def test_phase_runner_affinity_falls_back_to_preferred_runner_target_id():
+    runner_id = str(uuid.uuid4())
+    task = Task(
+        project_id=uuid.uuid4(),
+        title="Architecture review",
+        description="phase one",
+        payloads=[{"type": "design_doc_update"}],
+        context={"preferred_runner_target_id": runner_id},
+    )
+
+    assert _phase_runner_affinity(task) == runner_id
 
 
 # ── previous_decision_outcomes in _spawn_strategic_review payload ────────────
@@ -4982,6 +5521,58 @@ async def test_strategic_review_omits_held_directions_when_none_held(db_session)
     assert "held_directions" not in payload
 
 
+@pytest.mark.asyncio
+async def test_strategic_review_skips_query_when_held_directions_filtered(db_session):
+    """When held directions exist but none belong to the current project,
+    the held_directions block is empty and the recent FAILED tasks query
+    is not executed (avoiding wasted DB work).
+    """
+    from app.shared_state import record_direction_result, DIRECTION_HOLD_THRESHOLD
+
+    _shared_state.direction_failure_streaks.clear()
+    direction_id_held = "d-held02"
+    other_project_id = str(uuid.uuid4())
+    project = _make_project(
+        directions=[
+            {"id": "d-active01", "status": "active", "text": "Active dir", "priority": "medium"}
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Record a held direction in shared state with a DIFFERENT project_id
+    # (simulating a held direction from another project).
+    try:
+        for _ in range(DIRECTION_HOLD_THRESHOLD):
+            record_direction_result(
+                direction_id_held,
+                success=False,
+                failure_class="CODE_ERROR",
+                project_id=other_project_id,
+            )
+        assert _shared_state.get_held_directions().get(direction_id_held)
+
+        spawned = await _spawn_strategic_review(project, db_session)
+        assert spawned is True
+
+        result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+        strategic_tasks = [
+            t
+            for t in result.scalars().all()
+            if t.first_payload.get("type") == "strategic_review"
+        ]
+        assert strategic_tasks
+        payload = strategic_tasks[0].payloads[0]
+        # The held_directions block should be empty or absent since the held
+        # direction belongs to a different project.
+        held = payload.get("held_directions", [])
+        assert isinstance(held, list) and len(held) == 0
+    finally:
+        _shared_state.direction_failure_streaks.clear()
+
+
 # ---------------------------------------------------------------------------
 # _build_failure_feedback_mitigation unit tests
 # ---------------------------------------------------------------------------
@@ -5111,8 +5702,8 @@ def test_no_data_returns_proposed_scope_unchanged():
 
 def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
     """Lifecycle context must never disappear just because sibling context is
-    bloated. A compact version_phase floor should preserve the current goal and
-    theme, while _packer_meta records the degradation so the agent can fetch
+    bloated. A compact version_phase floor should preserve the current goal,
+    while _packer_meta records the degradation so the agent can fetch
     full lifecycle detail if needed."""
 
     large_finding = {
@@ -5125,7 +5716,6 @@ def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
         "version_number": 21,
         "phase": "build",
         "goal": "Ship the post-promotion observability milestone.",
-        "theme": "reliability",
         "tasks_merged_this_version": 9,
         "last_qualification": {
             "status": "not_promoted",
@@ -5190,7 +5780,6 @@ def test_pack_under_budget_keeps_version_phase_floor_under_pressure():
     assert vp["version_number"] == 21
     assert vp["phase"] == "build"
     assert vp["goal"] == "Ship the post-promotion observability milestone."
-    assert vp["theme"] == "reliability"
 
     meta = packed["_packer_meta"]
     dropped_keys = {entry["key"] for entry in meta["dropped"]}
@@ -5713,7 +6302,6 @@ def test_summarize_version_phase_strips_nested_audit_findings_but_keeps_facts():
         "version_number": 21,
         "phase": "stabilize",
         "goal": "Make promotion lifecycle context impossible to lose.",
-        "theme": "reliability",
         "tasks_merged_this_version": 11,
         "acceptance_aggregate": {"merged": 11, "proven": 9, "proven_rate": 0.8182},
         "last_qualification": {
@@ -5751,7 +6339,6 @@ def test_summarize_version_phase_strips_nested_audit_findings_but_keeps_facts():
     assert out["version_number"] == 21
     assert out["phase"] == "stabilize"
     assert out["goal"] == "Make promotion lifecycle context impossible to lose."
-    assert out["theme"] == "reliability"
     assert out["tasks_merged_this_version"] == 11
     assert out["acceptance_aggregate"] == {
         "merged": 11,
@@ -5792,7 +6379,6 @@ async def test_version_phase_includes_promotion_readiness(
     """When is_self_repo=True and QualificationVerdict rows exist, the strategic
     payload's version_phase block carries promotion_readiness with ready,
     would_promote_rate, and recurring_blockers keys."""
-    from datetime import datetime
     from app.models import ReleaseVersion, QualificationVerdict
 
     await _ensure_releaseversion_table(db_session)
@@ -5807,7 +6393,7 @@ async def test_version_phase_includes_promotion_readiness(
     await db_session.refresh(project)
 
     # Open version in stabilize phase
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -5866,7 +6452,7 @@ async def test_version_phase_includes_recent_versions(
 ):
     """When is_self_repo=True and closed ReleaseVersion rows exist, version_phase
     carries a recent_versions list."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -5879,7 +6465,7 @@ async def test_version_phase_includes_recent_versions(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
 
     # One closed (promoted) version
     closed = ReleaseVersion(
@@ -5931,6 +6517,199 @@ async def test_version_phase_includes_recent_versions(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_block_carries_goal_coverage_drift(
+    db_session, mocker, _lts_split_active
+):
+    """The always-on version_phase block carries goal_coverage_drift when the
+    helper returns a non-None dict, and the key survives _compact_version_phase
+    at both normal and floor levels."""
+    from app.models import ReleaseVersion, QualificationVerdict
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="build",
+        status="open",
+        goal="Ship feature X and Y",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Seed a QualificationVerdict with a merge_grade that flags a goal miss
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            merge_grade_status="fail",
+            merge_grade_coverage=0.45,
+            merge_grade_biggest_gap="feature Y not covered",
+            goal_alignment="partial",
+            finalized_at=now,
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    drift = vp.get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift should be present in version_phase"
+    assert "signal" in drift, "goal_coverage_drift must have 'signal' key"
+    assert drift["signal"] == "drifting", (
+        f"signal should be 'drifting' given stale merge grade, got {drift['signal']!r}"
+    )
+    assert "biggest_gap" in drift, "goal_coverage_drift must carry biggest_gap"
+
+    # Confirm it survives compaction at both normal and floor levels.
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    normal = _summarize_version_phase(vp)
+    assert "goal_coverage_drift" in normal, (
+        "goal_coverage_drift must survive _summarize_version_phase"
+    )
+    assert normal["goal_coverage_drift"].get("signal") == "drifting"
+
+    floor = _version_phase_floor(vp)
+    assert "goal_coverage_drift" in floor, (
+        "goal_coverage_drift must survive _version_phase_floor"
+    )
+
+
+@pytest.mark.asyncio
+async def test_version_phase_block_carries_criterion_coverage(
+    db_session, mocker, _lts_split_active
+):
+    """The initial strategic payload carries criterion_coverage for the open
+    version and the signal survives version_phase compaction/floor trimming."""
+
+    from app import acceptance_criteria as ac
+    from app.models import ReleaseVersion
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=4,
+        phase="build",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    c_covered = await ac.create_criterion(
+        db_session, project.id, version.id, "Ship the new auth layer"
+    )
+    c_partial = await ac.create_criterion(
+        db_session, project.id, version.id, "Harden CI pipeline"
+    )
+    c_uncovered = await ac.create_criterion(
+        db_session, project.id, version.id, "Document the rollout"
+    )
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_covered.id,
+        project_id=project.id,
+        source_kind="operator_attestation",
+        source_id="attest-1",
+    )
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c_partial.id,
+        project_id=project.id,
+        source_kind="operator",
+        source_id="note-7",
+    )
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    coverage = vp.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage should be present in version_phase"
+    assert coverage["total"] == 3
+    assert coverage["covered"] == 1
+    assert coverage["partial"] == 1
+    assert coverage["uncovered"] == 1
+    by_key = {entry["criterion_key"]: entry for entry in coverage["criteria"]}
+    assert by_key[c_covered.criterion_key]["coverage"] == "covered"
+    assert by_key[c_partial.criterion_key]["coverage"] == "partial"
+    assert by_key[c_uncovered.criterion_key]["coverage"] == "uncovered"
+
+    normal = _summarize_version_phase(vp)
+    assert normal["criterion_coverage"]["total"] == 3
+    assert len(normal["criterion_coverage"]["criteria"]) == 3
+
+    floor = _version_phase_floor(vp)
+    assert floor["criterion_coverage"]["total"] == 3
+    assert "criteria" not in floor["criterion_coverage"]
+
+    # stuck_count survives compaction — the uncovered criterion has no direction
+    # mapping so its stuck_reason is "no_mapping" and stuck_count is 1.
+    assert coverage["stuck_count"] == 1, "stuck_count must be carried in the raw payload"
+    assert normal["criterion_coverage"]["stuck_count"] == 1, "stuck_count must survive _summarize_version_phase"
+    assert floor["criterion_coverage"]["stuck_count"] == 1, "stuck_count must survive _version_phase_floor"
+    # Per-criterion stuck_reason is in the criteria list (not the floor path).
+    stuck_entry = by_key[c_uncovered.criterion_key]
+    assert stuck_entry["stuck_reason"] == "no_mapping", "uncovered criterion with no direction should be no_mapping"
+    # Covered and partial criteria have stuck_reason=None.
+    assert by_key[c_covered.criterion_key]["stuck_reason"] is None
+    assert by_key[c_partial.criterion_key]["stuck_reason"] is None
+
+
+@pytest.mark.asyncio
 async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     db_session, mocker, _lts_split_active
 ):
@@ -5970,7 +6749,7 @@ async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     closed = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -6079,9 +6858,8 @@ async def test_version_phase_uses_promotion_target_gate(db_session, mocker):
     await db_session.refresh(active_project)
 
     assert await _spawn_strategic_review(active_project, db_session) is True
-    # Two calls: (1) direct version-phase lookup, (2) release_readiness
-    # _compute_acceptance_aggregate — both inside the integration!=promotion gate.
-    assert current_open_version.call_count == 2
+    # The integration!=promotion gate now performs one direct version-phase lookup.
+    assert current_open_version.call_count == 1
     assert ensure_initial_release_version.call_args.kwargs["promotion_target"] == "main"
 
 
@@ -6143,7 +6921,7 @@ async def test_stabilize_stall_hint_fires_for_old_stabilize_version(
     await db_session.refresh(project)
 
     # Version stuck in stabilize well past the age threshold
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6201,7 +6979,7 @@ async def test_stabilize_hint_points_at_carried_audit_findings(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6287,7 +7065,7 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6336,7 +7114,7 @@ def _make_stabilize_version_with_candidate(candidate_sha):
     from app.models import ReleaseVersion
     from app.release_scoring import _audit_finding_key
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Carried findings stamped with the deterministic content key the resolution
     # ledger joins against (release_scoring._audit_finding_key) so readiness can be
     # computed exactly as it is for real carried findings.
@@ -6571,6 +7349,218 @@ async def test_stabilize_carried_findings_degrades_when_sha_unresolvable(
 
 
 @pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_staleness_includes_generated_at(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification candidate is BEHIND integration HEAD, the spawned
+    strategic_review payload must contain a payload_staleness block with stale=True,
+    payload_compiled_sha == candidate_sha, active_candidate_sha == candidate_sha,
+    and integration_head_sha == head_sha."""
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_audit_finding_resolution_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    head = "b" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=head)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present when currency resolved"
+    assert staleness["stale"] is True, "stale must be True when candidate is behind HEAD"
+    assert staleness["verdict"] == "stale", "verdict must be 'stale' when candidate is behind HEAD"
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    assert staleness["payload_compiled_sha"] == candidate
+    assert staleness["payload_sha"] == candidate
+    assert staleness["active_candidate_sha"] == candidate
+    assert staleness["integration_head_sha"] == head
+    _assert_generated_at_iso_utc(staleness)
+    assert staleness["stale_reason"] == "payload_sha_differs_from_integration_head"
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_staleness_current_when_candidate_matches_head(
+    db_session, mocker, _lts_split_active
+):
+    """When the qualification candidate equals the live HEAD, payload_staleness
+    must be present with stale=False."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sha = "c" * 40
+    version = _make_stabilize_version_with_candidate(sha)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=sha)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present when currency resolved"
+    assert staleness["stale"] is False, "stale must be False when candidate equals HEAD"
+    assert staleness["verdict"] == "fresh", "verdict must be 'fresh' when candidate matches HEAD"
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    assert staleness["payload_sha"] == sha
+    assert staleness["payload_compiled_sha"] == sha
+    assert staleness["active_candidate_sha"] == sha
+    assert staleness["integration_head_sha"] == sha
+    _assert_generated_at_iso_utc(staleness)
+    assert staleness["stale_reason"] is None
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_indeterminate(
+    db_session, mocker, _lts_split_active
+):
+    """When _resolve_candidate_currency returns None (GitHub unreachable or no
+    candidate SHA), payload_staleness must be present with verdict='unknown' and
+    a checked_at timestamp so the agent cannot mistake it for a confirmed-fresh result."""
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "d" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    # resolved=None means _resolve_github_with_session returned None (no credentials)
+    # so _resolve_candidate_currency returns None -> _currency stays None.
+    _patch_candidate_currency(mocker, resolved=None, head_sha="e" * 40)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, (
+        "payload_staleness must be present even when currency is indeterminate"
+    )
+    assert staleness.get("verdict") == "unknown", (
+        "verdict must be 'unknown' when currency could not be resolved"
+    )
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    assert staleness.get("stale") is None or "stale" not in staleness, (
+        "stale field must not be set on an unknown-verdict block"
+    )
+
+
+@pytest.mark.asyncio
+async def test_payload_staleness_resolves_true_verdict_without_carried_findings(
+    db_session, mocker, _lts_split_active
+):
+    """payload_staleness must carry a real stale/fresh verdict even when the
+    version has no carried audit findings (i.e. the stabilize+findings fast-path
+    is skipped).  Without the fallback resolution, _currency stays None and the
+    payload emits verdict='unknown' on every non-findings cycle."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "a" * 40
+    head = "b" * 40
+    now = _utcnow_naive()
+    # Stabilize phase with a candidate SHA but NO audit_findings — the
+    # stabilize+carried-findings guard is skipped, so only the fallback path runs.
+    version = ReleaseVersion(
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+        last_qualification={
+            "status": "not_promoted",
+            "confidence": 0.90,
+            "blocker": None,
+            "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+            "candidate_sha": candidate,
+            "audit_findings": [],
+        },
+    )
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    _patch_candidate_currency(mocker, resolved=("tok", "owner", "repo"), head_sha=head)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, "payload_staleness must be present"
+    assert staleness.get("verdict") == "stale", (
+        "verdict must be 'stale' (not 'unknown') when candidate SHA is behind HEAD "
+        "even without carried audit findings — the fallback path must resolve currency"
+    )
+    assert staleness.get("stale") is True
+    assert staleness.get("active_candidate_sha") == candidate
+    assert staleness.get("integration_head_sha") == head
+    _assert_generated_at_iso_utc(staleness)
+
+
+@pytest.mark.asyncio
 async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     db_session, mocker, _lts_split_active
 ):
@@ -6584,7 +7574,7 @@ async def test_stabilize_hint_names_hard_blocker_as_binding_constraint(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6625,7 +7615,7 @@ async def test_stabilize_hint_excludes_disabled_smoketest_from_binding(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6672,7 +7662,7 @@ async def test_qualification_substate_hint_promotion_in_flight(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6735,7 +7725,7 @@ async def test_qualification_substate_hint_promotion_failed(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6788,7 +7778,7 @@ async def test_qualification_substate_hint_absent_while_auditing(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=3,
@@ -6846,7 +7836,7 @@ async def test_stabilize_findings_hint_softens_when_remediation_direction_exists
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -6903,7 +7893,7 @@ async def test_post_promote_handoff_hint_fires_on_fresh_version(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -6952,7 +7942,7 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     states the concrete promotion — its date and final confidence — so the agent
     gets a positive 'it shipped' signal rather than only a 'stale text' warning,
     and is explicitly forbidden from re-qualifying the already-shipped version."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -6962,7 +7952,7 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     promoted_at = now - timedelta(hours=3)
     prior = ReleaseVersion(
         project_id=project.id,
@@ -7012,13 +8002,13 @@ async def test_post_promote_handoff_hint_grounds_in_prior_promoted_record(
 
 
 @pytest.mark.asyncio
-async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
+async def test_post_promote_handoff_respects_existing_fresh_goal(
     db_session, mocker, _lts_split_active
 ):
-    """A fresh post-promotion version can already have its goal/theme authored
+    """A fresh post-promotion version can already have its goal authored
     by the time the strategic review spawns. The handoff suffix must not carry
     stale null-goal instructions that contradict version_phase."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion
 
     await _ensure_releaseversion_table(db_session)
@@ -7028,7 +8018,7 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     promoted_at = now - timedelta(hours=2)
     prior = ReleaseVersion(
         project_id=project.id,
@@ -7043,7 +8033,6 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
         served_at=promoted_at,
     )
     fresh_goal = "Make lifecycle context recovery reliable after promotion."
-    fresh_theme = "reliability"
     fresh = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -7054,7 +8043,6 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
         last_qualification=None,
         qualification_attempts=0,
         goal=fresh_goal,
-        theme=fresh_theme,
     )
     db_session.add_all([prior, fresh])
     await db_session.commit()
@@ -7074,15 +8062,12 @@ async def test_post_promote_handoff_respects_existing_fresh_goal_and_theme(
 
     vp = payload.get("version_phase") or {}
     assert vp.get("goal") == fresh_goal
-    assert vp.get("theme") == fresh_theme
 
     suffix = payload.get("prompt_suffix", "")
     assert "Version handoff" in suffix
     assert fresh_goal in suffix or vp.get("goal") == fresh_goal
-    assert fresh_theme in suffix or vp.get("theme") == fresh_theme
     assert "goal field on v2 is null" not in suffix
     assert "new_version_goal" not in suffix
-    assert "new_version_theme" not in suffix
 
 
 @pytest.mark.asyncio
@@ -7101,7 +8086,7 @@ async def test_post_promote_handoff_hint_self_clears_after_first_qualification(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=2,
@@ -7149,7 +8134,7 @@ async def test_post_promote_handoff_hint_skipped_for_bootstrap_version(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -7197,7 +8182,7 @@ async def test_post_promote_handoff_unknown_serving_status_is_not_live(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -7258,7 +8243,7 @@ async def test_failed_deploy_directive_renders_after_next_version_qualification_
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # v1: promoted but deployment failed
     prior_version = ReleaseVersion(
         project_id=project.id,
@@ -7333,7 +8318,7 @@ async def test_failed_deploy_directive_clears_when_newer_version_serving_confirm
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # v1: promoted but deployment failed
     failed_version = ReleaseVersion(
         project_id=project.id,
@@ -7414,7 +8399,7 @@ async def test_failed_deploy_directive_text_states_same_sha_recovery_clears(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     failed_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -7486,7 +8471,7 @@ async def test_failed_deploy_directive_clears_on_same_sha_recovery(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     recovered_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -7553,7 +8538,7 @@ async def test_stabilize_stall_hint_suppressed_for_dry_run(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=4,
@@ -7617,7 +8602,7 @@ async def test_build_stall_nudge_counts_build_phase_merges_not_version_lifetime(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Version just re-entered build phase (age = 0 days)
     version = ReleaseVersion(
         project_id=project.id,
@@ -7691,7 +8676,7 @@ async def test_build_stall_nudge_tasks_merged_field_is_phase_scoped(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     # Version re-entered build phase past the age threshold
     phase_entry = now - timedelta(days=_BUILD_STALL_AGE_DAYS + 2)
     version = ReleaseVersion(
@@ -8261,7 +9246,7 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     """The strategic payload carries a deployment_state block under an LTS split:
     deployed SHA/status from DeploymentState, the promoted vs open version, and
     automain_ahead_of_main derived from un-promoted merged work."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion, DeploymentState
 
     await _ensure_releaseversion_table(db_session)
@@ -8283,7 +9268,7 @@ async def test_deployment_state_block_in_payload_when_split(db_session, mocker):
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -8396,7 +9381,7 @@ async def test_deployment_state_and_failed_directive_use_aggregate_failed_truth(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     failed_version = ReleaseVersion(
         project_id=project.id,
         version_number=1,
@@ -8501,7 +9486,7 @@ async def _spawn_self_repo_with_deployment_state(
 ):
     """Spawn a self-repo strategic review under an LTS split with a seeded
     DeploymentState row. Returns (deployment_state block, prompt_suffix)."""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
     from app.models import ReleaseVersion, DeploymentState
 
     await _ensure_releaseversion_table(db_session)
@@ -8523,7 +9508,7 @@ async def _spawn_self_repo_with_deployment_state(
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = datetime.utcnow().replace(tzinfo=None)
+    now = _utcnow_naive()
     db_session.add(
         ReleaseVersion(
             project_id=project.id,
@@ -8688,7 +9673,7 @@ async def test_active_counts_include_old_inflight_tasks_outside_lookback(db_sess
     await db_session.commit()
     await db_session.refresh(project)
 
-    old_started = datetime.utcnow().replace(tzinfo=None) - timedelta(days=35)
+    old_started = _utcnow_naive() - timedelta(days=35)
     db_session.add(
         Task(
             project_id=project.id,
@@ -9268,6 +10253,256 @@ async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
     assert commit_messages_mock.await_count == expected_scan_count
 
 
+# ── stranded-PR credit discount persisted by cycle-start reconciliation ────────
+
+
+@pytest.mark.asyncio
+async def test_verified_not_landed_persists_stranded_discount(db_session, mocker):
+    """verified_not_landed tasks get stranded_prs_merged incremented and stranded_discount_applied stamped.
+
+    When _build_recent_interventions classifies a task as verified_not_landed
+    (ancestry check returns False), it must call mark_stranded_non_landing and
+    discount_stranded_pr_from_direction_credit so the direction credit gate stops
+    crediting the stranded merge.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-stranded-discount"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "stranded discount test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 1,
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Stranded non-landing task",
+        description="merge commit NOT an ancestor of integration branch",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "pr_number": 501,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha", "head": {"sha": "h1"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is True, (
+        "stranded_discount_applied must be stamped after cycle-start reconciliation"
+    )
+    assert ctx.get("landed_on_integration") is False, (
+        "mark_stranded_non_landing must stamp landed_on_integration=False"
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") == 1, (
+        "stranded_prs_merged must be incremented to 1 for the matching research_history entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_verified_not_landed_stranded_discount_idempotent(db_session, mocker):
+    """A task already carrying stranded_discount_applied=True is not double-counted.
+
+    If a task was already processed by rollup verification (stranded_discount_applied=True
+    in context), the cycle-start reconciliation must NOT increment stranded_prs_merged again.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-stranded-idem"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "idempotency test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 1,
+                        "stranded_prs_merged": 1,  # already discounted once
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already stranded and discounted",
+        description="discount was already applied by rollup verification",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "pr_number": 502,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+            "landed_on_integration": False,
+            "stranded_discount_applied": True,  # already stamped
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={"merge_commit_sha": "stranded-sha2", "head": {"sha": "h2"}}
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") == 1, (
+        "stranded_prs_merged must not be incremented again when stranded_discount_applied=True"
+    )
+
+
+@pytest.mark.asyncio
+async def test_unverifiable_verdict_does_not_apply_stranded_discount(
+    db_session, mocker
+):
+    """Tasks with unverifiable verdict must not trigger the stranded-PR credit discount.
+
+    When ancestry cannot be determined (no GitHub credentials or API error),
+    the task gets verdict 'unverifiable' and must NOT be marked stranded.
+    """
+    research_task_id = str(uuid.uuid4())
+    direction_id = "dir-unverifiable"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {
+                "id": direction_id,
+                "text": "unverifiable test dir",
+                "status": "active",
+                "research_history": [
+                    {
+                        "task_id": research_task_id,
+                        "prs_merged": 1,
+                        "verified_prs_merged": 0,
+                    }
+                ],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No pr_number → ancestry check is skipped → verdict is "unverifiable"
+    task = Task(
+        project_id=project.id,
+        title="Unverifiable merge",
+        description="no pr_number so ancestry check is skipped",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Even if GitHub creds are present, no pr_number → unverifiable
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages", new=AsyncMock(return_value=[])
+    )
+
+    await _build_recent_interventions(project, db_session)
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is None, (
+        "unverifiable tasks must not have stranded_discount_applied stamped"
+    )
+    assert ctx.get("landed_on_integration") is None, (
+        "unverifiable tasks must not have landed_on_integration stamped"
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    the_dir = next(d for d in dirs if d.get("id") == direction_id)
+    history = the_dir.get("research_history", [])
+    entry = next(h for h in history if h.get("task_id") == research_task_id)
+    assert entry.get("stranded_prs_merged") is None, (
+        "stranded_prs_merged must not be written for unverifiable tasks"
+    )
+
+
 @pytest.mark.asyncio
 async def test_rollup_squash_body_evidence_applies_to_promotion_target(
     db_session, mocker
@@ -9348,7 +10583,7 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
     await db_session.commit()
     await db_session.refresh(project)
 
-    base_time = datetime.utcnow()
+    base_time = _utcnow_naive()
     tasks = []
     for i in range(_RECENT_MERGED_TITLES_CAP + 3):
         tasks.append(
@@ -9993,6 +11228,49 @@ class TestBuildCycleStartReconciliation:
         assert orphans == {"g-blocked": "blocked"}
         assert out["counts"]["deferred_gaps"] == 1
 
+    def test_staffed_but_deferred_gap_surfaced(self):
+        """A gap that is both staffed (active direction via gap_id) and carries a
+        deferral is a self-contradicting state — it must appear in
+        ``staffed_but_deferred``, not be silently skipped."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        deferral = {"rationale": "pending review", "created_at": "2026-01-01"}
+        pm = {
+            "gaps": [
+                # Staffed AND deferred → contradiction, must be surfaced.
+                {
+                    "id": "g-contradiction",
+                    "name": "needs attention",
+                    "status": "active",
+                    "priority": "high",
+                    "deferral": deferral,
+                },
+                # Staffed, no deferral → not a contradiction, not orphaned.
+                {"id": "g-clean", "name": "clean", "status": "active"},
+                # Deferred, not staffed → counted as deferred_gap, not contradiction.
+                {
+                    "id": "g-deferred-only",
+                    "name": "parked",
+                    "status": "active",
+                    "deferral": {"rationale": "later", "created_at": "x"},
+                },
+            ]
+        }
+        direction_stats = [
+            {"id": "d-1", "status": "active", "gap_id": "g-contradiction"},
+            {"id": "d-2", "status": "active", "gap_id": "g-clean"},
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, pm, {})
+        # The contradiction is surfaced.
+        assert len(out["staffed_but_deferred"]) == 1
+        entry = out["staffed_but_deferred"][0]
+        assert entry["gap_id"] == "g-contradiction"
+        assert entry["deferral"] == deferral
+        assert out["counts"]["staffed_but_deferred"] == 1
+        # Staffed-no-deferral and deferred-unstaffed gaps are NOT in the list.
+        assert out["orphaned_gaps"] == []
+        assert out["counts"]["deferred_gaps"] == 1
+
     def test_ungrounded_directions_by_reason(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
 
@@ -10478,6 +11756,64 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["stale_active_moves"] == 1
         # Clean gap is not surfaced.
         assert not any(s["gap_id"] == "g-clean" for s in stale)
+
+    def test_qualification_prose_drift_flags_stale_sha_in_current_focus(self):
+        # A stale candidate SHA embedded in current_focus is surfaced as
+        # qualification_prose_drift when last_qual carries a different candidate.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Audit findings on candidate f0224ab4 are blocking.",
+            }
+        }
+        last_qual = {"candidate_sha": "e587a4d0aabbccdd"}
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=last_qual
+        )
+        assert out is not None
+        drift = out["qualification_prose_drift"]
+        assert len(drift) == 1
+        assert drift[0]["stale_sha"] == "f0224ab4"
+        assert drift[0]["active_candidate_sha"] == "e587a4d0"
+        assert drift[0]["cited_in"] == "intent.current_focus"
+        assert out["counts"]["qualification_prose_drift"] == 1
+
+    def test_qualification_prose_drift_no_flag_when_sha_matches_active(self):
+        # When prose cites the CURRENT candidate SHA, no drift is flagged.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Candidate e587a4d0 is the active qualification target.",
+            }
+        }
+        last_qual = {"candidate_sha": "e587a4d0aabbccdd"}
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=last_qual
+        )
+        assert out is not None
+        assert out["qualification_prose_drift"] == []
+        assert out["counts"]["qualification_prose_drift"] == 0
+
+    def test_qualification_prose_drift_absent_without_last_qual(self):
+        # Without last_qual, no SHA detection runs — the field is empty but present.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        pm = {
+            "intent": {
+                "current_focus": "Working on f0224ab4 and other things.",
+            }
+        }
+        direction_stats = [{"id": "d-aaaa1111", "status": "active", "gap_id": None}]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, pm, {}, running_update="", last_qual=None
+        )
+        assert out is not None
+        assert out["qualification_prose_drift"] == []
+        assert out["counts"]["qualification_prose_drift"] == 0
 
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
@@ -11089,6 +12425,177 @@ async def test_seeded_goal_reaches_design_doc_update_payload(db_session):
     assert payload["problem_model"]["intent"]["purpose"] == _ONBOARD_GOAL
     open_contents = [m["content"] for m in payload["open_messages"]]
     assert _ONBOARD_GOAL in open_contents
+
+
+@pytest.mark.asyncio
+async def test_operator_context_refs_promoted_to_strategic_review_payload(db_session):
+    """Selected Strategic workbench refs become first-class pointer context."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.FEEDBACK,
+        content="Please review the release blocker with the linked memo.",
+        created_at=datetime(2026, 6, 3, 1, 0, 0),
+        context={
+            "strategic_session": {
+                "version": 1,
+                "interaction_mode": "continuous",
+                "active_surface": "pipeline",
+                "session_started_at": "2026-06-29T12:00:00Z",
+                "captured_at": "2026-06-29T12:05:00Z",
+                "context_package_id": "strategic-context:test",
+                "selected_refs": [
+                    {"kind": "task", "id": "task-1", "label": "Release blocker"},
+                    {"kind": "task", "id": "task-1", "label": "Duplicate"},
+                    {
+                        "kind": "knowledge_document",
+                        "id": "knowledge:doc-1",
+                        "label": "Prior memo",
+                    },
+                ],
+                "selected_ref_descriptors": [
+                    {
+                        "kind": "task",
+                        "id": "task-1",
+                        "label": "Release blocker task",
+                        "summary": "Small task descriptor",
+                        "status": "blocked",
+                        "target": {
+                            "surface": "task",
+                            "task_id": "task-1",
+                            "logs": "must not be copied",
+                        },
+                    }
+                ],
+                "canvas_body": "must not be copied",
+            }
+        },
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+
+    entries = payload["operator_context_refs"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["source_message_id"] == str(msg.id)
+    assert entry["context_package_id"] == "strategic-context:test"
+    assert entry["session_started_at"] == "2026-06-29T12:00:00Z"
+    assert entry["captured_at"] == "2026-06-29T12:05:00Z"
+
+    selected_refs = entry["selected_refs"]
+    assert selected_refs[:2] == [
+        {
+            "kind": "task",
+            "id": "task-1",
+            "label": "Release blocker",
+            "descriptor": {
+                "kind": "task",
+                "id": "task-1",
+                "label": "Release blocker task",
+                "summary": "Small task descriptor",
+                "status": "blocked",
+                "target": {"surface": "task", "task_id": "task-1"},
+            },
+        },
+        {
+            "kind": "knowledge_document",
+            "id": "knowledge:doc-1",
+            "label": "Prior memo",
+        },
+    ]
+    serialized = json.dumps(entries)
+    assert "canvas_body" not in serialized
+    assert "must not be copied" not in serialized
+    assert "logs" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_operator_context_refs_ignore_malformed_and_cap(db_session):
+    """Malformed snapshots are skipped and promoted refs stay tightly bounded."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="agent",
+            message_type=MessageType.NOTE,
+            content="Agent-selected context should not be treated as operator context.",
+            created_at=datetime(2026, 6, 3, 3, 0, 0),
+            context={
+                "strategic_session": {
+                    "context_package_id": "strategic-context:agent",
+                    "selected_refs": [{"kind": "task", "id": "agent-only"}],
+                }
+            },
+        )
+    )
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.NOTE,
+            content="Malformed context is ignored.",
+            created_at=datetime(2026, 6, 3, 2, 0, 0),
+            context={"strategic_session": "not-a-snapshot"},
+        )
+    )
+    refs = [
+        {"kind": "task", "id": "task-with-large-label", "label": "L" * 2000},
+        {"kind": "task", "id": "x" * 1000, "label": "oversized id"},
+        {"kind": "", "id": "missing-kind"},
+        "not-a-ref",
+        *[
+            {"kind": "task", "id": f"task-{i}", "label": f"Task {i}"}
+            for i in range(_OPERATOR_CONTEXT_REFS_KEEP + 3)
+        ],
+    ]
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.FEEDBACK,
+            content="Use the selected bounded context.",
+            created_at=datetime(2026, 6, 3, 1, 0, 0),
+            context={
+                "strategic_session": {
+                    "context_package_id": "strategic-context:bounded",
+                    "selected_refs": refs,
+                }
+            },
+        )
+    )
+    await db_session.commit()
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    entries = payload["operator_context_refs"]
+
+    assert len(entries) == 1
+    selected_refs = entries[0]["selected_refs"]
+    assert len(selected_refs) == _OPERATOR_CONTEXT_REFS_KEEP
+    assert selected_refs[0] == {"kind": "task", "id": "task-with-large-label"}
+    ref_ids = [ref["id"] for ref in selected_refs]
+    assert "agent-only" not in ref_ids
+    assert "x" * 1000 not in ref_ids
+    assert ref_ids[-1] == f"task-{_OPERATOR_CONTEXT_REFS_KEEP - 2}"
 
 
 @pytest.mark.asyncio
@@ -12107,6 +13614,14 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     # mark Phase 1 complete so the Phase 2 active-task guard does not skip.
     from app.strategic_trigger import strategic_refresh_origin
 
+    preferred_runner_id = str(uuid.uuid4())
+    design_doc_task.context = {
+        **(design_doc_task.context or {}),
+        "runner_target_id": preferred_runner_id,
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+    }
+    design_doc_task.vm_instance_id = f"runner:{preferred_runner_id}"
     project.vision = {
         k: v for k, v in project.vision.items() if k != "_strategic_refresh"
     }
@@ -12141,6 +13656,20 @@ async def test_architecture_cycle_operator_wake_reaches_phase2_after_marker_clea
     suffix = review.payloads[0].get("prompt_suffix", "")
     assert "OPERATOR STEERING" in suffix
     assert steering_text in suffix
+    assert (
+        (review.context or {}).get("preferred_runner_target_id")
+        == preferred_runner_id
+    )
+    assert (
+        (review.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
+        is True
+    )
+    assert (
+        (review.context or {}).get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+        == "workbench_continuous"
+    )
+    assert "runner_target_id" not in (review.context or {})
+    assert not (review.vm_instance_id or "").startswith("runner:")
 
 
 # ── persisted steering excerpt survives the conversation-thread aging out ─────
@@ -12444,7 +13973,7 @@ def _recent_strategic_task(project_id, minutes_ago: int) -> Task:
         payloads=[{"type": "design_doc_update", "base_branch": "main"}],
         status=TaskStatus.COMPLETED,
         created_by="ORCHESTRATOR",
-        created_at=datetime.utcnow() - timedelta(minutes=minutes_ago),
+        created_at=_utcnow_naive() - timedelta(minutes=minutes_ago),
     )
 
 
@@ -12473,7 +14002,7 @@ async def test_steering_acted_confirmation_skipped_when_marker_has_no_excerpt(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow_naive().isoformat(),
                 "reason": "operator_message",
                 "count": 1,
                 "origin": ORIGIN_OPERATOR,
@@ -12521,7 +14050,7 @@ async def test_steering_acted_confirmation_posted_when_marker_has_excerpt(
         vision={
             "purpose": "test",
             "_strategic_refresh": {
-                "requested_at": datetime.utcnow().isoformat(),
+                "requested_at": _utcnow_naive().isoformat(),
                 "reason": "operator_message",
                 "count": 1,
                 "origin": ORIGIN_OPERATOR,
@@ -13440,6 +14969,34 @@ def test_direction_activity_score_legacy_falls_back_to_prs_merged():
     assert _direction_activity_score(legacy) == 12
 
 
+def test_direction_activity_score_prefers_reachable_prs_merged():
+    """Reachable merges (landed on integration) take precedence over verified merges."""
+    # When reachable_prs_merged is present, use it instead of verified_prs_merged
+    reachable_stat = {"reachable_prs_merged": 3, "verified_prs_merged": 5, "prs_merged": 5}
+    # 3 reachable merges * 3 = 9, not 5 * 3 = 15
+    assert _direction_activity_score(reachable_stat) == 9
+
+    # When reachable_prs_merged is 0 (key present), use 0 — do NOT fall back to verified
+    zero_reachable = {"reachable_prs_merged": 0, "verified_prs_merged": 4}
+    # Key present with value 0 means reachability was recorded and nothing landed: score 0
+    assert _direction_activity_score(zero_reachable) == 0
+
+    # When both reachable and verified are present and non-zero, reachable wins
+    both_present = {"reachable_prs_merged": 2, "verified_prs_merged": 5}
+    # 2 reachable * 3 = 6, not 5 * 3 = 15
+    assert _direction_activity_score(both_present) == 6
+
+    # Missing reachable_prs_merged falls back through to verified_prs_merged
+    missing_reachable = {"verified_prs_merged": 3}
+    # 3 verified * 3 = 9
+    assert _direction_activity_score(missing_reachable) == 9
+
+    # All three missing falls back to prs_merged (legacy back-compat)
+    legacy_only = {"prs_merged": 2}
+    # 2 merges * 3 = 6
+    assert _direction_activity_score(legacy_only) == 6
+
+
 # ---------------------------------------------------------------------------
 # Direction-health/prioritization consumes the proven-vs-delivered signal.
 #
@@ -14148,7 +15705,7 @@ def test_one_time_spawnable_registry_set_is_implementation_types():
         STRATEGIST_SPAWNABLE_TASK_TYPES,
     )
 
-    assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES == {"create", "refactor", "qa"}
+    assert {"create", "refactor", "qa"} == STRATEGIST_ONE_TIME_SPAWNABLE_TYPES
     # The two lanes are mutually exclusive: a one-time fix is direction-free and
     # PR-producing; a spawn_task spawn is a read-only investigation.
     assert STRATEGIST_ONE_TIME_SPAWNABLE_TYPES.isdisjoint(
@@ -14344,3 +15901,274 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
     flag = (review.context or {}).get("_strategic_spawn_budget_exhausted")
     assert flag is not None
     assert flag["scope"] == "per_review"
+
+
+# ── CI compliance in strategic review payload ─────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_includes_ci_compliance_when_available(
+    db_session, mocker
+):
+    """When get_or_compute_ci_compliance returns a result it is included in the
+    strategic review payload under the 'ci_compliance' key."""
+    from unittest.mock import AsyncMock
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    fake_envelope = {
+        "status": "success",
+        "integration_branch": "automain",
+        "head_sha": "abc123def456",
+        "data": {
+            "ref": "abc123def456",
+            "compliant": True,
+            "violations": [],
+            "branch_literal_violations": [],
+            "checked": 5,
+            "limits_available": True,
+            "tree_available": True,
+        },
+        "computed": False,
+    }
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(return_value=fake_envelope),
+    )
+
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "ci_compliance" in payload, "ci_compliance block missing from strategic payload"
+    ci = payload["ci_compliance"]
+    assert ci["head_sha"] == "abc123def456"
+    assert ci["compliant"] is True
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_omits_ci_compliance_when_unavailable(
+    db_session, mocker
+):
+    """When get_or_compute_ci_compliance returns None the payload has no ci_compliance key."""
+    from unittest.mock import AsyncMock
+
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    mocker.patch(
+        "app.ci_compliance.ensure_current_ci_compliance",
+        new=AsyncMock(return_value={
+            "status": "unavailable",
+            "reason": "github_credentials_unavailable",
+            "integration_branch": "automain",
+            "head_sha": None,
+            "data": None,
+        }),
+    )
+
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    assert "ci_compliance" not in payload, (
+        "ci_compliance should be absent when ensure_current_ci_compliance is unavailable"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_reachable_prs_merged_in_stat_entry(db_session):
+    """reachable_prs_merged is surfaced in directions_summary stat_entry and survives compaction.
+
+    A direction with at least one history entry that carries reachable_prs_merged
+    should expose the lifetime reachable total. A direction with only legacy history
+    entries (no reachable_prs_merged field) should omit the key rather than fabricate 0.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-reachable01",
+                "status": "active",
+                "text": "Direction with reachable credit",
+                "priority": "medium",
+                # 3 merged, 2 ancestry-confirmed reachable.
+                "research_history": [
+                    {
+                        "prs_merged": 3,
+                        "verified_prs_merged": 3,
+                        "reachable_prs_merged": 2,
+                    }
+                ],
+            },
+            {
+                "id": "d-legacy-noreachable",
+                "status": "active",
+                "text": "Direction with legacy entry (no reachable field)",
+                "priority": "medium",
+                # Pre-reachability: reachable_prs_merged key absent.
+                "research_history": [{"prs_merged": 4, "verified_prs_merged": 4}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    reachable_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-reachable01"
+    )
+    assert reachable_dir["reachable_prs_merged"] == 2, (
+        "reachable_prs_merged must appear in stat_entry and survive compaction"
+    )
+    assert reachable_dir["reachable_prs_merged"] <= reachable_dir["prs_merged"]
+
+    legacy_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-legacy-noreachable"
+    )
+    assert "reachable_prs_merged" not in legacy_dir, (
+        "legacy directions without reachable_prs_merged must not fabricate a value"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_known_zero_reachable_in_window(db_session):
+    """A direction with in-window reachable_prs_merged=0 surfaces reachable_prs_merged: 0 (present, not omitted).
+
+    Known-zero (field present, value 0) must be distinguishable from legacy-unknown
+    (field absent).  The stat_entry must include reachable_prs_merged=0 so the
+    agent renderer can emit the explicit alarm annotation rather than silently
+    treating it as legacy-unknown.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-zero-reachable",
+                "status": "active",
+                "text": "Direction where all merges were badge-only (zero reachable)",
+                "priority": "high",
+                # 2 merged, reachability measured but zero confirmed reachable.
+                "research_history": [
+                    {
+                        "prs_merged": 2,
+                        "verified_prs_merged": 2,
+                        "reachable_prs_merged": 0,
+                    }
+                ],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    zero_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-zero-reachable"
+    )
+    assert "reachable_prs_merged" in zero_dir, (
+        "known-zero reachability (field present, value 0) must not be omitted from stat_entry"
+    )
+    assert zero_dir["reachable_prs_merged"] == 0, (
+        "reachable_prs_merged must be 0, not inflated"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direction_stats_known_zero_reachable_survives_eviction(db_session):
+    """A direction whose reachability-recorded cycles were all evicted still surfaces reachable_prs_merged: 0.
+
+    When all in-window history is evicted and the history_aggregate only has
+    total_reachable_prs_merged=0 but total_reachable_recorded_cycles>0, the
+    stat_entry must still include reachable_prs_merged=0 (not omit the field).
+    """
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # Build an aggregate that represents evicted cycles with known-zero reachability.
+    evicted_cycles = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "prs_merged": 3,
+            "verified_prs_merged": 3,
+            "reachable_prs_merged": 0,  # key present, value 0
+        },
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "prs_merged": 2,
+            "verified_prs_merged": 2,
+            "reachable_prs_merged": 0,
+        },
+    ]
+    history_aggregate = _fold_evicted_into_aggregate(None, evicted_cycles)
+    assert history_aggregate["total_reachable_recorded_cycles"] == 2
+    assert history_aggregate["total_reachable_prs_merged"] == 0
+
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-evicted-zero-reachable",
+                "status": "active",
+                "text": "Direction with evicted zero-reachable aggregate",
+                "priority": "high",
+                # No in-window history — all reachability info is in the aggregate.
+                "research_history": [],
+                "history_aggregate": history_aggregate,
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+
+    evicted_dir = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-evicted-zero-reachable"
+    )
+    assert "reachable_prs_merged" in evicted_dir, (
+        "known-zero reachability must survive eviction via total_reachable_recorded_cycles counter"
+    )
+    assert evicted_dir["reachable_prs_merged"] == 0

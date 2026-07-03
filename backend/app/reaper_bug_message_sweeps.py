@@ -101,6 +101,7 @@ async def sweep_converge_linked_bug_messages(
     from app.models import Direction, ProjectMessage
     from app.message_convergence import BUG_CLASS_TYPES, LINKED_STATUS, get_message_link
     from app.landed_signal import is_merged_completion
+    from app.project_message_projection import message_updated_event_payload
     from app.time_utils import _coerce_naive_utc
     from app.shared_state import runtime_config
 
@@ -179,7 +180,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -196,7 +197,7 @@ async def sweep_converge_linked_bug_messages(
                 _converge_message(msg, now, rationale)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -212,7 +213,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -230,7 +231,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -250,7 +251,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -268,7 +269,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -291,7 +292,7 @@ async def sweep_converge_linked_bug_messages(
                 _converge_message(msg, now, rationale)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -311,7 +312,7 @@ async def sweep_converge_linked_bug_messages(
                     _resurface_message(msg, now, reason)
                     session.add(msg)
                     pending_broadcasts.append(
-                        (str(msg.project_id), {"message_id": str(msg.id)})
+                        (str(msg.project_id), message_updated_event_payload(msg))
                     )
                     acted += 1
                     logger.info(
@@ -332,7 +333,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -350,7 +351,7 @@ async def sweep_converge_linked_bug_messages(
                 _resurface_message(msg, now, reason)
                 session.add(msg)
                 pending_broadcasts.append(
-                    (str(msg.project_id), {"message_id": str(msg.id)})
+                    (str(msg.project_id), message_updated_event_payload(msg))
                 )
                 acted += 1
                 logger.info(
@@ -517,6 +518,7 @@ async def sweep_resolve_open_owned_bug_messages(
         OPEN_STATUS,
         SYSTEM_AUTHORED_FROM_TYPES,
     )
+    from app.project_message_projection import message_updated_event_payload
 
     if verify_pr_merged is None:
         from app.rollup_pr_verification import _verify_pr_merged
@@ -576,7 +578,9 @@ async def sweep_resolve_open_owned_bug_messages(
         msg.context = ctx
         session.add(msg)
         resolved += 1
-        pending_broadcasts.append((str(msg.project_id), {"message_id": str(msg.id)}))
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
         logger.info(
             "[REAPER] Step 17: auto-resolved owned message %s — %s",
             msg.id,
@@ -709,6 +713,7 @@ async def sweep_resolve_stale_open_bug_messages(
         OPEN_STATUS,
         SYSTEM_AUTHORED_FROM_TYPES,
     )
+    from app.project_message_projection import message_updated_event_payload
 
     msgs = (
         (
@@ -765,7 +770,9 @@ async def sweep_resolve_stale_open_bug_messages(
         msg.context = ctx
         session.add(msg)
         resolved += 1
-        pending_broadcasts.append((str(msg.project_id), {"message_id": str(msg.id)}))
+        pending_broadcasts.append(
+            (str(msg.project_id), message_updated_event_payload(msg))
+        )
         logger.info(
             "[REAPER] Step 18: auto-resolved stale message %s — %s",
             msg.id,

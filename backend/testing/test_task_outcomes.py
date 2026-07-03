@@ -1499,5 +1499,60 @@ class TestPanelLensPassed:
         assert _panel_lens_passed("yes") is None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# mark_stranded_non_landing: clear stale merge-unblock signals
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_stranded_non_landing_clears_stale_merge_unblock():
+    """When marking a rollup stranded, clear any stale pr_merged unblock bit.
+
+    A task marked as stranded (landed_on_integration=false) must NOT carry the
+    pr_merged unblock signal, so dependency/unblock readers never treat a
+    confirmed non-landing as merge-equivalent success. This test validates that
+    mark_stranded_non_landing clears any older pr_merged=true bit (e.g., from a
+    prior mark_unblocked_non_merge or mark_landed_on_integration call) when
+    recording the definitive negative.
+    """
+    from app.landed_signal import (
+        mark_stranded_non_landing,
+        has_merge_unblock_signal,
+        STRANDED_LANDING_REASON_KEY,
+    )
+    from app.blocked_need_resolution import _foundation_shipped
+
+    # Start with a task that has the stale merge-unblock signal (e.g., from a
+    # previous mark_unblocked_non_merge or mark_landed_on_integration).
+    task = _make_task(
+        "create",
+        status=TaskStatus.COMPLETED,
+        context={
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+        },
+    )
+    assert has_merge_unblock_signal(task) is True
+    assert _foundation_shipped(task) is True
+
+    # Mark the task as stranded (ancestry check proved it did NOT land on integration).
+    mark_stranded_non_landing(task, reason="rollup->integration merge not an ancestor")
+
+    # After stranding, the merge-unblock signal must be cleared.
+    assert has_merge_unblock_signal(task) is False
+    # The stranded reason is recorded durably.
+    assert task.context.get(STRANDED_LANDING_REASON_KEY) == (
+        "rollup->integration merge not an ancestor"
+    )
+    # landed_on_integration is False.
+    assert task.context.get(LANDED_ON_INTEGRATION_KEY) is False
+    # The stale pr_merged bit is NOT present.
+    assert LANDED_SIGNAL_KEY not in task.context or task.context.get(
+        LANDED_SIGNAL_KEY
+    ) is not True
+    # As a result, _foundation_shipped returns False: the stranded task
+    # no longer acts as shipped and cannot unblock dependents.
+    assert _foundation_shipped(task) is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

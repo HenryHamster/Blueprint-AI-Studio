@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { Alert } from '../types/alert';
-import { API_BASE_URL, authHeaders, authGet } from '../api';
+import { API_BASE_URL, authHeaders, fetchAlerts as fetchAdminAlerts } from '../api';
 
 /**
  * Alerts banner state: the alert list plus fetch / dismiss actions.
@@ -14,13 +14,7 @@ export function useAlertsState(
 
   const fetchAlerts = async (silent = false) => {
     try {
-      const url = selectedProjectId
-        ? `${API_BASE_URL}/api/admin/alerts?project_id=${selectedProjectId}`
-        : `${API_BASE_URL}/api/admin/alerts`;
-      const res = await authGet(url);
-      if (res.ok) {
-        setAlerts(await res.json());
-      }
+      setAlerts(await fetchAdminAlerts({ projectId: selectedProjectId }));
     } catch (err) {
       console.error('Failed to fetch alerts:', err);
       if (!silent) addToast('Failed to load alerts', 'error');

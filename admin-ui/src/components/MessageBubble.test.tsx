@@ -130,6 +130,233 @@ describe('MessageBubble', () => {
     expect(screen.queryByTitle('Delete')).toBeNull();
   });
 
+  test('reply-only mode keeps reply available and hides triage actions', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      actionMode: 'reply-only',
+      msg: makeMsg({ message_type: 'QUESTION', content: 'Can you decide this?' }),
+      onReply,
+    })} />);
+
+    expect(screen.queryByTitle('Resolve')).toBeNull();
+    expect(screen.queryByTitle('Delete')).toBeNull();
+    expect(screen.queryByTitle('Create Direction')).toBeNull();
+
+    const replyBtn = screen.getByTitle('Reply');
+    fireEvent.click(replyBtn);
+    expect(onReply).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'msg-1',
+      content: 'Can you decide this?',
+      message_type: 'QUESTION',
+      status: 'open',
+    }));
+  });
+
+  test('chat presentation hides triage chrome while preserving reply', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        message_type: 'BUG_REPORT',
+        from_type: 'strategic',
+        content: 'Please choose the next direction.',
+        context: {
+          event_type: 'failure_alert',
+          _provenance_warnings: {
+            citation_state: 'absent',
+            broken_refs: ['backend/app/models.py:Task'],
+          },
+        },
+      }),
+      onReply,
+    })} />);
+
+    expect(screen.getByText('Strategic')).toBeTruthy();
+    expect(screen.getByText('Please choose the next direction.')).toBeTruthy();
+    expect(screen.queryByText('Bug')).toBeNull();
+    expect(screen.queryByText('Failure alert')).toBeNull();
+    expect(screen.queryByText('cited code missing on HEAD')).toBeNull();
+    expect(screen.queryByTitle('Copy message ref')).toBeNull();
+    expect(screen.queryByTitle('Resolve')).toBeNull();
+    expect(screen.queryByTitle('Delete')).toBeNull();
+    expect(screen.queryByTitle('Create Direction')).toBeNull();
+
+    fireEvent.click(screen.getByTitle('Reply'));
+    expect(onReply).toHaveBeenCalledWith(expect.objectContaining({
+      id: 'msg-1',
+      content: 'Please choose the next direction.',
+      from: 'Strategic',
+      message_type: 'BUG_REPORT',
+    }));
+  });
+
+  test('chat presentation renders task metadata as passive provenance', () => {
+    const onOpenTask = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'agent',
+        from_task_id: 'task-abcdef123456',
+        content: 'Task-linked update.',
+      }),
+      onOpenTask,
+    })} />);
+
+    const taskMeta = screen.getByText('task-abc');
+    expect(taskMeta).toBeTruthy();
+    expect(taskMeta.tagName.toLowerCase()).toBe('span');
+    fireEvent.click(taskMeta);
+    expect(onOpenTask).not.toHaveBeenCalled();
+  });
+
+  test('chat presentation treats operator from_type as the local speaker', () => {
+    const onReply = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'operator',
+        content: 'Keep this in the main plan.',
+      }),
+      onReply,
+    })} />);
+
+    expect(screen.getByText('Keep this in the main plan.')).toBeTruthy();
+    expect(screen.getByTestId('message-bubble').className).toContain('justify-end');
+    expect(screen.queryByTitle('Reply')).toBeNull();
+  });
+
+  test('chat reply-only mode keeps system messages passive', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      msg: makeMsg({
+        from_type: 'system',
+        message_type: 'NOTE',
+        content: 'Pipeline heartbeat.',
+      }),
+    })} />);
+
+    expect(screen.getByText('Pipeline heartbeat.')).toBeTruthy();
+    expect(screen.queryByTitle('Reply')).toBeNull();
+  });
+
+  test('chat presentation shows operator Strategic context receipt when captured', () => {
+    const onOpenStrategicContext = vi.fn();
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      actionMode: 'reply-only',
+      onOpenStrategicContext,
+      msg: makeMsg({
+        from_type: 'operator',
+        content: 'Use the current context.',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'continuous',
+            active_surface: 'pipeline',
+            context_package_id: 'strategic-context:proj-1',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+            ],
+            selected_ref_descriptors: [
+              {
+                kind: 'artifact',
+                id: 'artifact:latest-context',
+                label: 'Latest context report',
+                summary: 'Fresh context report from the active wave',
+                status: 'INVESTIGATION_REPORT',
+              },
+            ],
+            captured_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
+    const receipt = screen.getByTestId('strategic-context-receipt');
+    expect(receipt.tagName.toLowerCase()).toBe('div');
+    expect(receipt.textContent).toContain('Refs attached');
+    expect(receipt.textContent).not.toContain('Sent with context');
+    expect(receipt.textContent).toContain('Workday');
+    expect(receipt.textContent).toContain('Pipeline');
+    expect(receipt.textContent).toContain('Latest context report');
+    fireEvent.click(receipt);
+    expect(onOpenStrategicContext).not.toHaveBeenCalled();
+  });
+
+  test('triage presentation keeps operator Strategic context receipt hidden', () => {
+    render(<MessageBubble {...makeProps({
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'continuous',
+            selected_refs: [
+              { kind: 'artifact', id: 'artifact:latest-context', label: 'Latest context report' },
+            ],
+          },
+        },
+      }),
+    })} />);
+
+    expect(screen.queryByTestId('strategic-context-receipt')).toBeNull();
+  });
+
+  test('chat receipt stays hidden when the captured Strategic session only has default timestamps', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'chat',
+            active_surface: 'strategic',
+            selected_refs: [],
+            session_started_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
+    expect(screen.queryByTestId('strategic-context-receipt')).toBeNull();
+  });
+
+  test('chat receipt labels non-default captured surface as pipeline context', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({
+        from_type: 'operator',
+        context: {
+          strategic_session: {
+            version: 1,
+            interaction_mode: 'chat',
+            active_surface: 'pipeline',
+            selected_refs: [],
+            captured_at: '2026-06-29T12:00:00Z',
+          },
+        },
+      }),
+    })} />);
+
+    const receipt = screen.getByTestId('strategic-context-receipt');
+    expect(receipt.textContent).toContain('Pipeline context');
+    expect(receipt.textContent).not.toContain('Sent with context');
+  });
+
+  test('chat presentation omits task metadata when there is no task ref', () => {
+    render(<MessageBubble {...makeProps({
+      presentation: 'chat',
+      msg: makeMsg({ from_task_id: null }),
+    })} />);
+
+    expect(screen.queryByText(/task /)).toBeNull();
+  });
+
   test('shows resolved note when status is resolved with resolution', () => {
     render(<MessageBubble {...makeProps({
       msg: makeMsg({ status: 'resolved', resolution: 'Fixed in PR 123' }),

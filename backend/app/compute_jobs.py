@@ -116,6 +116,12 @@ _COMPUTE_PARK_GRACE_SECONDS = 600
 COMPUTE_PROVISIONING_DEADLINE_SECONDS = int(
     os.getenv("COMPUTE_PROVISIONING_DEADLINE_SECONDS", "360")
 )
+# After this many consecutive poll failures (status or cost) with no successful
+# poll between them, the monitor terminates the job rather than leaving it RUNNING
+# indefinitely. Default 20 ≈ 5 minutes at the 15-second poll interval.
+COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES = int(
+    os.getenv("COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES", "20")
+)
 _COMPUTE_RPC_DIAGNOSTIC_KEY = "compute_rpc_diagnostic"
 _COMPUTE_RPC_DIAGNOSTIC_MAX_STRING = 1000
 
@@ -1665,16 +1671,66 @@ async def _process_single_compute_job(
             job.id,
             exc,
         )
-        await _record_compute_rpc_failure(
+        _next_retry_at = failed_at + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
+        # When the wall-clock deadline has already passed, terminate immediately
+        # rather than deferring to the next poll cycle — a persistently
+        # unreachable backend would otherwise keep the job RUNNING forever.
+        if job.wall_clock_deadline is not None and now >= job.wall_clock_deadline:
+            terminate_diagnostic = _build_compute_rpc_diagnostic(
+                job,
+                operation="poll_status",
+                exc=exc,
+                started_at=started_at,
+                failed_at=failed_at,
+                next_retry_at=None,
+                reason="poll_unreachable_at_deadline",
+            )
+            terminated = True
+            if job.external_compute_id:
+                try:
+                    terminated = await backend.terminate(job, reason="deadline")
+                except Exception:
+                    logger.exception(
+                        "[COMPUTE_JOB] terminate failed for unreachable job=%s at deadline",
+                        job.id,
+                    )
+                    terminated = False
+            await _apply_polled_compute_job_result(
+                session_factory,
+                job.id,
+                now=now,
+                poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+                next_poll_at=now
+                + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+                status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+                accrued_cost_usd=float(job.accrued_cost_usd or 0.0),
+                terminal_status=ComputeJobStatus.TIMED_OUT,
+                outcome=ComputeJobOutcome.TIMED_OUT,
+                terminal_reason=(
+                    "compute job exceeded deadline; backend unreachable at kill time"
+                ),
+                terminate_ok=terminated,
+                compute_rpc_diagnostic=terminate_diagnostic,
+            )
+            return
+        _updated = await _record_compute_rpc_failure(
             session_factory,
             job.id,
             operation="poll_status",
             exc=exc,
             started_at=started_at,
             failed_at=failed_at,
-            next_retry_at=failed_at
-            + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
+            next_retry_at=_next_retry_at,
         )
+        if await _check_poll_failure_safety_kills(
+            _updated,
+            backend,
+            session_factory,
+            now=now,
+            poll_attempt_count=(job.poll_attempt_count or 0) + 1,
+            next_poll_at=_next_retry_at,
+        ):
+            return
         return
     poll_attempt_count = (job.poll_attempt_count or 0) + 1
     next_poll_at = now + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS)
@@ -1691,7 +1747,7 @@ async def _process_single_compute_job(
                 job.id,
                 exc,
             )
-            await _record_compute_rpc_failure(
+            _updated = await _record_compute_rpc_failure(
                 session_factory,
                 job.id,
                 operation="poll_cost",
@@ -1701,6 +1757,15 @@ async def _process_single_compute_job(
                 next_retry_at=failed_at
                 + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
             )
+            if await _check_poll_failure_safety_kills(
+                _updated,
+                backend,
+                session_factory,
+                now=now,
+                poll_attempt_count=poll_attempt_count,
+                next_poll_at=next_poll_at,
+            ):
+                return
             return
         accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
         timeout_like = _status_is_runtime_timeout(status)
@@ -1745,7 +1810,7 @@ async def _process_single_compute_job(
             job.id,
             exc,
         )
-        await _record_compute_rpc_failure(
+        _updated = await _record_compute_rpc_failure(
             session_factory,
             job.id,
             operation="poll_cost",
@@ -1755,6 +1820,15 @@ async def _process_single_compute_job(
             next_retry_at=failed_at
             + timedelta(seconds=COMPUTE_JOB_MONITOR_INTERVAL_SECONDS),
         )
+        if await _check_poll_failure_safety_kills(
+            _updated,
+            backend,
+            session_factory,
+            now=now,
+            poll_attempt_count=poll_attempt_count,
+            next_poll_at=next_poll_at,
+        ):
+            return
         return
     accrued_cost_usd = max(float(job.accrued_cost_usd or 0.0), cost.total_cost_usd)
 
@@ -2310,6 +2384,88 @@ async def _persist_compute_rpc_failure(
     return live
 
 
+async def _check_poll_failure_safety_kills(
+    updated_job: "ComputeJob | None",
+    backend,
+    session_factory,
+    *,
+    now: datetime,
+    poll_attempt_count: int,
+    next_poll_at: datetime,
+) -> bool:
+    """After a poll failure, check whether a safety kill should be applied.
+
+    Checks consecutive-failure threshold, wall-clock deadline, and estimated
+    spend cap — in that order. If any condition is met, terminates the backend
+    best-effort and records a terminal transition. Returns True if a kill fired.
+    """
+    if updated_job is None:
+        return False
+
+    diag = (updated_job.polling_metadata or {}).get(_COMPUTE_RPC_DIAGNOSTIC_KEY)
+    attempt_count = int(diag.get("attempt_count", 0) if isinstance(diag, dict) else 0)
+
+    terminal_status: ComputeJobStatus | None = None
+    outcome: ComputeJobOutcome | None = None
+    terminal_reason: str | None = None
+
+    if attempt_count >= COMPUTE_MAX_CONSECUTIVE_POLL_FAILURES:
+        terminal_status = ComputeJobStatus.FAILED
+        outcome = ComputeJobOutcome.FAILURE
+        terminal_reason = (
+            f"compute job terminated: backend unreachable after"
+            f" {attempt_count} consecutive poll failures"
+        )
+    else:
+        runtime_deadline = _runtime_deadline_at(updated_job)
+        wall_clock_deadline = updated_job.wall_clock_deadline
+        if (runtime_deadline is not None and runtime_deadline <= now) or (
+            wall_clock_deadline is not None and wall_clock_deadline <= now
+        ):
+            terminal_status = ComputeJobStatus.TIMED_OUT
+            outcome = ComputeJobOutcome.TIMED_OUT
+            terminal_reason = "compute job exceeded runtime deadline"
+        elif updated_job.spend_cap_usd is not None:
+            accrued = float(updated_job.accrued_cost_usd or 0.0)
+            cost_rate = float(
+                (updated_job.polling_metadata or {}).get("cost_rate_per_second") or 0.0
+            )
+            if updated_job.started_at is not None and cost_rate > 0:
+                elapsed = max(0.0, (now - updated_job.started_at).total_seconds())
+                estimated_cost = max(accrued, cost_rate * elapsed)
+            else:
+                estimated_cost = accrued
+            if estimated_cost >= float(updated_job.spend_cap_usd):
+                terminal_status = ComputeJobStatus.FAILED
+                outcome = ComputeJobOutcome.SPEND_CAP_EXCEEDED
+                terminal_reason = "compute job terminated at spend cap"
+
+    if terminal_status is None:
+        return False
+
+    try:
+        await backend.terminate(updated_job, reason=terminal_reason)
+    except Exception:
+        logger.exception(
+            "[COMPUTE_JOB] poll-failure safety-kill terminate failed for job=%s",
+            updated_job.id,
+        )
+
+    await _apply_polled_compute_job_result(
+        session_factory,
+        updated_job.id,
+        now=now,
+        poll_attempt_count=poll_attempt_count,
+        next_poll_at=next_poll_at,
+        status=ComputeStatusResult(status=ComputeJobStatus.FAILED),
+        accrued_cost_usd=float(updated_job.accrued_cost_usd or 0.0),
+        terminal_status=terminal_status,
+        outcome=outcome,
+        terminal_reason=terminal_reason,
+    )
+    return True
+
+
 async def _record_compute_rpc_failure(
     session_factory,
     job_id: uuid.UUID,
@@ -2538,6 +2694,22 @@ def build_compute_result_logs(job: ComputeJob) -> str:
         # as-is for multi-arm experiments.
         if isinstance(reported.get("arms"), dict) and "arms" not in result:
             result["arms"] = reported["arms"]
+    # Inject per-arm cost_usd by apportioning total cost by elapsed_seconds fraction.
+    # Sum elapsed_seconds across all arms; if total is 0 or missing, skip injection.
+    if final_cost is not None and isinstance(result.get("arms"), dict):
+        arms_block = result["arms"]
+        total_elapsed = 0.0
+        for arm_dict in arms_block.values():
+            if isinstance(arm_dict, dict):
+                elapsed = arm_dict.get("elapsed_seconds")
+                if isinstance(elapsed, (int, float)):
+                    total_elapsed += float(elapsed)
+        if total_elapsed > 0:
+            for arm_dict in arms_block.values():
+                if isinstance(arm_dict, dict):
+                    elapsed = arm_dict.get("elapsed_seconds")
+                    if isinstance(elapsed, (int, float)):
+                        arm_dict["cost_usd"] = float(final_cost) * (float(elapsed) / total_elapsed)
     # Embed the bounded command log text so downstream analysis (knowledge doc,
     # LLM analysis/verdict prompt) can find results that live in stdout/stderr
     # rather than in $BLUEPRINT_RESULT_FILE. Capped at _COMMAND_LOG_EMBED_CHARS so

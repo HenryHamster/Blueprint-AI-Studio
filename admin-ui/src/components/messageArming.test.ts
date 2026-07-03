@@ -5,6 +5,7 @@ import {
   composerHintCopy,
   predictArming,
   parseArmingOutcome,
+  workbenchArmingToastCopy,
 } from './messageArming';
 
 describe('armingToastCopy — post-send toast grounded in the real outcome', () => {
@@ -23,6 +24,9 @@ describe('armingToastCopy — post-send toast grounded in the real outcome', () 
     expect(copy).toContain('resending');
     // Must NOT make the false steering promise.
     expect(copy).not.toContain('steering the strategist');
+  });
+  test('duplicate outcome confirms the existing steer is already armed', () => {
+    expect(armingToastCopy('duplicate')).toBe('Message already sent — steer already armed');
   });
   test('missing outcome falls back to the generic confirmation', () => {
     expect(armingToastCopy(null)).toBe('Message sent');
@@ -44,6 +48,27 @@ describe('armingHintCopy — composer hint per outcome', () => {
     const copy = armingHintCopy('not_armed');
     expect(copy).toContain('Couldn’t wake the strategist');
     expect(copy).toContain('resending');
+  });
+  test('duplicate hint reflects the idempotent replay', () => {
+    expect(armingHintCopy('duplicate')).toBe('Message already sent — steer already armed.');
+  });
+});
+
+describe('workbenchArmingToastCopy — mode-change wake receipts', () => {
+  test('steering confirms the strategist is being woken', () => {
+    expect(workbenchArmingToastCopy('steering')).toBe('Strategic mode saved — waking the strategist');
+  });
+
+  test('not_armed is truthful about the failed wake', () => {
+    const copy = workbenchArmingToastCopy('not_armed');
+    expect(copy).toContain('wasn’t woken');
+    expect(copy).not.toContain('waking the strategist');
+  });
+
+  test('passive and missing outcomes stay quiet', () => {
+    expect(workbenchArmingToastCopy('passive_note')).toBeNull();
+    expect(workbenchArmingToastCopy('routine_event')).toBeNull();
+    expect(workbenchArmingToastCopy(null)).toBeNull();
   });
 });
 
@@ -84,12 +109,54 @@ describe('predictArming — type-only prediction before any send', () => {
 });
 
 describe('parseArmingOutcome — narrows an untrusted response field', () => {
-  test('accepts the four valid outcomes', () => {
-    expect(parseArmingOutcome('steering')).toBe('steering');
-    expect(parseArmingOutcome('passive_note')).toBe('passive_note');
-    expect(parseArmingOutcome('routine_event')).toBe('routine_event');
-    expect(parseArmingOutcome('not_armed')).toBe('not_armed');
+  function backendLikeCreateResponse(
+    arming: 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate',
+  ) {
+    const messageId = `m-${arming}`;
+    return {
+      id: messageId,
+      status: arming === 'duplicate' ? 'duplicate' : 'created',
+      arming,
+      message: {
+        id: messageId,
+        project_id: 'proj-1',
+        message_type: 'FEEDBACK',
+        from_type: 'user',
+        from_task_id: null,
+        content: 'Operator message',
+        context: {},
+        status: 'open',
+        resolution: null,
+        resolved_at: null,
+        created_at: '2026-07-01T12:00:00Z',
+      },
+    };
+  }
+
+  const backendLikeArmingFixtures = [
+    { response: backendLikeCreateResponse('steering'), expected: 'steering' },
+    { response: backendLikeCreateResponse('passive_note'), expected: 'passive_note' },
+    { response: backendLikeCreateResponse('routine_event'), expected: 'routine_event' },
+    { response: backendLikeCreateResponse('not_armed'), expected: 'not_armed' },
+    { response: backendLikeCreateResponse('duplicate'), expected: 'duplicate' },
+  ] as const;
+
+  test.each(backendLikeArmingFixtures)(
+    'accepts backend-like response arming=$expected',
+    ({ response, expected }) => {
+      expect(parseArmingOutcome(response.arming)).toBe(expected);
+    },
+  );
+
+  test('accepted outcomes have backend-like toast and hint copy', () => {
+    for (const { response, expected } of backendLikeArmingFixtures) {
+      const outcome = parseArmingOutcome(response.arming);
+      expect(outcome).toBe(expected);
+      expect(armingToastCopy(outcome)).toEqual(expect.any(String));
+      expect(armingHintCopy(outcome!)).toEqual(expect.any(String));
+    }
   });
+
   test('rejects unknown / missing values', () => {
     expect(parseArmingOutcome(undefined)).toBeNull();
     expect(parseArmingOutcome(null)).toBeNull();

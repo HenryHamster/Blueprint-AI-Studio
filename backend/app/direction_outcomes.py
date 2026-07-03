@@ -37,7 +37,7 @@ from app.acceptance_gate import (
     acceptance_was_declared,
     classify_merged_acceptance,
 )
-from app.landed_signal import is_merged_completion
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY, is_merged_completion
 from app.models import (
     Artifact,
     ArtifactType,
@@ -184,6 +184,32 @@ def verified_merged_count(entry: dict) -> int:
     return int(entry.get("prs_merged") or 0)
 
 
+def credit_gate_merged_count(entry: dict) -> int:
+    """Credit-eligible merge count for direction decision gates (auto-completion, churn, lifetime burn).
+
+    Confirmed-reachable (landed) and ancestry-indeterminate merges both count.
+    Only confirmed-unreachable (stranded) merges are excluded — flag-trust is
+    preserved for ancestry-indeterminate outcomes per the merge-trust policy.
+
+    Built on :func:`verified_merged_count` as the base; subtracts
+    ``stranded_prs_merged`` when present so a reconciliation pass that discovers
+    confirmed-stranded merges can persist them on the entry and have them excluded
+    here without touching any credit-gate caller. Legacy entries without the field
+    are unchanged (stranded defaults to 0).
+
+    ``stranded_prs_merged`` is reset to 0 by every full recompute in
+    :func:`_update_direction_research_outcomes` because the recompute already
+    excludes stranded tasks from ``verified_prs_merged`` (``is_merged_completion``
+    returns False when ``landed_on_integration`` is explicitly False). The
+    subtraction here only applies in the window between stranding and the next
+    recompute; after a recompute both ``stranded_prs_merged`` and
+    ``verified_prs_merged`` are consistent and the subtraction is a no-op.
+    """
+    verified = verified_merged_count(entry)
+    stranded = int(entry.get("stranded_prs_merged") or 0)
+    return max(0, verified - stranded)
+
+
 def proven_merged_count(entry: dict) -> int:
     """Machine-checked PROVEN merged-PR count for a research_history entry.
 
@@ -204,6 +230,25 @@ def proven_merged_count(entry: dict) -> int:
 def consumed_merged_count(entry: dict) -> int:
     """Merged downstream_artifact count proven by downstream consumption."""
     return int(entry.get("acceptance_consumed_merged") or 0)
+
+
+def reachable_merged_count(entry: dict) -> int | None:
+    """Ancestry-reachable merged-PR count for a research_history entry.
+
+    Returns the subset of ``prs_merged`` whose persisted task context carries
+    ``landed_on_integration=True`` — confirming the merge commit was an ancestor
+    of the integration branch at the time it was stamped. Distinct from
+    :func:`verified_merged_count`: reachability is about ancestry confirmation,
+    not verification quality.
+
+    Returns ``None`` for legacy entries written before ``reachable_prs_merged``
+    was recorded — the reachability of those merges is genuinely unknown, and
+    fabricating zero would misrepresent the historical data. Callers that render
+    a reachable-vs-badge split must omit it when this returns ``None``.
+    """
+    if "reachable_prs_merged" not in entry:
+        return None
+    return int(entry.get("reachable_prs_merged") or 0)
 
 
 def declared_merged_count(entry: dict) -> int:
@@ -268,6 +313,25 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
         violations.append(f"verified ({verified}) exceeds prs_merged ({prs_merged})")
     if declared > prs_merged:
         violations.append(f"declared ({declared}) exceeds prs_merged ({prs_merged})")
+
+    # reachable_prs_merged must be a non-negative subset of prs_merged. Only
+    # checked when the field is present — legacy entries without it are skipped.
+    if "reachable_prs_merged" in entry:
+        reachable = int(entry.get("reachable_prs_merged") or 0)
+        if reachable < 0:
+            violations.append(f"reachable ({reachable}) is negative")
+        if reachable > prs_merged:
+            violations.append(
+                f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
+            )
+    # stranded_prs_merged is a delta-patch applied between stranding and the next
+    # full recompute; _update_direction_research_outcomes resets it to 0 once a
+    # recompute runs (stranded tasks are already absent from prs_merged at that
+    # point), so it is not partitioned against prs_merged here.
+    if "stranded_prs_merged" in entry:
+        stranded = int(entry.get("stranded_prs_merged") or 0)
+        if stranded < 0:
+            violations.append(f"stranded ({stranded}) is negative")
 
     coverage = entry.get("acceptance_declaration_coverage")
     if "acceptance_merged_write_total" in entry:
@@ -520,6 +584,16 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "verified_prs_merged": {
         "consumer": "verified_merged_count (this module), digest_metrics.py, strategic_spawning.py"
+    },
+    "stranded_prs_merged": {
+        "consumer": (
+            "credit_gate_merged_count (this module), direction_metrics.py "
+            "(total_stranded_prs_merged), strategic_completion.py, "
+            "research_completion.py, research_direction_state.py"
+        )
+    },
+    "reachable_prs_merged": {
+        "consumer": "reachable_merged_count (this module), strategic_spawning.py (stat_entry reachable_prs_merged), strategic_payload_compaction.py (_compact_direction_summary_entry)"
     },
     # --- Acceptance aggregates: now wired to decision + reader-facing consumers. ---
     # These expose proven-by-evidence and declaration-coverage truth distinct
@@ -1170,6 +1244,25 @@ async def _update_direction_research_outcomes(
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
         + aggregate_buckets["undeclared"]
+    )
+    # A full recompute already excludes confirmed-stranded tasks from prs_merged
+    # and verified_prs_merged (is_merged_completion returns False when
+    # landed_on_integration is explicitly False). The delta-patch field
+    # stranded_prs_merged written by discount_stranded_pr_from_direction_credit
+    # is only needed in the window between stranding and the next recompute.
+    # Reset it here so credit_gate_merged_count does not double-discount: once
+    # because the stranded task is absent from verified_prs_merged, and again
+    # because stranded_prs_merged still carries the stale delta.
+    entry["stranded_prs_merged"] = 0
+    # reachable_prs_merged: the ancestry-confirmed subset of prs_merged — tasks
+    # whose persisted context carries landed_on_integration=True (explicit True,
+    # NOT the legacy pr_merged fallback). Badge-only/indeterminate merges (key
+    # absent but pr_merged=True) are NOT counted here, but they STILL count in
+    # prs_merged because indeterminate ancestry must not silently drop credit.
+    entry["reachable_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if (ct.context or {}).get(LANDED_ON_INTEGRATION_KEY) is True
     )
     # Honest proven-by-evidence + declaration-coverage aggregates. These are
     # STRICTLY ADDITIVE: they do not change verified_prs_merged or prs_merged —
@@ -2079,9 +2172,81 @@ async def refresh_direction_outcomes_after_merge(
     :func:`is_merged_completion`, so a single child's merge heals the whole
     cycle entry (picking up sibling PRs that landed since the last recompute).
 
-    No-op unless *task* carries both ``direction_id`` and ``research_task_id``.
+    Criterion evidence recording runs for any task that carries ``criterion_ids``
+    and a proven verdict, independent of whether the direction recompute ran.
+    The direction recompute additionally requires ``research_task_id``.
     Best-effort: a failure here must never break merge finalization, so errors
     are logged and the session is rolled back to keep the caller's scope clean.
+    """
+    import contextlib
+    import logging
+
+    if task.project_id is None:
+        return
+    ctx = task.context or {}
+    direction_id = ctx.get("direction_id")
+    research_task_id = ctx.get("research_task_id")
+    # Direction outcome recompute requires both IDs; skip if either is absent.
+    if direction_id and research_task_id:
+        try:
+            await _update_direction_research_outcomes(
+                task.project_id, str(direction_id), str(research_task_id), session
+            )
+        except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
+            logging.getLogger(__name__).warning(
+                "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
+                getattr(task, "id", None),
+                exc,
+            )
+            with contextlib.suppress(Exception):
+                await session.rollback()
+    # Criterion evidence is independent of the direction recompute — record for
+    # any task that carries criterion_ids and a proven verdict.
+    # Best-effort: a failure here must never break merge finalization.
+    try:
+        from app.acceptance_criteria import record_task_merge_evidence
+
+        await record_task_merge_evidence(session, task, task.project_id)
+    except Exception as exc:  # noqa: BLE001
+        logging.getLogger(__name__).warning(
+            "[DIRECTION] criterion evidence recording failed for task %s: %r",
+            getattr(task, "id", None),
+            exc,
+        )
+        with contextlib.suppress(Exception):
+            await session.rollback()
+
+
+async def discount_stranded_pr_from_direction_credit(
+    task: Task, session: AsyncSession, *, had_pr_merged: bool | None = None
+) -> None:
+    """Persist a confirmed non-landing discount to the direction's research-history entry.
+
+    Called after :func:`~app.landed_signal.mark_stranded_non_landing` has set
+    ``landed_on_integration=False`` on a task whose PR was previously
+    badge-counted (``pr_merged=True``) and may already have been accumulated
+    into the cycle's ``prs_merged``/``verified_prs_merged`` count by an earlier
+    :func:`_update_direction_research_outcomes` pass.
+
+    Increments ``stranded_prs_merged`` on the matching ``research_history`` entry
+    so that :func:`credit_gate_merged_count` subtracts the stale credit without
+    requiring a full outcome recompute.  Only increments when the task actually
+    carried ``pr_merged=True`` — a task that was never badge-counted needs no
+    correction.
+
+    ``had_pr_merged`` lets callers supply the pre-stranding badge state when
+    calling this function after :func:`~app.landed_signal.mark_stranded_non_landing`,
+    which clears ``pr_merged`` from ``task.context``.  When ``None`` (default),
+    the function reads ``pr_merged`` from the current context (safe only when
+    called before stranding).
+
+    Idempotent: stamps ``stranded_discount_applied=True`` on ``task.context``
+    after the first successful discount so repeated rollup-management cycles
+    that re-enter the stranded-PR path are no-ops and cannot over-subtract
+    direction credit.
+
+    Best-effort: failures are logged and the session rolled back so the caller's
+    stranding operation (``mark_stranded_non_landing``) is not disrupted.
     """
     import contextlib
     import logging
@@ -2091,13 +2256,38 @@ async def refresh_direction_outcomes_after_merge(
     research_task_id = ctx.get("research_task_id")
     if not (direction_id and research_task_id) or task.project_id is None:
         return
+    # Use caller-supplied snapshot when available — mark_stranded_non_landing
+    # pops pr_merged before this function is called, so ctx.get("pr_merged")
+    # would be falsy even for previously badge-counted tasks.
+    _was_badge_counted = had_pr_merged if had_pr_merged is not None else bool(ctx.get("pr_merged"))
+    if not _was_badge_counted:
+        # Never badge-counted; no stale credit to retract.
+        return
+    if ctx.get("stranded_discount_applied"):
+        # Idempotency guard: discount already applied on a prior cycle; skip.
+        return
     try:
-        await _update_direction_research_outcomes(
-            task.project_id, str(direction_id), str(research_task_id), session
-        )
-    except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
+
+        def _apply_stranded_discount(dirs: list) -> None:
+            for d in dirs:
+                if d.get("id") != str(direction_id):
+                    continue
+                history = list(d.get("research_history", []))
+                for idx, h in enumerate(history):
+                    if h.get("task_id") == str(research_task_id):
+                        current = int(h.get("stranded_prs_merged") or 0)
+                        history[idx] = {**h, "stranded_prs_merged": current + 1}
+                        break
+                d["research_history"] = history
+                break
+
+        await with_directions_locked(session, task.project_id, _apply_stranded_discount)
+        # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
+        task.context = {**ctx, "stranded_discount_applied": True}
+        await session.commit()
+    except Exception as exc:  # noqa: BLE001 — best-effort; must not undo stranding
         logging.getLogger(__name__).warning(
-            "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
+            "[DIRECTION] stranded-PR credit discount failed for task %s: %r",
             getattr(task, "id", None),
             exc,
         )

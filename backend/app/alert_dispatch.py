@@ -33,6 +33,7 @@ from app.models import (
     Alert,
     AlertSeverity,
 )
+from app.alert_policy import create_project_alert_if_allowed
 from app.notification import _send_webhook_notification
 from app.shared_state import runtime_config as _runtime_config
 from app.time_utils import _utcnow
@@ -999,39 +1000,29 @@ async def _maybe_create_pool_payoff_alert(
     supporting: "dict",
     recommended_action: str,
     severity: AlertSeverity = AlertSeverity.WARNING,
-) -> None:
+) -> tuple[Alert | None, bool]:
     """Create a deduplicated operator Alert when a scoped project's warm-pool
     payoff verdict crosses a decision boundary.
 
     Closes the loop on a *bounded* warm-pool enable: when the per-project payoff
     verdict transitions to ``COST_REGRESSION`` (idle-inclusive cost per merged PR
-    is materially above the pre-pool baseline) or to ``PROVEN`` with material
-    warm-start volume, the operator is alerted so the keep / widen / disable
-    decision is made without polling the warm-VM panel. DISTINCT from the silent,
-    cost-only, fleet-wide auto-drain guard (``warm_pool_maintainer``): that
+    is materially above the pre-pool baseline), the operator is alerted so the
+    keep / disable decision is made without polling the warm-VM panel. ``PROVEN``
+    remains a reader-facing payoff state, not a durable alert. DISTINCT from the
+    silent, cost-only, fleet-wide auto-drain guard (``warm_pool_maintainer``): that
     protects spend automatically; this informs a per-project strategic decision.
 
     The message carries the supporting numbers (pool hit rate, pool-origin
     warm-start share, idle-inclusive cost drift vs. baseline) plus the
     recommended action so the operator can act from the alert alone.
 
-    Deduplicated by ``(project_id, title, dismissed_at IS NULL)`` where the title
-    encodes the verdict state — so a verdict that persists across many ticks
+    Deduplicated by active ``warm_pool.payoff`` key where the key encodes the
+    verdict state — so a verdict that persists across many ticks
     raises exactly ONE alert, and a genuinely different verdict gets its own.
     The supporting numbers live in the message so a drifting metric never
     defeats dedup.
     """
     title = f"{_POOL_PAYOFF_ALERT_TITLE_PREFIX}: {verdict_state} on project {str(project_id)[:8]}"
-    existing = await session.execute(
-        select(Alert).where(
-            Alert.project_id == project_id,
-            Alert.task_id.is_(None),
-            Alert.dismissed_at.is_(None),
-            Alert.title == title,
-        )
-    )
-    if existing.scalars().first() is not None:
-        return
     message = (
         f"Warm-pool payoff verdict for project {project_id} is now "
         f"{verdict_state}. Pool hit rate: "
@@ -1045,13 +1036,22 @@ async def _maybe_create_pool_payoff_alert(
         f"baseline {_fmt_metric(supporting.get('cost_baseline'))}). "
         f"{recommended_action}"
     )[:1000]
-    alert = Alert(
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
         project_id=project_id,
+        event_type="warm_pool.payoff",
         severity=severity,
         title=title,
         message=message,
+        source="alert_dispatch",
+        dedupe_key=f"warm_pool.payoff:{project_id}:{verdict_state}",
+        broadcast=False,
     )
-    session.add(alert)
+    if alert is None:
+        return None, False
+    if not created:
+        await session.commit()
+        return alert, False
     await session.commit()
     await broadcast_to_project(
         str(project_id),
@@ -1062,6 +1062,7 @@ async def _maybe_create_pool_payoff_alert(
             "title": alert.title,
         },
     )
+    return alert, True
 
 
 # Stable per-project title for the unpriced-LLM-models coverage alert. The
@@ -1668,6 +1669,160 @@ async def _resolve_wake_delivery_stall_alert(
             Alert.project_id == project_id,
             Alert.dismissed_at.is_(None),
             Alert.title == title,
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+# Event type + dedupe-key scheme for the self-hosted fleet-runner death alert.
+# The dedupe key encodes the runner id so an active->inactive flip raises exactly
+# ONE open alert per runner (the ux_alert_active_dedupe_key unique index enforces
+# it), and a genuinely distinct death event — after the previous one was resolved
+# on recovery — gets a fresh alert. Kept stable: the resolve-on-recovery path
+# rebuilds the SAME key to find the open alert to dismiss.
+_RUNNER_DEACTIVATED_EVENT_TYPE = "runner.deactivated"
+
+
+def _runner_deactivated_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_DEACTIVATED_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_deactivated_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    had_active_work: bool = False,
+    active_work_count: int = 0,
+    seconds_since_last_seen: "int | None" = None,
+) -> bool:
+    """Create ONE deduplicated operator Alert when a fleet runner is deactivated.
+
+    Fired from the orchestrator's stale-runner sweep at the moment it flips a
+    registered self-hosted runner ``active -> inactive`` (missed heartbeat
+    window). Previously that sweep only nudged the UI cache — an idle registered
+    runner could die and nothing told the operator. This surfaces the death in
+    the same Alerts banner/popover as PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN and,
+    when ``PIPELINE_WEBHOOK_URL`` is set, PUSHES the ``RUNNER_DEACTIVATED`` webhook
+    so the operator is notified without watching the console.
+
+    Severity mirrors impact: **ERROR** when the runner had active work in flight
+    at deactivation (a job may have been interrupted), **WARNING** when it was
+    idle. Uses the always-on ``core`` alert domain (runner death is a portable
+    operator incident), so it is never suppressed by per-project domain config.
+
+    Deduplicated on ``dedupe_key = runner.deactivated:{runner_id}`` via the shared
+    :func:`create_project_alert_if_allowed` upsert: a repeated sweep (or any
+    re-entry while the runner stays inactive) bumps the existing open alert's
+    occurrence count instead of creating a second row. The webhook fires ONLY on
+    the first (newly-created) alert, not on dedup hits. Commits its own row so the
+    caller's transaction boundary is independent. Returns ``True`` when a NEW
+    alert was created (and the webhook pushed), else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    severity = AlertSeverity.ERROR if had_active_work else AlertSeverity.WARNING
+    if had_active_work:
+        title = f"Fleet runner went offline mid-job: {runner_label}"
+        work_desc = (
+            f" It had {active_work_count} active "
+            f"task{'s' if active_work_count != 1 else ''} in flight, which may "
+            f"have been interrupted."
+        )
+    else:
+        title = f"Fleet runner went offline: {runner_label}"
+        work_desc = " It had no active work at deactivation."
+    if seconds_since_last_seen is not None:
+        last_seen_desc = (
+            f" Last heartbeat {_fmt_duration_seconds(seconds_since_last_seen)} ago."
+        )
+    else:
+        last_seen_desc = " It never sent a heartbeat after registering."
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) missed "
+        f"its heartbeat window and was deactivated.{work_desc}{last_seen_desc} "
+        f"Bring the runner back online — it re-arms automatically on its next "
+        f"heartbeat (the alert clears then) — or retarget its work to another "
+        f"runner or the cloud fallback."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_DEACTIVATED_EVENT_TYPE,
+        severity=severity,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_deactivated_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        # Policy suppressed the durable alert (should not happen for the core
+        # domain, but keep the contract honest): nothing staged, nothing to push.
+        return False
+    await session.commit()
+    if not created:
+        # Dedup hit: the open alert's occurrence count was bumped and committed;
+        # do not re-broadcast or re-push the webhook while the runner stays dead.
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": severity.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    await _send_webhook_notification("RUNNER_DEACTIVATED", alert.title, alert.message)
+    return True
+
+
+async def _resolve_runner_deactivated_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-deactivated alert for a runner that recovered.
+
+    The companion to :func:`_maybe_create_runner_deactivated_alert`. Called from
+    the runner heartbeat handler when a previously-inactive runner re-arms
+    (status flips back to ``active``): the WARNING/ERROR alert that flagged the
+    death no longer describes a real condition, so it is resolved — mirroring how
+    :func:`_resolve_wake_delivery_stall_alert` dismisses its alert on recovery.
+
+    Looks the open alert up by the deterministic ``dedupe_key`` (rebuilt with the
+    SAME construction the create path used), stamps ``dismissed_at``, commits its
+    own rows, and broadcasts one ``alert_dismissed`` per dismissed alert so the
+    operator UI drops it without waiting for a poll. Only open
+    (``dismissed_at IS NULL``) alerts are touched, so this is a safe idempotent
+    no-op when none exists. Returns the number of alerts dismissed (0 or 1 in
+    practice). Best-effort contract: the caller wraps this so a resolve failure
+    never aborts the heartbeat that triggered it.
+    """
+    dedupe_key = _runner_deactivated_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
         )
     )
     open_alerts = result.scalars().all()

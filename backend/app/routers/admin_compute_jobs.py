@@ -13,6 +13,7 @@ from datetime import timedelta
 from typing import Any, Dict
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -46,6 +47,41 @@ _COMPUTE_JOB_TERMINAL_STATUSES = frozenset(
         ComputeJobStatus.TIMED_OUT,
     }
 )
+_ASK_HISTORY_MAX_TURNS = 6
+_ASK_HISTORY_TURN_MAX_CHARS = 1000
+
+
+class _ComputeJobAskHistoryTurn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    question: str = Field(..., min_length=1, max_length=_ASK_HISTORY_TURN_MAX_CHARS)
+    answer: str = Field(..., min_length=1, max_length=_ASK_HISTORY_TURN_MAX_CHARS)
+
+
+class _AskComputeJobRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    question: str = Field(..., min_length=1)
+    history: list[_ComputeJobAskHistoryTurn] = Field(default_factory=list)
+
+    @field_validator("history", mode="before")
+    @classmethod
+    def _sanitize_history(cls, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, list):
+            return []
+        turns: list[dict[str, str]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            question = item.get("question")
+            answer = item.get("answer")
+            if not isinstance(question, str) or not isinstance(answer, str):
+                continue
+            question = question[:_ASK_HISTORY_TURN_MAX_CHARS]
+            answer = answer[:_ASK_HISTORY_TURN_MAX_CHARS]
+            if question and answer:
+                turns.append({"question": question, "answer": answer})
+        return turns[-_ASK_HISTORY_MAX_TURNS:]
 
 router = APIRouter(
     prefix="/api/admin",
@@ -150,6 +186,7 @@ async def _build_compute_job_payload(
             )
         # Derive knowledge_document_id from the task's plan_output.
         knowledge_document_id: str | None = None
+        per_arm_verdicts: dict | None = None
         if task_obj is not None:
             knowledge_doc = (task_obj.plan_output or {}).get("knowledge_document") or {}
             raw_kdoc_id = (
@@ -158,6 +195,8 @@ async def _build_compute_job_payload(
             knowledge_document_id = (
                 str(raw_kdoc_id) if raw_kdoc_id is not None else None
             )
+            raw_pav = knowledge_doc.get("per_arm_verdicts") if isinstance(knowledge_doc, dict) else None
+            per_arm_verdicts = raw_pav if isinstance(raw_pav, dict) else None
         experiment: str | None = None
         benchmark: str | None = None
         hypothesis: str | None = None
@@ -174,6 +213,7 @@ async def _build_compute_job_payload(
         data["success_criterion"] = success_criterion
         data["criterion_verdict"] = criterion_verdict
         data["knowledge_document_id"] = knowledge_document_id
+        data["per_arm_verdicts"] = per_arm_verdicts
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis
@@ -318,7 +358,8 @@ async def kill_project_compute_job(
         killed = await session.get(ComputeJob, job_id)
         if killed is None:
             raise HTTPException(status_code=404, detail="Compute job not found")
-    return {"compute_job": serialize_compute_job_response_safe(killed)}
+    built = await _build_compute_job_payload(session, [killed])
+    return {"compute_job": built[0]}
 
 
 @router.get("/projects/{project_id}/compute-jobs/sweep-groups")
@@ -404,4 +445,58 @@ async def analyze_project_compute_job(
         result_reference=job.result_reference,
         session=session,
         logs=logs,
+    )
+
+
+@router.post("/compute-jobs/{job_id}/ask")
+async def ask_compute_job(
+    job_id: uuid.UUID,
+    body: _AskComputeJobRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Answer a free-form question grounded in a terminal compute job's evidence (member+)."""
+    job = await session.get(ComputeJob, job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Compute job not found")
+    await _get_user_project_with_role(
+        job.project_id, current_user["user_id"], session, "member"
+    )
+    if job.status not in _COMPUTE_JOB_TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Compute job is not terminal (status={job.status}); Q&A requires a terminal job",
+        )
+    if job.task_id is None:
+        raise HTTPException(status_code=409, detail="Compute job has no linked task")
+    task = await session.get(Task, job.task_id)
+    if task is None:
+        raise HTTPException(status_code=409, detail="Linked task not found")
+
+    compute_result = (task.plan_output or {}).get("compute_result") or {}
+    outcome = str(compute_result.get("outcome") or "")
+    if not outcome and job.outcome is not None:
+        outcome = job.outcome.value
+    if not outcome:
+        outcome = "unknown"
+    raw_cost = compute_result.get("final_cost_usd")
+    cost: float | None = float(raw_cost) if raw_cost is not None else None
+    criterion = compute_result.get("criterion")
+    if not isinstance(criterion, dict):
+        criterion = None
+
+    logs = json.dumps({"job_id": str(job.id)})
+
+    from app.knowledge_completion import answer_compute_experiment_question
+
+    return await answer_compute_experiment_question(
+        task,
+        question=body.question,
+        outcome=outcome,
+        cost=cost,
+        criterion=criterion,
+        result_reference=job.result_reference,
+        session=session,
+        logs=logs,
+        history=[turn.model_dump() for turn in body.history],
     )

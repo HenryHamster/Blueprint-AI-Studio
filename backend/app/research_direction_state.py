@@ -31,7 +31,7 @@ from app.models import (
 )
 from app.broadcast import broadcast_to_project
 from app.direction_metrics import _fold_evicted_into_aggregate
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -561,6 +561,18 @@ async def apply_post_spawn_state(
                     # we don't keep surfacing stale rejected titles after recovery.
                     if len(dir_child_tasks) > 0 and d.get("deadlock_filtered_titles"):
                         del d["deadlock_filtered_titles"]
+                    # NOTE: churn_family_pause_count is intentionally NOT reset here.
+                    # Creating child tasks is not the same as shipping merged PRs —
+                    # unproductive/churning directions routinely spawn tasks that
+                    # never merge. apply_post_spawn_state runs between lifecycle
+                    # ticks, so resetting on mere task creation let a paused
+                    # (counter=1) direction wipe its counter before the next tick
+                    # could advance it to the >=2 auto-retire fence, freezing the
+                    # zombie ladder one short of retirement. The counter is now
+                    # incremented only by direction_lifecycle.py and never reset
+                    # externally; a genuinely healthy direction simply stops being
+                    # churn-paused, so a stale non-zero counter is harmless
+                    # (ref bf6d8788).
                     # Compact history entry — just counters and a short summary.
                     # Full details available via task API using task_id.
                     titles = finding_titles_by_dir.get(did, [])[:3]
@@ -890,13 +902,17 @@ async def apply_post_spawn_state(
                         history = d.get("research_history", [])
                         agg = d.get("history_aggregate", {})
                         total_merged = sum(
-                            verified_merged_count(e) for e in history
-                        ) + int(
-                            agg.get(
-                                "total_verified_prs_merged",
-                                agg.get("total_prs_merged", 0),
+                            credit_gate_merged_count(e) for e in history
+                        ) + max(
+                            0,
+                            int(
+                                agg.get(
+                                    "total_verified_prs_merged",
+                                    agg.get("total_prs_merged", 0),
+                                )
+                                or 0
                             )
-                            or 0
+                            - int(agg.get("total_stranded_prs_merged", 0) or 0),
                         )
                         if total_merged < 3:
                             await _maybe_autocomplete_exhausted_direction(
@@ -1016,6 +1032,41 @@ async def apply_post_spawn_state(
                     session, task.project_id, _apply_archived_diagnoses
                 )
                 await session.commit()
+
+                # Reconcile problem-model gaps for the directions auto-completed
+                # on this pass. Mirrors the strategic-completion _apply_gap_reconcile
+                # pattern: prune each completed id from its gap's active_moves,
+                # union into past_moves, and record a GapDeferral when the gap is
+                # left unstaffed. Fail-open: a malformed/empty problem model must
+                # never block the completion that already committed above.
+                _completed_ids_for_reconcile = [
+                    _did for _, _did in _pending_archived_diagnoses
+                ]
+                _reconcile_now_iso = _utcnow().isoformat()
+                try:
+                    from app.problem_model import (
+                        reconcile_gaps_for_retired_directions,
+                    )
+                    from app.task_locking import with_problem_model_locked
+
+                    def _apply_research_gap_reconcile(pm: dict) -> None:
+                        reconcile_gaps_for_retired_directions(
+                            pm, _completed_ids_for_reconcile, _reconcile_now_iso
+                        )
+
+                    await with_problem_model_locked(
+                        session,
+                        task.project_id,
+                        _apply_research_gap_reconcile,
+                    )
+                    await session.commit()
+                except Exception as _reconcile_exc:
+                    logger.warning(
+                        "[RESEARCH] Gap reconciliation failed for auto-completed "
+                        "directions %s (non-fatal): %s",
+                        _completed_ids_for_reconcile,
+                        _reconcile_exc,
+                    )
 
     # Process direction notes — append to the target direction's notes list
     if direction_notes:

@@ -266,8 +266,10 @@ interface TaskStatusCounts {
   running: number;
   evaluating: number;
   blocked: number;
+  parked: number;
   failed: number;
   completed: number;
+  cancelled: number;
   total: number;
 }
 

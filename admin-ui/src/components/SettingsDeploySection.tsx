@@ -44,11 +44,9 @@ function MergeGradeGateSettings() {
 
   return (
     <div>
-      <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">Release Gate Thresholds</h3>
-      <p className="text-ui-md text-neutral-500 mb-3">
-        Arm the blind merge-grade hard block by raising <code className="font-mono">merge_grade_block_threshold</code> above <code className="font-mono">0.0</code> (typically <code className="font-mono">1.0</code>).
-        When the blind merge-grade verdict is <em>misses</em> and this threshold is &gt;&nbsp;0, qualification is blocked.
-        Default <code className="font-mono">0.0</code> ships dark (gate never fires).
+      <h3 className="mb-1 text-xs font-semibold uppercase tracking-wide text-neutral-300">Release Gate Thresholds</h3>
+      <p className="mb-3 text-ui-md text-neutral-500">
+        Set <code className="font-mono">merge_grade_block_threshold</code> from <code className="font-mono">0.0</code> to <code className="font-mono">1.0</code>. A value of <code className="font-mono">0.0</code> leaves the gate disabled.
       </p>
       <div className="flex flex-wrap items-center gap-2">
         <label className="text-xs text-neutral-400 w-48">merge_grade_block_threshold</label>
@@ -60,7 +58,7 @@ function MergeGradeGateSettings() {
         />
         <button
           onClick={save} disabled={saving}
-          className="inline-flex items-center justify-center min-h-[44px] bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded px-3 py-1 text-xs transition-colors disabled:opacity-50"
+          className="inline-flex min-h-[44px] items-center justify-center rounded-md border border-neutral-700 bg-[#151c25] px-3 py-1 text-xs text-neutral-300 transition-colors hover:bg-neutral-800 disabled:opacity-50"
           data-testid="merge-grade-block-threshold-save"
         >
           {saving ? 'Saving…' : saveOk ? 'Saved' : 'Save'}
@@ -130,15 +128,15 @@ export function DeploySection({
     : undefined;
   const nextCheckSeconds = useHealthCountdown(lastCheckIso, deployState?.health_check_interval_seconds);
   return (
-    <div className="space-y-6">
+    <div className="space-y-4">
       {/* Deploy Health */}
       <div>
-        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Deploy Health</h3>
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-300">Deploy Health</h3>
         {deployState ? (
           <div className="space-y-3">
-            <div className="grid grid-cols-3 gap-4 bg-neutral-900 rounded-lg border border-neutral-800 p-4">
+            <div className="grid grid-cols-1 gap-2 rounded-md border border-neutral-800 bg-[#10151c] p-3 sm:grid-cols-3">
               <div>
-                <span className="text-ui-md text-neutral-500 block mb-1">Status</span>
+                <span className="mb-1 block text-ui-md uppercase tracking-wide text-neutral-500">Status</span>
                 <span className={`text-sm font-semibold ${
                   deployState.status === 'STABLE' ? 'text-emerald-400' :
                   deployState.status === 'MONITORING' ? 'text-blue-400' :
@@ -148,7 +146,7 @@ export function DeploySection({
                 }`}>{deployState.status}</span>
               </div>
               <div>
-                <span className="text-ui-md text-neutral-500 block mb-1">{deployState.rolled_back_from_sha ? 'Live SHA' : 'SHA'}</span>
+                <span className="mb-1 block text-ui-md uppercase tracking-wide text-neutral-500">{deployState.rolled_back_from_sha ? 'Live SHA' : 'SHA'}</span>
                 <span className="text-sm text-neutral-300 font-mono">{deployState.current_sha?.slice(0, 8) || '\u2014'}</span>
                 {deployState.status === 'ROLLED_BACK' && deployState.rolled_back_from_sha && (
                   <span className="text-ui-md text-red-400/80 font-mono block mt-0.5" title={deployState.rolled_back_from_sha}>
@@ -158,7 +156,7 @@ export function DeploySection({
               </div>
               {(deployState.failure_rate ?? 0) > 0 && (
                 <div>
-                  <span className="text-ui-md text-neutral-500 block mb-1">Failure Rate</span>
+                  <span className="mb-1 block text-ui-md uppercase tracking-wide text-neutral-500">Failure Rate</span>
                   <span className={`text-sm font-mono ${(deployState.failure_rate ?? 0) > 0.3 ? 'text-red-400' : 'text-neutral-300'}`}>
                     {((deployState.failure_rate ?? 0) * 100).toFixed(0)}%
                   </span>
@@ -167,14 +165,14 @@ export function DeploySection({
             </div>
 
             {deployState.monitoring_window !== null && (
-              <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-neutral-500">Monitoring Progress</span>
                   <span className="text-xs text-blue-400 font-mono">{deployState.monitoring_window.percent}%</span>
                 </div>
-                <div className="w-full bg-neutral-800 rounded-full h-2">
+                <div className="h-1.5 w-full rounded-full bg-neutral-800">
                   <div
-                    className="bg-blue-500 h-2 rounded-full transition-all duration-500"
+                    className="h-1.5 rounded-full bg-blue-500 transition-all duration-500"
                     style={{ width: `${deployState.monitoring_window.percent}%` }}
                   />
                 </div>
@@ -190,18 +188,18 @@ export function DeploySection({
             )}
 
             {deployState.rollback_reason && (
-              <p className="text-xs text-amber-400/80 bg-amber-950/20 rounded-lg px-3 py-2">{deployState.rollback_reason}</p>
+              <p className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">{deployState.rollback_reason}</p>
             )}
             {deployState.pause_reason && (
-              <p className="text-xs text-amber-400/80 bg-amber-950/20 rounded-lg px-3 py-2">{deployState.pause_reason}</p>
+              <p className="rounded-md border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-xs text-amber-300">{deployState.pause_reason}</p>
             )}
 
             {/* External dependency health */}
             {deployState.external_health && (() => {
               const externalHealth = deployState.external_health;
               return (
-              <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
-                <div className="text-ui-md text-neutral-500 uppercase tracking-wider mb-1">External Dependencies</div>
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
+                <div className="mb-1 text-ui-md uppercase tracking-wide text-neutral-500">External Dependencies</div>
                 {EXTERNAL_DEP_ORDER.filter((dep) => {
                   if (!(dep in externalHealth)) return false;
                   return typeof externalHealth[dep] === 'boolean';
@@ -218,13 +216,13 @@ export function DeploySection({
                         </span>
                       </div>
                       {error && (
-                        <p className="text-ui-md text-red-400/70 bg-red-950/20 rounded px-2 py-1 break-all">{String(error)}</p>
+                        <p className="break-all rounded bg-red-950/20 px-2 py-1 text-ui-md text-red-400/70">{String(error)}</p>
                       )}
                     </div>
                   );
                 })}
                 {typeof deployState.external_health?.last_check === 'string' && (
-                  <div className="flex items-center justify-between mt-1 pt-1 border-t border-neutral-800">
+                  <div className="mt-1 flex items-center justify-between border-t border-neutral-800 pt-1">
                     <span className="text-ui-md text-neutral-600">Last check</span>
                     <span className="text-ui-md text-neutral-500 font-mono">
                       {parseTimestamp(deployState.external_health.last_check as string).toLocaleTimeString()}
@@ -253,12 +251,12 @@ export function DeploySection({
             })()}
 
             {deployState.status === 'PAUSED' && deployState.pre_pause_max_vms != null && (
-              <p className="text-xs text-neutral-400 bg-neutral-800/40 rounded-lg px-3 py-2">
+              <p className="rounded-md border border-neutral-800 bg-[#10151c] px-3 py-2 text-xs text-neutral-400">
                 Will restore to {deployState.pre_pause_max_vms} VM{deployState.pre_pause_max_vms !== 1 ? 's' : ''}
               </p>
             )}
             {deployState.status === 'PAUSED' && (deployState.health_recovery_streak ?? 0) > 0 && (
-              <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
+              <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-neutral-500">Recovery Progress</span>
                   <span className="text-xs text-emerald-400 font-mono">
@@ -275,9 +273,9 @@ export function DeploySection({
                     </span>
                   </p>
                 )}
-                <div className="w-full bg-neutral-800 rounded-full h-2">
+                <div className="h-1.5 w-full rounded-full bg-neutral-800">
                   <div
-                    className="bg-emerald-500 h-2 rounded-full transition-all duration-500"
+                    className="h-1.5 rounded-full bg-emerald-500 transition-all duration-500"
                     style={{ width: `${Math.min(100, (deployState.health_recovery_streak / (deployState.health_recovery_streak_required ?? 3)) * 100)}%` }}
                   />
                 </div>
@@ -306,7 +304,7 @@ export function DeploySection({
                 any deploy-state status change clears it upstream in the hook),
                 and the adjacent Rollback button below invites the retry. */}
             {failedRollback && (
-              <div className="bg-red-950/30 border border-red-900/50 rounded-lg px-3 py-2.5 flex items-start gap-2" role="alert">
+              <div className="flex items-start gap-2 rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2.5" role="alert">
                 <AlertTriangle className="w-4 h-4 text-red-400 mt-0.5 shrink-0" />
                 <div className="space-y-0.5 min-w-0">
                   <p className="text-xs font-semibold text-red-400">Last rollback failed — traffic still serves the current revision</p>
@@ -326,36 +324,36 @@ export function DeploySection({
             <div className="flex gap-2 flex-wrap">
               {deployState.status === 'PAUSED' || deployState.status === 'ROLLED_BACK' ? (
                 <button onClick={onResumePipeline}
-                  className="bg-emerald-950/30 hover:bg-emerald-900/40 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-emerald-900/50 flex items-center gap-1.5">
+                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-emerald-900/50 bg-emerald-950/30 px-3 py-2 text-xs text-emerald-300 transition-colors hover:bg-emerald-900/40">
                   <Play className="w-3.5 h-3.5" /> Resume
                 </button>
               ) : deployState.status === 'STABLE' || deployState.status === 'MONITORING' ? (
                 <button onClick={onPausePipeline}
-                  className="bg-amber-950/30 hover:bg-amber-900/40 text-amber-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-amber-900/50 flex items-center gap-1.5">
+                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-amber-900/50 bg-amber-950/30 px-3 py-2 text-xs text-amber-300 transition-colors hover:bg-amber-900/40">
                   <Pause className="w-3.5 h-3.5" /> Pause
                 </button>
               ) : null}
               {(deployState.status === 'MONITORING' || deployState.status === 'ROLLED_BACK' || deployState.status === 'HALTED') && (
                 <button onClick={onMarkStable}
-                  className="bg-neutral-800 hover:bg-neutral-700 text-emerald-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-1.5">
+                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-[#151c25] px-3 py-2 text-xs text-emerald-300 transition-colors hover:bg-neutral-800">
                   <CheckCircle className="w-3.5 h-3.5" /> Mark Stable
                 </button>
               )}
               {deployState.status === 'PAUSED' && (
                 <button
                   onClick={() => { if (window.confirm('Force-reset health and resume immediately? This bypasses the healthy-checks gate.')) onResetHealth(); }}
-                  className="bg-orange-950/30 hover:bg-orange-900/40 text-orange-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-orange-900/50 flex items-center gap-1.5">
+                  className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-orange-900/50 bg-orange-950/30 px-3 py-2 text-xs text-orange-300 transition-colors hover:bg-orange-900/40">
                   <Zap className="w-3.5 h-3.5" /> Force Reset
                 </button>
               )}
               <button
                 onClick={() => { if (window.confirm('Rollback to last known good revision? This will pause the pipeline.')) onRollback(); }}
                 disabled={deployState.status === 'ROLLED_BACK' || !deployState.last_known_good_sha || deployState.last_known_good_sha === deployState.current_sha}
-                className="bg-red-950/30 hover:bg-red-900/40 disabled:opacity-30 disabled:cursor-not-allowed text-red-400 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-red-900/50 flex items-center gap-1.5">
+                className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-300 transition-colors hover:bg-red-900/40 disabled:cursor-not-allowed disabled:opacity-30">
                 <RotateCw className="w-3.5 h-3.5" /> Rollback
               </button>
               <button onClick={onRepairState}
-                className="bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-xs min-h-[44px] py-2 px-4 rounded-lg transition-colors border border-neutral-700 flex items-center gap-1.5">
+                className="flex min-h-[44px] items-center gap-1.5 rounded-md border border-neutral-700 bg-[#151c25] px-3 py-2 text-xs text-neutral-300 transition-colors hover:bg-neutral-800">
                 <Wrench className="w-3.5 h-3.5" /> Repair
               </button>
             </div>
@@ -367,9 +365,9 @@ export function DeploySection({
 
       {/* Zone Health */}
       <div>
-        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Zone Health</h3>
+        <h3 className="mb-2 text-xs font-semibold uppercase tracking-wide text-neutral-300">Zone Health</h3>
         {zoneHealth ? (
-          <div className="bg-neutral-900 rounded-lg border border-neutral-800 p-4 space-y-2">
+          <div className="space-y-2 rounded-md border border-neutral-800 bg-[#10151c] p-3">
             {Object.entries(zoneHealth).map(([zone, data]) => {
               const region = zone.split('-').slice(0, 2).join('-');
               const dotColor = data.status === 'healthy' ? 'bg-emerald-500'
@@ -379,7 +377,7 @@ export function DeploySection({
                 : data.status === 'exhausted' ? 'text-red-400'
                 : 'text-amber-400';
               return (
-                <div key={zone} className="flex items-center justify-between">
+                <div key={zone} className="flex items-center justify-between gap-3">
                   <div className="flex items-center gap-2">
                     <span className={`w-2 h-2 rounded-full ${dotColor}`} />
                     <span className="text-xs text-neutral-400 font-mono">{zone}</span>

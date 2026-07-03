@@ -7,8 +7,9 @@ import userEvent from '@testing-library/user-event';
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 import { PRMonitorSection } from './PRMonitorSection';

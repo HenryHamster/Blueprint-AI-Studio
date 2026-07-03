@@ -7,8 +7,9 @@ import type { VersionLifecycleResponse } from '../api';
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 vi.mock('../api');
 
@@ -1362,98 +1363,6 @@ describe('VersionLifecyclePanel', () => {
       expect(within(evidence).queryByTestId('challenger-refuted-findings')).not.toBeInTheDocument();
     });
 
-    it('renders theme_delivery certified chip with grade', () => {
-      render(
-        <VersionLifecyclePanel
-          data={makeVersionLifecycleResponse({
-            current_version: makeCurrentVersion({
-              last_qualification: makeQualification({
-                audit_findings: [{ severity: 'low', summary: 'minor' }],
-                theme_delivery: { state: 'certified', assessed_grade: 1.0 },
-              }),
-            }),
-          })}
-          loading={false}
-          projectId="proj-1"
-          onRefresh={mockRefresh}
-        />
-      );
-
-      const evidence = screen.getByTestId('durable-qualification-evidence');
-      const chip = within(evidence).getByTestId('theme-delivery-chip');
-      expect(chip).toBeInTheDocument();
-      expect(chip).toHaveTextContent('theme certified 100%');
-    });
-
-    it('renders theme_delivery shortfall chip with gap sentence in title', () => {
-      render(
-        <VersionLifecyclePanel
-          data={makeVersionLifecycleResponse({
-            current_version: makeCurrentVersion({
-              last_qualification: makeQualification({
-                audit_findings: [{ severity: 'low', summary: 'minor' }],
-                theme_delivery: {
-                  state: 'shortfall',
-                  assessed_grade: 0.4,
-                  shortfalls: [{ criterion: 'leanness', why: 'Diff added unrelated auth boilerplate' }],
-                },
-              }),
-            }),
-          })}
-          loading={false}
-          projectId="proj-1"
-          onRefresh={mockRefresh}
-        />
-      );
-
-      const evidence = screen.getByTestId('durable-qualification-evidence');
-      const chip = within(evidence).getByTestId('theme-delivery-chip');
-      expect(chip).toBeInTheDocument();
-      expect(chip).toHaveTextContent('theme shortfall 40%');
-      expect(chip).toHaveAttribute('title', 'Diff added unrelated auth boilerplate');
-    });
-
-    it('does not render theme_delivery chip when state is not_applicable', () => {
-      render(
-        <VersionLifecyclePanel
-          data={makeVersionLifecycleResponse({
-            current_version: makeCurrentVersion({
-              last_qualification: makeQualification({
-                audit_findings: [{ severity: 'low', summary: 'minor' }],
-                theme_delivery: { state: 'not_applicable' },
-              }),
-            }),
-          })}
-          loading={false}
-          projectId="proj-1"
-          onRefresh={mockRefresh}
-        />
-      );
-
-      const evidence = screen.getByTestId('durable-qualification-evidence');
-      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
-    });
-
-    it('does not render theme_delivery chip when theme_delivery is absent', () => {
-      render(
-        <VersionLifecyclePanel
-          data={makeVersionLifecycleResponse({
-            current_version: makeCurrentVersion({
-              last_qualification: makeQualification({
-                audit_findings: [{ severity: 'low', summary: 'minor' }],
-              }),
-            }),
-          })}
-          loading={false}
-          projectId="proj-1"
-          onRefresh={mockRefresh}
-        />
-      );
-
-      const evidence = screen.getByTestId('durable-qualification-evidence');
-      expect(within(evidence).queryByTestId('theme-delivery-chip')).not.toBeInTheDocument();
-    });
-
     it('renders goal_alignment aligned chip with grade', () => {
       render(
         <VersionLifecyclePanel
@@ -2240,6 +2149,33 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.queryByText(/validated precision/)).not.toBeInTheDocument();
       // Should show self-approval rate
       expect(screen.getByText(/100% self-approval rate/)).toBeInTheDocument();
+    });
+
+    it('renders acceptance caveat on ready badge when present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            promotion_readiness: makeReadiness({
+              ready: true,
+              ground_truth_validated: true,
+              validated_precision: 0.9,
+              resolved_outcome_sample: 10,
+              serving_confirmed_count: 9,
+              deploy_failed_count: 1,
+              acceptance_caveat: 'acceptance not fully proven — this version contains 2 satisfied-but-not-machine-proven task(s)',
+              caveat: 'validated against post-promotion outcomes',
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+      // Badge should be green (ready=true)
+      expect(screen.getByTestId('ready-badge')).toHaveClass('bg-emerald-500/10');
+      // Acceptance caveat should be displayed despite ready=true
+      expect(screen.getByTestId('acceptance-caveat-on-badge')).toBeInTheDocument();
+      expect(screen.getByTestId('acceptance-caveat-on-badge')).toHaveTextContent(/acceptance not fully proven/);
     });
   });
 
@@ -3502,7 +3438,11 @@ describe('VersionLifecyclePanel', () => {
           data={makeVersionLifecycleResponse({
             current_version: makeCurrentVersion({
               qualification_state: {
-                state: 'promoted_serving',
+                // 'promoted' is the real backend state once a candidate merges;
+                // serving confirmation is carried by serving_status, not the
+                // qualification state string. ('promoted_serving' was never a
+                // value summarize_qualification_state emits.)
+                state: 'promoted',
                 summary: 'All artifacts confirmed.',
                 serving_status: 'serving_confirmed',
               },
@@ -3662,6 +3602,179 @@ describe('VersionLifecyclePanel', () => {
       );
 
       expect(screen.queryByTestId('changelog-toggle')).not.toBeInTheDocument();
+    });
+
+    it('renders criterion coverage panel with each criterion when criterion_coverage has criteria', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'k1', text: 'Must pass all tests', coverage: 'covered', evidence_count: 2 },
+          { criterion_key: 'k2', text: 'Performance within budget', coverage: 'partial', evidence_count: 1 },
+          { criterion_key: 'k3', text: 'Security audit complete', coverage: 'uncovered', evidence_count: 0 },
+        ],
+      };
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      expect(await screen.findByTestId('criterion-coverage-panel')).toBeInTheDocument();
+      expect(screen.getByText('Must pass all tests')).toBeInTheDocument();
+      expect(screen.getByText('Performance within budget')).toBeInTheDocument();
+      expect(screen.getByText('Security audit complete')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k1')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k2')).toBeInTheDocument();
+      expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
+    });
+
+    it('does not render criterion coverage panel when criterion_coverage is null', async () => {
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: null,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      await screen.findByTestId('version-summary-panel');
+      expect(screen.queryByTestId('criterion-coverage-panel')).not.toBeInTheDocument();
+    });
+
+    it('does not render criterion coverage panel when criterion_coverage is absent', async () => {
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      await screen.findByTestId('version-summary-panel');
+      expect(screen.queryByTestId('criterion-coverage-panel')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('smoketest disabled indicator', () => {
+    it('renders "smoke disabled" instead of "smoke 0%" when smoketest_enabled is false on last_qualification', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.0 },
+            smoketest_enabled: false,
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke disabled')).toBeInTheDocument();
+      expect(screen.queryByText(/smoke \d+%/)).not.toBeInTheDocument();
+    });
+
+    it('renders "smoke XX%" normally when smoketest_enabled is true', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.80 },
+            smoketest_enabled: true,
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke 80%')).toBeInTheDocument();
+      expect(screen.queryByText('smoke disabled')).not.toBeInTheDocument();
+    });
+
+    it('renders "smoke XX%" normally when smoketest_enabled is absent (legacy record)', () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          last_qualification: makeQualification({
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.75 },
+          }),
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      expect(screen.getByText('smoke 75%')).toBeInTheDocument();
+      expect(screen.queryByText('smoke disabled')).not.toBeInTheDocument();
+    });
+
+    it('renders "s:—" in verdict history sub-scores when smoketest_enabled is false', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [
+          {
+            id: 'v-1',
+            release_version_id: 'rv1',
+            candidate_sha: 'abcdef123456',
+            confidence: 0.88,
+            sub_scores: { audit: 0.90, test_erosion: 0.85, smoketest: 0.0 },
+            smoketest_enabled: false,
+            blocker: null,
+            audit_missing_reason: null,
+            would_promote: false,
+            promotion_enabled: false,
+            terminal_status: 'not_promoted',
+            threshold: 0.9,
+            started_at: null,
+            finalized_at: '2026-01-01T00:00:00Z',
+            created_at: '2026-01-01T00:00:00Z',
+          },
+        ],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const history = await screen.findByTestId('verdict-history');
+      expect(history).toBeInTheDocument();
+      // The compact sub-score should show "s:—" not "s:0" when smoke is disabled.
+      expect(history.textContent).toContain('s:—');
+      expect(history.textContent).not.toContain('s:0');
     });
   });
 });

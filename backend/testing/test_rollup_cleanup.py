@@ -737,6 +737,181 @@ async def test_cleanup_completed_children_do_not_block_staging(cleanup_db, mocke
     )
 
 
+@pytest.mark.asyncio
+async def test_cleanup_guard4_transitive_base_branch_targeter_skips_staging(
+    cleanup_db, mocker
+):
+    """Guard 4 (incident regression): a non-terminal task that targets the
+    staging branch via its payload ``base_branch`` — but is NOT a direct child
+    of the parent (e.g. a grandchild fix task, child of an intermediate audit
+    task) — must block staging deletion.
+
+    Such a task falls through Guards 1-3: it is not a direct child
+    (parent_task_id mismatch), it references the branch via payload base_branch
+    rather than context parent_base/original_base, and it never opened a PR.
+    The branch was deleted out from under these tasks → "Could not find remote
+    branch research/<hex> to clone" → permanent failure.
+    """
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/abc12345"},
+    )
+    # Intermediate audit task (direct child) — terminal, so Guard 1 passes.
+    audit = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="audit",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+    )
+    # Grandchild fix task — QUEUED, child of the audit task (NOT a direct child
+    # of `parent`), targeting the staging branch via payload base_branch.
+    await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.QUEUED,
+        parent_task_id=audit.id,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the thing",
+                "base_branch": "research/abc12345",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    # The grandchild still needs research/abc12345 to clone → must NOT be deleted.
+    mock_delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cleanup_guard4_terminal_base_branch_targeter_still_deletes(
+    cleanup_db, mocker
+):
+    """Guard 4 is not over-broad: a base_branch targeter that is TERMINAL
+    (COMPLETED/FAILED/CANCELLED) does not keep the branch alive — with no other
+    blockers the staging branch is still deleted."""
+    project = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/def67890"},
+    )
+    audit = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="audit",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=parent.id,
+    )
+    # Grandchild fix task targeting the branch but already CANCELLED (terminal).
+    await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="fix",
+        status=TaskStatus.CANCELLED,
+        parent_task_id=audit.id,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "fix the thing",
+                "base_branch": "research/def67890",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/def67890"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cleanup_guard4_scoped_to_project_not_cross_project(cleanup_db, mocker):
+    """Guard 4 query is scoped to the parent task's project — a non-terminal task
+    in a *different* project that happens to reference the same branch name does
+    not block staging deletion."""
+    # Project A: has the parent research task and no live grandchild targeter.
+    project_a = await _make_project(cleanup_db)
+    parent = await _make_task(
+        cleanup_db,
+        project_a.id,
+        task_type="research",
+        status=TaskStatus.EVALUATING,
+        context={"research_branch": "research/aabbccdd"},
+    )
+
+    # Project B: a separate project whose non-terminal task happens to carry the
+    # same base_branch value — must NOT influence project A's cleanup.
+    project_b = await _make_project(cleanup_db)
+    await _make_task(
+        cleanup_db,
+        project_b.id,
+        task_type="fix",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "fix",
+                "prompt": "unrelated fix",
+                "base_branch": "research/aabbccdd",
+            }
+        ],
+    )
+
+    mock_delete = mocker.patch(
+        "app.github.delete_branch", new_callable=AsyncMock, return_value=True
+    )
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("gh-token", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_open_pull_requests", new_callable=AsyncMock, return_value=[]
+    )
+
+    await _cleanup_branches(parent, cleanup_db)
+
+    # The cross-project task must not block deletion of project A's branch.
+    mock_delete.assert_called_once_with(
+        "gh-token", "owner", "repo", "research/aabbccdd"
+    )
+
+
 # ── _verify_pr_merged helpers ─────────────────────────────────────────────────
 
 
@@ -1080,6 +1255,46 @@ async def test_verify_pr_merged_401_retries_with_fresh_token(cleanup_db, mocker)
     # Second call must use force_refresh=True
     _, kwargs = mock_get_token.call_args_list[-1]
     assert kwargs.get("force_refresh") is True
+    assert mock_get_pr.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_verify_pr_merged_401_retry_transient_does_not_negative_cache(
+    cleanup_db, mocker
+):
+    """When a 401 prompts a fresh-token retry and the retry encounters a transient
+    error (503), return False without poisoning the negative cache. This ensures
+    transient GitHub instability during auth-retry doesn't block rollup convergence."""
+    project = await _make_project(cleanup_db)
+    task = await _make_task(cleanup_db, project.id, context={})
+    await _make_artifact(cleanup_db, task.id, "https://github.com/owner/repo/pull/77")
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("fresh-token", "owner", "repo"),
+    )
+    mock_invalidate = mocker.patch("app.routers.agent.invalidate_github_token_cache")
+    # First call: 401 (auth expired)
+    # Retry call: 503 (transient GitHub outage)
+    mock_get_pr = mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        side_effect=[
+            HTTPException(status_code=401, detail="Unauthorized"),
+            HTTPException(status_code=503, detail="Service Unavailable"),
+        ],
+    )
+
+    result = await _verify_pr_merged(task, cleanup_db)
+
+    assert result is False
+    # Crucially: no negative cache entry for this transient-on-retry case
+    from app.rollup_pr_verification import _pr_merge_negative_cache
+    assert task.id not in _pr_merge_negative_cache, (
+        "Transient error on fresh-token retry must not poison negative cache"
+    )
+    mock_invalidate.assert_called_once_with(str(task.project_id))
     assert mock_get_pr.call_count == 2
 
 

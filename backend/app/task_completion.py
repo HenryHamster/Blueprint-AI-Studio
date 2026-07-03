@@ -63,6 +63,10 @@ from app.compute_experiment_contract import (
     COMPUTE_EXPERIMENT_PREREQUISITE_MODE_CONTEXT_KEY,
 )
 from app.task_capabilities import WRITE_TASK_TYPES
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 from app.task_evaluators import (
     REVIEW_SECOND_OPINION_AWAITING_KEY,
     REVIEW_SECOND_OPINION_PARKED_KEY,
@@ -448,6 +452,37 @@ def _stamp_remediation_spawn_on_direction(
     fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
     if fingerprint:
         direction["last_remediation_fingerprint"] = str(fingerprint)
+
+
+def _phase_runner_affinity(task: Task) -> str | None:
+    """Return the local-runner id a completed phase should prefer next."""
+    ctx = task.context or {}
+    runner_target_id = ctx.get("runner_target_id")
+    if isinstance(runner_target_id, str) and runner_target_id.strip():
+        return runner_target_id.strip()
+    vm_instance_id = task.vm_instance_id
+    if isinstance(vm_instance_id, str) and vm_instance_id.startswith("runner:"):
+        runner_id = vm_instance_id.removeprefix("runner:").strip()
+        return runner_id or None
+    preferred_runner_target_id = ctx.get("preferred_runner_target_id")
+    if isinstance(preferred_runner_target_id, str) and preferred_runner_target_id.strip():
+        return preferred_runner_target_id.strip()
+    return None
+
+
+def _phase_local_runner_context(task: Task) -> dict[str, Any]:
+    """Carry hard local Strategic intent from architecture phase to review."""
+
+    ctx = task.context or {}
+    if not ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        return {}
+    reason = ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY)
+    return {
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: (
+            reason if isinstance(reason, str) and reason else "workbench_continuous"
+        ),
+    }
 
 
 # Cap on the per-direction remediation-outcome history list length.
@@ -2974,6 +3009,11 @@ _TERMINAL_TASK_STATUSES = frozenset(
     [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED, TaskStatus.BLOCKED]
 )
 
+# Best-effort deadline: if this many hours have elapsed since the oldest arm
+# was created and some arms are still non-terminal (wedged), finalize the
+# aggregate on partial results rather than deferring indefinitely.
+_SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS = 24
+
 
 def _build_sweep_aggregate_prompt(
     tasks: list,
@@ -3084,14 +3124,36 @@ async def _maybe_spawn_sweep_aggregate_followon(
         if t.status not in _TERMINAL_TASK_STATUSES and t.id != task.id
     ]
     if non_terminal:
-        logger.info(
-            "[COMPUTE] Sweep %s: arm %s terminal but %d sibling(s) still non-terminal; "
-            "deferring aggregate follow-on",
-            sweep_id,
-            task.id,
-            len(non_terminal),
+        # Check whether the best-effort deadline has elapsed.  If the oldest arm
+        # was created more than _SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS ago,
+        # finalize on partial results rather than waiting for wedged arms.
+        oldest_created = min(
+            (t.created_at for t in sibling_rows if t.created_at is not None),
+            default=None,
         )
-        return None
+        past_deadline = oldest_created is not None and (
+            _utcnow() - oldest_created
+        ) > timedelta(hours=_SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS)
+        if not past_deadline:
+            logger.info(
+                "[COMPUTE] Sweep %s: arm %s terminal but %d sibling(s) still non-terminal; "
+                "deferring aggregate follow-on",
+                sweep_id,
+                task.id,
+                len(non_terminal),
+            )
+            return None
+        # Deadline elapsed — finalize best-effort; treat wedged arms as failures.
+        logger.warning(
+            "[COMPUTE] Sweep %s: %d arm(s) wedged past %dh deadline — "
+            "finalizing best-effort aggregate on %d/%d terminal arm(s)",
+            sweep_id,
+            len(non_terminal),
+            _SWEEP_AGGREGATE_BEST_EFFORT_DEADLINE_HOURS,
+            len(sibling_rows) - len(non_terminal),
+            len(sibling_rows),
+        )
+        failure_mode = True
 
     # All arms are terminal — check whether an aggregate follow-on already exists.
     for sibling in sibling_rows:
@@ -4561,6 +4623,8 @@ async def _handle_design_doc_completion(
     # it into Phase 2 so the steering directive survives even when the operator
     # message has aged out of the live conversation-thread snapshot.
     steering_excerpt = (task.context or {}).get("steering_excerpt")
+    preferred_runner_target_id = _phase_runner_affinity(task)
+    local_runner_context = _phase_local_runner_context(task)
     spawned = None
     try:
         # Wave F4 H9: removed `await session.refresh(project)`. The caller
@@ -4575,6 +4639,8 @@ async def _handle_design_doc_completion(
             cycle_id=cycle_id,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
+            preferred_runner_target_id=preferred_runner_target_id,
+            local_runner_context=local_runner_context,
         )
         if spawned:
             phase2_spawned = True
@@ -4598,6 +4664,12 @@ async def _handle_design_doc_completion(
                     "cycle_id": cycle_id,
                     "operator_steered": operator_steered,
                     "steering_excerpt": steering_excerpt,
+                    **(
+                        {"preferred_runner_target_id": preferred_runner_target_id}
+                        if preferred_runner_target_id
+                        else {}
+                    ),
+                    **local_runner_context,
                 },
             }
             flag_modified(project, "vision")
@@ -4628,6 +4700,12 @@ async def _handle_design_doc_completion(
                 "cycle_id": cycle_id,
                 "operator_steered": operator_steered,
                 "steering_excerpt": steering_excerpt,
+                **(
+                    {"preferred_runner_target_id": preferred_runner_target_id}
+                    if preferred_runner_target_id
+                    else {}
+                ),
+                **local_runner_context,
             },
         }
         if cycle_id:

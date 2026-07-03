@@ -12,6 +12,7 @@ import { ProjectAutoRemediationSection } from './ProjectAutoRemediationSection';
 import { ProjectIssueImplementationSection } from './ProjectIssueImplementationSection';
 import { ProjectAutoReviewSection } from './ProjectAutoReviewSection';
 import { ProjectBranchesSection } from './ProjectBranchesSection';
+import { ProjectAlertDomainsSection } from './ProjectAlertDomainsSection';
 import { SettingsAccountsSection } from './SettingsAccountsSection';
 import { DeploySection } from './SettingsDeploySection';
 import type {
@@ -41,25 +42,30 @@ import type {
   TaskTypeProviderOverrides,
   TaskTypeRoutingEntry,
 } from '../types/settings';
-import type { SectionId } from './SettingsDropdown';
+import type { SectionId } from './settingsSections';
 
 /**
  * Props consumed by {@link SettingsSectionRouter}. These are exactly the
- * section-specific props that were previously threaded through every
- * `renderXxx()` helper inside `SettingsDropdown`. Extracting them here keeps
- * the dropdown's own surface limited to the modal shell + navigation state.
+ * section-specific props consumed by the existing settings bodies. Keeping
+ * them here lets Runtime and Project host the forms directly while the legacy
+ * settings modal can still host the same router.
  *
  * The shape is intentionally identical (same names, same types) to the
- * corresponding slice of `SettingsDropdownProps` so the behavior is preserved
- * exactly — the router just dispatches on `activeSection`.
+ * corresponding settings section props so the behavior is preserved exactly —
+ * the router just dispatches on `activeSection`.
  */
 export interface SettingsSectionRouterProps {
   activeSection: SectionId;
   isAdmin: boolean;
   /** Navigate to another section (used by the General section's CTA). */
   onNavigateToSection: (section: SectionId) => void;
-  /** Close the whole settings panel (used by the Accounts section). */
+  hostKind?: 'workspace' | 'modal';
+  /** Close the containing modal/panel when this router is hosted outside a workspace. */
+  onCloseHost?: () => void;
+  /** @deprecated Use hostKind/onCloseHost. Kept for older modal hosts. */
   onToggleSettings: () => void;
+  /** @deprecated Use hostKind="workspace" for embedded Runtime/Project hosts. */
+  closeOnExternalPanelOpen?: boolean;
   /** Computed union of every model name referenced by routing/preferences. */
   allModelOptions: string[];
   /** Health-check URLs textarea buffer + setter (owned by the dropdown). */
@@ -239,12 +245,18 @@ export interface SettingsSectionRouterProps {
 /**
  * Renders the body of the currently-active settings section.
  *
- * This was extracted verbatim from the `renderXxx()` helpers that previously
- * lived inside `SettingsDropdown`; each section delegates to its own focused
- * sub-component. Behavior is unchanged — only the location of the dispatch
- * moved, isolating the section-routing concern from the modal chrome.
+ * This was extracted from the `renderXxx()` helpers that previously lived
+ * inside the settings modal; each section delegates to its own focused
+ * sub-component. Runtime and Project now provide the surrounding navigation.
  */
 export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
+  const closeExternalPanelHost = () => {
+    const shouldClose = props.hostKind
+      ? props.hostKind === 'modal'
+      : (props.closeOnExternalPanelOpen ?? true);
+    if (shouldClose) (props.onCloseHost ?? props.onToggleSettings)();
+  };
+
   switch (props.activeSection) {
     case 'general':
       return (
@@ -400,7 +412,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
               <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-1">User Management</h3>
               <p className="text-xs text-neutral-500 mb-3">Manage which users can access this Blueprint instance and their roles.</p>
               <button
-                onClick={() => { props.onToggleUserManagement(); props.onToggleSettings(); }}
+                onClick={() => { props.onToggleUserManagement(); closeExternalPanelHost(); }}
                 className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
                   props.showUserManagement
                     ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
@@ -418,7 +430,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
               <p className="text-xs text-neutral-500 mb-3">Control who has access to this project and their roles.</p>
               <button
                 data-testid="toggle-project-members"
-                onClick={() => { props.onToggleProjectMembers(); props.onToggleSettings(); }}
+                onClick={() => { props.onToggleProjectMembers(); closeExternalPanelHost(); }}
                 className={`flex items-center gap-2 min-h-[44px] text-xs py-2 px-4 rounded-lg transition-colors border ${
                   props.showProjectMembers
                     ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-400'
@@ -460,6 +472,13 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           onDetect={props.onDetectBuildConfig}
           detectAvailable={Boolean(props.selectedProjectOwner && props.selectedProjectRepo)}
           projectId={props.selectedProjectId}
+        />
+      );
+    case 'alert-domains':
+      return (
+        <ProjectAlertDomainsSection
+          projectId={props.selectedProjectId}
+          canSave={props.selectedProjectRole === 'owner'}
         />
       );
     case 'auto-review':

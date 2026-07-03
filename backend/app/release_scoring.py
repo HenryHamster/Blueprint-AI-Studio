@@ -153,6 +153,167 @@ def evaluate_merge_grade(
     }
 
 
+# Number of tasks merged after the last merge-grade before the grade is
+# considered stale (goal-coverage read may no longer reflect current merged work).
+_DRIFT_STALE_MERGE_THRESHOLD = 5
+
+
+def compute_goal_coverage_drift(
+    goal: str | None,
+    *,
+    merge_grade_status: str | None,
+    merge_grade_coverage: float | None = None,
+    merge_grade_biggest_gap: str | None = None,
+    goal_alignment: Any | None = None,
+    merges_since_grade: int = 0,
+) -> dict[str, Any]:
+    """Derive a cheap goal-coverage divergence signal from already-persisted fields.
+
+    Pure / side-effect-free — no I/O, no LLM call. Inputs come from the latest
+    ``QualificationVerdict`` columns and a cheap merged-task count delta.
+
+    Return dict keys:
+      ``signal``  — ``"on_track"`` | ``"drifting"`` | ``"no_grade_yet"`` |
+                    ``"not_applicable"`` | ``"superseded_exempt"``
+      ``coverage``       — persisted coverage score (float | None)
+      ``biggest_gap``    — persisted biggest-gap string (str | None)
+      ``merges_since_grade`` — how many tasks merged since the grade was taken
+      ``stale``          — True when merges_since_grade >= threshold
+      ``detail``         — short human-readable explanation
+
+    Divergence fires when EITHER:
+      * the last grade already showed a goal miss (``merge_grade_status == "fail"``)
+      * material new work accumulated since the last grade (stale + was on_track)
+    """
+    goal_text = (goal or "").strip()
+    if not goal_text or is_contentless_goal(goal_text):
+        return {
+            "signal": "not_applicable",
+            "coverage": None,
+            "biggest_gap": None,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "No version goal set — coverage drift not applicable.",
+        }
+
+    if merge_grade_status is None:
+        stale_cold_start = merges_since_grade >= _DRIFT_STALE_MERGE_THRESHOLD
+        if stale_cold_start:
+            return {
+                "signal": "drifting",
+                "coverage": None,
+                "biggest_gap": merge_grade_biggest_gap,
+                "merges_since_grade": merges_since_grade,
+                "stale": True,
+                "detail": (
+                    f"No merge-grade recorded yet, but {merges_since_grade} task(s) "
+                    "have merged since the version opened — goal coverage is unknown "
+                    "with material accumulated work (cold-start drift)."
+                ),
+            }
+        return {
+            "signal": "no_grade_yet",
+            "coverage": None,
+            "biggest_gap": merge_grade_biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "No merge-grade has been taken for this version yet.",
+        }
+
+    stale = merges_since_grade >= _DRIFT_STALE_MERGE_THRESHOLD
+    coverage = merge_grade_coverage
+    biggest_gap = merge_grade_biggest_gap
+
+    # Prefer goal_alignment.biggest_gap when it carries one and merge_grade doesn't
+    if biggest_gap is None and isinstance(goal_alignment, dict):
+        ga_gap = goal_alignment.get("biggest_gap")
+        if ga_gap:
+            biggest_gap = str(ga_gap).strip()[:_FINDING_SUMMARY_MAX]
+
+    if merge_grade_status == "not_applicable":
+        return {
+            "signal": "not_applicable",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "Merge-grade was not applicable at grade time (goal was empty or contentless).",
+        }
+
+    if merge_grade_status == "superseded_exempt":
+        return {
+            "signal": "superseded_exempt",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": "Merge-grade was exempted as superseded; no coverage verdict available.",
+        }
+
+    if merge_grade_status == "already_on_main_exempt":
+        return {
+            "signal": "superseded_exempt",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": (
+                "Merge-grade was exempted because the candidate is already on the "
+                "promotion target; no coverage verdict available."
+            ),
+        }
+
+    if merge_grade_status not in ("pass", "fail"):
+        return {
+            "signal": "no_grade_yet",
+            "coverage": None,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": False,
+            "detail": f"Merge-grade status '{merge_grade_status}' is not a positive verdict — no coverage signal.",
+        }
+
+    if merge_grade_status == "fail":
+        return {
+            "signal": "drifting",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": stale,
+            "detail": (
+                "Last merge-grade flagged a goal miss"
+                + (
+                    f"; {merges_since_grade} additional tasks merged since grade."
+                    if merges_since_grade
+                    else "."
+                )
+            ),
+        }
+
+    # merge_grade_status == "pass" only reaches here
+    if stale:
+        return {
+            "signal": "drifting",
+            "coverage": coverage,
+            "biggest_gap": biggest_gap,
+            "merges_since_grade": merges_since_grade,
+            "stale": True,
+            "detail": (
+                f"{merges_since_grade} tasks merged since last merge-grade — "
+                "coverage read may no longer reflect current merged work."
+            ),
+        }
+
+    return {
+        "signal": "on_track",
+        "coverage": coverage,
+        "biggest_gap": biggest_gap,
+        "merges_since_grade": merges_since_grade,
+        "stale": False,
+        "detail": "Last merge-grade passed; no material new work since.",
+    }
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -165,8 +326,7 @@ def compute_composite(
     ci_required: bool = True,
     migration_collision: bool = False,
     migration_apply_blocked: bool = False,
-    theme_delivery_blocked: bool = False,
-    merge_grade_blocked: bool = False,
+    criterion_coverage: dict[str, Any] | None = None,
     merge_grade_misses: bool = False,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
@@ -176,19 +336,11 @@ def compute_composite(
       * ``not ci_green`` + ``ci_state == _CI_RED``  — confirmed failing build
         (``"ci_not_green"``).  Always a hard blocker, regardless of
         ``ci_required`` — never promote over a known-failing build.
-      * ``not ci_green`` + ``ci_state != _CI_RED`` + ``ci_required``  — CI could
-        not be evaluated (pending, no check-runs, or I/O degraded) on a
-        CI-gated project (``"ci_unresolved"``).  When ``ci_required`` is False
-        (the project relaxed per-PR CI on its integration branch — e.g.
-        ``automain`` pushes that legitimately carry zero check-runs, so the
-        candidate has NO direct CI signal to resolve) an unresolved CI is NOT a
-        blocker: it falls through to the weighted score.  The real CI gate for
-        such a project is the promotion PR -> ``main`` itself, which stays
-        strictly CI-gated (``proceed_on_no_checks`` keeps ``main`` in
-        ``ci_required_branches``), so an unresolved candidate CI never bypasses
-        validation — it is checked for real at the promotion-PR merge.  Without
-        this, a relaxed-CI project's every candidate is permanently wedged on
-        ``ci_unresolved`` (no automain commit ever carries a green CI signal).
+      * ``not ci_green`` + ``ci_state != _CI_RED`` + unresolved CI must block
+        (``"ci_unresolved"``).  ``ci_required`` can only relax a definitive
+        ``ci_state == "no_checks"`` absence that the caller already proved is
+        topologically allowed. Pending checks and degraded GitHub/API lookups
+        still block even when ``ci_required`` is False.
       * ``migration_collision`` is True — a deterministic Alembic
         revision-identity collision between the candidate and the deployed
         promotion target (the back-merge renumber class, prod incident
@@ -208,6 +360,14 @@ def compute_composite(
         caller precomputes this via
         ``migration_apply_gate.run_migration_apply_gate`` — this function stays
         pure and only consumes the boolean.
+      * ``merge_grade_misses`` is True — the required blind merge-grade ran and
+        found that the candidate misses the frozen version goal
+        (``"merge_grade_misses"``).  Checked before criterion coverage so an
+        empty or not-yet-mapped acceptance-criteria set cannot mask the grade.
+      * ``criterion_coverage`` reports at least one uncovered version-scoped
+        acceptance criterion (``"criterion_coverage_incomplete"``).  Versions
+        with no criteria, or callers that pass ``None`` for backward
+        compatibility, skip this gate.
       * ``smoketest_score`` is None — the smoketest never produced a usable
         score, treated as a startup-suite failure
         (``"smoketest_startup_failed"``).  ONLY checked when
@@ -281,14 +441,12 @@ def compute_composite(
         # known-failing build, regardless of whether the project gates per-PR
         # merges on CI.
         blocker = "ci_not_green"
-    elif not ci_green and ci_required:
-        # Unresolved CI (pending, no check-runs, or GitHub I/O degraded) is a
-        # resolution/infrastructure concern, not a quality signal.  It blocks
-        # ONLY on a CI-gated project.  A project that relaxed per-PR CI on its
-        # integration branch (``ci_required`` False) has no candidate-level CI
-        # signal to resolve, so blocking here would permanently wedge every
-        # promotion; the promotion PR -> ``main`` carries the real, still-strict
-        # CI gate instead.
+    elif not ci_green and (ci_required or ci_state != "no_checks"):
+        # Unresolved CI (pending or GitHub I/O degraded) is a resolution /
+        # infrastructure concern, not a quality signal, and must keep blocking.
+        # The only relaxed state is a definitive absence of checks that the
+        # caller already classified as topology-safe by setting ci_required
+        # False. A project-wide CI relaxation must not mask pending/API errors.
         blocker = "ci_unresolved"
     elif migration_collision:
         # A deterministic Alembic revision-identity collision between the
@@ -304,22 +462,18 @@ def compute_composite(
         # from the filename-identity collision above — checked after it so a
         # candidate failing both reports the identity collision first.
         blocker = "migration_apply_drift"
-    elif theme_delivery_blocked:
-        # The candidate's diffstat directionally contradicts its stated theme
-        # (e.g. a leanness candidate that added net LOC) and the operator has
-        # raised theme_block_threshold above 0.0 to arm hard-blocking.
-        # Ships dark by default (threshold=0.0 never fires).
-        blocker = "theme_delivery_shortfall"
     elif merge_grade_misses:
         # The armable-dark blind-grade gate: coverage_verdict == "misses" AND the
         # operator has raised merge_grade_block_threshold above 0.0.  Distinct from
-        # the child-task gate (covers_goal == False) so operators see the right label.
+        # the canonical criterion-coverage gate so operators see the right label.
         blocker = "merge_grade_misses"
-    elif merge_grade_blocked:
-        # The child-task merge-grade gate: the uninvested agent graded the merged
-        # DIFFS against the frozen version.goal and found they do NOT advance the
-        # goal (covers_goal == False).
-        blocker = "merge_grade_goal_coverage"
+    elif (
+        criterion_coverage is not None
+        and int(criterion_coverage.get("total") or 0) > 0
+        and int(criterion_coverage.get("covered") or 0)
+        < int(criterion_coverage.get("total") or 0)
+    ):
+        blocker = "criterion_coverage_incomplete"
     elif smoketest_enabled and smoketest_score is None:
         # Only a hard blocker when the smoketest subsystem was actually
         # enabled — a disabled subsystem legitimately produces no score.

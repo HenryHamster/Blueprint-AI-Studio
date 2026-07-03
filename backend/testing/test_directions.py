@@ -17,7 +17,16 @@ import pytest
 from httpx import AsyncClient
 from sqlalchemy import select
 
-from app.models import Alert, AlertSeverity, Direction, Project, Task, TaskStatus
+from app.models import (
+    Alert,
+    AlertSeverity,
+    Direction,
+    MessagesNoisePrefs,
+    Project,
+    ProjectMessage,
+    Task,
+    TaskStatus,
+)
 from app.autonomous_research import _spawn_research_task
 from app.direction_lifecycle import _process_direction_lifecycle
 from app.research_completion import (
@@ -4527,6 +4536,110 @@ async def test_retire_direction_spawns_and_persists_memo_task(db_session, mocker
         ctx = memo.context or {}
         assert ctx.get("memo_reasoning_kind") == "direction_retirement"
         assert ctx.get("memo_source_direction_id") == direction_id
+    finally:
+        app.dependency_overrides.pop(get_session, None)
+        app.dependency_overrides.pop(verify_agent_token, None)
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_reconciles_problem_model_gap(db_session, mocker):
+    """Live API retire path reconciles the problem-model gap in the same
+    committed transaction: prunes the retired id from gap.active_moves into
+    past_moves and records a GapDeferral when it was the gap's last move."""
+    from httpx import AsyncClient, ASGITransport
+    from app.main import app
+    from app.database import get_session
+    from app.routers.agent import verify_agent_token
+
+    mocker.patch("app.main.provision_agent_vm", return_value=None)
+
+    direction_id = "d-gap-staff"
+    project = Project(
+        name="P-gap-reconcile",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-staffed",
+                    "name": "staffed gap",
+                    "status": "active",
+                    "active_moves": [direction_id],
+                    "past_moves": [],
+                }
+            ],
+        },
+        directions=[
+            {
+                "id": direction_id,
+                "text": "Close the staffed gap",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "success_evidence": "Gap closed",
+                "retirement_condition": "Gap closed",
+            },
+            {"id": "d-other", "text": "Other", "status": "active", "notes": []},
+            {"id": "d-other-2", "text": "Other 2", "status": "active", "notes": []},
+            {"id": "d-other-3", "text": "Other 3", "status": "active", "notes": []},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review", "vision": {"revision": 1}}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = str(task.id)
+
+    async def _override_session():
+        yield db_session
+
+    app.dependency_overrides[get_session] = _override_session
+    app.dependency_overrides[verify_agent_token] = lambda: {
+        "sub": task_id,
+        "task_type": "strategic_review",
+    }
+
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer test-token"},
+        ) as ac:
+            r = await ac.post(
+                "/api/agent/strategic",
+                json={
+                    "op": "retire_direction",
+                    "task_id": task_id,
+                    "data": {
+                        "direction_id": direction_id,
+                        "rationale": "Gap is closed.",
+                    },
+                },
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "ok"
+
+        await db_session.refresh(project)
+        gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-staffed")
+        assert gap["active_moves"] == []
+        assert gap["past_moves"] == [direction_id]
+        assert gap.get("deferral")
+        assert direction_id in gap["deferral"]["rationale"]
+        assert gap["deferral"]["created_at"]
+        # Gap is never auto-closed.
+        assert gap["status"] == "active"
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
@@ -9302,6 +9415,100 @@ async def test_operator_message_idempotency_key_dedupes(
 
 
 @pytest.mark.asyncio
+async def test_project_scoped_and_canonical_messages_share_workbench_capture(
+    client: AsyncClient, db_session, mocker
+):
+    """The legacy project-scoped endpoint uses the durable operator create path.
+
+    Workbench state persistence and sanitized strategic-session snapshots are
+    distinctive shared-helper behavior; keeping both endpoints aligned here
+    prevents the legacy route from growing a second create flow again.
+    """
+
+    async def _stored_message_context(message_id: str) -> dict:
+        msg = await db_session.get(ProjectMessage, uuid.UUID(message_id))
+        assert msg is not None
+        return msg.context or {}
+
+    async def _stored_workbench(project_id: str) -> dict:
+        prefs = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.project_id == uuid.UUID(project_id),
+                    MessagesNoisePrefs.user_id == "test-user-123",
+                )
+            )
+        ).scalar_one()
+        return prefs.prefs["_strategic_workbench"]
+
+    project_scoped_id = await _deploy_project(client, mocker, "Legacy message project")
+    canonical_id = await _deploy_project(client, mocker, "Canonical message project")
+    workbench_context = {
+        "interaction_mode": "invalid",
+        "active_surface": "runtime",
+        "session_started_at": "2026-06-29T12:00:00Z",
+        "context_package_id": "strategic-context:shared",
+        "selected_refs": [
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Context map"},
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Duplicate"},
+            {
+                "kind": "artifact",
+                "id": "artifact-1",
+                "label": "x" * 500,
+                "storage_uri": "gs://secret",
+            },
+        ],
+        "storage_uri": "gs://secret",
+    }
+
+    legacy_resp = await client.post(
+        f"/api/admin/projects/{project_scoped_id}/messages",
+        json={
+            "content": "Keep this runtime context attached.",
+            "message_type": "FEEDBACK",
+            "workbench_context": workbench_context,
+        },
+    )
+    canonical_resp = await client.post(
+        "/api/admin/messages",
+        json={
+            "project_id": canonical_id,
+            "content": "Keep this runtime context attached.",
+            "message_type": "FEEDBACK",
+            "workbench_context": workbench_context,
+        },
+    )
+
+    assert legacy_resp.status_code == 200, legacy_resp.text
+    assert canonical_resp.status_code == 200, canonical_resp.text
+    assert set(legacy_resp.json()) == {"id", "status", "arming"}
+    assert canonical_resp.json()["message"]["id"] == canonical_resp.json()["id"]
+
+    for project_id, message_id in (
+        (project_scoped_id, legacy_resp.json()["id"]),
+        (canonical_id, canonical_resp.json()["id"]),
+    ):
+        context = await _stored_message_context(message_id)
+        session = context["strategic_session"]
+        assert session["interaction_mode"] == "chat"
+        assert session["active_surface"] == "runtime"
+        assert session["session_started_at"] == "2026-06-29T12:00:00Z"
+        assert session["context_package_id"] == "strategic-context:shared"
+        assert session["selected_refs"] == [
+            {"kind": "canvas", "id": "strategic-canvas:shared", "label": "Context map"},
+            {"kind": "artifact", "id": "artifact-1", "label": "x" * 160},
+        ]
+        assert "storage_uri" not in session
+
+        stored_workbench = await _stored_workbench(project_id)
+        assert stored_workbench["interaction_mode"] == "chat"
+        assert stored_workbench["active_surface"] == "runtime"
+        assert stored_workbench["selected_refs"] == session["selected_refs"]
+        assert "context_package_id" not in stored_workbench
+        assert "storage_uri" not in stored_workbench
+
+
+@pytest.mark.asyncio
 async def test_passive_note_does_not_arm_strategic_refresh(
     client: AsyncClient, db_session, mocker
 ):
@@ -9479,7 +9686,11 @@ async def test_add_direction_emits_strategic_updated(client: AsyncClient, mocker
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1, "expected one strategic_updated broadcast"
     assert events[0][0] == str(project_id)
-    assert events[0][2] == {"kind": "directions"}
+    payload = events[0][2]
+    assert payload["kind"] == "directions"
+    assert payload["resource"] == "strategic_output"
+    assert payload["strategic"]["output_kind"] == "directions"
+    assert payload["refetch"]["surfaces"] == ["strategic_session", "directions"]
 
 
 @pytest.mark.asyncio
@@ -9494,7 +9705,11 @@ async def test_remove_direction_emits_strategic_updated(client: AsyncClient, moc
     assert resp.status_code == 200, resp.text
     events = [c.args for c in bcast.await_args_list if c.args[1] == "strategic_updated"]
     assert len(events) == 1
-    assert events[0][2] == {"kind": "directions"}
+    payload = events[0][2]
+    assert payload["kind"] == "directions"
+    assert payload["resource"] == "strategic_output"
+    assert payload["strategic"]["output_kind"] == "directions"
+    assert payload["refetch"]["surfaces"] == ["strategic_session", "directions"]
 
 
 @pytest.mark.asyncio

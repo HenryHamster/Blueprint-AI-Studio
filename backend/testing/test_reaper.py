@@ -70,6 +70,11 @@ from app.retry_prompt import _build_retry_prompt_suffix
 from app.shared_state import runtime_config as _runtime_config
 import app.reaper_sweeps as _rs
 from app.reaper_sweeps import event_driven_unblock_on_knowledge
+from app.time_utils import _utcnow
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+)
 
 
 def test_heartbeat_stale_cutoff_respects_runtime_config_override():
@@ -432,13 +437,13 @@ async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mo
         payloads=[{"type": "create"}],
         vm_instance_id=old_vm_id,
         status=TaskStatus.QUEUED,
-        retry_after_until=datetime.utcnow() - timedelta(minutes=1),
+        retry_after_until=_utcnow() - timedelta(minutes=1),
         context={
             "parked_for_retarget": True,
-            "park_deadline": (datetime.utcnow() - timedelta(seconds=5)).isoformat(),
+            "park_deadline": (_utcnow() - timedelta(seconds=5)).isoformat(),
             "warm_target_vm_id": old_vm_id,
             "warm_handoff_deadline": (
-                datetime.utcnow() - timedelta(seconds=5)
+                _utcnow() - timedelta(seconds=5)
             ).isoformat(),
             "warm_target_pr": "4242",
             "blacklisted_accounts": ["acct-failed"],
@@ -452,7 +457,7 @@ async def test_parked_rate_limit_task_expires_back_to_cold_requeue(reaper_db, mo
         "app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock, return_value=True
     )
 
-    now = datetime.utcnow()
+    now = _utcnow()
     await run_infra_recovery_and_hold_maintenance(reaper_db, now)
 
     await reaper_db.refresh(task)
@@ -537,7 +542,7 @@ async def test_provisioning_absolute_15min_timeout_reaped(
         payloads=[{"type": "create"}],
         vm_instance_id="vm-absolute",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=16),
+        started_at=_utcnow() - timedelta(minutes=16),
         context={"provision_zone": "us-east1-a"},
     )
     reaper_db.add(t)
@@ -564,8 +569,8 @@ async def test_provisioning_just_inside_15min_not_reaped(
         status=TaskStatus.PROVISIONING,
         # vm_provisioned_at < 6 min ago AND last_heartbeat None — below the
         # pre-claim-death threshold too, so nothing else can trip.
-        started_at=datetime.utcnow() - timedelta(minutes=14),
-        vm_provisioned_at=datetime.utcnow() - timedelta(minutes=4),
+        started_at=_utcnow() - timedelta(minutes=14),
+        vm_provisioned_at=_utcnow() - timedelta(minutes=4),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -587,8 +592,8 @@ async def test_provisioning_pre_claim_death_reaped(
         payloads=[{"type": "create"}],
         vm_instance_id="vm-silent",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=7),
-        vm_provisioned_at=datetime.utcnow() - timedelta(minutes=7),
+        started_at=_utcnow() - timedelta(minutes=7),
+        vm_provisioned_at=_utcnow() - timedelta(minutes=7),
         last_heartbeat=None,
         context={"provision_zone": "us-east1-a"},
     )
@@ -613,7 +618,7 @@ async def test_in_progress_heartbeat_timeout_reaped(
         vm_instance_id="vm-hb",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+        last_heartbeat=_utcnow() - timedelta(minutes=6),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -642,7 +647,7 @@ async def test_execution_timeout_retry_escalates_effort(
         vm_instance_id="vm-exec-timeout",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
         latest_status_message="execution timed out after 3600s",
         context={
             "failure_class": "AGENT_TIMEOUT",
@@ -657,7 +662,7 @@ async def test_execution_timeout_retry_escalates_effort(
         vm_instance_id="vm-oom",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
         latest_status_message="exit code 137 out of memory",
         context={
             "failure_class": "AGENT_TIMEOUT",
@@ -706,7 +711,7 @@ async def test_reaper_retry_clears_stale_failure_verdict(
         vm_instance_id="vm-stale-verdict",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
         latest_status_message="test failed: AssertionError",
         context={
             # Stale verdict from the current attempt — must be stripped on retry.
@@ -763,7 +768,7 @@ async def test_in_progress_heartbeat_just_inside_threshold_not_reaped(
         vm_instance_id="vm-fresh",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=4),
+        last_heartbeat=_utcnow() - timedelta(minutes=4),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -786,7 +791,7 @@ async def test_in_progress_no_heartbeat_started_6min_reaped(
         vm_instance_id="vm-no-hb",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        started_at=datetime.utcnow() - timedelta(minutes=7),
+        started_at=_utcnow() - timedelta(minutes=7),
         last_heartbeat=None,
     )
     reaper_db.add(t)
@@ -815,8 +820,8 @@ async def test_in_progress_no_tool_use_past_progress_stale_reaped(
         vm_instance_id="vm-no-tool",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        started_at=datetime.utcnow() - timedelta(minutes=10),
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        started_at=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(seconds=30),
         last_tool_use_at=None,
         context={"scope": "small", "llm_provider": "anthropic"},
     )
@@ -843,7 +848,7 @@ async def test_in_progress_stalled_but_fresh_offrow_tool_use_not_reaped(
     from app.models import VmContact
 
     project = await _make_project(reaper_db)
-    now = datetime.utcnow()
+    now = _utcnow()
     vm_id = "vm-lockstarved-progress"
     t = Task(
         project_id=project.id,
@@ -890,7 +895,7 @@ async def test_in_progress_stalled_with_stale_offrow_tool_use_still_reaped(
     from app.models import VmContact
 
     project = await _make_project(reaper_db)
-    now = datetime.utcnow()
+    now = _utcnow()
     vm_id = "vm-genuine-stall"
     t = Task(
         project_id=project.id,
@@ -938,8 +943,8 @@ async def test_in_progress_no_tool_use_within_progress_stale_not_reaped(
         vm_instance_id="vm-warmup",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        started_at=datetime.utcnow() - timedelta(minutes=3),
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=10),
+        started_at=_utcnow() - timedelta(minutes=3),
+        last_heartbeat=_utcnow() - timedelta(seconds=10),
         last_tool_use_at=None,
         context={"scope": "small", "llm_provider": "anthropic"},
     )
@@ -965,7 +970,7 @@ async def test_in_progress_stale_tool_use_but_fresh_attempt_not_reaped(
     with each retry never getting a chance to actually run.
     """
     project = await _make_project(reaper_db)
-    now = datetime.utcnow()
+    now = _utcnow()
     t = Task(
         project_id=project.id,
         payloads=[{"type": "design_doc_update", "scope": "small"}],
@@ -1009,8 +1014,8 @@ async def test_in_progress_no_tool_use_codex_provider_not_reaped(
         vm_instance_id="vm-codex",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        started_at=datetime.utcnow() - timedelta(minutes=10),
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        started_at=_utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(seconds=30),
         last_tool_use_at=None,
         context={"scope": "small", "llm_provider": "openai"},
     )
@@ -1047,9 +1052,9 @@ async def test_in_progress_memo_zero_tool_use_heartbeating_not_reaped(
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
         # Started 10 minutes ago — would be stale under 480s cutoff but not 1500s
-        started_at=datetime.utcnow() - timedelta(minutes=10),
+        started_at=_utcnow() - timedelta(minutes=10),
         # Heartbeat fresh — agent is alive and thinking
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        last_heartbeat=_utcnow() - timedelta(seconds=30),
         # No tool calls — memo is pure reasoning, no tools needed
         last_tool_use_at=None,
         context={"scope": "small", "llm_provider": "anthropic"},
@@ -1078,7 +1083,7 @@ async def test_orphan_ignored_without_vm_instance_id(
         vm_instance_id=None,
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=30),
+        last_heartbeat=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -1101,7 +1106,7 @@ async def test_large_scope_heartbeat_within_15min_not_reaped(
         vm_instance_id="vm-large-fresh",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=8),
+        last_heartbeat=_utcnow() - timedelta(minutes=8),
         context={"scope": "large"},
     )
     reaper_db.add(t)
@@ -1125,7 +1130,7 @@ async def test_large_scope_heartbeat_past_15min_reaped(
         vm_instance_id="vm-large-dead",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=16),
+        last_heartbeat=_utcnow() - timedelta(minutes=16),
         context={"scope": "large"},
     )
     reaper_db.add(t)
@@ -1150,7 +1155,7 @@ async def test_medium_scope_heartbeat_within_7min_not_reaped(
         vm_instance_id="vm-med-fresh",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+        last_heartbeat=_utcnow() - timedelta(minutes=6),
         context={"scope": "medium"},
     )
     reaper_db.add(t)
@@ -1179,7 +1184,7 @@ async def test_provision_infra_failure_does_not_burn_retry_budget(
         payloads=[{"type": "create"}],
         vm_instance_id="vm-infra",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=16),
+        started_at=_utcnow() - timedelta(minutes=16),
         latest_status_message="QUOTA exceeded: cpus_all_regions",
         context={"provision_zone": "us-east1-a"},
     )
@@ -1213,7 +1218,7 @@ async def test_provision_task_specific_failure_burns_budget(
         payloads=[{"type": "create"}],
         vm_instance_id="vm-task-specific",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=16),
+        started_at=_utcnow() - timedelta(minutes=16),
         latest_status_message="agent /entrypoint.sh returned 1",
         context={"provision_zone": "us-east1-a"},
     )
@@ -1249,7 +1254,7 @@ async def test_provision_noninfra_startup_failure_calls_record_account_startup_f
         payloads=[{"type": "create"}],
         vm_instance_id="vm-non-infra-sf",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=16),
+        started_at=_utcnow() - timedelta(minutes=16),
         latest_status_message="agent /entrypoint.sh returned 1",
         context={
             "provision_zone": "us-east1-a",
@@ -1282,7 +1287,7 @@ async def test_provision_infra_failure_does_not_call_record_account_startup_fail
         payloads=[{"type": "create"}],
         vm_instance_id="vm-infra-sf",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=16),
+        started_at=_utcnow() - timedelta(minutes=16),
         latest_status_message="QUOTA exceeded: cpus_all_regions",
         context={
             "provision_zone": "us-east1-a",
@@ -1320,7 +1325,7 @@ async def test_rate_limit_requeue_blacklists_account_and_skips_budget(
         vm_instance_id="vm-rl",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         retry_after_until=datetime(2099, 1, 1),  # should be cleared
         context={
             "max_plan_account_id": "acct-123",
@@ -1380,7 +1385,7 @@ async def test_reaper_account_cooldown_silent_death_free_requeue(
         vm_instance_id="vm-rl-silent",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={
             "max_plan_account_id": account_id,
             # No rate-limit keywords in last_error — correlation driven purely by account state.
@@ -1438,7 +1443,7 @@ async def test_reaper_account_cooldown_uses_failure_instant_not_sweep_time(
         vm_instance_id="vm-rl-edge",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        last_heartbeat=_utcnow() - timedelta(minutes=20),
         context={
             "max_plan_account_id": account_id,
             # No rate-limit keywords — correlation via account state at failure instant only.
@@ -1501,7 +1506,7 @@ async def test_reaper_db_rl_cross_instance_silent_death_free_requeue(
         vm_instance_id="vm-db-rl-silent",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={
             "max_plan_account_id": account_id,
             # No rate-limit keywords — correlation driven purely by DB state.
@@ -1556,7 +1561,7 @@ async def test_reaper_db_rl_pool_wide_accountless_silent_death_free_requeue(
     )
 
     project = await _make_project(reaper_db)
-    failure_time = datetime.utcnow() - timedelta(minutes=10)
+    failure_time = _utcnow() - timedelta(minutes=10)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create", "model": "sonnet"}],
@@ -1632,7 +1637,7 @@ async def test_reaper_db_rl_verdict_persisted_stable_under_analytics(
         vm_instance_id="vm-db-rl-persist",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"max_plan_account_id": account_id},
     )
     reaper_db.add(t)
@@ -1694,7 +1699,7 @@ async def test_reaper_terminal_persist_uses_failure_instant_not_sweep_time(
 
     mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
 
-    failure_instant = datetime.utcnow() - timedelta(minutes=10)
+    failure_instant = _utcnow() - timedelta(minutes=10)
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -1756,7 +1761,7 @@ async def test_reaper_terminal_persist_falls_back_to_started_at_when_no_heartbea
 
     mocker.patch.object(fc, "classify_failure_with_confidence", side_effect=_spy)
 
-    started_at = datetime.utcnow() - timedelta(minutes=30)
+    started_at = _utcnow() - timedelta(minutes=30)
     project = await _make_project(reaper_db)
     t = Task(
         project_id=project.id,
@@ -1802,7 +1807,7 @@ async def test_reaper_enrichment_block_records_failure_class_from_initial_classi
         vm_instance_id="vm-enrich-at",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        last_heartbeat=_utcnow() - timedelta(minutes=20),
         # No last_error, no rate-limit keywords → AGENT_TIMEOUT
         context={},
     )
@@ -1835,7 +1840,7 @@ async def test_heartbeat_timeout_empty_logs_classified_as_agent_timeout(
         vm_instance_id="vm-silent-crash",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         # No latest_status_message, no context.last_error — pure heartbeat timeout.
     )
     reaper_db.add(t)
@@ -1861,7 +1866,7 @@ async def test_heartbeat_timeout_api_error_logs_classified_as_external_api(
         vm_instance_id="vm-api-err",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={"last_error": "api.github.com: 502 bad gateway"},
     )
     reaper_db.add(t)
@@ -1897,7 +1902,7 @@ async def test_cloud_run_task_reap_skips_vm_deletion(
         vm_instance_id="cloud-run-job-test-123",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -1929,7 +1934,7 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
         vm_instance_id="vm-api-escalate",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         # Non-transient error (DNS resolution) routes through the long
         # [5,15,30,60] sequence rather than the adaptive-5xx fast path.
         context={
@@ -1940,7 +1945,7 @@ async def test_external_api_retry_delay_escalates_with_attempt_count(
     reaper_db.add(t)
     await reaper_db.commit()
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
@@ -1978,13 +1983,13 @@ async def test_external_api_transient_5xx_uses_short_first_delay(
         vm_instance_id="vm-api-transient",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={"last_error": "HTTP 503 Service Unavailable from api.github.com"},
     )
     reaper_db.add(t)
     await reaper_db.commit()
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
@@ -2015,13 +2020,13 @@ async def test_external_api_transient_5xx_skips_delay_when_healthy(
         vm_instance_id="vm-api-healthy",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={"last_error": "502 Bad Gateway from api.github.com"},
     )
     reaper_db.add(t)
     await reaper_db.commit()
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
@@ -2054,7 +2059,7 @@ async def test_external_api_transient_5xx_with_committed_work_takes_fast_path(
         vm_instance_id="vm-api-with-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={
             "last_error": "502 Bad Gateway from api.github.com",
             "pr_number": 123,
@@ -2098,13 +2103,13 @@ async def test_general_exponential_backoff_capped_at_15_minutes(
         vm_instance_id="vm-expo-cap",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=5,  # will become 6 after the reaper retry increment
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         # Empty logs → classify_failure returns AGENT_TIMEOUT → general backoff.
     )
     reaper_db.add(t)
     await reaper_db.commit()
 
-    before = datetime.utcnow()
+    before = _utcnow()
     await _run_reaper_once()
     await reaper_db.refresh(t)
 
@@ -2131,7 +2136,7 @@ async def test_per_class_budget_exhaustion_fails_task(
         vm_instance_id="vm-budget-exhausted",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,  # equals CODE_ERROR budget → can_retry must be False
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         # Plain code-style error that classifies as CODE_ERROR (no special keywords).
         context={"last_error": "NameError: foo is not defined"},
     )
@@ -2160,7 +2165,7 @@ async def test_scope_aware_budget_small_code_error_gets_extra_retry(
         vm_instance_id="vm-small-code-error",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={"scope": "small", "last_error": "NameError: foo is not defined"},
     )
     reaper_db.add(t)
@@ -2187,7 +2192,7 @@ async def test_scope_aware_budget_large_code_error_fails_immediately(
         vm_instance_id="vm-large-code-error",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=16),
+        last_heartbeat=_utcnow() - timedelta(minutes=16),
         context={"scope": "large", "last_error": "NameError: foo is not defined"},
     )
     reaper_db.add(t)
@@ -2235,7 +2240,7 @@ async def test_retry_after_sweep_clears_far_future(
     Audit W1: retry_after_until is a column.
     """
     project = await _make_project(reaper_db)
-    far_dt = datetime.utcnow() + timedelta(hours=6)
+    far_dt = _utcnow() + timedelta(hours=6)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
@@ -2268,7 +2273,7 @@ async def test_step3_evaluating_parent_with_completed_child_triggers_rollup(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2306,7 +2311,7 @@ async def test_step3_evaluating_parent_without_completed_child_skipped(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2359,7 +2364,7 @@ async def test_step3_cancelled_child_with_rollup_nudge_marker_triggers_rollup(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2412,7 +2417,7 @@ async def test_step4_all_failed_children_triggers_requeue(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2453,7 +2458,7 @@ async def test_step4_mixed_active_children_not_rescued(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2474,7 +2479,7 @@ async def test_step4_mixed_active_children_not_rescued(
             payloads=[{"type": "create"}],
             status=TaskStatus.IN_PROGRESS,
             vm_instance_id=None,  # avoid Step 2 orphan reap
-            last_heartbeat=datetime.utcnow(),
+            last_heartbeat=_utcnow(),
         )
     )
     await reaper_db.commit()
@@ -2499,7 +2504,7 @@ async def test_step4_diagnostic_summarizes_failure_categories(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2582,7 +2587,7 @@ async def test_step4_rescues_parent_after_step3_rollup_expires_session(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent_a)
     await reaper_db.commit()
@@ -2602,7 +2607,7 @@ async def test_step4_rescues_parent_after_step3_rollup_expires_session(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent_b)
     await reaper_db.commit()
@@ -2752,7 +2757,7 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent_a)
     await reaper_db.commit()
@@ -2772,7 +2777,7 @@ async def test_step3_4_rollup_poison_rolled_back_for_later_steps(
         project_id=project.id,
         payloads=[{"type": "research"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(parent_b)
     await reaper_db.commit()
@@ -2812,7 +2817,7 @@ async def test_retry_after_sweep_preserves_valid(
     Audit W1: retry_after_until is a column.
     """
     project = await _make_project(reaper_db)
-    valid_dt = datetime.utcnow() + timedelta(minutes=5)
+    valid_dt = _utcnow() + timedelta(minutes=5)
     t = Task(
         project_id=project.id,
         payloads=[{"type": "create"}],
@@ -2897,7 +2902,7 @@ async def test_skip_locked_adds_to_skip_counts(
         vm_instance_id="vm-skip",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -2925,7 +2930,7 @@ async def test_force_lock_triggered_after_five_skips(
         vm_instance_id="vm-force",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -2958,7 +2963,7 @@ async def test_force_lock_timeout_resets_skip_count(
         vm_instance_id="vm-force-timeout",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -2990,7 +2995,7 @@ async def test_force_lock_reverify_healthy_preserves_skip_count(
         vm_instance_id="vm-force-healthy",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -2999,7 +3004,7 @@ async def test_force_lock_reverify_healthy_preserves_skip_count(
 
     real_execute = AsyncSession.execute
     state = {"for_update_calls": 0}
-    fresh_ts = datetime.utcnow()
+    fresh_ts = _utcnow()
 
     async def mock_execute(self, stmt, *args, **kwargs):
         if isinstance(stmt, TextClause):
@@ -3055,7 +3060,7 @@ async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
         vm_instance_id="vm-race-refresh",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+        last_heartbeat=_utcnow() - timedelta(minutes=6),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -3066,7 +3071,7 @@ async def test_heartbeat_refresh_between_step1_and_step2_not_reaped(
     # lock query, so the lock's fresh SELECT returns the refreshed row.
     real_execute = AsyncSession.execute
     refreshed = {"done": False}
-    fresh_ts = datetime.utcnow()
+    fresh_ts = _utcnow()
 
     async def mock_execute(self, stmt, *args, **kwargs):
         if not refreshed["done"] and getattr(stmt, "_for_update_arg", None) is not None:
@@ -3113,7 +3118,7 @@ async def test_skip_count_stale_entries_cleaned(
         vm_instance_id="vm-live",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -3138,7 +3143,7 @@ async def test_step6_tier1_info_alert_fires_past_threshold(
         title="stalled-task",
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        created_at=_utcnow() - timedelta(hours=2, minutes=30),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -3171,7 +3176,7 @@ async def test_step6_tier2_warning_skips_tier1_when_age_exceeds_3x(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(hours=7),
+        created_at=_utcnow() - timedelta(hours=7),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -3201,7 +3206,7 @@ async def test_step6_duplicate_tier1_suppressed(
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(hours=3),
+        created_at=_utcnow() - timedelta(hours=3),
         context={"queued_age_alert_tier": 1},
     )
     reaper_db.add(t)
@@ -3229,7 +3234,7 @@ async def test_step6_requires_approval_sets_likely_cause(
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
         requires_approval=True,
-        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        created_at=_utcnow() - timedelta(hours=2, minutes=30),
     )
     reaper_db.add(t)
     await reaper_db.commit()
@@ -3258,7 +3263,7 @@ async def test_step6_precondition_defer_sets_likely_cause(
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
         requires_approval=False,
-        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        created_at=_utcnow() - timedelta(hours=2, minutes=30),
         latest_status_message=(
             "Waiting: serializing migration — task abcd1234 holds the chain"
         ),
@@ -3290,7 +3295,7 @@ async def test_step6_alert_broadcasts_after_commit(reaper_db, mocker):
         title="stalled-task",
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        created_at=_utcnow() - timedelta(hours=2, minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3331,7 +3336,7 @@ async def test_step6_alert_does_not_broadcast_on_commit_failure(reaper_db, mocke
         title="stalled-task",
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        created_at=datetime.utcnow() - timedelta(hours=2, minutes=30),
+        created_at=_utcnow() - timedelta(hours=2, minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3381,7 +3386,7 @@ async def test_terminal_failure_non_provision_finalization(
         vm_instance_id="vm-terminal",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=2,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         latest_status_message="TypeError: 'NoneType' object is not subscriptable",
         context={"last_error": "TypeError in handler.py"},
     )
@@ -3457,7 +3462,7 @@ async def test_terminal_failure_before_budget_exhausted_not_failed(
         vm_instance_id="vm-still-retrying",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         latest_status_message="TypeError: 'NoneType' object is not subscriptable",
     )
     reaper_db.add(t)
@@ -3803,7 +3808,7 @@ async def test_step5_idempotency_collision_skipped_and_downstream_sweep_survives
         project_id=project.id,
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
-        retry_after_until=datetime.utcnow() + timedelta(hours=6),
+        retry_after_until=_utcnow() + timedelta(hours=6),
     )
     reaper_db.add_all([live, failed_dup, stale_retry])
     await reaper_db.commit()
@@ -3991,7 +3996,7 @@ async def test_dep_unblocking_removes_failed_id_from_queued_dependent(
         vm_instance_id="vm-dep-fail",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,  # At max_retries budget — reaper will mark FAILED, not retry.
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(failing)
     await reaper_db.commit()
@@ -4031,7 +4036,7 @@ async def test_dep_unblocking_clears_multiple_dependents_in_one_pass(
         vm_instance_id="vm-multi-dep",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(failing)
     await reaper_db.commit()
@@ -4091,7 +4096,7 @@ async def test_dep_unblocking_leaves_unrelated_queued_task_alone(
         vm_instance_id="vm-unrelated",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(failing)
     await reaper_db.commit()
@@ -4133,7 +4138,7 @@ async def test_dep_unblocking_skipped_when_task_is_retried_not_failed(
         vm_instance_id="vm-retry",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,  # Fresh attempt — reaper will QUEUE for retry, not FAIL.
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(retrying)
     await reaper_db.commit()
@@ -4339,7 +4344,7 @@ async def test_sweep_stale_residual_cases_closes_active_old(reaper_db):
     stale_case = ResidualRemediationCase(
         fingerprint="old-fp-abc123",
         status=ResidualCaseStatus.ACTIVE,
-        last_seen_at=datetime.utcnow() - timedelta(hours=73),
+        last_seen_at=_utcnow() - timedelta(hours=73),
     )
     reaper_db.add(stale_case)
     await reaper_db.commit()
@@ -4364,7 +4369,7 @@ async def test_sweep_stale_residual_cases_ignores_recent(reaper_db):
     recent_case = ResidualRemediationCase(
         fingerprint="recent-fp-xyz",
         status=ResidualCaseStatus.ACTIVE,
-        last_seen_at=datetime.utcnow() - timedelta(hours=1),
+        last_seen_at=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(recent_case)
     await reaper_db.commit()
@@ -4389,7 +4394,7 @@ async def test_sweep_stale_residual_cases_ignores_already_closed(reaper_db):
     already_closed = ResidualRemediationCase(
         fingerprint="closed-fp-already",
         status=ResidualCaseStatus.CLOSED_ORGANICALLY,
-        last_seen_at=datetime.utcnow() - timedelta(hours=100),
+        last_seen_at=_utcnow() - timedelta(hours=100),
     )
     reaper_db.add(already_closed)
     await reaper_db.commit()
@@ -4416,8 +4421,8 @@ async def test_sweep_stale_residual_cases_resolves_stale_remediating(reaper_db, 
         fingerprint="remediating-old-fp",
         status=ResidualCaseStatus.REMEDIATING,
         project_id=_uuid_mod.uuid4(),
-        last_seen_at=datetime.utcnow() - timedelta(hours=73),
-        last_spawned_at=datetime.utcnow() - timedelta(hours=73),
+        last_seen_at=_utcnow() - timedelta(hours=73),
+        last_spawned_at=_utcnow() - timedelta(hours=73),
         last_spawned_task_id=_uuid_mod.uuid4(),
     )
     reaper_db.add(stale_case)
@@ -4448,8 +4453,8 @@ async def test_sweep_stale_residual_cases_keeps_recent_remediating(reaper_db, mo
         fingerprint="remediating-recent-fp",
         status=ResidualCaseStatus.REMEDIATING,
         project_id=_uuid_mod.uuid4(),
-        last_seen_at=datetime.utcnow() - timedelta(hours=1),
-        last_spawned_at=datetime.utcnow() - timedelta(hours=1),
+        last_seen_at=_utcnow() - timedelta(hours=1),
+        last_spawned_at=_utcnow() - timedelta(hours=1),
         last_spawned_task_id=_uuid_mod.uuid4(),
     )
     reaper_db.add(recent_case)
@@ -4567,7 +4572,7 @@ async def test_reap_with_open_pr_goes_to_evaluating(
         vm_instance_id="vm-with-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4623,7 +4628,7 @@ async def test_reap_with_open_pr_spawn_failure_keeps_recovery_marker(
         vm_instance_id="vm-with-pr-spawnfail",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4663,7 +4668,7 @@ async def test_reap_without_pr_still_retries(
         vm_instance_id="vm-no-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4699,7 +4704,7 @@ async def test_terminal_reap_with_open_pr_goes_to_evaluating(
         vm_instance_id="vm-terminal-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,  # already at max for most classes
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4734,7 +4739,7 @@ async def test_terminal_reap_without_pr_still_fails(
         vm_instance_id="vm-terminal-no-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=5,  # definitely over any class budget
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4777,7 +4782,7 @@ async def test_reap_with_closed_unmerged_pr_marks_failed(
         vm_instance_id="vm-closed-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4833,7 +4838,7 @@ async def test_reap_with_merged_pr_marks_completed(
         vm_instance_id="vm-merged-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4905,7 +4910,7 @@ async def test_reap_with_merged_pr_on_distinct_promotion_target_alerts_without_p
         vm_instance_id="vm-merged-pr-promotion",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -4991,7 +4996,7 @@ async def test_reap_with_merged_pr_on_intermediate_staged_rollup_stays_evaluatin
         vm_instance_id="vm-merged-pr-intermediate",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small", "rollup_pr_number": 5557},
     )
     reaper_db.add(t)
@@ -5050,7 +5055,7 @@ async def test_reap_with_open_pr_via_gh_check_goes_to_evaluating(
         vm_instance_id="vm-open-pr",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -5099,7 +5104,7 @@ async def test_reap_with_pr_falls_back_to_open_when_gh_unreachable(
         vm_instance_id="vm-pr-gh-down",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -5156,7 +5161,7 @@ async def test_serial_log_survives_requeue_via_context_copy(
         vm_instance_id="vm-sticky-serial",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+        last_heartbeat=_utcnow() - timedelta(minutes=7),
         context={
             "provision_zone": "us-east1-a",
             "last_serial_log": "previous cycle: agent hung at step 3",
@@ -5732,7 +5737,7 @@ async def test_step7_stalled_cycle_cancels_linked_phase1_task(
         title="strategic-phase1",
         payloads=[{"type": "design_doc_update", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+        last_heartbeat=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5743,7 +5748,7 @@ async def test_step7_stalled_cycle_cancels_linked_phase1_task(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5773,7 +5778,7 @@ async def test_step7_stalled_cycle_cancels_linked_phase2_task(
         title="strategic-phase2",
         payloads=[{"type": "strategic_review", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+        last_heartbeat=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5784,8 +5789,8 @@ async def test_step7_stalled_cycle_cancels_linked_phase2_task(
         project_id=project.id,
         outcome="phase2_running",
         phase2_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
-        phase2_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5815,7 +5820,7 @@ async def test_stalled_cycle_force_terminate_records_infra_failure_category(
         title="strategic-phase1-stalled",
         payloads=[{"type": "design_doc_update", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+        last_heartbeat=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5826,7 +5831,7 @@ async def test_stalled_cycle_force_terminate_records_infra_failure_category(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5854,7 +5859,7 @@ async def test_step7_stalled_cycle_live_task_not_declared_stalled(
         title="strategic-live",
         payloads=[{"type": "design_doc_update", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        last_heartbeat=_utcnow() - timedelta(seconds=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5865,7 +5870,7 @@ async def test_step7_stalled_cycle_live_task_not_declared_stalled(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5905,7 +5910,7 @@ async def test_step7_stalled_cycle_already_terminal_task_untouched(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5931,7 +5936,7 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
         title="strategic-phase1",
         payloads=[{"type": "design_doc_update", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+        last_heartbeat=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5942,7 +5947,7 @@ async def test_step7_stalled_cycle_broadcasts_after_commit(reaper_db, mocker):
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -5986,7 +5991,7 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
         title="strategic-phase1",
         payloads=[{"type": "design_doc_update", "scope": "medium"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(hours=1),
+        last_heartbeat=_utcnow() - timedelta(hours=1),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -5997,7 +6002,7 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
         project_id=project.id,
         outcome="phase1_running",
         phase1_task_id=task.id,
-        phase1_started_at=datetime.utcnow() - timedelta(hours=4),
+        phase1_started_at=_utcnow() - timedelta(hours=4),
     )
     reaper_db.add(cycle)
     await reaper_db.commit()
@@ -6017,6 +6022,50 @@ async def test_step7_stalled_cycle_does_not_broadcast_on_commit_failure(
         )
 
     broadcast.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_step7_stalled_cycle_skips_strategic_local_runner_hold(reaper_db):
+    project = await _make_project(reaper_db)
+    task = Task(
+        project_id=project.id,
+        title="strategic-local-hold",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.QUEUED,
+        context={
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+            STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: (
+                _utcnow() - timedelta(hours=4)
+            ).isoformat(),
+        },
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+
+    cycle = StrategicCycle(
+        id=_make_cycle_id(),
+        project_id=project.id,
+        outcome="phase2_running",
+        phase1_started_at=_utcnow() - timedelta(hours=5),
+        phase1_completed_at=_utcnow() - timedelta(hours=4),
+        phase2_started_at=_utcnow() - timedelta(hours=4),
+        phase2_task_id=task.id,
+    )
+    reaper_db.add(cycle)
+    await reaper_db.commit()
+
+    stalled = await _rs.sweep_stalled_strategic_cycles(
+        reaper_db,
+        _utcnow(),
+        heartbeat_stale_cutoff_fn=lambda _task, now: now - timedelta(minutes=5),
+    )
+
+    await reaper_db.refresh(task)
+    await reaper_db.refresh(cycle)
+    assert stalled == 0
+    assert task.status == TaskStatus.QUEUED
+    assert cycle.outcome == "phase2_running"
 
 
 # ── Orphan reap crash isolation & quarantine ─────────────────────────────
@@ -6054,7 +6103,7 @@ async def test_orphan_per_row_commit_idempotency_collision_isolated(
         vm_instance_id="vm-good-row",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     collider = Task(
         project_id=project.id,
@@ -6062,7 +6111,7 @@ async def test_orphan_per_row_commit_idempotency_collision_isolated(
         vm_instance_id="vm-collider-row",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(good)
     reaper_db.add(collider)
@@ -6165,7 +6214,7 @@ async def test_orphan_crash_sibling_reaped_when_poison_throws(
         vm_instance_id="vm-poison",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     healthy = Task(
         project_id=project.id,
@@ -6173,7 +6222,7 @@ async def test_orphan_crash_sibling_reaped_when_poison_throws(
         vm_instance_id="vm-healthy-sibling",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(poison)
     reaper_db.add(healthy)
@@ -6238,7 +6287,7 @@ async def test_orphan_crash_quarantines_task_after_streak_threshold(
         vm_instance_id="vm-to-quarantine",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(poison)
     await reaper_db.commit()
@@ -6378,7 +6427,7 @@ async def test_cycle_halt_skips_further_cycle_attempts(
     _reaper_mod._reaper_halt_state.update(
         {
             "halted": True,
-            "halt_timestamp": datetime.utcnow(),
+            "halt_timestamp": _utcnow(),
             "last_error": "pre-halted",
             "crash_count": _REAPER_CYCLE_HALT_THRESHOLD,
         }
@@ -6491,7 +6540,7 @@ async def test_per_task_crash_does_not_trigger_cycle_halt(
         vm_instance_id="vm-per-task-crash",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(orphan)
     await reaper_db.commit()
@@ -6541,7 +6590,7 @@ async def test_half_open_probe_recovers_after_cooldown(
         {
             "halted": True,
             "hard_halted": False,
-            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "halt_timestamp": _utcnow() - timedelta(seconds=600),
             "last_error": "transient-error",
             "crash_count": 5,
             "half_open_failures": 0,
@@ -6576,7 +6625,7 @@ async def test_half_open_probe_failure_rehalts_with_incremented_counter(
         {
             "halted": True,
             "hard_halted": False,
-            "halt_timestamp": datetime.utcnow() - timedelta(seconds=600),
+            "halt_timestamp": _utcnow() - timedelta(seconds=600),
             "last_error": "initial-error",
             "crash_count": 5,
             "half_open_failures": 0,
@@ -6617,7 +6666,7 @@ async def test_half_open_hard_halt_after_probe_limit(
         {
             "halted": True,
             "hard_halted": False,
-            "halt_timestamp": datetime.utcnow() - timedelta(hours=2),
+            "halt_timestamp": _utcnow() - timedelta(hours=2),
             "last_error": "recurring-error",
             "crash_count": 5,
             "half_open_failures": probe_limit - 1,
@@ -6673,7 +6722,7 @@ async def test_reap_with_open_pr_uses_project_namespace(
         vm_instance_id="vm-with-pr-ns",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={"scope": "small"},
     )
     reaper_db.add(t)
@@ -6764,9 +6813,9 @@ def test_mark_reaper_progress_updates_last_progress():
     try:
         reaper_mod._reaper_last_progress = None
         # _utcnow() is naive UTC (see app.time_utils), so bracket with naive UTC.
-        before = datetime.utcnow()
+        before = _utcnow()
         _mark_reaper_progress()
-        after = datetime.utcnow()
+        after = _utcnow()
         assert reaper_mod._reaper_last_progress is not None
         assert before <= reaper_mod._reaper_last_progress <= after
     finally:
@@ -6939,14 +6988,14 @@ class _FakeClassifyTask:
         self.last_tool_use_at = last_tool_use_at
         # created_at defaults to "fresh" so the >10min catch-alls don't fire
         # unless a test sets it explicitly.
-        self.created_at = created_at if created_at is not None else datetime.utcnow()
+        self.created_at = created_at if created_at is not None else _utcnow()
         self.context = context or {}
         self.first_payload = first_payload or {"type": "create"}
         self.vm_instance_id = vm_instance_id
 
 
 def test_classify_orphan_provisioning_absolute_ceiling():
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=16)
     )
@@ -6954,7 +7003,7 @@ def test_classify_orphan_provisioning_absolute_ceiling():
 
 
 def test_classify_orphan_provisioning_just_inside_ceiling_not_orphan():
-    now = datetime.utcnow()
+    now = _utcnow()
     # 14min: under the 15min absolute ceiling, no heartbeat, no vm_provisioned_at.
     t = _FakeClassifyTask(
         status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=14)
@@ -6963,7 +7012,7 @@ def test_classify_orphan_provisioning_just_inside_ceiling_not_orphan():
 
 
 def test_classify_orphan_provisioning_silent_preclaim_death():
-    now = datetime.utcnow()
+    now = _utcnow()
     # vm dispatched 7min ago (past small-scope 6min preclaim cutoff), never claimed.
     t = _FakeClassifyTask(
         status=TaskStatus.PROVISIONING,
@@ -6974,7 +7023,7 @@ def test_classify_orphan_provisioning_silent_preclaim_death():
 
 
 def test_classify_orphan_runner_pin_awaiting_pull_not_preclaim_reaped():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Pinned to a self-hosted runner (vm_instance_id='runner:{id}') and not yet
     # pulled (started_at IS NULL). vm_provisioned_at is well past the small-scope
     # 6min preclaim cutoff and there is no heartbeat — the EXACT shape the
@@ -6992,7 +7041,7 @@ def test_classify_orphan_runner_pin_awaiting_pull_not_preclaim_reaped():
 
 
 def test_classify_orphan_runner_pin_after_pull_still_reaped_at_ceiling():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Once the runner pulls a pin it stamps started_at (runner.py next-task). A
     # pulled runner task that then blows the 15min absolute provisioning ceiling
     # is genuinely stuck and must still be reaped — the exclusion only covers the
@@ -7006,7 +7055,7 @@ def test_classify_orphan_runner_pin_after_pull_still_reaped_at_ceiling():
 
 
 def test_classify_orphan_non_runner_preclaim_still_reaped_with_null_started_at():
-    now = datetime.utcnow()
+    now = _utcnow()
     # A cloud/GCE pin (non-'runner:' vm id) with the same started_at IS NULL +
     # stale vm_provisioned_at + no heartbeat shape IS a silent pre-claim death and
     # must still be reaped — the runner exclusion is scoped strictly to the
@@ -7022,7 +7071,7 @@ def test_classify_orphan_non_runner_preclaim_still_reaped_with_null_started_at()
 
 
 def test_classify_orphan_in_progress_heartbeat_stale():
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
@@ -7032,7 +7081,7 @@ def test_classify_orphan_in_progress_heartbeat_stale():
 
 
 def test_classify_orphan_in_progress_fresh_heartbeat_not_orphan():
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),  # fresh
@@ -7043,7 +7092,7 @@ def test_classify_orphan_in_progress_fresh_heartbeat_not_orphan():
 
 
 def test_classify_orphan_open_pr_uses_90s_cutoff():
-    now = datetime.utcnow()
+    now = _utcnow()
     # 2min-stale heartbeat: NOT stale under the 5min default, but IS stale under
     # the 90s open-PR cutoff. The has_open_pr flag must flip the verdict.
     t = _FakeClassifyTask(
@@ -7056,7 +7105,7 @@ def test_classify_orphan_open_pr_uses_90s_cutoff():
 
 
 def test_classify_orphan_stalled_but_heartbeating_anthropic_no_tool_use():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Fresh heartbeat, zero tool calls ever, started 10min ago (past 8min small
     # progress cutoff), anthropic provider → agent_stalled orphan.
     t = _FakeClassifyTask(
@@ -7073,7 +7122,7 @@ def test_classify_orphan_stalled_but_heartbeating_anthropic_no_tool_use():
 
 
 def test_classify_orphan_cross_attempt_stale_tool_guard():
-    now = datetime.utcnow()
+    now = _utcnow()
     # Fresh heartbeat, last_tool_use_at is 11min stale (carried across a retry),
     # but the CURRENT attempt only started 1min ago — must NOT be reaped (the
     # started_at clause guards the 8c8cf973 cross-attempt false-positive).
@@ -7087,7 +7136,7 @@ def test_classify_orphan_cross_attempt_stale_tool_guard():
 
 
 def test_classify_orphan_degenerate_in_progress_catch_all():
-    now = datetime.utcnow()
+    now = _utcnow()
     # No heartbeat, no started_at, created >10min ago → degenerate catch-all.
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
@@ -7102,7 +7151,7 @@ def test_classify_orphan_step1_and_step2_predicate_agree():
     """FIX a regression guard: the helper IS the predicate both Step 1 and Step 2
     call, so by construction they cannot drift. This asserts the helper returns a
     plain bool across a representative matrix (the property the dedup relies on)."""
-    now = datetime.utcnow()
+    now = _utcnow()
     cases = [
         _FakeClassifyTask(
             status=TaskStatus.PROVISIONING, started_at=now - timedelta(minutes=20)
@@ -7136,7 +7185,7 @@ def test_classify_orphan_fresh_vm_contact_suppresses_stale_heartbeat_reap():
     """(a) An otherwise-stale IN_PROGRESS task is NOT reaped when the orchestrator
     heard from its VM within the same heartbeat-stale cutoff — the agent is alive
     and its last_heartbeat write was lock-starved by the rollup's task-row lock."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(minutes=10),  # past 5min small cutoff
@@ -7156,7 +7205,7 @@ def test_classify_orphan_stale_vm_contact_still_reaps_genuine_death():
     """(b) A stale heartbeat AND a stale/absent vm_contact still reap — genuine
     death (crashed/preempted VM that sends no requests) is preserved. Gated on the
     SAME cutoff so an old contact row never suppresses a real reap."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(minutes=10),
@@ -7181,7 +7230,7 @@ def test_classify_orphan_stale_vm_contact_still_reaps_genuine_death():
 def test_classify_orphan_no_vm_contact_row_is_backcompat():
     """(c) No vm_contact lookup (or an empty one) → unchanged behaviour: the stale
     heartbeat reaps exactly as it did before the fix."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(minutes=10),
@@ -7216,7 +7265,7 @@ def test_classify_orphan_fresh_contact_does_not_suppress_progress_stall():
     heartbeating): there the heartbeat is fresh and the reap is on tool-use
     staleness, not heartbeat staleness. The override only covers the
     last_heartbeat-staleness false-reap, never a genuine hung-agent stall."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),  # FRESH heartbeat
@@ -7234,7 +7283,7 @@ def test_classify_orphan_fresh_contact_does_not_suppress_progress_stall():
 def test_classify_orphan_fresh_contact_suppresses_provisioning_preclaim_death():
     """The override also covers the PROVISIONING silent-pre-claim-death branch: a
     VM that is demonstrably contacting the orchestrator is not a silent death."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.PROVISIONING,
         vm_provisioned_at=now - timedelta(minutes=7),  # past 6min preclaim cutoff
@@ -7256,7 +7305,7 @@ def test_classify_orphan_fresh_offrow_tool_use_suppresses_progress_stall():
     last_tool_use_at) is NOT reaped when the OFF-ROW vmcontact.last_tool_use_at is
     within the progress cutoff — the agent IS calling tools; its on-row tool stamp
     was lock-starved together with the heartbeat by the rollup's task-row lock."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),  # FRESH heartbeat
@@ -7288,7 +7337,7 @@ def test_classify_orphan_stale_offrow_tool_use_still_reaps_genuine_stall():
     """A genuinely stalled agent (no recent tool use anywhere — on-row stale AND
     off-row stale/absent) is still reaped. Gated on the SAME progress cutoff so an
     old off-row tool stamp can never mask a real stall."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),
@@ -7318,7 +7367,7 @@ def test_classify_orphan_fresh_offrow_tool_use_suppresses_zero_toolcall_stall():
     last_tool_use_at is None and started_at is past the progress cutoff, but a
     fresh OFF-ROW tool use means the agent DID record a tool call the lock-starved
     heartbeat failed to land on the task row — it is progressing, don't reap."""
-    now = datetime.utcnow()
+    now = _utcnow()
     t = _FakeClassifyTask(
         status=TaskStatus.IN_PROGRESS,
         last_heartbeat=now - timedelta(seconds=30),
@@ -7356,7 +7405,7 @@ async def test_relock_orphan_vm_liveness_cutoff_suppresses_heartbeat_stale_reap(
     from app.models import VmContact
 
     project = await _make_project(reaper_db)
-    now = datetime.utcnow()
+    now = _utcnow()
     vm_id = "vm-relock-alive"
     t = Task(
         project_id=project.id,
@@ -7396,7 +7445,7 @@ async def test_relock_orphan_no_cutoff_does_not_consult_vm_contact(reaper_db):
     from app.models import VmContact
 
     project = await _make_project(reaper_db)
-    now = datetime.utcnow()
+    now = _utcnow()
     vm_id = "vm-relock-stalled"
     t = Task(
         project_id=project.id,
@@ -7474,7 +7523,7 @@ async def test_orphan_loop_time_budget_defers_remaining_orphans(
             vm_instance_id=f"vm-budget-{i}",
             status=TaskStatus.IN_PROGRESS,
             attempt_count=0,
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+            last_heartbeat=_utcnow() - timedelta(minutes=10),
         )
         orphans.append(o)
         reaper_db.add(o)
@@ -7536,7 +7585,7 @@ async def test_orphan_loop_no_time_budget_when_disabled_processes_all(
             vm_instance_id=f"vm-nobudget-{i}",
             status=TaskStatus.IN_PROGRESS,
             attempt_count=0,
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+            last_heartbeat=_utcnow() - timedelta(minutes=10),
         )
         orphans.append(o)
         reaper_db.add(o)
@@ -7668,9 +7717,6 @@ from app.reaper_sweeps import (  # noqa: E402
     _BLOCKED_OPTIMISTIC_RETRY_CAP,
     _BLOCKED_PARKED_REEVAL_CAP,
 )
-from app.time_utils import _utcnow  # noqa: E402
-
-
 async def _blocked_task(db, project, **kwargs):
     defaults = {
         "project_id": project.id,
@@ -11359,6 +11405,33 @@ async def _make_bug_message(
     return msg
 
 
+def _assert_message_update_event_payload(
+    payload,
+    *,
+    project,
+    msg,
+    status: str,
+    action: str,
+) -> None:
+    message_type = getattr(msg.message_type, "value", str(msg.message_type))
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == action
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == message_type
+    assert payload["from"] == msg.from_type
+    assert payload["status"] == status
+    assert payload["message"] == {
+        "id": str(msg.id),
+        "type": message_type,
+        "from": msg.from_type,
+        "status": status,
+        "excerpt": msg.content,
+    }
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+
+
 async def _make_direction_row(
     db, project, *, direction_key="d-abc123", status="active"
 ):
@@ -11478,6 +11551,46 @@ async def test_linked_message_resurfaces_when_task_fails(reaper_db):
     assert ctx.get("_convergence_link_stale") is not None
     assert "_convergence_link" not in ctx
     assert "FAILED" in (ctx.get("_convergence_resurfaced_reason") or "")
+
+
+@pytest.mark.asyncio
+async def test_linked_message_resurface_broadcasts_workbench_envelope(
+    reaper_db, mocker
+):
+    """Linked-message updates publish the shared workbench message envelope."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+        context={},
+    )
+    reaper_db.add(task)
+    await reaper_db.commit()
+    await reaper_db.refresh(task)
+    link_message_to_outcome(msg, "task", str(task.id))
+    reaper_db.add(msg)
+    await reaper_db.commit()
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    acted = await sweep_converge_linked_bug_messages(reaper_db, _utcnow())
+
+    assert acted == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="open",
+        action="updated",
+    )
 
 
 @pytest.mark.asyncio
@@ -11698,7 +11811,7 @@ async def _conv_task(
         parent_task_id=parent,
         context=ctx or {},
         depends_on=depends_on or [],
-        created_at=created_at or datetime.utcnow(),
+        created_at=created_at or _utcnow(),
     )
     db.add(t)
     await db.commit()
@@ -11739,13 +11852,13 @@ async def test_converge_genuine_cross_parent_duplicate_wires_edge(
         reaper_db,
         project,
         files=files,
-        created_at=datetime.utcnow() - timedelta(hours=2),
+        created_at=_utcnow() - timedelta(hours=2),
     )
     dependent = await _conv_task(
-        reaper_db, project, files=files, created_at=datetime.utcnow()
+        reaper_db, project, files=files, created_at=_utcnow()
     )
 
-    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    n = await sweep_converge_duplicate_foundations(reaper_db, _utcnow())
     await reaper_db.refresh(canonical)
     await reaper_db.refresh(dependent)
 
@@ -11768,17 +11881,17 @@ async def test_converge_shared_finding_origin_wires_edge(reaper_db, _no_broadcas
         project,
         files=["backend/app/a.py"],
         ctx={"finding_hash": "deadbeefcafe0001"},
-        created_at=datetime.utcnow() - timedelta(hours=1),
+        created_at=_utcnow() - timedelta(hours=1),
     )
     dependent = await _conv_task(
         reaper_db,
         project,
         files=["backend/app/b.py", "backend/app/c.py"],
         ctx={"finding_hash": "deadbeefcafe0001"},
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
 
-    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    n = await sweep_converge_duplicate_foundations(reaper_db, _utcnow())
     await reaper_db.refresh(dependent)
 
     assert n == 1
@@ -11802,7 +11915,7 @@ async def test_no_converge_when_only_one_shared_infra_file(reaper_db, _no_broadc
         files=["backend/app/shared.py", "backend/app/c.py", "backend/app/d.py"],
     )
 
-    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    n = await sweep_converge_duplicate_foundations(reaper_db, _utcnow())
     await reaper_db.refresh(t1)
     await reaper_db.refresh(t2)
 
@@ -11822,7 +11935,7 @@ async def test_no_converge_same_parent(reaper_db, _no_broadcast):
     t1 = await _conv_task(reaper_db, project, files=files, parent=parent)
     t2 = await _conv_task(reaper_db, project, files=files, parent=parent)
 
-    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    n = await sweep_converge_duplicate_foundations(reaper_db, _utcnow())
     await reaper_db.refresh(t1)
     await reaper_db.refresh(t2)
 
@@ -11840,18 +11953,18 @@ async def test_converge_refuses_cycle(reaper_db, _no_broadcast):
     project = await _make_project(reaper_db)
     files = ["backend/app/foundation.py", "backend/app/x.py", "backend/app/y.py"]
     later = await _conv_task(
-        reaper_db, project, files=files, created_at=datetime.utcnow()
+        reaper_db, project, files=files, created_at=_utcnow()
     )
     # earlier=canonical, but it already depends on the later task → reverse edge cycles
     earlier = await _conv_task(
         reaper_db,
         project,
         files=files,
-        created_at=datetime.utcnow() - timedelta(hours=2),
+        created_at=_utcnow() - timedelta(hours=2),
         depends_on=[str(later.id)],
     )
 
-    n = await sweep_converge_duplicate_foundations(reaper_db, datetime.utcnow())
+    n = await sweep_converge_duplicate_foundations(reaper_db, _utcnow())
     await reaper_db.refresh(later)
     await reaper_db.refresh(earlier)
 
@@ -11882,7 +11995,7 @@ async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
         files=["backend/app/a.py"],
         parent=research_parent,
         ctx={"finding_hash": "spawnhash00000001"},
-        created_at=datetime.utcnow() - timedelta(minutes=5),
+        created_at=_utcnow() - timedelta(minutes=5),
         status=TaskStatus.QUEUED,
     )
     dependent = await _conv_task(
@@ -11891,7 +12004,7 @@ async def test_spawn_converge_within_batch_genuine_duplicate(reaper_db):
         files=["backend/app/b.py", "backend/app/c.py"],
         parent=research_parent,
         ctx={"finding_hash": "spawnhash00000001"},
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
         status=TaskStatus.QUEUED,
     )
 
@@ -11919,7 +12032,7 @@ async def test_spawn_converge_new_finding_vs_active_task(reaper_db):
         files=["backend/app/cap.py"],
         parent=_uuid_mod.uuid4(),
         ctx={"provides_capability": "token-budgeter"},
-        created_at=datetime.utcnow() - timedelta(hours=1),
+        created_at=_utcnow() - timedelta(hours=1),
         status=TaskStatus.IN_PROGRESS,
     )
     child = await _conv_task(
@@ -11928,7 +12041,7 @@ async def test_spawn_converge_new_finding_vs_active_task(reaper_db):
         files=["backend/app/other.py"],
         parent=_uuid_mod.uuid4(),
         ctx={"provides_capability": "token-budgeter"},
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
         status=TaskStatus.QUEUED,
     )
 
@@ -11953,14 +12066,14 @@ async def test_spawn_no_converge_subthreshold_incidental_overlap(reaper_db):
         project,
         files=["backend/app/shared.py", "backend/app/a.py", "backend/app/b.py"],
         parent=research_parent,
-        created_at=datetime.utcnow() - timedelta(minutes=1),
+        created_at=_utcnow() - timedelta(minutes=1),
     )
     b = await _conv_task(
         reaper_db,
         project,
         files=["backend/app/shared.py", "backend/app/c.py", "backend/app/d.py"],
         parent=research_parent,
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
 
     wired = converge_spawn_batch_foundations([a, b], [])
@@ -11984,14 +12097,14 @@ async def test_spawn_converge_skips_active_vs_active_pairs(reaper_db):
         project,
         files=files,
         parent=_uuid_mod.uuid4(),
-        created_at=datetime.utcnow() - timedelta(hours=2),
+        created_at=_utcnow() - timedelta(hours=2),
     )
     active_b = await _conv_task(
         reaper_db,
         project,
         files=files,
         parent=_uuid_mod.uuid4(),
-        created_at=datetime.utcnow() - timedelta(hours=1),
+        created_at=_utcnow() - timedelta(hours=1),
     )
     # The batch child is unrelated, so no child-dependent action is emitted.
     child = await _conv_task(
@@ -11999,7 +12112,7 @@ async def test_spawn_converge_skips_active_vs_active_pairs(reaper_db):
         project,
         files=["backend/app/unrelated.py"],
         parent=_uuid_mod.uuid4(),
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
 
     wired = converge_spawn_batch_foundations([child], [active_a, active_b])
@@ -12026,7 +12139,7 @@ async def test_spawn_converge_refuses_cycle_for_coordinated_siblings(reaper_db):
         files=["backend/app/a.py"],
         parent=research_parent,
         ctx={"finding_hash": "cyclehash00000001"},
-        created_at=datetime.utcnow(),
+        created_at=_utcnow(),
     )
     # earlier=canonical, but already declared to depend on `later` → reverse cycles.
     earlier = await _conv_task(
@@ -12035,7 +12148,7 @@ async def test_spawn_converge_refuses_cycle_for_coordinated_siblings(reaper_db):
         files=["backend/app/a.py"],
         parent=research_parent,
         ctx={"finding_hash": "cyclehash00000001"},
-        created_at=datetime.utcnow() - timedelta(hours=1),
+        created_at=_utcnow() - timedelta(hours=1),
         depends_on=[str(later.id)],
     )
 
@@ -12087,6 +12200,37 @@ async def test_open_owned_resolves_when_direction_completed(reaper_db):
     assert msg.resolved_at is not None
     assert msg.context.get("_owned_auto_resolved_at") is not None
     assert msg.context.get("_owned_auto_resolution") == msg.resolution
+
+
+@pytest.mark.asyncio
+async def test_open_owned_resolution_broadcasts_workbench_envelope(reaper_db, mocker):
+    """Owner-success auto-resolution publishes a resolved message envelope."""
+    project = await _make_project(reaper_db)
+    await _make_direction_row(
+        reaper_db, project, direction_key="d-done-env", status="completed"
+    )
+    msg = await _make_bug_message(
+        reaper_db, project, context={"direction_id": "d-done-env"}
+    )
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    resolved = await sweep_resolve_open_owned_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="resolved",
+        action="resolved",
+    )
 
 
 @pytest.mark.asyncio
@@ -12379,6 +12523,48 @@ async def test_stale_open_bug_resolves_when_citations_absent(reaper_db, monkeypa
     assert msg.context.get("_stale_auto_resolution") == msg.resolution
     assert msg.context.get("_stale_auto_citation_signal") == absent_signal
     assert "_owned_auto_resolution" not in msg.context
+
+
+@pytest.mark.asyncio
+async def test_stale_open_bug_resolution_broadcasts_workbench_envelope(
+    reaper_db, monkeypatch, mocker
+):
+    """Stale auto-resolution publishes the same resolved message envelope."""
+    project = await _make_project(reaper_db)
+    msg = await _make_bug_message(reaper_db, project, context={"source": "x"})
+
+    async def _absent(_session, _project, _content, *, structured_context=None):
+        return {
+            "citation_state": "absent",
+            "broken_refs": ["app/gone.py"],
+            "ungrounded_refs": [],
+        }
+
+    monkeypatch.setattr(_rs, "compute_message_citation_warning", _absent, raising=False)
+    monkeypatch.setattr(
+        "app.source_ref_validation.compute_message_citation_warning",
+        _absent,
+        raising=False,
+    )
+    broadcast = mocker.patch(
+        "app.broadcast.broadcast_to_project", new_callable=AsyncMock
+    )
+
+    resolved = await sweep_resolve_stale_open_bug_messages(reaper_db, _utcnow())
+
+    assert resolved == 1
+    await reaper_db.refresh(msg)
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_message_update_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        status="resolved",
+        action="resolved",
+    )
 
 
 @pytest.mark.asyncio
@@ -13850,7 +14036,7 @@ async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker)
     reset_wake_delivery_stall_state()
     project = await _make_project(reaper_db)
 
-    now = datetime.utcnow()
+    now = _utcnow()
     task = Task(
         project_id=project.id,
         title="park-stall",
@@ -13883,7 +14069,7 @@ async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker)
     # No-progress cycles with a persistent FIRED backlog climb the stall counter.
     for cycle in range(1, _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD + 1):
         result = await sweep_deliver_task_wakes(
-            reaper_db, datetime.utcnow(), batch_size=1
+            reaper_db, _utcnow(), batch_size=1
         )
         assert isinstance(result, WakeSweepResult)
         assert result.delivered == 0
@@ -13897,7 +14083,7 @@ async def test_wake_delivery_sweep_stall_signal_across_cycles(reaper_db, mocker)
     # A genuinely-delivering cycle drains the backlog and resets the signal.
     mocker.patch.object(_tl, "deliver_wake", new=real_deliver)
     recovered = await sweep_deliver_task_wakes(
-        reaper_db, datetime.utcnow(), batch_size=1
+        reaper_db, _utcnow(), batch_size=1
     )
     assert recovered.delivered == 1
     assert recovered.fired_undelivered == 0
@@ -13930,7 +14116,7 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     reset_wake_delivery_stall_state()
     project = await _make_project(reaper_db)
 
-    now = datetime.utcnow()
+    now = _utcnow()
     task = Task(
         project_id=project.id,
         title="park-alert-stall",
@@ -13962,7 +14148,7 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
 
     # Drive the stall counter up to threshold so delivery_stalled trips.
     for _ in range(_WAKE_DELIVERY_STALL_CYCLE_THRESHOLD):
-        await sweep_deliver_task_wakes(reaper_db, datetime.utcnow(), batch_size=1)
+        await sweep_deliver_task_wakes(reaper_db, _utcnow(), batch_size=1)
 
     assert get_wake_delivery_stall_cycles() >= _WAKE_DELIVERY_STALL_CYCLE_THRESHOLD
     stall_cycles = get_wake_delivery_stall_cycles()
@@ -14011,7 +14197,7 @@ async def test_wake_delivery_stall_raises_operator_alert(reaper_db, mocker):
     # Recovery: allow delivery to proceed and verify the alert is cleared.
     mocker.patch.object(_tl, "deliver_wake", new=real_deliver)
     recovered = await sweep_deliver_task_wakes(
-        reaper_db, datetime.utcnow(), batch_size=1
+        reaper_db, _utcnow(), batch_size=1
     )
     assert recovered.delivered == 1
     assert recovered.delivery_stalled is False
@@ -14073,7 +14259,7 @@ def _make_review_loop_fix_task(
         vm_instance_id=f"vm-fix-{pr_number}",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=attempt_count,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context=ctx,
     )
 
@@ -14243,7 +14429,7 @@ async def test_reaper_closes_pr_when_infra_retry_budget_exhausted(
     )
     mocker.patch("app.github.create_pr_comment", new_callable=AsyncMock)
 
-    recent = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+    recent = (_utcnow() - timedelta(hours=1)).isoformat()
     project = await _make_project(reaper_db)
     t = _make_review_loop_fix_task(
         project,

@@ -38,6 +38,100 @@ export function computeResearchPlanPromptFingerprint(mode: 'plan' | 'research'):
   return createHash('sha256').update(blocks.join('\n\n')).digest('hex').slice(0, 12);
 }
 
+function buildStrategicProblemModelSection(problemModelRecovery: ThinkerPromptParams['problemModelRecovery']): string {
+  if (problemModelRecovery === 'fetch') {
+    return [
+      '## Your current understanding (problem_model)',
+      '_**Your durable problem_model EXISTS but was not shipped in full this cycle** — the packer dropped or summarized it under the byte budget (see "Context not shipped this cycle" above). This is NOT the first cycle. Before you submit ANY problem_model update you MUST run `./fetch problem-model` to retrieve the full current model, then EDIT it — never replace it from scratch, or you will wipe real durable capabilities, gaps, and friction._',
+    ].join('\n');
+  }
+  if (problemModelRecovery === 'empty') {
+    return [
+      '## Your current understanding (problem_model)',
+      '_(empty — this is the first cycle. Bootstrap from the other sections below.)_',
+    ].join('\n');
+  }
+  return [
+    '## Your current understanding (problem_model)',
+    '```json',
+    '{',
+    '  "fingerprint": "strategic-prompt"',
+    '}',
+    '```',
+  ].join('\n');
+}
+
+function buildStrategicFingerprintPrompt(
+  p: ThinkerPromptParams,
+  promptSuffix: string,
+): string {
+  const canonical: ThinkerPromptParams = {
+    ...p,
+    contextPrefix: '',
+    projectName: '<project>',
+    clockHeader: '<clock>',
+    isSelfRepo: p.isSelfRepo,
+    userStateLine: '<user-state>',
+    gapMemoryTrimmedGapIds: p.gapMemoryTrimmedGapIds && p.gapMemoryTrimmedGapIds.length > 0
+      ? ['<trimmed-gap>']
+      : [],
+    packerMetaSection: p.packerMetaSection ? '<packer-meta>' : '',
+    strategicContext: p.strategicContext ? '<strategic-context>' : '',
+    problemModelSection: buildStrategicProblemModelSection(p.problemModelRecovery),
+    cycleStartReconciliationSection: p.cycleStartReconciliationSection ? '<cycle-start-reconciliation>' : '',
+    reflectionSection: '<reflection>',
+    selfImprovementBlock: p.selfImprovementBlock ? '<self-improvement>' : '',
+    runningUpdateSection: '<running-update>',
+    runningUpdateSupersededSection: p.runningUpdateSupersededSection ? '<running-update-superseded>' : '',
+    designDocJson: '<design-doc>',
+    visionJson: p.visionJson ? '<vision>' : '',
+    outcomeSection: p.outcomeSection ? '<outcome>' : '',
+    previousDecisionOutcomes: p.previousDecisionOutcomes ? '<previous-decision-outcomes>' : '',
+    pastRetirementCritiquesSection: p.pastRetirementCritiquesSection ? '<past-retirement-critiques>' : '',
+    retiredDirectionsSummarySection: p.retiredDirectionsSummarySection ? '<retired-directions-summary>' : '',
+    dirSummaryText: '<dir-summary>',
+    dirHealthSummary: '<dir-health>',
+    stagedDirectionsSection: p.stagedDirectionsSection ? '<staged-directions>' : '',
+    userPausedSection: p.userPausedSection ? '<user-paused>' : '',
+    rejectedProposalsSection: p.rejectedProposalsSection ? '<rejected-proposals>' : '',
+    operatorOverridesSection: p.operatorOverridesSection ? '<operator-overrides>' : '',
+    portfolioCompositionText: '<portfolio-composition>',
+    modelHealthSection: p.modelHealthSection ? '<model-health>' : '',
+    pruneCandidatesSection: p.pruneCandidatesSection ? '<prune-candidates>' : '',
+    systemMaturitySection: p.systemMaturitySection ? '<system-maturity>' : '',
+    driftSection: p.driftSection ? '<drift>' : '',
+    heldDirectionsSection: p.heldDirectionsSection ? '<held-directions>' : '',
+    recentWorkSection: '<recent-work>',
+    feedbackSection: '<feedback>',
+    questionSection: '<question>',
+    threadSection: '<thread>',
+    taskId: '<task>',
+    versionPhaseSection: p.versionPhaseSection ? '<version-phase>' : '',
+    memoCitationsSection: p.memoCitationsSection ? '<memo-citations>' : '',
+    efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
+    ciComplianceSection: p.ciComplianceSection ? '<ci-compliance>' : '',
+    availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
+    sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
+    localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
+    payloadStalenessSection: p.payloadStalenessSection ? '<payload-staleness>' : '',
+  };
+  const prompt = buildThinkerPrompt(canonical);
+  const withSuffix = promptSuffix
+    ? `${prompt}\n\nAdditional instructions:\n<strategic-prompt-suffix>`
+    : prompt;
+  return withSuffix;
+}
+
+export function computeStrategicPromptFingerprint(
+  p: ThinkerPromptParams,
+  promptSuffix = '',
+): string {
+  return createHash('sha256')
+    .update(buildStrategicFingerprintPrompt(p, promptSuffix))
+    .digest('hex')
+    .slice(0, 12);
+}
+
 // ── Exported for testing: thinker prompt builder ────────────────────────────
 
 export interface ThinkerPromptParams {
@@ -103,6 +197,12 @@ export interface ThinkerPromptParams {
   pruneCandidatesSection?: string;
   systemMaturitySection: string;
   driftSection: string;
+  /**
+   * Held-directions block: directions stuck on consecutive failures, with their
+   * dominant error fingerprint and recent raw failure messages. Optional so existing
+   * constructions/tests that omit it still compile; '' renders nothing.
+   */
+  heldDirectionsSection?: string;
   recentWorkSection: string;
   feedbackSection: string;
   questionSection: string;
@@ -111,6 +211,13 @@ export interface ThinkerPromptParams {
   versionPhaseSection: string;
   memoCitationsSection: string;
   efficiencySnapshotSection: string;
+  /**
+   * CI compliance snapshot for the current automain HEAD — module-size breaches
+   * and branch-literal offenders. Built from the strategic payload's
+   * `ci_compliance` field. Optional so existing constructions/tests that omit it
+   * still compile; '' renders nothing (also omitted when overall status is 'pass').
+   */
+  ciComplianceSection?: string;
   /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
@@ -133,6 +240,13 @@ export interface ThinkerPromptParams {
    * constructions/tests that omit it still compile; '' renders nothing.
    */
   localRunnerSection?: string;
+  /**
+   * Payload currency check — present when the backend could compute SHA
+   * divergence between the compiled payload and the current integration HEAD.
+   * Optional so existing constructions/tests that omit it still compile;
+   * '' renders nothing (also omitted when staleness is absent or indeterminate).
+   */
+  payloadStalenessSection?: string;
 }
 
 export function buildThinkerPrompt(p: ThinkerPromptParams): string {
@@ -177,6 +291,7 @@ ${p.clockHeader}
 Self-repo: ${p.isSelfRepo ? 'true' : 'false'}
 ${p.userStateLine}
 ${p.packerMetaSection ? `\n${p.packerMetaSection}\n` : ''}
+${p.payloadStalenessSection ? `\n${p.payloadStalenessSection}\n` : ''}
 ${p.strategicContext ? `\n## Running Context (from prior cycles)\n${p.strategicContext}\n` : ''}
 ${p.problemModelSection}
 ${p.cycleStartReconciliationSection ? `\n${p.cycleStartReconciliationSection}\n` : ''}
@@ -199,7 +314,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.efficiencySnapshotSection}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 
@@ -236,6 +351,13 @@ Each cycle:
 - \`recommended_mode=ship\` or absent/unknown: normal mode — ship product value.
 - \`recommended_mode=pause\`: the system is blocked externally; do not add new directions to it this cycle.
 On **every** \`create-direction\` and \`update-direction\` call, emit a \`recommended_mode\` field (one of: \`audit\`, \`fundamentals\`, \`ship\`, \`pause\`) that reflects your judgment for that direction's system. Omit only if the direction has no system affiliation.
+
+**Audit-first, convergent — standard behavior at every altitude.** Exploring and auditing to understand the terrain before committing is not an idle-time fallback; it is the default posture at three altitudes:
+- **Before setting or revising a version goal:** audit the project's current state — recent merges, open gaps, what's fragile, what's unfinished — and let that evidence establish a substantial, real goal. Not a feature list, not a nibble.
+- **Before opening a direction:** recon the area it touches so the direction targets the right work, not a symptom or an already-addressed problem.
+- **Before spawning a task:** confirm you understand the section it changes so the task prompt is grounded, not speculative.
+
+**The convergence guardrail:** every audit ends in a decision — a goal, a direction, or a concrete task. Reconnaissance that produces no commitment is drift, not diligence. If a cycle's audit yields no committed next step, that is a failure to converge — NOT "keeping watch." This line separates audit-first from the idle/observe drift failure mode the prompt already warns against.
 
 **Model-size hygiene (soft).** The "Problem-model size (soft signal)" section above (when present) reports how heavy your durable problem_model has grown. Healthy is **<=12 active gaps / <=20 capabilities / <=8 active friction**; a dimension at **>=1.5x** is \`growing\`, **>=2x** is \`large\`, **>=3x** is \`oversized\` (worst dimension wins). When the status is \`large\` or \`oversized\`, the model is getting too big to audit in one pass — **before** opening new gaps or capabilities this cycle, prioritize closing/archiving resolved gaps and consolidating overlapping capabilities to bring it back down. This is a signal to weigh, **never a hard cap**: if a genuinely needed new gap is warranted, still open it. The model grows without bound otherwise, and a model you can't read in one pass is one you can't defend.
 
@@ -379,12 +501,11 @@ When describing changes in prose, be precise: "opening gap g-xxx (from user_mess
 
 Before finishing, write /tmp/research_progress_${p.taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (≤3000 chars) capturing the model changes proposed, gaps opening/closing, and moves. This is a breadcrumb for retry agents if this task fails — lets a retry pick up from your analysis rather than redoing it from scratch.
 
-## 7. Version goal + theme (conditional — only when unset)
+## 7. Version goal (conditional — only when unset)
 
-**Four distinct concepts — keep them separate:**
+**Three distinct concepts — keep them separate:**
 - \`intent.purpose\` = enduring PROJECT north star, operator-owned, spans all versions. Never touch this.
 - \`version.goal\` = THIS version's frozen objective — a derivative of purpose, authored once per version.
-- \`version.theme\` = the falsifiable DELIVERY SHAPE for this version (one of the enum values defined under "Version theme" below).
 - \`intent.current_focus\` = live "working on now" status — NOT the goal, advances across cycles.
 
 **Version goal (only when the Goal shown in Version Phase is unset):**
@@ -400,21 +521,25 @@ Good: a concrete deliverable paired with a measurable success bar a new contribu
 
 Omit the \`new_version_goal\` key entirely if the goal is already set.
 
-**Version theme (only when the Theme shown in Version Phase is unset):**
+## 8. Acceptance criteria (conditional — author only when warranted)
 
-**Skip if the version already has a theme** — the theme is frozen once set; re-emitting is silently ignored.
+Author criteria only when the version needs a root acceptance contract:
+- When the Version Phase section shows \`criterion_coverage.total=0\` (no criteria exist yet for this version) AND the version has a non-empty \`Goal:\` line. If the Version Phase has a non-empty \`Goal:\` but no acceptance-criteria coverage block at all, treat that as the same no-criteria case.
+- OR when active directions created this cycle have no criterion mappings and need to be tied to version-level outcomes.
 
-**Only when the theme is currently unset:** write one of the following values to \`/tmp/new_version_theme_${p.taskId}.txt\` ${READ_ONLY_BASH_WRITE_NOTE}: \`leanness\` | \`reliability\` | \`performance\` | \`feature\` | \`mixed\` | \`none\`
+Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabricate criteria when the version goal is unset — Section 7 handles that case first.
 
-Choose the value that best describes the PRIMARY delivery shape of this version:
-- \`leanness\` — simplification, removal of dead code, reducing complexity or surface area
-- \`reliability\` — stability, correctness, error handling, test coverage, hardening
-- \`performance\` — throughput, latency, efficiency improvements
-- \`feature\` — new user-visible capabilities or significant enhancements
-- \`mixed\` — roughly equal mix of the above (use sparingly — be specific when possible)
-- \`none\` — maintenance cycle with no dominant delivery theme
+When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
-Write only the theme value — no JSON, no label, no quotes. Omit the file entirely if the theme is already set.
+\`\`\`json
+{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}
+\`\`\`
+
+Each \`criteria\` item has:
+- \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
+- \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
+
+Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 
 ${PLAYBOOK_GUIDANCE}
 
@@ -422,13 +547,12 @@ ${DEFAULT_TOOL_GUIDANCE}`;
 }
 
 // ── Pass-1 gate: run thinker, verify artifacts, retry once if missing ────────
-// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal?,
-// newVersionTheme? } when both /tmp/problem_model_<taskId>.json and
+// Exported for unit testing. Returns { ok: true, analysisText, newVersionGoal? }
+// when both /tmp/problem_model_<taskId>.json and
 // /tmp/running_update_<taskId>.md exist after the thinker (or its focused retry)
 // completes. Also reads the optional /tmp/new_version_goal_<taskId>.txt (Section 7
-// output) and /tmp/new_version_theme_<taskId>.txt (Section 7 output) and surfaces
-// their content so the caller can pre-merge them into the problem_model JSON before
-// the executor runs. On any failure path it calls
+// output) and surfaces its content so the caller can pre-merge it into the
+// problem_model JSON before the executor runs. On any failure path it calls
 // persistAndPostStatus(FAILED, failure_category=strategic_thinker_artifacts_missing)
 // and returns { ok: false } so the caller can simply return.
 export async function runThinkerWithGate(
@@ -439,7 +563,7 @@ export async function runThinkerWithGate(
   model: string | undefined,
   effort: string | undefined,
   disallowedTools: string[],
-): Promise<{ ok: true; analysisText: string; newVersionGoal?: string; newVersionTheme?: string } | { ok: false }> {
+): Promise<{ ok: true; analysisText: string; newVersionGoal?: string } | { ok: false }> {
   const problemModelPath = `/tmp/problem_model_${taskId}.json`;
   const runningUpdatePath = `/tmp/running_update_${taskId}.md`;
 
@@ -472,9 +596,35 @@ export async function runThinkerWithGate(
   if (fs.existsSync(problemModelPath)) {
     try {
       const fileContent = fs.readFileSync(problemModelPath, 'utf8');
-      JSON.parse(fileContent);
-      problemModelParseable = true;
-      sendLog(ws, `[INFO] Problem model file exists on disk and is valid JSON; skipping repair reopen.\n`);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const parsed = JSON.parse(fileContent);
+      // Validate the problem_model structure: reject schema-template placeholders
+      // and ensure it's a valid object (not null, array, or primitive).
+      if (parsed != null && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        const intent = (parsed as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+        // If intent is present, validate intent.purpose is not a placeholder.
+        if (intent != null) {
+          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
+          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+          if (isSchemaPlaceholder) {
+            sendLog(
+              ws,
+              `[WARNING] Problem model file exists but intent.purpose is a schema placeholder: "${purpose}"; triggering repair.\n`,
+            );
+            problemModelParseable = false;
+          } else {
+            problemModelParseable = true;
+            sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
+          }
+        } else {
+          // Partial updates may omit intent — that's legitimate.
+          problemModelParseable = true;
+          sendLog(ws, `[INFO] Problem model file exists on disk and is valid; skipping repair reopen.\n`);
+        }
+      } else {
+        sendLog(ws, `[WARNING] Problem model file exists but is not a valid object structure.\n`);
+        problemModelParseable = false;
+      }
     } catch (e) {
       sendLog(ws, `[WARNING] Problem model file exists but is invalid JSON: ${String(e)}\n`);
       problemModelParseable = false;
@@ -655,6 +805,70 @@ export async function runThinkerWithGate(
     }
   }
 
+  // Validate the final problem_model file content: ensure it's not just valid JSON
+  // but also a valid problem_model structure (not a schema placeholder or invalid object).
+  if (fs.existsSync(problemModelPath)) {
+    try {
+      const finalContent = fs.readFileSync(problemModelPath, 'utf8');
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+      const finalModel = JSON.parse(finalContent);
+      if (finalModel != null && typeof finalModel === 'object' && !Array.isArray(finalModel)) {
+        const intent = (finalModel as Record<string, unknown>).intent as Record<string, unknown> | undefined;
+        // If intent is present, it must have a valid non-placeholder purpose.
+        if (intent != null) {
+          const purpose = typeof intent.purpose === 'string' ? intent.purpose.trim() : '';
+          const isSchemaPlaceholder = purpose === '' || purpose === '...' || /^<[^>]+>$/.test(purpose);
+          if (isSchemaPlaceholder) {
+            sendLog(
+              ws,
+              `\n[ERROR] Final problem_model file has invalid intent.purpose after all retry attempts: "${purpose}"\n`,
+            );
+            try {
+              await persistAndPostStatus(taskId, {
+                task_id: taskId,
+                status: 'FAILED',
+                artifact_type: 'ERROR_LOG',
+                logs: `Problem model validation failed: intent.purpose is a schema placeholder "${purpose}"`,
+                failure_category: 'strategic_thinker_artifacts_missing',
+              });
+            } catch (e) {
+              sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+            }
+            return { ok: false };
+          }
+        }
+      } else {
+        sendLog(ws, `\n[ERROR] Final problem_model file is not a valid object structure.\n`);
+        try {
+          await persistAndPostStatus(taskId, {
+            task_id: taskId,
+            status: 'FAILED',
+            artifact_type: 'ERROR_LOG',
+            logs: 'Problem model validation failed: not a valid object structure',
+            failure_category: 'strategic_thinker_artifacts_missing',
+          });
+        } catch (e) {
+          sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e)}\n`);
+        }
+        return { ok: false };
+      }
+    } catch (e) {
+      sendLog(ws, `\n[ERROR] Final problem_model file is invalid JSON: ${String(e)}\n`);
+      try {
+        await persistAndPostStatus(taskId, {
+          task_id: taskId,
+          status: 'FAILED',
+          artifact_type: 'ERROR_LOG',
+          logs: `Problem model validation failed: invalid JSON - ${String(e)}`,
+          failure_category: 'strategic_thinker_artifacts_missing',
+        });
+      } catch (e2) {
+        sendLog(ws, `[ERROR] Failed to post validation failure: ${String(e2)}\n`);
+      }
+      return { ok: false };
+    }
+  }
+
   // Extract the optional new_version_goal — primary: first-class field in the
   // problem_model JSON (the authoritative handoff file the gate already validated);
   // fallback: legacy tmp file written by older thinker agents for backward compat.
@@ -681,19 +895,5 @@ export async function runThinkerWithGate(
     }
   }
 
-  // Read the optional Section 7 version-theme file if the thinker wrote it.
-  const validThemeValues = new Set(['leanness', 'reliability', 'performance', 'feature', 'mixed', 'none']);
-  const newVersionThemePath = `/tmp/new_version_theme_${taskId}.txt`;
-  let newVersionTheme: string | undefined;
-  if (fs.existsSync(newVersionThemePath)) {
-    try {
-      const raw = fs.readFileSync(newVersionThemePath, 'utf8').trim().toLowerCase();
-      if (raw && validThemeValues.has(raw)) newVersionTheme = raw;
-      else if (raw) sendLog(ws, `[WARNING] Ignoring invalid new_version_theme value: "${raw}"\n`);
-    } catch (e) {
-      sendLog(ws, `[WARNING] Failed to read ${newVersionThemePath}: ${String(e)}\n`);
-    }
-  }
-
-  return { ok: true, analysisText, newVersionGoal, newVersionTheme };
+  return { ok: true, analysisText, newVersionGoal };
 }

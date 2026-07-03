@@ -222,6 +222,107 @@ describe('TaskDetailDrawerMeta DetailsTab — viewport regression', () => {
     });
   });
 
+  test('renders sideboard context at 375px without horizontal overflow', async () => {
+    const task: Task = {
+      ...richTask,
+      sideboard_context: {
+        project: { id: 'proj-1', name: 'Blueprint', repo: 'HenryHamster/BlueprintAIStudio' },
+        purpose: 'A compact active-work sideboard context for the task drawer.',
+        strategic: {
+          direction: {
+            id: 'd-viewport-long',
+            text: 'Keep active work tied to the Strategic operator workbench without making the task drawer feel like a second pipeline management interface.',
+            priority: 'high',
+            status: 'active',
+          },
+          cycle: { id: 'sc-viewport-long-cycle-id', phase: 'strategic_review', outcome: 'phase2_running' },
+          parent_strategic_task_id: 'sc-viewport-long-cycle-id',
+        },
+        pipeline: {
+          parent_task_id: 'task-parent-viewport-long-id',
+          child_count: 4,
+          dependency_count: 2,
+          blocked_reason: 'Waiting for a long-running reviewer to finish validating the operator sideboard behavior.',
+        },
+        artifacts: {
+          total: 2,
+          by_type: { PULL_REQUEST: 1, GIT_COMMIT: 1 },
+          primary_pr_url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+          primary_commit: '550e8400e29b41d4a716446655440000abcdef12',
+        },
+        messages: {
+          total_recent: 4,
+          items: [
+            {
+              id: 'msg-viewport',
+              project_id: 'proj-1',
+              message_type: 'NOTE',
+              from_type: 'agent',
+              from_task_id: richTask.id,
+              content: 'This is a long task-linked message preview that should wrap inside the drawer context section on mobile.',
+              context: {},
+              status: 'open',
+              resolution: null,
+              resolved_at: null,
+              created_at: '2026-06-29T12:00:00Z',
+            },
+            {
+              id: 'msg-viewport-2',
+              project_id: 'proj-1',
+              message_type: 'STATUS',
+              from_type: 'agent',
+              from_task_id: richTask.id,
+              content: 'Another long update about operator sideboard context that should stay bounded to two previews.',
+              context: {},
+              status: 'open',
+              resolution: null,
+              resolved_at: null,
+              created_at: '2026-06-29T12:05:00Z',
+            },
+          ],
+        },
+        links: [
+          {
+            id: 'pipeline',
+            label: 'Pipeline flow for the currently selected operator task',
+            target: {
+              surface: 'pipeline',
+              id: 'task-550e8400e29b41d4a716446655440000',
+              task_id: 'task-550e8400e29b41d4a716446655440000',
+            },
+          },
+          {
+            id: 'parent_task',
+            label: 'Parent task with a very long context label',
+            target: {
+              surface: 'task',
+              id: 'task-parent-viewport-long-id-550e8400e29b41d4a716446655440000',
+              task_id: 'task-parent-viewport-long-id-550e8400e29b41d4a716446655440000',
+            },
+          },
+          {
+            id: 'pull_request',
+            label: 'Pull request',
+            target: {
+              surface: 'external',
+              id: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+              url: 'https://github.com/HenryHamster/BlueprintAIStudio/pull/4829',
+            },
+          },
+        ],
+      },
+    };
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => { r.render(<DetailsTab task={task} onNavigateToTask={vi.fn()} />); });
+      expect(host.querySelector('a[href="https://github.com/HenryHamster/BlueprintAIStudio/pull/4829"]')).toBeTruthy();
+    });
+  });
+
   test('displays reasoning text for both passed and failed checks', async () => {
     host = document.createElement('div');
     document.body.appendChild(host);

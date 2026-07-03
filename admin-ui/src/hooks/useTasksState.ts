@@ -304,11 +304,17 @@ export function useTasksState(deps: UseTasksStateDeps) {
     setTasks(prev => prev.map(t => t.id === taskId ? { ...t, status: 'QUEUED' } : t));
     setActionLoadingMap(m => ({ ...m, [taskId]: 'retry' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ status: 'QUEUED' }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        if (original) setTasks(prev => prev.map(t => t.id === taskId ? original : t));
+        addToast(data.detail ? `Failed to retry task: ${data.detail}` : 'Failed to retry task', 'error');
+        return;
+      }
       fetchTasks();
       fetchArchiveTasks();
       addToast('Task queued for retry', 'success');
@@ -324,11 +330,16 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const handleEditPrompt = async (taskId: string, newPrompt: string) => {
     setActionLoadingMap(m => ({ ...m, [taskId]: 'edit' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ payloads: [{ prompt: newPrompt }] }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail ? `Failed to edit task: ${data.detail}` : 'Failed to edit task', 'error');
+        return;
+      }
       fetchTasks();
       addToast('Prompt updated', 'success');
     } catch (error) {
@@ -342,11 +353,16 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const handleDismiss = async (taskId: string) => {
     setActionLoadingMap(m => ({ ...m, [taskId]: 'dismiss' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}`, {
         method: 'PATCH',
         headers: await authHeaders(),
         body: JSON.stringify({ status: 'CANCELLED' }),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail ? `Failed to dismiss task: ${data.detail}` : 'Failed to dismiss task', 'error');
+        return;
+      }
       fetchTasks();
       addToast('Task dismissed', 'success');
     } catch (error) {
@@ -360,10 +376,15 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const handleArchiveTask = async (taskId: string) => {
     setActionLoadingMap(m => ({ ...m, [taskId]: 'archive' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/archive`, {
         method: 'POST',
         headers: await authHeaders(),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail ? `Failed to archive task: ${data.detail}` : 'Failed to archive task', 'error');
+        return;
+      }
       fetchTasks();
       addToast('Task archived', 'success');
     } catch (error) {
@@ -377,10 +398,15 @@ export function useTasksState(deps: UseTasksStateDeps) {
   const handleUnarchiveTask = async (taskId: string) => {
     setActionLoadingMap(m => ({ ...m, [taskId]: 'unarchive' }));
     try {
-      await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/tasks/${taskId}/unarchive`, {
         method: 'POST',
         headers: await authHeaders(),
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        addToast(data.detail ? `Failed to unarchive task: ${data.detail}` : 'Failed to unarchive task', 'error');
+        return;
+      }
       fetchArchiveTasks();
       // Also refresh the main task list so pipeline/kanban pick up the
       // now-unarchived task (used by pipeline-view "Unarchive parent").

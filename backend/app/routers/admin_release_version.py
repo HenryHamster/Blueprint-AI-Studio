@@ -230,6 +230,7 @@ async def _serialize_version_history_entry(
     merged_count: Optional[int] = None
     merged_task_count: Optional[int] = None
     acceptance_aggregate: Optional[dict[str, Any]] = None
+    criterion_coverage: Optional[dict[str, Any]] = None
     if session is not None and project_id is not None:
         version_until = _closed_version_until(version)
         merged_count = await count_merged_since(
@@ -243,8 +244,18 @@ async def _serialize_version_history_entry(
             version,
             merged_count=merged_count,
             aggregate_serving_status=aggregate["serving_status"],
-            acceptance_aggregate=acceptance_aggregate,
         )
+        try:
+            from app import acceptance_criteria as _acceptance_criteria  # noqa: PLC0415
+
+            criterion_coverage = await _acceptance_criteria.get_version_coverage_summary(
+                session, version.id
+            )
+        except Exception:
+            logger.exception(
+                "[VERSION_HISTORY] criterion coverage compute failed for version %s",
+                version.id,
+            )
 
     return {
         "id": str(version.id),
@@ -305,6 +316,7 @@ async def _serialize_version_history_entry(
         "merged_count": merged_count,
         "merged_task_count": merged_task_count,
         "acceptance_aggregate": acceptance_aggregate,
+        "criterion_coverage": criterion_coverage,
     }
 
 
@@ -524,6 +536,21 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        criterion_coverage: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app import acceptance_criteria as _acceptance_criteria  # noqa: PLC0415
+
+                criterion_coverage = await _acceptance_criteria.get_version_coverage_summary(
+                    session, open_row.id
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] criterion coverage compute failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -626,7 +653,6 @@ async def get_version_lifecycle(
                     open_row,
                     merged_count=merged_count,
                     aggregate_serving_status=aggregate_serving["serving_status"],
-                    acceptance_aggregate=acceptance_aggregate,
                 ),
                 # Tasks merged AT/AFTER the last qualification verdict's finalized_at
                 # (verdict-staleness signal). None when no verdict/finalized_at.
@@ -694,7 +720,12 @@ async def get_version_lifecycle(
                 # True when the version has more than _TASKS_MERGED_LIMIT merged
                 # tasks; the UI can show a "showing N of total" indicator.
                 "tasks_merged_has_more": tasks_merged_has_more,
-                "theme": open_row.theme,
+                # Version-scoped acceptance criterion coverage (additive; nullable
+                # when the signal could not be computed). Shape:
+                # {total, covered, partial, uncovered, criteria:[{criterion_key,
+                # text, coverage, evidence_count}]}. total=0 with empty criteria
+                # list when no criteria are defined.
+                "criterion_coverage": criterion_coverage,
             }
 
         history_rows = (
@@ -941,68 +972,6 @@ async def set_version_goal(
         if open_ver.goal_updated_at
         else None,
         "goal_editor_info": open_ver.goal_editor_info,
-    }
-
-
-class _SetVersionThemeBody(BaseModel):
-    theme: str | None = _Field(default=None, max_length=32)
-
-
-@router.post("/projects/{project_id}/version-theme")
-async def set_version_theme(
-    project_id: uuid.UUID,
-    payload: _SetVersionThemeBody,
-    session: AsyncSession = Depends(get_session),
-    current_user: dict = Depends(get_current_user),
-) -> Dict[str, Any]:
-    """Set the delivery theme of the open release version for a project.
-
-    Member+ role required.  Returns 404 when there is no open version.
-    Allows operators to override a mis-authored theme so the merge-grade
-    theme-delivery gate is not permanently blocked.
-
-    Valid themes: leanness, reliability, performance, feature, mixed, none.
-    Pass ``null`` to clear the theme back to unset.
-    """
-    await _get_user_project_with_role(
-        project_id, current_user["user_id"], session, "member"
-    )
-
-    open_ver = (
-        (
-            await session.execute(
-                select(ReleaseVersion)
-                .where(
-                    ReleaseVersion.project_id == project_id,
-                    ReleaseVersion.status == "open",
-                )
-                .order_by(ReleaseVersion.opened_at.desc())
-                .limit(1)
-                .with_for_update()
-            )
-        )
-        .scalars()
-        .first()
-    )
-    if open_ver is None:
-        raise HTTPException(
-            status_code=404,
-            detail="No open release version found for this project.",
-        )
-
-    operator_id = current_user.get("email") or current_user["user_id"]
-    try:
-        _release_version.set_version_theme(
-            open_ver, payload.theme, editor_id=operator_id
-        )
-    except ValueError as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
-    session.add(open_ver)
-    await session.commit()
-    await session.refresh(open_ver)
-    return {
-        "version_number": open_ver.version_number,
-        "theme": open_ver.theme,
     }
 
 
@@ -1361,7 +1330,6 @@ async def get_version_summary(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving["serving_status"],
-        acceptance_aggregate=acceptance_aggregate,
     )
 
     return {
@@ -1729,7 +1697,6 @@ async def get_release_version_summary(
         version,
         merged_count=merged_count,
         aggregate_serving_status=aggregate_serving["serving_status"],
-        acceptance_aggregate=acceptance_aggregate,
     )
 
     return {

@@ -23,7 +23,7 @@ from app.direction_metrics import (
     _compute_direction_quality_score,
     proof_weighted_merged,
 )
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count, verified_merged_count
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -40,7 +40,6 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.release_version import _VALID_THEMES as _VALID_THEME_VALUES
 from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import strategic_phase_for
 from app.time_utils import _utcnow
@@ -417,9 +416,10 @@ NEW_VERSION_GOAL_CONTEXT_KEY = "_strategic_new_version_goal"
 # ReleaseVersion.goal).  Matches the display budget for version goal UI surfaces.
 _NEW_VERSION_GOAL_MAX = 500
 
-# Transient task.context key carrying an agent-emitted new_version_theme from the
-# set_problem_model endpoint to _handle_strategic_completion's API path.
-NEW_VERSION_THEME_CONTEXT_KEY = "_strategic_new_version_theme"
+# Transient task.context key carrying agent-emitted new_acceptance_criteria from the
+# set_problem_model endpoint to _handle_strategic_completion's API path. Mirrors
+# NEW_VERSION_GOAL_CONTEXT_KEY — one source of truth so producer + consumer never drift.
+NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY = "_strategic_new_acceptance_criteria"
 
 # OPTIONAL agent verdict that refines the deterministic outcome-progress
 # (scaffolding) detector. For each long-running ACTIVE direction the strategic
@@ -1194,109 +1194,96 @@ async def _apply_new_version_goal(
         )
 
 
-def extract_new_version_theme(raw: object) -> str | None:
-    """Validate + normalize a raw ``new_version_theme`` value.
-
-    Accepts the string the strategic agent embeds as a top-level sibling in the
-    ``set-problem-model`` payload and returns a clean lowercase string, or ``None``
-    when the input is absent, not a string, or not one of the allowed theme values.
-
-    Used by the ``set_problem_model`` endpoint to lift the field out of the
-    problem_model JSON (ProblemModel is extra="forbid", which would otherwise
-    reject the whole update). ``_apply_new_version_theme`` re-checks the
-    open-version / theme-already-set guards, so a no-op is safe.
-    """
-    if not isinstance(raw, str):
-        return None
-    cleaned = raw.strip().lower()
-    if cleaned not in _VALID_THEME_VALUES:
-        return None
-    return cleaned
-
-
-async def _apply_new_version_theme(
-    theme: object,
+async def _apply_new_acceptance_criteria(
+    criteria_texts: object,
     task: Task,
     project: Project,
     session: AsyncSession,
     *,
     path: str,
 ) -> None:
-    """Apply an optional ``new_version_theme`` from the strategic agent.
+    """Apply optional ``new_acceptance_criteria`` from the strategic agent.
 
-    ``theme`` is the raw value from either:
-      - the API path: ``task.context.get(NEW_VERSION_THEME_CONTEXT_KEY)``
-      - the fallback parse path: ``parsed.get("new_version_theme")``
-
-    When valid, sets the theme and ``session.add``s the row — the caller's
-    surrounding ``await session.commit()`` persists it.
-
-    Silently no-ops when:
-      - ``theme`` is None / not a non-empty string
-      - the value is not one of the valid theme values
-      - The project has no open ``ReleaseVersion``
-      - The open version has an operator-set theme (theme_editor_info starts with "[operator:")
-
-    All errors are logged and swallowed — a bad or absent theme must never
-    block vision/direction writes.
+    ``criteria_texts`` is the raw value from
+    ``task.context[NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY]`` — a list of strings.
+    For each text, creates a new VersionAcceptanceCriterion on the open version,
+    skipping duplicates (same text already exists). Errors are swallowed so a
+    bad criteria list never blocks vision/direction writes.
     """
-    if not theme or not isinstance(theme, str):
-        return
-    _nvt_text = theme.strip().lower()
-    if _nvt_text not in _VALID_THEME_VALUES:
+    if not isinstance(criteria_texts, list) or not criteria_texts:
         return
     try:
-        from app.release_version import (
-            current_open_version as _cur_open_version,
-            set_version_theme as _set_version_theme,
-        )
+        from app import acceptance_criteria as _ac
+        from app.release_version import current_open_version as _cur_open_version
 
         _open_ver = await _cur_open_version(session, project.id)
         if _open_ver is None:
-            logger.debug(
+            logger.info(
                 "[STRATEGIC] Task %s (%s path): no open ReleaseVersion for project %s "
-                "— skipping new_version_theme",
+                "— skipping new_acceptance_criteria",
                 task.id,
                 path,
                 project.id,
             )
             return
-        if _open_ver.theme is not None:
-            _ei = _open_ver.theme_editor_info or ""
-            if _ei.startswith("[operator:"):
+        existing = await _ac.get_criteria_for_version(session, _open_ver.id)
+        existing_texts = {c.text for c in existing}
+        headroom = _ac.MAX_CRITERIA_PER_VERSION - len(existing)
+        created_count = 0
+        skipped_over_cap = 0
+        for text in criteria_texts:
+            if not isinstance(text, str):
+                continue
+            cleaned = text.strip()
+            if not cleaned:
+                continue
+            if cleaned in existing_texts:
                 logger.debug(
-                    "[STRATEGIC] Task %s (%s path): open version v%d has an operator-set theme "
-                    "— skipping new_version_theme (operator themes are frozen to strategist)",
+                    "[STRATEGIC] Task %s (%s path): skipping duplicate criterion text for "
+                    "project %s version v%d: %.80s",
                     task.id,
                     path,
+                    project.id,
                     _open_ver.version_number,
+                    cleaned,
                 )
-                return
+                continue
+            if created_count >= headroom:
+                skipped_over_cap += 1
+                continue
+            await _ac.stage_criterion(
+                session,
+                project_id=project.id,
+                release_version_id=_open_ver.id,
+                text=cleaned,
+                created_by="strategist",
+            )
+            existing_texts.add(cleaned)
+            created_count += 1
+        if created_count > 0:
             logger.info(
-                "[STRATEGIC] Task %s (%s path): open version v%d has a non-operator theme "
-                "— allowing strategist correction",
+                "[STRATEGIC] Task %s (%s path): authored %d acceptance criterion(a) "
+                "for project %s version v%d",
                 task.id,
                 path,
+                created_count,
+                project.id,
                 _open_ver.version_number,
             )
-        _set_version_theme(
-            _open_ver,
-            _nvt_text,
-            editor_id=str(task.id)[:8],
-            source="strategist",
-        )
-        session.add(_open_ver)
-        logger.info(
-            "[STRATEGIC] Task %s (%s path): authored version theme for v%d project=%s: %s",
-            task.id,
-            path,
-            _open_ver.version_number,
-            project.id,
-            _nvt_text,
-        )
+        if skipped_over_cap > 0:
+            logger.info(
+                "[STRATEGIC] Task %s (%s path): dropped %d criterion(a) — "
+                "cap of %d reached for project %s version v%d",
+                task.id,
+                path,
+                skipped_over_cap,
+                _ac.MAX_CRITERIA_PER_VERSION,
+                project.id,
+                _open_ver.version_number,
+            )
     except Exception:
         logger.exception(
-            "[STRATEGIC] Task %s (%s path): failed to apply new_version_theme (non-fatal)",
+            "[STRATEGIC] Task %s (%s path): failed to apply new_acceptance_criteria (non-fatal)",
             task.id,
             path,
         )
@@ -1400,9 +1387,12 @@ async def _apply_qualify_request(
     It is the agent's signal that an ``open`` version in ``stabilize`` is
     release-ready (automain-lts-plan-v1.md Phase 3). When valid, looks up the
     open ``ReleaseVersion``, gates on
-    ``phase == "stabilize"``, and calls ``release_qualifier.run_qualification``
+    ``phase == "stabilize"``, verifies the current automain HEAD is not blocked
+    by CI-compliance violations, and calls ``release_qualifier.run_qualification``
     (which snapshots the candidate SHA + spawns the audit/smoketest children;
-    the caller's surrounding commit persists its version-row writes).
+    the caller's surrounding commit persists its version-row writes). When
+    CI-compliance blocks qualification, the cap-bump remediation task is spawned
+    before returning.
 
     Silently no-ops when ``request`` is None/not a dict, there is no open
     ``ReleaseVersion``, or that version is not in ``stabilize``. All errors are
@@ -1437,6 +1427,54 @@ async def _apply_qualify_request(
                 open_ver.phase,
             )
             return
+        try:
+            from app import ci_compliance as _ci_compliance
+            from app.strategic_spawning import (
+                _maybe_spawn_ci_compliance_cap_bump_fix,
+                ci_compliance_qualify_gate,
+            )
+
+            status = await _ci_compliance.ensure_current_ci_compliance(
+                session, project
+            )
+            if status.get("status") == "success":
+                gate = ci_compliance_qualify_gate(project, status.get("head_sha"))
+                if gate.get("blocked"):
+                    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(
+                        session, project, gate
+                    )
+                    logger.info(
+                        "[STRATEGIC] Task %s (%s path): qualify_request for "
+                        "project %s version v%d blocked by CI-compliance "
+                        "violations=%s head=%s cap_bump_task=%s (reason=%r)",
+                        task.id,
+                        path,
+                        project.id,
+                        open_ver.version_number,
+                        gate.get("violation_count", 0),
+                        gate.get("head_sha"),
+                        getattr(spawned, "id", None),
+                        reason,
+                    )
+                    return
+            else:
+                logger.info(
+                    "[STRATEGIC] Task %s (%s path): CI-compliance status "
+                    "unavailable for project %s before qualify_request "
+                    "(reason=%s); failing open",
+                    task.id,
+                    path,
+                    project.id,
+                    status.get("reason"),
+                )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] Task %s (%s path): CI-compliance qualify gate "
+                "failed for project %s; failing open",
+                task.id,
+                path,
+                project.id,
+            )
         result = await _rq.run_qualification(session, project.id, open_ver)
         logger.info(
             "[STRATEGIC] Task %s (%s path): qualify_request ran qualification "
@@ -2001,16 +2039,22 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     if len(history) < 3 or churn_window <= 0:
         return None
     window = history[-churn_window:]
-    # Verification-aware: degraded-unverified merges are excluded from the merge
-    # count (and so count as non-merge finished work) to match the per-task
-    # outcome layer. Benign-unverified and verified merges still count.
-    merged = sum(verified_merged_count(e) for e in window)
+    # Credit-gate aware: confirmed-stranded merges are excluded; landed and
+    # ancestry-indeterminate merges both count (flag-trust preserved). Also
+    # excludes degraded-unverified merges via verified_merged_count base.
+    merged = sum(credit_gate_merged_count(e) for e in window)
     # Proof-weighted merge volume drives the RATE gate so a direction whose merges
     # are mostly undeclared/unproven (the "merely delivered" proxy) reads as a lower
     # merge rate than one shipping proven work, and trips the churn guardrail where
-    # the proven direction does not. The displayed ``merged`` count stays the integer
-    # verified total. Legacy/read-only cycles degrade to the verified value.
-    proof_merged = sum(proof_weighted_merged(e) for e in window)
+    # the proven direction does not. The displayed ``merged`` count is the
+    # credit-gate basis (verified minus confirmed-stranded). Legacy/read-only cycles
+    # degrade to the verified value.
+    # Subtract confirmed-stranded merges from the proof-weighted total so the rate
+    # numerator stays consistent with the credit_gate_merged_count denominator.
+    proof_merged = sum(
+        max(0.0, proof_weighted_merged(e) - float(e.get("stranded_prs_merged") or 0))
+        for e in window
+    )
     tasks_complete = sum(e.get("tasks_completed", 0) for e in window)
     # Children that COMPLETED without opening a PR because the deliverable already
     # existed ("no changes needed") are correct no-ops, not churn. Subtract them so
@@ -2044,9 +2088,9 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
 
-    # Verification-aware merge counts (window + evicted aggregate): degraded
-    # merges are excluded so they don't suppress lifetime non-merge burn.
-    window_merged = sum(verified_merged_count(e) for e in history)
+    # Credit-gate aware: excludes confirmed-stranded AND degraded-unverified
+    # merges so neither suppresses lifetime non-merge burn.
+    window_merged = sum(credit_gate_merged_count(e) for e in history)
     window_completed = sum(e.get("tasks_completed", 0) for e in history)
     # Correct no-op completions ("deliverable already exists", no PR) are not burn.
     # Subtract them across both the rolling window and the lifetime aggregate. Both
@@ -2057,8 +2101,13 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
         for e in history
     )
     # Legacy aggregates predate total_verified_prs_merged; fall back to
-    # total_prs_merged so old folded data is unchanged.
-    agg_merged = agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0))
+    # total_prs_merged so old folded data is unchanged. Subtract stranded merges
+    # so the credit-gate discount survives cycle eviction into the aggregate.
+    agg_merged = max(
+        0,
+        int(agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0)
+        - int(agg.get("total_stranded_prs_merged", 0) or 0),
+    )
     agg_completed = agg.get("total_tasks_completed", 0)
     agg_no_pr = agg.get("total_tasks_completed_no_pr", 0)
     agg_code_failed = max(
@@ -2080,10 +2129,15 @@ def _compute_lifetime_burn_metrics(direction: dict) -> dict | None:
     # Proof-weighted lifetime merge volume drives the RATE gate (same rationale as
     # _compute_churn_metrics): undeclared/unproven lifetime merges count for less, so
     # a slow-burn direction shipping only unprovable work trips the backstop where a
-    # proven one does not. Displayed lifetime_merged stays the integer verified total.
+    # proven one does not. Displayed lifetime_merged is the credit-gate basis
+    # (verified minus confirmed-stranded, same as window_merged).
+    # Subtract confirmed-stranded merges so the rate numerator stays consistent with
+    # the credit_gate_merged_count basis used for lifetime_merged/window_merged.
+    agg_stranded = float(agg.get("total_stranded_prs_merged", 0) or 0)
     proof_lifetime_merged = sum(
-        proof_weighted_merged(e) for e in history
-    ) + _agg_proof_weighted_merged(agg)
+        max(0.0, proof_weighted_merged(e) - float(e.get("stranded_prs_merged") or 0))
+        for e in history
+    ) + max(0.0, _agg_proof_weighted_merged(agg) - agg_stranded)
     lifetime_merge_rate = proof_lifetime_merged / total_finished
     return {
         "lifetime_merged": lifetime_merged,
@@ -2710,6 +2764,14 @@ def outcome_progress_summary_fields(direction: dict) -> dict:
     return fields
 
 
+def _outcome_progress_merged_total(history: list[dict], agg: dict) -> int:
+    return sum(credit_gate_merged_count(e) for e in history) + max(
+        0,
+        int(agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0)
+        - int(agg.get("total_stranded_prs_merged", 0) or 0),
+    )
+
+
 def record_outcome_progress_snapshot(direction: dict) -> None:
     """Append a per-cycle outcome-progress snapshot to the direction (bounded).
 
@@ -2728,16 +2790,8 @@ def record_outcome_progress_snapshot(direction: dict) -> None:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    # Verified basis: progress is only credited for merges that reproduced on
-    # HEAD. ``verified_merged_count`` falls back to raw ``prs_merged`` for legacy
-    # entries; the aggregate falls back from ``total_verified_prs_merged`` to
-    # ``total_prs_merged`` for legacy folds (same basis as line ~890 and
-    # ``_check_direction_completion``). The reset baseline in
-    # ``_reset_scaffolding_state_on_outcome_change`` MUST use this same basis so
-    # the ``post_merged = total - reset_merged`` delta math stays consistent.
-    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
-        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
-    )
+    # Reachable credit basis; reset MUST use the same helper so deltas align.
+    total_merged = _outcome_progress_merged_total(history, agg)
     se_text = ((direction.get("context") or {}).get("success_evidence") or "").encode()
     success_evidence_fp = hashlib.sha256(se_text).hexdigest()[:16]
     snapshot = {
@@ -2821,11 +2875,8 @@ def _reset_scaffolding_state_on_outcome_change(direction: dict) -> bool:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     total_cycles = len(history) + (agg.get("total_cycles") or 0)
-    # Verified basis — MUST match ``record_outcome_progress_snapshot`` exactly so
-    # the latch's ``post_merged = total - reset_merged`` delta stays on one basis.
-    total_merged = sum(verified_merged_count(e) for e in history) + agg.get(
-        "total_verified_prs_merged", agg.get("total_prs_merged", 0)
-    )
+    # Reachable credit basis; MUST match ``record_outcome_progress_snapshot``.
+    total_merged = _outcome_progress_merged_total(history, agg)
     direction["outcome_progress_reset_at_cycle"] = total_cycles
     direction["outcome_progress_reset_at_merged"] = total_merged
     return cleared
@@ -3815,13 +3866,13 @@ async def _handle_strategic_completion(
         # Sets the open version's goal with source="strategist" when null.
         _nvg_ctx = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
         await _apply_new_version_goal(_nvg_ctx, task, project, session, path="api")
-        # Apply new_version_theme if the agent supplied one via the API. Same
-        # transport as new_version_goal: the ``set_problem_model`` endpoint lifts
-        # the field out of the problem_model JSON and stows the validated value
-        # under ``NEW_VERSION_THEME_CONTEXT_KEY``. Sets the open version's theme
-        # (leanness|reliability|performance|feature|mixed|none) when null.
-        _nvt_ctx = (task.context or {}).get(NEW_VERSION_THEME_CONTEXT_KEY)
-        await _apply_new_version_theme(_nvt_ctx, task, project, session, path="api")
+        # Apply new_acceptance_criteria if the agent supplied them via the API.
+        # Same transport: the ``set_problem_model`` endpoint lifts the field out of
+        # the problem_model JSON and stows the list under
+        # ``NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY``. Creates one criterion per text,
+        # skipping duplicates.
+        _nac_ctx = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
+        await _apply_new_acceptance_criteria(_nac_ctx, task, project, session, path="api")
 
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
@@ -3920,7 +3971,6 @@ async def _handle_strategic_completion(
     new_problem_model = parsed.get("problem_model")
     new_running_update = parsed.get("running_update")
     new_version_goal = parsed.get("new_version_goal")
-    new_version_theme = parsed.get("new_version_theme")
     direction_ops = parsed.get("direction_operations", [])
 
     # Lock project row to prevent concurrent direction/vision mutations.
@@ -4141,9 +4191,12 @@ async def _handle_strategic_completion(
     await _apply_new_version_goal(
         new_version_goal, task, project, session, path="fallback"
     )
-    # Apply new_version_theme when the strategist authors the delivery theme.
-    await _apply_new_version_theme(
-        new_version_theme, task, project, session, path="fallback"
+
+    # Apply new_acceptance_criteria when the strategist authors version-scoped
+    # criteria in the fallback output. Mirrors the API path above so fallback
+    # completions cannot silently drop the canonical acceptance contract.
+    await _apply_new_acceptance_criteria(
+        parsed.get("new_acceptance_criteria"), task, project, session, path="fallback"
     )
 
     # Reconcile project.running_update operator-wins via the same shared helper
@@ -4259,6 +4312,11 @@ async def _handle_strategic_completion(
     # project.vision assignment out of this file's ratchet count).
     _pending_rejected_proposals: list = []
     retired_rationales_fb: Dict[str, str] = {}
+    # Gap-staffing reconciliations to apply to project.problem_model after the
+    # op loop. Each entry is ``(direction_id, new_gap_id, prior_gap_id)`` — the
+    # fallback mirror of the HTTP create/update_direction reconciliation. Applied
+    # once after the loop, in the same locked transaction as the directions write.
+    _pending_gap_reconciles: list = []
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(
@@ -4492,6 +4550,14 @@ async def _handle_strategic_completion(
                     )
                     new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
+                # Stage the gap this fresh active direction staffs (active_moves
+                # + clear deferral). Mirror the HTTP create_direction path: only a
+                # live active direction staffs a gap (a pause-translated direction
+                # is not yet working it). Applied to problem_model after the loop.
+                if new_dir.get("gap_id") and new_dir.get("status") == "active":
+                    _pending_gap_reconciles.append(
+                        (new_dir["id"], new_dir["gap_id"], None)
+                    )
                 ops_applied += 1
                 creates_count += 1
                 created_ids_fb.append(new_dir["id"])
@@ -4529,6 +4595,9 @@ async def _handle_strategic_completion(
                         _pre_ctx = d.get("context") or {}
                         _pre_se = _pre_ctx.get("success_evidence")
                         _pre_rc = _pre_ctx.get("retirement_condition")
+                        # Prior gap_id captured before the change, for re-ground
+                        # reconciliation (prune old gap, stage the new one).
+                        _pre_gap_id_fb = d.get("gap_id")
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -4552,6 +4621,9 @@ async def _handle_strategic_completion(
                                 d["gap_id"] = str(gid)
                             else:
                                 d.pop("gap_id", None)
+                            _pending_gap_reconciles.append(
+                                (str(dir_id), d.get("gap_id"), _pre_gap_id_fb)
+                            )
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
@@ -5010,6 +5082,31 @@ async def _handle_strategic_completion(
             _dirs = list(directions)
             await with_directions_locked(session, task.project_id, lambda _: _dirs)
 
+        # Reconcile problem-model gaps for any create/re-ground that carried a
+        # gap_id, in the same locked transaction as the directions write (the
+        # project row is held for this whole fallback). Parse once, apply the
+        # whole batch, write back only when something changed — mirrors the HTTP
+        # create/update_direction reconciliation. Fail-open on a malformed model.
+        if _pending_gap_reconciles:
+            from app.problem_model import (
+                parse_problem_model,
+                reconcile_gap_staffing,
+            )
+            from pydantic import ValidationError as _PMValidationError
+
+            try:
+                _pm_model = parse_problem_model(project.problem_model)
+            except _PMValidationError:
+                _pm_model = None
+            if _pm_model is not None:
+                _pm_changed = False
+                for _did, _new_g, _prior_g in _pending_gap_reconciles:
+                    if reconcile_gap_staffing(_pm_model, _did, _new_g, _prior_g):
+                        _pm_changed = True
+                if _pm_changed:
+                    project.problem_model = _pm_model.model_dump()
+                    flag_modified(project, "problem_model")
+
         if _pending_retire_memory:
             from app.task_locking import with_vision_locked
 
@@ -5020,6 +5117,29 @@ async def _handle_strategic_completion(
                     record_retired_direction_memory(vision, _rd, reason="strategic_retire")
 
             await with_vision_locked(session, task.project_id, _apply_retire_memory)
+
+        # Reconcile problem-model gaps for the batch's retired directions in a
+        # single deferred locked pass (mirrors the _pending_retire_memory flush
+        # above) — NOT inside the per-op loop. Prunes each retired id from its
+        # gap's active_moves (-> past_moves) and records a GapDeferral when the
+        # retire emptied a gap's active_moves, so a gap whose only staffing
+        # direction just retired is acknowledged instead of flagged as a stale
+        # active-move / orphaned gap by the next cycle's reconciliation view.
+        if retires_applied and retired_ids_fb:
+            from app.problem_model import reconcile_gaps_for_retired_directions
+            from app.task_locking import with_problem_model_locked
+
+            _reconcile_ids = list(retired_ids_fb)
+            _reconcile_now = _utcnow().isoformat()
+
+            def _apply_gap_reconcile(pm: dict) -> None:
+                reconcile_gaps_for_retired_directions(
+                    pm, _reconcile_ids, _reconcile_now
+                )
+
+            await with_problem_model_locked(
+                session, task.project_id, _apply_gap_reconcile
+            )
 
         if _pending_rejected_proposals:
             from app.task_locking import with_vision_locked

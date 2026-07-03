@@ -3,18 +3,11 @@ import { useState, useCallback } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
 import { MarkdownContent } from './MarkdownContent';
+import type { CitationState, ProjectMessage, ProjectMessageContext, ProvenanceWarnings } from '../types/messages';
+import { buildMessageStrategicContextDescriptor } from '../utils/strategicContextDescriptor';
+import { StrategicContextDescriptor } from './StrategicContextDescriptor';
 
-type CitationState = 'absent' | 'present' | 'indeterminate';
-
-interface ProvenanceWarnings {
-  citation_state?: CitationState;
-  broken_refs?: string[];
-  ungrounded_refs?: string[];
-}
-
-type ProjectMessageContext = Record<string, unknown> & {
-  _provenance_warnings?: ProvenanceWarnings;
-};
+export type { ProjectMessage, ProjectMessageContext } from '../types/messages';
 
 function CopyableMessageRef({ msgId }: { msgId: string }) {
   const [copied, setCopied] = useState(false);
@@ -38,20 +31,6 @@ function CopyableMessageRef({ msgId }: { msgId: string }) {
       {shortRef}
     </button>
   );
-}
-
-export interface ProjectMessage {
-  id: string;
-  project_id: string;
-  message_type: string;
-  from_type: string;
-  from_task_id: string | null;
-  content: string;
-  context: ProjectMessageContext;
-  status: string;
-  resolution: string | null;
-  resolved_at: string | null;
-  created_at: string | null;
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
@@ -82,14 +61,23 @@ export function formatFromType(msg: ProjectMessage): string {
     const taskSlice = msg.from_task_id ? ` (${msg.from_task_id.slice(0, 8)})` : '';
     return `Agent${taskSlice}`;
   }
-  if (ft === 'strategic') return 'Strategic Review';
+  if (ft === 'strategic' || ft === 'strategist') return 'Strategic Review';
   if (ft === 'system') return 'System';
+  return 'You';
+}
+
+function formatChatFromType(msg: ProjectMessage): string {
+  const ft = (msg.from_type || '').toLowerCase();
+  if (ft === 'strategic' || ft === 'strategist') return 'Strategic';
+  if (ft === 'system') return 'System';
+  if (ft === 'agent') return 'Agent';
   return 'You';
 }
 
 // eslint-disable-next-line react-refresh/only-export-components
 export function isUserMessage(msg: ProjectMessage): boolean {
-  return (msg.from_type || '').toLowerCase() === 'user';
+  const ft = (msg.from_type || '').toLowerCase();
+  return ft === 'user' || ft === 'operator';
 }
 
 function asStringArray(value: unknown): string[] {
@@ -207,6 +195,9 @@ export interface MessageBubbleProps {
   faded?: boolean;
   readOnly?: boolean;
   allMessages?: ProjectMessage[];
+  presentation?: 'triage' | 'chat';
+  highlighted?: boolean;
+  actionMode?: 'full' | 'reply-only' | 'none';
   resolvingId: string | null;
   resolveInput: string;
   deletingIds: Set<string>;
@@ -227,6 +218,7 @@ export interface MessageBubbleProps {
   onStartInvestigate: (msgId: string) => void;
   onCancelInvestigate: () => void;
   onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => void;
+  onOpenStrategicContext?: () => void;
 }
 
 export function MessageBubble({
@@ -234,6 +226,9 @@ export function MessageBubble({
   faded = false,
   readOnly = false,
   allMessages = [],
+  presentation = 'triage',
+  highlighted = false,
+  actionMode = 'full',
   resolvingId,
   resolveInput,
   deletingIds,
@@ -254,12 +249,21 @@ export function MessageBubble({
   onStartInvestigate,
   onCancelInvestigate,
   onReply,
+  onOpenStrategicContext,
 }: MessageBubbleProps) {
   const config = TYPE_CONFIG[msg.message_type] || TYPE_CONFIG.NOTE;
   const Icon = config.icon;
   const userMsg = isUserMessage(msg);
+  const chatMode = presentation === 'chat';
+  const showOpsChrome = !chatMode;
+  const fromType = (msg.from_type || '').toLowerCase();
+  const replyableChatAuthor = fromType === 'agent' || fromType === 'strategic' || fromType === 'strategist';
+  const canChatReply = chatMode && replyableChatAuthor && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none';
   const isResolving = resolvingId === msg.id;
   const taskId = msg.from_task_id;
+  const strategicContextReceipt = chatMode && userMsg
+    ? buildMessageStrategicContextDescriptor(msg.context)
+    : null;
 
   let replyContextMsg: ProjectMessage | null = null;
   let replyContextType: 'feedback' | 'question' | null = null;
@@ -275,14 +279,57 @@ export function MessageBubble({
   }
 
   return (
-    <div data-testid="message-bubble" className={`flex ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''}`}>
-      <div className={`max-w-[85%] md:max-w-[70%] ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
+    <div
+      data-testid="message-bubble"
+      data-message-id={msg.id}
+      className={`group flex scroll-mt-24 rounded-md transition-colors ${userMsg ? 'justify-end' : 'justify-start'} ${faded ? 'opacity-75' : ''} ${highlighted ? 'bg-amber-400/5 ring-1 ring-amber-300/35' : ''}`}
+    >
+      <div className={`${
+        chatMode
+          ? userMsg
+            ? 'max-w-[86%] md:max-w-[72%]'
+            : 'w-full max-w-[92%] md:max-w-[76%]'
+          : 'max-w-[85%] md:max-w-[70%]'
+      } ${userMsg ? 'items-end' : 'items-start'} flex flex-col`}>
+        {chatMode && !userMsg && (
+          <div className="relative mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
+            <span className="font-medium text-neutral-400">{formatChatFromType(msg)}</span>
+            <span aria-hidden="true">·</span>
+            <span>{formatAge(msg.created_at)}</span>
+            {taskId && (
+              <>
+                <span aria-hidden="true">·</span>
+                <span
+                  className="font-mono text-ui-md text-neutral-600"
+                  title={`Task ${taskId}`}
+                >
+                  {taskId.slice(0, 8)}
+                </span>
+              </>
+            )}
+            {canChatReply && (
+              <button
+                onClick={() => onReply({ id: msg.id, content: msg.content, from: formatChatFromType(msg), message_type: msg.message_type, status: msg.status })}
+                title="Reply"
+                className="absolute -right-1 -top-3 flex min-h-[44px] min-w-[44px] items-center justify-center rounded p-2 text-neutral-600 opacity-40 transition-colors hover:text-neutral-300 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-neutral-600 md:opacity-0 md:group-hover:opacity-100"
+              >
+                <Reply className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+        )}
         {/* Bubble */}
-        <div className={`rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
-          msg.message_type === 'BLOCKER' ? 'border-amber-600/60 ring-1 ring-amber-500/20' :
-          msg.message_type === 'BUG_REPORT' ? 'border-red-700/60' : ''
-        }`}>
+        <div className={chatMode
+          ? userMsg
+            ? 'rounded-md border border-neutral-700/60 bg-[#10161f] px-3 py-2 shadow-[0_1px_0_rgba(255,255,255,0.035)]'
+            : 'rounded-md border border-transparent bg-transparent px-0.5 py-0.5'
+          : `rounded-2xl border px-4 py-3 ${config.bubbleBg} ${
+            msg.message_type === 'BLOCKER' ? 'border-amber-600/60 ring-1 ring-amber-500/20' :
+            msg.message_type === 'BUG_REPORT' ? 'border-red-700/60' : ''
+          }`
+        }>
           {/* Header line */}
+          {showOpsChrome && (
           <div className="flex items-center gap-2 mb-1">
             <Icon className={`w-3.5 h-3.5 shrink-0 ${config.color}`} />
             <span className={`text-ui-md font-semibold ${config.color}`}>{config.label}</span>
@@ -300,11 +347,12 @@ export function MessageBubble({
               <span> · {formatAge(msg.created_at)}</span>
             </span>
             <span className="flex-1" />
-            <CopyableMessageRef msgId={msg.id} />
+            {actionMode === 'full' && <CopyableMessageRef msgId={msg.id} />}
           </div>
+          )}
           {/* Reply context for feedback acknowledgment and question answer */}
           {replyContextMsg && (
-            <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
               <p className="text-ui-md text-neutral-500 mb-0.5">
                 {replyContextType === 'question' ? 'Answering your question:' : 'In reply to your feedback:'}
               </p>
@@ -313,27 +361,36 @@ export function MessageBubble({
           )}
           {/* Reply quote (if this message is a reply) */}
           {typeof msg.context.reply_preview === 'string' && (
-            <div className="mb-1.5 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
+            <div className="mb-1 px-2 py-1 border-l-2 border-neutral-700/50 rounded-r bg-neutral-800/30">
               <p className="text-ui-md text-neutral-500 truncate">{msg.context.reply_preview}</p>
             </div>
           )}
           {/* Content */}
           {userMsg ? (
-            <div className="text-sm text-neutral-200 leading-relaxed">
+            <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           ) : (
-            <div className="text-sm text-neutral-200 leading-relaxed">
+            <div className={chatMode ? 'text-sm text-neutral-100 leading-relaxed' : 'text-sm text-neutral-200 leading-relaxed'}>
               <MarkdownContent content={msg.content} />
             </div>
           )}
-          <StaleCitationBadge msg={msg} />
+          {showOpsChrome && <StaleCitationBadge msg={msg} />}
           {/* Context badges */}
-          <ContextBadges context={msg.context} fromType={msg.from_type} />
+          {showOpsChrome && <ContextBadges context={msg.context} fromType={msg.from_type} />}
+          {strategicContextReceipt && (
+            <div className="mt-1.5 border-t border-neutral-700/50 pt-1.5">
+              <StrategicContextDescriptor
+                model={strategicContextReceipt}
+                variant="receipt"
+                onOpen={onOpenStrategicContext}
+              />
+            </div>
+          )}
         </div>
 
         {/* Linked indicator (for linked messages) */}
-        {msg.status === 'linked' && (
+        {showOpsChrome && msg.status === 'linked' && (
           <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-indigo-800/30 border border-indigo-700/40`}>
             <p className="text-ui-md text-neutral-400">
               <span className="text-indigo-400 font-medium">Being addressed</span>
@@ -359,7 +416,7 @@ export function MessageBubble({
 
         {/* Resolution (for resolved messages) */}
         {msg.status === 'resolved' && msg.resolution && (
-          <div className={`mt-1 ${userMsg ? 'mr-3' : 'ml-3'} px-3 py-1.5 rounded-lg bg-neutral-800/50 border border-neutral-700/30`}>
+          <div className={`mt-1 ${userMsg ? 'mr-2' : 'ml-2'} px-2.5 py-1 ${chatMode ? 'rounded border border-neutral-800/70 bg-neutral-900/40' : 'rounded-lg bg-neutral-800/50 border border-neutral-700/30'}`}>
             <p className="text-ui-md text-neutral-500">
               <span className="text-emerald-500/70 font-medium">Resolved:</span> {msg.resolution}
             </p>
@@ -367,9 +424,9 @@ export function MessageBubble({
         )}
 
         {/* Action buttons (open messages only, not faded, not read-only grouped rows, not linked) */}
-        {!faded && !readOnly && msg.status === 'open' && (
+        {!chatMode && !faded && !readOnly && msg.status === 'open' && actionMode !== 'none' && (
           <div className={`flex items-center gap-1 mt-1 ${userMsg ? 'self-end mr-1' : 'self-start ml-1'}`}>
-            {selectMode && msg.message_type === 'FEEDBACK' && (
+            {selectMode && actionMode === 'full' && msg.message_type === 'FEEDBACK' && (
               <button
                 onClick={() => onToggleSelect(msg.id)}
                 className={`p-2.5 md:p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center ${
@@ -386,7 +443,7 @@ export function MessageBubble({
             >
               <Reply className="w-3.5 h-3.5" />
             </button>
-            {msg.message_type === 'FEEDBACK' && !selectMode && (
+            {actionMode === 'full' && msg.message_type === 'FEEDBACK' && !selectMode && (
               <button
                 onClick={() => onCreateDirection(msg)}
                 disabled={creatingDirectionIds.has(msg.id)}
@@ -396,7 +453,7 @@ export function MessageBubble({
                 <PlusCircle className="w-3.5 h-3.5" />
               </button>
             )}
-            {(msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
+            {actionMode === 'full' && (msg.message_type === 'BLOCKER' || msg.message_type === 'BUG_REPORT') && investigatingId !== msg.id && !investigatingIds.has(msg.id) && (
               <button
                 onClick={() => onStartInvestigate(msg.id)}
                 disabled={investigatingIds.has(msg.id)}
@@ -406,7 +463,7 @@ export function MessageBubble({
                 <AlertTriangle className="w-3.5 h-3.5" />
               </button>
             )}
-            {investigatingId === msg.id && (
+            {actionMode === 'full' && investigatingId === msg.id && (
               <div className="flex items-center gap-1 bg-neutral-900 border border-neutral-700 rounded-lg px-2 py-1 ml-1">
                 <span className="text-xs text-neutral-400 whitespace-nowrap">Spawn investigation?</span>
                 <button
@@ -426,7 +483,7 @@ export function MessageBubble({
                 </button>
               </div>
             )}
-            {!isResolving ? (
+            {actionMode === 'full' && (!isResolving ? (
               <button
                 onClick={() => onStartResolve(msg.id)}
                 title="Resolve"
@@ -461,7 +518,8 @@ export function MessageBubble({
                   <X className="w-3 h-3" />
                 </button>
               </div>
-            )}
+            ))}
+            {actionMode === 'full' && (
             <button
               onClick={() => onDelete(msg.id)}
               disabled={deletingIds.has(msg.id)}
@@ -470,6 +528,7 @@ export function MessageBubble({
             >
               <Trash2 className="w-3.5 h-3.5" />
             </button>
+            )}
           </div>
         )}
       </div>

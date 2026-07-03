@@ -1,9 +1,9 @@
 import { type Dispatch, type SetStateAction, type RefObject, useState, useRef, useEffect } from 'react';
-import { X, MessageSquare, AlertTriangle, ChevronUp, Save } from 'lucide-react';
+import { X, MessageSquare, AlertTriangle, ChevronUp, Save, SlidersHorizontal } from 'lucide-react';
 import { type EventPref } from './eventPrefs';
 import { type MuteWindow } from './muteWindow';
 import { type SavedView } from './savedViews';
-import { type ProjectMessage } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 import { formatTimestamp } from './messageGrouping';
 import { MuteWindowMenu } from './MuteWindowMenu';
 import { EventVisibilityMenu } from './EventVisibilityMenu';
@@ -17,6 +17,8 @@ export interface WebhookStats {
   last_failure_at: string | null;
   retry_queue_depth: number;
 }
+
+export type MessagesPanelFilterChrome = 'full' | 'compact' | 'minimal';
 
 export interface MessagesPanelHeaderProps {
   // Last-visit anchor
@@ -65,7 +67,9 @@ export interface MessagesPanelHeaderProps {
   onToggleShowOnlyNew: () => void;
   onToggleSelectMode: () => void;
   onOpenMutedPrefs: () => void;
-  onClose: () => void;
+  onClose?: () => void;
+  showCloseButton?: boolean;
+  filterChrome?: MessagesPanelFilterChrome;
 }
 
 /**
@@ -74,8 +78,9 @@ export interface MessagesPanelHeaderProps {
  * (sort / critical-only / since-last-visit / select / mute-window / event
  * visibility / close), the search input + save-view button, and the saved-views
  * tab strip. Purely presentational — every piece of state and persistence stays
- * owned by MessagesPanel and is wired through props. The only locally-owned
- * state is the webhook-detail popover open flag, which is purely UI-ephemeral.
+ * owned by MessagesPanel and is wired through props. Locally-owned state is only
+ * for ephemeral header chrome: popovers, debounced search input, and compact
+ * filter expansion.
  */
 export function MessagesPanelHeader({
   dividerTime,
@@ -118,14 +123,43 @@ export function MessagesPanelHeader({
   onToggleSelectMode,
   onOpenMutedPrefs,
   onClose,
+  showCloseButton,
+  filterChrome,
 }: MessagesPanelHeaderProps) {
   const [showWebhookDetail, setShowWebhookDetail] = useState(false);
   const [localSearchQuery, setLocalSearchQuery] = useState(searchQuery);
+  const [compactControlsOpen, setCompactControlsOpen] = useState(false);
   const debounceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resolvedFilterChrome = filterChrome ?? 'full';
+  const resolvedShowCloseButton = showCloseButton ?? Boolean(onClose);
+  const controlsExpanded = resolvedFilterChrome === 'full' || compactControlsOpen;
+  const hasActiveFilterChrome = Boolean(
+    searchQuery.trim() ||
+    localSearchQuery.trim() ||
+    sortMode !== 'importance' ||
+    criticalOnly ||
+    (showOnlyNew && dividerTime) ||
+    selectMode ||
+    muteActive ||
+    Object.keys(eventPrefs).length > 0 ||
+    activeViewId !== defaultViewId ||
+    activeTabModified,
+  );
+
+  const openMutedPrefs = () => {
+    if (resolvedFilterChrome === 'compact') setCompactControlsOpen(true);
+    onOpenMutedPrefs();
+  };
 
   useEffect(() => {
     setLocalSearchQuery(searchQuery);
   }, [searchQuery]);
+
+  useEffect(() => {
+    if (showPrefsPanel && resolvedFilterChrome === 'compact') {
+      setCompactControlsOpen(true);
+    }
+  }, [showPrefsPanel, resolvedFilterChrome]);
 
   useEffect(() => {
     debounceTimerRef.current = setTimeout(() => {
@@ -138,6 +172,8 @@ export function MessagesPanelHeader({
       }
     };
   }, [localSearchQuery, onSearchChange]);
+
+  if (resolvedFilterChrome === 'minimal') return null;
 
   return (
     <div className="px-4 md:px-6 py-3 border-b border-neutral-800 flex flex-col gap-2 shrink-0">
@@ -172,7 +208,7 @@ export function MessagesPanelHeader({
             </span>
           )}
           {mutedCount > 0 && (
-            <button onClick={onOpenMutedPrefs} className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors">
+            <button onClick={openMutedPrefs} className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors">
               {mutedCount} muted
             </button>
           )}
@@ -207,94 +243,127 @@ export function MessagesPanelHeader({
           )}
         </div>
         <div className="flex items-center gap-1 flex-wrap justify-end">
-        <button
-          onClick={onToggleSort}
-          title="Toggle sort order"
-          className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
-        >
-          {sortMode === 'importance' ? 'Importance' : 'Recent'}
-        </button>
-        <button
-          onClick={onToggleCriticalOnly}
-          title={criticalOnly ? 'Show all severities' : 'Critical only (BLOCKER, BUG, critical NOTEs)'}
-          className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
-            criticalOnly
-              ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
-              : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
-          }`}
-        >
-          <AlertTriangle className="w-3.5 h-3.5" />
-        </button>
-        <button
-          onClick={onToggleShowOnlyNew}
-          disabled={!dividerTime}
-          title={!dividerTime ? 'No messages to filter (visit first)' : showOnlyNew ? 'Show all messages' : 'Only new since last visit'}
-          className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${
-            showOnlyNew && dividerTime
-              ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
-              : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
-          }`}
-        >
-          <ChevronUp className="w-3.5 h-3.5" />
-        </button>
-        {openFeedbackCount > 1 && (
+        {resolvedFilterChrome === 'compact' && (
           <button
-            onClick={onToggleSelectMode}
-            className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
-              selectMode ? 'text-purple-400 bg-purple-500/10 border border-purple-500/30' : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
+            type="button"
+            onClick={() => setCompactControlsOpen(v => !v)}
+            title={controlsExpanded ? 'Hide filters and saved views' : 'Show filters and saved views'}
+            aria-expanded={controlsExpanded}
+            className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center gap-1.5 ${
+              controlsExpanded || hasActiveFilterChrome
+                ? 'text-blue-300 bg-blue-500/10 border-blue-500/30'
+                : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
             }`}
           >
-            {selectMode ? 'Cancel' : 'Select'}
+            <SlidersHorizontal className="w-3.5 h-3.5" />
+            <span className="hidden md:inline">Filters</span>
+            {hasActiveFilterChrome && !controlsExpanded && (
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400" aria-hidden="true" />
+            )}
           </button>
         )}
-        <MuteWindowMenu
-          muteActive={muteActive}
-          muteWindow={muteWindow}
-          onSetMuteWindow={onSetMuteWindow}
-        />
-        <EventVisibilityMenu
-          open={showPrefsPanel}
-          onOpenChange={onShowPrefsChange}
-          messages={messages}
-          eventPrefs={eventPrefs}
-          onUpdatePref={onUpdatePref}
-          onResetAll={onResetAllPrefs}
-        />
-        <button onClick={onClose} className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center">
-          <X className="w-4 h-4" />
-        </button>
+        {controlsExpanded && (
+          <>
+            <button
+              onClick={onToggleSort}
+              title="Toggle sort order"
+              className="text-xs px-2 py-1 rounded-lg transition-colors border border-neutral-800/60 text-neutral-500 hover:text-neutral-300 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center"
+            >
+              {sortMode === 'importance' ? 'Importance' : 'Recent'}
+            </button>
+            <button
+              onClick={onToggleCriticalOnly}
+              title={criticalOnly ? 'Show all severities' : 'Critical only (BLOCKER, BUG, critical NOTEs)'}
+              className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
+                criticalOnly
+                  ? 'text-amber-400 bg-amber-500/10 border-amber-500/30'
+                  : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
+              }`}
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+            </button>
+            <button
+              onClick={onToggleShowOnlyNew}
+              disabled={!dividerTime}
+              title={!dividerTime ? 'No messages to filter (visit first)' : showOnlyNew ? 'Show all messages' : 'Only new since last visit'}
+              className={`text-xs px-2 py-1 rounded-lg transition-colors border min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center disabled:opacity-40 disabled:cursor-not-allowed ${
+                showOnlyNew && dividerTime
+                  ? 'text-blue-400 bg-blue-500/10 border-blue-500/30'
+                  : 'text-neutral-500 hover:text-neutral-300 border-neutral-800/60'
+              }`}
+            >
+              <ChevronUp className="w-3.5 h-3.5" />
+            </button>
+            {openFeedbackCount > 1 && (
+              <button
+                onClick={onToggleSelectMode}
+                className={`text-xs px-2.5 py-1.5 rounded-lg transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto flex items-center justify-center ${
+                  selectMode ? 'text-purple-400 bg-purple-500/10 border border-purple-500/30' : 'text-neutral-500 hover:text-neutral-300 border border-transparent'
+                }`}
+              >
+                {selectMode ? 'Cancel' : 'Select'}
+              </button>
+            )}
+            <MuteWindowMenu
+              muteActive={muteActive}
+              muteWindow={muteWindow}
+              onSetMuteWindow={onSetMuteWindow}
+            />
+            <EventVisibilityMenu
+              open={showPrefsPanel}
+              onOpenChange={onShowPrefsChange}
+              messages={messages}
+              eventPrefs={eventPrefs}
+              onUpdatePref={onUpdatePref}
+              onResetAll={onResetAllPrefs}
+            />
+          </>
+        )}
+        {resolvedShowCloseButton && onClose && (
+          <button
+            onClick={onClose}
+            aria-label="Close messages panel"
+            className="bg-neutral-800 hover:bg-neutral-700 text-neutral-400 p-2 rounded-lg text-xs transition-colors border border-neutral-700 min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-[36px] flex items-center justify-center"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        )}
         </div>
       </div>
-      <div className="flex items-center gap-2">
-        <input
-          type="text"
-          value={localSearchQuery}
-          onChange={e => setLocalSearchQuery(e.target.value)}
-          placeholder="Search messages..."
-          className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
-        />
-        <button
-          onClick={onOpenSaveDialog}
-          title="Save current filters as a view"
-          className="shrink-0 flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 border border-neutral-800/60 hover:border-neutral-700 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto"
-        >
-          <Save className="w-3.5 h-3.5" />
-          <span className="hidden md:inline">Save view</span>
-        </button>
-      </div>
-      {/* Saved views tab strip */}
-      <SavedViewsTabStrip
-        savedViews={savedViews}
-        activeViewId={activeViewId}
-        defaultViewId={defaultViewId}
-        activeTabModified={activeTabModified}
-        openKebabId={openKebabId}
-        setOpenKebabId={setOpenKebabId}
-        kebabRef={kebabRef}
-        onApplyView={onApplyView}
-        onRenameView={onRenameView}
-        onDeleteView={onDeleteView}
-      />
+      {controlsExpanded && (
+        <>
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              value={localSearchQuery}
+              onChange={e => setLocalSearchQuery(e.target.value)}
+              placeholder="Search messages..."
+              className="flex-1 bg-neutral-900/50 border border-neutral-800/50 text-neutral-100 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-1 focus:ring-neutral-700 placeholder-neutral-600"
+            />
+            <button
+              onClick={onOpenSaveDialog}
+              title="Save current filters as a view"
+              className="shrink-0 flex items-center justify-center gap-1 px-2.5 py-2 rounded-lg text-xs text-neutral-400 hover:text-neutral-200 border border-neutral-800/60 hover:border-neutral-700 transition-colors min-h-[44px] min-w-[44px] md:min-h-[36px] md:min-w-auto"
+            >
+              <Save className="w-3.5 h-3.5" />
+              <span className="hidden md:inline">Save view</span>
+            </button>
+          </div>
+          {/* Saved views tab strip */}
+          <SavedViewsTabStrip
+            savedViews={savedViews}
+            activeViewId={activeViewId}
+            defaultViewId={defaultViewId}
+            activeTabModified={activeTabModified}
+            openKebabId={openKebabId}
+            setOpenKebabId={setOpenKebabId}
+            kebabRef={kebabRef}
+            onApplyView={onApplyView}
+            onRenameView={onRenameView}
+            onDeleteView={onDeleteView}
+          />
+        </>
+      )}
     </div>
   );
 }

@@ -8,7 +8,6 @@ import {
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
-  setVersionTheme,
   triggerQualify,
   type AgentServingShasResponse,
   type QualificationVerdictRecord,
@@ -74,8 +73,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
-  const [editingTheme, setEditingTheme] = useState<boolean>(false);
-  const [themeInput, setThemeInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
   const [promotionEnabledOverride, setPromotionEnabledOverride] = useState<boolean | null>(null);
   const [cuttingVersion, setCuttingVersion] = useState<boolean>(false);
@@ -93,10 +90,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     if (data?.current_version?.goal !== undefined) {
       setGoalInput(data.current_version.goal || '');
     }
-    if (data?.current_version?.theme !== undefined) {
-      setThemeInput(data.current_version.theme || '');
-    }
-  }, [data?.current_version?.goal, data?.current_version?.theme]);
+  }, [data?.current_version?.goal]);
   useEffect(() => {
     setOptimisticOverrides(null);
   }, [data?.current_version?.phase, data?.current_version?.goal]);
@@ -201,28 +195,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       setOptimisticOverrides(null);
       setEditingGoal(false);
       setGoalInput(cv?.goal || '');
-    } finally {
-      setActionLoading(null);
-    }
-  };
-
-  const handleSetTheme = async () => {
-    if (!projectId) return;
-    setActionLoading('theme');
-    setActionMsg(null);
-    try {
-      const response = await setVersionTheme(projectId, themeInput || null);
-      setOptimisticOverrides({
-        theme: response.theme,
-      });
-      setActionMsg('Theme updated');
-      setEditingTheme(false);
-      onRefresh();
-    } catch (error) {
-      setActionMsg(error instanceof Error ? error.message : 'Request failed');
-      setOptimisticOverrides(null);
-      setEditingTheme(false);
-      setThemeInput(cv?.theme || '');
     } finally {
       setActionLoading(null);
     }
@@ -559,71 +531,6 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                 Set goal
               </button>
             ) : null}
-            {editingTheme && projectId ? (
-              <div className="flex flex-col gap-1.5">
-                <select
-                  value={themeInput}
-                  onChange={(e) => setThemeInput(e.target.value)}
-                  disabled={actionLoading !== null}
-                  className="text-ui-md bg-neutral-800 border border-neutral-700 text-neutral-300 rounded px-2 py-1 focus:outline-none focus:border-neutral-600 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  <option value="">Clear theme</option>
-                  <option value="leanness">Leanness</option>
-                  <option value="reliability">Reliability</option>
-                  <option value="performance">Performance</option>
-                  <option value="feature">Feature</option>
-                  <option value="mixed">Mixed</option>
-                  <option value="none">None</option>
-                </select>
-                <div className="flex gap-1">
-                  <button
-                    onClick={handleSetTheme}
-                    disabled={actionLoading !== null}
-                    className="text-ui-sm px-2 py-0.5 rounded border border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                    data-viewport-allow-small-target
-                  >
-                    {actionLoading === 'theme' ? '…' : 'Save'}
-                  </button>
-                  <button
-                    onClick={() => {
-                      setEditingTheme(false);
-                      setThemeInput(cv.theme || '');
-                    }}
-                    disabled={actionLoading !== null}
-                    className="text-ui-sm px-2 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                    data-viewport-allow-small-target
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-            ) : cv.theme ? (
-              <div className="flex flex-col gap-1">
-                <p className="text-ui-md text-neutral-300">
-                  <span className="text-neutral-500">Theme: </span>
-                  <span className="px-1.5 py-0.5 rounded bg-neutral-800/70 text-neutral-300 border border-neutral-700 font-medium">{cv.theme}</span>
-                </p>
-                {projectId && (
-                  <button
-                    onClick={() => setEditingTheme(true)}
-                    disabled={actionLoading !== null}
-                    className="text-ui-sm px-1.5 py-0.5 w-fit rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                    data-viewport-allow-small-target
-                  >
-                    Edit
-                  </button>
-                )}
-              </div>
-            ) : projectId ? (
-              <button
-                onClick={() => setEditingTheme(true)}
-                disabled={actionLoading !== null}
-                className="text-ui-sm px-1.5 py-0.5 rounded border border-neutral-500/40 text-neutral-400 hover:bg-neutral-500/10 disabled:opacity-40 disabled:cursor-not-allowed"
-                data-viewport-allow-small-target
-              >
-                Set theme
-              </button>
-            ) : null}
             {cv.out_of_band_promotion && (
               <OutOfBandPromotionBadge oob={cv.out_of_band_promotion} />
             )}
@@ -717,7 +624,10 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                       <>
                         <span>audit {Math.round(cv.last_qualification.sub_scores.audit * 100)}%</span>
                         <span>erosion {Math.round(cv.last_qualification.sub_scores.test_erosion * 100)}%</span>
-                        <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                        {cv.last_qualification.smoketest_enabled === false
+                          ? <span className="text-neutral-600 italic">smoke disabled</span>
+                          : <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
+                        }
                       </>
                     )}
                     {cv.last_qualification.ci_resolution && (
@@ -778,7 +688,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} />
                 )}
               </div>
             )}
@@ -911,7 +821,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
                     <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                     {v.promotion_enabled && <span className="text-ui-xs font-mono text-emerald-600">LIVE</span>}
-                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)} s:{Math.round(v.sub_scores.smoketest * 100)}</span>}
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
                     {v.terminal_status === 'promoted' && (

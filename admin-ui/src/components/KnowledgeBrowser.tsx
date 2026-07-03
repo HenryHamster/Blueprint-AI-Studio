@@ -4,6 +4,7 @@ import { ResolvedReferenceLink, isResolvableStorageUri, isSafeUrl } from './Task
 import { MarkdownContent } from './MarkdownContent';
 import { ReleaseEvidencePanel } from './ReleaseEvidence';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
+import { CriterionVerdictBadge } from './CriterionVerdictBadge';
 import {
   fetchKnowledgeDocuments,
   fetchKnowledgeDocument,
@@ -20,6 +21,18 @@ interface KnowledgeBrowserProps {
   onLaunchWebResearchTask?: (topic?: string) => void;
   initialDirectionId?: string;
   initialDocumentId?: string;
+}
+
+interface KnowledgeQuery {
+  search: string;
+  topicFilter: string | null;
+  tagFilter: string | null;
+  directionFilter: string | null;
+  sourceKindFilter: string | null;
+  challengeStateFilter: string | null;
+  sweepFilter: string | null;
+  offset: number;
+  routedDirectionId: string | null;
 }
 
 function relativeDate(dateStr: string | null): string {
@@ -356,17 +369,22 @@ function ExportMarkdown({ body }: { body?: string }) {
 const PAGE_SIZE = 50;
 
 export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask, onLaunchWebResearchTask, initialDirectionId, initialDocumentId }: KnowledgeBrowserProps) {
-  const [query, setQuery] = useState({
+  const routedDirectionId = initialDirectionId ?? null;
+  const [query, setQuery] = useState<KnowledgeQuery>({
     search: '',
-    topicFilter: null as string | null,
-    tagFilter: null as string | null,
-    directionFilter: (initialDirectionId ?? null) as string | null,
-    sourceKindFilter: null as string | null,
-    challengeStateFilter: null as string | null,
-    sweepFilter: null as string | null,
+    topicFilter: null,
+    tagFilter: null,
+    directionFilter: routedDirectionId,
+    sourceKindFilter: null,
+    challengeStateFilter: null,
+    sweepFilter: null,
     offset: 0,
+    routedDirectionId,
   });
-  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = query;
+  const effectiveQuery = query.routedDirectionId === routedDirectionId
+    ? query
+    : { ...query, directionFilter: routedDirectionId, offset: 0, routedDirectionId };
+  const { search, topicFilter, tagFilter, directionFilter, sourceKindFilter, challengeStateFilter, sweepFilter, offset } = effectiveQuery;
 
   const [docs, setDocs] = useState<KnowledgeDocument[]>([]);
   const [total, setTotal] = useState(0);
@@ -374,16 +392,25 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
 
+  const syncRoute = useCallback((prev: KnowledgeQuery): KnowledgeQuery => (
+    prev.routedDirectionId === routedDirectionId
+      ? prev
+      : { ...prev, directionFilter: routedDirectionId, offset: 0, routedDirectionId }
+  ), [routedDirectionId]);
+
   const setFilter = useCallback(<K extends 'search' | 'topicFilter' | 'tagFilter' | 'directionFilter' | 'sourceKindFilter' | 'challengeStateFilter' | 'sweepFilter'>(
     key: K,
-    value: typeof query[K],
+    value: KnowledgeQuery[K],
   ) => {
-    setQuery(prev => ({ ...prev, [key]: value, offset: 0 }));
-  }, []);
+    setQuery(prev => ({ ...syncRoute(prev), [key]: value, offset: 0 }));
+  }, [syncRoute]);
 
   const loadMore = useCallback(() => {
-    setQuery(prev => ({ ...prev, offset: prev.offset + PAGE_SIZE }));
-  }, []);
+    setQuery(prev => {
+      const current = syncRoute(prev);
+      return { ...current, offset: current.offset + PAGE_SIZE };
+    });
+  }, [syncRoute]);
 
   // Debounced list/search fetch driven by backend full-text/tag/topic search.
   useEffect(() => {
@@ -458,7 +485,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-neutral-100 flex items-center gap-2">
                 <BookOpen className="w-4 h-4 text-violet-400 shrink-0" />
-                Knowledge Library
+                Knowledge library
               </h3>
               {!selected && (
                 <p className="text-ui-sm text-neutral-500 mt-0.5">
@@ -482,6 +509,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                 <CopyableId id={selected.id} />
                 <ExportMarkdown body={selected.body} />
                 <SourceKindBadge kind={selected.source_kind} />
+                <CriterionVerdictBadge doc={selected} />
                 <AcceptanceGradeBadge doc={selected} />
                 <OriginBadge doc={selected} />
                 {selected.authoring_branch && selected.head_sha && (
@@ -725,6 +753,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
                   {doc.summary && <p className="text-ui-md text-neutral-500 mt-1 line-clamp-2 leading-snug">{doc.summary}</p>}
                   <div className="flex items-center gap-1.5 flex-wrap mt-1.5">
                     <SourceKindBadge kind={doc.source_kind} />
+                    <CriterionVerdictBadge doc={doc} />
                     <AcceptanceGradeBadge doc={doc} />
                     <OriginBadge doc={doc} />
                     {doc.direction_id && (

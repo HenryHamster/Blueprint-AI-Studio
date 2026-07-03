@@ -3004,6 +3004,95 @@ async def test_per_arm_verdicts_even_split_when_no_durations(
     assert pav["arm_b"]["cost_usd"] == pytest.approx(0.25, rel=1e-4)
 
 
+@pytest.mark.asyncio
+async def test_per_arm_cost_apportionment_mixed_durations_sums_to_total(
+    db_session, _quiet_compute_io
+):
+    """per-arm costs sum to the experiment total in a mixed-duration run; a
+    crashed arm (no elapsed_seconds, no metric) is reported as unmeasured
+    (met=None), NOT as 'not met' (met=False).
+
+    Three-arm experiment: two arms finish with timing data; one crashes and
+    reports neither a metric nor elapsed_seconds.  The timed arms' apportioned
+    costs must sum to the full experiment total (not exceed it), and the
+    crashed arm must carry cost_usd=None and met=None.
+    """
+    task = await _make_compute_task(db_session)
+    task.payloads = [
+        {
+            "type": "compute_experiment",
+            "base_branch": "main",
+            "experiment": "mixed-duration-apportionment",
+            "success_criterion": {
+                "metric": "accuracy",
+                "operator": ">=",
+                "threshold": 0.9,
+            },
+        }
+    ]
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job, _artifact_uri = await _setup_durable_job_with_artifact(db_session, task)
+    # fast: 30 s, 0.91 accuracy (MET); slow: 90 s, 0.88 accuracy (NOT MET);
+    # crashed: no timing, no metric (UNMEASURED).
+    # total elapsed from timed arms = 120 s; total cost = $1.20
+    # → fast gets $1.20 * 30/120 = $0.30, slow gets $1.20 * 90/120 = $0.90,
+    #   crashed gets None (no timing → cannot apportion).
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "fast": {"accuracy": 0.91, "exit_code": 0, "elapsed_seconds": 30.0},
+                "slow": {"accuracy": 0.88, "exit_code": 0, "elapsed_seconds": 90.0},
+                "crashed": {"exit_code": 1},  # no metric, no elapsed
+            },
+        },
+    }
+    job.accrued_cost_usd = 1.20
+    job.final_cost_usd = 1.20
+    db_session.add(job)
+    await db_session.commit()
+
+    logs = _result_artifact(job_id=str(job.id), accuracy=0.91, final_cost_usd=1.20)
+    await _handle_compute_experiment_completion(task, logs, db_session)
+
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+
+    docs = await _knowledge_docs_for(db_session, task)
+    assert len(docs) == 1
+    verdict = docs[0].forward_quality_verdict
+
+    assert "per_arm_verdicts" in verdict
+    pav = verdict["per_arm_verdicts"]
+
+    # Timed arms: value + met populated
+    assert pav["fast"]["value"] == pytest.approx(0.91)
+    assert pav["fast"]["met"] is True  # 0.91 >= 0.9
+    assert pav["slow"]["value"] == pytest.approx(0.88)
+    assert pav["slow"]["met"] is False  # 0.88 < 0.9
+
+    # Crashed arm: unmeasured — met must be None, not False
+    assert pav["crashed"]["value"] is None
+    assert pav["crashed"]["met"] is None, (
+        "crashed arm (no metric) must be unmeasured (met=None), not 'not met' (met=False)"
+    )
+    assert pav["crashed"]["cost_usd"] is None
+
+    # Timed arms' apportioned costs must sum to the experiment total
+    fast_cost = pav["fast"]["cost_usd"]
+    slow_cost = pav["slow"]["cost_usd"]
+    assert fast_cost is not None
+    assert slow_cost is not None
+    assert fast_cost + slow_cost == pytest.approx(1.20, rel=1e-4), (
+        "per-arm costs for timed arms must sum to the experiment total"
+    )
+    assert fast_cost == pytest.approx(0.30, rel=1e-4)
+    assert slow_cost == pytest.approx(0.90, rel=1e-4)
+
+
 def _mock_anthropic_returning(citations: list[str]):
     """Build a mock anthropic.AsyncAnthropic class that returns a cited analysis."""
     fake_text = json.dumps(
@@ -6235,3 +6324,230 @@ async def test_multi_arm_metric_absent_from_all_arms_still_fires_unmeasured(
     assert ctx_criterion["measurable"] is False
     assert ctx_criterion["met"] is False
     assert ctx_criterion["value"] is None
+
+
+@pytest.mark.asyncio
+async def test_per_arm_cost_sums_to_total(db_session, _quiet_compute_io):
+    """Per-arm cost apportionment: two arms with elapsed_seconds sum cost correctly.
+
+    When total_cost=0.40, arm1 has elapsed_seconds=30, arm2 has elapsed_seconds=90,
+    verify that arm1.cost_usd ≈ 0.10 and arm2.cost_usd ≈ 0.30, and sum ≈ 0.40.
+    """
+    from app.compute_jobs import build_compute_result_logs
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.40
+    job.final_cost_usd = 0.40
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_1": {"elapsed_seconds": 30, "accuracy": 0.92},
+                "arm_2": {"elapsed_seconds": 90, "accuracy": 0.88},
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = build_compute_result_logs(job)
+    result = json.loads(logs)
+
+    assert result["final_cost_usd"] == pytest.approx(0.40)
+    assert "arms" in result
+    arms = result["arms"]
+    assert "arm_1" in arms
+    assert "arm_2" in arms
+
+    arm_1_cost = arms["arm_1"]["cost_usd"]
+    arm_2_cost = arms["arm_2"]["cost_usd"]
+
+    assert arm_1_cost == pytest.approx(0.10)
+    assert arm_2_cost == pytest.approx(0.30)
+    assert arm_1_cost + arm_2_cost == pytest.approx(0.40)
+
+
+def test_is_zero_cost_backend_runner_subprocess():
+    """RUNNER_SUBPROCESS_BACKEND_NAME is a zero-cost backend."""
+    from app.compute_backends import (
+        is_zero_cost_backend,
+        RUNNER_SUBPROCESS_BACKEND_NAME,
+    )
+
+    assert is_zero_cost_backend(RUNNER_SUBPROCESS_BACKEND_NAME) is True
+
+
+@pytest.mark.asyncio
+async def test_per_arm_cost_zero_elapsed_no_raise(db_session, _quiet_compute_io):
+    """Per-arm cost injection: zero or missing elapsed_seconds gracefully skips injection.
+
+    When arms have no elapsed_seconds (or all are 0), the function must not raise
+    and must return valid JSON without injecting cost_usd keys.
+    """
+    from app.compute_jobs import build_compute_result_logs
+
+    task = await _make_compute_task(db_session)
+    task.status = TaskStatus.IN_PROGRESS
+    db_session.add(task)
+    await db_session.commit()
+
+    job = await compute_jobs.create_compute_job(
+        db_session,
+        task,
+        command="python train.py",
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        deadline_seconds=300,
+    )
+    job.status = ComputeJobStatus.SUCCEEDED
+    job.outcome = ComputeJobOutcome.SUCCESS
+    job.accrued_cost_usd = 0.20
+    job.final_cost_usd = 0.20
+    job.terminal_reason = "compute job finished"
+    job.completed_at = datetime.utcnow()
+    job.polling_metadata = {
+        **(job.polling_metadata or {}),
+        "result_metrics": {
+            "arms": {
+                "arm_a": {"elapsed_seconds": 0, "accuracy": 0.95},
+                "arm_b": {"accuracy": 0.92},  # no elapsed_seconds
+            },
+        },
+    }
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    logs = build_compute_result_logs(job)
+    result = json.loads(logs)
+
+    assert result["final_cost_usd"] == pytest.approx(0.20)
+    assert "arms" in result
+    arms = result["arms"]
+    assert "arm_a" in arms
+    assert "arm_b" in arms
+
+    # cost_usd should not be injected when elapsed_seconds is 0 or missing
+    assert "cost_usd" not in arms["arm_a"]
+    assert "cost_usd" not in arms["arm_b"]
+
+    # Arms data should be intact
+    assert arms["arm_a"]["accuracy"] == pytest.approx(0.95)
+    assert arms["arm_b"]["accuracy"] == pytest.approx(0.92)
+
+
+# ── Sweep aggregate best-effort finalization past deadline ────────────────────
+
+
+@pytest.mark.asyncio
+async def test_sweep_aggregate_best_effort_when_arm_wedged_past_deadline(
+    db_session, _quiet_compute_io, mocker
+):
+    """When a sweep arm is wedged (non-terminal) but the best-effort deadline has
+    elapsed, _maybe_spawn_sweep_aggregate_followon must finalize on partial results
+    rather than deferring indefinitely.
+
+    Acceptance: the aggregate follow-on is spawned (not None) in failure/diagnose
+    mode, and its prompt references the wedged arm's status so the agent knows one
+    arm never finished.
+    """
+    from app.task_completion import (
+        _ACT_ON_VERDICT_SWEEP_KEY,
+        _maybe_spawn_sweep_aggregate_followon,
+    )
+
+    sweep_id = f"sweep-{uuid.uuid4().hex[:12]}"
+
+    project = Project(name="WedgedSweepDeadlineTest", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Arm A: terminally completed with a result.
+    terminal_arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-A-done",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-A-done",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    terminal_arm.plan_output = {
+        "compute_result": {"outcome": "SUCCESS", "final_cost_usd": 0.25}
+    }
+    db_session.add(terminal_arm)
+
+    # Arm B: QUEUED — simulates a backend that became permanently unreachable
+    # before transitioning to a terminal state (the "wedged" arm).
+    wedged_arm = Task(
+        project_id=project.id,
+        title="compute_experiment: arm-B-wedged",
+        status=TaskStatus.QUEUED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": "arm-B-wedged",
+            }
+        ],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(wedged_arm)
+    await db_session.commit()
+    await db_session.refresh(terminal_arm)
+    await db_session.refresh(wedged_arm)
+
+    # Simulate the deadline having elapsed: patch _utcnow to return a time well
+    # past 24 h after the oldest arm's created_at so the deadline branch fires.
+    future_time = terminal_arm.created_at + timedelta(hours=25)
+    mocker.patch("app.task_completion._utcnow", return_value=future_time)
+
+    result = await _maybe_spawn_sweep_aggregate_followon(
+        db_session,
+        terminal_arm,
+        sweep_id,
+        {},
+        "",
+        failure_mode=False,
+    )
+    await db_session.commit()
+
+    # Must have spawned despite the wedged arm — not deferred.
+    assert result is not None, (
+        "Expected aggregate follow-on to be spawned past deadline, got None"
+    )
+    # Wedged arm counts as failure → diagnose-and-fix title.
+    assert "diagnose" in result.title.lower(), (
+        f"Expected diagnose-and-fix title for wedged sweep; got: {result.title!r}"
+    )
+    # Context carries the sweep key for idempotency.
+    assert (result.context or {}).get(_ACT_ON_VERDICT_SWEEP_KEY) == sweep_id
+    # Prompt must reference the wedged arm so the agent is aware results are partial.
+    prompt = (result.first_payload or {}).get("prompt", "")
+    assert "arm-B-wedged" in prompt or "QUEUED" in prompt, (
+        f"Aggregate prompt must reference the wedged arm; got: {prompt[:300]!r}"
+    )

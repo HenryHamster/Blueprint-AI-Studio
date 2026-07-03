@@ -104,11 +104,16 @@ def classify_operator_arming(
     verdict to ``ARMING_NOT_ARMED`` when the marker could not be written — so the
     operator-facing outcome reflects what arming *actually did*, not just intent.
 
-    Returns one of ``ARMING_PASSIVE_NOTE`` (a ``NOTE``), ``ARMING_ROUTINE_EVENT``
-    (a non-passive type carrying a system/routine digest ``event_type``), or
-    ``ARMING_STEERING`` (genuine human steering that wakes the strategist).
+    Returns one of ``ARMING_PASSIVE_NOTE`` (a passive ``NOTE``),
+    ``ARMING_ROUTINE_EVENT`` (a non-passive type carrying a system/routine digest
+    ``event_type``), or ``ARMING_STEERING`` (genuine human steering that wakes
+    the strategist). ``question_answer`` is the one NOTE event that still
+    represents active operator steering: the strategist asked for missing input,
+    and the operator supplied it.
     """
     if message_type is MessageType.NOTE:
+        if event_type == "question_answer":
+            return ARMING_STEERING
         return ARMING_PASSIVE_NOTE
     if event_type:
         # Inline import — ROUTINE_EVENT_TYPES lives in the router module, which

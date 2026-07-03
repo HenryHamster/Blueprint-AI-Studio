@@ -1,0 +1,285 @@
+"""Admin endpoints for version-scoped acceptance criteria management.
+
+Provides:
+  GET    /api/admin/projects/{project_id}/acceptance-criteria                          — list criteria for open version
+  POST   /api/admin/projects/{project_id}/acceptance-criteria                          — create a criterion
+  DELETE /api/admin/projects/{project_id}/acceptance-criteria/{key}                    — delete a criterion
+  POST   /api/admin/projects/{project_id}/acceptance-criteria/link-direction           — link criteria keys to a direction
+  POST   /api/admin/projects/{project_id}/acceptance-criteria/{criterion_key}/attest   — operator attestation waiver
+"""
+
+import logging
+import uuid
+from typing import List
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlmodel import select
+
+from app import acceptance_criteria as ac
+from app.admin import _get_user_project_with_role
+from app.auth import get_current_user
+from app.database import get_session
+from app.models import CriterionEvidence, Direction
+
+router = APIRouter(prefix="/api/admin")
+logger = logging.getLogger(__name__)
+
+
+@router.get("/projects/{project_id}/acceptance-criteria")
+async def list_acceptance_criteria(
+    project_id: uuid.UUID,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Return criteria and coverage summary for the project's open release version."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        return {"release_version_id": None, "criteria": [], "total": 0}
+    summary = await ac.get_version_coverage_summary(session, open_version.id)
+    return {
+        "release_version_id": str(open_version.id),
+        "version_number": open_version.version_number,
+        **summary,
+    }
+
+
+class CreateCriterionRequest(BaseModel):
+    text: str
+
+
+@router.post("/projects/{project_id}/acceptance-criteria")
+async def create_acceptance_criterion(
+    project_id: uuid.UUID,
+    body: CreateCriterionRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Create a new acceptance criterion for the project's open release version.
+
+    Enforces a per-version cap of MAX_CRITERIA_PER_VERSION criteria.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    text = body.text.strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="text must not be empty")
+
+    existing_count = await ac.count_criteria_for_version(session, open_version.id)
+    if existing_count >= ac.MAX_CRITERIA_PER_VERSION:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Version already has {ac.MAX_CRITERIA_PER_VERSION} criteria (cap reached)",
+        )
+
+    criterion = await ac.create_criterion(
+        session,
+        project_id=project_id,
+        release_version_id=open_version.id,
+        text=text,
+        created_by="operator",
+    )
+    logger.info(
+        "[AC] Operator created criterion %s for project %s version %s",
+        criterion.criterion_key,
+        project_id,
+        open_version.id,
+    )
+    return {
+        "criterion_key": criterion.criterion_key,
+        "text": criterion.text,
+        "release_version_id": str(open_version.id),
+    }
+
+
+@router.delete("/projects/{project_id}/acceptance-criteria/{criterion_key}")
+async def delete_acceptance_criterion(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Delete a criterion from the open release version by its criterion_key."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    deleted = await ac.delete_criterion(
+        session,
+        project_id=project_id,
+        release_version_id=open_version.id,
+        criterion_key=criterion_key,
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Criterion not found")
+
+    logger.info(
+        "[AC] Operator deleted criterion %s from project %s version %s",
+        criterion_key,
+        project_id,
+        open_version.id,
+    )
+    return {"status": "deleted", "criterion_key": criterion_key}
+
+
+class LinkDirectionRequest(BaseModel):
+    direction_key: str = Field(..., max_length=128)
+    criterion_keys: List[str] = Field(..., max_length=50)
+
+
+@router.post("/projects/{project_id}/acceptance-criteria/link-direction")
+async def link_criteria_to_direction(
+    project_id: uuid.UUID,
+    body: LinkDirectionRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Link a set of criterion keys to a direction row (sets Direction.criterion_keys).
+
+    Validates that every supplied criterion_key exists in the current open
+    release version.  Keys from closed or older versions are rejected.
+    Duplicate keys in the request are silently de-duplicated.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    # De-duplicate while preserving order.
+    deduped_keys = list(dict.fromkeys(body.criterion_keys))
+
+    # Validate that all supplied keys exist in the current open version.
+    # criterion_key is unique only within release_version_id, so we must scope
+    # the lookup to open_version.id to reject stale keys from closed versions.
+    if deduped_keys:
+        existing = await ac.get_criteria_by_keys(
+            session,
+            project_id,
+            deduped_keys,
+            release_version_id=open_version.id,
+        )
+        existing_keys = {r.criterion_key for r in existing}
+        unknown = [k for k in deduped_keys if k not in existing_keys]
+        if unknown:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown criterion keys for this version: {unknown}",
+            )
+
+    row = (
+        await session.execute(
+            select(Direction).where(
+                Direction.project_id == project_id,
+                Direction.direction_key == body.direction_key,
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Direction not found")
+
+    row.criterion_keys = deduped_keys
+    session.add(row)
+    await session.commit()
+    logger.info(
+        "[AC] Linked %d criterion key(s) to direction %s for project %s",
+        len(deduped_keys),
+        body.direction_key,
+        project_id,
+    )
+    return {
+        "status": "ok",
+        "direction_key": body.direction_key,
+        "criterion_keys": deduped_keys,
+    }
+
+
+class AttestRequest(BaseModel):
+    reason: str = Field(...)
+
+
+@router.post("/projects/{project_id}/acceptance-criteria/{criterion_key}/attest")
+async def attest_criterion(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    body: AttestRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Record an operator attestation that a stuck criterion is intentionally accepted.
+
+    This waiver path allows operators to unblock qualification when a criterion is
+    permanently uncoverable (e.g. its mapped direction retired).  The attestation
+    is operator-only and is never called by autonomous agents.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(status_code=400, detail="reason must not be empty")
+
+    existing = await ac.get_criteria_by_keys(
+        session,
+        project_id,
+        [criterion_key],
+        release_version_id=open_version.id,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Criterion key not found in open version: {criterion_key}",
+        )
+
+    row = existing[0]
+    evidence = CriterionEvidence(
+        criterion_id=row.id,
+        project_id=project_id,
+        source_kind="operator_attestation",
+        source_id=current_user["user_id"],
+        detail={"reason": body.reason},
+    )
+    session.add(evidence)
+    try:
+        await session.commit()
+    except IntegrityError:
+        # uq_criterionevidence_dedup covers attestations (source_id=user_id is non-null);
+        # a duplicate by the same operator is an intentional no-op — just return covered.
+        await session.rollback()
+        return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
+
+    logger.info(
+        "[AC] Operator attestation recorded: project=%s criterion=%s user=%s reason=%r",
+        project_id,
+        criterion_key,
+        current_user["user_id"],
+        body.reason,
+    )
+    return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}

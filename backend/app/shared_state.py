@@ -229,8 +229,8 @@ github_call_counts_window_reset_at: int | None = None
 # Seed with current time so the first health check uses the passive path
 # instead of an active probe that can fail on cold start.
 last_github_success: datetime | None = (
-    datetime.utcnow()
-)  # Module-level init, _utcnow not available here at import order
+    _utcnow()
+)
 
 # --- Warm-continuity circuit-breaker deadlines ---
 # Auto-suppression deadline set by is_warm_continuity_suppressed() when the

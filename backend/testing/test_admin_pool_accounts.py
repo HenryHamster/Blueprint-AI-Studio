@@ -1,7 +1,7 @@
 import asyncio
 import json
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict
 from unittest.mock import AsyncMock
 
@@ -10,6 +10,7 @@ from sqlmodel import select
 
 from app.digest_cache import DigestCache, get_digest_cache
 from app.main import app
+from app.providers.base import UsageSnapshot
 from app.routers import admin_pool_accounts as _admin_pool_accounts
 from app.max_plan_pool import _account_by_id, _max_plan_pools
 from app.models import (
@@ -278,6 +279,7 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
 ):
     live_id = uuid.uuid4()
     db_only_id = uuid.uuid4()
+    db_configured_id = uuid.uuid4()
     db_session.add_all(
         [
             MaxPlanAccount(
@@ -305,6 +307,16 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
                 enabled=False,
                 disabled_reason="manual maintenance",
             ),
+            MaxPlanAccount(
+                id=db_configured_id,
+                user_id="test-user-123",
+                name="Configured DB Only Account",
+                provider=LLMProviderName.GEMINI,
+                auth_mode=LLMAuthMode.SERVICE_ACCOUNT,
+                secret_blob_ref="projects/test/secrets/configured-db-only/versions/1",
+                provider_metadata={"project": "p", "location": "us-central1"},
+                enabled=True,
+            ),
         ]
     )
     await db_session.commit()
@@ -328,7 +340,7 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
                 "active_tasks": 3,
                 "total_tasks": 99,
                 "daily_task_count": 4,
-                "daily_task_count_reset_at": datetime.utcnow(),
+                "daily_task_count_reset_at": _admin_pool_accounts._utcnow(),
                 "daily_task_cap": 20,
                 "max_concurrent_tasks": 2,
                 "auto_disable_after_rate_limits": 5,
@@ -336,7 +348,7 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
                 "disabled_models": {
                     "claude-opus-4-8": {
                         "hits": 2,
-                        "at": datetime.utcnow(),
+                            "at": _admin_pool_accounts._utcnow(),
                         "kind": "quota_exhausted",
                     }
                 },
@@ -379,7 +391,11 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
         roster = await client.get("/api/admin/max-plan-accounts")
         assert roster.status_code == 200, roster.text
         accounts = {a["id"]: a for a in roster.json()["accounts"]}
-        assert set(accounts) == {str(live_id), str(db_only_id)}
+        assert set(accounts) == {
+            str(live_id),
+            str(db_only_id),
+            str(db_configured_id),
+        }
         assert accounts[str(live_id)]["active_tasks"] == 3
         assert accounts[str(live_id)]["total_tasks"] == 7
         assert accounts[str(live_id)]["provider_metadata"]["available_models"] == [
@@ -389,8 +405,27 @@ async def test_max_plan_accounts_list_is_lightweight_authoritative_and_mutations
         assert accounts[str(live_id)]["disabled_models"]["claude-opus-4-8"][
             "kind"
         ] == "quota_exhausted"
+        assert accounts[str(live_id)]["credential_configured"] is True
+        assert accounts[str(live_id)]["runtime_ready"] is True
+        assert accounts[str(live_id)]["account_status"] == "at_cap"
+        assert "concurrent_cap_reached" in accounts[str(live_id)]["status_reasons"]
+        assert accounts[str(live_id)]["usage"]["daily_task_remaining"] == 16
+        assert accounts[str(live_id)]["usage"]["daily_task_usage_fraction"] == 0.2
+        assert accounts[str(live_id)]["usage"]["concurrent_task_remaining"] == 0
+        assert accounts[str(live_id)]["usage"]["at_any_cap"] is True
+        assert accounts[str(live_id)]["usage_snapshot"]["known"] is False
         assert accounts[str(db_only_id)]["name"] == "DB Only Account"
         assert accounts[str(db_only_id)]["enabled"] is False
+        assert accounts[str(db_only_id)]["account_status"] == "disabled"
+        assert "disabled" in accounts[str(db_only_id)]["status_reasons"]
+        assert accounts[str(db_only_id)]["usage_snapshot"]["known"] is False
+        configured = accounts[str(db_configured_id)]
+        assert configured["credential_configured"] is True
+        assert configured["runtime_ready"] is False
+        assert configured["account_status"] == "unavailable"
+        assert configured["status_reasons"] == ["runtime_not_loaded"]
+        assert configured["usage"]["at_any_cap"] is False
+        assert configured["usage_snapshot"]["known"] is False
         serialized = json.dumps(roster.json())
         assert "sk-ant-oat01-secret" not in serialized
         for forbidden in (
@@ -578,7 +613,7 @@ def inject_pool():
 
 async def test_account_health_summary_returns_per_account_data(client, inject_pool):
     """Health endpoint returns one entry per in-pool account with correct fields."""
-    now = datetime.utcnow()
+    now = _admin_pool_accounts._utcnow()
     acct_id = str(uuid.uuid4())
     acct = {
         "id": acct_id,
@@ -595,6 +630,13 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
             {"at": now - timedelta(hours=3), "success": False},
         ],
         "rl_events": [now - timedelta(hours=2)],
+        "usage_snapshot": UsageSnapshot(
+            known=True,
+            window_utilizations={"five_hour": 42.0, "seven_day": 63.5},
+            resets_at={"five_hour": "2026-06-30T12:00:00Z", "seven_day": None},
+            probed_at="2026-06-30T01:00:00",
+        ),
+        "usage_snapshot_at": now,
     }
     inject_pool("test-user-123", [acct])
 
@@ -621,13 +663,18 @@ async def test_account_health_summary_returns_per_account_data(client, inject_po
     }
     assert all(v == 0 for v in a["failure_class_counts"].values())
     assert a["rate_limited_models"] == []
+    assert a["usage_snapshot"]["known"] is True
+    assert a["usage_snapshot"]["five_hour_utilization"] == 42.0
+    assert a["usage_snapshot"]["seven_day_utilization"] == 63.5
+    assert a["usage_snapshot"]["resets_at"]["five_hour"] == "2026-06-30T12:00:00Z"
+    assert a["usage_snapshot"]["stale"] is False
 
 
 async def test_account_health_summary_failure_class_window_filter(
     client, db_session, inject_pool
 ):
     """Only tasks updated within the 24h window contribute to failure_class_counts."""
-    now = datetime.utcnow()
+    now = _admin_pool_accounts._utcnow()
     acct_id = str(uuid.uuid4())
     acct = {
         "id": acct_id,
@@ -698,14 +745,14 @@ async def test_account_health_summary_matches_context_account_ids(
             status=TaskStatus.FAILED,
             latest_status_message="tests failed: assertion error",
             context={"llm_account_id": acct_id},
-            updated_at=datetime.utcnow() - timedelta(hours=1),
+            updated_at=_admin_pool_accounts._utcnow() - timedelta(hours=1),
         ),
         Task(
             project_id=project.id,
             status=TaskStatus.CANCELLED,
             latest_status_message="tests failed: assertion error",
             context={"max_plan_account_id": acct_id},
-            updated_at=datetime.utcnow() - timedelta(hours=2),
+            updated_at=_admin_pool_accounts._utcnow() - timedelta(hours=2),
         ),
     ]
     db_session.add_all(tasks)
@@ -761,7 +808,7 @@ async def test_account_health_summary_fully_disabled_state(client, inject_pool):
 
 async def test_account_health_summary_disqualified_state(client, inject_pool):
     """Healthy accounts with health score below the disqualify threshold show state='disqualified'."""
-    now = datetime.utcnow()
+    now = _admin_pool_accounts._utcnow()
     acct_id = str(uuid.uuid4())
     # 0 completions, 3 RL events → score = 0 - 2*3 = -6, below threshold of -4
     acct = {
@@ -789,7 +836,7 @@ async def test_account_health_summary_disqualified_state(client, inject_pool):
 
 async def test_account_health_summary_disabled_models_with_kind(client, inject_pool):
     """Disabled models list distinguishes quota_exhausted from exponential cooldown."""
-    now = datetime.utcnow()
+    now = _admin_pool_accounts._utcnow()
     acct_id = str(uuid.uuid4())
     acct = {
         "id": acct_id,
@@ -1612,7 +1659,7 @@ async def test_clear_regression_endpoint_clears_only_regression_kind(
             "disabled_models": {
                 "claude-q": {
                     "kind": "regression",
-                    "at": datetime.utcnow(),
+                        "at": _admin_pool_accounts._utcnow(),
                     "hits": 1,
                     "provider": "anthropic",
                     "regression_stats": {
@@ -1626,7 +1673,7 @@ async def test_clear_regression_endpoint_clears_only_regression_kind(
                 # And a rate_limit entry on a different model — must be untouched.
                 "other-model": {
                     "kind": None,
-                    "at": datetime.utcnow(),
+                        "at": _admin_pool_accounts._utcnow(),
                     "hits": 1,
                 },
             },
@@ -1705,7 +1752,11 @@ async def test_clear_regression_endpoint_rejects_other_users_accounts(
             "user_id": "some-other-user",
             "provider": "anthropic",
             "disabled_models": {
-                "claude-q": {"kind": "regression", "at": datetime.utcnow(), "hits": 1}
+                    "claude-q": {
+                        "kind": "regression",
+                        "at": _admin_pool_accounts._utcnow(),
+                        "hits": 1,
+                    }
             },
         }
     try:
@@ -2156,7 +2207,7 @@ async def test_provider_model_breakdown_empty_accounts_carries_freshness(
 async def test_reset_rate_limits_clears_disabled_at_column(client, db_session):
     """reset-rate-limits must clear disabled_at in the DB so a subsequent manual
     disable is not silently undone by the auto-recovery sweep."""
-    past = datetime.utcnow() - timedelta(hours=2)
+    past = _admin_pool_accounts._utcnow() - timedelta(hours=2)
     acct = MaxPlanAccount(
         user_id="test-user-123",
         name="Rate Limited Account",

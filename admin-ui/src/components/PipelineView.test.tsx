@@ -19,19 +19,18 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   };
 }
 
-/** A task node is dimmed (filtered out) when it carries the opacity/grayscale class. */
 function nodeFor(taskId: string): HTMLElement {
   const el = document.querySelector(`[data-task-id="${taskId}"]`);
   if (!el) throw new Error(`no node for ${taskId}`);
   return el as HTMLElement;
 }
 
-describe('PipelineView Blocked filter', () => {
+describe('PipelineView task status visibility', () => {
   beforeEach(() => {
     vi.clearAllMocks();
   });
 
-  it('matches first-class BLOCKED tasks, not just QUEUED+depends_on', async () => {
+  it('keeps blocked and dependency-waiting tasks visible after removing local status chips', async () => {
     const user = userEvent.setup();
     const tasks = [
       makeTask({ id: 'blocked-status', title: 'Blocked by status', status: 'BLOCKED' }),
@@ -41,15 +40,19 @@ describe('PipelineView Blocked filter', () => {
     render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
 
     // Root groups default-collapse when they contain no active/failed work;
-    // expand them so the task nodes render before asserting on dimming.
+    // expand them so the task nodes render before asserting visibility.
     await user.click(screen.getByRole('button', { name: 'Expand all' }));
-    await user.click(screen.getByRole('button', { name: 'Blocked' }));
 
-    // Real BLOCKED status and the legacy QUEUED+deps inference both stay lit.
+    expect(screen.queryByRole('button', { name: 'All' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Active' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Waiting' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Blocked' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Failed' })).toBeNull();
+
+    // Real BLOCKED status and the legacy QUEUED+deps inference both remain visible.
     expect(nodeFor('blocked-status').className).not.toMatch(/opacity-40/);
     expect(nodeFor('legacy-blocked').className).not.toMatch(/opacity-40/);
-    // A plain QUEUED task with no deps is dimmed under the Blocked filter.
-    expect(nodeFor('plain-queued').className).toMatch(/opacity-40/);
+    expect(nodeFor('plain-queued').className).not.toMatch(/opacity-40/);
   });
 
   it('surfaces blocker_kind/blocked_reason/recheck_after in the BLOCKED node tooltip', async () => {
@@ -92,6 +95,42 @@ describe('PipelineView Blocked filter', () => {
 
     const title = nodeFor('plain-running').getAttribute('title') ?? '';
     expect(title).not.toContain('stale reason that should not render');
+  });
+
+  it('keeps blocked, parked, dependency-waiting, queued, and running tasks visible together', async () => {
+    const user = userEvent.setup();
+    const tasks = [
+      makeTask({ id: 'blocked-status', title: 'Blocked by status', status: 'BLOCKED' }),
+      makeTask({ id: 'parked-status', title: 'Parked by status', status: 'PARKED' }),
+      makeTask({ id: 'legacy-waiting', title: 'Waiting on dependency', status: 'QUEUED', depends_on: ['blocked-status'] }),
+      makeTask({ id: 'plain-queued', title: 'Plain queued', status: 'QUEUED' }),
+      makeTask({ id: 'running-task', title: 'Running task', status: 'IN_PROGRESS' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+
+    await user.click(screen.getByRole('button', { name: 'Expand all' }));
+
+    expect(nodeFor('blocked-status').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('parked-status').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('legacy-waiting').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('plain-queued').className).not.toMatch(/opacity-40/);
+    expect(nodeFor('running-task').className).not.toMatch(/opacity-40/);
+  });
+
+  it('expands groups with waiting children by default', () => {
+    const tasks = [
+      makeTask({ id: 'root-waiting', title: 'Root waiting group', status: 'QUEUED' }),
+      makeTask({
+        id: 'blocked-child',
+        title: 'Blocked child should be visible',
+        status: 'BLOCKED',
+        parent_task_id: 'root-waiting',
+      }),
+      makeTask({ id: 'sibling-root', title: 'Sibling root', status: 'QUEUED' }),
+    ];
+    render(<PipelineView tasks={tasks} onViewLogs={vi.fn()} />);
+
+    expect(nodeFor('blocked-child')).toBeInTheDocument();
   });
 });
 

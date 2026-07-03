@@ -17,17 +17,25 @@ import uuid
 from datetime import timedelta
 
 import pytest
+from sqlmodel import select
 
 from app import auth as auth_mod
 from app import orchestrator as orch
 from app.failure_classification import PROVISION_FAILURE
 from app.models import (
+    Alert,
+    AlertSeverity,
     LocalRunner,
     Project,
     ProjectMember,
     Task,
     TaskStatus,
     _utcnow,
+)
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
 
 TEST_USER_ID = "test-user-holds"
@@ -112,6 +120,158 @@ class TestFailStaleLocalRunnerHolds:
         assert (
             task.context or {}
         ).get("awaiting_local_runner_since") is not None
+
+    @pytest.mark.asyncio
+    async def test_fails_strategic_local_hold_older_than_timeout(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        held_since = _utcnow() - timedelta(
+            seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600
+        )
+        record_task_result = mocker.patch("app.routers.agent_status.record_task_result")
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since.isoformat(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 1
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.FAILED
+        assert "strategic_local_runner_required" in (
+            task.latest_status_message or ""
+        )
+        assert "Strategic-capable local runner" in (
+            task.latest_status_message or ""
+        )
+        assert "requeue" in (task.latest_status_message or "")
+        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
+        record_task_result.assert_called_once_with(
+            success=False,
+            failure_class=PROVISION_FAILURE,
+            task_id=str(task.id),
+            task_type="strategic_review",
+        )
+        alerts = (
+            (
+                await db_session.execute(
+                    select(Alert).where(
+                        Alert.task_id == task.id,
+                        Alert.severity == AlertSeverity.ERROR,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(alerts) == 1
+        assert "Strategic-capable local runner" in alerts[0].message
+
+    @pytest.mark.asyncio
+    async def test_keeps_recent_strategic_local_hold(self, db_session):
+        project = await _make_project(db_session)
+        held_since = _utcnow() - timedelta(seconds=60)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since.isoformat(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert (
+            task.context or {}
+        ).get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY) is not None
+
+    @pytest.mark.asyncio
+    async def test_ignores_malformed_strategic_local_hold_markers(self, db_session):
+        project = await _make_project(db_session)
+        held_since = (
+            _utcnow()
+            - timedelta(seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600)
+        ).isoformat()
+        missing_required = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since},
+        )
+        wrong_type = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since,
+            },
+        )
+        approval_gate = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            requires_approval=True,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since,
+            },
+        )
+        archived = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            archived=True,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since,
+            },
+        )
+        string_required = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: "true",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since,
+            },
+        )
+        db_session.add_all(
+            [missing_required, wrong_type, approval_gate, archived, string_required]
+        )
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0
+        for task in (
+            missing_required,
+            wrong_type,
+            approval_gate,
+            archived,
+            string_required,
+        ):
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.QUEUED
 
     @pytest.mark.asyncio
     async def test_ignores_unstamped_queued_task(self, db_session):

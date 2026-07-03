@@ -890,7 +890,7 @@ function buildPytestGateInner(dirPrefix: string, testCmd: string, taskId: string
   const harness = dirPrefix.includes('/') ? '' : `scripts/test-${dirPrefix}.sh`;
   const harnessProbe = harness
     ? `    if [ -f ${harness} ] && command -v docker >/dev/null 2>&1; then
-      _AVAIL_MB=$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)
+      _AVAIL_MB=\${BLUEPRINT_MEM_AVAIL_MB:-$(awk '/^MemAvailable:/ {print int($2/1024); exit}' /proc/meminfo 2>/dev/null || echo 99999)}
       if [ -n "\${ALLOW_LOW_MEM:-}" ]; then
         # Explicit opt-in: force the full sanctioned harness regardless of memory.
         _GATE_MODE="harness"

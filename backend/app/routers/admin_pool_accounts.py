@@ -334,6 +334,105 @@ def _disabled_models_from_db(account: MaxPlanAccount) -> dict[str, dict[str, Any
     return serialized
 
 
+def _cap_remaining(cap: int | None, used: int) -> int | None:
+    if cap is None:
+        return None
+    return max(0, int(cap) - int(used))
+
+
+def _cap_usage_fraction(cap: int | None, used: int) -> float | None:
+    if cap is None or int(cap) <= 0:
+        return None
+    return round(min(1.0, max(0, int(used)) / int(cap)), 4)
+
+
+def _account_usage_summary(
+    *,
+    active_tasks: int,
+    total_tasks: int,
+    daily_task_count: int,
+    daily_task_cap: int | None,
+    max_concurrent_tasks: int | None,
+) -> dict[str, Any]:
+    daily_remaining = _cap_remaining(daily_task_cap, daily_task_count)
+    concurrent_remaining = _cap_remaining(max_concurrent_tasks, active_tasks)
+    at_daily_cap = daily_remaining == 0 if daily_remaining is not None else False
+    at_concurrent_cap = (
+        concurrent_remaining == 0 if concurrent_remaining is not None else False
+    )
+    return {
+        "active_tasks": active_tasks,
+        "total_tasks": total_tasks,
+        "daily_task_count": daily_task_count,
+        "daily_task_cap": daily_task_cap,
+        "daily_task_remaining": daily_remaining,
+        "daily_task_usage_fraction": _cap_usage_fraction(
+            daily_task_cap, daily_task_count
+        ),
+        "max_concurrent_tasks": max_concurrent_tasks,
+        "concurrent_task_remaining": concurrent_remaining,
+        "concurrent_task_usage_fraction": _cap_usage_fraction(
+            max_concurrent_tasks, active_tasks
+        ),
+        "at_daily_cap": at_daily_cap,
+        "at_concurrent_cap": at_concurrent_cap,
+        "at_any_cap": at_daily_cap or at_concurrent_cap,
+    }
+
+
+def _account_usage_snapshot(mem_account: dict[str, Any] | None) -> dict[str, Any]:
+    if mem_account is None:
+        return {
+            "known": False,
+            "five_hour_utilization": None,
+            "seven_day_utilization": None,
+            "resets_at": {},
+            "probed_at": None,
+            "stale": True,
+        }
+    from app.max_plan_pool import _usage_snapshot_summary
+
+    return _usage_snapshot_summary(mem_account, _utcnow())
+
+
+def _account_status_summary(
+    *,
+    enabled: bool,
+    credential_configured: bool,
+    runtime_ready: bool,
+    disabled_reason: str | None,
+    disabled_models: dict[str, dict[str, Any]],
+    usage: dict[str, Any],
+) -> tuple[str, list[str]]:
+    reasons: list[str] = []
+    if not enabled:
+        reasons.append("disabled")
+    if not credential_configured:
+        reasons.append("missing_credentials")
+    if credential_configured and not runtime_ready:
+        reasons.append("runtime_not_loaded")
+    if usage["at_daily_cap"]:
+        reasons.append("daily_cap_reached")
+    if usage["at_concurrent_cap"]:
+        reasons.append("concurrent_cap_reached")
+    if disabled_reason:
+        reasons.append("disabled_reason")
+    if disabled_models:
+        reasons.append("rate_limited_models")
+
+    if not enabled:
+        return "disabled", reasons
+    if not credential_configured:
+        return "unconfigured", reasons
+    if not runtime_ready:
+        return "unavailable", reasons
+    if usage["at_any_cap"]:
+        return "at_cap", reasons
+    if disabled_reason or disabled_models:
+        return "degraded", reasons
+    return "ready", reasons
+
+
 def _serialize_max_plan_account_row(
     db_account: MaxPlanAccount, mem_account: dict[str, Any] | None
 ) -> dict[str, Any]:
@@ -360,6 +459,33 @@ def _serialize_max_plan_account_row(
         if mem_account is not None
         else _disabled_models_from_db(db_account)
     )
+    active_tasks = int((mem_account or {}).get("active_tasks") or 0)
+    total_tasks = int(db_account.total_tasks or 0)
+    daily_task_count = int(
+        (mem_account or {}).get("daily_task_count", db_account.daily_task_count)
+        or 0
+    )
+    runtime_ready = bool((mem_account or {}).get("runtime_ready"))
+    credential_configured = bool(_account_secret_ref(db_account))
+    disabled_reason = (mem_account or {}).get(
+        "disabled_reason", db_account.disabled_reason
+    )
+    usage = _account_usage_summary(
+        active_tasks=active_tasks,
+        total_tasks=total_tasks,
+        daily_task_count=daily_task_count,
+        daily_task_cap=db_account.daily_task_cap,
+        max_concurrent_tasks=db_account.max_concurrent_tasks,
+    )
+    usage_snapshot = _account_usage_snapshot(mem_account)
+    account_status, status_reasons = _account_status_summary(
+        enabled=bool(db_account.enabled),
+        credential_configured=credential_configured,
+        runtime_ready=runtime_ready,
+        disabled_reason=disabled_reason,
+        disabled_models=disabled_models,
+        usage=usage,
+    )
     return {
         "id": str(db_account.id),
         "name": db_account.name,
@@ -367,26 +493,26 @@ def _serialize_max_plan_account_row(
         "provider": provider_value,
         "auth_mode": auth_mode_value,
         "provider_metadata": metadata,
-        "active_tasks": int((mem_account or {}).get("active_tasks") or 0),
-        "total_tasks": int(db_account.total_tasks or 0),
+        "active_tasks": active_tasks,
+        "total_tasks": total_tasks,
         "token_created_at": _iso_or_none(db_account.token_created_at),
         "rl_hit_count": int((mem_account or {}).get("rl_hit_count") or 0),
         "daily_task_cap": db_account.daily_task_cap,
         "max_concurrent_tasks": db_account.max_concurrent_tasks,
         "auto_disable_after_rate_limits": db_account.auto_disable_after_rate_limits,
-        "daily_task_count": int(
-            (mem_account or {}).get("daily_task_count", db_account.daily_task_count)
-            or 0
-        ),
+        "daily_task_count": daily_task_count,
         "daily_task_count_reset_at": _iso_or_none(daily_reset_at),
-        "disabled_reason": (mem_account or {}).get(
-            "disabled_reason", db_account.disabled_reason
-        ),
+        "disabled_reason": disabled_reason,
         "disabled_at": _iso_or_none(
             (mem_account or {}).get("disabled_at", db_account.disabled_at)
         ),
         "disabled_models": disabled_models,
-        "runtime_ready": bool((mem_account or {}).get("runtime_ready")),
+        "credential_configured": credential_configured,
+        "runtime_ready": runtime_ready,
+        "account_status": account_status,
+        "status_reasons": status_reasons,
+        "usage": usage,
+        "usage_snapshot": usage_snapshot,
     }
 
 
@@ -602,6 +728,9 @@ async def _compute_account_health_summary(
                 "completions_24h": s["completions_24h"],
                 "rl_events_24h": s["rl_events_24h"],
                 "rate_limited_models": rate_limited_models,
+                "usage_snapshot": s.get(
+                    "usage_snapshot", _account_usage_snapshot(None)
+                ),
                 "failure_class_counts": failure_counts.get(
                     acct_id, {c: 0 for c in _HEALTH_FAILURE_CLASSES}
                 ),

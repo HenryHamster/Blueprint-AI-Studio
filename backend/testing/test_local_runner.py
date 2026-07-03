@@ -8,27 +8,45 @@ Covers the four new surfaces:
 """
 
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlmodel import select
 
+from app import alert_dispatch
 from app import auth as auth_mod
 from app import compute_backends as compute_backends_mod
 from app import orchestrator as orch
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
+    Alert,
+    AlertSeverity,
     ComputeJob,
     ComputeJobOutcome,
     ComputeJobStatus,
     LocalRunner,
+    MessagesNoisePrefs,
     Project,
     ProjectMember,
     Task,
     TaskStatus,
     _utcnow,
 )
-from app.routers.runner import _parse_multipart_form
+from app.messages_noise_prefs_store import get_messages_noise_prefs_row
+from app.routers.admin_runners import _runner_health
+from app.routers.runner import _parse_heartbeat_timestamp, _parse_multipart_form
+from app.task_capabilities import STRATEGIC_TASK_TYPES
+from app.workbench_state import (
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS,
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    WORKBENCH_STATE_KEY,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -59,6 +77,56 @@ async def _make_runner(session, project_id, **kwargs):
     await session.commit()
     await session.refresh(runner)
     return runner, token
+
+
+def _parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+
+
+async def _seed_strategic_continuation(
+    session,
+    project,
+    *,
+    timestamp: str,
+    interaction_mode: str = "continuous",
+    runner_id: str | None = None,
+    include_marker: bool = True,
+    include_marker_runner: bool = True,
+    include_workbench_runner: bool = True,
+) -> None:
+    workbench = {
+        "version": 1,
+        "interaction_mode": interaction_mode,
+        "active_surface": "runtime",
+        "selected_refs": [],
+        "session_started_at": timestamp,
+        "last_interaction_at": timestamp,
+    }
+    if runner_id and include_workbench_runner:
+        workbench["preferred_runner_id"] = runner_id
+    session.add(
+        MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={WORKBENCH_STATE_KEY: workbench},
+        )
+    )
+    if include_marker:
+        marker = {
+            "version": 1,
+            "active": True,
+            "operator_user_id": TEST_USER_ID,
+            "updated_at": timestamp,
+            "last_seen_at": timestamp,
+        }
+        if runner_id and include_marker_runner:
+            marker["preferred_runner_id"] = runner_id
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: marker,
+        }
+        session.add(project)
+    await session.commit()
 
 
 # ── Auth ─────────────────────────────────────────────────────────────────────
@@ -107,6 +175,191 @@ class TestRunnerAuth:
         assert await auth_mod.verify_runner_token(token, db_session) is None
 
 
+@pytest.mark.asyncio
+async def test_locked_noise_prefs_read_refreshes_identity_mapped_row(db_session):
+    project = await _make_project(db_session)
+    old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+    await _seed_strategic_continuation(
+        db_session,
+        project,
+        timestamp=old_at,
+        runner_id=str(uuid.uuid4()),
+    )
+
+    first = await get_messages_noise_prefs_row(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+    )
+    assert first is not None
+    assert first.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "continuous"
+    await db_session.commit()
+
+    Session = async_sessionmaker(
+        db_session.bind,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with Session() as other_session:
+        row = await get_messages_noise_prefs_row(
+            other_session,
+            TEST_USER_ID,
+            project.id,
+            for_update=True,
+        )
+        assert row is not None
+        prefs = dict(row.prefs or {})
+        workbench = dict(prefs[WORKBENCH_STATE_KEY])
+        workbench["interaction_mode"] = "chat"
+        prefs[WORKBENCH_STATE_KEY] = workbench
+        row.prefs = prefs
+        other_session.add(row)
+        await other_session.commit()
+
+    refreshed = await get_messages_noise_prefs_row(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        for_update=True,
+    )
+    assert refreshed is not None
+    assert refreshed is first
+    assert refreshed.prefs[WORKBENCH_STATE_KEY]["interaction_mode"] == "chat"
+
+
+# ── Runner health / trust telemetry (pure, no DB) ────────────────────────────
+
+
+def _health_runner(**kwargs) -> LocalRunner:
+    """In-memory LocalRunner for exercising _runner_health without a session."""
+    now = _utcnow()
+    caps = kwargs.pop("capabilities", {"task_types": "all", "max_concurrent": 2})
+    return LocalRunner(
+        project_id=uuid.uuid4(),
+        token_hash="x",
+        last_seen_at=kwargs.pop("last_seen_at", now - timedelta(seconds=30)),
+        capabilities=caps,
+        **kwargs,
+    )
+
+
+class TestRunnerHealthTrustTelemetry:
+    """The 'connected but failing' (degraded) false-green guard is pure logic."""
+
+    def test_healthy_live_runner_is_connected_not_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 50 * 1024**3,
+                    "gpu_utilization_pct": 42,
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+        assert h["degraded_reason"] is None
+        assert h["consecutive_job_failures"] == 0
+        assert h["gpu_utilization_pct"] == 42
+        assert h["disk_low"] is False
+        assert h["seconds_since_last_success"] == 60
+
+    def test_failure_streak_marks_runner_degraded_but_still_live(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=60),
+                consecutive_job_failures=3,
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded"] is True
+        assert h["degraded_reason"] == "job_failure_streak"
+        # A degraded runner is still connected/live — slot accounting is unaffected.
+        assert h["is_live"] is True
+
+    def test_recent_success_resets_to_ready(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow(),
+                consecutive_job_failures=0,
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_stale_success_while_working_is_degraded(self):
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=_utcnow() - timedelta(seconds=4000),
+                consecutive_job_failures=1,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "degraded"
+        assert h["degraded_reason"] == "success_stale"
+
+    def test_fresh_runner_on_first_job_is_not_degraded(self):
+        # Active work, never succeeded, zero failures — legitimately churning,
+        # must NOT be mislabelled as failing.
+        h = _runner_health(
+            _health_runner(
+                last_successful_job_at=None,
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "active_task_ids": ["t1"],
+                },
+            )
+        )
+        assert h["device_status"] == "connected"
+        assert h["degraded"] is False
+
+    def test_failure_streak_on_stale_runner_stays_stale_not_degraded(self):
+        # Degraded is only computed for a LIVE runner; a stale heartbeat wins.
+        h = _runner_health(
+            _health_runner(
+                last_seen_at=_utcnow() - timedelta(minutes=9),
+                last_successful_job_at=None,
+                consecutive_job_failures=5,
+            )
+        )
+        assert h["device_status"] == "stale"
+        assert h["degraded"] is False
+
+    def test_low_disk_flagged_without_degrading(self):
+        h = _runner_health(
+            _health_runner(
+                consecutive_job_failures=0,
+                capabilities={
+                    "task_types": "all",
+                    "max_concurrent": 2,
+                    "disk_free_bytes": 1 * 1024**3,
+                },
+            )
+        )
+        assert h["disk_low"] is True
+        assert h["disk_free_bytes"] == 1 * 1024**3
+        assert h["degraded"] is False
+
+
+def test_parse_heartbeat_timestamp_tolerates_bad_input():
+    assert _parse_heartbeat_timestamp(None) is None
+    assert _parse_heartbeat_timestamp("") is None
+    assert _parse_heartbeat_timestamp("not-a-date") is None
+    parsed = _parse_heartbeat_timestamp("2026-07-02T10:00:00Z")
+    assert parsed is not None and parsed.tzinfo is None  # normalized to naive UTC
+    # Offset is normalized to UTC (12:00+02:00 -> 10:00 naive UTC).
+    assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
+
+
 # ── Admin endpoints ──────────────────────────────────────────────────────────
 
 
@@ -143,6 +396,80 @@ class TestAdminRunnerEndpoints:
         assert row.capabilities["task_types"] == "all"
 
     @pytest.mark.asyncio
+    async def test_register_strategic_local_preset_limits_runner_to_strategic_tasks(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/runners/register",
+            json={
+                "hostname": "local-strategic",
+                "preset": "strategic_local",
+                "capabilities": {"task_types": "all", "max_concurrent": 9},
+            },
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+
+        row = (
+            await db_session.execute(
+                select(LocalRunner).where(
+                    LocalRunner.id == uuid.UUID(body["runner_id"])
+                )
+            )
+        ).scalars().first()
+        assert row is not None
+        assert row.capabilities["runner_preset"] == "strategic_local"
+        assert row.capabilities["workload"] == "strategic"
+        assert row.capabilities["task_types"] == sorted(STRATEGIC_TASK_TYPES)
+        assert row.capabilities["max_concurrent"] == 1
+
+    @pytest.mark.asyncio
+    async def test_register_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/runners/register",
+                json={"hostname": "local-strategic", "preset": "strategic_local"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "registered"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"]["id"] == resp.json()["runner_id"]
+        assert emit.await_args.kwargs["summary"]["preset"] == "strategic_local"
+
+    @pytest.mark.asyncio
+    async def test_register_rejects_malformed_capabilities(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        bad_payloads = [
+            {"capabilities": {"task_types": ["unknown_type"]}},
+            {"capabilities": {"task_types": []}},
+            {"capabilities": {"max_concurrent": 0}},
+            {"capabilities": {"max_concurrent": True}},
+            {"capabilities": {"max_concurrent": 1.5}},
+            {"capabilities": {"max_concurrent": "1.5"}},
+            {"capabilities": {"has_gpu": "yes"}},
+        ]
+        for payload in bad_payloads:
+            resp = await client.post(
+                f"/api/admin/projects/{project.id}/runners/register",
+                json=payload,
+            )
+            assert resp.status_code == 422, payload
+
+    @pytest.mark.asyncio
     async def test_list_excludes_deleted(self, client: AsyncClient, db_session):
         project = await _make_project(db_session)
         r1, _ = await _make_runner(db_session, project.id, hostname="a")
@@ -153,6 +480,65 @@ class TestAdminRunnerEndpoints:
         ids = {r["id"] for r in resp.json()}
         assert str(r1.id) in ids
         assert str(r2.id) not in ids
+
+    @pytest.mark.asyncio
+    async def test_list_returns_backend_computed_dispatch_health(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        live_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="live",
+            last_seen_at=_utcnow() - timedelta(seconds=30),
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 3,
+                "active_task_ids": ["task-a"],
+            },
+        )
+        stale_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="stale",
+            last_seen_at=_utcnow() - timedelta(minutes=9),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+        offline_runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="offline",
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(seconds=30),
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 2},
+        )
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200
+        by_id = {row["id"]: row for row in resp.json()}
+
+        live_health = by_id[str(live_runner.id)]["health"]
+        assert live_health["device_status"] == "connected"
+        assert live_health["device_status_reason"] is None
+        assert live_health["is_live"] is True
+        assert live_health["active_task_count"] == 1
+        assert live_health["max_concurrent"] == 3
+        assert live_health["available_slots"] == 2
+        assert live_health["stale_reason"] is None
+
+        stale_health = by_id[str(stale_runner.id)]["health"]
+        assert stale_health["device_status"] == "stale"
+        assert stale_health["device_status_reason"] == "heartbeat_stale"
+        assert stale_health["is_live"] is False
+        assert stale_health["stale_reason"] == "heartbeat_stale"
+        assert stale_health["liveness_window_seconds"] == 300
+
+        offline_health = by_id[str(offline_runner.id)]["health"]
+        assert offline_health["device_status"] == "offline"
+        assert offline_health["device_status_reason"] == "inactive"
+        assert offline_health["is_live"] is False
+        assert offline_health["stale_reason"] == "inactive"
 
     @pytest.mark.asyncio
     async def test_delete_marks_deleted(self, client: AsyncClient, db_session):
@@ -170,6 +556,137 @@ class TestAdminRunnerEndpoints:
             f"/api/admin/projects/{project.id}/runners/{runner.id}"
         )
         assert resp2.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_delete_clears_preferred_runner_workbench_state(
+        self, client: AsyncClient, db_session
+    ):
+        from app.workbench_state import (
+            STRATEGIC_LOCAL_CONTINUATION_KEY,
+            WORKBENCH_STATE_KEY,
+        )
+
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        now = _utcnow().isoformat()
+        db_session.add(
+            MessagesNoisePrefs(
+                user_id=TEST_USER_ID,
+                project_id=project.id,
+                prefs={
+                    WORKBENCH_STATE_KEY: {
+                        "version": 1,
+                        "interaction_mode": "continuous",
+                        "active_surface": "runtime",
+                        "selected_refs": [],
+                        "preferred_runner_id": str(runner.id),
+                    }
+                },
+            )
+        )
+        project.vision = {
+            **(project.vision or {}),
+            STRATEGIC_LOCAL_CONTINUATION_KEY: {
+                "version": 1,
+                "active": True,
+                "operator_user_id": TEST_USER_ID,
+                "updated_at": now,
+                "last_seen_at": now,
+                "preferred_runner_id": str(runner.id),
+            },
+        }
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}"
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            "preferred_runner_id"
+            not in prefs_row.prefs[WORKBENCH_STATE_KEY]
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["active"] is True
+        assert "preferred_runner_id" not in marker
+
+    @pytest.mark.asyncio
+    async def test_delete_releases_unpulled_runner_pins(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        unpulled = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+            started_at=None,
+        )
+        pulled = Task(
+            project_id=project.id,
+            payloads=[{"type": "review"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+            started_at=_utcnow(),
+        )
+        db_session.add(unpulled)
+        db_session.add(pulled)
+        await db_session.commit()
+
+        resp = await client.delete(
+            f"/api/admin/projects/{project.id}/runners/{runner.id}"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["released_unpulled_pins"] == 1
+
+        await db_session.refresh(unpulled)
+        await db_session.refresh(pulled)
+        assert unpulled.status == TaskStatus.QUEUED
+        assert unpulled.vm_instance_id is None
+        assert "runner_target_id" not in (unpulled.context or {})
+        assert pulled.status == TaskStatus.PROVISIONING
+        assert pulled.vm_instance_id == f"runner:{runner.id}"
+
+    @pytest.mark.asyncio
+    async def test_delete_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.admin_runners.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.delete(
+                f"/api/admin/projects/{project.id}/runners/{runner.id}"
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == project.id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "deleted"
+        assert "strategic_session" in emit.await_args.kwargs["refetch_surfaces"]
+        assert "runtime" in emit.await_args.kwargs["refetch_surfaces"]
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "deleted",
+            "released_unpulled_pins": 0,
+        }
 
 
 # ── Runner polling/heartbeat endpoints ───────────────────────────────────────
@@ -208,6 +725,7 @@ class TestRunnerEndpoints:
         assert body["task_id"] == str(task.id)
         assert body["task_type"] == "create"
         assert body["agent_token"]
+        assert body["vm_instance_id"] == f"runner:{runner.id}"
         assert body["payload"] == [{"type": "create", "title": "do a thing"}]
 
         # The minted JWT is task-scoped to this runner's vm id.
@@ -221,6 +739,47 @@ class TestRunnerEndpoints:
         await db_session.refresh(task)
         assert task.status == TaskStatus.PROVISIONING
         assert task.started_at is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("task_type", "output_kind"),
+        [
+            ("design_doc_update", "artifact"),
+            ("strategic_review", "knowledge"),
+        ],
+    )
+    async def test_next_task_returns_strategic_capability_slice(
+        self, client: AsyncClient, db_session, task_type: str, output_kind: str
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": task_type}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{runner.id}",
+            context={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/runner/next-task",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_type"] == task_type
+        capability = body["capability_slice"]
+        assert capability["id"] == task_type
+        assert capability["agent_mode"] == "read_only"
+        assert capability["run_shape"] == "single_agent"
+        assert capability["output_kind"] == output_kind
+
+        claims = auth_mod.verify_agent_jwt(body["agent_token"])
+        assert claims["task_type"] == task_type
+        assert claims["project_id"] == str(project.id)
 
     @pytest.mark.asyncio
     async def test_next_task_repoll_returns_204_after_dispatch(
@@ -350,6 +909,536 @@ class TestRunnerEndpoints:
         assert runner.capabilities["active_task_ids"] == ["abc", "def"]
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        success_at = (_utcnow() - timedelta(minutes=1)).replace(microsecond=0)
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": success_at.isoformat(),
+                "consecutive_job_failures": 4,
+                "disk_free_bytes": 12345678,
+                "gpu_utilization_pct": 77,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        # First-class columns.
+        assert runner.last_successful_job_at == success_at
+        assert runner.consecutive_job_failures == 4
+        # Display-only telemetry rides on capabilities.
+        assert runner.capabilities["disk_free_bytes"] == 12345678
+        assert runner.capabilities["gpu_utilization_pct"] == 77
+
+        # The runner is live but has a >= 3 failure streak -> degraded false-green.
+        list_resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert list_resp.status_code == 200
+        health = list_resp.json()[0]["health"]
+        assert health["device_status"] == "degraded"
+        assert health["degraded"] is True
+        assert health["consecutive_job_failures"] == 4
+        assert health["gpu_utilization_pct"] == 77
+
+        # A subsequent success (failures reset to 0) clears the degraded state.
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "last_successful_job_at": _utcnow().isoformat(),
+                "consecutive_job_failures": 0,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        list_resp2 = await client.get(f"/api/admin/projects/{project.id}/runners")
+        health2 = list_resp2.json()[0]["health"]
+        assert health2["device_status"] == "connected"
+        assert health2["degraded"] is False
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_trust_telemetry(
+        self, client: AsyncClient, db_session
+    ):
+        # Old runners omit the trust fields entirely — heartbeat must still succeed
+        # and leave the columns at their defaults.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.last_successful_job_at is None
+        assert runner.consecutive_job_failures == 0
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_renews_pinned_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        workbench = prefs_row.prefs[WORKBENCH_STATE_KEY]
+        assert _parse_iso(workbench["last_interaction_at"]) > _parse_iso(old_at)
+        assert workbench["preferred_runner_id"] == preferred_runner_id
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert _parse_iso(marker["last_seen_at"]) > _parse_iso(old_at)
+        assert _parse_iso(marker["updated_at"]) > _parse_iso(old_at)
+        assert marker["preferred_runner_id"] == preferred_runner_id
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_unpinned_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(runner.id),
+            include_marker_runner=False,
+            include_workbench_runner=False,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert "preferred_runner_id" not in marker
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_mismatched_runner_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        other_runner, _other_token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(other_runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["preferred_runner_id"] == str(other_runner.id)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_stale_strategic_continuation(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (
+            _utcnow()
+            - timedelta(seconds=STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS + 60)
+        ).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=str(runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["updated_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_when_owner_left_continuous_mode(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            interaction_mode="chat",
+            runner_id=str(runner.id),
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == old_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skips_recent_strategic_continuation_renewal(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        recent_at = (_utcnow() - timedelta(seconds=30)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=recent_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"]
+            == recent_at
+        )
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == recent_at
+        assert marker["updated_at"] == recent_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_renew_continuation_for_non_strategic_runner(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["docs"],
+                "max_concurrent": 1,
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_does_not_recreate_continuation_after_continuous_mode(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            interaction_mode="chat",
+            runner_id=str(runner.id),
+            include_marker=False,
+        )
+
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        assert resp.status_code == 200
+        await db_session.refresh(project)
+        assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_emits_workbench_runner_refresh(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={
+                    "active_task_ids": ["task-1"],
+                    "active_compute_job_ids": ["job-1"],
+                    "agent_available": True,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == runner.project_id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "heartbeat"
+        assert emit.await_args.kwargs["refetch_surfaces"] == (
+            "strategic_session",
+            "runtime",
+        )
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "active",
+            "active_task_count": 1,
+            "active_compute_job_count": 1,
+            "agent_available": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_emits_refetch_when_stale_runner_becomes_live(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=9),
+            capabilities={
+                "active_task_ids": ["task-1"],
+                "active_compute_job_ids": ["job-1"],
+                "agent_available": True,
+            },
+        )
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={
+                    "active_task_ids": ["task-1"],
+                    "active_compute_job_ids": ["job-1"],
+                    "agent_available": True,
+                },
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_awaited_once()
+        assert emit.await_args.args[0] == runner.project_id
+        assert emit.await_args.kwargs["resource"] == "local_runner"
+        assert emit.await_args.kwargs["action"] == "heartbeat"
+        assert emit.await_args.kwargs["refetch_surfaces"] == (
+            "strategic_session",
+            "runtime",
+        )
+        assert emit.await_args.kwargs["summary"] == {
+            "id": str(runner.id),
+            "status": "active",
+            "active_task_count": 1,
+            "active_compute_job_count": 1,
+            "agent_available": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_skips_refetch_for_default_empty_active_work(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+
+        with patch(
+            "app.routers.runner.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200
+        emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_heartbeat_persists_runner_reported_capabilities(
         self, client: AsyncClient, db_session
     ):
@@ -370,9 +1459,13 @@ class TestRunnerEndpoints:
             "/api/runner/heartbeat",
             json={
                 "active_task_ids": [],
+                "active_compute_job_ids": ["job-1"],
+                "agent_available": False,
                 "has_gpu": True,
                 "gpu_count": 1,
                 "gpu_names": ["Tesla T4"],
+                "hostname": "worker-host",
+                "version": "local-runner/1",
             },
             headers={"Authorization": f"Bearer {token}"},
         )
@@ -383,6 +1476,10 @@ class TestRunnerEndpoints:
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["gpu_count"] == 1
         assert runner.capabilities["gpu_names"] == ["Tesla T4"]
+        assert runner.capabilities["active_compute_job_ids"] == ["job-1"]
+        assert runner.capabilities["agent_available"] is False
+        assert runner.hostname == "worker-host"
+        assert runner.version == "local-runner/1"
 
         # Operator-configured fields must NOT be clobbered.
         assert runner.capabilities["task_types"] == "all"
@@ -400,6 +1497,24 @@ class TestRunnerEndpoints:
         # has_gpu persists from the previous heartbeat.
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["active_task_ids"] == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_rejects_malformed_boolean_capabilities(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        _, token = await _make_runner(db_session, project.id)
+
+        for payload in (
+            {"active_task_ids": [], "has_gpu": "yes"},
+            {"active_task_ids": [], "agent_available": "false"},
+        ):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            assert resp.status_code == 422, payload
 
     @pytest.mark.asyncio
     async def test_heartbeat_reactivates_inactive_runner(
@@ -430,6 +1545,75 @@ class TestRunnerEndpoints:
         # Re-armed to active and last_seen_at refreshed.
         assert runner.status == "active"
         assert runner.last_seen_at > _utcnow() - timedelta(minutes=1)
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_survives_declined_continuation_renewal_race(
+        self, client: AsyncClient, db_session
+    ):
+        """Regression: the with_vision_locked decline branch must not 500.
+
+        When a concurrent heartbeat wins the renewal race, the in-lock
+        ``_renew_marker`` declines and ``renewed_marker`` stays False. That
+        branch must release the project row lock with a COMMIT, not a rollback:
+        a rollback expires every ORM instance in the shared session (even under
+        expire_on_commit=False), including the caller's ``runner`` row, so the
+        heartbeat handler's subsequent ``runner.status`` read would trigger a
+        sync lazy-load -> MissingGreenlet (HTTP 500).
+
+        Patching ``with_vision_locked`` to a no-op forces the decline branch
+        deterministically: every pre-lock guard passes (renewal IS due) but the
+        marker is never renewed, reproducing the race without real concurrency.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "runner_preset": "strategic_local",
+                "workload": "strategic",
+                "agent_available": True,
+            },
+        )
+        # 2 minutes ago -> renewal IS due, so the helper reaches
+        # with_vision_locked before it can decline.
+        old_at = (_utcnow() - timedelta(minutes=2)).isoformat()
+        preferred_runner_id = str(runner.id)
+        await _seed_strategic_continuation(
+            db_session,
+            project,
+            timestamp=old_at,
+            runner_id=preferred_runner_id,
+        )
+
+        with patch(
+            "app.workbench_state.with_vision_locked",
+            new=AsyncMock(return_value=True),
+        ):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        # Before the fix this was a 500 (MissingGreenlet on the expired runner).
+        assert resp.status_code == 200
+        # Decline must still decline: the marker is left untouched.
+        await db_session.refresh(project)
+        marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
+        assert marker["last_seen_at"] == old_at
+        assert marker["updated_at"] == old_at
+        prefs_row = (
+            await db_session.execute(
+                select(MessagesNoisePrefs).where(
+                    MessagesNoisePrefs.user_id == TEST_USER_ID,
+                    MessagesNoisePrefs.project_id == project.id,
+                )
+            )
+        ).scalar_one()
+        assert (
+            prefs_row.prefs[WORKBENCH_STATE_KEY]["last_interaction_at"] == old_at
+        )
 
 
 # ── Durable artifact upload endpoint (FIX M1, backend side) ───────────────────
@@ -777,6 +1961,110 @@ class TestOrchestratorRunnerRouting:
         )
 
     @pytest.mark.asyncio
+    async def test_strategic_local_runner_pins_only_strategic_task_types(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": sorted(STRATEGIC_TASK_TYPES),
+                "has_gpu": False,
+                "max_concurrent": 4,
+            },
+        )
+        for task_type in sorted(STRATEGIC_TASK_TYPES):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": task_type}],
+                status=TaskStatus.QUEUED,
+            )
+            db_session.add(task)
+            await db_session.commit()
+            assert await orch._try_runner_dispatch(
+                db_session, task, {project.id: [runner]}, {}
+            )
+            await db_session.refresh(task)
+            assert task.vm_instance_id == f"runner:{runner.id}"
+            assert task.context["runner_target_id"] == str(runner.id)
+
+        for task_type in ("create", "research", "compute_experiment"):
+            task = Task(
+                project_id=project.id,
+                payloads=[{"type": task_type}],
+                status=TaskStatus.QUEUED,
+            )
+            db_session.add(task)
+            await db_session.commit()
+            assert await orch._try_runner_dispatch(
+                db_session, task, {project.id: [runner]}, {}
+            ) is False
+            await db_session.refresh(task)
+            assert task.status == TaskStatus.QUEUED
+
+    @pytest.mark.asyncio
+    async def test_agent_unavailable_runner_skips_agent_tasks(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "agent_available": False,
+            },
+        )
+        create_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        compute_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(create_task)
+        db_session.add(compute_task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, create_task, {project.id: [runner]}, {}
+        ) is False
+        assert await orch._try_runner_dispatch(
+            db_session, compute_task, {project.id: [runner]}, {}
+        ) is True
+
+    @pytest.mark.asyncio
+    async def test_active_compute_jobs_count_toward_runner_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 2,
+                "active_compute_job_ids": ["job-a", "job-b"],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [runner]}, {}
+        ) is False
+
+    @pytest.mark.asyncio
     async def test_try_runner_dispatch_prefers_least_loaded(self, db_session):
         project = await _make_project(db_session)
         busy, _ = await _make_runner(
@@ -802,6 +2090,345 @@ class TestOrchestratorRunnerRouting:
         )
         await db_session.refresh(task)
         assert task.vm_instance_id == f"runner:{idle.id}"
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_prefers_requested_runner_when_eligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "max_concurrent": 4,
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, idle]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{preferred.id}"
+        assert task.context["runner_target_id"] == str(preferred.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_at_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["existing-task"],
+                "max_concurrent": 1,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, fallback]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_at_cycle_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 1,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        runner_pins_this_cycle = {preferred.id: 1}
+        assert await orch._try_runner_dispatch(
+            db_session,
+            task,
+            {project.id: [preferred, fallback]},
+            runner_pins_this_cycle,
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+        assert runner_pins_this_cycle[preferred.id] == 1
+        assert runner_pins_this_cycle[fallback.id] == 1
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_stale(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "max_concurrent": 4},
+        )
+        live, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "max_concurrent": 4},
+        )
+        cache = await orch._load_active_runners_cache(db_session)
+        assert {r.id for r in cache.get(project.id, [])} == {live.id}
+
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(stale.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(db_session, task, cache, {})
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{live.id}"
+        assert task.context["runner_target_id"] == str(live.id)
+
+    @pytest.mark.asyncio
+    async def test_try_runner_dispatch_falls_back_when_preferred_runner_ineligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["review"],
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        fallback, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": [],
+                "max_concurrent": 4,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session, task, {project.id: [preferred, fallback]}, {}
+        )
+        await db_session.refresh(task)
+        assert task.vm_instance_id == f"runner:{fallback.id}"
+        assert task.context["runner_target_id"] == str(fallback.id)
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_holds_when_no_runner(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-should-not-launch",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert (
+            await orch._try_runner_dispatch(db_session, task, {project.id: []}, {})
+            is False
+        )
+        broadcast = mocker.patch(
+            "app.broadcast.broadcast_to_project",
+            new=AsyncMock(),
+        )
+
+        assert await orch._hold_strategic_local_runner_task(db_session, task) is True
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] is True
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+        assert "runner_target_id" not in task.context
+        assert "waiting for a live Strategic-capable local runner" in (
+            task.latest_status_message or ""
+        )
+        broadcast.assert_awaited_once()
+        assert broadcast.await_args.args[0] == str(project.id)
+        assert broadcast.await_args.args[1] == "task_updated"
+        assert broadcast.await_args.args[2]["task_id"] == str(task.id)
+        assert broadcast.await_args.args[2]["message"] == task.latest_status_message
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_hold_clears_resource_placeholder(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-pre-dispatch-placeholder",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+
+        assert await orch._hold_strategic_local_runner_task(db_session, task) is True
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_runner_path_holds_without_resource_deferral(
+        self, db_session, mocker
+    ):
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            vm_instance_id="agent-vm-pre-dispatch-placeholder",
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock())
+
+        handled = await orch._try_strategic_local_required_runner_path(
+            db_session,
+            task,
+            {project.id: []},
+            {},
+        )
+
+        await db_session.refresh(task)
+        assert handled is True
+        assert task.status == TaskStatus.QUEUED
+        assert task.vm_instance_id is None
+        assert task.context[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY]
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_required_clears_hold_when_runner_available(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": ["strategic_review"],
+                "has_gpu": False,
+                "max_concurrent": 2,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: _utcnow().isoformat(),
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        assert await orch._try_runner_dispatch(
+            db_session,
+            task,
+            {project.id: [runner]},
+            {},
+        )
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PROVISIONING
+        assert task.vm_instance_id == f"runner:{runner.id}"
+        assert task.context["runner_target_id"] == str(runner.id)
+        assert STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY not in task.context
+        assert task.context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] is True
 
     @pytest.mark.asyncio
     async def test_try_runner_dispatch_skips_already_pinned(self, db_session):
@@ -905,6 +2532,69 @@ class TestOrchestratorRunnerRouting:
         assert stale.status == "inactive"
 
     @pytest.mark.asyncio
+    async def test_deactivate_stale_runners_emits_grouped_workbench_refetch(
+        self, db_session
+    ):
+        project_a = await _make_project(db_session, name="Runner Project A")
+        project_b = await _make_project(db_session, name="Runner Project B")
+        fresh, _ = await _make_runner(db_session, project_a.id, last_seen_at=_utcnow())
+        stale_a1, _ = await _make_runner(
+            db_session, project_a.id, last_seen_at=_utcnow() - timedelta(minutes=10)
+        )
+        stale_a2, _ = await _make_runner(
+            db_session, project_a.id, last_seen_at=_utcnow() - timedelta(minutes=11)
+        )
+        stale_b, _ = await _make_runner(
+            db_session, project_b.id, last_seen_at=_utcnow() - timedelta(minutes=12)
+        )
+        pinned = Task(
+            project_id=project_a.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.PROVISIONING,
+            vm_instance_id=f"runner:{stale_a1.id}",
+            vm_provisioned_at=_utcnow(),
+            context={"runner_target_id": str(stale_a1.id)},
+        )
+        db_session.add(pinned)
+        await db_session.commit()
+
+        with patch(
+            "app.orchestrator.emit_workbench_refetch",
+            new=AsyncMock(),
+        ) as emit:
+            await orch._deactivate_stale_runners(db_session)
+
+        await db_session.refresh(fresh)
+        await db_session.refresh(stale_a1)
+        await db_session.refresh(stale_a2)
+        await db_session.refresh(stale_b)
+        assert fresh.status == "active"
+        assert stale_a1.status == "inactive"
+        assert stale_a2.status == "inactive"
+        assert stale_b.status == "inactive"
+
+        assert emit.await_count == 2
+        calls_by_project = {call.args[0]: call for call in emit.await_args_list}
+        assert set(calls_by_project) == {project_a.id, project_b.id}
+        for call in calls_by_project.values():
+            assert call.kwargs["resource"] == "local_runner"
+            assert call.kwargs["action"] == "deactivated_stale"
+            assert call.kwargs["refetch_surfaces"] == (
+                "strategic_session",
+                "runtime",
+            )
+            assert call.kwargs["summary_key"] == "runners"
+
+        assert calls_by_project[project_a.id].kwargs["summary"] == {
+            "deactivated_count": 2,
+            "released_unpulled_pins": 1,
+        }
+        assert calls_by_project[project_b.id].kwargs["summary"] == {
+            "deactivated_count": 1,
+            "released_unpulled_pins": 0,
+        }
+
+    @pytest.mark.asyncio
     async def test_deactivate_stale_runners_null_last_seen_at(self, db_session):
         project = await _make_project(db_session)
         never_heartbeated, _ = await _make_runner(
@@ -974,6 +2664,273 @@ class TestOrchestratorRunnerRouting:
         await db_session.refresh(running)
         assert running.status == TaskStatus.PROVISIONING
         assert running.vm_instance_id == f"runner:{stale.id}"
+
+
+class TestRunnerDeathAlert:
+    """Runner-death alerting: the stale-runner sweep raises a deduplicated,
+    push-notified operator alert on active->inactive, and a heartbeat that
+    re-arms the runner resolves it. See app.alert_dispatch._maybe_create_
+    runner_deactivated_alert / _resolve_runner_deactivated_alert."""
+
+    async def _runner_alerts(self, db_session, project_id):
+        rows = (
+            await db_session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.event_type == "runner.deactivated",
+                )
+            )
+        ).scalars().all()
+        return list(rows)
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_warning_alert_for_idle_runner(self, db_session):
+        project = await _make_project(db_session)
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.WARNING
+        assert alert.domain == "core"
+        assert alert.dedupe_key == f"runner.deactivated:{idle.id}"
+        assert alert.dismissed_at is None
+        assert "went offline" in alert.title
+        # Webhook is pushed for the newly-created alert.
+        webhook.assert_awaited_once()
+        assert webhook.await_args.args[0] == "RUNNER_DEACTIVATED"
+
+    @pytest.mark.asyncio
+    async def test_sweep_creates_error_alert_for_runner_with_active_work(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        busy, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={
+                "task_types": "all",
+                "active_task_ids": ["a", "b"],
+                "active_compute_job_ids": ["j1"],
+            },
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch("app.alert_dispatch._send_webhook_notification", new=AsyncMock()):
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        alert = alerts[0]
+        assert alert.severity == AlertSeverity.ERROR
+        assert "mid-job" in alert.title
+        # 3 active work items (2 tasks + 1 compute job) reported in the message.
+        assert "3 active" in alert.message
+        assert str(busy.id)[:8] in alert.message
+
+    @pytest.mark.asyncio
+    async def test_sweep_alert_is_deduplicated(self, db_session):
+        # A repeated sweep over a still-dead runner must NOT create a second
+        # alert (dedupe_key upsert). We reset the runner to active+stale to force
+        # the sweep to re-select it, simulating re-entry without a recovery.
+        project = await _make_project(db_session)
+        stale, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._deactivate_stale_runners(db_session)
+            # Force a re-selection: flip back to active but keep the heartbeat stale.
+            stale.status = "active"
+            stale.last_seen_at = _utcnow() - timedelta(minutes=10)
+            db_session.add(stale)
+            await db_session.commit()
+            await orch._deactivate_stale_runners(db_session)
+
+        alerts = await self._runner_alerts(db_session, project.id)
+        assert len(alerts) == 1
+        # Webhook pushed once (first creation only), not on the dedup re-entry.
+        webhook.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_resolves_open_alert(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            status="inactive",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Seed an open runner-death alert as the sweep would have.
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="Fleet runner went offline: runner x",
+            message="dead",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=f"runner.deactivated:{runner.id}",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            resp = await client.post(
+                "/api/runner/heartbeat",
+                json={"active_task_ids": []},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp.status_code == 200
+
+        await db_session.refresh(alert)
+        assert alert.dismissed_at is not None
+        await db_session.refresh(runner)
+        assert runner.status == "active"
+
+    @pytest.mark.asyncio
+    async def test_resolve_is_noop_without_open_alert(self, db_session):
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        with patch("app.alert_dispatch.broadcast_to_project", new=AsyncMock()):
+            dismissed = await alert_dispatch._resolve_runner_deactivated_alert(
+                db_session, project.id, runner.id
+            )
+        assert dismissed == 0
+
+
+class TestDeadRunnerAttention:
+    """Item 4: a registered runner that is not-live surfaces in the operator
+    attention feed directly, independent of a pinned task. See
+    app.operator_attention._load_dead_runners / _dead_runner_attention_item."""
+
+    @pytest.mark.asyncio
+    async def test_idle_dead_runner_surfaces_as_watch(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            hostname="workstation",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": []},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 0
+        assert watch == 1
+        assert [r.id for r in runners] == [dead.id]
+        item = _dead_runner_attention_item(runners[0])
+        assert item["reason"] == "dead_runner"
+        assert item["severity"] == "watch"
+        assert item["runner_id"] == str(dead.id)
+        assert item["target"]["section"] == "devices"
+        assert item["target"]["runner_id"] == str(dead.id)
+
+    @pytest.mark.asyncio
+    async def test_midjob_dead_runner_surfaces_as_needs_operator(self, db_session):
+        from app.operator_attention import (
+            _dead_runner_attention_item,
+            _load_dead_runners,
+        )
+
+        project = await _make_project(db_session)
+        await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+            capabilities={"task_types": "all", "active_task_ids": ["running-task"]},
+        )
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert needs_op == 1
+        assert watch == 0
+        item = _dead_runner_attention_item(runners[0])
+        assert item["severity"] == "needs_operator"
+        assert item["label"] == "Fleet runner offline mid-job"
+
+    @pytest.mark.asyncio
+    async def test_live_and_booting_runners_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        await _make_runner(db_session, project.id, last_seen_at=_utcnow())  # live
+        # Never-heartbeated active runner: booting/just-registered, not a death.
+        await _make_runner(db_session, project.id, status="active", last_seen_at=None)
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_open_alert_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        db_session.add(
+            Alert(
+                project_id=project.id,
+                severity=AlertSeverity.WARNING,
+                title="Fleet runner went offline: x",
+                message="dead",
+                domain="core",
+                event_type="runner.deactivated",
+                dedupe_key=f"runner.deactivated:{dead.id}",
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        # Covered by its open alert (which surfaces via the alert path) → excluded.
+        assert (needs_op, watch, runners) == (0, 0, [])
+
+    @pytest.mark.asyncio
+    async def test_runner_with_unpulled_pin_is_excluded(self, db_session):
+        from app.operator_attention import _load_dead_runners
+
+        project = await _make_project(db_session)
+        dead, _ = await _make_runner(
+            db_session,
+            project.id,
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        # Unpulled pin → covered by the stale_runner_pin item, not dead_runner.
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "compute_experiment"}],
+                status=TaskStatus.PROVISIONING,
+                started_at=None,
+                vm_instance_id=f"runner:{dead.id}",
+                vm_provisioned_at=_utcnow(),
+                context={"runner_target_id": str(dead.id)},
+            )
+        )
+        await db_session.commit()
+        needs_op, watch, runners = await _load_dead_runners(db_session, project.id)
+        assert (needs_op, watch, runners) == (0, 0, [])
 
 
 # ── Strategic-spawning local-runner availability signal ──────────────────────
@@ -1096,6 +3053,66 @@ class TestLocalRunnerStatusForStrategist:
         assert status["active_gpu"] == 1
 
 
+    def test_local_runner_status_registered_in_strategic_schema(self):
+        """Regression guard: local_runner_status must be in _STRATEGIC_REVIEW_SCHEMA
+        with priority 'medium' so the packer does not silently downgrade it to 'low'."""
+        from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+        entry = _STRATEGIC_REVIEW_SCHEMA.get("local_runner_status")
+        assert entry is not None, (
+            "local_runner_status is missing from _STRATEGIC_REVIEW_SCHEMA; "
+            "pack_under_budget will default it to 'low' priority and may drop it "
+            "under budget pressure even when it is the context preventing unsuitable "
+            "GPU experiment proposals"
+        )
+        assert entry.get("priority") == "medium", (
+            f"local_runner_status priority should be 'medium', got {entry.get('priority')!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strategic_review_payload_keeps_local_runner_status(self, db_session):
+        """local_runner_status must survive budget pressure in pack_under_budget.
+
+        Constructs a near-budget payload with local_runner_status present and
+        confirms the packer includes it in the result (not in _packer_meta dropped).
+        """
+        from app.payload_schemas import pack_under_budget
+        from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+        runner_status = {
+            "ever_registered": True,
+            "active_total": 0,
+            "active_gpu": 0,
+            "require_local_runner": False,
+        }
+        # Build a payload that is large but not over budget so the packer runs
+        # its priority logic.  Fill a medium-priority sibling (conversation_thread)
+        # with enough data to make the test non-trivial but keep total well under budget.
+        payload = {
+            "type": "strategic_review",
+            "project_name": "test-project",
+            "base_branch": "main",
+            "research_mode": "strategic",
+            "is_self_repo": False,
+            "enable_self_improvement": False,
+            "model": "claude-sonnet-4-5",
+            "effort": "high",
+            "vision": {"purpose": "test"},
+            "direction_counts": {"active": 2, "paused": 0, "total": 2, "max_active": 5},
+            "max_active_directions": 5,
+            "local_runner_status": runner_status,
+        }
+        packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA)
+        dropped_keys = {d["key"] for d in packed.get("_packer_meta", {}).get("dropped", [])}
+        assert "local_runner_status" not in dropped_keys, (
+            "local_runner_status was dropped by pack_under_budget; "
+            f"_packer_meta.dropped = {packed['_packer_meta']['dropped']}"
+        )
+        assert packed.get("local_runner_status") == runner_status, (
+            "local_runner_status value was not preserved correctly in the packed payload"
+        )
+
+
 class TestRegistryPasswordErasedOnTerminalFinalization:
     @pytest.mark.asyncio
     async def test_password_erased_from_polling_metadata_on_finalization(
@@ -1167,6 +3184,274 @@ class TestRegistryPasswordErasedOnTerminalFinalization:
         assert job.polling_metadata.get("runner_target_id") == "some-runner-id"
 
 
+class TestReportCommandLogDropsArbitraryKeys:
+    """Pin the allowlist behavior of the /compute-job/{id}/report endpoint.
+
+    The handler ONLY extracts ``text`` from ``command_log`` and writes a
+    fixed-shape ``{"text": ..., "truncated": ...}`` object — no injected keys
+    leak through, and result_metrics is bounded by _MAX_RUNNER_RESULT_METRICS_KEYS.
+    """
+
+    async def _make_running_job(self, db_session):
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        job = ComputeJob(
+            project_id=project.id,
+            backend=RUNNER_SUBPROCESS_BACKEND_NAME,
+            status=ComputeJobStatus.RUNNING,
+            polling_metadata={"runner_target_id": str(runner.id)},
+        )
+        db_session.add(job)
+        await db_session.commit()
+        await db_session.refresh(job)
+        return project, runner, token, job
+
+    @pytest.mark.asyncio
+    async def test_report_command_log_drops_arbitrary_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """Extra/hostile keys in command_log must NOT appear in polling_metadata."""
+        from app.routers.runner import _MAX_RUNNER_RESULT_METRICS_KEYS
+
+        _project, runner, token, job = await self._make_running_job(db_session)
+
+        # Build a command_log with hostile keys beyond ``text``.
+        hostile_command_log = {
+            "text": "run ok",
+            "injected": "x",
+            "container_registry_auth": {"password": "leak"},
+            "runner_exit_code": 999,
+        }
+
+        # Build a result_metrics dict exceeding the key cap.
+        oversized_metrics = {f"metric_{i}": i for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 50)}
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": hostile_command_log,
+                "result_metrics": oversized_metrics,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["ok"] is True
+
+        await db_session.refresh(job)
+        meta = job.polling_metadata
+
+        # runner_command_log must contain ONLY text and truncated.
+        command_log_stored = meta.get("runner_command_log", {})
+        assert set(command_log_stored.keys()) == {"text", "truncated"}, (
+            f"runner_command_log must have exactly {{text, truncated}}, got {set(command_log_stored.keys())}"
+        )
+        assert command_log_stored["text"] == "run ok"
+        assert command_log_stored["truncated"] is False
+
+        # Hostile keys must NOT appear as top-level polling_metadata keys.
+        for hostile_key in ("injected", "container_registry_auth", "runner_exit_code"):
+            assert hostile_key not in meta, (
+                f"hostile key '{hostile_key}' leaked into top-level polling_metadata"
+            )
+
+        # result_metrics must be bounded.
+        stored_metrics = meta.get("runner_result_metrics", {})
+        assert len(stored_metrics) <= _MAX_RUNNER_RESULT_METRICS_KEYS, (
+            f"result_metrics has {len(stored_metrics)} keys, expected <= {_MAX_RUNNER_RESULT_METRICS_KEYS}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_command_log_truncates_oversized_text(
+        self, client: AsyncClient, db_session
+    ):
+        """Oversized text in command_log is truncated and truncated=True is set."""
+        from app.routers.runner import _MAX_RUNNER_COMMAND_LOG_BYTES
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        # Build a text that exceeds the byte cap.
+        big_text = "A" * (_MAX_RUNNER_COMMAND_LOG_BYTES + 1000)
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "command_log": {"text": big_text, "extra_hostile": "should_drop"},
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_command_log", {})
+        assert stored.get("truncated") is True, "truncated must be True for oversized text"
+        assert set(stored.keys()) == {"text", "truncated"}, (
+            f"runner_command_log must have exactly {{text, truncated}}, got {set(stored.keys())}"
+        )
+        assert len(stored["text"].encode("utf-8")) <= _MAX_RUNNER_COMMAND_LOG_BYTES
+
+    @pytest.mark.asyncio
+    async def test_runner_report_drops_non_numeric_result_metric_values(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-numeric values in result_metrics are dropped at the report endpoint.
+
+        Strings, None, and nested objects must be filtered out so a misbehaving
+        runner cannot corrupt a JSONB experiment record with non-serialisable or
+        unexpected types. Only finite numeric values survive.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        mixed_metrics = {
+            "valid_int": 42,
+            "valid_float": 3.14,
+            "string_val": "should_drop",
+            "null_val": None,
+            "nested_dict": {"inner": 1},
+            "nested_list": [1, 2, 3],
+            "bool_true": True,
+            "bool_false": False,
+        }
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "result_metrics": mixed_metrics,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+
+        # Finite numerics survive (int and float).
+        assert stored.get("valid_int") == 42.0, (
+            f"expected valid_int=42.0, got {stored.get('valid_int')!r}"
+        )
+        assert abs(stored.get("valid_float", 0) - 3.14) < 1e-9, (
+            f"expected valid_float≈3.14, got {stored.get('valid_float')!r}"
+        )
+
+        # Booleans are coerced to float (True→1.0, False→0.0).
+        assert stored.get("bool_true") == 1.0, (
+            f"expected bool_true=1.0, got {stored.get('bool_true')!r}"
+        )
+        assert stored.get("bool_false") == 0.0, (
+            f"expected bool_false=0.0, got {stored.get('bool_false')!r}"
+        )
+
+        # Non-numeric types are dropped entirely.
+        assert "string_val" not in stored, (
+            "string value must be dropped, but 'string_val' found in stored metrics"
+        )
+        assert "null_val" not in stored, (
+            "null value must be dropped, but 'null_val' found in stored metrics"
+        )
+        assert "nested_dict" not in stored, (
+            "nested dict must be dropped, but 'nested_dict' found in stored metrics"
+        )
+        assert "nested_list" not in stored, (
+            "nested list must be dropped, but 'nested_list' found in stored metrics"
+        )
+
+    @pytest.mark.asyncio
+    async def test_report_result_metrics_rejects_non_finite_floats(
+        self, client: AsyncClient, db_session
+    ):
+        """NaN and Infinity values in result_metrics are dropped at the report endpoint.
+
+        JSON does not natively represent NaN/Inf, but some JSON serialisers emit
+        them as bare tokens. The endpoint must reject non-finite values to prevent
+        JSONB corruption.
+        """
+        import math
+
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        # Use a numeric value that is finite to confirm the filter is selective.
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "running",
+                "result_metrics": {
+                    "finite_val": 1.5,
+                    "very_large": 1e308,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+        assert stored.get("finite_val") == 1.5
+        assert math.isfinite(stored.get("very_large", float("nan")))
+
+        # Directly verify _filter_result_metrics drops non-finite floats.
+        from app.routers.runner import _filter_result_metrics
+
+        result = _filter_result_metrics({
+            "nan_val": float("nan"),
+            "inf_val": float("inf"),
+            "neg_inf": float("-inf"),
+            "ok": 7.0,
+        })
+        assert "nan_val" not in result, "NaN must be dropped"
+        assert "inf_val" not in result, "Inf must be dropped"
+        assert "neg_inf" not in result, "-Inf must be dropped"
+        assert result.get("ok") == 7.0
+
+    @pytest.mark.asyncio
+    async def test_report_result_metrics_preserves_arms_block(
+        self, client: AsyncClient, db_session
+    ):
+        """The 'arms' key with a dict value passes through verbatim.
+
+        A/B experiment arm results are structured objects, not scalars. The filter
+        must preserve the arms block exactly as received so downstream consumers
+        (_extract_experiment_arms) can process it.
+        """
+        _project, _runner, token, job = await self._make_running_job(db_session)
+
+        arms_block = {
+            "control": {"accuracy": 0.92, "loss": 0.08},
+            "treatment": {"accuracy": 0.95, "loss": 0.05},
+        }
+
+        resp = await client.post(
+            f"/api/runner/compute-job/{job.id}/report",
+            json={
+                "exec_status": "succeeded",
+                "result_metrics": {
+                    "accuracy": 0.95,
+                    "arms": arms_block,
+                },
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200, resp.text
+
+        await db_session.refresh(job)
+        stored = job.polling_metadata.get("runner_result_metrics", {})
+        assert stored.get("accuracy") == 0.95
+        assert stored.get("arms") == arms_block, (
+            f"arms block must be preserved verbatim, got {stored.get('arms')!r}"
+        )
+
+    def test_filter_result_metrics_unit_caps_at_key_limit(self):
+        """_filter_result_metrics enforces the key count cap."""
+        from app.routers.runner import _MAX_RUNNER_RESULT_METRICS_KEYS, _filter_result_metrics
+
+        oversized = {f"k{i}": float(i) for i in range(_MAX_RUNNER_RESULT_METRICS_KEYS + 100)}
+        result = _filter_result_metrics(oversized)
+        assert len(result) == _MAX_RUNNER_RESULT_METRICS_KEYS, (
+            f"expected exactly {_MAX_RUNNER_RESULT_METRICS_KEYS} keys, got {len(result)}"
+        )
+
+
 # ── Direct compute_experiment dispatch (no agent half) ───────────────────────
 
 
@@ -1225,6 +3510,106 @@ class TestDirectComputeExperimentDispatch:
         assert (job.polling_metadata or {}).get("runner_target_id") == str(runner.id)
 
     @pytest.mark.asyncio
+    async def test_launch_prefers_requested_compute_runner_when_eligible(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        preferred, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": ["existing-job"],
+            },
+        )
+        idle, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": "all",
+                "has_gpu": False,
+                "max_concurrent": 4,
+                "active_compute_job_ids": [],
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+            context={"preferred_runner_target_id": str(preferred.id)},
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session,
+            task,
+            {project.id: [preferred, idle]},
+            {},
+        )
+
+        assert outcome == "launched"
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.PARKED
+        assert task.context["runner_target_id"] == str(preferred.id)
+        job = await _compute_job_for_task(db_session, task.id)
+        assert job is not None
+        assert job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert (job.polling_metadata or {}).get("runner_target_id") == str(
+            preferred.id
+        )
+
+    @pytest.mark.asyncio
+    async def test_runner_subprocess_jobs_count_toward_next_cycle_capacity(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        project.build_config = {"resource_envelope": {"require_local_runner": True}}
+        db_session.add(project)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "has_gpu": False, "max_concurrent": 1},
+        )
+        first = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        second = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(first)
+        db_session.add(second)
+        await db_session.commit()
+
+        assert await orch._dispatch_compute_experiment_directly(
+            db_session, first, {project.id: [runner]}, {}
+        ) == "launched"
+        first_job = await _compute_job_for_task(db_session, first.id)
+        assert first_job is not None
+        assert first_job.backend == RUNNER_SUBPROCESS_BACKEND_NAME
+        assert first_job.status == ComputeJobStatus.QUEUED
+
+        next_cycle_cache = await orch._load_active_runners_cache(db_session)
+        next_cycle_runner = next_cycle_cache[project.id][0]
+        assert str(first_job.id) in (
+            next_cycle_runner.capabilities or {}
+        ).get("active_compute_job_ids", [])
+
+        assert await orch._dispatch_compute_experiment_directly(
+            db_session, second, next_cycle_cache, {}
+        ) == "held"
+        await db_session.refresh(second)
+        assert second.status == TaskStatus.QUEUED
+        assert (second.context or {}).get("awaiting_local_runner_since")
+        assert await _compute_job_for_task(db_session, second.id) is None
+
+    @pytest.mark.asyncio
     async def test_launch_cloud_fallback_when_no_runner(self, db_session):
         project = await _make_project(db_session)
         task = Task(
@@ -1266,6 +3651,39 @@ class TestDirectComputeExperimentDispatch:
         assert outcome == "held"
         await db_session.refresh(task)
         # Held QUEUED with the wait stamp; NEVER a billable cloud job.
+        assert task.status == TaskStatus.QUEUED
+        assert (task.context or {}).get("awaiting_local_runner_since")
+        assert await _compute_job_for_task(db_session, task.id) is None
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_runner_does_not_satisfy_compute_local_policy(
+        self, db_session
+    ):
+        project = await _make_project(db_session)
+        project.build_config = {"resource_envelope": {"require_local_runner": True}}
+        db_session.add(project)
+        runner, _ = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={
+                "task_types": sorted(STRATEGIC_TASK_TYPES),
+                "has_gpu": False,
+                "max_concurrent": 1,
+            },
+        )
+        task = Task(
+            project_id=project.id,
+            payloads=[_ce_payload()],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        outcome = await orch._dispatch_compute_experiment_directly(
+            db_session, task, {project.id: [runner]}, {}
+        )
+        assert outcome == "held"
+        await db_session.refresh(task)
         assert task.status == TaskStatus.QUEUED
         assert (task.context or {}).get("awaiting_local_runner_since")
         assert await _compute_job_for_task(db_session, task.id) is None
@@ -1334,3 +3752,58 @@ class TestDirectComputeExperimentDispatch:
         await db_session.refresh(task)
         assert task.status == TaskStatus.FAILED
         assert await _compute_job_for_task(db_session, task.id) is None
+
+
+# ── Rate limiting ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_runner_polling_endpoint_rate_limited(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """Runner heartbeat endpoint returns 429 + Retry-After once limit is exceeded.
+
+    Verifies: (a) under-limit calls return 200, (b) the call that crosses the
+    threshold returns 429 with a Retry-After header, (c) a second distinct runner
+    is not throttled (per-(runner_id, endpoint) bucketing, not global).
+    """
+    import app.runner_rate_limiter as rl_mod
+    from app.runner_rate_limiter import reset_runner_rate_limiter
+
+    project = await _make_project(db_session)
+    runner_a, token_a = await _make_runner(db_session, project.id)
+    runner_b, token_b = await _make_runner(db_session, project.id)
+
+    # Lower the heartbeat limit to 3 so the test is fast and deterministic.
+    monkeypatch.setitem(rl_mod._ENDPOINT_LIMITS, "heartbeat", 3)
+    reset_runner_rate_limiter()
+
+    # First 3 calls from runner A must succeed.
+    for _ in range(3):
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token_a}"},
+        )
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}"
+
+    # 4th call from runner A must be rate-limited.
+    resp = await client.post(
+        "/api/runner/heartbeat",
+        json={"active_task_ids": []},
+        headers={"Authorization": f"Bearer {token_a}"},
+    )
+    assert resp.status_code == 429, f"Expected 429, got {resp.status_code}"
+    retry_after = resp.headers.get("Retry-After")
+    assert retry_after is not None, "Expected Retry-After header in 429 response"
+    assert int(retry_after) > 0, f"Retry-After must be positive, got {retry_after!r}"
+
+    # Runner B's bucket is independent — it must still get through.
+    resp_b = await client.post(
+        "/api/runner/heartbeat",
+        json={"active_task_ids": []},
+        headers={"Authorization": f"Bearer {token_b}"},
+    )
+    assert resp_b.status_code == 200, (
+        f"Runner B should not be throttled, got {resp_b.status_code}"
+    )

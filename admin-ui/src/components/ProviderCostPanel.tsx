@@ -21,6 +21,28 @@ interface ProviderCostSummary {
   rows: ProviderCostRow[];
 }
 
+function spendPressureForRow(row: ProviderCostRow): { label: string; cls: string; severity: number } {
+  if (row.total_cost_usd > 0 && row.merged_count === 0) {
+    return { label: 'No merges for spend', cls: 'text-red-300', severity: 3 };
+  }
+  if (row.cost_per_merged_pr != null && row.cost_per_merged_pr > 15) {
+    return { label: 'High $/merge', cls: 'text-red-300', severity: 3 };
+  }
+  if (row.success_rate != null && row.success_rate < 0.5) {
+    return { label: 'Low success', cls: 'text-amber-300', severity: 2 };
+  }
+  if (row.cost_per_merged_pr != null && row.cost_per_merged_pr > 5) {
+    return { label: 'Watch cost', cls: 'text-amber-300', severity: 1 };
+  }
+  return { label: 'Efficient', cls: 'text-emerald-300', severity: 0 };
+}
+
+function spendPressureBannerClasses(severity: number): string {
+  if (severity >= 3) return 'border-red-500/20 bg-red-500/10 text-red-200';
+  if (severity >= 1) return 'border-amber-500/20 bg-amber-500/10 text-amber-200';
+  return 'border-emerald-500/20 bg-emerald-500/10 text-emerald-200';
+}
+
 export function ProviderCostPanel({
   selectedProjectId,
   windowHours,
@@ -64,6 +86,21 @@ export function ProviderCostPanel({
 
   const w24 = efficiency?.window_24h;
   const w7 = efficiency?.window_7d;
+  const totalTasks = data.rows.reduce((sum, row) => sum + row.total_tasks, 0);
+  const successCount = data.rows.reduce((sum, row) => sum + row.success_count, 0);
+  const mergedCount = data.rows.reduce((sum, row) => sum + row.merged_count, 0);
+  const totalSpend = data.rows.reduce((sum, row) => sum + row.total_cost_usd, 0);
+  const aggregateSuccessRate = totalTasks > 0 ? successCount / totalTasks : null;
+  const aggregateCostPerMerged = mergedCount > 0 ? totalSpend / mergedCount : null;
+  const rowPressures = data.rows.map(row => ({ row, pressure: spendPressureForRow(row) }));
+  const worstPressure = rowPressures.reduce((worst, current) => (
+    current.pressure.severity > worst.pressure.severity ? current : worst
+  ));
+  const spendAction = worstPressure.pressure.severity >= 3
+    ? `Reroute or inspect ${worstPressure.row.account_name}: ${worstPressure.pressure.label.toLowerCase()}.`
+    : worstPressure.pressure.severity >= 1
+      ? `Watch ${worstPressure.row.account_name}: ${worstPressure.pressure.label.toLowerCase()}.`
+      : 'Spend is within the current success envelope.';
 
   return (
     <section>
@@ -82,6 +119,41 @@ export function ProviderCostPanel({
           <EffMetric label="review cycles" value={fmtEffIter(w7?.review_iter_median)} delta={w7?.vs_prior_review_iter_median_delta} lowerIsBetter />
         </div>
       )}
+      <div
+        data-testid="provider-cost-summary"
+        className="mb-2 grid grid-cols-2 overflow-hidden rounded-md border border-neutral-800/60 bg-neutral-950/30 sm:grid-cols-4"
+      >
+        <div className="border-r border-b border-neutral-800/60 px-2.5 py-2 sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Window</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{data.window_hours}h</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{selectedProjectId ? 'project' : 'fleet'} scope</div>
+        </div>
+        <div className="border-r-0 border-b border-neutral-800/60 px-2.5 py-2 sm:border-r sm:border-b-0">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Tasks</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">{totalTasks}</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{mergedCount} merged</div>
+        </div>
+        <div className="border-r border-neutral-800/60 px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Success</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-emerald-300">
+            {aggregateSuccessRate == null ? '—' : `${Math.round(aggregateSuccessRate * 100)}%`}
+          </div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">{successCount} succeeded</div>
+        </div>
+        <div className="px-2.5 py-2">
+          <div className="text-ui-sm uppercase tracking-wide text-neutral-500">Spend</div>
+          <div className="mt-0.5 font-mono text-xs font-semibold text-neutral-200">${totalSpend.toFixed(2)}</div>
+          <div className="mt-0.5 truncate text-ui-sm text-neutral-600">
+            {aggregateCostPerMerged == null ? 'no merges' : `$${aggregateCostPerMerged.toFixed(2)}/merge`}
+          </div>
+        </div>
+      </div>
+      <div
+        className={`mb-2 rounded-md border px-2.5 py-1.5 text-ui-sm ${spendPressureBannerClasses(worstPressure.pressure.severity)}`}
+        data-testid="provider-cost-spend-pressure"
+      >
+        <span className="font-semibold">Spend pressure:</span> {spendAction}
+      </div>
       <div className="bg-neutral-900/50 border border-neutral-800/50 rounded-lg overflow-hidden">
         {/* Mobile: stacked card layout */}
         <div className="sm:hidden divide-y divide-neutral-800/30">
@@ -94,6 +166,7 @@ export function ProviderCostPanel({
               : row.cost_per_merged_pr <= 5 ? 'text-emerald-400'
               : row.cost_per_merged_pr <= 15 ? 'text-amber-400'
               : 'text-red-400';
+            const pressure = spendPressureForRow(row);
             return (
               <div key={i} className="px-3 py-2 text-ui-sm">
                 <div className="flex items-start justify-between gap-2 mb-1">
@@ -106,6 +179,7 @@ export function ProviderCostPanel({
                   <span>Spend: <span className="text-neutral-300 font-mono tabular-nums">${row.total_cost_usd.toFixed(2)}</span></span>
                   <span>$/Merge: <span className={`font-mono tabular-nums ${cpmColor}`}>{row.cost_per_merged_pr != null ? `$${row.cost_per_merged_pr.toFixed(2)}` : '—'}</span></span>
                 </div>
+                <div className={`mt-1 ${pressure.cls}`}>Next: {pressure.label}</div>
               </div>
             );
           })}
@@ -119,6 +193,7 @@ export function ProviderCostPanel({
               <th className="text-right px-3 py-2 font-medium">Success</th>
               <th className="text-right px-3 py-2 font-medium">Spend</th>
               <th className="text-right px-3 py-2 font-medium">$/Merge</th>
+              <th className="text-right px-3 py-2 font-medium">Action</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-neutral-800/30">
@@ -131,6 +206,7 @@ export function ProviderCostPanel({
                 : row.cost_per_merged_pr <= 5 ? 'text-emerald-400'
                 : row.cost_per_merged_pr <= 15 ? 'text-amber-400'
                 : 'text-red-400';
+              const pressure = spendPressureForRow(row);
               return (
                 <tr key={i}>
                   <td className="px-3 py-2">
@@ -146,6 +222,9 @@ export function ProviderCostPanel({
                   </td>
                   <td className={`text-right px-3 py-2 font-mono tabular-nums ${cpmColor}`}>
                     {row.cost_per_merged_pr != null ? `$${row.cost_per_merged_pr.toFixed(2)}` : '—'}
+                  </td>
+                  <td className={`text-right px-3 py-2 ${pressure.cls}`}>
+                    {pressure.label}
                   </td>
                 </tr>
               );

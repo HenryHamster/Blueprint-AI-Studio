@@ -98,7 +98,7 @@ async def verify_rollup_merge_landed(
         from app.release_qualifier import _resolve_github_with_session
 
         creds = await _resolve_github_with_session(session, project)
-    except Exception as exc:  # noqa: BLE001 — credential failure -> indeterminate
+    except Exception as exc:
         logger.debug(
             "[ROLLUP_ANCESTRY] credential resolution skipped for %s: %s", source, exc
         )
@@ -116,9 +116,9 @@ async def verify_rollup_merge_landed(
                 token, owner, repo, pr_number, project_id=project_id
             )
             merge_commit_sha = (pr_data or {}).get("merge_commit_sha")
-        except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
-            logger.debug(
-                "[ROLLUP_ANCESTRY] PR #%s fetch failed for %s: %s",
+        except Exception as exc:
+            logger.warning(
+                "[ROLLUP_ANCESTRY] PR #%s fetch failed (transient) for %s: %s — degrading to indeterminate",
                 pr_number,
                 source,
                 exc,
@@ -139,8 +139,12 @@ async def verify_rollup_merge_landed(
             integration_branch,
             project_id=project_id,
         )
-    except Exception as exc:  # noqa: BLE001 — API error -> indeterminate
-        logger.debug("[ROLLUP_ANCESTRY] is_ancestor_of failed for %s: %s", source, exc)
+    except Exception as exc:
+        logger.warning(
+            "[ROLLUP_ANCESTRY] is_ancestor_of raised for %s: %s — degrading to indeterminate",
+            source,
+            exc,
+        )
         return "indeterminate"
 
     if is_anc is True:
@@ -156,11 +160,16 @@ async def verify_rollup_merge_landed(
         f"rollup->integration merge did not land. Leaving pr_merged/shipped unset "
         f"and marking the task stranded ({source})."
     )
+    _had_pr_merged = bool((task.context or {}).get("pr_merged"))
     mark_stranded_non_landing(task, reason=reason)
     logger.error("[ROLLUP_ANCESTRY] %s task=%s", reason, getattr(task, "id", None))
+    from app.direction_outcomes import discount_stranded_pr_from_direction_credit
+    await discount_stranded_pr_from_direction_credit(
+        task, session, had_pr_merged=_had_pr_merged
+    )
     try:
         await _maybe_create_failure_alert(task, session, reason)
-    except Exception as exc:  # noqa: BLE001 — alert failure must not undo the gate
+    except Exception as exc:
         logger.warning(
             "[ROLLUP_ANCESTRY] stranded alert failed for task %s: %s",
             getattr(task, "id", None),
@@ -319,7 +328,26 @@ async def _verify_pr_merged(task: Task, session: AsyncSession) -> bool:
                 gh_token, owner, repo = await get_github_token_for_task(
                     task.id, session, force_refresh=True
                 )
-                pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                try:
+                    pr_data = await get_pull_request(gh_token, owner, repo, pr_number)
+                except HTTPException as retry_err:
+                    if retry_err.status_code in (500, 502, 503):
+                        # Transient GitHub error on retry — don't poison cache
+                        logger.warning(
+                            f"[PR_VERIFY] GitHub API error ({retry_err.status_code}) on fresh-token retry for PR #{pr_number} task {task.id} — skipping"
+                        )
+                        return False
+                    raise
+                except Exception as retry_exc:
+                    logger.warning(
+                        f"[PR_VERIFY] GitHub fetch error on fresh-token retry for PR #{pr_number} task {task.id}: {retry_exc} — skipping (transient)"
+                    )
+                    return False
+            except Exception as fetch_exc:
+                logger.warning(
+                    f"[PR_VERIFY] GitHub fetch error for PR #{pr_number} task {task.id}: {fetch_exc} — skipping (transient)"
+                )
+                return False
             if pr_data.get("merged"):
                 project = (
                     await session.get(Project, task.project_id)

@@ -661,6 +661,17 @@ describe('TaskCard BLOCKED status', () => {
     expect(screen.getByText('file_conflict')).toBeInTheDocument();
   });
 
+  it('prefers movement_explanation over the raw blocker reason', () => {
+    const task = makeTask({
+      status: 'BLOCKED',
+      blocked_reason: 'Raw blocker reason should stay hidden',
+      movement_explanation: 'Backend normalized why this task cannot move.',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Backend normalized why this task cannot move.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw blocker reason should stay hidden')).toBeNull();
+  });
+
   it('renders cleanly for a BLOCKED task with no blocker metadata (backward compat)', () => {
     const task = makeTask({ status: 'BLOCKED' });
     render(<TaskCard task={task} {...baseProps} />);
@@ -680,10 +691,44 @@ describe('TaskCard BLOCKED status', () => {
     const task = makeTask({ status: 'BLOCKED' });
     render(<TaskCard task={task} {...baseProps} onCancel={onCancel} />);
     // First click arms the confirm, second confirms.
-    const cancelBtn = screen.getByTitle('Cancel');
+    const cancelBtn = screen.getByTitle(/^Cancel — cancels this blocked task/);
     await user.click(cancelBtn);
     await user.click(screen.getByTitle(/Confirm cancel/));
     expect(onCancel).toHaveBeenCalledWith('task-1');
+  });
+
+  it('queued cancel tooltip avoids VM termination copy', () => {
+    const task = makeTask({ status: 'QUEUED' });
+    render(<TaskCard task={task} {...baseProps} />);
+    const cancelBtn = screen.getByTitle(/^Cancel — cancels before it starts/);
+    expect(cancelBtn).toBeInTheDocument();
+    expect(cancelBtn.getAttribute('title')).not.toContain('VM');
+  });
+
+  it('cancel tooltip surfaces blast radius when other tasks depend on this one', () => {
+    const task = makeTask({ status: 'IN_PROGRESS' });
+    render(<TaskCard task={task} {...baseProps} blockingCount={3} />);
+    expect(
+      screen.getByTitle('Cancel — stops the agent and cleans up its VM. In-progress work is discarded and not saved. — 3 visible tasks waiting on this'),
+    ).toBeInTheDocument();
+  });
+
+  it('dismiss/archive tooltips spell out their distinct consequences', () => {
+    const task = makeTask({ status: 'FAILED' });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByTitle(/Dismiss — marks this failed task cancelled/)).toBeInTheDocument();
+    expect(screen.getByTitle(/Archive — moves this task off the board/)).toBeInTheDocument();
+  });
+
+  it('prefers movement_explanation over the raw parked reason', () => {
+    const task = makeTask({
+      status: 'PARKED',
+      park_reason: 'Raw parked reason should stay hidden',
+      movement_explanation: 'Backend normalized why this task is parked.',
+    });
+    render(<TaskCard task={task} {...baseProps} />);
+    expect(screen.getByText('Backend normalized why this task is parked.')).toBeInTheDocument();
+    expect(screen.queryByText('Raw parked reason should stay hidden')).toBeNull();
   });
 });
 

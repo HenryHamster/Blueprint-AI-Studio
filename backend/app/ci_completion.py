@@ -652,6 +652,37 @@ async def _attempt_merge_with_retry_and_escalation(
                             await refresh_direction_outcomes_after_merge(
                                 orig, _orig_session
                             )
+                        if record_pr_merged and orig.criterion_ids:
+                            try:
+                                from app import acceptance_criteria as _ac
+                                from app.release_version import (
+                                    current_open_version as _cur_open_version,
+                                )
+
+                                _open_ver = await _cur_open_version(
+                                    _orig_session, orig.project_id
+                                )
+                                if _open_ver is not None:
+                                    for _ckey in orig.criterion_ids:
+                                        _crit = await _ac.get_criterion_by_key(
+                                            _orig_session, _open_ver.id, _ckey
+                                        )
+                                        if _crit is not None:
+                                            await _ac.record_evidence(
+                                                _orig_session,
+                                                criterion_id=_crit.id,
+                                                project_id=orig.project_id,
+                                                source_kind="task_merge",
+                                                source_id=str(orig.id),
+                                                detail={"pr": ci_pr_number},
+                                            )
+                            except Exception:
+                                logger.warning(
+                                    "[CI] Failed to record criterion evidence for "
+                                    "task %s after merge (non-fatal)",
+                                    orig.id,
+                                    exc_info=True,
+                                )
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True
@@ -1638,45 +1669,120 @@ async def handle_ci_completion(
             if not ci_loop.get("review_wait_started"):
                 ci_loop["review_wait_started"] = _utcnow().isoformat()
             # Orphan-review backstop: if a review task died without setting
-            # review_approved, the PR parks here indefinitely. Force-escalate
-            # after a deadline so operators get an alert and the task can be
-            # manually resolved rather than silently burning quota forever.
+            # review_approved, the PR parks here indefinitely. Rather than
+            # gate a mergeable PR on a human immediately, RESPAWN a fresh
+            # review task first so good PRs keep flowing autonomously; only
+            # fall back to requires_approval (+ operator alert) once respawn
+            # is suppressed (cap/merged/closed) or we've already respawned the
+            # configured number of times. ``task.context`` is snapshotted now,
+            # while ``task`` is still fresh: ``_spawn_pipeline_task`` can roll
+            # back the session and expire ``task`` (#6754 family), so the
+            # commit tail below must not re-read ``task.context``/``task.status``.
             _REVIEW_WAIT_TIMEOUT_MIN = 60
+            _park_ctx_snapshot = dict(task.context or {})
             _rw_started = ci_loop.get("review_wait_started")
             if _rw_started and not ci_loop.get("review_wait_escalated"):
                 try:
                     from datetime import datetime
 
+                    from app.shared_state import runtime_config as _rt_cfg
+
                     _rw_dt = datetime.fromisoformat(_rw_started)
                     _rw_age_s = (_utcnow() - _rw_dt).total_seconds()
                     if _rw_age_s > _REVIEW_WAIT_TIMEOUT_MIN * 60:
-                        ci_loop["review_wait_escalated"] = True
-                        task.requires_approval = True
-                        task.latest_status_message = (
-                            f"CI passed on PR #{ci_pr_number} but review approval "
-                            f"never arrived after {_REVIEW_WAIT_TIMEOUT_MIN}min "
-                            "— review task may have died; requires manual approval"
+                        _respawned = False
+                        _auto_respawn = _rt_cfg.get("review_wait_auto_respawn", True)
+                        _respawn_count = int(
+                            ci_loop.get("review_wait_respawn_count", 0) or 0
                         )
-                        await _maybe_create_failure_alert(
-                            task,
-                            session,
-                            f"PR #{ci_pr_number}: review approval pending >"
-                            f"{_REVIEW_WAIT_TIMEOUT_MIN}min — review task may be "
-                            "orphaned; manual approval required",
+                        _respawn_cap = int(
+                            _rt_cfg.get("review_wait_respawn_cap", 1)
                         )
-                        logger.warning(
-                            "[CI] PR #%s review-wait backstop fired for task %s "
-                            "(%.0f min elapsed) — set requires_approval",
-                            ci_pr_number,
-                            task.id,
-                            _rw_age_s / 60,
-                        )
+                        if _auto_respawn and _respawn_count < _respawn_cap:
+                            _orig_prompt = ci_payload.get("prompt", "") or (
+                                task.description or ""
+                            )
+                            new_review, _created = await _spawn_pipeline_task(
+                                task,
+                                "review",
+                                session,
+                                ci_pr_number,
+                                ci_branch,
+                                ci_base,
+                                original_prompt=_orig_prompt,
+                                original_task_id=ci_orig_id,
+                            )
+                            if _created and new_review is not None:
+                                _respawned = True
+                                ci_loop["review_wait_respawned"] = True
+                                ci_loop["review_wait_respawn_task_id"] = str(
+                                    new_review.id
+                                )
+                                ci_loop["review_wait_respawn_count"] = (
+                                    _respawn_count + 1
+                                )
+                                # Reset the window so the fresh reviewer gets a
+                                # full timeout before we escalate again.
+                                ci_loop["review_wait_started"] = (
+                                    _utcnow().isoformat()
+                                )
+                                task.latest_status_message = (
+                                    f"CI passed on PR #{ci_pr_number} but review "
+                                    f"approval never arrived after "
+                                    f"{_REVIEW_WAIT_TIMEOUT_MIN}min — respawned "
+                                    f"review task {new_review.id}"
+                                )
+                                _bcast_status = TaskStatus.EVALUATING
+                                logger.warning(
+                                    "[CI] PR #%s review-wait orphan respawn fired "
+                                    "for task %s (%.0f min elapsed) — spawned "
+                                    "review %s (respawn #%d)",
+                                    ci_pr_number,
+                                    task.id,
+                                    _rw_age_s / 60,
+                                    new_review.id,
+                                    _respawn_count + 1,
+                                )
+                        if not _respawned:
+                            # Respawn disabled, suppressed, or cap reached —
+                            # gate on a human so the PR isn't stranded silently.
+                            ci_loop["review_wait_escalated"] = True
+                            task.requires_approval = True
+                            task.latest_status_message = (
+                                f"CI passed on PR #{ci_pr_number} but review "
+                                f"approval never arrived after "
+                                f"{_REVIEW_WAIT_TIMEOUT_MIN}min — review task may "
+                                "have died; requires manual approval"
+                            )
+                            await _maybe_create_failure_alert(
+                                task,
+                                session,
+                                f"PR #{ci_pr_number}: review approval pending >"
+                                f"{_REVIEW_WAIT_TIMEOUT_MIN}min — review task may "
+                                "be orphaned; manual approval required",
+                            )
+                            logger.warning(
+                                "[CI] PR #%s review-wait backstop fired for task "
+                                "%s (%.0f min elapsed) — set requires_approval",
+                                ci_pr_number,
+                                task.id,
+                                _rw_age_s / 60,
+                            )
                 except (ValueError, TypeError):
                     pass
-            task.context = {**(task.context or {}), "review_loop": ci_loop}
+            # Re-merge onto the pre-spawn snapshot: a respawn may have expired
+            # ``task``, so do not re-read ``task.context`` here.
+            task.context = {**_park_ctx_snapshot, "review_loop": ci_loop}
             flag_modified(task, "context")
             session.add(task)
-            _bcast_status = task.status
+            # ``task.status`` is never mutated on the park path; read it from the
+            # instance dict (never IO) and default to EVALUATING if a respawn
+            # rollback expired the attribute.
+            _bcast_status = (
+                _bcast_status
+                or task.__dict__.get("status")
+                or TaskStatus.EVALUATING
+            )
             await session.commit()
             await broadcast_to_project(
                 _bcast_project_id,

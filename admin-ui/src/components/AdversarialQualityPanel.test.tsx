@@ -5,9 +5,12 @@ import { AdversarialQualityPanel } from './AdversarialQualityPanel';
 
 let axesPayload: unknown = null;
 
-vi.mock('../api', () => ({
-  fetchEfficiencyAxes: vi.fn(async () => axesPayload),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    fetchEfficiencyAxes: vi.fn(async () => axesPayload),
+  });
+});
 
 const BASE_AXES = {
   axes: {},

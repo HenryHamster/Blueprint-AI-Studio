@@ -3277,6 +3277,10 @@ def _payoff_design_doc(
     }
 
 
+def _warm_pool_alert_build_config():
+    return {"alert_domains": {"warm_pool": {"enabled": True}}}
+
+
 async def _payoff_alerts(db_session, project_id):
     stmt = _sql_select(Alert).where(
         Alert.project_id == project_id,
@@ -3292,6 +3296,7 @@ async def test_payoff_transition_cost_regression_fires_warning(db_session, mocke
         "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
     )
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=12.0,
             cost_baseline=10.0,  # +20% idle-inclusive drift, over the 5% tolerance
@@ -3327,10 +3332,44 @@ async def test_payoff_transition_cost_regression_fires_warning(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_payoff_transition_does_not_advance_marker_without_alert(
+    db_session, mocker
+):
+    """A policy race that suppresses creation must not mark the verdict alerted."""
+    mocker.patch(
+        "app.alert_dispatch._maybe_create_pool_payoff_alert",
+        new_callable=AsyncMock,
+        return_value=(None, False),
+    )
+    project = make_project(
+        build_config=_warm_pool_alert_build_config(),
+        design_doc=_payoff_design_doc(
+            incl_current=12.0,
+            cost_baseline=10.0,
+            warm_pool=8,
+            pool_origin_share=0.5,
+            hit_rate=0.4,
+            total_dispatches=50,
+        ),
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
+
+    assert fired is None
+    await db_session.refresh(project)
+    assert LAST_ALERTED_PAYOFF_KEY not in project.design_doc[DESIGN_DOC_KEY]
+    assert await _payoff_alerts(db_session, project.id) == []
+
+
+@pytest.mark.asyncio
 async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
     """A second tick at the same verdict does not fire a second alert."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=12.0,
             cost_baseline=10.0,
@@ -3353,10 +3392,13 @@ async def test_payoff_transition_dedups_same_verdict(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_payoff_transition_proven_with_volume_fires_info(db_session, mocker):
-    """PROVEN with warm-start volume at/above the floor fires an INFO alert."""
+async def test_payoff_transition_proven_with_volume_skips_durable_info_alert(
+    db_session, mocker
+):
+    """PROVEN is useful history, but it is not a durable operator alert."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=10.0,
             cost_baseline=10.0,  # no cost regression
@@ -3371,11 +3413,9 @@ async def test_payoff_transition_proven_with_volume_fires_info(db_session, mocke
     await db_session.refresh(project)
 
     fired = await maybe_alert_pool_payoff_transition(db_session, project.id)
-    assert fired == POOL_PAYOFF_PROVEN
+    assert fired is None
     alerts = await _payoff_alerts(db_session, project.id)
-    assert len(alerts) == 1
-    assert alerts[0].severity == AlertSeverity.INFO
-    assert "PROVEN" in alerts[0].title
+    assert alerts == []
 
 
 @pytest.mark.asyncio
@@ -3383,6 +3423,7 @@ async def test_payoff_transition_proven_below_volume_floor_no_alert(db_session, 
     """PROVEN but below the warm-start volume floor does NOT alert (too thin)."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=10.0,
             cost_baseline=10.0,
@@ -3406,6 +3447,7 @@ async def test_payoff_transition_no_lift_no_alert(db_session, mocker):
     """NO_LIFT (barely serving, cost in tolerance) is not alert-worthy."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=10.0,
             cost_baseline=10.0,
@@ -3429,6 +3471,7 @@ async def test_payoff_transition_insufficient_data_no_alert(db_session, mocker):
     """INSUFFICIENT_DATA (too few pool dispatches to judge) is not alert-worthy."""
     mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=12.0,
             cost_baseline=10.0,
@@ -3456,6 +3499,7 @@ async def test_payoff_transition_unscoped_project_no_alert(db_session, mocker):
     # Scope the pool to some OTHER project so this one is out of scope.
     _runtime_config["warm_pool_project_allowlist"] = [str(_uuid.uuid4())]
     project = make_project(
+        build_config=_warm_pool_alert_build_config(),
         design_doc=_payoff_design_doc(
             incl_current=12.0,
             cost_baseline=10.0,

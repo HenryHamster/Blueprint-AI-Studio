@@ -121,6 +121,9 @@ HELP_INVOCATIONS = [
     ["directions", "add"],
     ["directions", "update"],
     ["directions", "unhold"],
+    ["directions", "retarget"],
+    ["directions", "activate"],
+    ["directions", "cancel"],
     ["logs"],
     ["logs", "errors"],
     ["logs", "tail"],
@@ -919,15 +922,28 @@ def mock_api(monkeypatch):
             }
         if "/directions/" in path and "/unhold" in path:
             return {"status": "unheld", "direction_id": "d-abc12345", "was_held": True}
+        if "/directions/" in path and method == "DELETE":
+            return {"message": "Direction removed", "direction_id": "d-staged12345", "cancelled_tasks": 0}
         if "/directions/" in path and method == "PATCH":
+            if body and "staged_for_version" in body:
+                return {"direction": {"id": "d-staged12345", "text": "Stage the next release",
+                                      "priority": "medium", "status": "staged",
+                                      "staged_for_version": body["staged_for_version"],
+                                      "staged_at": "2026-06-18T12:00:00Z"}}
+            if body and body.get("status") == "active":
+                return {"direction": {"id": "d-staged12345", "text": "Stage the next release",
+                                      "priority": "medium", "status": "active"}}
             return {"direction": {"id": "d-abc12345", "text": "Updated text",
                                   "priority": "high", "status": "active"}}
         if "/directions/" in path and method == "POST":
             return {"direction": {"id": "d-abc12345", "text": "New direction",
                                   "priority": "medium", "status": "active"}}
         if "/directions" in path and method == "POST":
+            staged = bool(body and body.get("staged"))
             return {"direction": {"id": "d-newdir01", "text": "New direction",
-                                  "priority": "medium", "status": "active"}}
+                                  "priority": "medium",
+                                  "status": "staged" if staged else "active",
+                                  "staged_for_version": 13 if staged else None}}
         if "/directions" in path:
             return {
                 "directions": [
@@ -936,6 +952,11 @@ def mock_api(monkeypatch):
                      "research_history": [{"researched_at": "2026-06-01", "tasks_created": 2, "prs_merged": 1}],
                      "notes": [{"text": "operator note", "added_at": "2026-06-01T00:00:00"}],
                      "held": False, "possibly_complete": False, "possibly_saturated": False},
+                    {"id": "d-staged12345", "text": "Stage the next release",
+                     "status": "staged", "priority": "medium",
+                     "staged_for_version": 13, "staged_at": "2026-06-18T12:00:00Z",
+                     "research_history": [], "notes": [], "held": False,
+                     "possibly_complete": False, "possibly_saturated": False},
                     {"id": "d-def67890", "text": "Refactor legacy modules",
                      "status": "paused", "priority": "medium",
                      "research_history": [], "notes": [], "held": True,
@@ -1308,6 +1329,82 @@ def test_promote_recover_qualify_fires_with_yes(mock_api, monkeypatch, capsys):
     rc = blueprint.main(["--json", "promote-recover", "qualify", "--yes"])
     assert rc == 0
     assert any(method == "POST" and "qualify" in path for method, path, _ in mock_api)
+
+
+def test_promote_recover_cut_discloses_staged_activation_consequences(monkeypatch):
+    """promote-recover cut should disclose lifecycle consequences before confirm."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "version-lifecycle" in path:
+            return {
+                "current_version": {
+                    "version_number": 12,
+                    "phase": "build",
+                    "in_flight_task_count": 3,
+                    "qualification_state": {
+                        "state": "promotion_in_flight",
+                        "promotion_pr_number": 456,
+                    },
+                },
+                "staged_directions": [
+                    {"id": "dir-1", "text": "Ship staged change A", "staged_for_version": 12},
+                    {"id": "dir-2", "text": "Ship staged change B", "staged_for_version": None},
+                    {"id": "dir-3", "text": "Ignore later stage", "staged_for_version": 99},
+                ],
+            }
+        if method == "POST" and "version-cut" in path:
+            raise AssertionError("cut mutation should not fire when user declines")
+        raise AssertionError(f"unexpected API call: {method} {path}")
+
+    prompts = []
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "n")
+
+    rc = blueprint.main(["promote-recover", "cut"])
+    assert rc == 0
+    assert prompts, "expected a confirmation prompt"
+    prompt = prompts[0]
+    assert "Start 2 staged directions immediately" in prompt
+    assert "Ship staged change A" in prompt
+    assert "Ship staged change B" in prompt
+    assert "3 in-flight tasks will NOT be stopped" in prompt
+    assert "Promotion PR #456 is open and auto-merging" in prompt
+    assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
+
+
+def test_promote_recover_cut_falls_back_when_lifecycle_read_fails(monkeypatch):
+    """promote-recover cut uses the generic confirmation when lifecycle fetch fails."""
+    calls = []
+
+    def fake_api(method, path, body=None, timeout=30):
+        calls.append((method, path, body))
+        if method == "GET" and "version-lifecycle" in path:
+            raise RuntimeError("boom")
+        if method == "POST" and "version-cut" in path:
+            raise AssertionError("cut mutation should not fire when user declines")
+        raise AssertionError(f"unexpected API call: {method} {path}")
+
+    prompts = []
+    monkeypatch.setattr(blueprint_api, "api", fake_api)
+    monkeypatch.setattr(blueprint, "api", fake_api)
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "get_project_id", lambda x=None: "proj-1")
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: prompts.append(prompt) or "n")
+
+    rc = blueprint.main(["promote-recover", "cut"])
+    assert rc == 0
+    assert prompts, "expected a confirmation prompt"
+    assert prompts[0] == "About to abandon the open version and open the next. Proceed? [y/N] "
+    assert not any(method == "POST" and "version-cut" in path for method, path, _ in calls)
 
 
 def test_ops_requeue_failed_aborts_without_confirmation(mock_api, monkeypatch, capsys):
@@ -2477,34 +2574,38 @@ def test_monitor_no_subcommand_exits_nonzero(capsys):
 
 def test_directions_group(mock_api, monkeypatch, capsys):
     """End-to-end coverage for blueprint directions list/show/add/update/unhold."""
-
-    # 1. directions list (human) — shows active direction, hides paused by default
     rc = blueprint.main(["directions", "list"])
     assert rc == 0
     out = capsys.readouterr().out
     assert "DIRECTIONS" in out
     assert "Improve test coverage" in out
+    assert "staged→v13" in out
+    assert "Stage the next release" in out
+    assert "Refactor legacy modules" not in out
     assert any("/directions" in path for _, path, _ in mock_api)
-
-    # 2. directions list --json — emits valid JSON with directions key
     mock_api.clear()
     rc = blueprint.main(["--json", "directions", "list"])
     assert rc == 0
     out = capsys.readouterr().out
     payload = json.loads(out)
     assert "directions" in payload
-    assert len(payload["directions"]) >= 1
+    assert len(payload["directions"]) >= 2
     assert payload["directions"][0]["id"] == "d-abc12345"
-
-    # 3. directions list --all — passes through all directions
+    assert any(d["status"] == "staged" for d in payload["directions"])
     mock_api.clear()
-    rc = blueprint.main(["directions", "list", "--all"])
+    rc = blueprint.main(["directions", "list", "--staged"])
     assert rc == 0
     out = capsys.readouterr().out
-    # paused direction is now visible
-    assert "Refactor legacy modules" in out
-
-    # 4. directions show <id-prefix> — renders detail view
+    assert "Stage the next release" in out
+    assert "Improve test coverage" not in out
+    assert "Refactor legacy modules" not in out
+    mock_api.clear()
+    rc = blueprint.main(["directions", "list", "--staged", "--all"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Stage the next release" in out
+    assert "Improve test coverage" not in out
+    assert "Refactor legacy modules" not in out
     mock_api.clear()
     rc = blueprint.main(["directions", "show", "d-abc"])
     assert rc == 0
@@ -2512,16 +2613,15 @@ def test_directions_group(mock_api, monkeypatch, capsys):
     assert "d-abc12345" in out
     assert "Improve test coverage" in out
     assert "DIRECTION:" in out
-
-    # 5. directions show --json
     mock_api.clear()
-    rc = blueprint.main(["--json", "directions", "show", "d-abc"])
+    rc = blueprint.main(["directions", "show", "d-staged"])
     assert rc == 0
     out = capsys.readouterr().out
-    d = json.loads(out)
-    assert d["id"] == "d-abc12345"
-
-    # 6. directions unhold --yes issues POST /unhold and reports was_held
+    assert "d-staged12345" in out
+    assert "Stage the next release" in out
+    assert "Staged for: v13" in out
+    assert "Staged at:" in out
+    assert "Waiting age:" in out
     mock_api.clear()
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
@@ -2531,26 +2631,80 @@ def test_directions_group(mock_api, monkeypatch, capsys):
     assert "Unheld" in out or "was_held" in out.lower() or "d-abc12345" in out
     unhold_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "unhold" in p]
     assert unhold_calls, "Expected a POST to /unhold endpoint"
-
-    # 7. directions update <id> --priority high --yes issues PATCH
     mock_api.clear()
     rc = blueprint.main(["directions", "update", "d-abc12345", "--priority", "high", "--yes"])
     assert rc == 0
     patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "directions" in p]
     assert patch_calls, "Expected a PATCH to directions endpoint"
     assert patch_calls[0][2].get("priority") == "high"
-
-    # 8. read-only guard blocks mutating actions
+    mock_api.clear()
+    rc = blueprint.main(["directions", "update", "d-staged12345", "--staged-for-version", "14", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "directions" in p]
+    assert patch_calls, "Expected a PATCH to directions endpoint"
+    assert patch_calls[0][2] == {"staged_for_version": 14}
+    mock_api.clear()
+    rc = blueprint.main(["directions", "retarget", "d-staged", "15", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "directions" in p]
+    assert patch_calls, "Expected retarget to PATCH directions endpoint"
+    assert patch_calls[0][1].endswith("/directions/d-staged12345")
+    assert patch_calls[0][2] == {"staged_for_version": 15}
+    mock_api.clear()
+    rc = blueprint.main(["directions", "activate", "d-staged", "--yes"])
+    assert rc == 0
+    patch_calls = [(m, p, b) for m, p, b in mock_api if m == "PATCH" and "directions" in p]
+    assert patch_calls and patch_calls[0][1].endswith("/directions/d-staged12345")
+    assert patch_calls[0][2] == {"status": "active"}
+    mock_api.clear()
+    rc = blueprint.main(["directions", "cancel", "d-staged", "--yes"])
+    assert rc == 0
+    delete_calls = [(m, p) for m, p, _ in mock_api if m == "DELETE" and "directions" in p]
+    assert delete_calls, "Expected cancel to DELETE directions endpoint"
+    assert delete_calls[0][1].endswith("/directions/d-staged12345")
+    mock_api.clear()
+    rc = blueprint.main(["directions", "unhold", "d-abc", "--yes"])
+    assert rc == 0
+    unhold_calls = [(m, p) for m, p, _ in mock_api if m == "POST" and "unhold" in p]
+    assert unhold_calls, "Expected unhold to POST to /unhold endpoint"
+    assert unhold_calls[0][1].endswith("/directions/d-abc12345/unhold")
+    mock_api.clear()
+    rc = blueprint.main(["directions", "add", "some staged text", "--staged", "--yes"])
+    assert rc == 0
+    post_calls = [(m, p, b) for m, p, b in mock_api if m == "POST" and "/directions" in p]
+    assert post_calls and post_calls[0][2].get("staged") is True
     monkeypatch.setattr(blueprint_api, "load_config", lambda: {"read_only": True})
     monkeypatch.setattr(blueprint, "load_config", lambda: {"read_only": True})
     for argv in [
         ["directions", "add", "some text", "--yes"],
+        ["directions", "add", "some text", "--staged", "--yes"],
         ["directions", "update", "d-abc", "--priority", "low", "--yes"],
+        ["directions", "update", "d-staged12345", "--staged-for-version", "16", "--yes"],
+        ["directions", "retarget", "d-staged12345", "16", "--yes"],
+        ["directions", "activate", "d-staged12345", "--yes"],
+        ["directions", "cancel", "d-staged12345", "--yes"],
         ["directions", "unhold", "d-abc", "--yes"],
     ]:
         with pytest.raises(SystemExit) as exc:
             blueprint.main(argv)
         assert exc.value.code == 1
+
+    monkeypatch.setattr(blueprint_api, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    monkeypatch.setattr(blueprint, "load_config", lambda: {"api_url": "x", "api_key": "y"})
+    for argv, expected in [
+        (["directions", "retarget", "d-abc", "15", "--yes"], "Direction is not staged"),
+        (["directions", "activate", "d-abc", "--yes"], "Direction is not staged"),
+        (["directions", "cancel", "d-abc", "--yes"], "Direction is not staged"),
+        (["directions", "activate", "d-", "--yes"], "Direction prefix is ambiguous"),
+        (["directions", "cancel", "d-nope", "--yes"], "Direction not found"),
+    ]:
+        mock_api.clear()
+        with pytest.raises(SystemExit) as exc:
+            blueprint.main(argv)
+        assert exc.value.code == 1
+        err = capsys.readouterr().err
+        assert expected in err
+        assert not any(m in {"PATCH", "DELETE"} and "directions/" in p for m, p, _ in mock_api)
 
 
 def test_trials_json(mock_api, capsys):

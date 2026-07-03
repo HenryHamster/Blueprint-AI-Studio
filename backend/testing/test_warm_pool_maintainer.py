@@ -4597,14 +4597,6 @@ async def test_leader_startup_reclaims_orphaned_lane_workspaces(db_session):
     )
     db_session.add(orphaned_lane)
 
-    # Create a real PoolVm so the second lane keeps its workspace_state.
-    live_vm = PoolVm(
-        vm_instance_id="vm-still-alive",
-        state=PoolVmState.IDLE,
-        project_id=project.id,
-    )
-    db_session.add(live_vm)
-
     live_lane = ImprovementLane(
         project_id=project.id,
         title="live lane",
@@ -4615,7 +4607,16 @@ async def test_leader_startup_reclaims_orphaned_lane_workspaces(db_session):
         workspace_state="WARM_RESERVED",
         workspace_vm_instance_id="vm-still-alive",
     )
-    db_session.add(live_lane)
+    # Create a real matching reservation so the second lane keeps its workspace_state.
+    live_vm = PoolVm(
+        vm_instance_id="vm-still-alive",
+        state=PoolVmState.IDLE,
+        project_id=project.id,
+        reserved_lane_id=live_lane.id,
+        reservation_expires_at=_utcnow() + timedelta(minutes=30),
+        reservation_hard_expires_at=_utcnow() + timedelta(hours=1),
+    )
+    db_session.add_all([live_lane, live_vm])
 
     # Lane already COLD — should be untouched.
     cold_lane = ImprovementLane(
@@ -4661,14 +4662,6 @@ async def test_periodic_reclaim_clears_orphaned_workspace(
     """
     project = await _make_project(db_session, name="Periodic Reclaim Test")
 
-    # Lane whose VM exists in the DB — workspace_state should survive.
-    live_vm = PoolVm(
-        vm_instance_id="vm-periodic-alive",
-        state=PoolVmState.IDLE,
-        project_id=project.id,
-    )
-    db_session.add(live_vm)
-
     live_lane = ImprovementLane(
         project_id=project.id,
         title="live lane",
@@ -4679,7 +4672,17 @@ async def test_periodic_reclaim_clears_orphaned_workspace(
         workspace_state="WARM_RESERVED",
         workspace_vm_instance_id="vm-periodic-alive",
     )
-    db_session.add(live_lane)
+    # Lane whose VM exists in the DB with a valid reservation — workspace_state
+    # should survive.
+    live_vm = PoolVm(
+        vm_instance_id="vm-periodic-alive",
+        state=PoolVmState.IDLE,
+        project_id=project.id,
+        reserved_lane_id=live_lane.id,
+        reservation_expires_at=_utcnow() + timedelta(minutes=30),
+        reservation_hard_expires_at=_utcnow() + timedelta(hours=1),
+    )
+    db_session.add_all([live_lane, live_vm])
 
     # Lane whose VM is absent — should be cleared by the periodic sweep.
     orphaned_lane = ImprovementLane(
@@ -4719,3 +4722,302 @@ async def test_periodic_reclaim_clears_orphaned_workspace(
     assert live_lane.workspace_state == "WARM_RESERVED", (
         f"live lane should remain WARM_RESERVED, got {live_lane.workspace_state}"
     )
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_dry_run_is_structured_and_idempotent(
+    db_session,
+):
+    from app.improvement_lane_ops import reconcile_lane_workspaces
+
+    project = await _make_project(db_session, name="Workspace Dry Run")
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="dry-run orphan",
+        goal="dry-run goal",
+        branch_name="lane/dry-run",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-dry-run-missing",
+    )
+    db_session.add(lane)
+    await db_session.commit()
+
+    dry = await reconcile_lane_workspaces(db_session, dry_run=True)
+    assert dry["dry_run"] is True
+    assert dry["missing_backing_vm"] == 1
+    assert dry["lanes_would_clear"] == 1
+    assert dry["lanes_cleared"] == 0
+
+    await db_session.refresh(lane)
+    assert lane.workspace_state == "WARM_RESERVED"
+    assert lane.workspace_vm_instance_id == "vm-dry-run-missing"
+
+    repaired = await reconcile_lane_workspaces(db_session)
+    await db_session.commit()
+    assert repaired["missing_backing_vm"] == 1
+    assert repaired["lanes_cleared"] == 1
+
+    second = await reconcile_lane_workspaces(db_session)
+    assert second["lanes_cleared"] == 0
+    assert second["lanes_would_clear"] == 0
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_clears_terminal_and_missing_leased_task(
+    db_session,
+):
+    from app.improvement_lane_ops import reconcile_lane_workspaces
+
+    project = await _make_project(db_session, name="Leased Task Reconcile")
+    terminal_task = await _make_task(db_session, project, TaskStatus.COMPLETED)
+
+    terminal_lane = ImprovementLane(
+        project_id=project.id,
+        title="terminal leased lane",
+        goal="terminal goal",
+        branch_name="lane/terminal-leased",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        current_task_id=terminal_task.id,
+        workspace_state="LEASED",
+        workspace_vm_instance_id="vm-terminal-task",
+    )
+    missing_lane = ImprovementLane(
+        project_id=project.id,
+        title="missing leased lane",
+        goal="missing goal",
+        branch_name="lane/missing-leased",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        current_task_id=uuid.uuid4(),
+        workspace_state="LEASED",
+        workspace_vm_instance_id="vm-missing-task",
+    )
+    db_session.add_all(
+        [
+            terminal_lane,
+            missing_lane,
+            PoolVm(
+                vm_instance_id="vm-terminal-task",
+                project_id=project.id,
+                state=PoolVmState.LEASED,
+                leased_task_id=terminal_task.id,
+            ),
+            PoolVm(
+                vm_instance_id="vm-missing-task",
+                project_id=project.id,
+                state=PoolVmState.LEASED,
+                leased_task_id=uuid.uuid4(),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await reconcile_lane_workspaces(db_session)
+    await db_session.commit()
+
+    assert result["terminal_or_missing_leased_task"] == 2
+    assert result["lanes_cleared"] == 2
+    await db_session.refresh(terminal_lane)
+    await db_session.refresh(missing_lane)
+    assert terminal_lane.workspace_state == "COLD"
+    assert missing_lane.workspace_state == "COLD"
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_project_filter_isolates_repairs(
+    db_session,
+):
+    from app.improvement_lane_ops import reconcile_lane_workspaces
+
+    project_a = await _make_project(db_session, name="Project A Reconcile")
+    project_b = await _make_project(db_session, name="Project B Reconcile")
+    lane_b = ImprovementLane(
+        project_id=project_b.id,
+        title="valid b lane",
+        goal="valid b goal",
+        branch_name="lane/project-b",
+        base_branch="automain",
+        status=ImprovementLaneStatus.PARKED.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-cross-project",
+    )
+    lane_a = ImprovementLane(
+        project_id=project_a.id,
+        title="cross project lane",
+        goal="cross project goal",
+        branch_name="lane/project-a",
+        base_branch="automain",
+        status=ImprovementLaneStatus.PARKED.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-cross-project",
+    )
+    member_b = PoolVm(
+        vm_instance_id="vm-cross-project",
+        project_id=project_b.id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane_b.id,
+        reservation_expires_at=_utcnow() + timedelta(minutes=30),
+        reservation_hard_expires_at=_utcnow() + timedelta(hours=1),
+    )
+    db_session.add_all([lane_a, lane_b, member_b])
+    await db_session.commit()
+
+    result = await reconcile_lane_workspaces(db_session, project_id=project_a.id)
+    await db_session.commit()
+
+    assert result["project_mismatch"] == 1
+    assert result["lanes_cleared"] == 1
+    assert result["reservations_cleared"] == 0
+    await db_session.refresh(lane_a)
+    await db_session.refresh(lane_b)
+    await db_session.refresh(member_b)
+    assert lane_a.workspace_state == "COLD"
+    assert lane_b.workspace_state == "WARM_RESERVED"
+    assert member_b.reserved_lane_id == lane_b.id
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_clears_stale_terminal_reservation(
+    db_session,
+):
+    from app.improvement_lane_ops import reconcile_lane_workspaces
+
+    project = await _make_project(db_session, name="Stale Reservation")
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="terminal reserved lane",
+        goal="terminal reserved goal",
+        branch_name="lane/stale-reservation",
+        base_branch="automain",
+        status=ImprovementLaneStatus.KILLED.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-stale-reservation",
+    )
+    member = PoolVm(
+        vm_instance_id="vm-stale-reservation",
+        project_id=project.id,
+        state=PoolVmState.IDLE,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=_utcnow() + timedelta(minutes=30),
+        reservation_hard_expires_at=_utcnow() + timedelta(hours=1),
+    )
+    db_session.add_all([lane, member])
+    await db_session.commit()
+
+    result = await reconcile_lane_workspaces(db_session)
+    await db_session.commit()
+
+    assert result["terminal_lane_workspace"] == 1
+    assert result["terminal_reservation_lane"] == 1
+    assert result["lanes_cleared"] == 1
+    assert result["reservations_cleared"] == 1
+    await db_session.refresh(lane)
+    await db_session.refresh(member)
+    assert lane.workspace_state == "COLD"
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+    assert lane.reservation_force_expired_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_clears_non_idle_reservation(
+    db_session,
+):
+    from app.improvement_lane_ops import reconcile_lane_workspaces
+
+    project = await _make_project(db_session, name="Non Idle Reservation")
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="non-idle reserved lane",
+        goal="non-idle reserved goal",
+        branch_name="lane/non-idle-reservation",
+        base_branch="automain",
+        status=ImprovementLaneStatus.PARKED.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-non-idle-reservation",
+    )
+    member = PoolVm(
+        vm_instance_id="vm-non-idle-reservation",
+        project_id=project.id,
+        state=PoolVmState.LEASED,
+        reserved_lane_id=lane.id,
+        reservation_expires_at=_utcnow() + timedelta(minutes=30),
+        reservation_hard_expires_at=_utcnow() + timedelta(hours=1),
+    )
+    db_session.add_all([lane, member])
+    await db_session.commit()
+
+    result = await reconcile_lane_workspaces(db_session)
+    await db_session.commit()
+
+    assert result["stale_workspace_reservation"] == 1
+    assert result["non_idle_reservations"] == 1
+    assert result["lanes_cleared"] == 1
+    assert result["reservations_cleared"] == 1
+    await db_session.refresh(lane)
+    await db_session.refresh(member)
+    assert lane.workspace_state == "COLD"
+    assert member.reserved_lane_id is None
+    assert member.reservation_expires_at is None
+    assert lane.reservation_force_expired_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lane_workspace_reconciliation_race_safe_noop(db_session, mocker):
+    from app import improvement_lane_ops as ops
+
+    project = await _make_project(db_session, name="Race Reconcile")
+    lane = ImprovementLane(
+        project_id=project.id,
+        title="race lane",
+        goal="race goal",
+        branch_name="lane/race",
+        base_branch="automain",
+        status=ImprovementLaneStatus.ACTIVE.value,
+        workspace_state="WARM_RESERVED",
+        workspace_vm_instance_id="vm-race-old",
+    )
+    db_session.add(lane)
+    await db_session.commit()
+    await db_session.refresh(lane)
+
+    async def raced_clear(session, scanned_lane):
+        from sqlalchemy import update
+
+        old_state = scanned_lane.workspace_state
+        old_vm = scanned_lane.workspace_vm_instance_id
+        await session.execute(
+            update(ImprovementLane)
+            .where(ImprovementLane.id == scanned_lane.id)
+            .values(
+                workspace_state="WARM_RESERVED",
+                workspace_vm_instance_id="vm-race-new",
+            )
+            .execution_options(synchronize_session=False)
+        )
+        result = await session.execute(
+            update(ImprovementLane)
+            .where(
+                ImprovementLane.id == scanned_lane.id,
+                ImprovementLane.workspace_state == old_state,
+                ImprovementLane.workspace_vm_instance_id == old_vm,
+            )
+            .values(workspace_state="COLD", workspace_vm_instance_id=None)
+            .execution_options(synchronize_session=False)
+        )
+        return bool(result.rowcount)
+
+    mocker.patch.object(ops, "_clear_lane_workspace_if_snapshot_matches", raced_clear)
+
+    result = await ops.reconcile_lane_workspaces(db_session)
+    await db_session.commit()
+
+    assert result["missing_backing_vm"] == 1
+    assert result["lanes_cleared"] == 0
+    assert result["race_noops"] == 1
+    await db_session.refresh(lane)
+    assert lane.workspace_state == "WARM_RESERVED"
+    assert lane.workspace_vm_instance_id == "vm-race-new"

@@ -300,7 +300,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
           className="flex items-center gap-2 text-ui-md font-bold text-neutral-400 uppercase tracking-widest hover:text-neutral-300 transition-colors"
         >
           {warmChains > 0 && (
-            <span className="bg-orange-500/20 border border-orange-500/40 text-orange-400 text-ui-sm font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
+            <span className="bg-cyan-500/15 border border-cyan-500/35 text-cyan-300 text-ui-sm font-bold px-1.5 py-0.5 rounded-full leading-none flex items-center gap-1">
               <Flame className="w-2.5 h-2.5" />
               {warmChains} chain{warmChains !== 1 ? 's' : ''}
             </span>
@@ -340,7 +340,7 @@ export function WarmVmPanel({ onViewTask, projects = [] }: Props) {
                 <span><span className="text-neutral-500">warm chains</span>: <span className="font-mono text-neutral-300">{warmChains}</span></span>
                 <span><span className="text-neutral-500">backlog reuse</span>: <span className="font-mono text-sky-400">{backlogClaims}</span></span>
                 <span data-testid="pool-origin-claims"><span className="text-neutral-500">pool origin</span>: <span className="font-mono text-emerald-400">{poolClaims}</span>{poolShare !== null && <span className="text-neutral-500"> ({Math.round(poolShare * 100)}%)</span>}</span>
-                <span><span className="text-neutral-500">chain claims</span>: <span className="font-mono text-orange-400">{chainClaims}</span></span>
+                <span><span className="text-neutral-500">chain claims</span>: <span className="font-mono text-cyan-300">{chainClaims}</span></span>
                 <span><span className="text-neutral-500">pinned queued</span>: <span className="font-mono text-neutral-300">{pinnedQueued}</span></span>
                 <span><span className="text-neutral-500">clears/hr</span>: <span className={`font-mono ${overThreshold ? 'text-red-400' : 'text-neutral-300'}`}>{clearsHour}</span></span>
                 <span><span className="text-neutral-500">clears/24h</span>: <span className="font-mono text-neutral-300">{data.warm_pin_metrics.clears_last_24h}</span></span>

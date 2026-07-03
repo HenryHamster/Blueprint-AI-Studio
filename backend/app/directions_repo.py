@@ -108,6 +108,26 @@ async def get_direction(
     return dict(row.data or {})
 
 
+async def get_direction_row(
+    session: AsyncSession, project_id, direction_key: str
+) -> "Direction | None":
+    """Return the Direction ORM row (or None) for a direction key.
+
+    Unlike :func:`get_direction` which returns only the ``data`` dict, this
+    returns the full row so callers can read first-class columns like
+    ``criterion_keys`` that are not part of the data blob.
+    """
+    pid = _coerce_project_id(project_id)
+    return (
+        await session.execute(
+            select(Direction).where(
+                Direction.project_id == pid,
+                Direction.direction_key == direction_key,
+            )
+        )
+    ).scalar_one_or_none()
+
+
 async def upsert_direction(
     session: AsyncSession, project_id, direction: Dict[str, Any]
 ) -> None:

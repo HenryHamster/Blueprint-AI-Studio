@@ -881,6 +881,7 @@ async def claim_task(
     _claimed_task_id = task.id
     _claimed_project_id = task.project_id
     _claimed_context = dict(task.context or {})
+    _claimed_payloads = list(task.payloads or [])
     _claimed_first_payload = task.first_payload
 
     # Broadcast status change to frontend
@@ -893,7 +894,7 @@ async def claim_task(
     # Strip internal runtime-routing fields before returning task context to the agent.
     safe_context = {
         k: v
-        for k, v in (task.context or {}).items()
+        for k, v in _claimed_context.items()
         if not k.startswith("max_plan_") and not k.startswith("llm_")
     }
     # Resolve per-project branch metadata once so we can inject it into both
@@ -910,10 +911,20 @@ async def claim_task(
         get_project_integration_branch(project) if project else None
     )
 
+    _claim_runtime_model = _claimed_context.get("llm_model")
+    _claim_runtime_execution_mode = _claimed_context.get("llm_execution_mode")
+
     response_payloads: list = []
-    for entry in task.payloads or []:
+    for entry in _claimed_payloads:
         if isinstance(entry, dict):
             patched = dict(entry)
+            if isinstance(_claim_runtime_model, str) and _claim_runtime_model.strip():
+                patched["model"] = _claim_runtime_model.strip()
+            if (
+                isinstance(_claim_runtime_execution_mode, str)
+                and _claim_runtime_execution_mode.strip()
+            ):
+                patched["execution_mode"] = _claim_runtime_execution_mode.strip()
             if project_promotion_target and not patched.get("promotion_target"):
                 patched["promotion_target"] = project_promotion_target
             if project_integration_branch and not patched.get("integration_branch"):
@@ -5245,6 +5256,9 @@ async def agent_list_knowledge_documents(
     finding_hash: str | None = Query(
         default=None, description="Exact originating research finding hash filter"
     ),
+    sweep_id: str | None = Query(
+        default=None, description="Exact sweep_id filter (compute experiment sweeps)"
+    ),
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
@@ -5257,8 +5271,9 @@ async def agent_list_knowledge_documents(
     newest-first, limit/offset paginated) but scopes to the token's task project
     — never a URL-supplied project — so an agent cannot read another project's
     documents. The list shape omits the markdown body; use get-by-id for the
-    full document. The new ``direction`` / ``source_kind`` filters are additive:
-    omitting them preserves the prior behavior and response shape exactly.
+    full document. The new ``direction`` / ``source_kind`` / ``sweep_id`` filters
+    are additive: omitting them preserves the prior behavior and response shape
+    exactly.
     """
     project_id = await _resolve_token_project_id(session, token)
     return await kq_list_knowledge_documents(
@@ -5272,6 +5287,7 @@ async def agent_list_knowledge_documents(
         origin_state=origin_state,
         challenge_state=challenge_state,
         finding_hash=finding_hash,
+        sweep_id=sweep_id,
         limit=limit,
         offset=offset,
     )

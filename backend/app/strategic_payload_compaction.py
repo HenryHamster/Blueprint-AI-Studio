@@ -14,6 +14,7 @@ _VERSION_PHASE_RECENT_VERSIONS_CAP = 3
 _VERSION_PHASE_RECENT_VERSIONS_FLOOR_CAP = 2
 _VERSION_PHASE_TEXT_CAP = 500
 _VERSION_PHASE_TEXT_FLOOR_CAP = 240
+_VERSION_PHASE_CRITERIA_CAP = 20
 _DIRECTION_SUMMARY_TEXT_CAP = 260
 _DIRECTION_SUMMARY_LONG_TEXT_CAP = 420
 _DIRECTION_SUMMARY_LIST_CAP = 3
@@ -120,7 +121,6 @@ def _compact_cert(value: Any, *, text_cap: int) -> dict | None:
     for key in (
         "state",
         "status",
-        "theme_class",
         "deterministic_grade",
         "assessed_grade",
         "threshold_warn",
@@ -265,9 +265,6 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     challenge_summary = _compact_verdict_like(value.get("challenge_verdicts"), text_cap=text_cap)
     if challenge_summary:
         out["challenge_verdicts_summary"] = challenge_summary
-    theme_delivery = _compact_cert(value.get("theme_delivery"), text_cap=text_cap)
-    if theme_delivery:
-        out["theme_delivery"] = theme_delivery
     merge_grade = _compact_cert(value.get("merge_grade"), text_cap=text_cap)
     if merge_grade:
         out["merge_grade"] = merge_grade
@@ -381,9 +378,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         "version_number",
         "phase",
         "goal",
-        "theme",
         "goal_needed",
-        "theme_needed",
         "phase_changed_at",
         "tasks_merged_this_version",
         "qualification_attempts",
@@ -396,7 +391,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
             out,
             block,
             key,
-            text_cap=text_cap if key in {"goal", "theme"} else None,
+            text_cap=text_cap if key == "goal" else None,
         )
     _put_present(out, block, "phase_reasoning", text_cap=text_cap)
     acceptance = block.get("acceptance_aggregate")
@@ -414,6 +409,22 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     pr = _compact_promotion_readiness(block.get("promotion_readiness"), floor=floor)
     if pr:
         out["promotion_readiness"] = pr
+    drift = _compact_scalar_mapping(block.get("goal_coverage_drift"), text_cap=text_cap)
+    if drift:
+        out["goal_coverage_drift"] = drift
+    coverage = block.get("criterion_coverage")
+    if isinstance(coverage, dict):
+        compact_coverage: dict[str, Any] = {}
+        for key in ("total", "covered", "partial", "uncovered", "stuck_count"):
+            if key in coverage:
+                compact_coverage[key] = coverage[key]
+        if not floor:
+            # Normal path: include per-criterion list capped to bounded length.
+            criteria = coverage.get("criteria")
+            if isinstance(criteria, list):
+                compact_coverage["criteria"] = criteria[:_VERSION_PHASE_CRITERIA_CAP]
+        if compact_coverage:
+            out["criterion_coverage"] = compact_coverage
     for key in (
         "last_qualification_candidate_currency",
         "stabilize_stall",
@@ -543,15 +554,19 @@ def _direction_activity_score(stat: dict) -> int:
     and recency (cycles). High-priority directions get a small boost so a quiet
     high-priority direction doesn't get evicted by a chatty low-priority one.
 
-    "Work shipped" counts VERIFIED merges (``verified_prs_merged``, populated in
-    the direction_stats loop) so a direction whose merges never actually landed —
-    or landed degraded/unverified — does not win payload space over one that
-    truly shipped. Falls back to the raw ``prs_merged`` for back-compat with
-    stat dicts that predate the verified field.
+    "Work shipped" prefers REACHABLE merges (``reachable_prs_merged``: commits
+    confirmed landed on integration branch), falling back to VERIFIED merges
+    (``verified_prs_merged``: CI/acceptance-bucket-verified), then raw
+    ``prs_merged`` for back-compat. This ensures directions with stranded merges
+    (CI-passing but never landed) do not crowd out directions whose work truly shipped.
     """
     if not isinstance(stat, dict):
         return 0
-    merged = int(stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
+    merged = int(
+        stat["reachable_prs_merged"]
+        if "reachable_prs_merged" in stat
+        else (stat.get("verified_prs_merged", stat.get("prs_merged", 0)) or 0)
+    )
     failed = int(stat.get("tasks_failed") or 0)
     cycles = int(stat.get("total_cycles") or 0)
     priority = stat.get("priority")
@@ -681,6 +696,8 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "total_cycles",
         "prs_merged",
         "verified_prs_merged",
+        "reachable_prs_merged",
+        "badge_only_prs_merged",
         "proven_prs_merged",
         "consumed_prs_merged",
         "acceptance_declaration_coverage",

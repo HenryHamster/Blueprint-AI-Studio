@@ -873,3 +873,474 @@ class TestViewportResidualStore:
         results = get_top_viewport_residual_fingerprints()
         assert len(results) == 1
         assert results[0]["assertion_type"] == "min_touch_target"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cooldown auto-recovery for SUSPENDED residual cases
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestSuspendedResidualCaseAutoRecovery:
+    """Tests for exponential-backoff auto-recovery of SUSPENDED residual cases.
+
+    These exercise the auto-recovery path added to
+    ``_spawn_residual_fingerprint_remediation`` in
+    ``app.autonomous_research_residual``. The pattern reuses the same SQLite
+    in-memory engine used by TestUpsertResidualCaseAsync.
+    """
+
+    @pytest_asyncio.fixture
+    async def session_factory(self):
+        from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+        from sqlalchemy.orm import sessionmaker
+        from sqlalchemy.pool import StaticPool
+        from sqlmodel import SQLModel
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.create_all)
+        factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        yield factory
+        async with engine.begin() as conn:
+            await conn.run_sync(SQLModel.metadata.drop_all)
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_suspended_residual_case_auto_recovers_after_cooldown(
+        self, session_factory, monkeypatch
+    ):
+        """SUSPENDED residual case auto-recovers once its backoff cooldown elapses.
+
+        Sets up a SUSPENDED ResidualRemediationCase with suspended_at 48 h ago
+        (past the 24 h base cooldown) and calls
+        _spawn_residual_fingerprint_remediation. Verifies that the case status
+        is set to ACTIVE and recovery_attempts is incremented, even though no
+        task is spawned (blocked by the concurrency cap from 2 REMEDIATING rows).
+        """
+        import time
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import AsyncMock
+
+        import app.database as db_mod
+        from app.models import ResidualRemediationCase, ResidualCaseStatus, Project
+        from app.autonomous_research_residual import (
+            _spawn_residual_fingerprint_remediation,
+        )
+        from app.failure_residual import _residual_store
+        from sqlmodel import select
+
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        # Suppress notification side-effects to keep the test self-contained.
+        # The deferred `from app.notification_dispatch import ...` inside the
+        # function picks up the patched attribute from the module object.
+        import app.notification_dispatch as nd_mod
+        monkeypatch.setattr(
+            nd_mod,
+            "post_residual_fix_auto_recovered_message",
+            AsyncMock(return_value=None),
+        )
+
+        # Mock spend-ceiling check so it doesn't short-circuit before auto-recovery.
+        import app.autonomous_research as ar_mod
+        monkeypatch.setattr(
+            ar_mod,
+            "_project_spend_ceiling_spawn_defer_reason",
+            AsyncMock(return_value=None),
+        )
+
+        project_id = uuid.uuid4()
+        fp_suspended = "fp_auto_recover_cooldown_test"
+
+        # Ensure the in-memory store is clean before and after this test.
+        _residual_store.clear()
+
+        # Inject the fingerprint into the in-memory store so the scan finds it.
+        _residual_store[fp_suspended] = {
+            "count": 5,
+            "first_seen": time.time() - 7200,
+            "last_seen": time.time(),
+            "sample_message": "TypeError: auto-recover test error",
+            "task_ids": [],
+            "is_error_shaped": True,
+        }
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        # suspended_at is 48 h ago — well past the 24 h base cooldown.
+        suspended_at = now_naive - timedelta(hours=48)
+
+        async with session_factory() as session:
+            project = Project(
+                id=project_id,
+                name="Auto Recovery Test",
+                user_id="test-user",
+                autonomous_enabled=True,
+                directions=[],
+            )
+            session.add(project)
+
+            # Two REMEDIATING cases so active_count >= max_concurrent (2) — this
+            # prevents any spawn while still allowing auto-recovery to run first.
+            for i in range(2):
+                session.add(
+                    ResidualRemediationCase(
+                        project_id=project_id,
+                        fingerprint=f"fp_remediating_{i}",
+                        status=ResidualCaseStatus.REMEDIATING,
+                        hit_count=3,
+                        first_seen_at=now_naive,
+                        last_seen_at=now_naive,
+                        created_at=now_naive,
+                        updated_at=now_naive,
+                    )
+                )
+
+            # The SUSPENDED case under test — cooldown already elapsed.
+            suspended_case = ResidualRemediationCase(
+                project_id=project_id,
+                fingerprint=fp_suspended,
+                status=ResidualCaseStatus.SUSPENDED,
+                suspended_at=suspended_at,
+                recovery_attempts=0,
+                hit_count=5,
+                sample_message="TypeError: auto-recover test error",
+                first_seen_at=suspended_at,
+                last_seen_at=now_naive,
+                created_at=suspended_at,
+                updated_at=suspended_at,
+            )
+            session.add(suspended_case)
+            await session.commit()
+            await session.refresh(project)
+
+            # Call the spawn function. It should auto-recover the SUSPENDED case
+            # then hit the concurrency cap (2 REMEDIATING) and return 0.
+            spawned = await _spawn_residual_fingerprint_remediation(project, session)
+
+        assert spawned == 0, "Concurrency cap should block spawn (2 REMEDIATING cases)"
+
+        async with session_factory() as read_session:
+            recovered = (
+                await read_session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fp_suspended,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        assert recovered is not None, "ResidualRemediationCase row must still exist"
+        assert recovered.status == ResidualCaseStatus.ACTIVE, (
+            f"SUSPENDED case must be ACTIVE after cooldown, got {recovered.status}"
+        )
+        assert recovered.suspended_at is None, "suspended_at must be cleared on auto-recovery"
+        assert recovered.recovery_attempts == 1, (
+            f"recovery_attempts must be incremented to 1, got {recovered.recovery_attempts}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_suspended_viewport_case_auto_recovers_after_cooldown(
+        self, session_factory, monkeypatch
+    ):
+        """Viewport SUSPENDED cases persist auto-recovery before cap return too."""
+        import time
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import AsyncMock
+
+        import app.autonomous_research as ar_mod
+        import app.database as db_mod
+        import app.notification_dispatch as nd_mod
+        from app.autonomous_research_residual import (
+            _spawn_viewport_regression_remediation,
+        )
+        from app.failure_residual import _viewport_residual_store
+        from app.models import Project, ResidualCaseStatus, ResidualRemediationCase
+        from sqlmodel import select
+
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+        monkeypatch.setattr(
+            nd_mod,
+            "post_residual_fix_auto_recovered_message",
+            AsyncMock(return_value=None),
+        )
+        monkeypatch.setattr(
+            ar_mod,
+            "_project_spend_ceiling_spawn_defer_reason",
+            AsyncMock(return_value=None),
+        )
+
+        project_id = uuid.uuid4()
+        fp_suspended = "viewport:TaskCard:overflow"
+        now_epoch = time.time()
+
+        _viewport_residual_store.clear()
+        _viewport_residual_store[fp_suspended] = {
+            "count": 5,
+            "first_seen": now_epoch - 7200,
+            "last_seen": now_epoch,
+            "component": "TaskCard",
+            "assertion_type": "overflow",
+            "sample_message": "expectNoOverflowAt failed",
+            "task_ids": [],
+        }
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        suspended_at = now_naive - timedelta(hours=48)
+
+        async with session_factory() as session:
+            project = Project(
+                id=project_id,
+                name="Viewport Auto Recovery Test",
+                user_id="test-user",
+                autonomous_enabled=True,
+                directions=[],
+            )
+            session.add(project)
+            for i in range(2):
+                session.add(
+                    ResidualRemediationCase(
+                        project_id=project_id,
+                        fingerprint=f"viewport:Other:{i}",
+                        status=ResidualCaseStatus.REMEDIATING,
+                        hit_count=3,
+                        first_seen_at=now_naive,
+                        last_seen_at=now_naive,
+                        created_at=now_naive,
+                        updated_at=now_naive,
+                    )
+                )
+            session.add(
+                ResidualRemediationCase(
+                    project_id=project_id,
+                    fingerprint=fp_suspended,
+                    status=ResidualCaseStatus.SUSPENDED,
+                    suspended_at=suspended_at,
+                    recovery_attempts=0,
+                    hit_count=5,
+                    sample_message="expectNoOverflowAt failed",
+                    first_seen_at=suspended_at,
+                    last_seen_at=now_naive,
+                    created_at=suspended_at,
+                    updated_at=suspended_at,
+                )
+            )
+            await session.commit()
+            await session.refresh(project)
+
+            spawned = await _spawn_viewport_regression_remediation(project, session)
+
+        assert spawned == 0, "Concurrency cap should block viewport remediation spawn"
+
+        async with session_factory() as read_session:
+            recovered = (
+                await read_session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fp_suspended,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        _viewport_residual_store.clear()
+
+        assert recovered is not None
+        assert recovered.status == ResidualCaseStatus.ACTIVE
+        assert recovered.suspended_at is None
+        assert recovered.recovery_attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_suspended_case_stays_blocked_within_cooldown(
+        self, session_factory, monkeypatch
+    ):
+        """SUSPENDED case within its cooldown window must not auto-recover."""
+        import time
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import AsyncMock
+
+        import app.database as db_mod
+        from app.models import ResidualRemediationCase, ResidualCaseStatus, Project
+        from app.autonomous_research_residual import (
+            _spawn_residual_fingerprint_remediation,
+        )
+        from app.failure_residual import _residual_store
+        from sqlmodel import select
+
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        import app.notification_dispatch as nd_mod
+        monkeypatch.setattr(
+            nd_mod, "post_residual_fix_auto_recovered_message", AsyncMock(return_value=None)
+        )
+
+        import app.autonomous_research as ar_mod
+        monkeypatch.setattr(
+            ar_mod,
+            "_project_spend_ceiling_spawn_defer_reason",
+            AsyncMock(return_value=None),
+        )
+
+        project_id = uuid.uuid4()
+        fp = "fp_within_cooldown_test"
+
+        _residual_store.clear()
+        _residual_store[fp] = {
+            "count": 5,
+            "first_seen": time.time() - 3600,
+            "last_seen": time.time(),
+            "sample_message": "some error within cooldown",
+            "task_ids": [],
+            "is_error_shaped": True,
+        }
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        # suspended_at is only 1 h ago — within the 24 h base cooldown.
+        suspended_at = now_naive - timedelta(hours=1)
+
+        async with session_factory() as session:
+            project = Project(
+                id=project_id,
+                name="Within Cooldown Test",
+                user_id="test-user",
+                autonomous_enabled=True,
+                directions=[],
+            )
+            session.add(project)
+            session.add(
+                ResidualRemediationCase(
+                    project_id=project_id,
+                    fingerprint=fp,
+                    status=ResidualCaseStatus.SUSPENDED,
+                    suspended_at=suspended_at,
+                    recovery_attempts=0,
+                    hit_count=5,
+                    sample_message="some error within cooldown",
+                    first_seen_at=suspended_at,
+                    last_seen_at=now_naive,
+                    created_at=suspended_at,
+                    updated_at=suspended_at,
+                )
+            )
+            await session.commit()
+            await session.refresh(project)
+
+            spawned = await _spawn_residual_fingerprint_remediation(project, session)
+
+        assert spawned == 0, "Within-cooldown SUSPENDED case must not spawn"
+
+        async with session_factory() as read_session:
+            row = (
+                await read_session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fp,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        assert row is not None
+        assert row.status == ResidualCaseStatus.SUSPENDED, (
+            "Within-cooldown case must remain SUSPENDED"
+        )
+        assert row.recovery_attempts == 0, "recovery_attempts must not increment"
+
+    @pytest.mark.asyncio
+    async def test_suspended_case_permanently_blocked_at_max_attempts(
+        self, session_factory, monkeypatch
+    ):
+        """SUSPENDED case at MAX_AUTO_RECOVERY_ATTEMPTS stays permanently suspended."""
+        import time
+        from datetime import datetime, timezone, timedelta
+        from unittest.mock import AsyncMock
+
+        import app.database as db_mod
+        from app.models import ResidualRemediationCase, ResidualCaseStatus, Project
+        from app.autonomous_research_residual import (
+            _spawn_residual_fingerprint_remediation,
+        )
+        from app.auto_remediation import MAX_AUTO_RECOVERY_ATTEMPTS
+        from app.failure_residual import _residual_store
+        from sqlmodel import select
+
+        monkeypatch.setattr(db_mod, "AsyncSessionLocal", session_factory)
+
+        import app.notification_dispatch as nd_mod
+        monkeypatch.setattr(
+            nd_mod, "post_residual_fix_auto_recovered_message", AsyncMock(return_value=None)
+        )
+
+        import app.autonomous_research as ar_mod
+        monkeypatch.setattr(
+            ar_mod,
+            "_project_spend_ceiling_spawn_defer_reason",
+            AsyncMock(return_value=None),
+        )
+
+        project_id = uuid.uuid4()
+        fp = "fp_max_attempts_test"
+
+        _residual_store.clear()
+        _residual_store[fp] = {
+            "count": 5,
+            "first_seen": time.time() - 7200,
+            "last_seen": time.time(),
+            "sample_message": "max attempts error",
+            "task_ids": [],
+            "is_error_shaped": True,
+        }
+
+        now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+        # suspended_at is 48 h ago (past cooldown) but at max attempts → stays blocked.
+        suspended_at = now_naive - timedelta(hours=48)
+
+        async with session_factory() as session:
+            project = Project(
+                id=project_id,
+                name="Max Attempts Test",
+                user_id="test-user",
+                autonomous_enabled=True,
+                directions=[],
+            )
+            session.add(project)
+            session.add(
+                ResidualRemediationCase(
+                    project_id=project_id,
+                    fingerprint=fp,
+                    status=ResidualCaseStatus.SUSPENDED,
+                    suspended_at=suspended_at,
+                    recovery_attempts=MAX_AUTO_RECOVERY_ATTEMPTS,
+                    hit_count=5,
+                    sample_message="max attempts error",
+                    first_seen_at=suspended_at,
+                    last_seen_at=now_naive,
+                    created_at=suspended_at,
+                    updated_at=suspended_at,
+                )
+            )
+            await session.commit()
+            await session.refresh(project)
+
+            spawned = await _spawn_residual_fingerprint_remediation(project, session)
+
+        assert spawned == 0, "Max-attempts SUSPENDED case must not spawn"
+
+        async with session_factory() as read_session:
+            row = (
+                await read_session.execute(
+                    select(ResidualRemediationCase).where(
+                        ResidualRemediationCase.project_id == project_id,
+                        ResidualRemediationCase.fingerprint == fp,
+                    )
+                )
+            ).scalar_one_or_none()
+
+        assert row is not None
+        assert row.status == ResidualCaseStatus.SUSPENDED, (
+            "Max-attempts case must remain SUSPENDED even past cooldown"
+        )
+        assert row.recovery_attempts == MAX_AUTO_RECOVERY_ATTEMPTS, (
+            "recovery_attempts must not increase past MAX_AUTO_RECOVERY_ATTEMPTS"
+        )

@@ -1309,9 +1309,8 @@ def test_to_phase_block_qualification_state_none_when_unqualified():
     assert rv.to_phase_block(version)["qualification_state"] is None
 
 
-def test_to_phase_block_carries_acceptance_aggregate():
-    """to_phase_block surfaces the stored version-window acceptance aggregate
-    additively, without disturbing the existing keys."""
+def test_to_phase_block_omits_acceptance_aggregate():
+    """to_phase_block no longer surfaces the retired acceptance aggregate."""
     version = ReleaseVersion(
         version_number=3,
         phase="stabilize",
@@ -1332,16 +1331,13 @@ def test_to_phase_block_carries_acceptance_aggregate():
     }
     version.last_qualification = {"acceptance_aggregate": aggregate}
     block = rv.to_phase_block(version)
-    # The aggregate passes through verbatim...
-    assert block["acceptance_aggregate"] == aggregate
-    # ...and the existing shape keys are untouched.
+    assert "acceptance_aggregate" not in block
     assert block["version_number"] == 3
     assert block["goal"] == "Ship proven-vs-merged surfacing"
 
 
-def test_to_phase_block_acceptance_aggregate_none_on_legacy():
-    """A legacy version with no stored aggregate yields acceptance_aggregate=None
-    (backward-compatible) — the key is always present."""
+def test_to_phase_block_acceptance_aggregate_absent_on_legacy():
+    """Legacy phase blocks also omit acceptance_aggregate."""
     version = ReleaseVersion(
         version_number=1,
         phase="build",
@@ -1349,8 +1345,7 @@ def test_to_phase_block_acceptance_aggregate_none_on_legacy():
         opened_at=_utcnow(),
     )
     block = rv.to_phase_block(version)
-    assert "acceptance_aggregate" in block
-    assert block["acceptance_aggregate"] is None
+    assert "acceptance_aggregate" not in block
 
 
 # ===========================================================================
@@ -1371,7 +1366,6 @@ def test_build_version_highlights_open_no_merged_work():
         version,
         merged_count=0,
         aggregate_serving_status=None,
-        acceptance_aggregate=None,
     )
     assert h["headline"] == "open in build with no merged work yet"
     assert h["merged_count"] == 0
@@ -1383,7 +1377,7 @@ def test_build_version_highlights_open_no_merged_work():
 
 def test_build_version_highlights_open_with_merged():
     """An open version with merged work names the count in its phase context and
-    surfaces the proven/total acceptance metrics plus qualification conf/threshold."""
+    surfaces qualification conf/threshold."""
     version = ReleaseVersion(
         version_number=2,
         phase="stabilize",
@@ -1395,12 +1389,11 @@ def test_build_version_highlights_open_with_merged():
         version,
         merged_count=3,
         aggregate_serving_status=None,
-        acceptance_aggregate={"proven": 2, "total": 3},
     )
     assert h["headline"] == "open in stabilize with 3 merged"
     assert h["merged_count"] == 3
-    assert h["proven"] == 2
-    assert h["total_merged_for_acceptance"] == 3
+    assert h["proven"] == 0
+    assert h["total_merged_for_acceptance"] == 0
     assert h["qualification_confidence"] == 0.82
     assert h["qualification_threshold"] == 0.9
 
@@ -1418,7 +1411,6 @@ def test_build_version_highlights_promoted_and_serving_when_aggregate_confirmed(
         version,
         merged_count=12,
         aggregate_serving_status="serving_confirmed",
-        acceptance_aggregate={"proven": 10, "total": 12},
     )
     assert h["headline"] == "promoted & serving"
 
@@ -1440,7 +1432,6 @@ def test_build_version_highlights_promoted_uses_aggregate_not_scalar():
         version,
         merged_count=8,
         aggregate_serving_status="deploy_failed",
-        acceptance_aggregate=None,
     )
     assert h["headline"] == "promoted"
 
@@ -1459,7 +1450,6 @@ def test_build_version_highlights_promoted_unconfirmed_aggregate_is_just_promote
             version,
             merged_count=1,
             aggregate_serving_status=agg,
-            acceptance_aggregate=None,
         )
         assert h["headline"] == "promoted", f"aggregate={agg!r}"
 
@@ -1476,14 +1466,12 @@ def test_build_version_highlights_abandoned():
         version,
         merged_count=5,
         aggregate_serving_status="serving_confirmed",
-        acceptance_aggregate={"proven": 1, "total": 5},
     )
     assert h["headline"] == "abandoned"
 
 
-def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
-    """A legacy version with no acceptance aggregate and no verdict yields proven/
-    total 0 and null conf/threshold without crashing."""
+def test_build_version_highlights_legacy_none_acceptance_omits_metrics():
+    """A legacy version omits retired acceptance metrics without crashing."""
     version = ReleaseVersion(
         version_number=8,
         phase="build",
@@ -1495,7 +1483,6 @@ def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
         version,
         merged_count=2,
         aggregate_serving_status=None,
-        acceptance_aggregate=None,
     )
     assert h["proven"] == 0
     assert h["total_merged_for_acceptance"] == 0
@@ -1510,7 +1497,7 @@ def test_build_version_highlights_legacy_none_acceptance_defaults_zero():
 
 def test_build_version_highlights_open_with_merged_has_narrative():
     """An open version with merged work has a non-empty narrative that mentions
-    the merged count and phase, and reflects acceptance + qualification state."""
+    the merged count and phase, and reflects qualification state."""
     version = ReleaseVersion(
         version_number=2,
         phase="stabilize",
@@ -1522,7 +1509,6 @@ def test_build_version_highlights_open_with_merged_has_narrative():
         version,
         merged_count=3,
         aggregate_serving_status=None,
-        acceptance_aggregate={"proven": 2, "total": 3},
     )
     narrative = h["narrative"]
     assert isinstance(narrative, str) and narrative, (
@@ -1530,9 +1516,7 @@ def test_build_version_highlights_open_with_merged_has_narrative():
     )
     assert "3" in narrative, "narrative should mention merged count"
     assert "stabilize" in narrative, "narrative should mention phase"
-    assert "2" in narrative and "3" in narrative, (
-        "narrative should reflect proven/total"
-    )
+    assert "Acceptance evidence" not in narrative
     assert "82%" in narrative or "below" in narrative, (
         "narrative should reflect qualification state"
     )
@@ -1550,13 +1534,12 @@ def test_build_version_highlights_promoted_and_serving_narrative():
         version,
         merged_count=12,
         aggregate_serving_status="serving_confirmed",
-        acceptance_aggregate={"proven": 10, "total": 12},
     )
     narrative = h["narrative"]
     assert isinstance(narrative, str) and narrative
     assert "serving" in narrative.lower(), "narrative must mention serving"
     assert "12" in narrative, "narrative should mention merged count"
-    assert "10" in narrative, "narrative should mention proven count"
+    assert "Acceptance evidence" not in narrative
 
 
 def test_build_version_highlights_abandoned_narrative():
@@ -1571,7 +1554,6 @@ def test_build_version_highlights_abandoned_narrative():
         version,
         merged_count=5,
         aggregate_serving_status="serving_confirmed",
-        acceptance_aggregate={"proven": 1, "total": 5},
     )
     narrative = h["narrative"]
     assert isinstance(narrative, str) and narrative
@@ -1592,7 +1574,6 @@ def test_build_version_highlights_legacy_none_acceptance_narrative():
         version,
         merged_count=2,
         aggregate_serving_status=None,
-        acceptance_aggregate=None,
     )
     narrative = h["narrative"]
     assert isinstance(narrative, str) and narrative
@@ -1601,11 +1582,11 @@ def test_build_version_highlights_legacy_none_acceptance_narrative():
 
 def test_build_version_highlights_narrative_always_present():
     """narrative key is always in the returned dict regardless of version state."""
-    for status, merged, agg in [
-        ("open", 0, None),
-        ("open", 5, {"proven": 3, "total": 5}),
-        ("promoted", 10, {"proven": 8, "total": 10}),
-        ("abandoned", 3, None),
+    for status, merged in [
+        ("open", 0),
+        ("open", 5),
+        ("promoted", 10),
+        ("abandoned", 3),
     ]:
         version = ReleaseVersion(
             version_number=1,
@@ -1617,7 +1598,6 @@ def test_build_version_highlights_narrative_always_present():
             version,
             merged_count=merged,
             aggregate_serving_status=None,
-            acceptance_aggregate=agg,
         )
         assert "narrative" in h, f"narrative key missing for status={status}"
         assert isinstance(h["narrative"], str) and h["narrative"], (
@@ -1699,6 +1679,35 @@ def test_qual_state_pending_no_audit_signal_stays_qualifying():
         audit_child={"task_status": "FAILED", "report": {"score": 0.9}},
     )
     assert state["state"] == "qualifying"
+
+
+def test_summarize_qualification_state_bare_promotion_claim_blocks():
+    """A bare promotion CLAIM must be recognized as a promotion-blocking state.
+
+    promote() writes ``promotion_pending = {claiming: True, candidate_sha, ...}``
+    under the row lock BEFORE releasing it for its 30-120s of GitHub I/O, so a
+    concurrent re-qualify can't clobber the in-flight promotion. The claim has no
+    ``pr_number`` yet (the PR isn't open), so summarize must still classify it as
+    ``promotion_in_flight`` ∈ ``PROMOTION_BLOCKING_STATES`` — that is what makes
+    Guard 2b (``_promotion_in_flight_result``) and the version-cut lever refuse a
+    concurrent qualify from the instant the claim commits. If this regressed to
+    ``qualifying`` the clobber race (PR #12492) would reopen."""
+    state = rv.summarize_qualification_state(
+        {
+            "status": "pending",
+            "candidate_sha": "abcd" * 10,
+            "promotion_pending": {
+                "claiming": True,
+                "candidate_sha": "abcd" * 10,
+                "enabled_at": _utcnow().isoformat(),
+            },
+        }
+    )
+    assert state is not None
+    assert state["state"] == "promotion_in_flight"
+    assert state["state"] in rv.PROMOTION_BLOCKING_STATES
+    # No PR exists yet — the claim precedes the promotion PR being opened.
+    assert state.get("promotion_pr_number") is None
 
 
 def test_qual_state_pending_running_audit_child_stays_qualifying():
@@ -2035,6 +2044,123 @@ def test_qual_state_unknown_status_passes_through():
     """Forward-compat: an unrecognized status is echoed, never crashes."""
     state = rv.summarize_qualification_state({"status": "some_new_status"})
     assert state["state"] == "some_new_status"
+
+
+# ===========================================================================
+# TestQualificationStateVocab — pin QUALIFICATION_STATE_VOCAB contract
+# ===========================================================================
+
+
+class TestQualificationStateVocab:
+    """Pin the QUALIFICATION_STATE_VOCAB constant and its relationship to
+    summarize_qualification_state return values."""
+
+    def test_is_frozenset_of_strings(self):
+        vocab = rv.QUALIFICATION_STATE_VOCAB
+        assert isinstance(vocab, frozenset)
+        assert vocab, "vocab must not be empty"
+        assert all(isinstance(s, str) for s in vocab)
+
+    def test_contains_all_14_states(self):
+        expected = frozenset(
+            {
+                "qualifying",
+                "audit_crashed",
+                "promotion_check_wait",
+                "promotion_in_flight",
+                "promotion_failed",
+                "required_check_failed",
+                "protection_blocked_review",
+                "not_promoted",
+                "dry_run",
+                "promoted",
+                "promoted_unconfirmed",
+                "promotion_deploy_failed",
+                "promotion_confirmation_timed_out",
+                "deferred_unsynced",
+            }
+        )
+        assert rv.QUALIFICATION_STATE_VOCAB == expected
+
+    def test_promotion_blocking_states_subset_of_vocab(self):
+        assert rv.PROMOTION_BLOCKING_STATES <= rv.QUALIFICATION_STATE_VOCAB
+
+    @pytest.mark.parametrize(
+        "verdict,kwargs",
+        [
+            # qualifying — pending with no promotion_pending
+            ({"status": "pending"}, {}),
+            # audit_crashed — pending with a crashed audit child
+            (
+                {"status": "pending"},
+                {"audit_child": {"task_status": "FAILED", "report": None}},
+            ),
+            # promotion_check_wait — pending with managed_check_wait promo
+            (
+                {
+                    "status": "pending",
+                    "promotion_pending": {"managed_check_wait": True},
+                },
+                {},
+            ),
+            # promotion_in_flight — pending with non-managed promo
+            (
+                {
+                    "status": "pending",
+                    "promotion_pending": {"auto_merge_enabled": True},
+                },
+                {},
+            ),
+            # required_check_failed
+            (
+                {"status": "promotion_failed", "error": "required_check_failed"},
+                {},
+            ),
+            # protection_blocked_review
+            (
+                {"status": "promotion_failed", "error": "protection_blocked_review"},
+                {},
+            ),
+            # promotion_failed (generic)
+            ({"status": "promotion_failed", "error": "merge_conflict"}, {}),
+            # not_promoted
+            ({"status": "not_promoted", "confidence": 0.5, "threshold": 0.9}, {}),
+            # dry_run
+            ({"status": "dry_run"}, {}),
+            # promoted (no serving info)
+            ({"status": "promoted"}, {}),
+            # promoted_unconfirmed
+            ({"status": "promoted"}, {"serving_status": "unconfirmed"}),
+            # promotion_deploy_failed
+            ({"status": "promoted"}, {"serving_status": "deploy_failed"}),
+            # promotion_confirmation_timed_out
+            (
+                {"status": "promoted"},
+                {"serving_status": "confirmation_timed_out"},
+            ),
+            # deferred_unsynced
+            ({"status": "deferred_unsynced"}, {}),
+        ],
+    )
+    def test_returned_state_is_in_vocab(self, verdict, kwargs):
+        """Every distinct code path returns a state that is in QUALIFICATION_STATE_VOCAB."""
+        result = rv.summarize_qualification_state(verdict, **kwargs)
+        assert result is not None, "expected a non-None result for this verdict"
+        state = result.get("state")
+        assert state in rv.QUALIFICATION_STATE_VOCAB, (
+            f"state={state!r} is not in QUALIFICATION_STATE_VOCAB"
+        )
+
+    def test_prompt_suffix_hint_states_subset_of_vocab(self):
+        """The 5-state prompt-suffix set in strategic_spawning stays inside vocab."""
+        hint_states = {
+            "promotion_in_flight",
+            "promotion_check_wait",
+            "promotion_failed",
+            "required_check_failed",
+            "protection_blocked_review",
+        }
+        assert hint_states <= rv.QUALIFICATION_STATE_VOCAB
 
 
 # ===========================================================================

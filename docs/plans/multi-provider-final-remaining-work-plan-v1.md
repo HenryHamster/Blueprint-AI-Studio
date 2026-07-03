@@ -146,10 +146,12 @@ Goal: expose the new backend controls in the actual admin UX.
   - `provider_mode_capabilities`
   - `task_type_execution_defaults`
   - `cross_provider_fallback_enabled`
-- Update `admin-ui/src/components/SettingsDropdown.tsx` to add:
+- Update `admin-ui/src/components/SettingsSectionRouter.tsx` wiring so the current settings hosts expose the provider-aware sections.
+- Update `admin-ui/src/components/SettingsAccountsSection.tsx` for:
   - provider-aware account creation/edit form
   - auth-mode-specific fields
   - provider metadata inputs
+- Update `admin-ui/src/components/ProviderSettingsPanel.tsx` for:
   - task-type provider order controls
   - task-type concrete model priority controls
   - task-type execution mode defaults
@@ -272,7 +274,9 @@ Frontend:
 
 - `admin-ui/src/types/settings.ts`
 - `admin-ui/src/hooks/useSettings.ts`
-- `admin-ui/src/components/SettingsDropdown.tsx`
+- `admin-ui/src/components/SettingsSectionRouter.tsx`
+- `admin-ui/src/components/SettingsAccountsSection.tsx`
+- `admin-ui/src/components/ProviderSettingsPanel.tsx`
 - `admin-ui/src/components/OrchestratorHealthBar.tsx`
 - any small supporting components/helpers added for provider preference and model priority editing
 

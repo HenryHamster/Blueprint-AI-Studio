@@ -46,6 +46,7 @@ from app.admin_helpers import _get_user_project, _get_user_task
 from app.schemas import ArtifactDownloadResponse
 from app.admin import router as admin_router
 from app.routers.admin_projects import router as admin_projects_router
+from app.routers.admin_project_strategic_session import router as admin_project_strategic_session_router
 from app.routers.admin_settings import router as admin_settings_router
 from app.routers.admin_debug import router as admin_debug_router
 from app.routers.admin_pool_accounts import router as admin_pool_accounts_router
@@ -55,6 +56,7 @@ from app.routers.admin_runners import router as admin_runners_router
 from app.routers.runner import router as runner_router
 from app.routers.agent import router as agent_router
 from app.routers.agent_github import router as agent_github_router
+from app.routers.agent_ci_compliance import router as agent_ci_compliance_router
 from app.routers.agent_strategic_fetch import router as agent_strategic_fetch_router
 from app.routers.agent_warm_continuity import router as agent_warm_continuity_router
 from app.efficiency_snapshot import agent_router as efficiency_snapshot_agent_router
@@ -83,7 +85,9 @@ from app.routers.agent_status import router as agent_status_router
 from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
+from app.routers.admin_acceptance_criteria import router as admin_acceptance_criteria_router
 from app.routers.admin_state import router as admin_state_router
+from app.routers.admin_operator_attention import router as admin_operator_attention_router
 from app.shared_state import limiter
 import app.shared_state as _shared_state
 from app.shared_state import runtime_config as _runtime_config
@@ -96,7 +100,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0349"
+EXPECTED_SCHEMA_REVISION = "0366"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -777,6 +781,7 @@ app = FastAPI(
 
 app.include_router(admin_router)
 app.include_router(admin_projects_router)
+app.include_router(admin_project_strategic_session_router)
 app.include_router(admin_settings_router)
 app.include_router(admin_debug_router)
 app.include_router(admin_pool_accounts_router)
@@ -787,6 +792,7 @@ app.include_router(runner_router)
 app.include_router(agent_router)
 app.include_router(efficiency_snapshot_agent_router)
 app.include_router(agent_github_router)
+app.include_router(agent_ci_compliance_router)
 app.include_router(agent_strategic_fetch_router)
 app.include_router(agent_warm_continuity_router)
 app.include_router(github_router)
@@ -801,6 +807,8 @@ app.include_router(admin_metrics_router)
 app.include_router(admin_activity_router)
 app.include_router(admin_health_router)
 app.include_router(admin_state_router)
+app.include_router(admin_acceptance_criteria_router)
+app.include_router(admin_operator_attention_router)
 app.include_router(admin_evergreen_router)
 app.include_router(admin_orchestrator_errors_router)
 app.include_router(admin_scope_measurement_router)
@@ -1769,6 +1777,7 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     resp = JSONResponse(
         status_code=exc.status_code,
         content={"error": {"code": exc.status_code, "message": exc.detail}},
+        headers=exc.headers,
     )
     return _apply_cors_headers(resp, request)
 

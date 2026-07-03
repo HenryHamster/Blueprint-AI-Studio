@@ -28,9 +28,10 @@ are a projected view over directions, not a separate store.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +568,202 @@ def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
             still_active.append(gap)
     model.gaps = still_active
     return model
+
+
+def reconcile_gaps_for_retired_directions(
+    raw_model: dict | None,
+    retired_direction_ids: Iterable[str],
+    now_iso: str,
+    rationale: str | None = None,
+) -> tuple[dict, list[str]]:
+    """Reconcile problem-model gaps when their staffing direction(s) retire.
+
+    Pure, side-effecting-on-its-argument helper invoked under the project row
+    lock by both retire paths (the live ``retire_direction`` strategic op and
+    the batch/log-parse strategic-completion pass). It operates directly on the
+    *raw* JSONB dict (gaps as raw dicts, straight from ``project.problem_model``)
+    so it never has to round-trip through the pydantic model.
+
+    For every retired direction id, across every gap whose ``active_moves`` list
+    contains that id (``active_moves`` is the authoritative staffing list — we
+    match on the direction id, not the direction's ``gap_id`` hint):
+
+    - prune the retired id out of ``gap.active_moves`` and union it into
+      ``gap.past_moves`` (no duplicate if it is already there);
+    - if that prune empties ``active_moves`` (it was the gap's LAST active move)
+      AND the gap has no existing ``deferral``, record a :class:`GapDeferral`
+      naming the retired direction(s) as the trigger — acknowledging the now
+      unstaffed gap instead of silently orphaning it.
+
+    It deliberately does NOT change ``gap.status`` (never auto-closes a gap) and
+    NEVER overwrites an existing ``deferral``. It is idempotent: re-running with
+    an id that has already been pruned is a no-op (the id is no longer in
+    ``active_moves`` to match), so it cannot duplicate a ``past_moves`` entry or
+    clobber a recorded deferral.
+
+    Backward-compatible by construction: gaps missing any of
+    ``active_moves`` / ``past_moves`` / ``deferral``, a model missing ``gaps``,
+    and retired ids matching no gap are all no-ops (never raise).
+
+    Args:
+        raw_model: the raw ``project.problem_model`` dict (may be ``None``/empty).
+        retired_direction_ids: the direction ids that just retired.
+        now_iso: ISO-8601 timestamp stamped onto any newly recorded deferral.
+        rationale: optional override for the deferral rationale; when omitted a
+            default naming the retired direction(s) is used.
+
+    Returns:
+        ``(raw_model, newly_deferred_gap_ids)`` — the same (mutated) dict and
+        the ids of gaps that gained a fresh deferral on this call.
+    """
+    model = raw_model if isinstance(raw_model, dict) else {}
+    retired = {str(d) for d in (retired_direction_ids or []) if d}
+    newly_deferred: list[str] = []
+    if not retired:
+        return model, newly_deferred
+
+    gaps = model.get("gaps")
+    if not isinstance(gaps, list):
+        return model, newly_deferred
+
+    for gap in gaps:
+        if not isinstance(gap, dict):
+            continue
+        active = gap.get("active_moves")
+        if not isinstance(active, list):
+            continue
+        matched = [m for m in active if str(m) in retired]
+        if not matched:
+            continue
+
+        gap["active_moves"] = [m for m in active if str(m) not in retired]
+
+        past = gap.get("past_moves")
+        if not isinstance(past, list):
+            past = []
+        past_seen = {str(p) for p in past}
+        for m in matched:
+            if str(m) not in past_seen:
+                past.append(m)
+                past_seen.add(str(m))
+        gap["past_moves"] = past
+
+        # Last active move removed AND no deferral yet -> acknowledge the now
+        # unstaffed gap. An existing deferral is left exactly as-is.
+        if not gap["active_moves"] and not gap.get("deferral"):
+            trigger = ", ".join(str(m) for m in matched)
+            deferral_rationale = rationale or (
+                f"auto-deferred: last staffing direction {trigger} retired"
+            )
+            gap["deferral"] = GapDeferral(
+                rationale=deferral_rationale,
+                created_at=now_iso,
+            ).model_dump()
+            gid = gap.get("id")
+            if gid is not None:
+                newly_deferred.append(str(gid))
+
+    return model, newly_deferred
+
+
+def reconcile_gap_staffing(
+    model: ProblemModel,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+) -> bool:
+    """Reconcile a gap's ``active_moves`` / ``deferral`` when a direction is
+    created on, or re-grounded onto, a gap.
+
+    The staffing-side mirror of the retire-side reconciliation: where retiring a
+    gap-linked direction prunes it from the gap's ``active_moves`` (and resolves
+    or re-defers the now-unstaffed gap), *staffing* a gap with a direction must
+    record that the gap is being actively worked again.
+
+    Mutates ``model`` in place and returns ``True`` iff something changed (so the
+    caller can skip a no-op write and keep the durable model byte-identical):
+
+    - ``new_gap_id`` set and matching an existing gap — add ``direction_id`` to
+      that gap's ``active_moves`` (no duplicate) and clear any ``deferral`` (set
+      ``None``): the gap is now actively staffed, so a recorded "intentionally
+      unstaffed this cycle" decision is false.
+    - ``prior_gap_id`` set, matching an existing gap, and different from
+      ``new_gap_id`` — the direction re-grounded away from (or cleared) its old
+      gap: prune ``direction_id`` from that gap's ``active_moves`` and record it
+      in ``past_moves`` (the merged/failed move-history convention). Clearing the
+      linkage entirely (``new_gap_id`` falsy) prunes the old gap with no new
+      staffing.
+
+    Proposed-wins compatible and non-destructive: it only adjusts
+    ``active_moves`` / ``past_moves`` / ``deferral`` on gaps that already exist in
+    the model — it never creates a gap or touches any other field, so it cannot
+    fight the strategic agent's own problem-model writes. An ``new_gap_id`` /
+    ``prior_gap_id`` with no matching gap is a safe no-op (mirrors how the
+    retire/respawn paths tolerate a dangling ``gap_id`` linkage). Idempotent:
+    re-running with the same linkage neither duplicates an ``active_moves`` entry
+    nor re-clears an already-cleared deferral.
+    """
+    if not direction_id:
+        return False
+
+    gap_by_id = {gap.id: gap for gap in model.gaps}
+    changed = False
+
+    # Re-ground away from (or clear) the OLD gap: prune the move, archive it in
+    # past_moves. Only when the linkage actually moved to a different gap.
+    if prior_gap_id and prior_gap_id != new_gap_id:
+        old_gap = gap_by_id.get(prior_gap_id)
+        if old_gap is not None:
+            if direction_id in old_gap.active_moves:
+                old_gap.active_moves = [
+                    m for m in old_gap.active_moves if m != direction_id
+                ]
+                changed = True
+            if direction_id not in old_gap.past_moves:
+                old_gap.past_moves.append(direction_id)
+                changed = True
+
+    # Staff the NEW gap: record the active move and drop a now-false deferral.
+    if new_gap_id:
+        new_gap = gap_by_id.get(new_gap_id)
+        if new_gap is not None:
+            if direction_id not in new_gap.active_moves:
+                new_gap.active_moves.append(direction_id)
+                changed = True
+            if new_gap.deferral is not None:
+                new_gap.deferral = None
+                changed = True
+
+    return changed
+
+
+def reconcile_gap_staffing_raw(
+    problem_model_raw: dict | None,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+) -> dict | None:
+    """Raw-JSONB adapter for :func:`reconcile_gap_staffing`.
+
+    The direction write paths hold ``project.problem_model`` as a raw JSONB dict
+    on a row already locked alongside ``directions`` (same project row). This
+    parses that dict, reconciles, and returns a fresh ``model_dump()`` dict when
+    something changed — or ``None`` when nothing changed (so the caller skips the
+    write and leaves the column byte-identical) or the model is empty.
+
+    Fail-open: a malformed model returns ``None`` rather than raising, so a bad
+    durable problem model can never block a direction create/update — mirroring
+    how the retire/respawn paths tolerate a model they cannot reconcile.
+    """
+    if not problem_model_raw:
+        return None
+    try:
+        model = parse_problem_model(problem_model_raw)
+    except ValidationError:
+        return None
+    if reconcile_gap_staffing(model, direction_id, new_gap_id, prior_gap_id):
+        return model.model_dump()
+    return None
 
 
 def _archived_gap_recency_key(gap: Gap) -> str:

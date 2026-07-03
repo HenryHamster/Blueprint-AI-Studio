@@ -77,7 +77,42 @@ describe('ProviderCostPanel', () => {
     expect(table.getByText('83%')).toBeInTheDocument();
     expect(table.getByText('$21.50')).toBeInTheDocument();
     expect(table.getByText('$5.38')).toBeInTheDocument();
+    expect(table.getByText('Watch cost')).toBeInTheDocument();
+    const summary = screen.getByTestId('provider-cost-summary');
+    expect(summary).toHaveTextContent('24h');
+    expect(summary).toHaveTextContent('12');
+    expect(summary).toHaveTextContent('4 merged');
+    expect(summary).toHaveTextContent('$21.50');
+    expect(screen.getByTestId('provider-cost-spend-pressure')).toHaveTextContent('Watch Primary: watch cost');
     expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/provider-cost-summary?hours=24&project_id=proj-abc', undefined);
+  });
+
+  it('flags spend with no merged output as pressure', async () => {
+    apiFetchMock.mockResolvedValue(
+      jsonResponse({
+        window_hours: 24,
+        rows: [
+          {
+            provider: 'anthropic',
+            account_id: 'acc-1',
+            account_name: 'Expensive',
+            total_tasks: 8,
+            success_count: 2,
+            merged_count: 0,
+            total_cost_usd: 31.25,
+            success_rate: 0.25,
+            cost_per_merged_pr: null,
+          },
+        ],
+      }),
+    );
+
+    render(<ProviderCostPanel selectedProjectId={null} windowHours={24} />);
+
+    expect(await screen.findByTestId('provider-cost-spend-pressure')).toHaveTextContent(
+      'Reroute or inspect Expensive: no merges for spend',
+    );
+    expect(within(screen.getByRole('table')).getByText('No merges for spend')).toBeInTheDocument();
   });
 
   it('polls every 30 seconds', async () => {

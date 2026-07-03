@@ -762,10 +762,10 @@ POOL_PAYOFF_ORIGIN_SHARE_FLOOR = 0.10
 POOL_PAYOFF_MIN_POOL_DISPATCHES = 20
 POOL_PAYOFF_COST_TOLERANCE_PCT = 5.0
 
-# Minimum pool-origin warm starts before a PROVEN verdict is worth an operator
-# alert. PROVEN on only a couple of warm starts is statistically thin — wait for
-# material volume before recommending a wider scope. COST_REGRESSION has no such
-# floor: a cost regression on a bounded enable is actionable immediately.
+# Minimum pool-origin warm starts before a PROVEN verdict is treated as
+# materially supported in reader-facing summaries. PROVEN is useful history, but
+# it is not a durable operator alert; COST_REGRESSION remains the actionable
+# payoff transition.
 POOL_PAYOFF_PROVEN_MIN_WARM_STARTS = 5
 
 
@@ -3313,9 +3313,9 @@ async def maybe_alert_pool_payoff_transition(
     payoff verdict off the warm-VM panel. This per-project check — run every
     hourly snapshot tick, independent of the daily snapshot-write cadence — emits
     a deduplicated Alert when the verdict transitions to ``COST_REGRESSION``
-    (WARNING; recommend reducing the target or disabling) or to ``PROVEN`` with
-    material warm-start volume (INFO; recommend considering a wider scope), so the
-    keep / widen / disable decision is driven without polling.
+    (WARNING; recommend reducing the target or disabling), so the keep / widen /
+    disable decision is driven without polling. ``PROVEN`` remains visible in
+    payoff summaries but does not create a durable alert.
 
     Reuses the verdict synthesized by :func:`read_baseline_with_drift` (which
     folds in :func:`compute_pool_payoff_verdict`) rather than re-deriving
@@ -3332,8 +3332,9 @@ async def maybe_alert_pool_payoff_transition(
     fired, else ``None``.
     """
     from app.alert_dispatch import _maybe_create_pool_payoff_alert
+    from app.alert_policy import alert_policy_allows
     from app.models import AlertSeverity
-    from app.task_locking import with_design_doc_locked
+    from app.task_locking import project_lock, with_design_doc_locked
     from app.warm_pool import is_project_warm_pool_scoped
 
     if not is_project_warm_pool_scoped(project_id):
@@ -3345,41 +3346,45 @@ async def maybe_alert_pool_payoff_transition(
     supporting = dict(verdict.get("supporting") or {})
     recommended_action = verdict.get("recommended_action") or ""
 
-    # Decide alert-worthiness + severity. COST_REGRESSION always alerts; PROVEN
-    # only with material warm-start volume; NO_LIFT / INSUFFICIENT_DATA never.
+    # Decide alert-worthiness + severity. COST_REGRESSION alerts; PROVEN,
+    # NO_LIFT, and INSUFFICIENT_DATA remain dashboard/history states.
     if state == POOL_PAYOFF_COST_REGRESSION:
         severity = AlertSeverity.WARNING
-    elif (
-        state == POOL_PAYOFF_PROVEN
-        and int(supporting.get("pool_warm_starts") or 0)
-        >= POOL_PAYOFF_PROVEN_MIN_WARM_STARTS
-    ):
-        severity = AlertSeverity.INFO
     else:
         return None
 
-    # Transition edge: only fire when the alert-worthy state differs from the
-    # last state we alerted on. Locked read-modify-write via the canonical
-    # design_doc helper so a concurrent snapshot writer cannot clobber the
-    # marker; the lock is held until the alert helper commits, so the marker
-    # advance and the Alert row land atomically.
-    changed = {"fire": False}
-
-    def _advance_marker(doc: Dict[str, Any]) -> None:
-        container = dict(doc.get(DESIGN_DOC_KEY) or {})
-        if container.get(LAST_ALERTED_PAYOFF_KEY) == state:
-            return  # no transition — leave the marker untouched
-        container[LAST_ALERTED_PAYOFF_KEY] = state
-        doc[DESIGN_DOC_KEY] = container
-        changed["fire"] = True
-
-    await with_design_doc_locked(
-        session, project_id, _advance_marker, skip_locked=False
+    decision = await alert_policy_allows(
+        session,
+        project_id,
+        "warm_pool.payoff",
+        severity=severity,
     )
-    if not changed["fire"]:
+    if not decision.emit:
+        logger.info(
+            "[POOL_PAYOFF_ALERT] project=%s verdict=%s suppressed=%s",
+            project_id,
+            state,
+            decision.reason,
+        )
         return None
 
-    await _maybe_create_pool_payoff_alert(
+    # Transition edge: only fire when the alert-worthy state differs from the
+    # last state we have a durable alert for. The marker is advanced only after
+    # an active alert row exists; otherwise a policy race could record "alerted"
+    # without any operator-visible alert.
+    should_fire = False
+    async with project_lock(session, project_id, skip_locked=False) as project:
+        if project is None:
+            return None
+        doc = dict(project.design_doc or {})
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        should_fire = container.get(LAST_ALERTED_PAYOFF_KEY) != state
+    await session.rollback()
+
+    if not should_fire:
+        return None
+
+    alert, created = await _maybe_create_pool_payoff_alert(
         project_id,
         session,
         verdict_state=state,
@@ -3387,6 +3392,28 @@ async def maybe_alert_pool_payoff_transition(
         recommended_action=recommended_action,
         severity=severity,
     )
+    if alert is None:
+        return None
+
+    changed = {"fire": False}
+
+    def _advance_marker(doc: Dict[str, Any]) -> None:
+        container = dict(doc.get(DESIGN_DOC_KEY) or {})
+        if container.get(LAST_ALERTED_PAYOFF_KEY) == state:
+            return
+        container[LAST_ALERTED_PAYOFF_KEY] = state
+        doc[DESIGN_DOC_KEY] = container
+        changed["fire"] = True
+
+    wrote_marker = await with_design_doc_locked(
+        session, project_id, _advance_marker, skip_locked=False
+    )
+    if wrote_marker and changed["fire"]:
+        await session.commit()
+    else:
+        await session.rollback()
+    if not created:
+        return None
     logger.info(
         "[POOL_PAYOFF_ALERT] project=%s verdict=%s severity=%s",
         project_id,

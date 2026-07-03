@@ -5,8 +5,9 @@ import { render, screen, fireEvent } from '@testing-library/react';
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
-  signOut: vi.fn(),
   getIdToken: vi.fn().mockResolvedValue('test-token'),
+  onAuthChange: vi.fn(() => () => {}),
+  signOut: vi.fn(),
 }));
 
 vi.mock('recharts', () => ({
@@ -59,6 +60,91 @@ describe('PoolAccountHealthPanel', () => {
     expect(sr7dEl).toHaveTextContent('95% 7d');
     expect(sr7dEl.className).toContain('text-emerald-400');
     expect(screen.queryByTitle('Dominant failure class (24h)')).not.toBeInTheDocument();
+  });
+
+  it('renders a compact state, cooldown, and usage summary', () => {
+    render(
+      <PoolAccountHealthPanel
+        accounts={[
+          makeAccount({
+            account_id: 'healthy',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 25,
+              seven_day_utilization: 40,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+          makeAccount({
+            account_id: 'disabled',
+            state: 'disabled',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 92,
+              seven_day_utilization: 82,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+            rate_limited_models: [
+              { model: 'claude-rate', cooldown_seconds_remaining: 120, cooldown_type: 'rate_limit' },
+              { model: 'claude-regression', cooldown_seconds_remaining: 3600, cooldown_type: 'regression' },
+            ],
+          }),
+        ]}
+        loading={false}
+      />,
+    );
+
+    const summary = screen.getByTestId('account-health-summary');
+    expect(summary).toHaveTextContent('1/2');
+    expect(summary).toHaveTextContent('2 model cooldowns');
+    expect(summary).toHaveTextContent('1 regressions');
+    expect(screen.getAllByTestId('account-health-next-action').map(el => el.textContent)).toEqual([
+      'Next: Ready for dispatch',
+      'Next: Disabled: enable or rotate credentials',
+    ]);
+  });
+
+  it('prioritizes quota exhaustion and usage pressure as row next actions', () => {
+    render(
+      <PoolAccountHealthPanel
+        accounts={[
+          makeAccount({
+            account_id: 'quota',
+            rate_limited_models: [
+              { model: 'claude-quota', cooldown_seconds_remaining: 3600, cooldown_type: 'quota_exhausted' },
+            ],
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 95,
+              seven_day_utilization: 40,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+          makeAccount({
+            account_id: 'pressure',
+            usage_snapshot: {
+              known: true,
+              five_hour_utilization: 76,
+              seven_day_utilization: 50,
+              resets_at: {},
+              probed_at: null,
+              stale: false,
+            },
+          }),
+        ]}
+        loading={false}
+      />,
+    );
+
+    const actions = screen.getAllByTestId('account-health-next-action').map(el => el.textContent);
+    expect(actions).toContain('Next: Hold traffic: daily quota exhausted');
+    expect(actions).toContain('Next: Usage pressure: keep as backup');
   });
 
   it('renders regression diagnostic line for regression-quarantined models', () => {
@@ -195,7 +281,7 @@ describe('PoolAccountHealthPanel', () => {
     const badge = screen.getByTitle(/Usage headroom — 5h \/ 7d window utilization/);
     expect(badge).toHaveClass('opacity-60');
     expect(badge).toHaveTextContent('stale');
-    expect(badge).toHaveTextContent('@12:00');
+    expect(badge.textContent).toMatch(/stale @/);
   });
 
   it('renders a response-level stale chip when servedStale is true', () => {

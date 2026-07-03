@@ -1,4 +1,5 @@
 import type { TaskType } from '../taskCapabilities';
+import type { ProjectMessagePreview } from './messages';
 
 export type TaskStatus = 'QUEUED' | 'PROVISIONING' | 'IN_PROGRESS' | 'EVALUATING' | 'BLOCKED' | 'PARKED' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
 export type { TaskType };
@@ -91,6 +92,96 @@ export interface TaskArtifact {
   created_at?: string | null;
 }
 
+export interface TaskSideboardContext {
+  task?: {
+    id: string;
+    title?: string | null;
+    status: string;
+    task_type?: string | null;
+    latest_status_message?: string | null;
+    blocker?: {
+      kind?: string | null;
+      reason?: string | null;
+      blocked_at?: string | null;
+      recheck_after?: string | null;
+      parked_at?: string | null;
+    };
+    runner?: {
+      vm_instance_id?: string | null;
+      runner_target_id?: string | null;
+      machine_type?: string | null;
+      spot?: boolean | null;
+      warm_start?: boolean | null;
+      provider?: string | null;
+      account_id?: string | null;
+    };
+    cost?: {
+      estimated_vm_usd?: number | null;
+      llm_usd?: number | null;
+      llm_any_unpriced?: boolean | null;
+    };
+    next_action?: {
+      label: string;
+      reason?: string | null;
+      target?: {
+        surface: string;
+        section?: string | null;
+        id?: string | null;
+        task_id?: string | null;
+        url?: string | null;
+      } | null;
+    };
+  };
+  project: {
+    id: string;
+    name?: string | null;
+    repo?: string | null;
+  };
+  purpose?: string | null;
+  strategic: {
+    direction: {
+      id: string;
+      text?: string | null;
+      priority?: string | null;
+      status?: string | null;
+    } | null;
+    cycle: {
+      id: string;
+      phase: 'design_doc_update' | 'strategic_review' | string | null;
+      outcome: string;
+    } | null;
+  };
+  pipeline: {
+    parent_task_id?: string | null;
+    child_count: number;
+    dependency_count: number;
+    blocked_reason?: string | null;
+    movement_explanation?: string | null;
+  };
+  artifacts: {
+    total: number;
+    by_type: Record<string, number>;
+    primary_pr_url?: string | null;
+    primary_commit?: string | null;
+  };
+  messages: {
+    total_recent: number;
+    items: ProjectMessagePreview[];
+  };
+  links: Array<{
+    id: string;
+    label: string;
+    target: {
+      surface: string;
+      section?: string | null;
+      id?: string | null;
+      task_id?: string | null;
+      direction_id?: string | null;
+      url?: string | null;
+    };
+  }>;
+}
+
 export interface Task {
   id: string;
   project_id?: string;
@@ -100,6 +191,7 @@ export interface Task {
   task_type?: TaskType;
   vm_instance_id?: string;
   latest_status_message?: string;
+  movement_explanation?: string | null;
   status_log?: { t: string; msg: string }[];
   created_by: string;
   requires_approval: boolean;
@@ -245,6 +337,7 @@ export interface Task {
   // Transitional state: agent run completed but post-commit side effects
   // (PR submission, child task spawns, merge) haven't fired yet.
   post_commit_pending?: boolean | null;
+  sideboard_context?: TaskSideboardContext | null;
 }
 
 export interface EdgeConsidered {

@@ -3,19 +3,21 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { DirectionsPanel } from './DirectionsPanel';
 
-vi.mock('../api', () => ({
-  authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
-  API_BASE_URL: '',
-  // DirectionsPanel calls apiFetch, not fetch directly — route through
-  // the global fetch stub so the test's mockFetch() responses still apply.
-  apiFetch: (path: string, init?: RequestInit) => (globalThis.fetch as typeof fetch)(path, init),
-  // useDirectionsData also imports fetchVersionLifecycle and (since the #11917
-  // perf reorder) calls it at the TOP of fetchDirections, before the directions
-  // apiFetch calls. The mock factory fully replaces '../api', so this export must
-  // be present or it resolves to undefined and the call throws synchronously —
-  // which the try/catch swallows, silently skipping every later apiFetch.
-  fetchVersionLifecycle: vi.fn().mockResolvedValue(null),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authHeaders: vi.fn().mockResolvedValue({ Authorization: 'Bearer ***' }),
+    // DirectionsPanel calls apiFetch, not fetch directly — route through
+    // the global fetch stub so the test's mockFetch() responses still apply.
+    apiFetch: (path: string, init?: RequestInit) => (globalThis.fetch as typeof fetch)(path, init),
+    // useDirectionsData also imports fetchVersionLifecycle and (since the #11917
+    // perf reorder) calls it at the TOP of fetchDirections, before the directions
+    // apiFetch calls. The mock factory fully replaces '../api', so this export must
+    // be present or it resolves to undefined and the call throws synchronously —
+    // which the try/catch swallows, silently skipping every later apiFetch.
+    fetchVersionLifecycle: vi.fn().mockResolvedValue(null),
+  });
+});
 
 vi.mock('./DirectionCard', () => ({
   DirectionCard: ({ direction }: { direction: { text: string } }) => (

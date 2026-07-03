@@ -46,12 +46,34 @@ describe('OrchestratorHealthBar cost pill', () => {
 
     expect(apiFetchMock.mock.calls[0]?.[0]).toBe('/api/admin/digest?hours=24');
 
-    const pill = screen.getByTitle(/Daily cost: \$5\.50\. Click/);
+    const pill = screen.getByTitle('Daily cost: $5.50.');
     expect(pill).toBeTruthy();
     expect(pill.textContent).toContain('$5.50');
     expect(pill.textContent).not.toContain('/');
     expect(pill.className).not.toContain('red');
     expect(pill.className).not.toContain('amber');
+  });
+
+  it('only promises cost-section navigation when the active surface exposes it', async () => {
+    apiFetchMock.mockResolvedValue(makeCostResponse(5.5, 0));
+    const anchor = document.createElement('div');
+    anchor.id = 'cost-section';
+    document.body.appendChild(anchor);
+
+    try {
+      await act(async () => { render(<OrchestratorHealthBar {...baseProps} />); });
+      expect(screen.queryByTitle(/Click to view cost section/)).toBeNull();
+    } finally {
+      anchor.remove();
+    }
+  });
+
+  it('promises cost-section navigation when costSectionAvailable is true', async () => {
+    apiFetchMock.mockResolvedValue(makeCostResponse(5.5, 0));
+
+    await act(async () => { render(<OrchestratorHealthBar {...baseProps} costSectionAvailable />); });
+    const pill = screen.getByTitle(/Daily cost: \$5\.50\. Click to view cost section\./);
+    expect(pill).toBeTruthy();
   });
 
   it('shows neutral pill when under 60% of ceiling', async () => {

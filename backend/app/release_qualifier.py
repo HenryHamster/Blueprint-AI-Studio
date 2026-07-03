@@ -41,7 +41,7 @@ row lock before the 30-120s of GitHub I/O) only ever flushes qualifier state,
 because the dedicated session has nothing else dirty.  A fresh session also
 cannot self-deadlock: the completion handler holds a lock on the *Task* row, not
 the ``ReleaseVersion`` row, and the reaper sweep takes no lock on the version
-before delegating — so the dedicated session's ``SELECT ... FOR UPDATE`` on the
+before delegating — so the dedicated session's ``SELECT ... FOR UPDATE SKIP LOCKED`` on the
 version row can never wait on a lock the caller still holds; if a peer holds it,
 the finalize attempt skips and the next completion/sweep retries.
 
@@ -63,6 +63,7 @@ Public API: ``run_qualification``, ``maybe_finalize_qualification``,
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import logging
 import uuid
 from datetime import datetime
@@ -74,7 +75,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app import github, release_version, theme_delivery
+from app import github, release_version
 from app.database import AsyncSessionLocal, resolve_async_engine
 from app.failure_classification import (
     AGENT_TIMEOUT,
@@ -85,6 +86,7 @@ from app.failure_classification import (
 from app.acceptance_gate import (
     classify_merged_acceptance_context,
 )
+from app.acceptance_criteria import get_version_coverage_summary
 from app.landed_signal import landed_signal_predicate
 from app.models import (
     ArtifactType,
@@ -110,6 +112,7 @@ from app.release_promotion import (
     _candidate_already_on_main,
     _idempotent_pr_url,
     _lts_branch_names,
+    _merge_grade_misses_armed,
     _notify_operator,
     _record_promotion_failure,  # noqa: F401 — tests access via rq.*
     _record_promotion_success,
@@ -120,6 +123,7 @@ from app.release_promotion import (
     promote,
 )
 from app.release_reconciliation import (
+    _reconcile_if_ci_unresolved_now_green,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_deploy_failed_recovered,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_not_promoted_but_pr_merged,  # noqa: F401 — re-exported for back-compat
     _reconcile_if_pending_auto_merge_landed,  # noqa: F401 — re-exported for back-compat
@@ -132,7 +136,7 @@ from app.release_qualifier_audit import (
     _MIN_INFRA_ERROR_STREAK,  # noqa: F401 — re-exported for callers/tests
     append_infra_failure_child_event,
     _enrich_infra_error,
-    _handle_independent_blocker,  # noqa: F401 — re-exported for callers/tests
+    _handle_independent_blocker,  # re-exported for callers/tests
     _handle_infra_failure,
     _latest_artifact_logs,
     _select_lifecycle_audit,  # noqa: F401 — re-exported for callers/tests
@@ -148,10 +152,11 @@ from app.release_qualifier_audit import (
 )
 from app.ci_resolution import (
     _CI_GREEN,
-    _CI_NO_CHECKS,  # noqa: F401
+    _CI_NO_CHECKS,
     _CI_PENDING,
     _CI_RED,
     _classify_check_runs,
+    proceed_on_no_checks,
     requires_ci_checks,
 )
 from app.release_scoring import (
@@ -169,7 +174,7 @@ from app.release_scoring import (
     _MAX_DELETED_TEST_FILES,  # noqa: F401 — re-exported for callers/tests
     _MAX_FAILED_SMOKE_TESTS,  # noqa: F401 — re-exported for callers/tests
     _MIN_TELEMETRY_SAMPLE,  # noqa: F401 — re-exported for callers/tests
-    _SEVERITY_RANK,  # noqa: F401
+    _SEVERITY_RANK,
     _SEVERITIES_REQUIRING_VERIFICATION,
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
@@ -193,7 +198,6 @@ from app.release_scoring import (
     evaluate_merge_grade,
     is_contentless_goal,
 )
-from app.acceptance_gate import summarize_version_acceptance_aggregate
 from app.release_stall_alerts import (
     _AUTO_MERGE_STALL_SECONDS,  # noqa: F401 — re-exported for back-compat
     _BUILD_STALL_AGE_DAYS,  # noqa: F401 — re-exported for back-compat
@@ -217,6 +221,7 @@ from app.release_qualifier_sweep import (
     # implementations live in release_qualifier_sweep.py; ``_finalize_locked_version``
     # in this module calls the timeout helpers. noqa pins keep a ruff --fix
     # sweep from dropping the re-exports as "unused".
+    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
     _MAX_QUALIFICATION_DURATION_SECONDS,
     _MAX_SWEEP_CRASH_STREAK,  # noqa: F401 — re-exported for tests
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
@@ -266,6 +271,98 @@ _CONCLUSIVE_VERDICT_STATUSES: frozenset[str] = frozenset(
     {"promoted", "not_promoted", "dry_run"}
 )
 
+
+def _is_audited_surface_path(path: str) -> bool:
+    """True when a file is part of the code surface a release audit judges.
+
+    Excludes the mechanically-regenerated artifacts an audit does NOT judge —
+    emitter-inventory snapshots and other ``__fixtures__``/``__snapshots__``,
+    the module-size limits config, CI workflow files, generated test-timing
+    data, and docs.  A candidate that differs from a prior audited candidate
+    ONLY in these excluded files has the SAME audited surface, so its audit
+    verdict can be reused (Guard 3) instead of re-rolling the ~15min LLM audit.
+    Everything else — app code AND test logic — is IN the surface, so a real
+    change always re-audits.
+    """
+    p = path.lower()
+    if p.startswith(".github/"):
+        return False
+    if "/__fixtures__/" in p or "/__snapshots__/" in p:
+        return False
+    if p.endswith("module_size_limits.json"):
+        return False
+    if p.endswith(".test_durations"):
+        return False
+    if p.endswith(".md"):
+        return False
+    return True
+
+
+def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
+    """Content hash of the audited code surface at a candidate ref.
+
+    Built from the git blob SHAs of every tracked file EXCEPT the mechanically-
+    regenerated artifacts a code audit does not judge (see
+    ``_is_audited_surface_path``).  Two candidates whose audited surface is
+    byte-identical hash identically, so the qualifier can REUSE a prior audit
+    verdict for the newer commit (Guard 3) instead of re-rolling the audit — the
+    "fixing CI / regenerating a snapshot must not re-run the whole qualification"
+    lever (Henry, 2026-07-02).  Cheap: the whole tree (path + blob SHA) comes
+    from ONE ``list_repo_tree_paths_at_ref`` call, no per-file reads.  Returns
+    None when the tree is unavailable — fail-open: no reuse, the normal
+    SHA-keyed cache path applies.
+    """
+    if not tree_entries:
+        return None
+    relevant = sorted(
+        (str(e["path"]), str(e["sha"]))
+        for e in tree_entries
+        if isinstance(e, dict)
+        and e.get("sha")
+        and e.get("path")
+        and _is_audited_surface_path(str(e["path"]))
+    )
+    if not relevant:
+        return None
+    h = hashlib.sha256()
+    for path, sha in relevant:
+        h.update(path.encode("utf-8"))
+        h.update(b"\0")
+        h.update(sha.encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def _promotion_failed_reuse_eligible(
+    qual: dict[str, Any] | None, candidate_diff_hash: str | None
+) -> bool:
+    """True when a ``promotion_failed`` verdict can be re-used to RE-PROMOTE.
+
+    A ``promotion_failed`` verdict ALWAYS means the audit PASSED and only the
+    PROMOTION step failed (PR CI red / staleness / merge) — ``promote()`` is
+    only ever reached from ``_finalize_qualification`` for a would-promote
+    composite.  When the harvested fix landed ENTIRELY in an audit-EXCLUDED path
+    (CI workflow / test fixture / config), the live audited-surface hash is
+    byte-identical to the passing candidate, so that audit verdict still holds:
+    the CURRENT candidate can be re-promoted WITHOUT re-running the ~15min audit
+    (which also re-rolls a non-deterministic score — the v21 treadmill, passed
+    0.9657 → CI-failed → re-qualified 0.6171).  Henry, 2026-07-02.
+
+    Strictly gated (any miss ⇒ fall through to the normal re-audit — a CHANGED
+    surface, i.e. an app-code fix, MUST re-audit): the prior status is
+    ``promotion_failed`` AND the LIVE ``candidate_diff_hash`` is truthy AND it
+    equals the prior verdict's ``candidate_diff_hash``.  The cap
+    (``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS``) is enforced separately by the
+    caller so a persistently-red candidate cannot re-promote forever.
+    """
+    if not isinstance(qual, dict):
+        return False
+    if qual.get("status") != "promotion_failed":
+        return False
+    prior_hash = qual.get("candidate_diff_hash")
+    return bool(candidate_diff_hash and prior_hash and candidate_diff_hash == prior_hash)
+
+
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
 # The hardcoded fallback rubric (_DEFAULT_POLICY) and the scoring math live in
@@ -308,11 +405,7 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in (
-            "theme_warn_threshold",
-            "theme_block_threshold",
-            "merge_grade_block_threshold",
-        ):
+        for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
             if _v is not None:
                 with contextlib.suppress(TypeError, ValueError):
@@ -327,14 +420,114 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
         return None
 
 
-def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+# A project's per-project promotion threshold is clamped to this floor so a
+# project can never set a near-zero bar that silently disables its own gate.
+_SAFE_PROMOTION_THRESHOLD_FLOOR = 0.5
+# The audit dimension must carry real weight in any per-project rubric.
+# compute_composite only hard-blocks a MISSING audit, so a rubric that zeroes the
+# audit weight would let a terrible-but-present audit promote — reject it.
+_MIN_AUDIT_WEIGHT = 0.2
+# Margin by which the threshold is clamped above (1 - audit_weight) so a
+# zero-audit candidate strictly fails the composite (audit can always veto).
+_AUDIT_VETO_MARGIN = 0.05
+
+
+def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
+    """Resolve a per-project promotion rubric from ``Project.build_config``.
+
+    A project may LEGITIMATELY promote at a different bar than the fleet default
+    (an external research/witness repo vs Blueprint's trusted self-improvement
+    core), so ``build_config`` carries an optional per-project override on the
+    SAME schemaless JSONB seam that already holds ``requires_ci_checks`` /
+    ``has_ci`` — no new settings surface, no migration.  Returns
+    ``{"weights", "threshold"}`` or ``None`` when the project sets no override
+    (fall through to the fleet rubric).  Never raises.
+
+    Safety: the threshold is clamped to ``_SAFE_PROMOTION_THRESHOLD_FLOOR`` so a
+    project cannot set a near-zero bar; weights must sum ~1.0 (mirrors the YAML
+    validation) or the override is ignored and the fleet rubric applies.
+    """
+    bc = (project.build_config or {}) if project is not None else {}
+    threshold_raw = bc.get("promotion_threshold")
+    weights_raw = bc.get("promotion_weights")
+    if threshold_raw is None and weights_raw is None:
+        return None
+    try:
+        if weights_raw is not None:
+            weights = {
+                "audit": float(weights_raw["audit"]),
+                "test_erosion": float(weights_raw["test_erosion"]),
+                "smoketest": float(weights_raw["smoketest"]),
+            }
+            wsum = weights["audit"] + weights["test_erosion"] + weights["smoketest"]
+            if abs(wsum - 1.0) > 0.01:
+                raise ValueError(
+                    f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
+                )
+            if weights["audit"] < _MIN_AUDIT_WEIGHT:
+                raise ValueError(
+                    f"build_config promotion_weights audit={weights['audit']:.3f} "
+                    f"below the {_MIN_AUDIT_WEIGHT} floor — the audit dimension "
+                    f"must carry real weight"
+                )
+        else:
+            weights = dict(_DEFAULT_POLICY["weights"])
+        threshold = (
+            float(threshold_raw)
+            if threshold_raw is not None
+            else float(_DEFAULT_POLICY["threshold"])
+        )
+        # Audit-veto coupling (round-2 review finding B): the audit-weight floor
+        # and the threshold floor are independent, so at their joint minimum
+        # (audit_weight=0.2, threshold=0.5) a candidate with a PRESENT-but-terrible
+        # audit (score 0.0 — no audit_missing hard block) still promotes
+        # (0.2·0 + test_erosion + smoketest = 0.8 ≥ 0.5).  A zero-audit candidate
+        # scores at most (1 − audit_weight), so CLAMP the threshold up to strictly
+        # exceed that — the audit dimension can then ALWAYS veto a promotion, for
+        # any per-project weights.  (Clamping up rather than rejecting keeps the
+        # override usable; it only ever makes the gate stricter.)
+        _audit_veto_floor = 1.0 - weights["audit"] + _AUDIT_VETO_MARGIN
+        threshold = max(
+            threshold, _SAFE_PROMOTION_THRESHOLD_FLOOR, _audit_veto_floor
+        )
+        return {"weights": weights, "threshold": threshold}
+    except Exception as exc:  # noqa: BLE001 — a bad per-project override falls through
+        logger.warning(
+            "[RELEASE_QUALIFIER] project %s build_config promotion rubric invalid "
+            "(%s) — falling back to the fleet rubric",
+            getattr(project, "id", "?"),
+            exc,
+        )
+        return None
+
+
+def _resolve_policy_with_provenance(
+    project: "Project | None" = None,
+) -> tuple[dict[str, Any], str, str | None]:
     """Resolve the promotion rubric and return its active source + fallback reason.
 
     The policy payload itself keeps the legacy ``{"weights": ..., "threshold": ...}``
     shape. This helper layers operator-visible provenance on top so callers can tell
-    whether the active rubric came from runtime config, the YAML file, or the
-    hardcoded defaults after a YAML failure.
+    whether the active rubric came from the project's build_config, runtime config,
+    the YAML file, or the hardcoded defaults after a YAML failure.
     """
+    fleet_policy, fleet_source, fleet_error = _resolve_fleet_policy_with_provenance()
+    overrides = _policy_from_build_config(project)
+    if overrides is not None:
+        # Overlay ONLY the per-project threshold/weights onto the fleet policy so
+        # fleet-only keys (e.g. merge_grade_block_threshold) are PRESERVED — a
+        # per-project bar must not silently disarm the merge-grade goal-coverage
+        # blocker that the runtime_config / yaml tiers carry.
+        merged = dict(fleet_policy)
+        merged["weights"] = overrides["weights"]
+        merged["threshold"] = overrides["threshold"]
+        return merged, "build_config", fleet_error
+    return fleet_policy, fleet_source, fleet_error
+
+
+def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+    """Resolve the FLEET promotion rubric (no per-project override): live
+    ``runtime_config`` → ``promotion_policy.yaml`` → hardcoded defaults."""
     from_config = _policy_from_runtime_config()
     if from_config is not None:
         return from_config, "runtime_config", None
@@ -375,11 +568,7 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
             )
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
-        for _k in (
-            "theme_warn_threshold",
-            "theme_block_threshold",
-            "merge_grade_block_threshold",
-        ):
+        for _k in ("merge_grade_block_threshold",):
             if _k in parsed:
                 with contextlib.suppress(TypeError, ValueError):
                     result[_k] = float(parsed[_k])
@@ -402,10 +591,13 @@ def _resolve_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
         )
 
 
-def _load_policy() -> dict[str, Any]:
-    """Resolve the promotion rubric: live runtime_config → YAML file → defaults.
+def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
+    """Resolve the promotion rubric: project build_config → runtime_config → YAML → defaults.
 
     Resolution order:
+      0. ``project.build_config['promotion_threshold'/'promotion_weights']`` — an
+         optional per-project override (clamped to a safety floor), for a repo
+         that legitimately promotes at a different bar than the fleet default.
       1. ``runtime_config['promotion_threshold'/'promotion_weights']`` — the
          live, admin-tunable rubric (seeded from the YAML at startup, then
          operator-overridable via PATCH /api/admin/settings with no redeploy).
@@ -424,7 +616,7 @@ def _load_policy() -> dict[str, Any]:
     ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
        "threshold": float}`` with every value coerced to float.
     """
-    policy, _, _ = _resolve_policy_with_provenance()
+    policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
 
 
@@ -721,38 +913,107 @@ async def _resolve_candidate_ci(
             "detail": f"pr-for-commit lookup failed: {exc}",
         }
 
+    if not prs:
+        # ``list_pull_requests_for_commit`` collapses API failures and genuine
+        # empty results to ``[]``. Re-check the raw response so a transient
+        # ``commits/{sha}/pulls`` failure stays strict instead of self-clearing
+        # as definitive ``no_checks``.
+        try:
+            response = await github._github_request(  # type: ignore[attr-defined]
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/commits/{candidate_sha}/pulls?per_page=100",
+                {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/vnd.github.v3+json",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                project_id=project_id,
+            )
+        except Exception as exc:  # noqa: BLE001 — raw PR lookup failure → pending
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                exc,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: {exc}",
+            }
+        if response.status_code != 200:
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: "
+                "HTTP %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                response.status_code,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: HTTP {response.status_code}",
+            }
+        try:
+            prs = response.json()
+        except (ValueError, TypeError) as exc:
+            logger.warning(
+                "[RELEASE_QUALIFIER] PR-for-commit lookup failed for %s/%s@%s: %s",
+                owner,
+                repo,
+                candidate_sha[:8],
+                exc,
+            )
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": f"pr-for-commit lookup failed: {exc}",
+            }
+        if not isinstance(prs, list):
+            return {
+                "state": _CI_PENDING,
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": "pr-for-commit lookup returned a non-list body",
+            }
+
     # Prefer merged PRs; fall back to every associated PR when none carry merged_at.
     merged_prs = [pr for pr in prs if isinstance(pr, dict) and pr.get("merged_at")]
     use_prs = merged_prs or [pr for pr in prs if isinstance(pr, dict)]
-    head_shas: list[str] = []
+    all_head_shas: list[str] = []
     for pr in use_prs:
         head = pr.get("head")
         head_sha = head.get("sha") if isinstance(head, dict) else None
-        if head_sha and head_sha != candidate_sha and head_sha not in head_shas:
-            head_shas.append(head_sha)
-            # Cap the sweep to avoid exhausting API quota on repos with many PRs.
-            if len(head_shas) >= _PR_HEAD_SWEEP_MAX:
-                break
+        if head_sha and head_sha != candidate_sha and head_sha not in all_head_shas:
+            all_head_shas.append(head_sha)
+
+    # Cap the sweep to avoid exhausting API quota on repos with many PRs.
+    head_shas = all_head_shas[:_PR_HEAD_SWEEP_MAX]
+    truncated = len(all_head_shas) > len(head_shas)
 
     # Log a warning if we had to truncate the PR head sweep.
-    if len(use_prs) > len(head_shas):
-        total_prs = len(use_prs)
+    if truncated:
         logger.warning(
             "[RELEASE_QUALIFIER] CI resolution: commit %s@%s/%s is associated with "
-            "%d PRs; checking at most %d PR heads (truncated)",
+            "%d PR heads; checking at most %d PR heads (truncated)",
             candidate_sha[:8],
             owner,
             repo,
-            total_prs,
+            len(all_head_shas),
             _PR_HEAD_SWEEP_MAX,
         )
 
     if not head_shas:
         return {
-            "state": _CI_PENDING,
+            "state": _CI_NO_CHECKS,
             "ci_green": False,
             "resolved_sha": None,
-            "detail": "no check-runs on candidate and no PR head with CI",
+            "detail": "no check-runs on candidate and no associated PR heads",
         }
 
     # Exhaustive RED-preferring sweep: inspect every PR head before deciding.
@@ -761,6 +1022,8 @@ async def _resolve_candidate_ci(
     # green AND no associated head is red.
     first_red_sha: str | None = None
     first_green_sha: str | None = None
+    saw_pending = False
+    saw_error = False
     for head_sha in head_shas:
         try:
             pr_checks = await github.get_check_runs_cached(
@@ -780,12 +1043,15 @@ async def _resolve_candidate_ci(
                 head_sha[:8],
                 exc,
             )
+            saw_error = True
             continue
         pr_state = _classify_check_runs(pr_checks)
         if pr_state == _CI_RED and first_red_sha is None:
             first_red_sha = head_sha
         elif pr_state == _CI_GREEN and first_green_sha is None:
             first_green_sha = head_sha
+        elif pr_state == _CI_PENDING:
+            saw_pending = True
         # pending / no_checks — keep inspecting remaining heads.
 
     if first_red_sha is not None:
@@ -802,12 +1068,114 @@ async def _resolve_candidate_ci(
             "resolved_sha": first_green_sha,
             "detail": "PR head check-runs passed",
         }
+    if saw_error and not saw_pending:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "PR head check-runs fetch failed",
+        }
+    if saw_pending:
+        return {
+            "state": _CI_PENDING,
+            "ci_green": False,
+            "resolved_sha": None,
+            "detail": "PR head check-runs still pending or unavailable",
+        }
     return {
-        "state": _CI_PENDING,
+        "state": _CI_NO_CHECKS,
         "ci_green": False,
         "resolved_sha": None,
-        "detail": "PR head check-runs still pending / absent",
+        "detail": "no check-runs on candidate or associated PR heads",
     }
+
+
+async def _annotate_absent_ci_integration_topology(
+    *,
+    token: str,
+    owner: str,
+    repo: str,
+    project: Project,
+    candidate_sha: str,
+    ci_resolution: dict[str, Any],
+) -> dict[str, Any]:
+    """Add finalize-time topology provenance for a definitive no-checks result.
+
+    The scorer still receives a plain ``ci_required`` boolean.  This provenance
+    lets the finalizer relax that boolean only when the absent candidate-level
+    CI belongs to the configured integration branch; comparison failures are
+    recorded as indeterminate and remain strict.
+    """
+    if ci_resolution.get("state") != _CI_NO_CHECKS:
+        return ci_resolution
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    topology: dict[str, Any] = {
+        "integration_branch": integration_branch,
+        "promotion_target": promotion_target,
+        "candidate_reachable_from_integration": None,
+    }
+    if integration_branch == promotion_target:
+        topology["detail"] = "integration branch equals promotion target"
+        return {**ci_resolution, "integration_branch_topology": topology}
+    if requires_ci_checks(project):
+        topology["detail"] = "project requires candidate CI checks"
+        return {**ci_resolution, "integration_branch_topology": topology}
+
+    try:
+        reachable = await github.is_ancestor_of(
+            token,
+            owner,
+            repo,
+            candidate_sha,
+            integration_branch,
+            project_id=str(project.id),
+        )
+    except Exception as exc:  # noqa: BLE001 — topology-unavailable stays strict
+        logger.warning(
+            "[RELEASE_QUALIFIER] finalize CI topology check failed for %s/%s@%s "
+            "against %s: %s",
+            owner,
+            repo,
+            candidate_sha[:8],
+            integration_branch,
+            exc,
+        )
+        topology["detail"] = f"integration topology check failed: {exc}"
+        return {**ci_resolution, "integration_branch_topology": topology}
+
+    topology["candidate_reachable_from_integration"] = reachable
+    if reachable is True:
+        topology["detail"] = "candidate is reachable from integration branch"
+    elif reachable is False:
+        topology["detail"] = "candidate is not reachable from integration branch"
+    else:
+        topology["detail"] = "integration topology check was indeterminate"
+    return {**ci_resolution, "integration_branch_topology": topology}
+
+
+def _ci_required_for_finalize(
+    project: Project | None,
+    ci_resolution: dict[str, Any],
+) -> bool:
+    """Return whether the finalize scorer must hard-block unresolved CI."""
+    if project is None:
+        return True
+    if ci_resolution.get("state") != _CI_NO_CHECKS:
+        return True
+    if requires_ci_checks(project):
+        return True
+
+    integration_branch, promotion_target = _lts_branch_names(project)
+    if integration_branch == promotion_target:
+        return True
+
+    topology = ci_resolution.get("integration_branch_topology")
+    if not isinstance(topology, dict):
+        return True
+    if topology.get("candidate_reachable_from_integration") is not True:
+        return True
+    return not proceed_on_no_checks(project, integration_branch)
 
 
 async def _resolve_ci_at_finalize(
@@ -862,6 +1230,14 @@ async def _resolve_ci_at_finalize(
         ci_resolution = await _resolve_candidate_ci(
             token, owner, repo, candidate_sha, project_id=str(version.project_id)
         )
+        ci_resolution = await _annotate_absent_ci_integration_topology(
+            token=token,
+            owner=owner,
+            repo=repo,
+            project=project,
+            candidate_sha=candidate_sha,
+            ci_resolution=ci_resolution,
+        )
         logger.info(
             "[RELEASE_QUALIFIER] finalize CI re-resolution for v%d candidate "
             "%s: state=%s ci_green=%s (%s)",
@@ -877,6 +1253,10 @@ async def _resolve_ci_at_finalize(
             "resolved_sha": ci_resolution.get("resolved_sha"),
             "detail": ci_resolution.get("detail"),
         }
+        if "integration_branch_topology" in ci_resolution:
+            resolution_provenance["integration_branch_topology"] = ci_resolution[
+                "integration_branch_topology"
+            ]
         return bool(ci_resolution["ci_green"]), resolution_provenance
     except Exception as exc:  # noqa: BLE001 — finalize CI failure → not-green
         logger.warning(
@@ -886,6 +1266,7 @@ async def _resolve_ci_at_finalize(
             exc,
         )
         return False, degenerate_resolution
+
 
 
 # ---------------------------------------------------------------------------
@@ -1051,6 +1432,9 @@ async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
     version: release_version.ReleaseVersion,
+    *,
+    session_factory=None,
+    allow_synchronous_reuse_promote: bool = False,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -1234,6 +1618,36 @@ async def run_qualification(
     ci_green = ci_resolution["ci_green"]
     ci_state = ci_resolution["state"]
 
+    # 3a. Content hash of the audited surface at the candidate (cheap — ONE tree
+    #     call, no per-file reads).  Lets Guard 3 reuse a prior conclusive verdict
+    #     when a newer commit differs ONLY in CI/fixture/config files: fixing CI
+    #     or regenerating a snapshot must NOT re-run the whole ~15min audit
+    #     (Henry, 2026-07-02).  Fail-open: list_repo_tree_paths_at_ref returns
+    #     None on any error, so candidate_diff_hash is None → no reuse, the
+    #     SHA-keyed cache path applies unchanged.
+    #
+    #     Skip the tree call entirely when a SAME-SHA conclusive verdict already
+    #     stands: Guard 3 will serve that from the SHA cache and never reach the
+    #     cross-SHA reuse branch, so the hash (needed only for cross-SHA reuse +
+    #     storage on a fresh spawn) would be a wasted API call every strategic
+    #     cycle a version sits not_promoted.  The pre-lock read may be stale; a
+    #     wrong skip only forgoes reuse (candidate_diff_hash=None → fail-open),
+    #     never causes a wrong reuse.
+    _pre_lock_qual = version.last_qualification or {}
+    _same_sha_conclusive = (
+        _pre_lock_qual.get("status") in _CONCLUSIVE_VERDICT_STATUSES
+        and _pre_lock_qual.get("candidate_sha") == candidate_sha
+    )
+    candidate_diff_hash = (
+        None
+        if _same_sha_conclusive
+        else compute_audited_surface_hash(
+            await github.list_repo_tree_paths_at_ref(
+                token, owner, repo, candidate_sha, project_id=str(project_id)
+            )
+        )
+    )
+
     # 3b. Qualify-on-synced gate (LTS split only).  Don't score a candidate that
     #     is behind the promotion target — it would fail the promotion merge and
     #     bounce the version back to stabilize, burning a full re-audit.  Bounded,
@@ -1253,6 +1667,79 @@ async def run_qualification(
         )
         if _sync_gate is not None:
             return _sync_gate
+
+    # 3c. Passing-audit reuse across a promotion_failed → RE-PROMOTE without
+    #     re-auditing (Henry, 2026-07-02).  A promotion_failed verdict ALWAYS
+    #     means the audit PASSED and only the promotion step failed (PR CI red /
+    #     staleness / merge).  When the harvested fix landed ENTIRELY in an
+    #     audit-EXCLUDED path (CI workflow / test fixture / config), the live
+    #     audited-surface hash equals the passing candidate's, so the audit still
+    #     holds — re-attempt the promotion on the CURRENT candidate (it carries
+    #     the fix; its surface == the passed one by hypothesis) WITHOUT re-running
+    #     the ~15min audit or re-rolling the non-deterministic score (the v21
+    #     treadmill).  Strictly gated: prior status promotion_failed AND the live
+    #     candidate_diff_hash is truthy AND == the prior verdict's hash AND the
+    #     promotion-failure re-qualify cap is NOT exhausted.  ANY miss (a CHANGED
+    #     surface = an app-code fix, or the cap reached) FALLS THROUGH to the
+    #     normal re-audit below — fail-safe.
+    #
+    #     Lock/session discipline (critical): the promote runs in a DEDICATED
+    #     AsyncSessionLocal session, NEVER this caller's — otherwise promote()'s
+    #     intermediate commit (which it issues to free the row lock before its
+    #     30-120s of GitHub I/O) would prematurely commit the caller's unrelated
+    #     dirty work.  This runs BEFORE this function's own FOR UPDATE lock (step
+    #     4 below): the dedicated session must be free to SELECT..FOR UPDATE the
+    #     version row, which this caller has NOT yet locked, so there is no
+    #     self-deadlock.  The dedicated helper re-verifies the gate + cap under
+    #     its OWN row lock (authoritative — the pre-lock read may be stale) and
+    #     reconstructs composite/base_record from the passing fields the
+    #     promotion_failed record carries; a None return (state changed, cap hit,
+    #     candidate already on main, lock contended) falls through to re-audit.
+    if _promotion_failed_reuse_eligible(_pre_lock_qual, candidate_diff_hash) and (
+        int(_pre_lock_qual.get("promotion_failure_count") or 0)
+        < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+    ):
+        if not allow_synchronous_reuse_promote:
+            # DEFER the reuse-promote to the sweep re-driver (review finding 1).
+            # promote() → _record_promotion_success synchronously activates staged
+            # directions via a nested UPDATE on a SEPARATE connection.  Run from a
+            # caller that holds row locks — notably the STRATEGIC transaction, which
+            # may hold the very Direction/Project rows that UPDATE needs — the
+            # await-suspended caller would hang forever (Postgres can't see the
+            # cross-connection wait cycle, so its deadlock detector never fires).
+            # ONLY the promotion_failed sweep re-driver runs OUTSIDE any lock-holding
+            # request AND re-drives promotion_failed every cycle, so it is the sole
+            # caller that sets allow_synchronous_reuse_promote.  Return a no-op
+            # deferral here (NOT a re-audit — that would re-introduce the treadmill);
+            # the sweep performs the promote safely on its next pass.
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d is promotion_failed with "
+                "an unchanged audited surface — DEFERRING the passing-audit "
+                "reuse-promote to the sweep re-driver (a synchronous promote inside "
+                "this lock-holding caller could hang on staged-direction activation)",
+                version.version_number,
+            )
+            return {
+                "status": "promotion_failed_reuse_deferred",
+                "candidate_sha": candidate_sha,
+            }
+        _reuse_result = await _reattempt_promotion_failed_in_dedicated_session(
+            version.id,
+            candidate_sha,
+            candidate_diff_hash,
+            session_factory=session_factory,
+        )
+        if _reuse_result is not None:
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d reused the PASSING "
+                "audit of a promotion_failed candidate (audited surface "
+                "unchanged) and re-attempted promotion on %s WITHOUT "
+                "re-auditing — result=%s",
+                version.version_number,
+                candidate_sha[:8],
+                _reuse_result.get("status"),
+            )
+            return {**_reuse_result, "reused_audit": True}
 
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both
@@ -1355,19 +1842,62 @@ async def run_qualification(
     # Infra/error outcomes are non-conclusive; they must re-run when the
     # qualification is re-requested.  Once automain moves to a new commit, that
     # new candidate is unscored and a fresh qualification is always permitted.
+    # ``ci_unresolved`` is the narrow transient exception: a same-SHA
+    # not_promoted verdict may re-run once the fresh CI snapshot is green.
     prior_qual = version.last_qualification or {}
     prior_status = prior_qual.get("status")
+    ci_unresolved_recovered_same_sha = (
+        prior_status == "not_promoted"
+        and prior_qual.get("blocker") == "ci_unresolved"
+        and prior_qual.get("candidate_sha") == candidate_sha
+        and ci_green
+    )
+    # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
+    # to the prior conclusive candidate (differs only in excluded CI/fixture/
+    # config files) carries the same verdict — reuse it instead of re-rolling the
+    # audit.  This is the "fixing CI / regenerating a snapshot must not re-run the
+    # whole qualification" lever; it never wedges a not_promoted (real findings
+    # are app-code, so fixing them changes the hash and re-audits).
+    # Content-hash CROSS-SHA reuse is valid ONLY for a verdict whose outcome is
+    # fully determined by the AUDITED SURFACE.  That holds for promoted / dry_run
+    # (a would-promote decision driven by audit + test-erosion), but NOT for
+    # not_promoted: a not_promoted can be blocked on state OUTSIDE the audited-
+    # surface hash — CI (.github/), operator criterion attestation, live
+    # migration-apply drift, an operator-lowered merge-grade threshold — any of
+    # which is fixable WITHOUT changing the hash.  Reusing such a verdict across
+    # SHAs would wedge the version not_promoted even after the real fix lands
+    # (round-2 review finding A, generalizing the CI-only wedge round 1 found).
+    # So restrict cross-SHA reuse to non-not_promoted conclusive verdicts; a
+    # not_promoted only reuses on the SAME SHA, so its externally-determined
+    # blocker is re-evaluated on any HEAD advance.
+    _prior_diff_hash = prior_qual.get("candidate_diff_hash")
+    _same_audited_surface = bool(
+        candidate_diff_hash
+        and _prior_diff_hash
+        and candidate_diff_hash == _prior_diff_hash
+        and prior_status != "not_promoted"
+    )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES
-        and prior_qual.get("candidate_sha") == candidate_sha
+        and (
+            prior_qual.get("candidate_sha") == candidate_sha
+            or _same_audited_surface
+        )
+        and not ci_unresolved_recovered_same_sha
     ):
+        _reuse_reason = (
+            "automain unchanged"
+            if prior_qual.get("candidate_sha") == candidate_sha
+            else "audited surface unchanged (CI/fixture-only diff)"
+        )
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d already has a "
-            "conclusive %s verdict for candidate %s (automain unchanged) — "
-            "skipping (cached verdict)",
+            "conclusive %s verdict for candidate %s (%s) — skipping (cached "
+            "verdict)",
             version.version_number,
             prior_status,
             candidate_sha[:8],
+            _reuse_reason,
         )
         return {
             "status": "cached_verdict",
@@ -1428,7 +1958,13 @@ async def run_qualification(
     # spawned and compute_composite drops the smoketest dimension entirely —
     # see _finalize_qualification / compute_composite.  When True, behave as
     # the design doc specifies (audit + test-erosion + smoketest).
-    smoketest_enabled = bool(_runtime_config.get("smoketest_enabled"))
+    # Per-project override on the build_config seam (a project may or may not
+    # have a smoke suite), falling back to the fleet-global runtime_config flag.
+    smoketest_enabled = bool(
+        (project.build_config or {}).get(
+            "smoketest_enabled", _runtime_config.get("smoketest_enabled")
+        )
+    )
     audit_task_id: str | None = None
     challenge_task_id: str | None = None
     audit_challenge_task_id: str | None = None
@@ -1512,6 +2048,7 @@ async def run_qualification(
     version.last_qualification = {
         "status": "pending",
         "candidate_sha": candidate_sha,
+        "candidate_diff_hash": candidate_diff_hash,
         "ci_green": ci_green,
         "ci_state": ci_state,
         "smoketest_enabled": smoketest_enabled,
@@ -1528,6 +2065,9 @@ async def run_qualification(
         "previous_infra_failure_candidate_sha": prior_infra_failure_candidate_sha,
         "infra_attempt_history": infra_attempt_history,
         "prior_superseded": prior_superseded,
+        "keyless_requalification_consumed_at": prior_qual.get(
+            "keyless_requalification_consumed_at"
+        ),
     }
     # Read-modify-write is safe here (unlike the no_credentials / sha_error
     # early returns, which run pre-lock and use the atomic
@@ -1607,11 +2147,10 @@ _BLOCKER_LABELS: dict[str, str] = {
         "the candidate's migration chain does not apply cleanly against "
         "production's recorded schema state (deploy-fatal drift)"
     ),
-    "theme_delivery_shortfall": (
-        "the candidate's diffstat directionally contradicts its stated theme"
-    ),
-    "merge_grade_goal_coverage": (
-        "the blind merge-grade found the merged diffs do not advance the version goal"
+    "criterion_coverage_incomplete": (
+        "one or more version acceptance criteria remain uncovered; stuck "
+        "criteria (no direction mapping, or all mapped directions retired) need "
+        "direction remapping or operator attestation to clear"
     ),
     "merge_grade_misses": (
         "the merged diffs 'misses' the version goal per the blind merge-grade "
@@ -2117,7 +2656,7 @@ async def _merged_pr_numbers_for_version(
 ) -> list[int]:
     """Return the PR numbers merged into this version's acceptance window.
 
-    Reuses the SAME landed-merge predicate the theme-evidence path uses
+    Reuses the SAME landed-merge predicate the blind merge-grade path uses
     (``landed_signal_predicate`` + the version's opened_at window) so the blind
     merge-grade child grades exactly the diffs that landed in this version.
     Pure DB read — no GitHub I/O; the agent fetches each PR's diff itself.
@@ -2152,45 +2691,50 @@ async def _merged_pr_numbers_for_version(
     return sorted(pr_numbers)
 
 
-async def _fetch_version_theme_evidence(
+async def _candidate_already_on_main_at_finalize(
     session: AsyncSession,
-    version_obj: release_version.ReleaseVersion,
-) -> dict[str, Any] | None:
-    """Fetch PR-file diffstats for theme-delivery evidence. Fail-safe (returns None on error)."""
+    version: release_version.ReleaseVersion,
+    candidate_sha: str | None,
+) -> bool:
+    """Best-effort: is ``candidate_sha`` already reachable from the promotion target?
+
+    A thin finalize-time wrapper over ``_candidate_already_on_main`` (resolves the
+    project's GitHub credentials first) used ONLY to exempt an already-landed
+    candidate from the restored hard merge-grade gate — see the exemption in
+    ``_finalize_qualification``.
+
+    Fail-CLOSED to ``False`` (keep the gate armed) on any credential / GitHub /
+    single-branch-repo condition: a transient failure must never wave a failing
+    merge-grade through, and a genuinely-landed candidate is re-detected on the
+    next finalize / sweep retry once GitHub is reachable.
+    """
+    if not candidate_sha:
+        return False
     try:
-        project = await session.get(Project, version_obj.project_id)
+        project = await session.get(Project, version.project_id)
         if project is None:
-            return None
+            return False
+        integration_branch, promotion_target = _lts_branch_names(project)
+        if integration_branch == promotion_target:
+            # Single-branch repo (LTS inactive): "already on main" is not a
+            # meaningful distinction — nothing to exempt.
+            return False
         resolved = await _resolve_github_with_session(session, project)
         if resolved is None:
-            return None
+            return False
         token, owner, repo = resolved
-        pr_files: dict[int, list[dict[str, Any]]] = {}
-        if version_obj.opened_at is not None:
-            rows = (
-                (
-                    await session.execute(
-                        select(Task).where(
-                            Task.project_id == version_obj.project_id,
-                            Task.status == TaskStatus.COMPLETED,
-                            landed_signal_predicate(session),
-                            Task.updated_at >= version_obj.opened_at,
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for t in rows:
-                if release_version._task_completed_at(t) < version_obj.opened_at:
-                    continue
-                pn = (t.first_payload or {}).get("pr_number")
-                if isinstance(pn, int) and pn > 0:
-                    with contextlib.suppress(Exception):
-                        pr_files[pn] = await github.get_pr_files(token, owner, repo, pn)
-        return theme_delivery.compute_theme_evidence(version_obj.goal, pr_files)
-    except Exception:  # noqa: BLE001
-        return None
+        return await _candidate_already_on_main(
+            token, owner, repo, candidate_sha, version, project=project
+        )
+    except Exception as exc:  # noqa: BLE001 — a check failure keeps the gate armed
+        logger.warning(
+            "[RELEASE_QUALIFIER] merge-grade already-on-main exemption check "
+            "failed for v%d candidate %s (%s) — keeping the gate armed",
+            version.version_number,
+            (candidate_sha or "")[:8],
+            exc,
+        )
+        return False
 
 
 async def _finalize_qualification(
@@ -2258,7 +2802,8 @@ async def _finalize_qualification(
             session, version, candidate_sha
         )
 
-    policy = _load_policy()
+    _policy_project = await session.get(Project, version.project_id)
+    policy = _load_policy(_policy_project)
 
     # --- Infra-failure detection: check required child terminal statuses ------
     # A FAILED, CANCELLED, or BLOCKED required child means the qualifier pipeline
@@ -3192,36 +3737,18 @@ async def _finalize_qualification(
         )
     migration_apply_blocked = apply_verdict == "block"
 
-    # --- Theme-delivery evidence (fail-safe) --------------------------------
-    # Pre-computed in _finalize_locked_version before the lock when possible;
-    # fall back to computing inline for direct calls (tests, timeout path).
-    _theme_ev = (
-        _pre_gates.get("pre_theme_evidence")
-        if _pre_gates is not None
-        else await _fetch_version_theme_evidence(session, version)
-    )
-    _theme_cert: dict[str, Any] = (
-        theme_delivery.build_theme_delivery_cert(version.goal, _theme_ev, policy)
-        if _theme_ev is not None
-        else {
-            "state": "not_applicable",
-            "theme_class": "unknown",
-            "falsifiable": False,
-            "directional_contradiction": False,
-            "net_loc": 0,
-        }
-    )
-    _theme_blocked = _theme_cert.get("state") == "blocked"
-
-    # --- Blind merge-grade goal-coverage gate (dir d-c0fe439f) --------------
+    # --- Blind merge-grade artifact validation (dir d-c0fe439f) -------------
     # An uninvested release_merge_grade agent graded the merged diffs against the
-    # frozen version.goal (blind to running_update).  Read its verdict and turn a
-    # FAILING goal-coverage grade into a HARD promotion blocker.  Semantics:
+    # frozen version.goal (blind to running_update).  Since ae0664174 the grade
+    # is a HARD promotion blocker when armed: a "misses" verdict forces
+    # merge_grade_misses below (blocker="merge_grade_misses") whenever the
+    # operator has raised merge_grade_block_threshold above 0.0 — it is no longer
+    # observability-only.  The canonical version acceptance-criteria coverage
+    # gate is a separate, additional hard gate.  Semantics:
     #   * version.goal empty/unset → the gate is a no-op PASS (nothing to grade
     #     against); no child was spawned, merge_grade_task_id is None.
-    #   * goal non-empty + a usable grade → covers_goal False is a hard block.
     #   * goal non-empty but the required grade is MISSING / UNPARSEABLE → HOLD
-    #     (infra_failure): the gate cannot be skipped or waved through.
+    #     (infra_failure): required artifacts cannot be skipped or waved through.
     merge_grade_cert: dict[str, Any] = {
         "status": "not_applicable",
         "covers_goal": None,
@@ -3230,7 +3757,6 @@ async def _finalize_qualification(
         "blocked": False,
         "detail": None,
     }
-    merge_grade_blocked = False
     if merge_grade_task_id:
         merge_grade_artifact: dict[str, Any] | None = None
         try:
@@ -3246,6 +3772,12 @@ async def _finalize_qualification(
                 version.version_number,
             )
         merge_grade_cert = evaluate_merge_grade(version.goal, merge_grade_artifact)
+        if qual.get("prior_superseded") and merge_grade_cert["status"] == "fail":
+            merge_grade_cert = {
+                **merge_grade_cert,
+                "status": "superseded_exempt",
+                "blocked": False,
+            }
         # A spawned merge-grade child MUST produce a usable goal-coverage verdict
         # to finalize.  A COMPLETED child with an absent artifact, or a present
         # but malformed artifact, is an infrastructure failure (the agent ran but
@@ -3258,79 +3790,49 @@ async def _finalize_qualification(
                 else "merge_grade_report_unparseable"
             )
             return await _handle_infra_failure(session, version, qual, label)
-        merge_grade_blocked = bool(merge_grade_cert["blocked"])
-        # Already-promoted exemption: when the previous qualification was
-        # qualification_superseded (force-promoted out-of-band), the feature
-        # content is already on the promotion target.  Grading stabilization-
-        # only tail commits against the frozen goal is meaningless — suppress.
-        if merge_grade_blocked and qual.get("prior_superseded"):
-            logger.warning(
-                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                "prior qualification was superseded (force-promoted out-of-band); "
-                "stabilization-only diff graded against frozen goal is not actionable",
-                version.version_number,
-            )
-            merge_grade_blocked = False
-            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-        # Fallback: direct GitHub ancestry check when prior_superseded was not
-        # set (e.g. GitHub-cred outage let the 6h timeout beat the supersession
-        # reconciler).  Fail-closed: cred unavailable or any error → leave
-        # merge_grade_blocked as-is.
-        #
-        # Normal path (_pre_gates is not None): result was pre-resolved before
-        # the FOR UPDATE lock in _finalize_locked_version — consume it directly
-        # without re-issuing a GitHub call under the lock.
-        # Fallback path (_pre_gates is None): direct calls from tests or the
-        # timeout reaper — run inline as before.
-        if merge_grade_blocked and candidate_sha:
-            if _pre_gates is not None:
-                if _pre_gates.get("pre_merge_grade_already_on_main") is True:
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                        "direct GitHub ancestry check confirms candidate %s is already "
-                        "on main (prior_superseded was not set — likely GitHub-cred outage "
-                        "during force-promote window)",
-                        version.version_number,
-                        candidate_sha[:8],
-                    )
-                    merge_grade_blocked = False
-                    merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-            else:
-                try:
-                    _mg_project = await session.get(Project, version.project_id)
-                    _mg_resolved = await _resolve_github_with_session(session, _mg_project)
-                    if _mg_resolved is not None:
-                        _mg_token, _mg_owner, _mg_repo = _mg_resolved
-                        if await _candidate_already_on_main(
-                            _mg_token, _mg_owner, _mg_repo, candidate_sha, version, project=_mg_project
-                        ):
-                            logger.warning(
-                                "[RELEASE_QUALIFIER] v%d merge_grade_goal_coverage suppressed: "
-                                "direct GitHub ancestry check confirms candidate %s is already "
-                                "on main (prior_superseded was not set — likely GitHub-cred outage "
-                                "during force-promote window)",
-                                version.version_number,
-                                candidate_sha[:8],
-                            )
-                            merge_grade_blocked = False
-                            merge_grade_cert = {**merge_grade_cert, "status": "superseded_exempt", "blocked": False}
-                except Exception:
-                    logger.warning(
-                        "[RELEASE_QUALIFIER] v%d direct already-on-main check failed "
-                        "(fail-closed): merge_grade_goal_coverage block preserved",
-                        version.version_number,
-                        exc_info=True,
-                    )
 
-    # --- Compute the composite ---------------------------------------------
-    # Whether an UNRESOLVED candidate CI (pending / no check-runs) hard-blocks
-    # depends on the project: one that relaxed per-PR CI on its integration
-    # branch (``requires_ci_checks`` False — e.g. automain pushes carry zero
-    # check-runs) has no candidate-level CI signal to resolve, so the candidate
-    # gate must NOT block on ci_unresolved (the promotion PR -> main carries the
-    # real, still-strict CI gate). A confirmed red still blocks regardless.
-    _ci_project = await session.get(Project, version.project_id)
-    ci_required = requires_ci_checks(_ci_project) if _ci_project is not None else True
+    ci_state = ci_resolution.get("state", _CI_RED)
+    ci_required = True
+    if _pre_gates is not None and "ci_required" in _pre_gates:
+        ci_required = bool(_pre_gates["ci_required"])
+    elif ci_state == _CI_NO_CHECKS:
+        _proj_for_ci_gate = await session.get(Project, version.project_id)
+        ci_required = _ci_required_for_finalize(_proj_for_ci_gate, ci_resolution)
+    criterion_coverage = await get_version_coverage_summary(session, version.id)
+    merge_grade_misses = _merge_grade_misses_armed(
+        {
+            "merge_grade_status": merge_grade_cert["status"],
+            "merge_grade": merge_grade_cert,
+        },
+        policy,
+    )
+    # Already-on-main ancestry exemption (finding 0).  The restored hard
+    # merge-grade gate (ae0664174) can otherwise wedge an out-of-band
+    # force-promoted candidate: once it has landed on the promotion target
+    # directly, a "misses" verdict would keep producing not_promoted /
+    # merge_grade_misses every finalize, and NO reconciler clears that blocker
+    # (the prior_superseded exemption above is only set on the version-cut path,
+    # never on a bare force-merge).  A candidate already reachable from the
+    # promotion target is past the point where blocking promotion is meaningful,
+    # so exempt the grade.  Guarded by ``merge_grade_misses`` so the ancestry
+    # GitHub read only runs in the exact wedge case (armed gate + failing grade),
+    # never on the common unarmed / passing-grade paths.
+    if merge_grade_misses and await _candidate_already_on_main_at_finalize(
+        session, version, candidate_sha
+    ):
+        logger.info(
+            "[RELEASE_QUALIFIER] v%d candidate %s failed the blind merge-grade "
+            "but is already on the promotion target — exempting "
+            "merge_grade_misses to avoid a not_promoted wedge",
+            version.version_number,
+            (candidate_sha or "")[:8],
+        )
+        merge_grade_misses = False
+        merge_grade_cert = {
+            **merge_grade_cert,
+            "status": "already_on_main_exempt",
+            "blocked": False,
+        }
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3338,50 +3840,30 @@ async def _finalize_qualification(
         smoketest_score=smoketest_score,
         policy=policy,
         smoketest_enabled=smoketest_enabled,
-        ci_state=ci_resolution.get("state", _CI_RED),
+        ci_state=ci_state,
         ci_required=ci_required,
         migration_collision=migration_collision,
         migration_apply_blocked=migration_apply_blocked,
-        theme_delivery_blocked=_theme_blocked,
-        merge_grade_blocked=merge_grade_blocked,
+        criterion_coverage=criterion_coverage,
+        merge_grade_misses=merge_grade_misses,
     )
 
-    # --- Acceptance-window aggregate (additive evidence, no score impact) --
+    # --- Acceptance-window counts (additive evidence, no score impact) -----
     # Reuses the same verified-prs-merged predicate from direction_outcomes so
     # the release qualification surfaces the same proven-vs-delivered signal as
     # the strategic and direction layers. Merged into sub_scores as additive
     # keys; the existing audit/test_erosion/smoketest weights are unchanged.
-    acceptance_aggregate = await _compute_acceptance_window_aggregate(session, version)
+    acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
-    extended_sub_scores.update(acceptance_aggregate)
+    extended_sub_scores.update(acceptance_window)
 
     finalized_at = _utcnow().isoformat()
-    acceptance_aggregate = None
-    if version.opened_at is not None:
-        merged_rows = (
-            (
-                await session.execute(
-                    select(Task)
-                    .where(
-                        Task.project_id == version.project_id,
-                        Task.status == TaskStatus.COMPLETED,
-                        landed_signal_predicate(session),
-                        Task.updated_at >= version.opened_at,
-                    )
-                    .order_by(Task.created_at.asc())
-                )
-            )
-            .scalars()
-            .all()
-        )
-        merged_rows = [
-            task
-            for task in merged_rows
-            if release_version._task_completed_at(task) >= version.opened_at
-        ]
-        acceptance_aggregate = summarize_version_acceptance_aggregate(merged_rows)
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
+        # Carry the audited-surface hash from the pending record into the verdict
+        # so the NEXT qualify's Guard 3 can reuse this verdict for a commit that
+        # differs only in CI/fixture/config files (content-hash reuse).
+        "candidate_diff_hash": qual.get("candidate_diff_hash"),
         "ci_green": ci_green,
         "ci_resolution": ci_resolution,
         "smoketest_enabled": smoketest_enabled,
@@ -3391,6 +3873,16 @@ async def _finalize_qualification(
         "threshold": policy.get("threshold"),
         "started_at": qual.get("started_at"),
         "finalized_at": finalized_at,
+        # One-shot keyless re-qualification marker (finding 1).  The sweep's
+        # same-SHA keyless re-drive (release_qualifier_sweep._redrive_not_promoted_
+        # qualification) bounds itself to exactly-once by checking this marker on
+        # the not_promoted record.  base_record REPLACES last_qualification, so it
+        # must carry the marker forward from the pending record (run_qualification
+        # seeds it from the prior verdict) — otherwise the exactly-once bound is
+        # lost and heavy re-qualification can loop on an unchanged HEAD.
+        "keyless_requalification_consumed_at": qual.get(
+            "keyless_requalification_consumed_at"
+        ),
         "audit_task_id": audit_task_id,
         "challenge_task_id": challenge_task_id,
         # Parsed challenge artifact — observable on last_qualification.
@@ -3424,8 +3916,7 @@ async def _finalize_qualification(
         "migration_safety_detail": migration_detail,
         "migration_apply_safety": apply_verdict,
         "migration_apply_safety_detail": apply_detail,
-        "acceptance_aggregate": acceptance_aggregate,
-        "theme_delivery": _theme_cert,
+        "criterion_coverage": criterion_coverage,
         # Blind merge-grade goal-coverage verdict (dir d-c0fe439f). Mirrored into
         # last_qualification AND persisted on QualificationVerdict so an operator
         # can see the single biggest gap toward the goal.
@@ -3434,38 +3925,12 @@ async def _finalize_qualification(
         "merge_grade_coverage": merge_grade_cert["coverage"],
         "merge_grade_biggest_gap": merge_grade_cert["biggest_gap"],
         "merge_grade": merge_grade_cert,
+        "merge_grade_misses": merge_grade_misses,
         # Goal-alignment grade emitted by the release_audit agent when
         # version.goal is set. None when no goal is configured or the audit
         # predates this field.
         "goal_alignment": (audit_report or {}).get("goal_alignment"),
     }
-
-    # Advisory WARN notification: theme cert advisory shortfall (not a hard block).
-    # Fires when the cert is in "shortfall" state — assessed_grade is below the
-    # warn threshold but the block threshold is dark (0.0) so promotion proceeds.
-    if _theme_cert.get("state") == "shortfall":
-        await _notify_operator(
-            session,
-            version,
-            "theme_delivery_shortfall",
-            (
-                f"v{version.version_number} theme-delivery advisory shortfall: "
-                f"assessed_grade {_theme_cert.get('assessed_grade', 0.0):.2f} "
-                f"below warn threshold {_theme_cert.get('threshold_warn', 0.70):.2f}. "
-                f"Theme: {_theme_cert.get('theme_class')}. "
-                f"Net LOC: {_theme_cert.get('net_loc', 'N/A')}. "
-                f"Shipping dark — no hard block until threshold_block > 0."
-            ),
-            extra={
-                "theme_class": _theme_cert.get("theme_class"),
-                "assessed_grade": _theme_cert.get("assessed_grade"),
-                "threshold_warn": _theme_cert.get("threshold_warn"),
-                "net_loc": _theme_cert.get("net_loc"),
-                "directional_contradiction": _theme_cert.get(
-                    "directional_contradiction"
-                ),
-            },
-        )
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
     # this project has no explicit override) — additive, behavior unchanged for
@@ -3558,14 +4023,6 @@ async def _finalize_qualification(
             # would fail to create, not just the generic blocker label.
             if composite["blocker"] == "migration_apply_drift" and apply_detail:
                 blocker_label = f"{blocker_label} — {apply_detail}"
-            # The merge-grade blocker carries the single biggest gap so the
-            # operator sees WHAT the merges failed to deliver toward the goal.
-            if composite[
-                "blocker"
-            ] == "merge_grade_goal_coverage" and merge_grade_cert.get("biggest_gap"):
-                blocker_label = (
-                    f"{blocker_label} — biggest gap: {merge_grade_cert['biggest_gap']}"
-                )
             notify_event = "release_blocked"
             notify_summary = (
                 f"v{version.version_number} blocked from promotion — "
@@ -4011,19 +4468,19 @@ async def _finalize_in_dedicated_session(
     is injectable for tests (defaults to ``AsyncSessionLocal``).
 
     **Why it cannot self-deadlock.**  The dedicated session takes
-    ``SELECT ... FOR UPDATE SKIP LOCKED`` on the ``ReleaseVersion`` row.  The
+    ``SELECT ... FOR UPDATE`` on the ``ReleaseVersion`` row.  The
     task-completion caller holds a lock on the *Task* row, not the
     ``ReleaseVersion`` row; the reaper sweep takes NO lock on the version row
     before calling here.  So a fresh session can never block on a version-row
-    lock held by the same logical caller; if a peer holds the row, this attempt
-    no-ops and the next completion/sweep retries — concern (c).
+    lock held by the same logical caller — concern (c).
 
     **Why concurrent calls cannot double-promote (concern d).**  This function
-    ``SELECT ... FOR UPDATE SKIP LOCKED``-locks the version row for the
-    readiness check and decision.  For the NON-promote outcomes (``dry_run`` /
-    ``not_promoted``) the lock is held until commit, so a second concurrent call
-    that cannot acquire it simply returns ``None``; a later retry re-reads
-    ``last_qualification.status`` and bails at the pending guard.
+    ``SELECT ... FOR UPDATE``-locks the version row at the very top and holds it
+    across the readiness check and the decision.  For the NON-promote outcomes
+    (``dry_run`` / ``not_promoted``) the lock is held until commit, so a second
+    concurrent call blocks until the first commits, then re-reads
+    ``last_qualification.status``, sees it is no longer ``"pending"``, and bails
+    at the pending guard — the pending guard alone serializes those paths.
 
     The PROMOTE path is different and the pending guard is NOT what protects it:
     ``promote()`` issues an intermediate ``commit()`` that releases this row
@@ -4086,6 +4543,372 @@ async def _finalize_in_dedicated_session(
         version_id, result, session_factory=session_factory
     )
     return result
+
+
+async def _reattempt_promotion_failed_locked(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str,
+) -> dict[str, Any] | None:
+    """Lock + re-promote a ``promotion_failed`` version on an open dedicated session.
+
+    The body of ``_reattempt_promotion_failed_in_dedicated_session`` (which owns
+    the session + its rollback-on-error contract).  Re-verifies the reuse gate
+    AUTHORITATIVELY under a ``SELECT ... FOR UPDATE`` on the version row (the
+    pre-lock check in ``run_qualification`` may be stale), reconstructs the
+    ``composite`` / ``base_record`` from the PASSING fields the promotion_failed
+    record carries, and re-enters ``promote()`` on the CURRENT ``candidate_sha``
+    WITHOUT re-auditing.  Commits the dedicated session on the promote path
+    (``promote()`` issues its own intermediate commit but the FINAL state write
+    in ``_record_promotion_{success,failure}`` is committed by the caller —
+    mirrors ``_finalize_locked_version``).  Returns the ``promote()`` result, or
+    ``None`` for every no-op guard so ``run_qualification`` falls through to the
+    normal re-audit path.
+    """
+    version: release_version.ReleaseVersion | None = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        return None
+    # Only an OPEN, stabilize-phase version can be re-promoted.  A concurrent
+    # finalize/promote may have flipped it to promoted/abandoned or moved it out
+    # of stabilize between the pre-lock read and this lock — bail to re-audit.
+    if version.status != "open" or version.phase != "stabilize":
+        return None
+    qual = version.last_qualification or {}
+    # Authoritative re-verify of the reuse gate under the lock: a concurrent
+    # re-attempt may have already advanced the state (e.g. a new promotion_failed
+    # with a different hash, or a promoted verdict).
+    if not _promotion_failed_reuse_eligible(qual, candidate_diff_hash):
+        return None
+    # Cap re-check under the lock — a concurrent re-attempt may have bumped the
+    # promotion_failure_count to the cap since the pre-lock read.  Never
+    # re-promote a persistently-red candidate forever (mirrors the sweep
+    # re-driver's circuit breaker).
+    if (
+        int(qual.get("promotion_failure_count") or 0)
+        >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+    ):
+        return None
+
+    # Reconstruct the composite promote() needs (it only reads confidence, for
+    # the PR body) from the passing verdict — do NOT re-score.
+    composite = {
+        "confidence": qual.get("confidence"),
+        "promote": True,
+        "blocker": qual.get("blocker"),
+        "sub_scores": qual.get("sub_scores"),
+    }
+    # Reconstruct base_record from the promotion_failed record, which is exactly
+    # the passing base_record PLUS the promotion-outcome keys.  Strip those
+    # outcome keys, and pin candidate_sha + candidate_diff_hash to the CURRENT
+    # candidate (its audited surface equals the passed one by hypothesis, so the
+    # reused audit findings/scores are valid for it, but the promotion + the
+    # recorded verdict must target the commit that carries the fix).
+    _outcome_keys = {
+        "status",
+        "error",
+        "detail",
+        "conflict",
+        "pr_url",
+        "promotion_pending",
+        "promotion_failure_count",
+        "promotion_loop_escalated",
+    }
+    base_record = {k: v for k, v in qual.items() if k not in _outcome_keys}
+    base_record["candidate_sha"] = candidate_sha
+    base_record["candidate_diff_hash"] = candidate_diff_hash
+
+    result = await promote(
+        session,
+        version,
+        candidate_sha,
+        composite=composite,
+        base_record=base_record,
+    )
+    await session.commit()
+    return result
+
+
+async def _reattempt_promotion_failed_in_dedicated_session(
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str,
+    *,
+    session_factory=None,
+) -> dict[str, Any] | None:
+    """Re-attempt promotion of a ``promotion_failed`` version WITHOUT re-auditing.
+
+    The passing-audit-reuse chokepoint for ``run_qualification``'s promotion_failed
+    fast-promote path (Henry, 2026-07-02).  Mirrors
+    ``_finalize_in_dedicated_session``'s discipline exactly:
+
+    **Why a dedicated session.**  ``promote()`` issues an intermediate
+    ``session.commit()`` to release the ``ReleaseVersion`` row lock before its
+    30-120s of GitHub I/O.  ``run_qualification``'s caller session may hold
+    UNRELATED dirty work (the strategic path's post-commit chain); committing it
+    mid-run would destroy that caller's atomicity.  So this opens its OWN session
+    via ``AsyncSessionLocal`` (injectable for tests), whose only dirty state is
+    the qualifier's own promote write.
+
+    **Why it cannot self-deadlock.**  ``run_qualification`` calls this from its
+    PRE-LOCK section — before it takes its own FOR UPDATE on the version row — so
+    the fresh session's ``SELECT ... FOR UPDATE`` never blocks on a lock held by
+    the same logical caller.  The strategic caller's Project lock is
+    ``FOR NO KEY UPDATE`` (``lock_project_then_task``), which does NOT conflict
+    with the ``FOR KEY SHARE`` an ``open_version`` FK-insert takes on the Project
+    row, and the promote chain never UPDATEs the Project row — so the dedicated
+    promote cannot deadlock against a concurrent strategic cycle either.
+
+    **Idempotency / no double-promote.**  Reuses ``promote()``'s existing
+    machinery: the ``_candidate_already_on_main`` ancestry check routes an
+    already-landed candidate straight to success, the Fix-3 under-lock
+    ``promotion_pending`` claim fences concurrent re-qualification, and the
+    ``version.status != "open"`` re-check in ``_record_promotion_{success,failure}``
+    makes an overlapping promote bail.  A repeat failure records ``promotion_failed``
+    and increments ``promotion_failure_count`` exactly as today — the cap
+    eventually stops it.
+
+    Returns the ``promote()`` result dict, or ``None`` when the under-lock
+    re-verify no-oped (so ``run_qualification`` falls through to a normal
+    re-audit).
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            result = await _reattempt_promotion_failed_locked(
+                session, version_id, candidate_sha, candidate_diff_hash
+            )
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reuse-promote: rollback failed for "
+                    "version %s",
+                    version_id,
+                )
+            raise
+
+    # The dedicated session has now committed + closed.  Run the same post-commit
+    # hooks the finalize path runs (outside the session + row lock, best-effort):
+    # a merge-conflict failure triggers a main → automain reconciliation, and any
+    # resolved outcome re-triggers the strategic agent so it re-plans.  Only when
+    # a promote actually ran (result is not None) — a no-op reuse leaves the
+    # version exactly as it was.
+    if result is not None:
+        await _maybe_reconcile_after_promotion_conflict(
+            version_id, result, session_factory=session_factory
+        )
+        await _maybe_trigger_strategic_after_qualification(
+            version_id, result, session_factory=session_factory
+        )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Operator FORCE-PROMOTE — skip the audit gate, still open the PR + wait for CI.
+# ---------------------------------------------------------------------------
+# Statuses returned by force_promote_current_version / _force_promote_locked that
+# mean promote() never ran (a pre-promote no-op guard) — the post-commit hooks
+# and any "promotion attempted" messaging must skip these.
+_FORCE_PROMOTE_NOOP_STATUSES: frozenset[str] = frozenset(
+    {
+        "no_open_version",
+        "project_not_found",
+        "no_credentials",
+        "sha_error",
+        "version_not_found",
+        "not_open",
+        "promotion_in_flight",
+    }
+)
+
+
+async def _force_promote_locked(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str | None,
+    actor: str | None,
+) -> dict[str, Any]:
+    """Lock + FORCE-promote an open version on a dedicated session (no audit).
+
+    Body of ``_force_promote_in_dedicated_session``.  Takes ``SELECT..FOR UPDATE``
+    on the version row, refuses when the version is not open or a promotion is
+    already in flight (Guard 2b / the Fix-3 claim), builds a FORCED
+    composite/base_record (no audit score — marked ``forced_promote``), and
+    re-enters ``promote()`` on the current candidate, mirroring
+    ``_finalize_locked_version``'s commit discipline.
+    """
+    version = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        return {"status": "version_not_found"}
+    if version.status != "open":
+        return {"status": "not_open", "version_status": version.status}
+    # Refuse when a promotion is already in flight (an audit-passed PR open + the
+    # Fix-3 claim, or a concurrent force-promote) — mirrors the /qualify + the
+    # version-cut levers so every lever over an in-flight promotion agrees.
+    _promo = _promotion_in_flight_result(version)
+    if _promo is not None:
+        return _promo
+    now = _utcnow()
+    # Forced composite: NO audit score.  promote() only reads ``confidence`` for
+    # the PR body (renders 'n/a' when absent), so omit it.
+    composite: dict[str, Any] = {"promote": True, "forced_promote": True}
+    base_record: dict[str, Any] = {
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": candidate_diff_hash,
+        "confidence": None,
+        "forced_promote": True,
+        "forced_promote_by": actor,
+        "forced_promote_at": now.isoformat(),
+        "started_at": now.isoformat(),
+        "finalized_at": now.isoformat(),
+    }
+    logger.warning(
+        "[RELEASE_QUALIFIER] FORCE-PROMOTE: v%d cutting release branch + opening "
+        "promotion PR at candidate %s (audit gate SKIPPED; CI still gates the "
+        "merge) — actor=%s",
+        version.version_number,
+        candidate_sha[:8],
+        actor,
+    )
+    result = await promote(
+        session,
+        version,
+        candidate_sha,
+        composite=composite,
+        base_record=base_record,
+    )
+    await session.commit()
+    return result
+
+
+async def _force_promote_in_dedicated_session(
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str | None,
+    actor: str | None,
+    *,
+    session_factory=None,
+) -> dict[str, Any]:
+    """Run FORCE-promote on a DEDICATED session (mirrors the reuse-promote path).
+
+    A dedicated ``AsyncSessionLocal`` is required because ``promote()`` issues an
+    intermediate lock-releasing commit — running it on the request session would
+    prematurely commit unrelated work.  Runs the same post-commit hooks the
+    finalize/reuse paths run, but only when a promotion actually attempted.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            result = await _force_promote_locked(
+                session, version_id, candidate_sha, candidate_diff_hash, actor
+            )
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] force-promote: rollback failed for "
+                    "version %s",
+                    version_id,
+                )
+            raise
+
+    if result.get("status") not in _FORCE_PROMOTE_NOOP_STATUSES:
+        await _maybe_reconcile_after_promotion_conflict(
+            version_id, result, session_factory=session_factory
+        )
+        await _maybe_trigger_strategic_after_qualification(
+            version_id, result, session_factory=session_factory
+        )
+    return result
+
+
+async def force_promote_current_version(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    candidate_sha: str | None = None,
+    actor: str | None = None,
+    session_factory=None,
+) -> dict[str, Any]:
+    """Operator FORCE-PROMOTE the project's open version.
+
+    SKIPS the audit / qualification gate, but still cuts the release branch,
+    opens the ``release-vN → promotion-target`` PR, and lets the NORMAL CI-wait /
+    managed-check-wait machinery merge it once the promotion target's required
+    checks (branch-protection CI) pass — 'force' skips the AUDIT, not CI.
+
+    Resolves the candidate (an explicit SHA, else the current integration-branch
+    HEAD) + credentials on the request session (pre-lock GitHub I/O), then
+    re-enters ``promote()`` in a DEDICATED session (``promote()`` releases the row
+    lock mid-flight).  Refuses when a promotion is already in flight.  Returns the
+    ``promote()`` result, or a no-op guard status.
+    """
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {"status": "no_open_version"}
+    project = await session.get(Project, project_id)
+    if project is None:
+        return {"status": "project_not_found"}
+    resolved = await _resolve_github_with_session(session, project)
+    if resolved is None:
+        return {"status": "no_credentials"}
+    token, owner, repo = resolved
+    integration_branch, _promotion_target = _lts_branch_names(project)
+    if not candidate_sha:
+        try:
+            candidate_sha = await github.get_branch_sha(
+                token, owner, repo, integration_branch
+            )
+        except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
+            return {"status": "sha_error", "detail": str(exc)[:300]}
+    if not candidate_sha:
+        return {"status": "sha_error", "detail": "empty candidate sha"}
+    candidate_diff_hash = compute_audited_surface_hash(
+        await github.list_repo_tree_paths_at_ref(
+            token, owner, repo, candidate_sha, project_id=str(project_id)
+        )
+    )
+    logger.warning(
+        "[RELEASE_QUALIFIER] FORCE-PROMOTE requested: project %s v%d candidate %s "
+        "actor=%s — SKIPPING the audit/qualify gate (CI still gates the merge)",
+        project_id,
+        version.version_number,
+        candidate_sha[:8],
+        actor,
+    )
+    return await _force_promote_in_dedicated_session(
+        version.id,
+        candidate_sha,
+        candidate_diff_hash,
+        actor,
+        session_factory=session_factory,
+    )
 
 
 def _qualification_timeout_age_seconds(
@@ -4208,42 +5031,6 @@ async def _finalize_locked_version(
         ) = await _resolve_migration_apply_at_finalize(
             session, peek, peek_candidate_sha
         )
-        pre_theme_evidence = await _fetch_version_theme_evidence(session, peek)
-        # Pre-resolve the direct already-on-main ancestry check (merge-grade
-        # exemption fallback) before acquiring the lock.  Only attempt when a
-        # merge-grade child was spawned, a candidate SHA is available, and the
-        # prior_superseded exemption will not already clear the block (short-
-        # circuit avoids a spurious GitHub call).  Fail-closed: any error or
-        # cred unavailability → None (preserved in _pre_gates; consumed as
-        # fail-closed inside _finalize_qualification).
-        _pre_merge_grade_already_on_main: bool | None = None
-        if (
-            peek_qual.get("merge_grade_task_id")
-            and peek_candidate_sha
-            and not peek_qual.get("prior_superseded")
-        ):
-            try:
-                _mg_project_pre = await session.get(Project, peek.project_id)
-                _mg_resolved_pre = await _resolve_github_with_session(
-                    session, _mg_project_pre
-                )
-                if _mg_resolved_pre is not None:
-                    _mg_token_pre, _mg_owner_pre, _mg_repo_pre = _mg_resolved_pre
-                    _pre_merge_grade_already_on_main = await _candidate_already_on_main(
-                        _mg_token_pre,
-                        _mg_owner_pre,
-                        _mg_repo_pre,
-                        peek_candidate_sha,
-                        peek,
-                        project=_mg_project_pre,
-                    )
-            except Exception:
-                logger.warning(
-                    "[RELEASE_QUALIFIER] pre-lock already-on-main check failed "
-                    "(fail-closed): stored as None in _pre_gates",
-                    exc_info=True,
-                )
-
         _pre_gates = {
             "ci_green": pre_ci_green,
             "ci_resolution": pre_ci_resolution,
@@ -4251,9 +5038,12 @@ async def _finalize_locked_version(
             "migration_detail": pre_migration_detail,
             "apply_verdict": pre_apply_verdict,
             "apply_detail": pre_apply_detail,
-            "pre_theme_evidence": pre_theme_evidence,
-            "pre_merge_grade_already_on_main": _pre_merge_grade_already_on_main,
         }
+        if pre_ci_resolution.get("state") == _CI_NO_CHECKS:
+            _pre_proj_for_ci_gate = await session.get(Project, peek.project_id)
+            _pre_gates["ci_required"] = _ci_required_for_finalize(
+                _pre_proj_for_ci_gate, pre_ci_resolution
+            )
         # The pre-lock phase is read-only and intentionally best-effort. Some
         # helpers fail closed by swallowing exceptions, but a swallowed DBAPI
         # error still leaves the SQLAlchemy transaction aborted; without this

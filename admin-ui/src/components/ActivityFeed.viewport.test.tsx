@@ -13,72 +13,75 @@ vi.mock('../firebase', () => ({
   onAuthChange: vi.fn(() => () => {}),
 }));
 
-vi.mock('../api', () => ({
-  authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
-  apiFetch: vi.fn(async () =>
-    new Response(
-      JSON.stringify([
-        {
-          id: 'evt-1',
-          type: 'TASK_COMPLETED',
-          title: 'feat(auth): implement OAuth2 PKCE flow with refresh token rotation',
-          timestamp: new Date().toISOString(),
-          task_id: 'task-1',
-          task_type: 'create',
-          commit_hash: 'abc1234',
-          repo_url: 'https://github.com/example/repo/commit/abc1234',
-          pr_url: 'https://github.com/example/repo/pull/42',
-          duration_seconds: 420,
-          changed_files: ['auth.ts', 'oauth.ts', 'token.ts'],
-          scope: 'medium',
-          direction_id: 'dir-abc123',
-          review_iterations: 2,
-        },
-        {
-          id: 'evt-2',
-          type: 'TASK_FAILED',
-          title: 'fix(db): resolve connection pool exhaustion under high concurrency',
-          timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
-          task_id: 'task-2',
-          failure_class: 'CODE_ERROR',
-          taxonomy: 'correctness',
-          error_summary:
-            'Error: Connection pool exhausted after 30s\n  at Database.connect (/app/db.ts:42:11)\n  at retryWithBackoff (/app/utils.ts:89:5)',
-          investigation_summary: 'Root cause: max_connections exceeded during peak load. Recommended fix: increase pool size.',
-          duration_seconds: 1800,
-        },
-        {
-          id: 'evt-3',
-          type: 'RESEARCH_FINDINGS',
-          title: 'Research: Authentication patterns in microservices',
-          timestamp: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
-          finding_count: 7,
-        },
-        {
-          id: 'evt-4',
-          type: 'DEPLOY_EVENT',
-          title: 'Deploy abc1234 — ROLLED_BACK',
-          timestamp: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
-          deploy_status: 'ROLLED_BACK',
-          commit_hash: 'abc1234',
-          rolled_back_from_sha: 'def5678',
-          rollback_count: 1,
-        },
-        {
-          id: 'evt-5',
-          type: 'TASK_IN_PROGRESS',
-          title: 'Running: migrate user sessions to Redis',
-          timestamp: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
-          task_id: 'task-5',
-          task_type: 'create',
-          latest_status_message: 'Writing migration file…',
-        },
-      ]),
-      { status: 200 },
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    authGet: vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+    apiFetch: vi.fn(async () =>
+      new Response(
+        JSON.stringify([
+          {
+            id: 'evt-1',
+            type: 'TASK_COMPLETED',
+            title: 'feat(auth): implement OAuth2 PKCE flow with refresh token rotation',
+            timestamp: new Date().toISOString(),
+            task_id: 'task-1',
+            task_type: 'create',
+            commit_hash: 'abc1234',
+            repo_url: 'https://github.com/example/repo/commit/abc1234',
+            pr_url: 'https://github.com/example/repo/pull/42',
+            duration_seconds: 420,
+            changed_files: ['auth.ts', 'oauth.ts', 'token.ts'],
+            scope: 'medium',
+            direction_id: 'dir-abc123',
+            review_iterations: 2,
+          },
+          {
+            id: 'evt-2',
+            type: 'TASK_FAILED',
+            title: 'fix(db): resolve connection pool exhaustion under high concurrency',
+            timestamp: new Date(Date.now() - 1000 * 60 * 5).toISOString(),
+            task_id: 'task-2',
+            failure_class: 'CODE_ERROR',
+            taxonomy: 'correctness',
+            error_summary:
+              'Error: Connection pool exhausted after 30s\n  at Database.connect (/app/db.ts:42:11)\n  at retryWithBackoff (/app/utils.ts:89:5)',
+            investigation_summary: 'Root cause: max_connections exceeded during peak load. Recommended fix: increase pool size.',
+            duration_seconds: 1800,
+          },
+          {
+            id: 'evt-3',
+            type: 'RESEARCH_FINDINGS',
+            title: 'Research: Authentication patterns in microservices',
+            timestamp: new Date(Date.now() - 1000 * 60 * 30).toISOString(),
+            finding_count: 7,
+          },
+          {
+            id: 'evt-4',
+            type: 'DEPLOY_EVENT',
+            title: 'Deploy abc1234 — ROLLED_BACK',
+            timestamp: new Date(Date.now() - 1000 * 60 * 60).toISOString(),
+            deploy_status: 'ROLLED_BACK',
+            commit_hash: 'abc1234',
+            rolled_back_from_sha: 'def5678',
+            rollback_count: 1,
+          },
+          {
+            id: 'evt-5',
+            type: 'TASK_IN_PROGRESS',
+            title: 'Running: migrate user sessions to Redis',
+            timestamp: new Date(Date.now() - 1000 * 60 * 2).toISOString(),
+            task_id: 'task-5',
+            task_type: 'create',
+            latest_status_message: 'Writing migration file…',
+          },
+        ]),
+        { status: 200 },
+      ),
     ),
-  ),
-  API_BASE_URL: 'http://localhost:8000',
-}));
+    API_BASE_URL: 'http://localhost:8000',
+  });
+});
 
 describe('ActivityFeed — viewport regression', () => {
   let root: Root | null = null;

@@ -119,7 +119,10 @@ def _task_local_attr(task: Task, attr: str, default: Any = None) -> Any:
 
 def _task_type(task: Task) -> str | None:
     """Resolve a task's declared type from its first payload, or None."""
-    return (task.first_payload or {}).get("type")
+    payload = task.first_payload or {}
+    if not isinstance(payload, dict):
+        return None
+    return payload.get("type")
 
 
 # ---------------------------------------------------------------------------

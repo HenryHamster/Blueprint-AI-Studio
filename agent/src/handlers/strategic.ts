@@ -27,7 +27,7 @@ import {
   formatRetiredDirectionsSummary,
 } from './research-direction-context.js';
 import {
-  computeResearchPlanPromptFingerprint,
+  computeStrategicPromptFingerprint,
   buildThinkerPrompt,
   runThinkerWithGate,
 } from '../prompts/thinker.js';
@@ -52,6 +52,7 @@ import {
   buildPruneCandidatesSection,
   buildModelHealthSection,
   buildDriftSection,
+  buildHeldDirectionsSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -60,6 +61,9 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildSweepComparisonSection,
+  buildCiComplianceSection,
+  buildPayloadStalenessSection,
 } from './strategic-sections.js';
 
 /**
@@ -253,11 +257,6 @@ export async function handleStrategic(
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode, 'research');
   const disallowedTools = configureAgentPermissions(researchMode);
-  const promptFingerprint = computeResearchPlanPromptFingerprint('research');
-  const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
-  if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
-  const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -307,10 +306,16 @@ export async function handleStrategic(
       ? payload.drift_signals as Record<string, unknown>
       : null;
 
+    const heldDirections = Array.isArray(payload.held_directions)
+      ? payload.held_directions as Array<Record<string, unknown>>
+      : [];
+
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
+    const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
+    const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -584,6 +589,10 @@ export async function handleStrategic(
     const cycleStartReconciliationSection = buildCycleStartReconciliationSection(
       payload.cycle_start_reconciliation as Record<string, unknown> | undefined,
     );
+    const payloadStaleness = payload.payload_staleness && typeof payload.payload_staleness === 'object'
+      ? payload.payload_staleness as Record<string, unknown>
+      : undefined;
+    const payloadStalenessSection = buildPayloadStalenessSection(payloadStaleness);
     const pruneCandidatesSection = buildPruneCandidatesSection(
       payload.prune_candidates as Record<string, unknown> | undefined,
     );
@@ -632,7 +641,7 @@ prompts, schemas, tools, or orchestration.` : '';
     const versionPhase = payload.version_phase && typeof payload.version_phase === 'object'
       ? payload.version_phase as Record<string, unknown>
       : undefined;
-    const thinkerPrompt = buildThinkerPrompt({
+    const thinkerParams = {
       contextPrefix,
       projectName,
       clockHeader,
@@ -673,6 +682,7 @@ prompts, schemas, tools, or orchestration.` : '';
       pruneCandidatesSection,
       systemMaturitySection,
       driftSection,
+      heldDirectionsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,
@@ -681,19 +691,37 @@ prompts, schemas, tools, or orchestration.` : '';
       versionPhaseSection: buildVersionPhaseSection(versionPhase),
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
+      ciComplianceSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.
       availableCapabilitiesSection: buildStrategicAvailableCapabilitiesSection(
         payload.available_capabilities,
       ),
-    });
+      // Fully-verdicted multi-arm sweep synthesis: every completed sweep demands
+      // exactly one follow-on move from the thinker so no sweep is silently skipped.
+      sweepComparisonSection: buildSweepComparisonSection(
+        payload.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined,
+      ),
+      payloadStalenessSection,
+    };
+
+    const thinkerPrompt = buildThinkerPrompt(thinkerParams);
+    const promptSuffix = renderStrategicPromptSuffix(payload);
+    const promptFingerprint = computeStrategicPromptFingerprint(
+      thinkerParams,
+      promptSuffix,
+    );
+    const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
+    if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
+    const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
+    if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
     // Append the backend-supplied prompt_suffix as "Additional instructions"
     // (same convention as every other task type). This guidance is reasoning
     // input — deployment framing, stabilize audit-findings hints, stall nudges,
     // mode hints — so it belongs in the analysis pass that produces decisions.
-    const thinkerPromptWithSuffix = thinkerPrompt + renderStrategicPromptSuffix(payload);
+    const thinkerPromptWithSuffix = thinkerPrompt + promptSuffix;
 
     const thinkerGateResult = await runThinkerWithGate(
       thinkerPromptWithSuffix, taskId, ws, statusRef, model, effort, disallowedTools,
@@ -701,24 +729,33 @@ prompts, schemas, tools, or orchestration.` : '';
     if (!thinkerGateResult.ok) return;
     const analysisText = thinkerGateResult.analysisText;
 
-    // If the thinker emitted a version goal or theme (Section 7 files), pre-merge
-    // them into the problem_model JSON now so the executor's set-problem-model call
-    // carries them without needing to search prose. Non-fatal: if the merge fails
-    // (malformed JSON, write error) the executor can still proceed; the goal/theme
+    // If the thinker emitted a version goal (Section 7 file), pre-merge it into
+    // the problem_model JSON now so the executor's set-problem-model call carries
+    // it without needing to search prose. Non-fatal: if the merge fails
+    // (malformed JSON, write error) the executor can still proceed; the goal
     // stays unset this cycle and the thinker can retry next cycle.
-    const { newVersionGoal, newVersionTheme } = thinkerGateResult;
-    if (newVersionGoal || newVersionTheme) {
+    const { newVersionGoal } = thinkerGateResult;
+    if (newVersionGoal) {
       const pmPath = `/tmp/problem_model_${taskId}.json`;
       try {
         const pmRaw = fs.readFileSync(pmPath, 'utf8');
         const pm = JSON.parse(pmRaw) as Record<string, unknown>;
-        if (newVersionGoal) pm.new_version_goal = newVersionGoal;
-        if (newVersionTheme) pm.new_version_theme = newVersionTheme;
+        pm.new_version_goal = newVersionGoal;
         fs.writeFileSync(pmPath, `${JSON.stringify(pm, null, 2)}\n`);
-        const merged = [newVersionGoal && 'new_version_goal', newVersionTheme && 'new_version_theme'].filter(Boolean).join(', ');
-        sendLog(ws, `[INFO] Pre-merged ${merged} into problem_model JSON\n`);
+        sendLog(ws, `[INFO] Pre-merged new_version_goal into problem_model JSON\n`);
       } catch (e) {
-        sendLog(ws, `[WARNING] Failed to pre-merge version goal/theme into problem_model JSON (executor will handle it): ${String(e)}\n`);
+        sendLog(ws, `[WARNING] Failed to pre-merge version goal into problem_model JSON (executor will handle it): ${String(e)}\n`);
+      }
+    }
+
+    let proposedCriteriaBlock = '';
+    const proposedCriteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    if (fs.existsSync(proposedCriteriaPath)) {
+      try {
+        const raw = fs.readFileSync(proposedCriteriaPath, 'utf8').trim();
+        if (raw) proposedCriteriaBlock = `# Proposed acceptance criteria\n\`\`\`json\n${raw}\n\`\`\`\n`;
+      } catch (e) {
+        sendLog(ws, `[WARNING] Failed to read proposed_criteria file: ${String(e)}\n`);
       }
     }
 
@@ -893,6 +930,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # assessed no directions — it's an optional precision refinement, never required.
 ./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing","rationale":"..."}]'
 
+# CONDITIONAL: Submit acceptance criteria proposed by the Thinker, only when the
+# /tmp/proposed_criteria_${taskId}.json file exists and is non-empty.
+./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"
+
 # Spawn a targeted investigation/knowledge task when something from the Recent
 # Work section needs attention NOW instead of waiting for the next autonomous
 # cycle. Choose the type by what you need:
@@ -984,9 +1025,10 @@ ${analysisText.slice(0, 50_000)}
 
 ${strategicChallengeSection}
 
+${proposedCriteriaBlock}
 # Instructions
 
-1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and/or \`new_version_theme\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
+1. **Problem model (REQUIRED).** First do step 5 below: if the Thinker emitted \`version_phase_decision\`, \`qualify_request\`, and/or \`new_version_goal\`, edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add those top-level sibling fields. Then pass \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\` — the \`cat\` re-reads the file, so the sibling fields you added in step 5 are included. Don't summarize or re-emit the model's own content — read-and-pass; the only edit permitted is step 5's sibling fields.
 
    Fallback (use judgment): if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen, you may construct a corrected problem_model yourself — but ground it STRICTLY in the thinker's analysis below (Sections 1-6) and in the project described by CLAUDE.md. Verify findings against the analysis before writing. If even the analysis is insufficient, call \`./strategic pending-confirm\` with type "major_decision" to surface the gap rather than ship bad state. NEVER describe this execution environment, this prompt, your role, or the ./strategic / ./design-doc commands — the problem_model describes the managed project from CLAUDE.md.${executorFetchRecoveryNote}
 
@@ -1017,6 +1059,8 @@ ${strategicChallengeSection}
 
    *Optional companion:* If the Thinker's Section 3.6 recorded \`evidence_progress\` verdicts for long-running active directions, persist them with \`./strategic set-evidence-progress '[{"direction_id":"d-xxx","status":"advancing|stalled|met","rationale":"..."}]'\`. Skip entirely when Section 3.6 is empty — this is an optional precision refinement, never a required call. **Challenge gate:** submit an \`advancing\` or \`met\` status ONLY for a (direction_id, status) pair the independent challenge APPROVED (see the "Independent strategic challenge" section above). For any direction the challenge did not approve at that exact status — or if the challenge was blocked/invalid — submit \`stalled\` (advisory, always allowed) or omit it.
 
+4.5. **Acceptance criteria (conditional).** If the proposed criteria block above is non-empty, call \`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"\`. If the file is absent or empty, SKIP — do not fabricate a criteria list.
+
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
    If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not add the field. Absence means "no phase change this cycle."
@@ -1027,9 +1071,11 @@ ${strategicChallengeSection}
 
    Likewise, if \`new_version_goal\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version goal this cycle; do NOT fabricate one.
 
-   Likewise, if \`new_version_theme\` is already present as a top-level key in \`/tmp/problem_model_${taskId}.json\` (pre-merged from the Thinker's Section 7 output file before this executor pass), it is already set — the \`cat\` in step 1 will carry it through automatically. Do NOT overwrite or re-add it. If it is absent from the file, the Thinker did not set a version theme this cycle; do NOT fabricate one.
+   You may also emit \`new_acceptance_criteria\` as a top-level sibling array to author acceptance criteria for the open version:
+   \`{"new_acceptance_criteria": ["All unit tests pass on automain", "No P0 bugs in open state"], ...rest_of_problem_model}\`
+   Each string becomes a new VersionAcceptanceCriterion (duplicates are skipped). Omit the key entirely when no new criteria are needed — absence is the default and means "no new criteria this cycle."
 
-   \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and \`new_version_theme\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
+   \`version_phase_decision\`, \`qualify_request\`, \`new_version_goal\`, and \`new_acceptance_criteria\` are independent siblings; add whichever the Thinker emitted (any, all, or none).
 
    Because step 1 passes \`"$(cat /tmp/problem_model_${taskId}.json)"\` to \`./strategic set-problem-model\`, editing the file here is what carries these siblings through — step 1 will re-read the file and the fields will be included. If the file is missing/malformed and you took step 1's fallback (constructing the model inline), include these siblings in that inline JSON instead.
 
@@ -1110,8 +1156,8 @@ ${strategicChallengeSection}
     try {
       const directionCreatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"create_direction"/.test(allOutput)
         || /"op"\s*:\s*"create_direction"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
-      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"/.test(allOutput)
-        || /"op"\s*:\s*"(update_direction|retire_direction|approve_direction|reject_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
+      const directionUpdatedInOutput = /"status"\s*:\s*"ok"[\s\S]{0,100}"op"\s*:\s*"(update_direction|retire_direction|stage_direction|approve_direction|reject_direction)"/.test(allOutput)
+        || /"op"\s*:\s*"(update_direction|retire_direction|stage_direction|approve_direction|reject_direction)"[\s\S]{0,100}"status"\s*:\s*"ok"/.test(allOutput);
       const anyDirectionOp = directionCreatedInOutput || directionUpdatedInOutput;
 
       // Detect constraint rejections (cap/dedup) so we don't retry wastefully
@@ -1120,6 +1166,7 @@ ${strategicChallengeSection}
       // Check if thinker's structured output contained direction recommendations
       const structuredSection = analysisText.match(/## Structured Output[\s\S]*$/i)?.[0] ?? '';
       const thinkerRecommendedCreates = /create[_-]direction|"op"\s*:\s*"create"/i.test(structuredSection);
+      const thinkerRecommendedOtherOps = /retire[_-]direction|update[_-]direction|stage[_-]direction|approve[_-]direction|reject[_-]direction/i.test(structuredSection);
 
       if (directionRejectedInOutput && !anyDirectionOp) {
         sendLog(ws, '\n[INFO] Direction creation was attempted but rejected by constraints (cap/duplicate). Not retrying.\n');
@@ -1132,6 +1179,22 @@ ${strategicChallengeSection}
           './strategic create-direction \'{"text": "...", "priority": "high|medium|low", "category": "product|structural", "gap_id": "g-xxx", "rationale": "...", "success_evidence": "observable outcome that proves this direction is done (required)", "retirement_condition": "measurable condition that triggers retirement (required)", "dedup_reasoning": {"closest_directions": ["d-xxx"], "distinction": "..."}}\' \n\n' +
           'success_evidence and retirement_condition are required fields — the backend will reject the call with HTTP 400 if either is missing.\n\n' +
           'Extract the directions from the analysis and call the commands. Nothing else.',
+          ws, statusRef, model, effort, disallowedTools
+        );
+        exitCode = retryResult.exitCode;
+        allOutput = allOutput + '\n' + retryResult.allOutput;
+        lastResultText = retryResult.lastResultText || lastResultText;
+      } else if (exitCode === 0 && thinkerRecommendedOtherOps && !anyDirectionOp) {
+        sendLog(ws, '\n[WARNING] Strategic executor completed but recommended direction operations were not executed. Retrying...\n');
+        const retryResult = await runClaudeCode(
+          'Your previous attempt did not execute the recommended direction operation commands.\n\n' +
+          'The strategic analysis recommended one or more of the following operations. Run the relevant commands NOW:\n\n' +
+          './strategic retire-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n' +
+          './strategic update-direction \'{"direction_id": "d-xxx", "changes": {"priority": "...", "text": "...", "success_evidence": "...", "retirement_condition": "..."}, "rationale": "..."}\'\n' +
+          './strategic stage-direction \'{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}\'\n' +
+          './strategic approve-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n' +
+          './strategic reject-direction \'{"direction_id": "d-xxx", "rationale": "..."}\'\n\n' +
+          'Extract the direction operation from the analysis and call the appropriate command. Nothing else.',
           ws, statusRef, model, effort, disallowedTools
         );
         exitCode = retryResult.exitCode;

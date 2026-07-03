@@ -28,6 +28,14 @@ from app.models import (
 from app.auth import create_agent_token
 
 
+def _assert_generated_at_iso_utc(payload: dict) -> None:
+    generated_at = payload.get("generated_at")
+    assert isinstance(generated_at, str) and generated_at
+    parsed = datetime.fromisoformat(generated_at)
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
 async def _make_project_task(db_session, *, vm="agent-vm-msg"):
     project = Project(name="Msg Test", user_id="test-user-msg")
     db_session.add(project)
@@ -76,6 +84,27 @@ async def _add_ambiguous_messages(
     return shared_prefix, messages
 
 
+def _assert_project_message_event_payload(
+    payload: dict,
+    *,
+    project: Project,
+    msg: ProjectMessage,
+    action: str,
+    status: str,
+) -> None:
+    message_type = getattr(msg.message_type, "value", str(msg.message_type))
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == action
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == message_type
+    assert payload["from"] == msg.from_type
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["status"] == status
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
+
+
 @pytest.mark.asyncio
 async def test_agent_fetch_direction_returns_full_record_with_history_cap(
     client: AsyncClient, db_session
@@ -116,6 +145,167 @@ async def test_agent_fetch_direction_returns_full_record_with_history_cap(
     # 30 entries → capped at 20 most recent
     assert len(body["data"]["research_history"]) == 20
     assert body["data"]["_history_truncated"] == {"shown": 20, "total": 30}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary(
+    client: AsyncClient, db_session
+):
+    """Agent fetch response includes an additive merge_credit summary with
+    verified vs badge-only split computed from the full history."""
+    project = Project(
+        name="Credit Test",
+        user_id="test-user-credit",
+        directions=[
+            {
+                "id": "dir-credit",
+                "status": "active",
+                "text": "Credit direction",
+                "priority": "high",
+                # 3 history entries: 2 with verified_prs_merged, 1 legacy
+                "research_history": [
+                    {"prs_merged": 4, "verified_prs_merged": 3},
+                    {"prs_merged": 2, "verified_prs_merged": 2},
+                    {"prs_merged": 1},  # legacy — no verified field, treated as verified
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-credit"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-credit")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-credit",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    mc = body["data"]["merge_credit"]
+    # raw total: 4+2+1 = 7
+    assert mc["prs_merged"] == 7
+    # verified: 3+2 + legacy fallback 1 = 6
+    assert mc["verified_prs_merged"] == 6
+    # badge-only = 7 - 6 = 1
+    assert mc["badge_only_prs_merged"] == 1
+    assert mc["proven_prs_merged"] == 0
+    assert mc["consumed_prs_merged"] == 0
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary_includes_reachability(
+    client: AsyncClient, db_session
+):
+    """merge_credit includes reachable_prs_merged when history entries carry the
+    reachable_prs_merged field; entries without it are treated as legacy-unknown
+    and contribute 0, matching strategic_spawning stat_entry semantics."""
+    project = Project(
+        name="Reachability Credit Test",
+        user_id="test-user-reach",
+        directions=[
+            {
+                "id": "dir-reach",
+                "status": "active",
+                "text": "Reachability direction",
+                "priority": "high",
+                # 3 entries: two with reachable_prs_merged recorded, one legacy
+                "research_history": [
+                    {"prs_merged": 3, "verified_prs_merged": 3, "reachable_prs_merged": 2},
+                    {"prs_merged": 2, "verified_prs_merged": 2, "reachable_prs_merged": 2},
+                    {"prs_merged": 1, "verified_prs_merged": 1},  # legacy — no reachable field
+                ],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                    "total_reachable_prs_merged": 0,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-reach"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reach")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-reach",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    mc = res.json()["data"]["merge_credit"]
+    # raw total: 3+2+1 = 6
+    assert mc["prs_merged"] == 6
+    # verified total: 3+2+1 = 6 (all verified)
+    assert mc["verified_prs_merged"] == 6
+    # badge_only = 6 - 6 = 0
+    assert mc["badge_only_prs_merged"] == 0
+    # reachable_prs_merged: present because at least one entry has the field;
+    # legacy entry contributes 0, so total = 2+2+0 = 4
+    assert "reachable_prs_merged" in mc, "reachable_prs_merged must be present when any history entry records it"
+    assert mc["reachable_prs_merged"] == 4
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_merge_credit_summary_preserves_known_zero_reachability_after_eviction(
+    client: AsyncClient, db_session
+):
+    """Known-zero reachability survives eviction when the aggregate records it."""
+    project = Project(
+        name="Reachability Eviction Test",
+        user_id="test-user-reach-zero",
+        directions=[
+            {
+                "id": "dir-reach-zero",
+                "status": "active",
+                "text": "Zero-reachability direction",
+                "priority": "high",
+                "research_history": [],
+                "history_aggregate": {
+                    "total_prs_merged": 0,
+                    "total_reachable_prs_merged": 0,
+                    "total_reachable_recorded_cycles": 2,
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-reach-zero"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-reach-zero")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-reach-zero",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    mc = res.json()["data"]["merge_credit"]
+    assert "reachable_prs_merged" in mc
+    assert mc["reachable_prs_merged"] == 0
 
 
 @pytest.mark.asyncio
@@ -921,9 +1111,11 @@ async def test_agent_fetch_message_cross_project_not_found(
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_message_by_short_ref_plain(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message op accepts a short ref and resolves a plain message."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -935,6 +1127,10 @@ async def test_strategic_resolve_message_by_short_ref_plain(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -953,13 +1149,26 @@ async def test_strategic_resolve_message_by_short_ref_plain(
     assert msg.status == "resolved"
     assert msg.resolution == "done"
     assert msg.resolved_at is not None
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
 
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_message_by_short_ref_links_bug(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message op by short ref links a bug-class message to an outcome."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -971,6 +1180,10 @@ async def test_strategic_resolve_message_by_short_ref_links_bug(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -989,6 +1202,17 @@ async def test_strategic_resolve_message_by_short_ref_links_bug(
     assert body["linked_to"] == {"kind": "direction", "id": "dir-99"}
     await db_session.refresh(msg)
     assert msg.status == "linked"
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="updated",
+        status="linked",
+    )
 
 
 @pytest.mark.asyncio
@@ -1171,6 +1395,57 @@ async def test_strategic_create_message_note_type_not_grounded(
     ).scalar_one()
     assert "_provenance_warnings" not in (msg.context or {})
     spy.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_strategic_create_message_broadcasts_workbench_envelope(
+    client: AsyncClient, db_session, mocker
+):
+    """Strategist-authored messages publish the shared project-message envelope."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_message",
+            "data": {
+                "type": "NOTE",
+                "content": "Keep the local Strategic session warm.",
+            },
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalar_one()
+    broadcast.assert_awaited_once()
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_created"
+    assert payload["schema_version"] == 1
+    assert payload["project_id"] == str(project.id)
+    assert payload["resource"] == "project_message"
+    assert payload["action"] == "created"
+    assert payload["message_id"] == str(msg.id)
+    assert payload["type"] == "NOTE"
+    assert payload["from"] == "strategic"
+    assert payload["message"]["id"] == str(msg.id)
+    assert payload["message"]["status"] == "open"
+    assert payload["refetch"] == {"surfaces": ["messages", "strategic_session"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1564,7 +1839,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     )
     version.phase = "stabilize"
     version.goal = "Harden the release gate"
-    version.theme = "reliability"
     version.phase_changed_at = datetime(2026, 6, 2, 9, 30, 0)
     version.qualification_attempts = 2
     version.serving_status = "unconfirmed"
@@ -1595,7 +1869,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
         status="promoted",
         phase="stabilize",
         goal="Previous release",
-        theme="performance",
         opened_at=datetime(2026, 5, 1, 0, 0, 0),
         promoted_at=datetime(2026, 5, 10, 12, 0, 0),
         serving_status="serving_confirmed",
@@ -1634,7 +1907,6 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert current["version_number"] == 10
     assert current["phase"] == "stabilize"
     assert current["goal"] == "Harden the release gate"
-    assert current["theme"] == "reliability"
     assert current["phase_changed_at"] == "2026-06-02T09:30:00"
     assert current["qualification_attempts"] == 2
     assert current["qualification_state"]["state"] == "not_promoted"
@@ -2750,9 +3022,11 @@ async def test_fetch_efficiency_snapshot_rejects_cross_project(
 
 @pytest.mark.asyncio
 async def test_strategic_resolve_question_posts_answer_note(
-    client: AsyncClient, db_session
+    client: AsyncClient, db_session, mocker
 ):
     """resolve_message on a QUESTION-type message posts a question_answer NOTE."""
+    from unittest.mock import AsyncMock
+
     project, task = await _make_project_task(db_session)
     msg = await _add_message(
         db_session,
@@ -2764,6 +3038,10 @@ async def test_strategic_resolve_question_posts_answer_note(
     )
     token = create_agent_token(
         str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
     )
     res = await client.post(
         "/api/agent/strategic",
@@ -2801,3 +3079,1189 @@ async def test_strategic_resolve_question_posts_answer_note(
         and n.context.get("reply_to") == str(msg.id)
     ]
     assert len(matching) == 1, f"Expected 1 question_answer NOTE, got {len(matching)}"
+    await db_session.refresh(msg)
+    reply_msg = matching[0]
+    assert broadcast.await_count == 2
+    update_call, create_call = broadcast.await_args_list
+    project_id, event, payload = update_call.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
+    project_id, event, payload = create_call.args
+    assert project_id == str(project.id)
+    assert event == "message_created"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=reply_msg,
+        action="created",
+        status="open",
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_question_reply_commit_failure_does_not_broadcast_reply(
+    client: AsyncClient, db_session, mocker
+):
+    """A failed optional reply write must not emit a phantom reply-created event."""
+    from unittest.mock import AsyncMock
+
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.QUESTION,
+        from_type="user",
+        content="What changed?",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    broadcast = mocker.patch(
+        "app.routers.admin_agent_ops.broadcast_to_project",
+        new=AsyncMock(),
+    )
+    from sqlalchemy.ext.asyncio import AsyncSession as _AsyncSession
+
+    real_commit = _AsyncSession.commit
+    commit_count = 0
+
+    async def _commit_reply_failure(session, *args, **kwargs):
+        nonlocal commit_count
+        commit_count += 1
+        if commit_count == 2:
+            raise RuntimeError("reply commit failed")
+        return await real_commit(session, *args, **kwargs)
+
+    mocker.patch.object(
+        _AsyncSession,
+        "commit",
+        autospec=True,
+        side_effect=_commit_reply_failure,
+    )
+
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "Resolved, but reply persistence failed.",
+            },
+        },
+    )
+
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "ok"
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert broadcast.await_count == 1
+    project_id, event, payload = broadcast.await_args.args
+    assert project_id == str(project.id)
+    assert event == "message_updated"
+    assert payload["message_id"] == str(msg.id)
+    assert payload["message"]["status"] == "resolved"
+    _assert_project_message_event_payload(
+        payload,
+        project=project,
+        msg=msg,
+        action="resolved",
+        status="resolved",
+    )
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+            )
+        )
+    ).scalars().all()
+    assert notes == []
+
+
+@pytest.mark.asyncio
+async def test_strategic_resolve_feedback_posts_acknowledgment_note(
+    client: AsyncClient, db_session
+):
+    """resolve_message on a FEEDBACK message posts a feedback_acknowledgment NOTE."""
+    project, task = await _make_project_task(db_session)
+    msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.FEEDBACK,
+        from_type="user",
+        content="Please clarify the rollout note.",
+        status="open",
+    )
+    token = create_agent_token(
+        str(task.id), task.vm_instance_id, task_type="strategic_review"
+    )
+    res = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "resolve_message",
+            "data": {
+                "message_id": str(msg.id),
+                "resolution": "Rollout note now names the release owner.",
+            },
+        },
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "ok"
+
+    from sqlalchemy import select
+    from app.models import ProjectMessage
+
+    notes = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.message_type == MessageType.NOTE,
+                ProjectMessage.from_type == "system",
+            )
+        )
+    ).scalars().all()
+    matching = [
+        n
+        for n in notes
+        if isinstance(n.context, dict)
+        and n.context.get("event_type") == "feedback_acknowledgment"
+        and n.context.get("reply_to") == str(msg.id)
+        and n.context.get("resolution") == "Rollout note now names the release owner."
+    ]
+    assert len(matching) == 1, (
+        f"Expected 1 feedback_acknowledgment NOTE, got {len(matching)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_surfaces_goal_coverage_drift(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint includes goal_coverage_drift for open version with a
+    merge-grade verdict that shows a goal miss — signals drifting + biggest_gap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-drift"
+    )
+    version.goal = "Harden the auth layer and improve test reliability"
+    version.phase = "build"
+    flag_modified(version, "goal")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a QualificationVerdict whose merge-grade indicates a goal miss.
+    from app.models import QualificationVerdict as QV
+    verdict = QV(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="deadbeef" * 5,
+        confidence=0.55,
+        terminal_status="not_promoted",
+        audit_findings=[],
+        merge_grade_status="fail",
+        merge_grade_coverage=0.35,
+        merge_grade_biggest_gap="Auth improvements not merged",
+        finalized_at=datetime(2026, 6, 1, 10, 0, 0),
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(verdict)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    # Backward-compat: existing keys unchanged
+    assert data["source"] == "open_version"
+    assert data["current_version"] is not None
+    assert "recent_versions" in data
+
+    # New additive field: goal_coverage_drift
+    drift = data.get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift must be present for open version"
+    assert drift["signal"] == "drifting"
+    assert drift["biggest_gap"] == "Auth improvements not merged"
+    assert drift["coverage"] == pytest.approx(0.35)
+    # No material new work added after the verdict (count_merged_since returns 0
+    # when no COMPLETED tasks exist in the window), so stale may be False.
+    assert isinstance(drift["merges_since_grade"], int)
+    assert "stale" in drift
+    assert "detail" in drift
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_drift_not_applicable_empty_goal(
+    client: AsyncClient, db_session
+):
+    """goal_coverage_drift is not_applicable when version has no goal."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-drift-na"
+    )
+    # Ensure goal is empty/None
+    version.goal = None
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    drift = body["data"].get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "not_applicable"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_includes_goal_coverage_drift_signal(
+    client: AsyncClient, db_session
+):
+    """qualification endpoint includes goal_coverage_drift; existing keys unchanged."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-drift"
+    )
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.goal = "Ship the new data pipeline"
+    flag_modified(version, "goal")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="cafebabe" * 5,
+        confidence=0.91,
+        terminal_status="dry_run",
+        audit_findings=[],
+        merge_grade_status="pass",
+        merge_grade_coverage=0.88,
+        merge_grade_biggest_gap=None,
+        finalized_at=datetime(2026, 6, 15, 12, 0, 0),
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # Backward-compat: existing keys must not change
+    assert body["source"] == "qualification_verdict"
+    assert body["candidate_sha"] is not None
+    assert "requalification_ready" in body
+    assert "finding_resolution" in body
+
+    # New additive field
+    drift = body.get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "on_track"
+    assert drift["coverage"] == pytest.approx(0.88)
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_drift_in_fallback_path(
+    client: AsyncClient, db_session
+):
+    """goal_coverage_drift is present in the last_qualification fallback path too."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-drift-fb"
+    )
+    from sqlalchemy.orm.attributes import flag_modified
+
+    version.goal = "Improve observability"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "confidence": 0.5,
+        "candidate_sha": "aabbccdd" * 5,
+    }
+    flag_modified(version, "goal")
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    # New additive field present even on fallback path (no verdict → no_grade_yet)
+    drift = body.get("goal_coverage_drift")
+    assert drift is not None
+    assert drift["signal"] == "no_grade_yet"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_current_identity_uses_version_phase_when_verdict_evidence_is_historical(
+    client: AsyncClient, db_session
+):
+    """Identity fields (candidate_sha, status, finalized_at) come from
+    last_qualification (Version Phase) even when a historical verdict row with
+    audit_findings exists, so ./fetch qualification and ./fetch version-phase
+    always agree on the current candidate identity."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-vp-identity"
+    )
+
+    # Older verdict with audit_findings — its identity fields are historical.
+    old_sha = "a" * 40
+    historical_finding = {"severity": "HIGH", "summary": "Old finding", "file": "app/old.py"}
+    old_verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        confidence=0.55,
+        sub_scores={"audit": 0.4},
+        terminal_status="not_promoted",
+        finalized_at=datetime(2026, 5, 1, 8, 0, 0),
+        audit_findings=[historical_finding],
+    )
+    db_session.add(old_verdict)
+
+    # Newer qualification recorded in Version Phase last_qualification — this is
+    # the authoritative current candidate identity.
+    new_sha = "b" * 40
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": new_sha,
+        "finalized_at": "2026-06-15T10:00:00",
+        "confidence": 0.82,
+        "sub_scores": {"audit": 0.9},
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # Source still reflects that a verdict row provided the findings.
+    assert body["source"] == "qualification_verdict"
+
+    # Identity fields must come from last_qualification (Version Phase),
+    # NOT from the historical verdict row.
+    assert body["candidate_sha"] == new_sha, (
+        "candidate_sha must reflect the current Version Phase, not the historical verdict"
+    )
+    assert body["status"] == "dry_run", (
+        "status must reflect the current Version Phase, not the historical verdict"
+    )
+    assert body["finalized_at"] == "2026-06-15T10:00:00", (
+        "finalized_at must reflect the current Version Phase, not the historical verdict"
+    )
+
+    # Findings still come from the verdict row.
+    assert len(body["findings"]) == 1
+    assert body["findings"][0]["summary"] == "Old finding"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_prefers_verdict_terminal_status_over_stale_promotion_pending(
+    client: AsyncClient, db_session
+):
+    """When last_qualification.status=pending with promotion_pending AND
+    QualificationVerdict.terminal_status=promoted, the endpoint returns
+    status=promoted and populates source_disagreement."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qual-verdict-override"
+    )
+
+    sha = "c" * 40
+    finding = {"severity": "LOW", "summary": "Minor style issue", "file": "app/foo.py"}
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.91,
+        sub_scores={"audit": 0.95},
+        terminal_status="promoted",
+        finalized_at=datetime(2026, 6, 20, 14, 0, 0),
+        audit_findings=[finding],
+    )
+    db_session.add(verdict)
+
+    # last_qualification is still in transient pending state with promotion_pending
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.91,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/example/repo/pull/42",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "qualification_verdict"
+    # Verdict terminal_status wins over the stale pending
+    assert body["status"] == "promoted", (
+        "verdict terminal_status should override stale pending status"
+    )
+    assert body["finalized_at"] == "2026-06-20T14:00:00"
+    assert body["candidate_sha"] == sha
+    # source_disagreement must be populated
+    assert body["source_disagreement"] is not None
+    assert body["source_disagreement"]["last_qualification_status"] == "pending"
+    assert body["source_disagreement"]["verdict_terminal_status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_verdict_finalized(
+    client: AsyncClient, db_session
+):
+    """When open version last_qualification.status=pending with promotion_pending
+    AND QualificationVerdict.terminal_status=promoted, version-phase returns
+    qualification_state_disagreement and qualification_state.state reflects the
+    resolved outcome (not promotion_in_flight)."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-verdict-override"
+    )
+
+    sha = "d" * 40
+    finding = {"severity": "LOW", "summary": "Style nit", "file": "app/bar.py"}
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.88,
+        sub_scores={"audit": 0.9},
+        terminal_status="promoted",
+        finalized_at=datetime(2026, 6, 21, 10, 0, 0),
+        audit_findings=[finding],
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.88,
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/example/repo/pull/99",
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    current = body["data"]["current_version"]
+    # qualification_state.state must not be promotion_in_flight when verdict is finalized
+    assert current["qualification_state"]["state"] != "promotion_in_flight", (
+        "qualification_state should not show promotion_in_flight when verdict is finalized"
+    )
+    # The disagreement field must be present
+    assert "qualification_state_disagreement" in current
+    assert current["qualification_state_disagreement"]["last_qualification_status"] == "pending"
+    assert current["qualification_state_disagreement"]["verdict_terminal_status"] == "promoted"
+
+
+# ---------------------------------------------------------------------------
+# compute-sweeps recovery endpoints + sweep_id filter on knowledge-documents
+# ---------------------------------------------------------------------------
+
+
+async def _make_sweep_project(db_session, *, vm: str = "agent-vm-sweep"):
+    """Create a project + task and return (project, task, token)."""
+    project = Project(name="Sweep Test", user_id="test-user-sweep")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id=vm)
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), vm)
+    return project, task, token
+
+
+async def _add_sweep_docs(db_session, project, sweep_id: str):
+    """Add two compute_experiment docs belonging to the same sweep_id."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    # KnowledgeDocument requires source_task_id (NOT NULL) — create a dummy task.
+    src_task = Task(project_id=project.id, payloads=[{}], vm_instance_id=f"src-{sweep_id[:8]}")
+    db_session.add(src_task)
+    await db_session.commit()
+    await db_session.refresh(src_task)
+
+    docs = []
+    for arm_label in ("arm-a", "arm-b"):
+        doc = KnowledgeDocument(
+            project_id=project.id,
+            source_task_id=src_task.id,
+            title=f"Sweep {sweep_id} {arm_label}",
+            summary=f"Results for {arm_label}",
+            body="body text",
+            source_kind=SourceKind.COMPUTE_EXPERIMENT,
+            sweep_id=sweep_id,
+            arm_label=arm_label,
+            topic="gpu-throughput",
+        )
+        db_session.add(doc)
+        docs.append(doc)
+    await db_session.commit()
+    for d in docs:
+        await db_session.refresh(d)
+    return docs
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweeps_returns_grouped_evidence(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps returns multi-arm sweeps grouped by
+    sweep_id. Lone-arm docs (sweep_id set but only one doc) are excluded by
+    build_compute_sweep_groups (_SWEEP_MIN_DOCS=2). A second sweep with two
+    arms is returned. Docs with no sweep_id are never included."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-grouped"
+    )
+
+    # Two-arm sweep — should appear in the response.
+    await _add_sweep_docs(db_session, project, "sweep-multi")
+
+    # Lone-arm doc — excluded by min-docs filter.
+    lone_src = Task(project_id=project.id, payloads=[{}], vm_instance_id="src-lone")
+    db_session.add(lone_src)
+    await db_session.commit()
+    await db_session.refresh(lone_src)
+    lone = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=lone_src.id,
+        title="Lone arm",
+        summary="only one",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        sweep_id="sweep-lone",
+        arm_label="arm-only",
+        topic="t",
+    )
+    db_session.add(lone)
+
+    # No-sweep_id doc — never included.
+    nosweep = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=lone_src.id,
+        title="No sweep",
+        summary="no id",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        topic="t",
+    )
+    db_session.add(nosweep)
+    await db_session.commit()
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    # The multi-arm sweep is present.
+    assert "sweep-multi" in data
+    assert len(data["sweep-multi"]) == 2
+    arm_labels = {e["arm_label"] for e in data["sweep-multi"]}
+    assert arm_labels == {"arm-a", "arm-b"}
+    # The lone-arm sweep is excluded.
+    assert "sweep-lone" not in data
+    # Docs with no sweep_id are never present.
+    titles = [e["title"] for entries in data.values() for e in entries]
+    assert "No sweep" not in titles
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweep_single_returns_docs_for_that_sweep(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps/{sweep_id} returns only docs for
+    that sweep, oldest-first."""
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-single"
+    )
+    await _add_sweep_docs(db_session, project, "sweep-abc")
+
+    # Add a second sweep — must not appear.
+    await _add_sweep_docs(db_session, project, "sweep-xyz")
+
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps/sweep-abc",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    entries = body["data"]
+    assert isinstance(entries, list)
+    assert len(entries) == 2
+    sweep_ids = {e["sweep_id"] for e in entries}
+    assert sweep_ids == {"sweep-abc"}
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweep_single_missing_returns_404(
+    client: AsyncClient, db_session
+):
+    """GET /projects/{id}/compute-sweeps/{sweep_id} returns 404 for unknown sweep."""
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-cs-missing"
+    )
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/compute-sweeps/does-not-exist",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_compute_sweeps_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch compute-sweeps for project B (404)."""
+    project_a = Project(name="CS A", user_id="test-user-csa")
+    project_b = Project(name="CS B", user_id="test-user-csb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-csa")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-csa")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/compute-sweeps",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_knowledge_documents_sweep_id_filter(
+    client: AsyncClient, db_session
+):
+    """GET /knowledge-documents?sweep_id=X returns only docs for that sweep_id."""
+    from app.models import KnowledgeDocument, SourceKind
+
+    project, task, token = await _make_sweep_project(
+        db_session, vm="agent-vm-kd-sweep"
+    )
+    # Two docs in target sweep.
+    await _add_sweep_docs(db_session, project, "target-sweep")
+
+    # One doc in a different sweep — must not appear in the filtered result.
+    other_src = Task(project_id=project.id, payloads=[{}], vm_instance_id="src-other-kd")
+    db_session.add(other_src)
+    await db_session.commit()
+    await db_session.refresh(other_src)
+    other = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=other_src.id,
+        title="Other sweep",
+        summary="other",
+        body="body",
+        source_kind=SourceKind.COMPUTE_EXPERIMENT,
+        sweep_id="other-sweep",
+        arm_label="arm-x",
+        topic="t",
+    )
+    db_session.add(other)
+    await db_session.commit()
+
+    res = await client.get(
+        "/api/agent/knowledge-documents",
+        params={"sweep_id": "target-sweep"},
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["total"] == 2
+    returned_sweep_ids = {d["sweep_id"] for d in body["documents"]}
+    assert returned_sweep_ids == {"target-sweep"}
+    # Unfiltered call returns all three docs.
+    res_all = await client.get(
+        "/api/agent/knowledge-documents",
+        headers={"x-agent-token": token},
+    )
+    assert res_all.json()["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_cold_start_drift_counts_merges_since_open(
+    client: AsyncClient, db_session
+):
+    """Cold-start: no merge-grade verdict, but >=5 pr_merged tasks since version
+    open → goal_coverage_drift signal must be 'drifting' with stale=True.
+
+    Acceptance gate: named test in the task spec; asserts non-trivial behavior
+    exercised by production code in release_readiness + release_scoring.
+    """
+    from datetime import timezone
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-vp-cold-start"
+    )
+    version.goal = "Harden the release pipeline and improve coverage"
+    version.phase = "build"
+    # opened_at must be in the past so merged tasks are counted since it
+    version.opened_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    flag_modified(version, "goal")
+    flag_modified(version, "opened_at")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create 5 COMPLETED tasks with pr_merged=True, all after version.opened_at.
+    # count_merged_since uses updated_at >= since, then _task_completed_at check.
+    for i in range(5):
+        merged_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+            updated_at=datetime(2026, 2, 1, tzinfo=timezone.utc),
+            vm_instance_id=f"agent-vm-cold-merged-{i}",
+            context={"pr_merged": True},
+        )
+        db_session.add(merged_task)
+    await db_session.commit()
+
+    # No QualificationVerdict exists for this version → cold-start scenario.
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    drift = body["data"].get("goal_coverage_drift")
+    assert drift is not None, "goal_coverage_drift must be present"
+    assert drift["signal"] == "drifting", (
+        f"expected 'drifting' for cold-start with 5 merges, got {drift['signal']!r}"
+    )
+    assert drift["stale"] is True
+    assert drift["coverage"] is None
+
+
+@pytest.mark.asyncio
+async def test_fetch_ci_compliance_endpoint_returns_unavailable_without_github_creds(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/ci-compliance returns source=unavailable when
+    the project has no GitHub credentials (the common test-environment case)."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cicomp")
+    token = create_agent_token(str(task.id), "agent-vm-cicomp")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert body["data"]["source"] == "unavailable"
+
+
+@pytest.mark.asyncio
+async def test_fetch_ci_compliance_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch ci-compliance for project B (404)."""
+    project_a = Project(name="CCA", user_id="u-cca")
+    project_b = Project(name="CCB", user_id="u-ccb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-ccxp")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-ccxp")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/ci-compliance",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# criterion_coverage in version-phase endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_surfaces_criterion_coverage(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint includes criterion_coverage in current_version for
+    an open version that has acceptance criteria with recorded evidence.
+
+    Asserts: counts are accurate (covered/partial/uncovered), per-criterion
+    entries are present with the correct coverage classification and evidence
+    count, and backward-compat keys (goal_coverage_drift, recent_versions) are
+    still present.
+
+    Acceptance requirement: test_agent_fetch_version_phase_surfaces_criterion_coverage
+    must run green under a real merge-test verdict.
+    """
+    from app.acceptance_criteria import create_criterion, record_evidence
+
+    project = Project(name="CovTest", user_id="test-user-covtest")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-cov")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=10,
+        status="open",
+        opened_at=datetime(2026, 1, 1),
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create two criteria: one will be covered, one uncovered.
+    c_covered = await create_criterion(
+        db_session, project.id, version.id, "Ship the new auth layer"
+    )
+    c_uncovered = await create_criterion(
+        db_session, project.id, version.id, "Harden CI pipeline"
+    )
+
+    # Record a proven task_merge evidence for c_covered → classified 'covered'.
+    await record_evidence(
+        db_session,
+        c_covered.id,
+        project.id,
+        source_kind="task_merge",
+        source_id="pr-101",
+        detail={"proven": True},
+    )
+    # No evidence for c_uncovered → classified 'uncovered'.
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    assert data["source"] == "open_version"
+    current = data["current_version"]
+    assert current is not None
+
+    # criterion_coverage must be present with correct scalar counts.
+    coverage = current.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage must be present for open version"
+    assert coverage["total"] == 2
+    assert coverage["covered"] == 1
+    assert coverage["partial"] == 0
+    assert coverage["uncovered"] == 1
+
+    # Per-criterion entries must be present and correctly classified.
+    criteria_list = coverage.get("criteria")
+    assert isinstance(criteria_list, list), "criteria list must be present"
+    assert len(criteria_list) == 2
+    by_key = {c["criterion_key"]: c for c in criteria_list}
+    assert by_key[c_covered.criterion_key]["coverage"] == "covered"
+    assert by_key[c_covered.criterion_key]["evidence_count"] == 1
+    assert by_key[c_uncovered.criterion_key]["coverage"] == "uncovered"
+    assert by_key[c_uncovered.criterion_key]["evidence_count"] == 0
+
+    # Backward-compat: existing top-level keys must remain present.
+    assert "goal_coverage_drift" in data
+    assert "recent_versions" in data
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_criterion_coverage_empty_degrades_gracefully(
+    client: AsyncClient, db_session
+):
+    """version_phase endpoint returns criterion_coverage with zero counts and an
+    empty criteria list when the open version has no acceptance criteria at all.
+    The endpoint must not raise an error."""
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-cov-empty"
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+
+    data = body["data"]
+    assert data["source"] == "open_version"
+    current = data["current_version"]
+    assert current is not None
+
+    # With no criteria rows the summary is all zeros and empty list — not an error.
+    coverage = current.get("criterion_coverage")
+    assert coverage is not None, "criterion_coverage present even with no criteria"
+    assert coverage["total"] == 0
+    assert coverage["covered"] == 0
+    assert coverage["partial"] == 0
+    assert coverage["uncovered"] == 0
+    assert coverage.get("criteria") == []
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_criterion_coverage_absent_when_no_open_version(
+    client: AsyncClient, db_session
+):
+    """When there is no open version, current_version is None and criterion_coverage
+    is absent from the response (no errors, source=no_open_version)."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cov-noversion")
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    data = body["data"]
+    assert data["source"] == "no_open_version"
+    assert data["current_version"] is None
+    # criterion_coverage is absent when there is no open version.
+    assert "criterion_coverage" not in (data.get("current_version") or {})
+
+
+# ---------------------------------------------------------------------------
+# candidate_currency freshness-SHAs tests
+# ---------------------------------------------------------------------------
+
+
+def _patch_version_phase_currency(mocker, *, resolved, head_sha):
+    """Mock the GitHub resolution path used by _resolve_candidate_currency
+    for agent_fetch_version_phase tests."""
+    from unittest.mock import AsyncMock
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=head_sha),
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_exposes_payload_freshness_shas(
+    client: AsyncClient, db_session, mocker
+):
+    """Acceptance requirement: candidate_currency in the version-phase response
+    must expose payload_sha, active_candidate_sha, integration_head_sha, stale,
+    and stale_reason when the open version has a candidate SHA and the integration
+    branch HEAD can be resolved.
+
+    Stale case: candidate != HEAD -> stale=True, stale_reason set.
+    Current case: candidate == HEAD -> stale=False, stale_reason=None.
+
+    This test covers both sub-cases in one fixture to satisfy the named acceptance
+    evidence requirement: test_agent_fetch_version_phase_exposes_payload_freshness_shas.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    candidate = "a" * 40
+    head = "b" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-shas"
+    )
+    version.last_qualification = {"candidate_sha": candidate, "status": "not_promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    _patch_version_phase_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=head
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Stale case: candidate differs from HEAD
+    cc = data.get("candidate_currency")
+    assert cc is not None, "candidate_currency must be present when currency resolves"
+    assert cc["stale"] is True
+    assert cc["payload_sha"] == candidate
+    assert cc["payload_compiled_sha"] == candidate
+    assert cc["active_candidate_sha"] == candidate
+    assert cc["integration_head_sha"] == head
+    _assert_generated_at_iso_utc(cc)
+    assert cc["stale_reason"] == "payload_sha_differs_from_integration_head"
+    # backward-compat fields preserved
+    assert cc["current"] is False
+    assert cc["candidate_sha"] == candidate
+    assert cc["head_sha"] == head
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_version_phase_candidate_currency_current(
+    client: AsyncClient, db_session, mocker
+):
+    """When candidate_sha equals integration HEAD, candidate_currency has stale=False
+    and stale_reason=None."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    sha = "c" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-current"
+    )
+    version.last_qualification = {"candidate_sha": sha, "status": "promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    _patch_version_phase_currency(
+        mocker, resolved=("tok", "owner", "repo"), head_sha=sha
+    )
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    cc = data.get("candidate_currency")
+    assert cc is not None
+    assert cc["stale"] is False
+    assert cc["payload_sha"] == sha
+    assert cc["active_candidate_sha"] == sha
+    assert cc["integration_head_sha"] == sha
+    _assert_generated_at_iso_utc(cc)
+    assert cc["stale_reason"] is None
+    assert cc["current"] is True
+
+
+@pytest.mark.asyncio
+async def test_candidate_currency_indeterminate_marker(
+    client: AsyncClient, db_session, mocker
+):
+    """Acceptance requirement: when GitHub resolution fails (resolved=None),
+    candidate_currency must include an explicit indeterminate marker with
+    verdict="unknown" so the agent can distinguish indeterminate from current/stale.
+    The endpoint must not error, and the marker must be present in the response."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    candidate = "d" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-indet"
+    )
+    version.last_qualification = {"candidate_sha": candidate, "status": "not_promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    # resolved=None -> _resolve_github_with_session returns None -> _resolve_candidate_currency returns None
+    _patch_version_phase_currency(mocker, resolved=None, head_sha="e" * 40)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    # Indeterminate marker must be present with verdict="unknown"
+    cc = data.get("candidate_currency")
+    assert cc is not None, "candidate_currency must be present when freshness is indeterminate"
+    assert cc.get("verdict") == "unknown", "verdict must be 'unknown' when currency is indeterminate"
+    _assert_generated_at_iso_utc(cc)

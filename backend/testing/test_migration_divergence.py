@@ -129,9 +129,14 @@ def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> Asyn
 @pytest.mark.asyncio
 async def test_qualification_gate_ok_when_refs_agree(mocker):
     """Identical migration sets on both refs → ('ok', None)."""
+    src = _migration_source("0143", "0142")
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0142_parent.py", "0143_vm_contact.py"]),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=src),
     )
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
@@ -148,6 +153,7 @@ async def test_qualification_gate_authorizes_reconciled_0143_divergence(mocker):
     deploy-time reconciliation makes this exact renumber safe, the gate no longer
     hard-blocks it → ('ok', informational note) — otherwise the version could
     never promote and the divergence could never clear (permanent deadlock)."""
+    src_0142 = _migration_source("0142", "0141")
     mocker.patch(
         "app.github.list_versions_at_ref",
         new=_versions_by_ref(
@@ -158,6 +164,12 @@ async def test_qualification_gate_authorizes_reconciled_0143_divergence(mocker):
                 "0144_vm_contact_last_tool_use.py",
             ],
         ),
+    )
+    # Only 0142_parent.py is shared between main and candidate; return identical
+    # body for both refs so the body-immutability check passes cleanly.
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=src_0142),
     )
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
@@ -248,6 +260,161 @@ async def test_qualification_gate_defers_when_target_fetch_fails(mocker):
     )
     assert verdict == "defer"
     assert "promotion target" in detail
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_blocks_inplace_body_edit_of_deployed_migration(
+    mocker,
+):
+    """Body-immutability gate: a migration with the same filename on both refs
+    but a DIFFERENT body must be BLOCKED ('block', reason naming the migration).
+    This is the class that filename-only identity checks are blind to."""
+    deployed_src = _migration_source("0309", "0308")
+    tampered_src = deployed_src + "# tampered by candidate\n"
+
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
+            candidate_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
+        ),
+    )
+
+    async def _body(path, *, token, owner, repo, ref, project_id=None):
+        if ref == "main":
+            return deployed_src
+        return tampered_src
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_body))
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "block"
+    assert "0309_computejob_heartbeat" in detail
+    assert "immutable" in detail or "in-place" in detail or "body" in detail.lower()
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_ok_when_shared_migration_body_identical(mocker):
+    """A shared migration with IDENTICAL body on both refs stays ('ok', None)
+    — no false positive from the body-immutability check."""
+    src = _migration_source("0309", "0308")
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
+            candidate_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
+        ),
+    )
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=src),
+    )
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "ok"
+    assert detail is None
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_ok_when_no_shared_basenames(mocker):
+    """When the candidate adds brand-new migrations not present on the target,
+    there are no shared basenames and no body fetch is triggered — ('ok', None)."""
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0308_parent.py"],
+            candidate_list=["0308_parent.py", "0309_new_feature.py"],
+        ),
+    )
+    # 0308_parent.py IS shared; mock returns identical body so immutability passes.
+    src = _migration_source("0308", "0307")
+    mocker.patch(
+        "app.github.get_file_text_at_ref",
+        new=AsyncMock(return_value=src),
+    )
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "ok"
+    assert detail is None
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_defers_when_deployed_file_fetch_fails(mocker):
+    """Fail-safe: if fetching the deployed body of a shared migration raises,
+    the gate returns ('defer', reason) — never ('ok') or ('block')."""
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0309_computejob_heartbeat.py"],
+            candidate_list=["0309_computejob_heartbeat.py"],
+        ),
+    )
+
+    async def _body(path, *, token, owner, repo, ref, project_id=None):
+        if ref == "main":
+            raise RuntimeError("GitHub 503 fetching deployed body")
+        return _migration_source("0309", "0308")
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_body))
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "defer"
+    assert "0309_computejob_heartbeat" in detail or "promotion target" in detail
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_defers_when_deployed_file_empty(mocker):
+    """Fail-safe: an empty body from the deployed ref is treated as an unknown
+    state and returns ('defer', reason) — not ('ok') or ('block')."""
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0309_computejob_heartbeat.py"],
+            candidate_list=["0309_computejob_heartbeat.py"],
+        ),
+    )
+
+    async def _body(path, *, token, owner, repo, ref, project_id=None):
+        if ref == "main":
+            return ""  # empty body
+        return _migration_source("0309", "0308")
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_body))
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "defer"
+    assert "empty" in detail or "promotion target" in detail
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_defers_when_candidate_body_fetch_fails(mocker):
+    """Fail-safe: if fetching the candidate body of a shared migration raises,
+    the gate returns ('defer', reason) — never ('ok') or ('block')."""
+    deployed_src = _migration_source("0309", "0308")
+    mocker.patch(
+        "app.github.list_versions_at_ref",
+        new=_versions_by_ref(
+            main_list=["0309_computejob_heartbeat.py"],
+            candidate_list=["0309_computejob_heartbeat.py"],
+        ),
+    )
+
+    async def _body(path, *, token, owner, repo, ref, project_id=None):
+        if ref == "main":
+            return deployed_src
+        raise RuntimeError("GitHub 502 fetching candidate body")
+
+    mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock(side_effect=_body))
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "defer"
+    assert "cand-sha" in detail or "candidate" in detail
 
 
 # ===========================================================================

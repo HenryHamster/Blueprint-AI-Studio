@@ -13656,12 +13656,15 @@ class TestStampNoFindingsRefractory:
 
     def _run(self, project, coro):
         import asyncio
-        from unittest.mock import patch
+        from unittest.mock import patch, AsyncMock
 
         async def _mock_wdl(session, project_id, mutate_fn):
             mutate_fn(project.directions)
 
-        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+        with (
+            patch("app.research_completion.with_directions_locked", _mock_wdl),
+            patch("app.research_completion.with_problem_model_locked", AsyncMock()),
+        ):
             asyncio.get_event_loop().run_until_complete(coro)
 
     def test_first_unproductive_cycle_not_marked_saturated(self):
@@ -13799,6 +13802,45 @@ class TestStampNoFindingsRefractory:
             "Direction with 3 verified aggregate merges must be auto-completed"
         )
 
+    def test_auto_complete_aggregate_stranded_merges_not_counted(self):
+        """Auto-completion must subtract total_stranded_prs_merged from aggregate verified total.
+
+        When total_verified_prs_merged >= 3 but all are confirmed-stranded (stranded==verified),
+        the effective credit-eligible count is 0 and the direction must NOT be auto-completed.
+        When the non-stranded remainder reaches 3, it should auto-complete.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+
+        # Case 1: 3 verified, 3 stranded → credit-eligible = 0 → must NOT auto-complete
+        agg_all_stranded = {
+            "total_prs_merged": 3,
+            "total_verified_prs_merged": 3,
+            "total_stranded_prs_merged": 3,
+            "total_cycles": 5,
+        }
+        task = self._make_task()
+        project = self._make_saturated_project(agg=agg_all_stranded)
+        self._run(project, _stamp_no_findings_refractory(task, self._make_session()))
+        direction = project.directions[0]
+        assert direction.get("status") != "completed", (
+            "Direction whose only aggregate merges are confirmed-stranded must NOT be auto-completed"
+        )
+
+        # Case 2: 5 verified, 2 stranded → credit-eligible = 3 → must auto-complete
+        agg_partial_stranded = {
+            "total_prs_merged": 5,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+            "total_cycles": 5,
+        }
+        task2 = self._make_task()
+        project2 = self._make_saturated_project(agg=agg_partial_stranded)
+        self._run(project2, _stamp_no_findings_refractory(task2, self._make_session()))
+        direction2 = project2.directions[0]
+        assert direction2.get("status") == "completed", (
+            "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) must auto-complete"
+        )
+
     # ── Additive exhaustion route (terminal COMPLETED regardless of merge count) ──
 
     def _make_exhausted_project(
@@ -13923,6 +13965,97 @@ class TestStampNoFindingsRefractory:
         direction2 = project2.directions[0]
         assert direction2.get("status") != "completed", (
             "A budget-paused (cost_pause_evidence) direction must NOT be auto-completed"
+        )
+
+    def test_no_findings_auto_completion_reconciles_gap_staffing(self):
+        """Auto-completing a direction via the no-findings path must reconcile
+        problem-model gap staffing — pruning the direction from active_moves
+        and recording a GapDeferral when it was the last active move.
+
+        The lifecycle and strategic-completion retire paths both call
+        reconcile_gaps_for_retired_directions when retiring a direction; the
+        no-findings auto-complete path must do so too, or the next lifecycle
+        prune can remove the completed direction from project.directions while
+        the problem model still lists it in gap.active_moves.
+        """
+        from app.research_completion import _stamp_no_findings_refractory
+        import asyncio
+        from unittest.mock import patch
+
+        direction_id = "d-gap-test"
+        gap_id = "g-test-gap"
+
+        # Build a saturated direction that will auto-complete via the verified merge path.
+        history = [
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+            {"prs_merged": 1, "verified_prs_merged": 1},
+        ]
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "text": "Gap-staffed direction",
+                "status": "active",
+                "gap_id": gap_id,
+                "research_history": history,
+                "history_aggregate": {},
+                "consecutive_unproductive_cycles": 2,
+            }
+        ]
+
+        # problem_model with a gap that has the direction in active_moves.
+        pm: dict = {
+            "gaps": [
+                {
+                    "id": gap_id,
+                    "name": "Test gap",
+                    "status": "active",
+                    "active_moves": [direction_id],
+                    "past_moves": [],
+                }
+            ]
+        }
+
+        captured_pm_calls: list[dict] = []
+
+        async def _mock_wdl(sess, pid, mutate_fn):
+            mutate_fn(project.directions)
+
+        async def _mock_wpml(sess, pid, mutate_fn):
+            mutate_fn(pm)
+            captured_pm_calls.append(dict(pm))
+
+        task = self._make_task(direction_id=direction_id)
+        session = self._make_session()
+
+        with (
+            patch("app.research_completion.with_directions_locked", _mock_wdl),
+            patch("app.research_completion.with_problem_model_locked", _mock_wpml),
+        ):
+            asyncio.get_event_loop().run_until_complete(
+                _stamp_no_findings_refractory(task, session)
+            )
+
+        # The direction must have been auto-completed to trigger gap reconciliation.
+        direction = project.directions[0]
+        assert direction.get("status") == "completed", (
+            "Direction must have been auto-completed to trigger gap reconciliation"
+        )
+
+        # with_problem_model_locked must have been called.
+        assert captured_pm_calls, (
+            "with_problem_model_locked must be called when a direction is auto-completed"
+        )
+
+        # The gap's active_moves must no longer contain the completed direction.
+        gap = pm["gaps"][0]
+        assert direction_id not in gap.get("active_moves", []), (
+            "auto-completed direction must be pruned from gap.active_moves"
+        )
+        # The direction must be recorded in past_moves.
+        assert direction_id in gap.get("past_moves", []), (
+            "auto-completed direction must be moved to gap.past_moves"
         )
 
 
@@ -14668,4 +14801,520 @@ async def test_genuine_cross_tree_none_base_branch_is_noop(db_session, mocker):
     assert dep_base != "", (
         "_maybe_inherit_base must not overwrite dependent base_branch with empty "
         "string when foundation has no base_branch"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
+    """Auto-completing an exhausted direction reconciles the problem-model gap.
+
+    When apply_post_spawn_state auto-completes a direction (via the dedup-deadlock
+    exhaustion path), any gap in project.problem_model whose active_moves contains
+    that direction id must have it pruned out (moved to past_moves) after the call.
+    This mirrors the invariant enforced by strategic and zombie retirements.
+
+    Acceptance requirement: test_exhaustion_autocomplete_reconciles_gap_active_moves
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-gap-reconcile-test"
+
+    # Two pre-existing dedup-zero history entries to prime the deadlock window.
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-gcr-old1",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 2,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-gcr-old2",
+            "tasks_created": 0,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 1,
+                "word_overlap_dedup": 1,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "no findings",
+        },
+    ]
+    direction = {
+        **_active_direction(direction_id, "Exhausted direction with gap"),
+        "research_history": old_history,
+    }
+
+    # problem_model has a gap with this direction in active_moves
+    gap_id = "g-test-gap-01"
+    initial_problem_model = {
+        "gaps": [
+            {
+                "id": gap_id,
+                "title": "Test gap",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            }
+        ]
+    }
+
+    project = _Project(
+        name="Gap Reconcile Test",
+        user_id="test-user-gcr1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model=initial_problem_model,
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Third dedup-zero cycle — triggers exhaustion auto-complete via deadlock detection.
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],  # findings
+        [],  # child_tasks
+        [],  # deduplicated
+        [],  # insights
+        [],  # direction_notes
+        [],  # direction_proposals
+        1,   # hash_dedup_count — dedup activity in 3rd cycle
+        0,   # word_overlap_count
+        0,   # file_overlap_count
+        0,   # evidence_overlap_count
+        0,   # type_filtered_count
+        0,   # empty_prompt_count
+        "research-branch",
+        "main",
+        0,   # research_depth
+        None,  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    # Direction must be terminally completed.
+    d = project.directions[0]
+    assert d["status"] == "completed", (
+        f"direction must be auto-completed, got {d['status']!r}"
+    )
+
+    # problem_model gap must have direction pruned from active_moves and moved to past_moves.
+    pm = project.problem_model or {}
+    gaps = pm.get("gaps", [])
+    assert gaps, "problem_model must still have gaps list"
+    test_gap = next((g for g in gaps if g.get("id") == gap_id), None)
+    assert test_gap is not None, f"gap {gap_id} must still exist in problem_model"
+
+    active_moves = test_gap.get("active_moves", [])
+    past_moves = test_gap.get("past_moves", [])
+
+    assert direction_id not in active_moves, (
+        f"completed direction {direction_id!r} must be pruned from gap active_moves, "
+        f"got active_moves={active_moves!r}"
+    )
+    assert direction_id in past_moves, (
+        f"completed direction {direction_id!r} must appear in gap past_moves, "
+        f"got past_moves={past_moves!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Criterion propagation: _handle_research_completion wires Direction.criterion_keys
+# into newly spawned Task.criterion_ids.
+# ---------------------------------------------------------------------------
+
+
+@_pytest.mark.asyncio
+async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker):
+    """_handle_research_completion sets criterion_ids on spawned tasks from the
+    parent direction's criterion_keys.  This guards the pre-fetch + assignment
+    path that was added alongside Direction.criterion_keys — a manually
+    constructed Task would not catch a regression here."""
+    from app.models import Direction as _Direction, ReleaseVersion
+    from app import acceptance_criteria as _ac
+    from test_autonomous_research import _active_direction, _patch_research_externals
+
+    direction_id = "d-crit-prop-01"
+    direction_data = _active_direction(direction_id, "Criterion propagation direction")
+    project = _Project(
+        name="CritProp Parent",
+        user_id="test-user-crit",
+        autonomous_enabled=True,
+        directions=[direction_data],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a release version and a criterion for it.
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    criterion = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="All endpoints documented",
+        created_by="strategist",
+    )
+
+    # Create a Direction ORM row with criterion_keys set (as the link-direction
+    # endpoint would produce).
+    dir_row = _Direction(
+        project_id=project.id,
+        direction_key=direction_id,
+        data=direction_data,
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    await db_session.commit()
+
+    # Build a research task whose context carries the direction_id so
+    # _parent_direction_id is set during research_completion processing.
+    task = _Task(
+        project_id=project.id,
+        title="Research: Criterion propagation direction",
+        payloads=[{"type": "research", "directions": [direction_data], "base_branch": "main"}],
+        context={"research_depth": 0, "direction_id": direction_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    finding = {
+        "title": "Add endpoint docs",
+        "description": "Document the REST API",
+        "prompt": "Add OpenAPI docs for all endpoints",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "direction_id": direction_id,
+    }
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health", return_value=(False, None)
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "expected exactly one spawned child task"
+    child = children[0]
+    assert child.criterion_ids == [criterion.criterion_key], (
+        f"spawned task must inherit criterion_ids from parent direction; "
+        f"got {child.criterion_ids!r}"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_criterion_ids_propagated_from_finding_direction(db_session, mocker):
+    """When a finding carries its own direction_id (cross-direction spawn),
+    _handle_research_completion must load criterion_keys for THAT direction —
+    not just the parent direction — and set them on the spawned task."""
+    from app.models import Direction as _Direction, ReleaseVersion
+    from app import acceptance_criteria as _ac
+    from test_autonomous_research import _active_direction, _patch_research_externals
+
+    parent_dir_id = "d-crit-parent-02"
+    child_dir_id = "d-crit-child-02"
+
+    parent_direction_data = _active_direction(parent_dir_id, "Parent direction")
+    child_direction_data = _active_direction(child_dir_id, "Child direction")
+
+    project = _Project(
+        name="CritProp CrossDir",
+        user_id="test-user-crit2",
+        autonomous_enabled=True,
+        directions=[parent_direction_data, child_direction_data],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Criterion is linked to the CHILD direction (the finding-level direction).
+    criterion = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Child direction criterion",
+        created_by="strategist",
+    )
+    child_dir_row = _Direction(
+        project_id=project.id,
+        direction_key=child_dir_id,
+        data=child_direction_data,
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    # Parent direction has NO criterion_keys.
+    parent_dir_row = _Direction(
+        project_id=project.id,
+        direction_key=parent_dir_id,
+        data=parent_direction_data,
+        status="active",
+        criterion_keys=[],
+    )
+    db_session.add(child_dir_row)
+    db_session.add(parent_dir_row)
+    await db_session.commit()
+
+    task = _Task(
+        project_id=project.id,
+        title="Research: Parent direction",
+        payloads=[
+            {"type": "research", "directions": [parent_direction_data], "base_branch": "main"}
+        ],
+        context={"research_depth": 0, "direction_id": parent_dir_id},
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # The finding references the child direction (cross-direction spawn).
+    finding = {
+        "title": "Implement child feature",
+        "description": "Child direction work",
+        "prompt": "Implement the child direction feature",
+        "priority": "medium",
+        "scope": "small",
+        "risk": "low",
+        "type": "improvement",
+        "direction_id": child_dir_id,
+    }
+    _patch_research_externals(mocker)
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[finding])
+    mocker.patch(
+        "app.research_completion._assess_project_spawn_health", return_value=(False, None)
+    )
+
+    await _handle_research_completion(task, "", db_session)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1, "expected exactly one spawned child task"
+    child = children[0]
+    assert child.criterion_ids == [criterion.criterion_key], (
+        f"spawned task must inherit criterion_ids from the finding's direction "
+        f"(cross-direction); got {child.criterion_ids!r}"
+    )
+
+
+@_pytest.mark.asyncio
+async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_session):
+    """apply_post_spawn_state must subtract total_stranded_prs_merged from aggregate total.
+
+    When stranded merges have been evicted into history_aggregate, the aggregate term
+    in the saturated auto-complete gate must apply the same credit-gate discount as
+    research_completion._stamp_no_findings_refractory and
+    strategic_completion._compute_lifetime_burn_metrics.
+
+    Case 1: total_verified=3, total_stranded=3 → credit-eligible=0 → must NOT auto-complete.
+    Case 2: total_verified=5, total_stranded=2 → credit-eligible=3 → must auto-complete.
+    """
+    from datetime import datetime, timedelta
+
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-agg-stranded-apply"
+
+    # Two prior genuine (non-dedup-zero) cycles with tasks_created=1.
+    # When apply_post_spawn_state adds a no-findings entry (tasks_created=0,
+    # no dedup) for the 3rd cycle, _compute_saturation sees 3 consecutive
+    # genuine low-output cycles → possibly_saturated=True → triggers auto-complete check.
+    old_history = [
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "task_id": "t-agg-str-1",
+            "tasks_created": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "test cycle 1",
+        },
+        {
+            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "task_id": "t-agg-str-2",
+            "tasks_created": 1,
+            "findings_produced": 0,
+            "filter_breakdown": {
+                "hash_dedup": 0,
+                "word_overlap_dedup": 0,
+                "file_overlap_dedup": 0,
+                "evidence_overlap_dedup": 0,
+                "type_filtered": 0,
+                "empty_prompt": 0,
+            },
+            "summary": "test cycle 2",
+        },
+    ]
+
+    # Case 1: 3 verified, 3 stranded → credit-eligible = max(0, 3-3) = 0 → NOT auto-complete.
+    agg_all_stranded = {
+        "total_prs_merged": 3,
+        "total_verified_prs_merged": 3,
+        "total_stranded_prs_merged": 3,
+        "total_cycles": 5,
+    }
+    direction = {
+        **_active_direction(direction_id, "Aggregate stranded test direction"),
+        "research_history": list(old_history),
+        "history_aggregate": agg_all_stranded,
+    }
+    project = _Project(
+        name="Aggregate Stranded Test",
+        user_id="test-user-agg-str1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    assert d.get("status") != "completed", (
+        "Direction whose only aggregate merges are confirmed-stranded must NOT be "
+        "auto-completed via apply_post_spawn_state"
+    )
+
+    # Case 2: 5 verified, 2 stranded → credit-eligible = max(0, 5-2) = 3 → auto-complete.
+    direction_id2 = "d-agg-stranded-apply2"
+    agg_partial_stranded = {
+        "total_prs_merged": 5,
+        "total_verified_prs_merged": 5,
+        "total_stranded_prs_merged": 2,
+        "total_cycles": 5,
+    }
+    direction2 = {
+        **_active_direction(direction_id2, "Aggregate partial stranded test direction"),
+        "research_history": list(old_history),
+        "history_aggregate": agg_partial_stranded,
+    }
+    project2 = _Project(
+        name="Aggregate Partial Stranded Test",
+        user_id="test-user-agg-str2",
+        autonomous_enabled=True,
+        directions=[direction2],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    task2 = await _make_research_task(project2, direction2, db_session)
+    task2.context = {**(task2.context or {}), "direction_id": direction_id2}
+    db_session.add(task2)
+    await db_session.commit()
+
+    await apply_post_spawn_state(
+        db_session,
+        task2,
+        [],   # findings
+        [],   # child_tasks
+        [],   # deduplicated
+        [],   # insights
+        [],   # direction_notes
+        [],   # direction_proposals
+        0,    # hash_dedup_count
+        0,    # word_overlap_count
+        0,    # file_overlap_count
+        0,    # evidence_overlap_count
+        0,    # type_filtered_count
+        0,    # empty_prompt_count
+        "research-branch",
+        "main",
+        0,    # research_depth
+        None, # parent_research_task_id
+    )
+    await db_session.refresh(project2)
+
+    d2 = project2.directions[0]
+    assert d2.get("status") == "completed", (
+        "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) "
+        "must auto-complete via apply_post_spawn_state"
     )

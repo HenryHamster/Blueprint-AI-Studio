@@ -165,9 +165,18 @@ Before pushing, ensure these invariants pass:
    - `EXPECTED_SCHEMA_REVISION` in `backend/app/main.py` must match latest Alembic migration
    - If outdated: Update `EXPECTED_SCHEMA_REVISION` to the latest revision
 
-3. **Import guards** (`test_invariants.py::test_*_import_guard`)
+3. **Migration chain shape** (`test_invariants.py::test_gapped_linear_chain_validates_clean`)
+   - Non-contiguous Alembic revision ids are valid when the chain remains linear
+   - Gaps such as `0354 -> 0365` are normal branch-cut artifacts, not missing migrations
+   - Do not edit committed files in `backend/alembic/versions/` to annotate a gap; document or test the policy outside migration history
+
+4. **Import guards** (`test_invariants.py::test_*_import_guard`)
    - Certain symbols must be importable from their canonical location
    - Example: `MAX_REVIEW_FIX_ITERATIONS` must be importable from `app.review_pipeline`
+
+5. **Release criterion coverage** (`test_release_qualifier.py::TestBlindMergeGradeBlock`)
+   - `criterion_coverage_incomplete` means at least one version acceptance criterion is not fully covered
+   - Uncovered criteria and stuck/partial criteria both block promotion until remapped to active direction work or explicitly attested by an operator
 
 ### Common Test Patterns
 

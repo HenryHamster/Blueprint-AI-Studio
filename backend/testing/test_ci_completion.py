@@ -3811,6 +3811,90 @@ async def test_orig_positive_ancestry_stamps_as_before(db_session, mocker):
     alert_mock.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_orig_ancestry_gate_degrades_to_indeterminate_on_github_exception(
+    db_session, mocker
+):
+    """When is_ancestor_of raises (e.g. network timeout), the orig ancestry gate
+    must degrade to indeterminate and preserve flag-trust: the orig still receives
+    pr_merged=True and must NOT be stranded or alert.
+
+    A transient GitHub exception in the ancestry check must behave identically to
+    is_ancestor_of returning None — the last-known credit state is preserved and
+    the gate re-checks on the next cycle.
+    """
+    from app.landed_signal import STRANDED_LANDING_REASON_KEY
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"merged": True, "merge_commit_sha": "deadbeefcafe1234"},
+    )
+    # Simulate a transient GitHub API failure on the ancestry check
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new_callable=AsyncMock,
+        side_effect=Exception("connection timeout"),
+    )
+
+    project = Project(name="Ancestry gate exception", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Original create task",
+        payloads=[{"type": "create", "prompt": "do something"}],
+        context={},
+        vm_instance_id="agent-vm-orig-exc",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(orig_task)
+    ctx = orig_task.context or {}
+    # Exception in is_ancestor_of must degrade to indeterminate → preserves flag-trust
+    assert ctx.get("pr_merged") is True, (
+        "Ancestry gate must preserve pr_merged when is_ancestor_of raises — "
+        "a transient GitHub exception must degrade to indeterminate, not strand the task"
+    )
+    assert STRANDED_LANDING_REASON_KEY not in ctx, (
+        "A transient GitHub exception must NOT record a durable stranded marker"
+    )
+    alert_mock.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Guard: ci_errors must never produce an empty code block in the PR comment
 # ---------------------------------------------------------------------------
@@ -4343,8 +4427,9 @@ async def test_review_wait_started_set_on_first_entry_not_overwritten(
 
 @pytest.mark.asyncio
 async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
-    """After the 60-minute backstop threshold, requires_approval and
-    review_wait_escalated are set, and a failure alert is created."""
+    """After the 60-minute backstop threshold, when respawn is suppressed,
+    requires_approval and review_wait_escalated are set, and a failure alert
+    is created."""
     from datetime import datetime, timedelta
 
     from app.ci_completion import handle_ci_completion
@@ -4353,6 +4438,12 @@ async def test_review_wait_backstop_fires_after_timeout(db_session, mocker):
         "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
     )
     mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    # Respawn-first runs before the human gate; mock it as suppressed
+    # (None, False) so the requires_approval fallback is what we assert here.
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
 
     project = Project(name="Review wait backstop", user_id="test-user")
     db_session.add(project)
@@ -4433,6 +4524,223 @@ async def test_review_wait_backstop_does_not_refire(db_session, mocker):
     alert_mock.assert_not_called()
 
 
+def _make_fake_review_task(project_id):
+    """A minimal stand-in for the freshly spawned review task."""
+    return Task(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        title="Respawned review",
+        payloads=[{"type": "review"}],
+        status=TaskStatus.QUEUED,
+    )
+
+
+@pytest.mark.asyncio
+async def test_orphan_review_wait_respawns_review(db_session, mocker):
+    """When CI passed but review approval never arrived past the backstop
+    deadline, a fresh review task is respawned BEFORE gating on a human:
+    requires_approval stays False, no failure alert fires, and the respawn is
+    recorded in review_loop with the window reset for the new reviewer."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+
+    project = Project(name="Review wait respawn", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    fake_review = _make_fake_review_task(project.id)
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(fake_review, True)),
+    )
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    # A fresh review was spawned with task_type "review".
+    spawn_mock.assert_awaited_once()
+    spawn_args = spawn_mock.await_args
+    assert spawn_args.args[1] == "review", "must respawn a review task"
+
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_respawned") is True
+    assert review_loop.get("review_wait_respawn_task_id") == str(fake_review.id)
+    assert review_loop.get("review_wait_respawn_count") == 1
+    # Window reset for the new reviewer — review_wait_started moved forward.
+    assert review_loop.get("review_wait_started") != old_started
+    # No human gate, no orphan escalation, no alert.
+    assert task.requires_approval is not True, (
+        "requires_approval must NOT be set when a review respawn succeeds"
+    )
+    assert review_loop.get("review_wait_escalated") is not True
+    alert_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_respawn_suppressed_falls_back_to_approval(
+    db_session, mocker
+):
+    """If respawn is suppressed (None, False) — cap/merged/closed — the human
+    gate fallback fires: requires_approval + review_wait_escalated + one alert."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(None, False)),
+    )
+
+    project = Project(name="Review wait respawn suppressed", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_respawned") is not True
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_respawn_capped(db_session, mocker):
+    """A second timeout with review_wait_respawn_count already at the cap must
+    NOT respawn again — it falls back to the human gate."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(uuid.uuid4()), True)),
+    )
+
+    project = Project(name="Review wait respawn capped", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        # Already respawned once (cap is 1) — next timeout must gate.
+        ci_loop_extra={
+            "review_wait_started": old_started,
+            "review_wait_respawn_count": 1,
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_review_wait_auto_respawn_disabled(db_session, mocker):
+    """With review_wait_auto_respawn=False, the legacy immediate
+    requires_approval behavior is preserved (no respawn attempt)."""
+    from datetime import datetime, timedelta
+
+    from app.ci_completion import handle_ci_completion
+
+    alert_mock = mocker.patch(
+        "app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock
+    )
+    mocker.patch("app.broadcast.broadcast_to_project", new=AsyncMock(return_value=None))
+    spawn_mock = mocker.patch(
+        "app.review_pipeline._spawn_pipeline_task",
+        new=AsyncMock(return_value=(_make_fake_review_task(uuid.uuid4()), True)),
+    )
+    # Disable auto-respawn via runtime config.
+    from app.shared_state import runtime_config
+
+    mocker.patch.dict(runtime_config, {"review_wait_auto_respawn": False})
+
+    project = Project(name="Review wait respawn disabled", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    old_started = (datetime.utcnow() - timedelta(minutes=70)).isoformat()
+    task = _make_task_no_review_approved(
+        db_session,
+        project,
+        ci_loop_extra={"review_wait_started": old_started},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    ci_result = {"status": "completed", "conclusion": "success"}
+    result = await handle_ci_completion(
+        task, ci_result, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    spawn_mock.assert_not_awaited()
+    await db_session.refresh(task)
+    review_loop = (task.context or {}).get("review_loop", {})
+    assert review_loop.get("review_wait_escalated") is True
+    assert task.requires_approval is True
+    alert_mock.assert_called_once()
+
+
 # ---------------------------------------------------------------------------
 # Non-terminal check-run status: waiting / requested / pending
 # ---------------------------------------------------------------------------
@@ -4501,3 +4809,101 @@ async def test_waiting_check_run_does_not_resolve_green(mocker, non_terminal_sta
     assert result["conclusion"] != "success" or result["status"] != "completed", (
         "aggregate must not resolve green while a check-run is still non-terminal"
     )
+
+
+# ---------------------------------------------------------------------------
+# CriterionEvidence recorded through _attempt_merge_with_retry_and_escalation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker):
+    """CriterionEvidence rows are persisted through the full merge path.
+
+    Exercises the production code path at ci_completion.py:655 — the block that
+    records task_merge evidence for each criterion_id on the original task after
+    a PR lands on the integration branch.  A regression that removes or bypasses
+    that block would fail this test, unlike unit tests that directly call
+    get_criterion_by_key/record_evidence.
+    """
+    from app import acceptance_criteria as ac
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    # Merge succeeds on the first attempt
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "abc123merge"},
+    )
+    # Ancestry gate returns "indeterminate" (no GitHub credentials) → record_pr_merged stays True
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        new=AsyncMock(return_value="indeterminate"),
+    )
+
+    project = Project(name="CriterionEvidence merge test", user_id="test-user-ce")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create an open release version and a criterion
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Feature ships green",
+        created_by="strategist",
+    )
+
+    # Create the original (implementation) task with criterion_ids set
+    orig_task = Task(
+        project_id=project.id,
+        title="Implement feature",
+        payloads=[{"type": "create", "prompt": "build the feature", "base_branch": "main"}],
+        context={"direction_id": "d-ce-test"},
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # Create the CI review task pointing to the original task
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=99,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "merge should have succeeded"
+
+    # Re-query criterion evidence using a fresh session path (dedicated session
+    # in _attempt_merge_with_retry_and_escalation commits via AsyncSessionLocal,
+    # which is patched to the test engine by the autouse fixture)
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) >= 1, (
+        "At least one CriterionEvidence row must be persisted for the merged task"
+    )
+    task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
+    assert task_merge_ev[0].source_id == str(orig_task.id)
+    assert task_merge_ev[0].detail == {"pr": 99}

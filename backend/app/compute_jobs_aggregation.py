@@ -13,6 +13,7 @@ from datetime import timedelta
 from sqlalchemy import func
 from sqlmodel import select
 
+from app.database import resolve_dialect_name
 from app.models import ComputeJob, ComputeJobStatus, Task
 from app.time_utils import _utcnow
 
@@ -22,6 +23,28 @@ _COMPUTE_JOB_ACTIVE_STATUSES = [
     ComputeJobStatus.RUNNING,
     ComputeJobStatus.POLLING,
 ]
+
+
+def _criterion_met_expr(session):
+    if resolve_dialect_name(session) == "sqlite":
+        return func.json_extract(
+            Task.plan_output,
+            "$.compute_result.criterion.met",
+        ).label("met_value")
+    return func.jsonb_extract_path_text(
+        Task.plan_output,
+        "compute_result",
+        "criterion",
+        "met",
+    ).label("met_value")
+
+
+def _criterion_is_met(raw_value) -> bool:
+    if raw_value is True:
+        return raw_value
+    if isinstance(raw_value, int) and raw_value == 1:
+        return True
+    return raw_value == "true"
 
 
 async def aggregate_compute_jobs_summary(
@@ -125,16 +148,12 @@ async def aggregate_criterion_summary(
         (ComputeJob.status.in_(_COMPUTE_JOB_ACTIVE_STATUSES) | terminal_filter),
         ComputeJob.task_id.is_not(None),
     ]
-    # jsonb_extract_path_text returns the text value at the given path, or NULL
-    # when any key along the path is absent.  A non-NULL result means the
-    # criterion was evaluated; "true"/"false" records whether it was met.
+    # Postgres and SQLite expose JSON path reads through different functions.
+    # A non-NULL result means the criterion was evaluated; true/false records
+    # whether it was met.
     rows = (
         await session.execute(
-            select(
-                func.jsonb_extract_path_text(
-                    Task.plan_output, "compute_result", "criterion", "met"
-                ).label("met_text")
-            )
+            select(_criterion_met_expr(session))
             .select_from(ComputeJob)
             .join(Task, ComputeJob.task_id == Task.id)
             .where(*window_filter)
@@ -142,8 +161,8 @@ async def aggregate_criterion_summary(
         )
     ).all()
 
-    criterion_measured = sum(1 for row in rows if row.met_text is not None)
-    criterion_met = sum(1 for row in rows if row.met_text == "true")
+    criterion_measured = sum(1 for row in rows if row.met_value is not None)
+    criterion_met = sum(1 for row in rows if _criterion_is_met(row.met_value))
     return {"criterion_measured": criterion_measured, "criterion_met": criterion_met}
 
 
@@ -193,19 +212,17 @@ async def aggregate_all_compute_jobs_summary(
 
     criterion_rows = (
         await session.execute(
-            select(
-                func.jsonb_extract_path_text(
-                    Task.plan_output, "compute_result", "criterion", "met"
-                ).label("met_text")
-            )
+            select(_criterion_met_expr(session))
             .select_from(ComputeJob)
             .join(Task, ComputeJob.task_id == Task.id)
             .where(ComputeJob.project_id == project_id, ComputeJob.task_id.is_not(None))
             .group_by(Task.id, Task.plan_output)
         )
     ).all()
-    criterion_measured = sum(1 for row in criterion_rows if row.met_text is not None)
-    criterion_met = sum(1 for row in criterion_rows if row.met_text == "true")
+    criterion_measured = sum(1 for row in criterion_rows if row.met_value is not None)
+    criterion_met = sum(
+        1 for row in criterion_rows if _criterion_is_met(row.met_value)
+    )
 
     return {
         "total_jobs": total,

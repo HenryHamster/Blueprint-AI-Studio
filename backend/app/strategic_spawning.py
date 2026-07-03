@@ -21,7 +21,9 @@ from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import (
     declared_merged_count,
+    discount_stranded_pr_from_direction_credit,
     proven_merged_count,
+    reachable_merged_count,
     verified_merged_count,
 )
 from app.direction_mode import mode_prompt_hint, normalized_recommended_mode
@@ -43,7 +45,7 @@ from app.strategic_payload_compaction import (
     _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
-    _direction_activity_score,
+    _direction_activity_score,  # noqa: F401 — re-exported for test imports
     _enrich_drift_with_trend,
     _summarize_directions,
     _summarize_drift_signals,
@@ -96,7 +98,14 @@ from app.shared_state import (
 )
 from app.time_utils import _utcnow, _coerce_naive_utc
 from app.vision_merge import REJECTED_EDITS_KEY
-from app.landed_signal import LANDED_ON_INTEGRATION_KEY
+from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landing
+from app.project_message_projection import agent_thread_message_dict
+from app.workbench_state import (
+    STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
+    strategic_local_continuation_status_from_vision,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +174,116 @@ async def _load_local_runner_status(
         "active_total": active_total,
         "active_gpu": active_gpu,
     }
+
+
+def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
+    """Return project vision without backend-only operator session metadata."""
+
+    visible = dict(vision or {})
+    visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
+    return visible
+
+
+def _local_runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
+    task_types = (runner.capabilities or {}).get("task_types", "all")
+    if task_types == "all":
+        return True
+    if isinstance(task_types, (list, tuple, set)):
+        return task_type in task_types
+    return False
+
+
+def _local_runner_is_live(runner: LocalRunner) -> bool:
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    return (
+        runner.status == "active"
+        and runner.last_seen_at is not None
+        and runner.last_seen_at > cutoff
+    )
+
+
+def _local_runner_agent_available(runner: LocalRunner) -> bool:
+    return (runner.capabilities or {}).get("agent_available") is not False
+
+
+async def _resolve_local_continuation_runner_affinity(
+    session: AsyncSession,
+    project_id: Any,
+    task_type: str,
+) -> str | None:
+    """Return advisory runner affinity for fresh continuous local Strategic mode."""
+
+    current_vision = (
+        await session.execute(select(Project.vision).where(Project.id == project_id))
+    ).scalar_one_or_none()
+    status = strategic_local_continuation_status_from_vision(current_vision or {})
+    if not status.get("enabled") or not status.get("fresh"):
+        return None
+
+    rows = (
+        await session.execute(
+            select(LocalRunner)
+            .where(
+                LocalRunner.project_id == project_id,
+                LocalRunner.status != "deleted",
+            )
+            .order_by(
+                LocalRunner.last_seen_at.desc(),
+                LocalRunner.created_at.desc(),
+            )
+        )
+    ).scalars().all()
+    live_capable = [
+        runner
+        for runner in rows
+        if _local_runner_is_live(runner)
+        and _local_runner_handles_task_type(runner, task_type)
+        and _local_runner_agent_available(runner)
+    ]
+    if not live_capable:
+        return None
+
+    preferred_runner_id = status.get("preferred_runner_id")
+    if isinstance(preferred_runner_id, str) and preferred_runner_id.strip():
+        preferred_runner_id = preferred_runner_id.strip()
+        for runner in live_capable:
+            if str(runner.id) == preferred_runner_id:
+                return preferred_runner_id
+
+    return str(live_capable[0].id)
+
+
+async def _resolve_local_continuation_runner_intent(
+    session: AsyncSession,
+    project_id: Any,
+    task_type: str,
+) -> dict[str, Any]:
+    """Return dispatch context for fresh continuous local Strategic mode.
+
+    A fresh continuation marker is a hard local intent, even when no runner is
+    live at spawn time. The runner id remains advisory within the local fleet;
+    the explicit required flag is what prevents cloud fallback later.
+    """
+
+    current_vision = (
+        await session.execute(select(Project.vision).where(Project.id == project_id))
+    ).scalar_one_or_none()
+    status = strategic_local_continuation_status_from_vision(current_vision or {})
+    if not status.get("enabled") or not status.get("fresh"):
+        return {}
+
+    context: dict[str, Any] = {
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+    }
+    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
+        session,
+        project_id,
+        task_type,
+    )
+    if preferred_runner_target_id:
+        context["preferred_runner_target_id"] = preferred_runner_target_id
+    return context
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -1309,6 +1428,9 @@ _CAPABILITY_DOMAIN_KEYWORD_BUCKETS: dict[str, list[str]] = {
 # timeout caps the worst case of a single hung GitHub request.
 _ANCESTRY_CONCURRENCY = 6
 _ANCESTRY_CALL_TIMEOUT_S = 15.0
+# Matches an 8-hex-char short SHA in prose, but not the hex suffix of a direction
+# ID (e.g. 'd-f0224ab4') — the negative lookbehind suppresses matches preceded by '-'.
+_QUAL_SHA_PAT = re.compile(r"(?<!-)\b([0-9a-f]{8})\b")
 
 
 def _build_cycle_start_reconciliation(
@@ -1318,6 +1440,7 @@ def _build_cycle_start_reconciliation(
     held_by_direction: dict[str, int] | None = None,
     per_direction_delta: list[dict] | None = None,
     running_update: str | None = None,
+    last_qual: dict | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -1441,6 +1564,7 @@ def _build_cycle_start_reconciliation(
     # Blocked gaps are still open problems with no direction working them, so
     # they are orphan-eligible too — just flagged with their status.
     orphaned_gaps: list[dict] = []
+    staffed_but_deferred: list[dict] = []
     deferred_gap_count = 0
     for g in gaps:
         if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
@@ -1448,6 +1572,16 @@ def _build_cycle_start_reconciliation(
         gid = str(g.get("id") or "")
         staffed = bool(gid and gid in referenced_gap_ids)
         if staffed:
+            if g.get("deferral"):
+                staffed_but_deferred.append(
+                    {
+                        "gap_id": gid,
+                        "name": _label(g.get("name")),
+                        "priority": g.get("priority"),
+                        "status": g.get("status"),
+                        "deferral": g.get("deferral"),
+                    }
+                )
             continue
         if g.get("deferral"):
             deferred_gap_count += 1
@@ -1674,15 +1808,46 @@ def _build_cycle_start_reconciliation(
                     {"direction_id": ref_id, "cited_in": field_name}
                 )
 
+    # 7. Qualification prose-drift: prose cites a short SHA that does not match
+    # the current active qualification candidate.  When the strategist embeds a
+    # specific candidate commit in current_focus or running_update, that SHA
+    # becomes stale the moment the qualification advances.  Scans the same prose
+    # fields as the phantom-direction-ref check; only fires when last_qual carries
+    # a candidate_sha so cold-start projects are never flagged.
+    qualification_prose_drift: list[dict] = []
+    _active_candidate_short: str | None = None
+    if isinstance(last_qual, dict):
+        _cand = last_qual.get("candidate_sha")
+        if isinstance(_cand, str) and len(_cand) >= 8:
+            _active_candidate_short = _cand[:8]
+            _seen_stale: set[str] = set()
+            for field_name, prose in _prose_to_check:
+                for m in _QUAL_SHA_PAT.finditer(prose):
+                    found_sha = m.group(1)
+                    if found_sha == _active_candidate_short:
+                        continue
+                    if found_sha in _seen_stale:
+                        continue
+                    _seen_stale.add(found_sha)
+                    qualification_prose_drift.append(
+                        {
+                            "stale_sha": found_sha,
+                            "active_candidate_sha": _active_candidate_short,
+                            "cited_in": field_name,
+                        }
+                    )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
         and not capability_contradictions
         and not orphaned_gaps
+        and not staffed_but_deferred
         and not deferred_gap_count
         and not stale_active_moves
         and not merge_accounting
         and not phantom_direction_refs
+        and not qualification_prose_drift
     ):
         return None
 
@@ -1693,11 +1858,13 @@ def _build_cycle_start_reconciliation(
 
     capped_caps, caps_total = _cap(capability_contradictions)
     capped_orphans, orphans_total = _cap(orphaned_gaps)
+    capped_staffed_deferred, staffed_deferred_total = _cap(staffed_but_deferred)
     capped_ungrounded, ungrounded_total = _cap(ungrounded_directions)
     capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
+    capped_qual_drift, qual_drift_total = _cap(qualification_prose_drift)
     # Cap each surfaced direction's not-landed title list too, preserving the
     # true count (``not_landed``) so the renderer can show "+N more".
     for m in capped_merge:
@@ -1712,15 +1879,18 @@ def _build_cycle_start_reconciliation(
     return {
         "capability_contradictions": capped_caps,
         "orphaned_gaps": capped_orphans,
+        "staffed_but_deferred": capped_staffed_deferred,
         "ungrounded_directions": capped_ungrounded,
         "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
         "phantom_direction_refs": capped_phantoms,
+        "qualification_prose_drift": capped_qual_drift,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
             "orphaned_gaps": len(capped_orphans) + orphans_total,
+            "staffed_but_deferred": len(capped_staffed_deferred) + staffed_deferred_total,
             "ungrounded_directions": len(capped_ungrounded) + ungrounded_total,
             "stale_active_moves": len(capped_stale) + stale_total,
             "deferred_gaps": deferred_gap_count,
@@ -1739,6 +1909,7 @@ def _build_cycle_start_reconciliation(
             "merge_not_landed": merge_not_landed_total,
             "merge_unverifiable": merge_unverifiable_total,
             "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
+            "qualification_prose_drift": len(capped_qual_drift) + qual_drift_total,
         },
     }
 
@@ -2172,6 +2343,22 @@ _CRITICAL_OPEN_MESSAGE_TYPES = (
     MessageType.BUG_REPORT.value,
     MessageType.BLOCKER.value,
 )
+_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT = 30
+_OPERATOR_CONTEXT_REQUESTS_KEEP = 6
+_OPERATOR_CONTEXT_REFS_KEEP = 12
+_OPERATOR_CONTEXT_REF_SCAN_LIMIT = 24
+_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT = 24
+_OPERATOR_CONTEXT_FROM_TYPES = ("user", "operator")
+_OPERATOR_CONTEXT_TARGET_KEYS = (
+    "surface",
+    "section",
+    "task_id",
+    "message_id",
+    "direction_id",
+    "document_id",
+    "artifact_id",
+    "cycle_id",
+)
 
 
 def _open_message_survival_key(msg: dict) -> tuple:
@@ -2237,6 +2424,247 @@ def _summarize_open_messages(messages: list) -> list:
     critical inbox items survive budget pressure instead of vanishing.
     """
     return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
+
+
+def _operator_context_text(
+    value: Any,
+    *,
+    max_chars: int,
+    raw_max_chars: int | None = None,
+) -> str | None:
+    if not isinstance(value, str):
+        return None
+    raw_max = raw_max_chars if raw_max_chars is not None else max_chars * 4
+    if len(value) > raw_max:
+        return None
+    text = " ".join(value.strip().split())
+    if not text:
+        return None
+    return text[:max_chars]
+
+
+def _operator_context_ref(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
+    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
+    if not kind or not ref_id:
+        return None
+    ref: dict[str, str] = {"kind": kind, "id": ref_id}
+    label = _operator_context_text(
+        raw.get("label"), max_chars=180, raw_max_chars=720
+    )
+    if label:
+        ref["label"] = label
+    return ref
+
+
+def _operator_context_target(raw: Any) -> dict[str, str] | None:
+    if not isinstance(raw, dict):
+        return None
+    target: dict[str, str] = {}
+    for key in _OPERATOR_CONTEXT_TARGET_KEYS:
+        value = _operator_context_text(
+            raw.get(key), max_chars=180, raw_max_chars=720
+        )
+        if value:
+            target[key] = value
+    return target or None
+
+
+def _operator_context_descriptor(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
+    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
+    if not kind or not ref_id:
+        return None
+
+    descriptor: dict[str, Any] = {"kind": kind, "id": ref_id}
+    label = _operator_context_text(
+        raw.get("label"), max_chars=180, raw_max_chars=720
+    )
+    if label:
+        descriptor["label"] = label
+    summary = _operator_context_text(
+        raw.get("summary"), max_chars=220, raw_max_chars=880
+    )
+    if summary:
+        descriptor["summary"] = summary
+    status = _operator_context_text(
+        raw.get("status"), max_chars=80, raw_max_chars=320
+    )
+    if status:
+        descriptor["status"] = status
+    target = _operator_context_target(raw.get("target"))
+    if target:
+        descriptor["target"] = target
+    return descriptor
+
+
+def _operator_context_descriptor_map(
+    snapshot: dict[str, Any],
+) -> dict[tuple[str, str], dict[str, Any]]:
+    raw_descriptors = snapshot.get("selected_ref_descriptors")
+    if not isinstance(raw_descriptors, list):
+        return {}
+    descriptors: dict[tuple[str, str], dict[str, Any]] = {}
+    for raw in raw_descriptors[:_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT]:
+        descriptor = _operator_context_descriptor(raw)
+        if not descriptor:
+            continue
+        key = (descriptor["kind"], descriptor["id"])
+        if key not in descriptors:
+            descriptors[key] = descriptor
+    return descriptors
+
+
+def _operator_context_package_descriptor(raw: Any) -> dict[str, Any] | None:
+    descriptor = _operator_context_descriptor(raw)
+    if descriptor:
+        return descriptor
+    if not isinstance(raw, dict):
+        return None
+    package_id = _operator_context_text(
+        raw.get("id") or raw.get("context_package_id"),
+        max_chars=180,
+        raw_max_chars=720,
+    )
+    if not package_id:
+        return None
+    result: dict[str, Any] = {"id": package_id}
+    label = _operator_context_text(
+        raw.get("label") or raw.get("title"),
+        max_chars=180,
+        raw_max_chars=720,
+    )
+    if label:
+        result["label"] = label
+    summary = _operator_context_text(
+        raw.get("summary"), max_chars=220, raw_max_chars=880
+    )
+    if summary:
+        result["summary"] = summary
+    status = _operator_context_text(
+        raw.get("status"), max_chars=80, raw_max_chars=320
+    )
+    if status:
+        result["status"] = status
+    return result
+
+
+def _operator_context_created_sort_value(message: ProjectMessage) -> tuple:
+    created_at = message.created_at or datetime.min
+    return (created_at, str(message.id))
+
+
+def _build_operator_context_refs_from_messages(
+    messages: list[ProjectMessage],
+) -> list[dict[str, Any]]:
+    """Promote recent operator-selected Strategic context into pointer entries.
+
+    The source snapshots were already sanitized when ProjectMessage rows were
+    created. This bridge still treats the JSON defensively because rows may be
+    legacy or manually inserted: it copies only pointer-shaped fields, caps all
+    strings/counts, dedupes repeated refs globally, and never includes bodies,
+    logs, or arbitrary nested context.
+    """
+    requests: list[dict[str, Any]] = []
+    seen_refs: set[tuple[str, str]] = set()
+    seen_packages: set[str] = set()
+    total_refs = 0
+
+    for message in sorted(
+        (
+            m
+            for m in messages
+            if getattr(m, "from_type", None) in _OPERATOR_CONTEXT_FROM_TYPES
+        ),
+        key=_operator_context_created_sort_value,
+        reverse=True,
+    ):
+        context = message.context if isinstance(message.context, dict) else {}
+        snapshot = context.get("strategic_session")
+        if not isinstance(snapshot, dict):
+            continue
+
+        descriptors = _operator_context_descriptor_map(snapshot)
+        selected_refs: list[dict[str, Any]] = []
+        raw_refs = snapshot.get("selected_refs")
+        if isinstance(raw_refs, list):
+            for raw_ref in raw_refs[:_OPERATOR_CONTEXT_REF_SCAN_LIMIT]:
+                if total_refs >= _OPERATOR_CONTEXT_REFS_KEEP:
+                    break
+                ref = _operator_context_ref(raw_ref)
+                if not ref:
+                    continue
+                key = (ref["kind"], ref["id"])
+                if key in seen_refs:
+                    continue
+                seen_refs.add(key)
+                descriptor = descriptors.get(key)
+                if descriptor:
+                    ref = {**ref, "descriptor": descriptor}
+                selected_refs.append(ref)
+                total_refs += 1
+
+        entry: dict[str, Any] = {
+            "source_message_id": str(message.id),
+            "created_at": message.created_at.isoformat()
+            if message.created_at
+            else None,
+            "selected_refs": selected_refs,
+        }
+        for source_key, output_key, max_chars in (
+            ("context_package_id", "context_package_id", 180),
+            ("session_id", "session_id", 180),
+            ("id", "session_id", 180),
+            ("session_started_at", "session_started_at", 80),
+            ("captured_at", "captured_at", 80),
+        ):
+            if output_key in entry:
+                continue
+            value = _operator_context_text(
+                snapshot.get(source_key),
+                max_chars=max_chars,
+                raw_max_chars=max_chars * 4,
+            )
+            if value:
+                entry[output_key] = value
+
+        package_descriptor = _operator_context_package_descriptor(
+            snapshot.get("context_package_descriptor") or snapshot.get("context_package")
+        )
+        if package_descriptor:
+            entry["context_package_descriptor"] = package_descriptor
+
+        package_id = entry.get("context_package_id")
+        has_new_package = isinstance(package_id, str) and package_id not in seen_packages
+        if isinstance(package_id, str):
+            seen_packages.add(package_id)
+
+        if selected_refs or has_new_package or package_descriptor:
+            requests.append(entry)
+        if len(requests) >= _OPERATOR_CONTEXT_REQUESTS_KEEP:
+            break
+
+    return requests
+
+
+async def _fetch_operator_context_refs(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> list[dict[str, Any]]:
+    result = await session.execute(
+        select(ProjectMessage)
+        .where(
+            ProjectMessage.project_id == project_id,
+            ProjectMessage.from_type.in_(_OPERATOR_CONTEXT_FROM_TYPES),
+        )
+        .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id.desc())
+        .limit(_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT)
+    )
+    return _build_operator_context_refs_from_messages(result.scalars().all())
 
 
 def _open_message_citation_summary(context: Any) -> dict:
@@ -2322,15 +2750,7 @@ async def _fetch_open_messages(
     )
     messages = [
         {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "status": m.status,
-            "resolution": m.resolution,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
+            **agent_thread_message_dict(m),
             # Promote the reproduce-on-HEAD citation signal (stored on the
             # message context at ingestion) to the top level so a stale or
             # broken-citation bug report is VISIBLY discounted to the strategist
@@ -2386,6 +2806,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # operator-wins reconciliation loop so the agent reconciles instead of
     # re-proposing overridden values.
     "operator_overrides": {"priority": "medium"},
+    # Recent operator-selected Strategic workbench pointers promoted out of
+    # ProjectMessage.context.strategic_session so selected refs survive when the
+    # conversation thread is trimmed. Already capped and pointer-only.
+    "operator_context_refs": {"priority": "high"},
     # Computed cycle-start reconciliation of the four strategic surfaces
     # (capabilities vs grounding, gaps vs directions, per-direction research
     # pipeline). Conflict-focused and bounded at build time, so it ships whole
@@ -2486,6 +2910,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "summarize": _summarize_version_phase,
         "floor": _version_phase_floor,
     },
+    # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
+    # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
+    # pressure.  High priority so it ships alongside version_phase.
+    "payload_staleness": {"priority": "high"},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
@@ -2502,6 +2930,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "medium",
         "summarize": _summarize_efficiency_snapshot,
     },
+    # CI-compliance signal for the current integration branch HEAD: module-size
+    # guardrail breaches and branch-literal violations. Low priority — advisory
+    # signal that degrades before load-bearing state. Dropped whole under budget;
+    # full detail fetchable via ./fetch ci-compliance.
+    "ci_compliance": {"priority": "low"},
     # Held-directions block: directions that have hit the consecutive-failure
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
@@ -2516,6 +2949,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # draws prerequisite / provides_capability refs from. Small and bounded; medium
     # priority so it survives typical pressure but degrades before load-bearing state.
     "available_capabilities": {"priority": "medium"},
+    # Live local-runner availability (ever_registered, active_total, active_gpu,
+    # require_local_runner). Surfaced only when the project has ever registered a
+    # runner OR declares the enforce-local policy. Medium priority: it is small
+    # (4 scalars) and actionable — the strategist uses it to avoid authoring GPU
+    # experiments that would fall back to billable cloud GPU (or be held
+    # indefinitely when require_local_runner is set).
+    "local_runner_status": {"priority": "medium"},
 }
 
 
@@ -2527,6 +2967,8 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
     "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
+    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context.
+    "operator_context_refs": {"priority": "high"},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
     # per-section content is fetched on demand via POST /api/agent/design-doc.
@@ -3358,6 +3800,16 @@ async def _build_recent_interventions(
                 and len(recent_not_landed_titles) < _RECON_LIST_CAP
             ):
                 recent_not_landed_titles.append(title)
+            if merge_verdict == "verified_not_landed" and (t.context or {}).get(
+                LANDED_ON_INTEGRATION_KEY
+            ) is not False:
+                _had_pr_merged = bool((t.context or {}).get("pr_merged"))
+                mark_stranded_non_landing(
+                    t, reason="cycle_start_reconciliation_ancestry_check"
+                )
+                await discount_stranded_pr_from_direction_credit(
+                    t, session, had_pr_merged=_had_pr_merged
+                )
         if recent_merges_dicts:
             entry["recent_merged_titles"] = recent_merges_dicts[
                 :_RECENT_MERGED_TITLES_CAP
@@ -3922,6 +4374,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # feed (status-filtered query, size-bounded, BUG_REPORT/BLOCKER-prioritized)
     # so this path and the strategic_review path stay unified.
     open_msgs = await _fetch_open_messages(session, project.id)
+    operator_context_refs = await _fetch_operator_context_refs(session, project.id)
 
     # Build shipped_changes_manifest: tasks merged since the last arch review
     shipped_changes_manifest = await _build_shipped_changes_manifest(project, session)
@@ -3959,15 +4412,17 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # design output) so the strategist knows what knowledge already exists and
     # can fetch full bodies on demand — included only when documents exist.
     _knowledge_index = await build_knowledge_index(session, project.id)
+    _dd_compute_sweep_groups = await build_compute_sweep_groups(session, project.id)
 
     payload: dict = pack_under_budget(
         {
             "type": "design_doc_update",
             "design_doc": _design_doc_index(reconciled_design_doc),
             **({"knowledge_index": _knowledge_index} if _knowledge_index else {}),
+            **({"compute_experiment_sweeps": _dd_compute_sweep_groups} if _dd_compute_sweep_groups else {}),
             "proposed_changes": (project.design_doc or {}).get("proposed_changes", []),
             "project_name": project.name,
-            "vision": project.vision or {},
+            "vision": _agent_visible_vision(project.vision),
             **(
                 {"missing_capability_demand": _missing_demand}
                 if _missing_demand_present
@@ -3992,6 +4447,11 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 else {}
             ),
             "open_messages": open_msgs,
+            **(
+                {"operator_context_refs": operator_context_refs}
+                if operator_context_refs
+                else {}
+            ),
             "shipped_changes_manifest": shipped_changes_manifest,
             "base_branch": get_project_integration_branch(project),
             **({"model": doc_model} if doc_model else {}),
@@ -4014,7 +4474,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     # flag on the task context so the Phase 2 chain can re-surface the operator
     # steering directive rather than silently dropping it on architecture cycles.
     operator_steered = strategic_refresh_origin(project.vision) == ORIGIN_OPERATOR
-    task_context: dict = {"strategic_cycle_id": cycle_id}
+    local_runner_intent = await _resolve_local_continuation_runner_intent(
+        session,
+        project.id,
+        "design_doc_update",
+    )
+    task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
     if operator_steered:
         task_context["operator_steered"] = True
         # Persist the operator steering excerpt alongside the flag: the marker is
@@ -4069,6 +4534,52 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
     return True
 
 
+def _freshness_generated_at() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _build_freshness_shas_block(currency: dict) -> dict:
+    """Build a normalized SHA-freshness dict from a resolved candidate-currency dict.
+
+    Takes the ``{"current": bool, "candidate_sha": str, "head_sha": str}`` dict
+    returned by ``_resolve_candidate_currency`` and returns an additive block that
+    exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
+    stale_reason.  payload_compiled_sha is kept for backward-compat with older
+    agent consumers that read it directly.
+    """
+    from datetime import datetime
+
+    is_stale = not currency["current"]
+    return {
+        "verdict": "stale" if is_stale else "fresh",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "payload_sha": currency["candidate_sha"],
+        "payload_compiled_sha": currency["candidate_sha"],
+        "active_candidate_sha": currency["candidate_sha"],
+        "integration_head_sha": currency["head_sha"],
+        "generated_at": _freshness_generated_at(),
+        "stale": is_stale,
+        "stale_reason": (
+            "payload_sha_differs_from_integration_head" if is_stale else None
+        ),
+    }
+
+
+def _build_unknown_freshness_block() -> dict:
+    """Build a freshness block for when currency resolution was indeterminate.
+
+    Returns a block with verdict='unknown' so consumers can distinguish an
+    unresolved freshness check from a confirmed-fresh or confirmed-stale result.
+    """
+    from datetime import datetime
+
+    return {
+        "verdict": "unknown",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _freshness_generated_at(),
+    }
+
+
 async def _resolve_candidate_currency(
     session: AsyncSession,
     project: Project,
@@ -4117,12 +4628,169 @@ async def _resolve_candidate_currency(
     }
 
 
+def ci_compliance_qualify_gate(
+    project: Project,
+    head_sha: str | None = None,
+) -> dict[str, Any]:
+    """Return whether current CI-compliance violations block qualification."""
+    records = project.ci_compliance or {}
+    selected_sha = head_sha
+    if selected_sha is None and isinstance(records, dict) and records:
+        selected_sha = next(reversed(records))
+    record = records.get(selected_sha) if selected_sha else None
+    if not isinstance(record, dict):
+        return {
+            "blocked": False,
+            "head_sha": selected_sha,
+            "violations": [],
+            "violation_count": 0,
+            "branch_literal_violations": [],
+            "branch_literal_violation_count": 0,
+            "reason": "ci_compliance_record_missing",
+        }
+    violations = record.get("violations") if isinstance(record.get("violations"), list) else []
+    branch_literal_violations = (
+        record.get("branch_literal_violations")
+        if isinstance(record.get("branch_literal_violations"), list)
+        else []
+    )
+    blocked = record.get("compliant") is False and (
+        bool(violations) or bool(branch_literal_violations)
+    )
+    return {
+        "blocked": blocked,
+        "head_sha": selected_sha,
+        "violations": violations,
+        "violation_count": len(violations),
+        "branch_literal_violations": branch_literal_violations,
+        "branch_literal_violation_count": len(branch_literal_violations),
+        "compliant": record.get("compliant"),
+    }
+
+
+async def _maybe_spawn_ci_compliance_cap_bump_fix(
+    session: AsyncSession,
+    project: Project,
+    gate: dict[str, Any],
+) -> Task | None:
+    """Spawn one cap-bump remediation task for a non-compliant HEAD."""
+    if not gate.get("blocked"):
+        return None
+    head_sha = gate.get("head_sha")
+    if not isinstance(head_sha, str) or not head_sha:
+        return None
+
+    active_statuses = {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+        TaskStatus.BLOCKED,
+        TaskStatus.PARKED,
+    }
+    rows = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+            )
+        )
+    ).scalars().all()
+    for task in rows:
+        context = task.context or {}
+        if (
+            context.get("spawned_by") == "ci_compliance_cap_bump_gate"
+            and context.get("head_sha") == head_sha
+        ):
+            return task
+
+    violations = gate.get("violations") if isinstance(gate.get("violations"), list) else []
+    branch_literal_violations = (
+        gate.get("branch_literal_violations")
+        if isinstance(gate.get("branch_literal_violations"), list)
+        else []
+    )
+    violation_lines = "\n".join(
+        f"- {v.get('section')}/{v.get('rel')}: {v.get('count')} lines"
+        + (f" > cap {v.get('cap')}" if v.get("cap") is not None else " (uncapped)")
+        for v in violations
+        if isinstance(v, dict)
+    )
+    branch_literal_lines = "\n".join(
+        f"- {v.get('section')}/{v.get('rel')}:{v.get('line')}: {v.get('text')}"
+        for v in branch_literal_violations
+        if isinstance(v, dict)
+    )
+    prompt_parts = [
+        "Automain HEAD is failing the CI-compliance guardrail.",
+    ]
+    if violations:
+        prompt_parts += [
+            "Size violations (run `python3 backend/testing/check_size_limits.py --fix` "
+            "from the repo root and commit the updated `backend/testing/module_size_limits.json`):",
+            violation_lines or "- see ci_compliance payload",
+        ]
+    if branch_literal_violations:
+        prompt_parts += [
+            "Branch-literal violations (remove hardcoded branch names from the listed files):",
+            branch_literal_lines,
+        ]
+    prompt_parts.append(f"\nHEAD: {head_sha}")
+    prompt = "\n".join(prompt_parts)
+    payload = validate_internal_payload(
+        {
+            "type": "create",
+            "title": "Bump CI-compliance size caps",
+            "prompt": prompt,
+            "base_branch": get_project_integration_branch(project),
+            "acceptance_evidence": {
+                "kind": "named_test",
+                "test_path": "backend/testing/test_ci_compliance_gate.py",
+            },
+        },
+        "strategic_spawning:ci_compliance_cap_bump",
+    )
+    task = Task(
+        project_id=project.id,
+        title=f"Fix CI-compliance cap bump for {head_sha[:8]}",
+        description=(
+            "Run backend/testing/check_size_limits.py --fix and commit the "
+            "resulting size-cap update."
+        ),
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context={
+            "spawned_by": "ci_compliance_cap_bump_gate",
+            "ci_compliance_cap_bump": True,
+            "head_sha": head_sha,
+            "violation_count": gate.get("violation_count", 0),
+        },
+    )
+    session.add(task)
+    await session.flush()
+    session.add(
+        TaskHistory(
+            task_id=task.id,
+            action="SPAWNED",
+            details={
+                "spawned_by": "CI_COMPLIANCE_CAP_BUMP_GATE",
+                "head_sha": head_sha,
+            },
+        )
+    )
+    return task
+
+
 async def _spawn_strategic_review(
     project: Project,
     session: AsyncSession,
     cycle_id: str | None = None,
     operator_steered: bool = False,
     steering_excerpt: str | None = None,
+    preferred_runner_target_id: str | None = None,
+    local_runner_context: dict[str, Any] | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -4146,6 +4814,15 @@ async def _spawn_strategic_review(
     Either way it feeds ``_build_operator_steering_directive`` as the durable
     fallback so the directive survives the operator message aging out of the
     volatile conversation-thread snapshot.
+
+    ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
+    hint from the preceding architecture phase. Dispatch may honor it only if
+    that runner is still live, eligible, agent-available, and has capacity.
+
+    ``local_runner_context`` carries a hard local-only Strategic intent from
+    the Phase 1 task context. It is captured by the caller before any retry or
+    rollback-prone work so this function does not need to re-read mutable
+    project ORM attributes in the post-build finalize path.
     """
     from app.task_lifecycle import _has_active_strategic_task
 
@@ -4210,6 +4887,13 @@ async def _spawn_strategic_review(
         _base_running_update = (
             project.running_update if isinstance(project.running_update, str) else ""
         )
+    local_runner_intent = dict(local_runner_context or {})
+    if not local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        local_runner_intent = await _resolve_local_continuation_runner_intent(
+            session,
+            _project_id,
+            "strategic_review",
+        )
 
     # Build direction stats with rich data. Include `active` + `paused` +
     # `proposed`: paused entries are a strong user signal the strategic agent
@@ -4247,6 +4931,18 @@ async def _spawn_strategic_review(
         total_consumed_merged = sum(
             h.get("acceptance_consumed_merged", 0) for h in history
         ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+        # Ancestry-reachable lifetime merge total — returns None for legacy entries
+        # (unknown reachability); aggregate falls back to 0. Only included in
+        # stat_entry when at least one history entry has reachable_prs_merged.
+        _reachable_counts = [reachable_merged_count(h) for h in history]
+        _any_reachable_recorded = any(c is not None for c in _reachable_counts) or bool(
+            agg.get("total_reachable_prs_merged")
+        ) or (agg.get("total_reachable_recorded_cycles", 0) or 0) > 0
+        total_reachable_merged: int | None = None
+        if _any_reachable_recorded:
+            total_reachable_merged = sum(
+                c for c in _reachable_counts if c is not None
+            ) + (agg.get("total_reachable_prs_merged", 0) or 0)
         # Declaration coverage = declared / merged-write, recomputed from summed
         # counts (not averaged per-cycle fractions) so it survives eviction.
         total_declared_merged = sum(declared_merged_count(h) for h in history) + (
@@ -4322,6 +5018,10 @@ async def _spawn_strategic_review(
             "total_cycles": total_cycles,
             "prs_merged": total_merged,
             "verified_prs_merged": total_verified_merged,
+            # badge_only = merges counted via is_merged_completion badge but not
+            # yet ancestry-verified; max(0,...) guards against legacy data where
+            # verified could transiently exceed raw due to aggregate drift.
+            "badge_only_prs_merged": max(0, total_merged - total_verified_merged),
             # Proven count + declaration coverage: the honest, machine-checked
             # subset of verified merges (proven <= verified) plus how much merged
             # code even committed to forward evidence. Lets the strategist
@@ -4330,6 +5030,7 @@ async def _spawn_strategic_review(
             "consumed_prs_merged": total_consumed_merged,
             "acceptance_declaration_coverage": acceptance_declaration_coverage,
             "tasks_failed": total_failed,
+            **({"reachable_prs_merged": total_reachable_merged} if total_reachable_merged is not None else {}),
             "possibly_saturated": d.get("possibly_saturated", False),
         }
         # Surface the direction→gap linkage so the strategic agent can reconcile
@@ -4541,26 +5242,14 @@ async def _spawn_strategic_review(
         .limit(15)
     )
     all_thread_msgs = list(reversed(thread_result.scalars().all()))  # chronological
-    conversation_thread = [
-        {
-            "id": str(m.id),
-            "type": m.message_type,
-            "content": m.content,
-            "context": m.context,
-            "from": m.from_type,
-            "status": m.status,
-            "resolution": m.resolution,
-            "created_at": m.created_at.isoformat() if m.created_at else None,
-            "resolved_at": m.resolved_at.isoformat() if m.resolved_at else None,
-        }
-        for m in all_thread_msgs
-    ]
+    conversation_thread = [agent_thread_message_dict(m) for m in all_thread_msgs]
     # The strategist's open-message inbox is its OWN authoritative status query
     # — NOT a slice of the conversation_thread above (capped at 15 by recency).
     # Deriving it from that slice meant any OPEN BUG_REPORT/BLOCKER older than
     # the 15 newest messages aged out of the strategist's view and could never
     # be resolved. _fetch_open_messages keeps them visible until fixed/resolved.
     open_msgs = await _fetch_open_messages(session, project.id)
+    operator_context_refs = await _fetch_operator_context_refs(session, project.id)
 
     # When did the user last engage? Last ProjectMessage from_type='user'.
     # The strategic agent uses this to frame its running_update "since last
@@ -4642,6 +5331,7 @@ async def _spawn_strategic_review(
     # gated on the per-project branch pair, not project.is_self_repo. Best-effort.
     _open_version = None
     _version_phase_block: dict | None = None
+    _currency: dict | None = None
     _integration_branch = get_project_integration_branch(project)
     _promotion_target = get_project_promotion_target(project)
     if _integration_branch != _promotion_target:
@@ -4769,13 +5459,6 @@ async def _spawn_strategic_review(
                         if _open_version.goal is None
                         else {}
                     ),
-                    # Signals the strategist to author the delivery theme this cycle.
-                    # Absent once the theme is set (null theme → action needed).
-                    **(
-                        {"theme_needed": True}
-                        if _open_version.theme is None
-                        else {}
-                    ),
                 }
             # Enrich with cross-version promotion-readiness trend.  Best-effort:
             # absent when no QualificationVerdict rows exist yet.
@@ -4808,6 +5491,32 @@ async def _spawn_strategic_review(
             except Exception:
                 logger.exception(
                     "[STRATEGIC] recent_closed_versions fetch failed; continuing"
+                )
+            try:
+                from app.release_readiness import compute_goal_coverage_drift_signal
+
+                _drift = await compute_goal_coverage_drift_signal(session, project.id)
+                if _drift is not None:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["goal_coverage_drift"] = _drift
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] goal_coverage_drift fetch failed; continuing"
+                )
+            try:
+                if _open_version is not None:
+                    from app.acceptance_criteria import get_version_coverage_summary
+
+                    _coverage = await get_version_coverage_summary(
+                        session, _open_version.id
+                    )
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["criterion_coverage"] = _coverage
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] criterion_coverage fetch failed; continuing"
                 )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
@@ -5113,53 +5822,59 @@ async def _spawn_strategic_review(
             _dir_text_map = {
                 d.get("id"): d for d in (project.directions or []) if d.get("id")
             }
-            # One bounded query for the project's recent FAILED tasks, then
-            # partition by direction_id in memory (mirrors the gathering logic
-            # in _spawn_direction_hold_investigation, copied here intentionally
-            # since that spawner is slated for deletion).
-            _recent_failed = (
-                (
-                    await session.execute(
-                        select(Task)
-                        .where(
-                            Task.project_id == project.id,
-                            Task.status == TaskStatus.FAILED,
+            # Pre-filter held directions to only those that belong to this project
+            # and exist in the current direction list. This avoids a wasted query
+            # when all held directions are from other projects or have been deleted.
+            _applicable_held_dirs = {
+                _did: _hold_info
+                for _did, _hold_info in _held.items()
+                if _hold_info.get("project_id") == _project_id_str
+                and _did in _dir_text_map
+            }
+            if _applicable_held_dirs:
+                # One bounded query for the project's recent FAILED tasks, then
+                # partition by direction_id in memory (mirrors the gathering logic
+                # in _spawn_direction_hold_investigation, copied here intentionally
+                # since that spawner is slated for deletion).
+                _recent_failed = (
+                    (
+                        await session.execute(
+                            select(Task)
+                            .where(
+                                Task.project_id == project.id,
+                                Task.status == TaskStatus.FAILED,
+                            )
+                            .order_by(Task.created_at.desc())
+                            .limit(60)
                         )
-                        .order_by(Task.created_at.desc())
-                        .limit(60)
                     )
+                    .scalars()
+                    .all()
                 )
-                .scalars()
-                .all()
-            )
-            for _did, _hold_info in _held.items():
-                if _hold_info.get("project_id") != _project_id_str:
-                    continue
-                _direction = _dir_text_map.get(_did)
-                if not _direction:
-                    continue
-                _dir_failures = [
-                    t
-                    for t in _recent_failed
-                    if (t.context or {}).get("direction_id") == _did
-                ][:5]
-                _failure_messages: list[str] = []
-                _fingerprints: list[str] = []
-                for t in _dir_failures:
-                    _err = (t.latest_status_message or "(no message)")[:240]
-                    _fingerprints.append(_error_fingerprint(_err))
-                    _failure_messages.append(_err)
-                _dominant_fp = _fingerprints[0] if _fingerprints else None
-                _held_directions_block.append(
-                    {
-                        "direction_id": _did,
-                        "direction_text": (_direction.get("text") or "?")[:300],
-                        "consecutive_failures": _hold_info.get("consecutive_failures"),
-                        "last_failure_class": _hold_info.get("last_failure_class"),
-                        "dominant_error_fingerprint": _dominant_fp,
-                        "recent_failure_messages": _failure_messages,
-                    }
-                )
+                for _did, _hold_info in _applicable_held_dirs.items():
+                    _direction = _dir_text_map.get(_did)
+                    _dir_failures = [
+                        t
+                        for t in _recent_failed
+                        if (t.context or {}).get("direction_id") == _did
+                    ][:5]
+                    _failure_messages: list[str] = []
+                    _fingerprints: list[str] = []
+                    for t in _dir_failures:
+                        _err = (t.latest_status_message or "(no message)")[:240]
+                        _fingerprints.append(_error_fingerprint(_err))
+                        _failure_messages.append(_err)
+                    _dominant_fp = _fingerprints[0] if _fingerprints else None
+                    _held_directions_block.append(
+                        {
+                            "direction_id": _did,
+                            "direction_text": (_direction.get("text") or "?")[:300],
+                            "consecutive_failures": _hold_info.get("consecutive_failures"),
+                            "last_failure_class": _hold_info.get("last_failure_class"),
+                            "dominant_error_fingerprint": _dominant_fp,
+                            "recent_failure_messages": _failure_messages,
+                        }
+                    )
     except Exception:
         logger.exception("[STRATEGIC] held-directions block build failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened, it was
@@ -5186,7 +5901,6 @@ async def _spawn_strategic_review(
         _cur_n = _open_version.version_number
         _target = _promotion_target or "main"
         _cur_goal = (_open_version.goal or "").strip()
-        _cur_theme = (_open_version.theme or "").strip()
         _goal_state = (
             f"v{_cur_n} already has `version_phase.goal` set: "
             f"{_cur_goal[:220]!r}."
@@ -5194,15 +5908,6 @@ async def _spawn_strategic_review(
             else (
                 f"`version_phase.goal` on v{_cur_n} is null, so this version "
                 "still needs its objective."
-            )
-        )
-        _theme_state = (
-            f"v{_cur_n} already has `version_phase.theme` set to "
-            f"{_cur_theme!r}."
-            if _cur_theme
-            else (
-                f"`version_phase.theme` on v{_cur_n} is null, so this version "
-                "still needs its delivery theme."
             )
         )
         _setup_actions: list[str] = []
@@ -5222,16 +5927,6 @@ async def _spawn_strategic_review(
                 "the frozen version goal the blind merge-grade will score "
                 "merged diffs against; write it as a DELIVERABLE statement, "
                 "not a status line)"
-            )
-        if _cur_theme:
-            _setup_actions.append(
-                f"use v{_cur_n}'s existing `version_phase.theme` as the "
-                "delivery theme; leave the stored version theme unchanged this cycle"
-            )
-        else:
-            _setup_actions.append(
-                f"output `new_version_theme` with the delivery theme for "
-                f"v{_cur_n}"
             )
         _setup_instruction = "; ".join(
             f"({idx}) {action}" for idx, action in enumerate(_setup_actions, start=1)
@@ -5363,7 +6058,7 @@ async def _spawn_strategic_review(
                 f"NOT yet treat the milestone as fully shipped; the sweep will "
                 f"resolve it to serving_confirmed, confirmation_timed_out, or "
                 f"deploy_failed shortly. You may prepare v{_cur_n}'s mission. "
-                f"{_goal_state} {_theme_state} Next-version setup: "
+                f"{_goal_state} Next-version setup: "
                 f"{_setup_instruction}. Do not "
                 f"declare v{_prior_n} live until serving is confirmed, and do "
                 f"NOT re-promote/re-qualify v{_prior_n}."
@@ -5379,7 +6074,7 @@ async def _spawn_strategic_review(
                 f"that is already done and merged to {_target} (cross-check "
                 f"`version_phase.recent_versions` and `deployment_state` — "
                 f"v{_prior_n} is recorded there with status='promoted'). "
-                f"{_goal_state} {_theme_state} A null "
+                f"{_goal_state} A null "
                 f"`version_phase.last_qualification` on v{_cur_n} means this "
                 f"fresh version has not yet begun its OWN qualification (expected "
                 f"for a just-opened version) — it does NOT mean v{_prior_n}'s "
@@ -5467,17 +6162,22 @@ async def _spawn_strategic_review(
     # to integration-branch refactors of release_version on back-merge.
     if _open_version is not None:
         from app.release_version import (
+            QUALIFICATION_STATE_VOCAB as _QUAL_STATE_VOCAB,
             summarize_qualification_state as _summarize_qual_state,
         )
 
-        _qual_state = _summarize_qual_state(_open_version.last_qualification)
-        if _qual_state and _qual_state.get("state") in {
+        _QUAL_HINT_STATES = {
             "promotion_in_flight",
             "promotion_check_wait",
             "promotion_failed",
             "required_check_failed",
             "protection_blocked_review",
-        }:
+        }
+        assert (
+            _QUAL_HINT_STATES <= _QUAL_STATE_VOCAB
+        ), "prompt-suffix states not in vocab"
+        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        if _qual_state and _qual_state.get("state") in _QUAL_HINT_STATES:
             _qual_hint = (
                 f"Qualification sub-state: {_qual_state['state'].upper()} — "
                 f"{_qual_state['summary']} Do NOT read "
@@ -5831,6 +6531,32 @@ async def _spawn_strategic_review(
                     }
         except Exception:
             logger.exception("[STRATEGIC] build-stall hint build failed; continuing")
+    # Fallback currency resolution: the stabilize+carried-findings path above
+    # already set _currency when applicable.  For every other cycle (build phase,
+    # or stabilize with no carried findings), resolve it here so the freshness
+    # verdict is accurate on all paths, not just the stabilize+findings one.
+    if _currency is None and _open_version is not None:
+        try:
+            _currency = await _resolve_candidate_currency(
+                session,
+                project,
+                _open_version.last_qualification or {},
+                _integration_branch,
+            )
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] fallback candidate-currency resolution failed; continuing"
+            )
+    # Derive structured payload-staleness signal from the already-resolved
+    # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
+    # integration_head_sha, and an explicit stale/current verdict at cycle start
+    # so the agent can detect stale-context before making portfolio decisions.
+    # Always present: 'unknown' verdict when GitHub was unreachable so the agent
+    # can never mistake an indeterminate freshness check for a confirmed-fresh one.
+    if _currency is not None:
+        _payload_staleness: dict = _build_freshness_shas_block(_currency)
+    else:
+        _payload_staleness = _build_unknown_freshness_block()
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)
@@ -5961,6 +6687,7 @@ async def _spawn_strategic_review(
         (recent_interventions or {}).get("held_by_direction"),
         (recent_interventions or {}).get("per_direction_delta"),
         running_update=project.running_update or "",
+        last_qual=_open_version.last_qualification if _open_version is not None else None,
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model
@@ -5996,6 +6723,24 @@ async def _spawn_strategic_review(
     _local_runner_status["require_local_runner"] = resolve_project_require_local_runner(
         project
     )
+    _ci_compliance_block: dict[str, Any] | None = None
+    try:
+        from app import ci_compliance as _ci_compliance
+
+        _ci_status = await _ci_compliance.ensure_current_ci_compliance(session, project)
+        if _ci_status.get("status") == "success":
+            _ci_compliance_block = _ci_compliance.compact_ci_compliance(
+                _ci_status.get("data")
+            )
+            _ci_gate = ci_compliance_qualify_gate(
+                project, _ci_status.get("head_sha")
+            )
+            if _ci_gate.get("blocked"):
+                await _maybe_spawn_ci_compliance_cap_bump_fix(
+                    session, project, _ci_gate
+                )
+    except Exception:
+        logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -6017,7 +6762,7 @@ async def _spawn_strategic_review(
                     _agent_view_design_doc(project.design_doc), **verification_kwargs
                 )
             ),
-            "vision": project.vision or {},
+            "vision": _agent_visible_vision(project.vision),
             "problem_model": _verified_problem_model,
             **(
                 {"cycle_start_reconciliation": _cycle_start_reconciliation}
@@ -6115,6 +6860,11 @@ async def _spawn_strategic_review(
             ),
             "project_name": project.name,
             "open_messages": open_msgs,
+            **(
+                {"operator_context_refs": operator_context_refs}
+                if operator_context_refs
+                else {}
+            ),
             "conversation_thread": conversation_thread,
             **(
                 {"operator_overrides": _operator_overrides}
@@ -6139,6 +6889,8 @@ async def _spawn_strategic_review(
             ),
             **({"drift_signals": drift_summary} if drift_summary else {}),
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
+            **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
+            **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
             **(
                 {"deployment_state": _deployment_state_block}
                 if _deployment_state_block
@@ -6233,6 +6985,21 @@ async def _spawn_strategic_review(
         )
         return False
 
+    effective_preferred_runner_target_id = (
+        str(preferred_runner_target_id)
+        if preferred_runner_target_id
+        else local_runner_intent.get("preferred_runner_target_id")
+    )
+    task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
+    if local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        task_context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
+        task_context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = local_runner_intent.get(
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+            "workbench_continuous",
+        )
+    if effective_preferred_runner_target_id:
+        task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
+
     new_task = Task(
         project_id=_project_id,
         title=f"Strategic review: {_project_name}",
@@ -6241,7 +7008,7 @@ async def _spawn_strategic_review(
         vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
         status=TaskStatus.QUEUED,
         created_by="ORCHESTRATOR",
-        context={"strategic_cycle_id": cycle_id},
+        context=task_context,
         strategic_cycle_id=cycle_id,
     )
     session.add(new_task)

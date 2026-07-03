@@ -52,7 +52,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _compute_acceptance_rate,
     _compute_productivity_score,
 )
-from app.direction_outcomes import verified_merged_count
+from app.direction_outcomes import credit_gate_merged_count
 from app.failure_classification import (
     CO_DEFERRED_SHELVED,
     GRADER_CAUSE_REFUSAL,
@@ -160,6 +160,7 @@ from app.spawn_calibration import (  # noqa: F401 — re-exported for tests/call
 from app.task_locking import (
     with_design_doc_locked,
     with_directions_locked,
+    with_problem_model_locked,
     with_vision_locked,
 )
 from app.plan_completion import (
@@ -903,12 +904,15 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
 
             history = target.get("research_history", [])
             agg = target.get("history_aggregate", {})
-            total_merged = sum(verified_merged_count(e) for e in history) + int(
-                agg.get(
-                    "total_verified_prs_merged",
-                    agg.get("total_prs_merged", 0),
-                )
-                or 0
+            total_merged = sum(credit_gate_merged_count(e) for e in history) + max(
+                0,
+                int(
+                    agg.get(
+                        "total_verified_prs_merged",
+                        agg.get("total_prs_merged", 0),
+                    )
+                    or 0
+                ) - int(agg.get("total_stranded_prs_merged", 0) or 0),
             )
             total_cycles = len(history) + (agg.get("total_cycles") or 0)
             if total_merged >= 3:
@@ -945,6 +949,31 @@ async def _stamp_no_findings_refractory(task: Task, session: AsyncSession) -> No
     await with_directions_locked(
         session, task.project_id, _apply_no_findings_refractory
     )
+
+    # Reconcile problem-model gap staffing when the direction was auto-completed.
+    # The no-findings path bypasses _apply_direction_state_updates, so gap
+    # reconciliation would otherwise be skipped — leaving the direction in
+    # active_moves until the next lifecycle prune removes the completed entry.
+    if _auto_complete_info:
+        from app.problem_model import reconcile_gaps_for_retired_directions  # noqa: PLC0415
+
+        _reconcile_now = _utcnow().isoformat()
+        _retired_id = direction_id
+
+        def _apply_gap_reconcile_no_findings(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [_retired_id], _reconcile_now)
+
+        try:
+            await with_problem_model_locked(
+                session, task.project_id, _apply_gap_reconcile_no_findings
+            )
+        except Exception as _gap_exc:
+            logger.warning(
+                "[NO_FINDINGS] Gap reconcile failed for auto-completed direction "
+                "%s: %s",
+                direction_id,
+                _gap_exc,
+            )
 
     for info in _auto_complete_info:
         from app.models import Alert, AlertSeverity  # noqa: PLC0415
@@ -2850,7 +2879,22 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     ) or _get_project_integration_branch(project_obj)
     short_id = str(task.id).replace("-", "")[:8]
     research_branch_prefix = getattr(project_obj, "research_branch_prefix", "research/")
-    research_branch = f"{research_branch_prefix}{short_id}"
+    # When this task is a requeue-clone that already opened a rollup PR, carry
+    # the original staging branch forward instead of deriving a new
+    # research/<id> branch from the clone's task ID.  Reusing the branch keeps
+    # the merge-guard invariant (reviewed-branch == PR-head) intact: the PR
+    # head still points at the original branch, so the merge guard won't abort
+    # with a branch-mismatch error on every subsequent iteration.
+    # Guard: only reuse when BOTH research_branch AND rollup_pr_number are
+    # present — rollup_pr_number confirms a PR was actually opened (not just a
+    # branch-setup step that failed before the PR was created).
+    _rctx = task.context or {}
+    _inherited_research_branch = _rctx.get("research_branch")
+    _has_rollup_pr = bool(_rctx.get("rollup_pr_number"))
+    if _inherited_research_branch and _has_rollup_pr:
+        research_branch = _inherited_research_branch
+    else:
+        research_branch = f"{research_branch_prefix}{short_id}"
 
     # Stamp spawn-pending before _ensure_branch commits its row-lock release
     # (task_completion.py ~line 1260). If spawn is interrupted mid-flight by a
@@ -3442,6 +3486,39 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         }
         task.context = _ctx
         flag_modified(task, "context")
+
+    # Pre-fetch criterion_keys for every direction referenced by deduplicated
+    # findings (plus the parent direction).  A finding may carry its own
+    # direction_id that differs from _parent_direction_id; without this
+    # pre-fetch, _direction_criterion_cache would miss that key and the spawned
+    # task would inherit no criterion_ids even though its direction has some.
+    # Best-effort: a lookup failure leaves that direction absent from the cache.
+    _direction_criterion_cache: dict[str, list[str]] = {}
+    _dirs_to_prefetch: set[str] = set()
+    if _parent_direction_id:
+        _dirs_to_prefetch.add(_parent_direction_id)
+    for _, _pf_finding, _ in deduplicated:
+        _pf_did = _pf_finding.get("direction_id")
+        if _pf_did and isinstance(_pf_did, str):
+            _dirs_to_prefetch.add(_pf_did)
+    if _dirs_to_prefetch:
+        try:
+            from app.directions_repo import get_direction_row as _get_dir_row
+
+            for _pf_dir_id in _dirs_to_prefetch:
+                try:
+                    _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
+                    if _pf_row is not None and _pf_row.criterion_keys:
+                        _direction_criterion_cache[_pf_dir_id] = list(
+                            _pf_row.criterion_keys
+                        )
+                except Exception:
+                    logger.debug(
+                        "[RESEARCH] criterion_keys lookup failed for direction %s",
+                        _pf_dir_id,
+                    )
+        except Exception:
+            logger.debug("[RESEARCH] directions_repo import failed; criterion cache empty")
 
     for orig_i, finding, fhash in deduplicated:
         scope = finding.get("scope", DEFAULT_TASK_SCOPE)
@@ -4530,6 +4607,13 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             )
             if isinstance(v, str) and v.strip()
         }
+        # Inherit criterion_ids from the direction this task works on (best-effort).
+        # The cache was pre-fetched for the parent direction before the loop; a
+        # finding-level direction_id falls back to the parent direction's criteria.
+        _spawn_effective_dir_id = direction_id or parent_direction_id
+        _spawn_criterion_ids = _direction_criterion_cache.get(
+            _spawn_effective_dir_id or "", []
+        )
         new_task = Task(
             project_id=task.project_id,
             title=title,
@@ -4537,6 +4621,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             parent_task_id=task.id,
             payloads=[finding_payload],
             previous_error_fingerprint=_prev_fp_col,
+            criterion_ids=_spawn_criterion_ids,
             context={
                 "research_task_id": str(task.id),
                 "parent_research_task_id": str(task.id),

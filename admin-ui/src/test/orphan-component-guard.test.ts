@@ -17,7 +17,10 @@ const COMPONENTS_DIR = path.join(SRC_DIR, 'components');
 // Add entries here with a one-line rationale when a file serves as a
 // library export or is composed exclusively by an external consumer.
 const ORPHAN_ALLOWLIST = new Set<string>([
-  // No current exemptions — all components must be reachable from main.tsx.
+  // Legacy metrics shell retained while its useful diagnostics are migrated
+  // into the intentional Runtime/Project deep-monitoring surfaces.
+  'MetricsDashboard.tsx',
+  'LaneDiagPanel.tsx',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -42,7 +45,10 @@ function resolveRelative(from: string, imp: string): string | null {
   const base = path.resolve(path.dirname(from), imp);
   for (const ext of EXT_CANDIDATES) {
     const candidate = base + ext;
-    try { statSync(candidate); return candidate; } catch { /* skip */ }
+    try {
+      const stat = statSync(candidate);
+      if (stat.isFile()) return candidate;
+    } catch { /* skip */ }
   }
   return null;
 }

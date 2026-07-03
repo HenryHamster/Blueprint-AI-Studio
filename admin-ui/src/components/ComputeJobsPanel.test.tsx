@@ -1,5 +1,5 @@
 import { describe, test, expect, vi, afterEach } from 'vitest';
-import { render, waitFor, act } from '@testing-library/react';
+import { render, waitFor, act, fireEvent } from '@testing-library/react';
 import type { ComputeJob, ComputeJobsListResponse } from '../api';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import {
@@ -23,22 +23,27 @@ const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
 const fetchComputeSweepGroups = vi.fn();
 const rerunComputeExperiment = vi.fn();
+const askComputeJob = vi.fn();
 
-vi.mock('../api', () => ({
-  fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
-  fetchComputeJobsPaged: async (...args: unknown[]) => {
-    const r = await fetchComputeJobs(...args);
-    return Array.isArray(r) ? { jobs: r, hasMore: false } : r;
-  },
-  killComputeJob: (...args: unknown[]) => killComputeJob(...args),
-  analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
-  fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
-  resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
-  fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
-  fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
-  fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
-  rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    fetchComputeJobs: (...args: unknown[]) => fetchComputeJobs(...args),
+    fetchComputeJobsPaged: async (...args: unknown[]) => {
+      const r = await fetchComputeJobs(...args);
+      return Array.isArray(r) ? { jobs: r, hasMore: false } : r;
+    },
+    killComputeJob: (...args: unknown[]) => killComputeJob(...args),
+    analyzeComputeJob: (...args: unknown[]) => analyzeComputeJob(...args),
+    fetchKnowledgeDocument: (...args: unknown[]) => fetchKnowledgeDocument(...args),
+    resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
+    fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
+    fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
+    fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
+    rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
+    askComputeJob: (...args: unknown[]) => askComputeJob(...args),
+  });
+});
 
 function makeJob(overrides: Partial<ComputeJob> = {}): ComputeJob {
   return {
@@ -215,6 +220,7 @@ describe('ComputeJobsPanel render + kill', () => {
     fetchComputeJobsAggregateSummary.mockReset();
     fetchHeldComputeExperiments.mockReset();
     fetchComputeSweepGroups.mockReset();
+    askComputeJob.mockReset();
     vi.restoreAllMocks();
   });
 
@@ -2355,13 +2361,13 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(marginChip.textContent).toContain('arm-slow');
   });
 
-  test('compares_runs_grouped_by_sweep_id: renders sweep knowledge groups section when sweep groups returned', async () => {
+  test('compares_runs_grouped_by_sweep_id renders backend criterion verdict values', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
     fetchComputeSweepGroups.mockResolvedValue({
       sweep_groups: {
         'sweep-abc': [
-          { id: 'doc-1', title: 'accuracy_v1 sweep run A', summary: 'Achieved 0.91 accuracy', acceptance_grade: 'B', arm_label: 'run-a', created_at: '2026-06-20T10:00:00Z' },
-          { id: 'doc-2', title: 'accuracy_v1 sweep run B', summary: 'Achieved 0.95 accuracy', acceptance_grade: 'A', arm_label: 'run-b', created_at: '2026-06-20T11:00:00Z' },
+          { id: 'doc-1', title: 'accuracy_v1 sweep run A', summary: 'Achieved 0.91 accuracy', compute_acceptance_grade: 'measured_only', criterion_met: false, criterion: { metric: 'accuracy', operator: '>=', threshold: 0.93 }, per_arm_verdicts: { 'run-a': { value: 0.91, met: false, cost_usd: 0.42 } }, arm_label: 'run-a', created_at: '2026-06-20T10:00:00Z' },
+          { id: 'doc-2', title: 'accuracy_v1 sweep run B', summary: 'Achieved 0.95 accuracy', compute_acceptance_grade: 'acceptance', criterion_met: true, criterion: { metric: 'accuracy', operator: '>=', threshold: 0.93 }, per_arm_verdicts: { 'run-b': { value: 0.95, met: true, cost_usd: 0.53 } }, arm_label: 'run-b', created_at: '2026-06-20T11:00:00Z' },
         ],
       },
     });
@@ -2378,8 +2384,10 @@ describe('ComputeJobsPanel render + kill', () => {
     const table = await findByTestId('sweep-knowledge-comparison-table');
     expect(table.textContent).toContain('run-a');
     expect(table.textContent).toContain('run-b');
-    expect(table.textContent).toContain('A');
-    expect(table.textContent).toContain('B');
+    expect(table.textContent).toContain('NOT MET / measured');
+    expect(table.textContent).toContain('MET / accepted');
+    expect(table.textContent).toContain('accuracy >= 0.93');
+    expect(table.textContent).toContain('run-b: 0.95 MET ($0.53)');
   });
 
   test('compares_runs_grouped_by_sweep_id: hides sweep knowledge groups section when no groups returned', async () => {
@@ -2437,5 +2445,708 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByTestId('rerun-inline-panel');
     await act(async () => { (await findByTestId('rerun-submit')).click(); });
     expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
+  });
+
+  test('arms breakdown shows per-arm pass/fail chip and cost when per_arm_verdicts present', async () => {
+    const armsJob = makeJob({
+      id: 'job-pav',
+      task_title: 'DEN vs NN experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'DEN': { score: 0.91 },
+            'NN': { score: 0.85 },
+          },
+        },
+      },
+      per_arm_verdicts: {
+        'DEN': { value: 0.91, met: true, cost_usd: 1.20 },
+        'NN': { value: 0.85, met: false, cost_usd: 0.80 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const armsBlock = await findByTestId('arms-breakdown');
+    // Both arm names present
+    expect(armsBlock.textContent).toContain('DEN');
+    expect(armsBlock.textContent).toContain('NN');
+    // pass/fail chips appear for both arms
+    const verdictChips = getAllByTestId('arm-verdict-chip');
+    expect(verdictChips).toHaveLength(2);
+    const passChip = verdictChips.find((c) => c.textContent === 'pass');
+    const failChip = verdictChips.find((c) => c.textContent === 'fail');
+    expect(passChip).toBeTruthy();
+    expect(failChip).toBeTruthy();
+    expect(passChip!.className).toContain('emerald');
+    expect(failChip!.className).toContain('red');
+    // cost chips appear for both arms
+    const costChips = getAllByTestId('arm-cost');
+    expect(costChips).toHaveLength(2);
+    expect(armsBlock.textContent).toContain('$1.20');
+    expect(armsBlock.textContent).toContain('$0.80');
+  });
+
+  test('arms breakdown shows amber n/a chip when per_arm_verdicts has met=null (unmeasured arm)', async () => {
+    const armsJob = makeJob({
+      id: 'job-pav-null-met',
+      task_title: 'null met experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-measured': { score: 0.92 },
+            'arm-crashed': {},
+          },
+        },
+      },
+      per_arm_verdicts: {
+        'arm-measured': { value: 0.92, met: true, cost_usd: 1.00 },
+        'arm-crashed': { value: null, met: null, cost_usd: 0.50 },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('arms-breakdown');
+    const verdictChips = getAllByTestId('arm-verdict-chip');
+    expect(verdictChips).toHaveLength(2);
+    const passChip = verdictChips.find((c) => c.textContent === 'pass');
+    const naChip = verdictChips.find((c) => c.textContent === 'n/a');
+    expect(passChip).toBeTruthy();
+    expect(naChip).toBeTruthy();
+    expect(passChip!.className).toContain('emerald');
+    expect(naChip!.className).toContain('amber');
+  });
+
+  test('arms breakdown omits verdict chip and cost when per_arm_verdicts absent', async () => {
+    const armsJob = makeJob({
+      id: 'job-no-pav',
+      task_title: 'no verdict experiment',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-a': { score: 0.9 },
+            'arm-b': { score: 0.8 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([armsJob]));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByTestId('arms-breakdown');
+    expect(queryAllByTestId('arm-verdict-chip')).toHaveLength(0);
+    expect(queryAllByTestId('arm-cost')).toHaveLength(0);
+  });
+
+  test('test_per_arm_comparison_renders_cost_and_passfail_chip', async () => {
+    // job1 has per-arm costs and criterion_verdict.per_arm so the comparison
+    // matrix can show numeric cost_usd chips and pass/fail verdicts per arm.
+    const job1 = makeJob({
+      id: 'perarm-job1',
+      task_title: 'run A',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 2.0,
+      experiment: 'perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-good': 0.95, 'arm-bad': 0.82 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-good': { accuracy: 0.95, cost_usd: 1.50, elapsed_seconds: 1800 },
+            'arm-bad': { accuracy: 0.82, cost_usd: 0.50, elapsed_seconds: 600 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'perarm-job2',
+      task_title: 'run B',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.88,
+        met: false,
+        measurable: true,
+      },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job1, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Open comparison mode
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    // arms-comparison section appears (job1 has arms)
+    const armsSection = await findByTestId('arms-comparison');
+    expect(armsSection).toBeTruthy();
+    // Per-arm costs rendered as formatted USD chips
+    const costChips = getAllByTestId('arm-cost-usd');
+    expect(costChips.length).toBeGreaterThanOrEqual(2);
+    const costTexts = costChips.map((c) => c.textContent);
+    expect(costTexts.some((t) => t?.includes('$1.50'))).toBe(true);
+    expect(costTexts.some((t) => t?.includes('$0.50'))).toBe(true);
+    // cost_usd must not also appear as plain "cost_usd: 1.5" metric text
+    expect(armsSection.textContent).not.toContain('cost_usd:');
+    // Per-arm pass/fail chips: arm-good passes (0.95 >= 0.9), arm-bad fails (0.82 < 0.9)
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    expect(pfTexts).toContain('pass');
+    expect(pfTexts).toContain('fail');
+    // pass chip uses emerald styling, fail chip uses red
+    const passChip = pfChips.find((c) => c.textContent === 'pass');
+    const failChip = pfChips.find((c) => c.textContent === 'fail');
+    expect(passChip?.className).toContain('emerald');
+    expect(failChip?.className).toContain('red');
+  });
+
+  test('per-arm pass/fail chip handles != operator correctly', async () => {
+    // arm-neq-pass has value 0.5 which != 0.9 (should pass); arm-neq-fail has value 0.9 which == 0.9 (should fail)
+    const job = makeJob({
+      id: 'neq-job',
+      task_title: 'neq run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'neq-sweep',
+      success_criterion: { metric: 'score', operator: '!=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'score',
+        operator: '!=',
+        threshold: 0.9,
+        value: 0.5,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-neq-pass': 0.5, 'arm-neq-fail': 0.9 },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-neq-pass': { score: 0.5 },
+            'arm-neq-fail': { score: 0.9 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'neq-job2',
+      task_title: 'neq run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'neq-sweep',
+      success_criterion: { metric: 'score', operator: '!=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'score', operator: '!=', threshold: 0.9, value: 0.5, met: true, measurable: true },
+      polling_metadata: { result_metrics: { score: 0.5 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    // arm-neq-pass (0.5 != 0.9) → pass; arm-neq-fail (0.9 != 0.9 is false) → fail
+    expect(pfTexts).toContain('pass');
+    expect(pfTexts).toContain('fail');
+    const passChip = pfChips.find((c) => c.textContent === 'pass');
+    const failChip = pfChips.find((c) => c.textContent === 'fail');
+    expect(passChip?.className).toContain('emerald');
+    expect(failChip?.className).toContain('red');
+  });
+
+  test('per-arm pass/fail chip renders amber inconclusive when per_arm value is null', async () => {
+    const job = makeJob({
+      id: 'null-arm-job',
+      task_title: 'null arm run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'null-arm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.9,
+        met: true,
+        measurable: true,
+        per_arm: { 'arm-measured': 0.95, 'arm-unmeasured': null },
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-measured': { accuracy: 0.95 },
+            'arm-unmeasured': {},
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'null-arm-job2',
+      task_title: 'null arm run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'null-arm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([job, job2]));
+    const { findByTestId, getAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    const pfChips = getAllByTestId('arm-passfail-chip');
+    const pfTexts = pfChips.map((c) => c.textContent);
+    expect(pfTexts).toContain('inconclusive');
+    expect(pfTexts).toContain('pass');
+    const inconclusiveChip = pfChips.find((c) => c.textContent === 'inconclusive');
+    expect(inconclusiveChip?.className).toContain('amber');
+  });
+
+  test('per-arm pass/fail chip does not render when criterion_verdict has no per_arm but job has arms', async () => {
+    const jobWithArmsNoPérArm = makeJob({
+      id: 'no-per-arm-job',
+      task_title: 'no perarm run',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'no-perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.92,
+        met: true,
+        measurable: true,
+        // no per_arm field
+      },
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'arm-alpha': { accuracy: 0.92, cost_usd: 0.75 },
+            'arm-beta': { accuracy: 0.88, cost_usd: 0.75 },
+          },
+        },
+      },
+      started_at: null,
+      completed_at: null,
+    });
+    const job2 = makeJob({
+      id: 'no-per-arm-job2',
+      task_title: 'no perarm run 2',
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      experiment: 'no-perarm-sweep',
+      success_criterion: { metric: 'accuracy', operator: '>=' as const, threshold: 0.9 },
+      criterion_verdict: { metric: 'accuracy', operator: '>=', threshold: 0.9, value: 0.88, met: false, measurable: true },
+      polling_metadata: { result_metrics: { accuracy: 0.88 } },
+      started_at: null,
+      completed_at: null,
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([jobWithArmsNoPérArm, job2]));
+    const { findByTestId, queryAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const toggleBtn = await findByTestId('sweep-compare-toggle');
+    await act(async () => { toggleBtn.click(); });
+    await findByTestId('arms-comparison');
+    // pass/fail chips must NOT render when per_arm is absent
+    expect(queryAllByTestId('arm-passfail-chip')).toHaveLength(0);
+  });
+
+  test('renders grounded answer and citations for Ask about this run', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The experiment achieved 92% accuracy on the validation set.',
+      citations: ['gs://artifacts/metrics.json', 'gs://artifacts/eval_log.txt'],
+      grounded: true,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Ask input is visible for terminal jobs
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What accuracy did this run achieve?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    // Grounded answer renders
+    const result = await findByTestId('compute-ask-result');
+    expect(result.textContent).toContain('92% accuracy');
+    // Citations render inline
+    const citations = await findByTestId('compute-ask-citations');
+    expect(citations.textContent).toContain('gs://artifacts/metrics.json');
+    expect(citations.textContent).toContain('gs://artifacts/eval_log.txt');
+    // Ungrounded disclaimer is absent for a grounded answer
+    expect(result.querySelector('[data-testid="compute-ask-ungrounded"]')).toBeNull();
+    // API called with correct args
+    expect(askComputeJob).toHaveBeenCalledWith('job-1', 'What accuracy did this run achieve?', undefined);
+  });
+
+  test('shows starter questions based on criterion verdict', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Starter question buttons appear
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    expect(starterQuestions.length).toBeGreaterThan(0);
+    // Suggestion includes the criterion
+    expect(starterQuestions[0].textContent).toContain('accuracy');
+  });
+
+  test('clicking starter question populates the input field', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'accuracy',
+        operator: '>=',
+        threshold: 0.9,
+        value: 0.95,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    expect(input).toHaveValue('');
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    await act(async () => { starterQuestions[0].click(); });
+    // Input now contains the clicked question
+    expect(input).toHaveValue(starterQuestions[0].textContent || '');
+  });
+
+  test('formats citations with readable labels instead of opaque strings', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The control arm achieved 88% accuracy.',
+      citations: ['result_metrics:accuracy', 'arm:control'],
+      grounding_miss: false,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'How did control perform?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const citations = await findByTestId('compute-ask-citations');
+    // Citations rendered with formatted labels
+    expect(citations.textContent).toContain('result_metrics:');
+    expect(citations.textContent).toContain('accuracy');
+    expect(citations.textContent).toContain('arm:');
+    expect(citations.textContent).toContain('control');
+  });
+
+  test('shows "Grounded in run data" only when citations are present', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The accuracy was 92%.',
+      citations: ['result_metrics:accuracy'],
+      grounding_miss: false,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What accuracy?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const groundedLabel = await findByTestId('compute-ask-grounded');
+    expect(groundedLabel.textContent).toContain('Grounded in run data');
+    // No ungrounded message when citations present
+    expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
+  });
+
+  test('shows ungrounded message when no citations and grounding_miss true', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: null,
+      citations: [],
+      grounding_miss: true,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'Unknown question' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const ungroundedMsg = await findByTestId('compute-ask-ungrounded');
+    expect(ungroundedMsg.textContent).toContain('No evidence found');
+    // Grounded label not shown
+    expect(queryByTestId('compute-ask-grounded')).toBeNull();
+  });
+
+  test('shows starter questions for multi-arm runs', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      polling_metadata: {
+        result_metrics: {
+          arms: {
+            'control': { accuracy: 0.88 },
+            'treatment': { accuracy: 0.92 },
+          },
+        },
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const starterQuestions = await findAllByTestId('compute-ask-starter');
+    // Includes arm-related questions
+    const armQuestions = starterQuestions.filter((q) => q.textContent?.toLowerCase().includes('arm'));
+    expect(armQuestions.length).toBeGreaterThan(0);
+  });
+
+  test('placeholder text suggests first starter question when available', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      criterion_verdict: {
+        metric: 'f1_score',
+        operator: '>=',
+        threshold: 0.85,
+        value: 0.88,
+        met: true,
+        measurable: true,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input') as HTMLInputElement;
+    // Placeholder includes first starter question suggestion
+    expect(input.placeholder).toContain('f1_score');
+  });
+
+  test('shows no-citation-info when answer has no citations and grounding_miss is false', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The run completed successfully.',
+      citations: [],
+      grounding_miss: false,
+    });
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What happened?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    const noCitationMsg = await findByTestId('compute-ask-no-citation-info');
+    expect(noCitationMsg.textContent).toContain('No citations provided');
+    // Other messages absent
+    expect(queryByTestId('compute-ask-grounded')).toBeNull();
+    expect(queryByTestId('compute-ask-ungrounded')).toBeNull();
+  });
+
+  test('renders ungrounded compute Q&A answer with an unverified caution treatment', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The model might have been overfitting.',
+      citations: [],
+      grounding_miss: true,
+    });
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'Why did this happen?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    // Result block uses amber warning colors instead of indigo
+    const resultBlock = await findByTestId('compute-ask-result');
+    expect(resultBlock.className).toContain('bg-amber-500/10');
+    expect(resultBlock.className).toContain('border-amber-500/30');
+    // Caution label is visible
+    const cautionLabel = await findByTestId('compute-ask-unverified-caution');
+    expect(cautionLabel.textContent).toContain('Unverified answer');
+    expect(cautionLabel.textContent).toContain('no grounding found');
+    // Answer text uses amber color
+    expect(resultBlock.textContent).toContain('The model might have been overfitting.');
+    const answerDiv = resultBlock.querySelector('.text-amber-200');
+    expect(answerDiv).toBeTruthy();
+  });
+
+  test('multi-turn: both Q&A pairs remain rendered after second question, prior turn sent as history', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    // First answer: grounded
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'The accuracy was 0.95.',
+      citations: ['gs://artifacts/metrics.json#metric:accuracy'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+    // Second answer: also grounded
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'The control arm scored 0.85.',
+      citations: ['gs://artifacts/metrics.json#arm:control'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    // Ask first question
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input, { target: { value: 'What was the accuracy?' } });
+    });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+
+    // First result rendered
+    await findByTestId('compute-ask-result');
+
+    // Ask second question (input should be cleared after first answer)
+    const input2 = await findByTestId('compute-ask-input');
+    await act(async () => {
+      fireEvent.change(input2, { target: { value: 'And arm control?' } });
+    });
+    await act(async () => { submitBtn.click(); });
+
+    // Both Q&A pairs must still be in the DOM
+    const results = await findAllByTestId('compute-ask-result');
+    expect(results.length).toBe(2);
+    expect(results[0].textContent).toContain('0.95');
+    expect(results[1].textContent).toContain('0.85');
+
+    // Thread questions rendered
+    const questions = await findAllByTestId('compute-ask-thread-question');
+    expect(questions.length).toBe(2);
+
+    // Second call must include the prior turn as history
+    expect(askComputeJob).toHaveBeenNthCalledWith(
+      2,
+      'job-1',
+      'And arm control?',
+      [{ question: 'What was the accuracy?', answer: 'The accuracy was 0.95.' }],
+    );
+  });
+
+  test('multi-turn: per-answer grounding treatment preserved (first grounded, second unverified)', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'Accuracy was 0.91.',
+      citations: ['gs://artifacts/metrics.json#metric:accuracy'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+    askComputeJob.mockResolvedValueOnce({
+      answer: 'Cannot find evidence for that.',
+      citations: [],
+      grounding_miss: true,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, findAllByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input, { target: { value: 'First question' } }); });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+
+    await findByTestId('compute-ask-grounded');
+
+    const input2 = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input2, { target: { value: 'Second question' } }); });
+    await act(async () => { submitBtn.click(); });
+
+    const results = await findAllByTestId('compute-ask-result');
+    expect(results.length).toBe(2);
+    // First is grounded (indigo style)
+    expect(results[0].className).toContain('indigo');
+    // Second is unverified (amber style)
+    expect(results[1].className).toContain('amber');
+
+    // Ungrounded notice on second turn
+    const ungrounded = results[1].querySelector('[data-testid="compute-ask-unverified-caution"]');
+    expect(ungrounded).toBeTruthy();
+  });
+
+  test('multi-turn: clear conversation button resets thread', async () => {
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.5 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'Some answer.',
+      citations: ['gs://artifacts/metrics.json#metric:x'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    const { findByTestId, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const input = await findByTestId('compute-ask-input');
+    await act(async () => { fireEvent.change(input, { target: { value: 'A question' } }); });
+    const submitBtn = await findByTestId('compute-ask-submit');
+    await act(async () => { submitBtn.click(); });
+    await findByTestId('compute-ask-result');
+
+    // Clear button appears
+    const clearBtn = await findByTestId('compute-ask-clear');
+    await act(async () => { clearBtn.click(); });
+
+    // Thread must be gone after clearing
+    expect(queryByTestId('compute-ask-result')).toBeNull();
+    expect(queryByTestId('compute-ask-thread')).toBeNull();
   });
 });

@@ -72,7 +72,10 @@ from app.strategic_spawning import (
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Project, ProjectMember, StrategicCycle, Task
+from app.models import Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, VersionAcceptanceCriterion
+from app.auth import create_agent_token
+from httpx import AsyncClient
+from sqlmodel import select
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -4101,6 +4104,324 @@ async def test_gap_id_updated_on_update_fallback_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_gap_reconciled_on_create_fallback_path(db_session, mocker):
+    """The fallback create path stages the problem-model gap a new direction
+    staffs: the direction id joins active_moves and a stale deferral is cleared,
+    in the same locked transaction as the directions write."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-CREATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-metering",
+                    "name": "metering",
+                    "status": "active",
+                    "active_moves": [],
+                    "deferral": {"rationale": "not this cycle"},
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create",
+                    "text": "Close the metering gap",
+                    "priority": "high",
+                    "gap_id": "g-metering",
+                    "success_evidence": "Metering accurate",
+                    "retirement_condition": "No open metering bugs",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = next(
+        d for d in (project.directions or []) if "metering" in d.get("text", "")
+    )
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-metering")
+    assert created["id"] in gap["active_moves"]
+    # Deferral cleared — the gap is now actively staffed.
+    assert gap.get("deferral") is None
+
+
+@pytest.mark.asyncio
+async def test_gap_reconciled_on_reground_fallback_path(db_session, mocker):
+    """The fallback update path re-grounds a direction onto a new gap: it joins
+    the new gap's active_moves (deferral cleared) and is pruned from the old
+    gap's active_moves into past_moves."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-REGROUND",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-fb",
+                "text": "Existing direction",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-old",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-old",
+                    "name": "old",
+                    "status": "active",
+                    "active_moves": ["d-fb"],
+                },
+                {
+                    "id": "g-new",
+                    "name": "new",
+                    "status": "active",
+                    "active_moves": [],
+                    "deferral": {"rationale": "parked"},
+                },
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-fb",
+                    "changes": {"gap_id": "g-new"},
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    # New gap staffed, deferral cleared.
+    assert "d-fb" in gaps["g-new"]["active_moves"]
+    assert gaps["g-new"].get("deferral") is None
+    # Old gap pruned, move archived in past_moves.
+    assert "d-fb" not in gaps["g-old"]["active_moves"]
+    assert "d-fb" in gaps["g-old"]["past_moves"]
+
+
+@pytest.mark.asyncio
+async def test_gap_reconciled_on_retire_fallback_path(db_session, mocker):
+    """The fallback retire path prunes the direction from the gap's active_moves
+    and auto-defers the gap when it becomes unstaffed, in the same locked
+    transaction as the directions write."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-RETIRE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-xxx",
+                "text": "Close the metering gap",
+                "status": "active",
+                "priority": "high",
+                "gap_id": "g-metering",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-metering",
+                    "name": "metering",
+                    "status": "active",
+                    "active_moves": ["d-xxx"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-xxx",
+                    "rationale": "Done — metering gap closed",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    gap = next(
+        g for g in project.problem_model["gaps"] if g["id"] == "g-metering"
+    )
+    # Direction pruned from active_moves, archived in past_moves.
+    assert "d-xxx" not in gap["active_moves"]
+    assert "d-xxx" in gap["past_moves"]
+    # Gap auto-deferred because no active staffing remains.
+    assert gap.get("deferral") is not None
+
+
+@pytest.mark.asyncio
+async def test_gap_deferral_suppresses_orphan_after_retire(db_session, mocker):
+    """After the fallback retire reconciles a gap, the cycle-start advisory no
+    longer reports that gap as an orphan (stale_active_moves / orphaned_gaps)."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+    from app.strategic_spawning import _build_cycle_start_reconciliation
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="GAPRECON-FB-ORPHAN",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-yyy",
+                "text": "Close the latency gap",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-latency",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-latency",
+                    "name": "latency",
+                    "status": "active",
+                    "active_moves": ["d-yyy"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-yyy",
+                    "rationale": "Latency gap resolved",
+                }
+            ],
+        }
+    )
+    await _handle_strategic_completion(task, logs, db_session)
+    await db_session.refresh(project)
+
+    # Build the cycle-start reconciliation view on the post-retire model.
+    directions_after = project.directions or []
+    recon = _build_cycle_start_reconciliation(
+        directions_after, project.problem_model, {}
+    )
+
+    # The retired direction's gap must NOT appear as an orphan.
+    orphaned = recon.get("orphaned_gaps", [])
+    stale = recon.get("stale_active_moves", [])
+    gap_ids_orphaned = [o.get("gap_id") for o in orphaned]
+    gap_ids_stale = [s.get("gap_id") for s in stale]
+    assert "g-latency" not in gap_ids_orphaned, (
+        f"g-latency should not be an orphan after retire reconciliation; got {orphaned}"
+    )
+    assert "g-latency" not in gap_ids_stale, (
+        f"g-latency should not appear in stale_active_moves after retire; got {stale}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_absent_dedup_reasoning_no_error_on_create(db_session, mocker):
     """Omitting dedup_reasoning entirely causes no error — direction is created normally."""
     import json
@@ -4881,6 +5202,107 @@ async def test_set_retirement_critiques_invalid_dict_returns_400(
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_rejects_empty_list(client, db_session, mocker):
+    """HTTP API: an empty list returns 400 — not silently stored as no-op."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-EMPTY",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-empty",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-rc-empty", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": [],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "no_eligible_retirements" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_set_retirement_critiques_rejects_all_malformed(client, db_session, mocker):
+    """HTTP API: a list where every item is missing required fields returns 400."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="RC-MALFORMED",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-rc-malformed",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-rc-malformed", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_retirement_critiques",
+            "data": [
+                {"direction_id": "d-123"},  # missing what_it_addressed/pattern/lesson
+                {"lesson": "something"},  # missing direction_id/what_it_addressed/pattern
+            ],
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 400, resp.text
+    assert "no_eligible_retirements" in resp.text
 
 
 # ── set_evidence_progress HTTP API path ────────────────────────────────────────
@@ -7871,6 +8293,147 @@ async def test_set_problem_model_with_qualify_request_does_not_400(client, db_se
     assert body["qualify_request_received"] is True
 
 
+# ── new_acceptance_criteria transport / fallback ─────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_logs(
+    db_session, mocker
+):
+    """Fallback completion output must author version-scoped criteria."""
+    from unittest.mock import AsyncMock
+    from app import acceptance_criteria as ac
+    from app import release_version as rv
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NAC-FALLBACK",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    db_session.add(version)
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "new_acceptance_criteria": [
+                "All unit tests pass",
+                "No unresolved P0 bugs",
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert [c.text for c in fetched] == [
+        "All unit tests pass",
+        "No unresolved P0 bugs",
+    ]
+    assert all(c.created_by == "strategist" for c in fetched)
+
+
+@pytest.mark.asyncio
+async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
+    client, db_session
+):
+    """The API seam must strip, stow, and later apply new_acceptance_criteria."""
+    from app import acceptance_criteria as ac
+    from app import release_version as rv
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app.strategic_completion import (
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+        _handle_strategic_completion,
+    )
+    from app import strategic_cycle
+
+    project = Project(
+        name="NAC-E2E",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-nac-e2e",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-nac-e2e", task_type="strategic_review")
+    criteria_texts = [
+        "All unit tests pass",
+        "No unresolved P0 bugs",
+    ]
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
+                "capabilities": [],
+                "gaps": [],
+                "new_acceptance_criteria": criteria_texts,
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["op"] == "set_problem_model"
+    assert body["new_acceptance_criteria_received"] is True
+
+    await db_session.refresh(project)
+    assert "new_acceptance_criteria" not in (project.problem_model or {})
+
+    await db_session.refresh(task)
+    stored = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
+    assert stored == criteria_texts
+
+    await _handle_strategic_completion(task, "", db_session)
+
+    fetched = await ac.get_criteria_for_version(db_session, version.id)
+    assert [c.text for c in fetched] == criteria_texts
+    assert all(c.created_by == "strategist" for c in fetched)
+
+
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
 
 
@@ -7947,6 +8510,26 @@ class TestComputeLifetimeBurnMetrics:
         m = _compute_lifetime_burn_metrics(d)
         assert m is not None
         assert m["lifetime_non_merge_finished"] == 10  # only tasks_completed counts
+
+    def test_aggregate_stranded_merges_discounted_from_lifetime_merged_and_rate(self):
+        # Aggregate: 5 verified merges, 2 confirmed-stranded → credit-eligible = 3
+        # 10 tasks_completed, 0 failed. Window is empty.
+        # agg_merged = 5 - 2 = 3; non_merge = max(0, 10 - 3) = 7; total_finished = 10
+        # lifetime_merge_rate = proof_weighted / 10 ≈ 3/10 (no acceptance fields → proof == verified)
+        agg = {
+            "total_prs_merged": 5,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+            "total_tasks_completed": 10,
+            "total_tasks_failed": 0,
+            "total_tasks_failed_infra": 0,
+        }
+        d = _direction(research_history=[], history_aggregate=agg)
+        m = _compute_lifetime_burn_metrics(d)
+        assert m is not None
+        assert m["lifetime_merged"] == 3  # 5 verified − 2 stranded
+        assert m["lifetime_non_merge_finished"] == 7  # 10 completed − 3 credit-merged
+        assert m["lifetime_merge_rate"] == round(3 / 10, 3)
 
 
 # ── Rule 6: Lifetime burn backstop ───────────────────────────────────────────
@@ -8619,6 +9202,83 @@ def _scaffolding_direction(progress_window, *, success_evidence_fps=None, **over
     }
     d.update(overrides)
     return d
+
+
+class TestCreditGateMergedCount:
+    """credit_gate_merged_count: indeterminate merges count, only stranded excluded.
+
+    The credit-decision gates (auto-completion, churn-rate pause, lifetime-burn
+    pause) must count ancestry-indeterminate merges alongside confirmed-landed
+    ones, and exclude ONLY merges confirmed as unreachable (stranded).
+    """
+
+    def test_indeterminate_merge_counts_only_stranded_excluded_from_credit_gate(self):
+        from app.direction_outcomes import credit_gate_merged_count
+
+        # No stranded_prs_merged field → indeterminate case: all verified count
+        entry_indeterminate = {"verified_prs_merged": 2, "prs_merged": 2}
+        assert credit_gate_merged_count(entry_indeterminate) == 2
+
+        # One confirmed-stranded: subtracted from verified, only 1 credit-eligible
+        entry_one_stranded = {
+            "verified_prs_merged": 2,
+            "prs_merged": 3,
+            "stranded_prs_merged": 1,
+        }
+        assert credit_gate_merged_count(entry_one_stranded) == 1
+
+        # All stranded (floors at 0, never negative)
+        entry_all_stranded = {
+            "verified_prs_merged": 2,
+            "prs_merged": 2,
+            "stranded_prs_merged": 2,
+        }
+        assert credit_gate_merged_count(entry_all_stranded) == 0
+
+        # Legacy entry (no verified_prs_merged): falls back via verified_merged_count
+        entry_legacy = {"prs_merged": 3, "stranded_prs_merged": 1}
+        assert credit_gate_merged_count(entry_legacy) == 2
+
+    def test_churn_gate_excludes_stranded_merges_from_merge_count(self):
+        # 5 cycles, each with 1 verified merge that is confirmed-stranded.
+        # credit_gate_merged_count returns 0 → churn gate sees 0 merges → fires.
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 2,
+                    "tasks_completed": 2,
+                    "tasks_failed": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "stranded_prs_merged": 1,
+                }
+                for _ in range(5)
+            ]
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        # All merges are stranded → credit count is 0 → all 10 completions are non-merge
+        assert m["merged"] == 0
+        assert m["non_merge_finished"] == 10
+
+    def test_churn_gate_counts_indeterminate_merges(self):
+        # Same shape but no stranded_prs_merged → indeterminate merges count
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 2,
+                    "tasks_completed": 2,
+                    "tasks_failed": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                }
+                for _ in range(5)
+            ]
+        )
+        m = _compute_churn_metrics(d)
+        assert m is not None
+        assert m["merged"] == 5
+        assert m["non_merge_finished"] == 5
 
 
 class TestComputeOutcomeProgressSignal:
@@ -12033,6 +12693,28 @@ class TestResetScaffoldingStateOnOutcomeChange:
         assert d["outcome_progress_reset_at_merged"] == 7
 
 
+def test_outcome_progress_excludes_stranded_merges():
+    d = {
+        "research_history": [
+            {"prs_merged": 4, "verified_prs_merged": 4, "stranded_prs_merged": 1},
+            {"prs_merged": 3, "verified_prs_merged": 2},
+        ],
+        "history_aggregate": {
+            "total_cycles": 5,
+            "total_prs_merged": 8,
+            "total_verified_prs_merged": 5,
+            "total_stranded_prs_merged": 2,
+        },
+        "outcome_progress_ever_met": True,
+    }
+    record_outcome_progress_snapshot(d)
+    assert d["outcome_progress_history"][-1]["merged"] == 8
+
+    _reset_scaffolding_state_on_outcome_change(d)
+    assert d["outcome_progress_reset_at_cycle"] == 7
+    assert d["outcome_progress_reset_at_merged"] == 8
+
+
 class TestRecordOutcomeProgressSnapshotPostReset:
     """After an outcome reset, the cumulative completion heuristic must NOT
     immediately re-latch ``outcome_progress_ever_met`` — fresh post-reset
@@ -14818,193 +15500,6 @@ async def test_apply_new_version_goal_logs_info_when_operator_goal_frozen(db_ses
     assert version.goal == "operator choice"
 
 
-# ===========================================================================
-# extract_new_version_theme + _apply_new_version_theme
-# ===========================================================================
-
-
-def test_extract_new_version_theme_valid_values():
-    """All allowed theme values are accepted and lowercased."""
-    from app.strategic_completion import extract_new_version_theme
-
-    for val in ("leanness", "reliability", "performance", "feature", "mixed", "none"):
-        assert extract_new_version_theme(val) == val
-    # Case-insensitive normalization
-    assert extract_new_version_theme("Leanness") == "leanness"
-    assert extract_new_version_theme("RELIABILITY") == "reliability"
-
-
-def test_extract_new_version_theme_invalid_values():
-    """Invalid theme values, non-strings, and blank are rejected."""
-    from app.strategic_completion import extract_new_version_theme
-
-    assert extract_new_version_theme(None) is None
-    assert extract_new_version_theme(42) is None
-    assert extract_new_version_theme("") is None
-    assert extract_new_version_theme("invalid_theme") is None
-    assert extract_new_version_theme("quality") is None
-
-
-@pytest.mark.asyncio
-async def test_apply_new_version_theme_sets_theme(db_session):
-    """_apply_new_version_theme sets version.theme when it is currently unset."""
-    from app.strategic_completion import _apply_new_version_theme
-    from app import release_version as rv
-
-    project = Project(
-        name="ThemeTest",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    version = await rv.open_version(db_session, project.id, version_number=1)
-    await db_session.commit()
-    await db_session.refresh(version)
-    assert version.theme is None
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r"}],
-        context={},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    await _apply_new_version_theme("reliability", task, project, db_session, path="test")
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    assert version.theme == "reliability"
-
-
-@pytest.mark.asyncio
-async def test_apply_new_version_theme_can_be_corrected(db_session):
-    """_apply_new_version_theme allows strategist to correct a previously-set theme."""
-    from app.strategic_completion import _apply_new_version_theme
-    from app import release_version as rv
-
-    project = Project(
-        name="ThemeCorrect",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    version = await rv.open_version(db_session, project.id, version_number=1)
-    version.theme = "leanness"
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r"}],
-        context={},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    await _apply_new_version_theme("feature", task, project, db_session, path="test")
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    # Strategist can correct a previously-set theme.
-    assert version.theme == "feature"
-
-
-@pytest.mark.asyncio
-async def test_apply_new_version_theme_operator_freeze(db_session):
-    """Operator-set theme is frozen to strategist overwrites."""
-    from app.strategic_completion import _apply_new_version_theme
-    from app import release_version as rv
-
-    project = Project(
-        name="ThemeOperatorFreeze",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    version = await rv.open_version(db_session, project.id, version_number=1)
-
-    # Simulate an operator setting the theme via the admin endpoint.
-    rv.set_version_theme(version, "reliability", editor_id="op@example.com", source="operator")
-    db_session.add(version)
-    await db_session.commit()
-    await db_session.refresh(version)
-    assert version.theme == "reliability"
-    assert version.theme_editor_info == "[operator:op@example.com]"
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r"}],
-        context={},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    # Strategist attempts to overwrite the operator theme — must be a no-op.
-    await _apply_new_version_theme("feature", task, project, db_session, path="test")
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    assert version.theme == "reliability", (
-        f"Operator theme must not be overridden by strategist; got {version.theme!r}"
-    )
-    assert version.theme_editor_info == "[operator:op@example.com]", (
-        f"theme_editor_info must remain operator-set; got {version.theme_editor_info!r}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_apply_new_version_theme_invalid_value_is_noop(db_session):
-    """Invalid theme value is silently ignored."""
-    from app.strategic_completion import _apply_new_version_theme
-    from app import release_version as rv
-
-    project = Project(
-        name="ThemeInvalid",
-        user_id="u1",
-        vision={"purpose": "test", "revision": 1},
-        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
-    )
-    db_session.add(project)
-    await db_session.commit()
-    await db_session.refresh(project)
-
-    version = await rv.open_version(db_session, project.id, version_number=1)
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    task = Task(
-        project_id=project.id,
-        payloads=[{"type": "strategic_review", "prompt": "r"}],
-        context={},
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
-
-    await _apply_new_version_theme("invalid_value", task, project, db_session, path="test")
-    await db_session.commit()
-    await db_session.refresh(version)
-
-    assert version.theme is None
-
-
 # ── _compute_model_gc_telemetry ───────────────────────────────────────────────
 
 
@@ -15828,133 +16323,387 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
     )
 
 
-async def test_set_problem_model_lifts_new_version_theme_api_path(
-    client, db_session, mocker
+@pytest.mark.asyncio
+async def test_batch_retire_reconciles_gap_active_moves_and_records_deferral(
+    db_session, mocker
 ):
-    """Full API-path regression: new_version_theme lifts past ProblemModel extra=forbid,
-    stows in task.context, and the completion handler applies it to a null-theme version.
-
-    Exercises the seam end-to-end using the real HTTP transport (not a mocked
-    context write) so that a future regression in any of the three layers
-    (endpoint strip, context stow, completion apply) will fail this test.
-    """
-    from unittest.mock import AsyncMock
-    from app.auth import create_agent_token
-    from app.models import TaskStatus
-    from app.strategic_completion import (
-        NEW_VERSION_THEME_CONTEXT_KEY,
-        _handle_strategic_completion,
-    )
-    from app import release_version as rv
-    from app import strategic_cycle
+    """End-to-end (batch/log-parse path): retiring a gap's last staffing
+    direction prunes it from the problem-model gap's active_moves (-> past_moves)
+    and records a GapDeferral, in the same completion pass."""
+    from app.strategic_completion import _handle_strategic_completion
 
     mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._spawn_retirement_memos", new_callable=AsyncMock
+    )
 
     project = Project(
-        name="NVT-E2E",
+        name="P",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
-        directions=[],
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-ret",
+                    "name": "unstaffed soon",
+                    "status": "active",
+                    "active_moves": ["d-ret"],
+                    "past_moves": [],
+                }
+            ],
+        },
+        directions=[
+            {"id": "d-ret", "text": "Work the gap", "status": "active"},
+        ],
     )
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Open ReleaseVersion with no theme — the strategist should be able to author it.
-    version = await rv.open_version(db_session, project.id, version_number=1)
-    cycle = await strategic_cycle.create(db_session, project_id=project.id)
-    await db_session.commit()
-    await db_session.refresh(version)
-    assert version.theme is None
-
     task = Task(
         project_id=project.id,
-        status=TaskStatus.IN_PROGRESS,
-        vm_instance_id="vm-nvt-e2e",
         payloads=[
             {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
         ],
-        context={"strategic_cycle_id": cycle.id},
-        strategic_cycle_id=cycle.id,
+        context={},
     )
     db_session.add(task)
     await db_session.commit()
     await db_session.refresh(task)
 
-    token = create_agent_token(str(task.id), "vm-nvt-e2e", task_type="strategic_review")
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "retire",
+                    "direction_id": "d-ret",
+                    "rationale": "no longer worthwhile",
+                },
+            ],
+        }
+    )
 
-    theme_text = "reliability"
+    await _handle_strategic_completion(task, logs, db_session)
 
-    # The agent embeds new_version_theme as a TOP-LEVEL SIBLING of the
-    # problem_model fields. The endpoint must strip it before ProblemModel
-    # validation (extra="forbid" would 400 if it reaches apply_agent_update).
+    await db_session.refresh(project)
+    # Direction flipped to retired in the live list.
+    d = next(d for d in project.directions if d["id"] == "d-ret")
+    assert d["status"] == "retired"
+
+    # The staffed gap is reconciled end-to-end.
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-ret")
+    assert gap["active_moves"] == []
+    assert gap["past_moves"] == ["d-ret"]
+    # Last active move retired -> deferral recorded naming the trigger direction.
+    assert gap.get("deferral")
+    assert "d-ret" in gap["deferral"]["rationale"]
+    assert gap["deferral"]["created_at"]
+    # Status is never auto-closed.
+    assert gap["status"] == "active"
+
+
+# ---------------------------------------------------------------------------
+# set_acceptance_criteria strategic op (DB-backed, HTTP endpoint)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_strategic_authors_and_maps_acceptance_criteria(
+    client: AsyncClient, db_session
+):
+    """strategic op set_acceptance_criteria creates VersionAcceptanceCriterion rows
+    and maps directions to them via Direction.criterion_keys.
+
+    Exercises:
+    - happy path: two criteria, one mapped to a direction
+    - idempotency: same call twice → no duplicate rows
+    - 409 when no open release version exists
+    """
+    # --- Setup ---
+    project = Project(name="AC-Strategic-Test", user_id="test-user-ac-strat")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-ac-test1",
+        data={"id": "d-ac-test1", "text": "Test direction", "status": "active"},
+        status="active",
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-strat",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-ac-strat", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # --- First call: creates two criteria, maps first to direction ---
     resp = await client.post(
         "/api/agent/strategic",
+        headers=headers,
         json={
             "task_id": str(task.id),
-            "op": "set_problem_model",
+            "op": "set_acceptance_criteria",
             "data": {
-                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
-                "capabilities": [],
-                "gaps": [],
-                "new_version_theme": theme_text,
+                "criteria": [
+                    {
+                        "text": "Users can create projects",
+                        "direction_keys": ["d-ac-test1"],
+                    },
+                    {
+                        "text": "CI passes on HEAD",
+                        "direction_keys": [],
+                    },
+                ]
             },
         },
-        headers={"x-agent-token": token},
     )
-    assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+    assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["op"] == "set_problem_model"
-    assert body["new_version_theme_received"] is True, (
-        "Response must confirm new_version_theme was received"
-    )
+    assert body["status"] == "ok"
+    assert body["op"] == "set_acceptance_criteria"
+    assert len(body["criteria"]) == 2
 
-    # The transient signal must NOT linger in the stored problem_model.
-    await db_session.refresh(project)
-    assert "new_version_theme" not in (project.problem_model or {}), (
-        "new_version_theme must be stripped before ProblemModel validation"
-    )
-    assert (project.problem_model or {}).get("intent", {}).get("purpose") == (
-        "Ship the thing"
-    )
+    first_item = next(c for c in body["criteria"] if "create projects" in c["text"])
+    second_item = next(c for c in body["criteria"] if "CI passes" in c["text"])
+    assert first_item["is_new"] is True
+    assert second_item["is_new"] is True
+    assert "d-ac-test1" in first_item["direction_keys"]
+    assert second_item["direction_keys"] == []
 
-    # It must ride task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get(NEW_VERSION_THEME_CONTEXT_KEY)
-    assert stored == theme_text, (
-        f"Expected new_version_theme stowed in task.context[{NEW_VERSION_THEME_CONTEXT_KEY!r}]; "
-        f"got {stored!r}"
-    )
+    criterion_key_1 = first_item["criterion_key"]
+    criterion_key_2 = second_item["criterion_key"]
 
-    # Completion handler's API path must apply the theme to the null-theme version.
-    await _handle_strategic_completion(task, "", db_session)
+    # DB: two VersionAcceptanceCriterion rows
+    rows = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows) == 2
+    texts = {r.text for r in rows}
+    assert "Users can create projects" in texts
+    assert "CI passes on HEAD" in texts
+    for row in rows:
+        assert row.project_id == project.id
+        assert row.release_version_id == version.id
 
-    await db_session.refresh(version)
-    assert version.theme == theme_text, (
-        f"Expected open version theme to be set to {theme_text!r}; got {version.theme!r}"
-    )
+    # DB: direction has criterion_key_1 in criterion_keys
+    await db_session.refresh(direction)
+    assert criterion_key_1 in direction.criterion_keys
+    assert criterion_key_2 not in direction.criterion_keys
 
-    # A second call with a different theme from the strategist IS allowed —
-    # the strategist can correct its own previously-authored theme.
-    corrected_theme = "feature"
+    # --- Second call: same criteria → no new rows (idempotent) ---
     resp2 = await client.post(
         "/api/agent/strategic",
+        headers=headers,
         json={
             "task_id": str(task.id),
-            "op": "set_problem_model",
+            "op": "set_acceptance_criteria",
             "data": {
-                "intent": {"purpose": "Ship the thing", "current_focus": "build"},
-                "capabilities": [],
-                "gaps": [],
-                "new_version_theme": corrected_theme,
+                "criteria": [
+                    {
+                        "text": "Users can create projects",
+                        "direction_keys": ["d-ac-test1"],
+                    },
+                    {
+                        "text": "CI passes on HEAD",
+                        "direction_keys": [],
+                    },
+                ]
             },
         },
-        headers={"x-agent-token": token},
     )
     assert resp2.status_code == 200, resp2.text
-    await db_session.refresh(task)
-    await _handle_strategic_completion(task, "", db_session)
-    await db_session.refresh(version)
-    assert version.theme == corrected_theme, (
-        f"Strategist must be able to correct its own theme; got {version.theme!r}"
+    body2 = resp2.json()
+    assert body2["status"] == "ok"
+    for item in body2["criteria"]:
+        assert item["is_new"] is False
+
+    rows_after = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.release_version_id == version.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows_after) == 2, "Idempotent call must not create duplicate rows"
+
+    # criterion_keys on direction still contains only criterion_key_1 (no duplicates)
+    await db_session.refresh(direction)
+    assert direction.criterion_keys.count(criterion_key_1) == 1
+
+    # --- Third call: no open version → 409 ---
+    version.status = "closed"
+    db_session.add(version)
+    await db_session.commit()
+
+    resp3 = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {"criteria": [{"text": "Should fail", "direction_keys": []}]},
+        },
     )
+    assert resp3.status_code == 409, resp3.text
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_enforces_cap(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria stops adding new rows at MAX_CRITERIA_PER_VERSION
+    and reports the skipped count in skipped_over_cap.
+
+    Pre-condition: version is pre-filled to MAX-1, then two new criteria are
+    requested — the first fills the last slot, the second is skipped.
+    Existing-by-text (idempotent) rows do NOT consume new headroom.
+    """
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Cap-Op-Test", user_id="test-user-cap-op")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Pre-fill to MAX - 1, leaving exactly one slot
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(db_session, project.id, version.id, f"Pre {i}")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-cap-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cap-op", task_type="strategic_review")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {"text": "New criterion 1", "direction_keys": []},
+                    {"text": "New criterion 2", "direction_keys": []},
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # One accepted (fills last slot), one skipped over cap
+    assert body["skipped_over_cap"] == 1
+    assert len(body["criteria"]) == 1
+    assert body["criteria"][0]["text"] == "New criterion 1"
+    assert body["criteria"][0]["is_new"] is True
+
+    # DB: verify count is exactly at cap
+    all_rows = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(all_rows) == ac.MAX_CRITERIA_PER_VERSION
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_dedup_does_not_consume_headroom(
+    client: AsyncClient, db_session
+):
+    """Duplicate-by-text criteria in set_acceptance_criteria do not count against
+    the cap — only genuinely new rows consume headroom."""
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Cap-Dedup-Test", user_id="test-user-cap-dedup")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Pre-fill to MAX - 1, leaving one slot; also pre-create the duplicate row
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(db_session, project.id, version.id, f"Existing {i}")
+    # The last pre-created row uses index 0 text; create an extra "Already exists" row
+    # to use as the idempotent duplicate in the request
+    await ac.create_criterion(db_session, project.id, version.id, "Already exists")
+
+    # Now at MAX (no slots)
+    count_before = await ac.count_criteria_for_version(db_session, version.id)
+    assert count_before == ac.MAX_CRITERIA_PER_VERSION
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-cap-dedup",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-cap-dedup", task_type="strategic_review")
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {"text": "Already exists", "direction_keys": []},  # duplicate — no headroom consumed
+                    {"text": "Truly new", "direction_keys": []},       # new — no slots → skipped
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # Duplicate is accepted (is_new=False), new one is skipped over cap
+    assert body["skipped_over_cap"] == 1
+    assert len(body["criteria"]) == 1
+    assert body["criteria"][0]["text"] == "Already exists"
+    assert body["criteria"][0]["is_new"] is False
+
+    # DB count unchanged
+    count_after = await ac.count_criteria_for_version(db_session, version.id)
+    assert count_after == ac.MAX_CRITERIA_PER_VERSION

@@ -31,6 +31,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    TASK_AGENT_STATUS_IDEMPOTENT_STATUSES,
     bank_task_current_attempt,
     get_task_total_vm_cost_usd,
     with_task_attempt_banking,
@@ -104,14 +105,84 @@ router = APIRouter()
 
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
-_AGENT_STATUS_TERMINAL_STATUSES = (
-    TaskStatus.COMPLETED,
-    TaskStatus.FAILED,
-    TaskStatus.CANCELLED,
-    TaskStatus.BLOCKED,
-)
+_AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
 _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS = 600
 _PARK_AND_RETARGET_MAX_BUDGET_SECONDS = 1800
+
+_GITHUB_AUTH_FAILURE_MARKERS = (
+    "github.com",
+    "api.github.com",
+    "x-access-token",
+    "git clone",
+    "git fetch",
+    "invalid username or token",
+    "password authentication is not supported",
+    "authentication failed for 'https://github.com",
+)
+
+_PROVIDER_AUTH_ENDPOINT_MARKERS = {
+    "anthropic": (
+        "api.anthropic.com",
+        "claude code",
+        "anthropic",
+    ),
+    "openai": (
+        "api.openai.com",
+        "chatgpt.com/backend-api/codex",
+        "codex_api",
+        "codex_login",
+        "openai",
+    ),
+    "gemini": (
+        "generativelanguage.googleapis.com",
+        "aiplatform.googleapis.com",
+        "gemini",
+        "google generative",
+    ),
+}
+
+_PROVIDER_AUTH_STRONG_MARKERS = {
+    "anthropic": (
+        "oauth_org_not_allowed",
+        "invalid x-api-key",
+        "x-api-key header is required",
+        "could not resolve authentication",
+        "please run /login",
+    ),
+    "openai": (
+        "token_invalidated",
+        "refresh_token_invalidated",
+        "app_session_terminated",
+        "your session has ended. please log in again",
+        "refresh token was revoked",
+        "refresh token was already used",
+        "refresh token has already been used",
+        "incorrect api key provided",
+        "invalid_api_key",
+        "missing bearer or basic authentication",
+    ),
+    "gemini": (
+        "api key not valid",
+        "api_key_invalid",
+        "permission_denied",
+        "unauthenticated",
+    ),
+}
+
+_PROVIDER_AUTH_GENERIC_MARKERS = (
+    "http 401",
+    "401 unauthorized",
+    "unauthorized",
+    "authentication_failed",
+    "authentication failed",
+    "failed to authenticate",
+    "invalid authentication credentials",
+    "invalid api key",
+    "bad credentials",
+    "token expired",
+    "token invalid",
+    "token revoked",
+)
 
 
 def record_task_result(
@@ -165,6 +236,57 @@ def record_task_result(
 
     if success:
         _shared_state.deploy_monitoring["last_completion_time"] = _utcnow()
+
+
+def _is_task_llm_auth_hard_disable(
+    task: Task,
+    logs: str | None,
+    *,
+    payload_provider: str | None = None,
+) -> bool:
+    """True only when EXTERNAL_API auth evidence belongs to this task's LLM.
+
+    Generic auth text is common outside the LLM provider layer: GitHub clone/fetch
+    failures, PR API calls, and backend task-token 401s all use phrases like
+    "unauthorized" or "authentication failed". Those must not hard-disable the
+    task's LLM account. Prefer the structured agent report when present; otherwise
+    require provider-specific markers or provider endpoint context.
+    """
+
+    provider = (get_task_llm_provider(task) or "").strip().lower()
+    if not provider:
+        return False
+
+    if payload_provider and payload_provider.strip().lower() != provider:
+        return False
+
+    ctx = task.context or {}
+    report = ctx.get("agent_error_report")
+    if isinstance(report, dict):
+        classified = str(report.get("classified") or "").strip().lower()
+        report_provider = str(report.get("provider") or "").strip().lower()
+        if classified == "auth_failure":
+            if report_provider and report_provider != provider:
+                return False
+            return True
+
+    combined = (logs or "").lower()
+    if not combined:
+        return False
+
+    strong_markers = _PROVIDER_AUTH_STRONG_MARKERS.get(provider, ())
+    if any(marker in combined for marker in strong_markers):
+        return True
+
+    if any(marker in combined for marker in _GITHUB_AUTH_FAILURE_MARKERS):
+        return False
+
+    endpoint_markers = _PROVIDER_AUTH_ENDPOINT_MARKERS.get(provider, ())
+    has_provider_context = any(marker in combined for marker in endpoint_markers)
+    has_auth_context = any(
+        marker in combined for marker in _PROVIDER_AUTH_GENERIC_MARKERS
+    )
+    return has_provider_context and has_auth_context
 
 
 def _park_and_retarget_budget_seconds() -> int:
@@ -1516,6 +1638,7 @@ async def update_agent_status(
                     from app.task_blocked import enter_blocked_state
 
                     _blk_acct_id = get_task_llm_account_id(task)
+                    _blocked_vm_id = task.vm_instance_id
                     if _blk_acct_id and not (task.context or {}).get("_slot_released"):
                         await release_max_plan_account(_blk_acct_id)
                         task.context = {**(task.context or {}), "_slot_released": True}
@@ -1532,10 +1655,10 @@ async def update_agent_status(
                         ),
                     )
                     task.vm_stopped_at = _utcnow()
-                    # Retire any LEASED pool member before the commit. enter_blocked_state
-                    # does not clear vm_instance_id, so the linkage is still intact here.
-                    # The terminal-completion path never fires for BLOCKED tasks, so this
-                    # is the last chance to release the member before it leaks permanently.
+                    # Retire any LEASED pool member before clearing vm_instance_id.
+                    # The terminal-completion path never fires for BLOCKED tasks,
+                    # so this is the last chance to release the member before it
+                    # leaks permanently.
                     try:
                         from app.models import PoolVmState  # noqa: PLC0415
                         from app.warm_pool import (  # noqa: PLC0415
@@ -1554,6 +1677,9 @@ async def update_agent_status(
                             "[AGENT STATUS] pool-member retire failed for BLOCKED task %s",
                             task.id,
                         )
+                    task.vm_instance_id = None
+                    task.last_heartbeat = None
+                    task.started_at = None
                     session.add(task)
                     await session.commit()
                     # Surface one deduplicated, operator-visible precondition
@@ -1580,7 +1706,7 @@ async def update_agent_status(
                         {"task_id": str(task.id), "status": TaskStatus.BLOCKED},
                     )
                     await _ensure_vm_deleted(
-                        task.vm_instance_id, reason="blocked_precondition"
+                        _blocked_vm_id, reason="blocked_precondition"
                     )
                     logger.info(
                         f"[AGENT STATUS] Task {task.id} BLOCKED — precondition not "
@@ -1734,25 +1860,17 @@ async def update_agent_status(
                                 task.latest_status_message = "External API model/config failure - update provider model/settings and retry."
                                 task.attempt_count = _runtime_config["max_retries"]
                                 should_requeue = False
-                        # Permanent auth failures (bad/expired credentials, org-disabled
-                        # OAuth) should never be retried — they keep failing until the
-                        # operator re-authenticates. Detect these by inspecting the failure
-                        # message before burning retries.
-                        elif any(
-                            ind in (payload.logs or "").lower()
-                            for ind in (
-                                "token expired",
-                                "token revoked",
-                                "bad credentials",
-                                "unauthorized",
-                                "authentication_failed",
-                                "authentication failed",
-                                "failed to authenticate",
-                                "invalid authentication credentials",
-                                "invalid api key",
-                                "401",
-                                "oauth_org_not_allowed",
-                            )
+                        # Permanent LLM-provider auth failures (bad/expired
+                        # provider credentials, org-disabled OAuth) should
+                        # never be retried. Keep this destructive action scoped
+                        # to the task's LLM provider/account: GitHub token
+                        # failures and lens-provider auth failures can contain
+                        # the same generic 401/authentication text but must not
+                        # hard-disable the primary LLM account.
+                        elif _is_task_llm_auth_hard_disable(
+                            task,
+                            payload.logs,
+                            payload_provider=payload.provider,
                         ):
                             logger.warning(
                                 f"[AGENT STATUS] Task {task.id} EXTERNAL_API permanent auth failure "

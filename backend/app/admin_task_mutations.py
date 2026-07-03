@@ -47,6 +47,18 @@ logger = logging.getLogger(__name__)
 _TERMINAL_STATUSES = frozenset(
     {TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED}
 )
+CANCEL_CASCADE_CHILD_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.IN_PROGRESS,
+    TaskStatus.EVALUATING,
+)
+CANCEL_WAITING_DEPENDENT_STATUSES = (
+    TaskStatus.QUEUED,
+    TaskStatus.BLOCKED,
+    TaskStatus.PROVISIONING,
+    TaskStatus.PARKED,
+)
 
 
 async def _refresh_direction_outcomes_for_task(task: Task) -> None:
@@ -267,14 +279,7 @@ async def _apply_status_mutation(
                 await session.execute(
                     select(Task).where(
                         Task.parent_task_id == task.id,
-                        Task.status.in_(
-                            [
-                                TaskStatus.QUEUED,
-                                TaskStatus.PROVISIONING,
-                                TaskStatus.IN_PROGRESS,
-                                TaskStatus.EVALUATING,
-                            ]
-                        ),
+                        Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
                     )
                 )
             )

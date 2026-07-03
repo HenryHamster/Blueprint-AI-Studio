@@ -171,6 +171,45 @@ class TaskStatus(str, Enum):
     CANCELLED = "CANCELLED"
 
 
+TASK_OUTCOME_TERMINAL_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+    }
+)
+
+# Statuses where the current agent/VM binding is no longer live and any issued
+# agent JWT must be revoked. BLOCKED/PARKED are recoverable, but both release
+# the agent slot immediately.
+TASK_AGENT_RELEASE_STATUSES: frozenset[TaskStatus] = (
+    TASK_OUTCOME_TERMINAL_STATUSES | {TaskStatus.BLOCKED, TaskStatus.PARKED}
+)
+
+# Agent status callbacks should be idempotent after true terminal outcomes and
+# BLOCKED. PARKED has its own stale-callback response because it is non-terminal
+# work owned by the wake-delivery worker.
+TASK_AGENT_STATUS_IDEMPOTENT_STATUSES: frozenset[TaskStatus] = (
+    TASK_OUTCOME_TERMINAL_STATUSES | {TaskStatus.BLOCKED}
+)
+
+TASK_PARKABLE_STATUSES: frozenset[TaskStatus] = frozenset(
+    {
+        TaskStatus.QUEUED,
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.EVALUATING,
+    }
+)
+
+
+def task_status_releases_agent_resources(status: TaskStatus | str | None) -> bool:
+    """True when ``status`` releases the active agent/VM binding."""
+    if status is None:
+        return False
+    return status in TASK_AGENT_RELEASE_STATUSES
+
+
 class WakeAction(str, Enum):
     """What the wake-delivery worker does with a PARKED task when its source fires.
 
@@ -255,11 +294,11 @@ class ArtifactType(str, Enum):
     # Blind goal-coverage grade from the release_merge_grade handler: an
     # uninvested agent grades the merged DIFFS of a release version against the
     # frozen version.goal — BLIND to the strategist's running_update narrative —
-    # and emits {covers_goal, coverage_score, biggest_gap}. Consumed as a hard
-    # gate in _finalize_qualification (compute_composite blocker
-    # ``merge_grade_goal_coverage``): a candidate whose merged diffs do not
-    # advance the goal cannot promote. Like MERGE_TEST_RESULT the artifact column
-    # is a plain String so no migration is needed for the ArtifactType itself.
+    # and emits {covers_goal, coverage_score, biggest_gap}. Kept as diagnostic
+    # artifact evidence; canonical VersionAcceptanceCriterion coverage now owns
+    # the hard goal-coverage qualification gate. Like MERGE_TEST_RESULT the
+    # artifact column is a plain String so no migration is needed for the
+    # ArtifactType itself.
     RELEASE_MERGE_GRADE = "RELEASE_MERGE_GRADE"
     MEMO = "MEMO"
     # Verdict from the verify_tests agent handler: the repo's detected test
@@ -608,6 +647,17 @@ class Project(SQLModel, table=True):
         default=None,
         sa_column=Column(String, nullable=True),
     )
+    # Per-automain-HEAD CI-compliance status (module-size guardrails), keyed by
+    # commit SHA. Written by ci_compliance.record_ci_compliance after
+    # evaluate_ci_compliance_at_ref reads the capped modules at the HEAD ref via
+    # the GitHub file-read-at-SHA path; read via get_ci_compliance and surfaced
+    # in the strategist payload so guardrail violations are discovered
+    # CONTINUOUSLY (per merge) rather than only when qualification CI fails.
+    # Shape: {sha: {ref, compliant: bool, violations: [{section, rel, count, cap}]}}.
+    # NULL = never evaluated.
+    ci_compliance: Dict[str, Any] | None = Field(
+        default=None, sa_column=Column(JSONB, nullable=True)
+    )
 
     @property
     def enable_self_improvement(self) -> bool:
@@ -882,8 +932,9 @@ class MessagesSavedViews(SQLModel, table=True):
     this table is the authoritative source when the backend is reachable.
 
     saved_views shape (stored as JSONB, validated by the admin_notifications router):
-      [{"name": str, "query": str, "event_prefs": {...}, "sort_mode": str,
-        "show_resolved": bool, "show_routine": bool, "only_new": bool}, ...]
+      [{"id": str, "name": str, "query": str, "prefs": {...}, "sort": str,
+        "showResolved": bool, "routineExpanded": bool, "showOnlyNew": bool,
+        "createdAt": number}, ...]
     """
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -1257,6 +1308,13 @@ class Task(SQLModel, table=True):
     version: int = Field(
         default=1,
         sa_column=Column(Integer, nullable=False, server_default=text("1")),
+    )
+
+    # Criterion keys this task provides evidence for (captured at dispatch).
+    # List of criterion_key strings from VersionAcceptanceCriterion.
+    criterion_ids: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
     )
 
     @property
@@ -2305,22 +2363,6 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             emit_task_terminated_notify,
         )
 
-        # BLOCKED is terminal-for-now: entering it releases the VM and must
-        # revoke the agent JWT (emit_task_terminated_notify), and the
-        # BLOCKED->QUEUED unblock must fire the revive branch so peer instances
-        # evict the stale deny-list entry. PARKED is the same shape: entering it
-        # releases the agent VM/JWT/slot immediately (see park_task), so it must
-        # revoke the agent JWT exactly as BLOCKED does; the PARKED->QUEUED resume
-        # wake then fires the revive branch so peer instances evict the stale
-        # deny-list entry. Keep this in lockstep with the terminal set used by
-        # _on_status_set's callbacks below and with _AGENT_WS_TERMINAL_STATUSES.
-        terminal = (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.BLOCKED,
-            TaskStatus.PARKED,
-        )
         for instance in session.dirty:
             if not isinstance(instance, Task):
                 continue
@@ -2328,9 +2370,11 @@ def _emit_jwt_revocation_on_terminal(session, flush_context, instances):
             if not history.added:
                 continue
             new_status = history.added[0]
-            if new_status in terminal:
+            if task_status_releases_agent_resources(new_status):
                 emit_task_terminated_notify(session, str(instance.id))
-            elif history.deleted and history.deleted[0] in terminal:
+            elif history.deleted and task_status_releases_agent_resources(
+                history.deleted[0]
+            ):
                 # Real terminal → non-terminal transition (requeue/revive): the
                 # prior status was terminal and the new one is not. Broadcast so
                 # every instance evicts its stale deny-list entry. The guard on
@@ -2401,20 +2445,10 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
                 e,
             )
         task_id = str(target.id)
-        # Notify JWT revocation when task reaches terminal state. BLOCKED is
-        # terminal-for-now: the VM is released and must stop, so revoke its JWT
-        # exactly as for FAILED/CANCELLED. Recovery requeues the task to QUEUED,
-        # which falls into the revive branch below and clears the deny-list entry.
-        # PARKED behaves identically — it releases the agent VM/JWT/slot the moment
-        # it parks, so the released agent's token must be revoked; the resume wake
-        # back to QUEUED hits the revive branch and clears the deny-list entry.
-        if value in (
-            TaskStatus.COMPLETED,
-            TaskStatus.FAILED,
-            TaskStatus.CANCELLED,
-            TaskStatus.BLOCKED,
-            TaskStatus.PARKED,
-        ):
+        # Notify JWT revocation when task reaches a resource-releasing state.
+        # BLOCKED/PARKED are recoverable, but both release the active agent/VM
+        # binding and must revoke the old token until a fresh QUEUED claim revives it.
+        if task_status_releases_agent_resources(value):
             for cb in _on_task_terminal_callbacks:
                 try:
                     cb(task_id)
@@ -2452,6 +2486,21 @@ class Alert(SQLModel, table=True):
     )
     title: str
     message: str
+    domain: str = Field(
+        default="core",
+        sa_column=Column(String, nullable=False, server_default="core"),
+    )
+    event_type: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    source: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    dedupe_key: str | None = Field(default=None, sa_column=Column(String, nullable=True))
+    occurrence_count: int = Field(
+        default=1,
+        sa_column=Column(Integer, nullable=False, server_default="1"),
+    )
+    last_seen_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
     # Audit 2026-04-29 (M-S3): FK to task.id with ondelete=SET NULL added in
     # migration 0056. Alert messages survive parent-task GC for the admin UI.
     task_id: uuid.UUID | None = Field(
@@ -2474,6 +2523,16 @@ class Alert(SQLModel, table=True):
         Index("ix_alert_project_id_dismissed", "project_id", "dismissed_at"),
         Index("ix_alert_severity", "severity"),
         Index("ix_alert_project_severity", "project_id", "severity"),
+        Index("ix_alert_project_domain", "project_id", "domain"),
+        Index("ix_alert_project_event_type", "project_id", "event_type"),
+        Index(
+            "ux_alert_active_dedupe_key",
+            "project_id",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text("dedupe_key IS NOT NULL AND dismissed_at IS NULL"),
+            sqlite_where=text("dedupe_key IS NOT NULL AND dismissed_at IS NULL"),
+        ),
     )
 
 
@@ -2757,7 +2816,7 @@ class ProjectMessage(SQLModel, table=True):
     context: Dict[str, Any] = Field(
         default_factory=dict, sa_column=Column(JSONB, nullable=True, default={})
     )
-    status: str = Field(default="open")  # "open" | "resolved"
+    status: str = Field(default="open")  # "open" | "linked" | "resolved"
     resolution: str | None = None
     # Client-supplied idempotency key. A double-click / network retry of a
     # send that already succeeded server-side carries the same key, so the
@@ -3096,6 +3155,10 @@ class ResidualRemediationCase(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    recovery_attempts: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
+    )
     sample_messages: List[str] = Field(
         default_factory=list,
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'")),
@@ -3162,6 +3225,7 @@ class Artifact(SQLModel, table=True):
             "task_id",
             unique=True,
             postgresql_where=text("artifact_type = 'PULL_REQUEST'"),
+            sqlite_where=text("artifact_type = 'PULL_REQUEST'"),
         ),
         Index(
             "ix_artifact_pr_url_trgm",
@@ -3660,6 +3724,15 @@ class Direction(SQLModel, table=True):
         ),
     )
 
+    # Criterion keys this direction is mapped to (captured at assignment).
+    # List of criterion_key strings from VersionAcceptanceCriterion.
+    # server_default uses a string literal (not text()) because the `text` name
+    # is shadowed by the Direction.text field declared above in this class body.
+    criterion_keys: List[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default="'[]'"),
+    )
+
 
 class ReleaseVersion(SQLModel, table=True):
     """Release-version lifecycle record for automain → main promotion gating.
@@ -3727,21 +3800,6 @@ class ReleaseVersion(SQLModel, table=True):
     # Editor provenance for the goal: "[operator:email]" format, mirroring phase_reasoning.
     # Populated only when an operator edits the goal; auto-derived goals carry no editor info.
     goal_editor_info: str | None = Field(
-        default=None,
-        sa_column=Column(String(255), nullable=True),
-    )
-
-    # Delivery theme authored by the strategist (new_version_theme field).
-    # One of: leanness | reliability | performance | feature | mixed | none.
-    # Nullable: pre-0332 rows carry no theme.
-    theme: str | None = Field(
-        default=None,
-        sa_column=Column(String(32), nullable=True),
-    )
-
-    # Editor provenance for the theme: "[operator:email]" or "[strategist:id]" format,
-    # mirroring goal_editor_info. Operator-set themes are frozen to strategist overwrites.
-    theme_editor_info: str | None = Field(
         default=None,
         sa_column=Column(String(255), nullable=True),
     )
@@ -3943,6 +4001,125 @@ class ReleaseVersion(SQLModel, table=True):
             "version_number",
             name="uq_releaseversion_project_version",
         ),
+    )
+
+
+class VersionAcceptanceCriterion(SQLModel, table=True):
+    """A single verifiable acceptance criterion scoped to a release version.
+
+    Criteria are stable-ID records authored by the strategist or an operator
+    before a version opens for feature work.  Each criterion has a
+    ``criterion_key`` (e.g. ``c-<8hexchars>``) that is unique within the
+    version and that Direction.criterion_keys / Task.criterion_ids reference so
+    criterion coverage can be computed without joining on UUIDs.
+    """
+
+    __tablename__ = "versionacceptancecriterion"
+    __table_args__ = (
+        UniqueConstraint(
+            "release_version_id",
+            "criterion_key",
+            name="uq_vac_version_key",
+        ),
+        Index("ix_vac_version", "release_version_id"),
+        Index("ix_vac_project", "project_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    release_version_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("releaseversion.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    # Stable string ID, e.g. 'c-1a2b3c4d'.  Unique within the version.
+    criterion_key: str = Field(sa_column=Column(String(64), nullable=False))
+
+    # Human-readable criterion description.
+    text: str = Field(sa_column=Column(Text, nullable=False))
+
+    # Provenance: 'strategist' | 'operator' | etc. Nullable.
+    created_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
+class CriterionEvidence(SQLModel, table=True):
+    """A single piece of evidence satisfying a VersionAcceptanceCriterion.
+
+    One criterion can accumulate many evidence rows over the version's lifetime
+    (e.g. multiple task merges, an operator attestation, a reachability signal).
+    Coverage is derived by querying whether at least one evidence row exists for
+    each criterion on the version.
+    """
+
+    __tablename__ = "criterionevidence"
+    __table_args__ = (
+        Index("ix_criterionevidence_criterion_id", "criterion_id"),
+        Index("ix_criterionevidence_project", "project_id"),
+        Index(
+            "uq_criterionevidence_dedup",
+            "criterion_id",
+            "source_kind",
+            "source_id",
+            unique=True,
+            postgresql_where=text("source_id IS NOT NULL"),
+        ),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    criterion_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("versionacceptancecriterion.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    # 'task_merge' | 'operator' | 'reachability' | etc.
+    source_kind: str = Field(sa_column=Column(String(64), nullable=False))
+
+    # Task UUID (as string) or other source identifier.  Nullable.
+    source_id: str | None = Field(
+        default=None,
+        sa_column=Column(String(255), nullable=True),
+    )
+
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+    # Arbitrary evidence metadata (JSONB).
+    detail: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
     )
 
 
@@ -4192,14 +4369,6 @@ class QualificationVerdict(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=True),
     )
     audit_reconciliation: Any | None = Field(
-        default=None,
-        sa_column=Column(JSONB, nullable=True),
-    )
-
-    # Theme-delivery certification: {state, theme_class, deterministic_grade,
-    # assessed_grade, directional_contradiction, criteria, shortfalls, ...}
-    # Nullable: existing verdict rows carry no theme_delivery data.
-    theme_delivery: Any | None = Field(
         default=None,
         sa_column=Column(JSONB, nullable=True),
     )
@@ -5002,8 +5171,11 @@ class LocalRunner(SQLModel, table=True):
         sa_column=Column(String(16), nullable=False, server_default=text("'active'")),
     )
     # {"task_types": "all" | [str], "has_gpu": bool (heartbeat-reported ground truth),
-    #  "gpu_count": int, "gpu_names": [str], "max_concurrent": int,
-    #  "active_task_ids": [str]}  — has_gpu et al. are overwritten at first heartbeat.
+    #  "gpu_count": int, "gpu_names": [str], "gpu_utilization_pct": int (0-100),
+    #  "disk_free_bytes": int, "max_concurrent": int, "active_task_ids": [str]}
+    #  — has_gpu et al. are overwritten at first heartbeat. gpu_utilization_pct and
+    #  disk_free_bytes are display-only trust telemetry, stashed here alongside the
+    #  other heartbeat-reported hardware fields rather than as dedicated columns.
     capabilities: Dict[str, Any] = Field(
         default_factory=lambda: {
             "task_types": "all",
@@ -5015,6 +5187,20 @@ class LocalRunner(SQLModel, table=True):
     last_seen_at: datetime | None = Field(
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    # Trust telemetry (heartbeat-reported): the last time this runner reported a
+    # job succeeding, and the count of job failures since its last success. First-
+    # class columns because the "connected but failing" degraded state and the
+    # Fleet Runners panel key on them — a runner can heartbeat fine while every job
+    # fails (false-green), and these two fields are what distinguishes "healthy"
+    # from "healthy AND working".
+    last_successful_job_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    consecutive_job_failures: int = Field(
+        default=0,
+        sa_column=Column(Integer, nullable=False, server_default=text("0")),
     )
     created_at: datetime = Field(
         default_factory=_utcnow,

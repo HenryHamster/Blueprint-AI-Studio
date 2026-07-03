@@ -1,0 +1,1082 @@
+{
+  "command_descriptor": {
+    "enabled": true,
+    "executable": true,
+    "group": "mode",
+    "id": "session.mode.continuous",
+    "label": "Workday mode",
+    "mutation": {
+      "body": {
+        "workbench": {
+          "interaction_mode": "continuous"
+        }
+      },
+      "method": "POST",
+      "path": "/api/admin/projects/proj-1/strategic-session"
+    },
+    "priority": "normal",
+    "refetch_surfaces": [
+      "strategic_session",
+      "runtime"
+    ],
+    "target": {
+      "action": "set_continuous_mode",
+      "project_id": "proj-1",
+      "surface": "messages"
+    }
+  },
+  "context_targets": {
+    "message_reply": {
+      "action": "reply",
+      "message_id": "msg-1",
+      "surface": "messages"
+    },
+    "runtime_runner_alias_normalized": {
+      "runner_id": "runner-1",
+      "section": "devices",
+      "surface": "runtime"
+    },
+    "task": {
+      "surface": "task",
+      "task_id": "task-1"
+    }
+  },
+  "message_arming_outcomes": [
+    "steering",
+    "passive_note",
+    "routine_event",
+    "not_armed",
+    "duplicate"
+  ],
+  "schema_version": 1,
+  "strategic_session_response": {
+    "arming": null,
+    "context_package": {
+      "canvas": {
+        "drilldowns": [],
+        "edge_count": 0,
+        "edges": [],
+        "id": "strategic-canvas:proj-1",
+        "kind": "strategic_context",
+        "node_count": 1,
+        "nodes": [
+          {
+            "id": "runner:runner-1",
+            "kind": "local_runner",
+            "label": "operator-desk",
+            "status": "connected",
+            "target": {
+              "runner_id": "runner-1",
+              "section": "devices",
+              "surface": "runtime"
+            }
+          }
+        ],
+        "title": "Strategic context map"
+      },
+      "drilldowns": [],
+      "evidence": {
+        "artifacts": {
+          "items": [],
+          "total": 0
+        },
+        "knowledge": {
+          "items": [],
+          "total": 0
+        }
+      },
+      "id": "strategic-context:proj-1",
+      "item_count": 3,
+      "resources": [
+        {
+          "id": "strategic-canvas:proj-1",
+          "kind": "canvas",
+          "label": "Strategic context map",
+          "target": {
+            "section": "problem-model",
+            "surface": "project"
+          }
+        }
+      ],
+      "sources": [
+        {
+          "count": 1,
+          "kind": "runtime"
+        }
+      ],
+      "status": "ready",
+      "title": "Operator workbench contract",
+      "updated_at": "2026-07-01T10:00:00Z"
+    },
+    "conversation": {
+      "has_more": false,
+      "items": [
+        {
+          "content": "Keep it simple.",
+          "context": {},
+          "created_at": "2026-07-01T10:00:00Z",
+          "from_task_id": null,
+          "from_type": "user",
+          "id": "msg-1",
+          "message_type": "FEEDBACK",
+          "project_id": "proj-1",
+          "status": "open"
+        }
+      ],
+      "limit": 20,
+      "order": "oldest_first"
+    },
+    "location": "locally",
+    "project_id": "proj-1",
+    "recent_outputs": [],
+    "runtime": {
+      "local_runner": {
+        "active_runner_id": null,
+        "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
+        "agent_unavailable_count": 0,
+        "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
+        "eligible_live_count": 1,
+        "fallback_reason": null,
+        "live_runner_count": 1,
+        "liveness_window_seconds": 300,
+        "location": "locally",
+        "mode": "local_ready",
+        "runners": [
+          {
+            "capabilities": {
+              "agent_available": true,
+              "has_gpu": false,
+              "max_concurrent": 1,
+              "runner_preset": "strategic_local",
+              "task_types": [
+                "design_doc_update",
+                "strategic_review"
+              ],
+              "workload": "strategic"
+            },
+            "created_at": "2026-07-01T09:00:00Z",
+            "eligible_for_active_task": true,
+            "handles_active_task_type": true,
+            "health": {
+              "active_compute_job_count": 0,
+              "active_task_count": 1,
+              "active_work_count": 1,
+              "agent_available": true,
+              "available_slots": 0,
+              "device_status": "connected",
+              "is_live": true,
+              "liveness_window_seconds": 300,
+              "max_concurrent": 1,
+              "seconds_since_last_seen": 12
+            },
+            "hostname": "operator-desk",
+            "id": "runner-1",
+            "is_active_runner": false,
+            "is_preferred": true,
+            "last_seen_at": "2026-07-01T10:00:00Z",
+            "status": "active"
+          }
+        ],
+        "stale_runner_count": 0,
+        "status": "idle",
+        "status_reason": null,
+        "strategic_runner_count": 1
+      },
+      "work": {
+        "compute_jobs": {
+          "counts": {
+            "active": 0,
+            "cancelled_recent": 0,
+            "criterion_measured": 0,
+            "criterion_met": 0,
+            "failed_recent": 0,
+            "polling": 0,
+            "queued": 0,
+            "running": 0,
+            "starting": 0,
+            "succeeded_recent": 0,
+            "terminal_recent": 0,
+            "timed_out_recent": 0,
+            "total": 0
+          },
+          "items": [],
+          "spend": {
+            "active_accrued_usd": 0,
+            "recent_terminal_usd": 0,
+            "window_total_usd": 0
+          },
+          "window_minutes": 60
+        },
+        "held_approvals": {
+          "count": 0,
+          "items": []
+        },
+        "local_runner_holds": {
+          "compute_count": 0,
+          "count": 0,
+          "items": [],
+          "strategic_count": 0
+        },
+        "parked_wakes": {
+          "counts": {
+            "active": 0,
+            "expired": 0,
+            "failed": 0,
+            "fired": 0,
+            "pending": 0,
+            "problem": 0
+          },
+          "items": []
+        }
+      }
+    },
+    "session": {
+      "active_surface": "strategic",
+      "attention_level": "watch",
+      "commands": [
+        {
+          "enabled": true,
+          "executable": true,
+          "group": "mode",
+          "id": "session.mode.continuous",
+          "label": "Workday mode",
+          "mutation": {
+            "body": {
+              "workbench": {
+                "interaction_mode": "continuous"
+              }
+            },
+            "method": "POST",
+            "path": "/api/admin/projects/proj-1/strategic-session"
+          },
+          "priority": "normal",
+          "refetch_surfaces": [
+            "strategic_session",
+            "runtime"
+          ],
+          "target": {
+            "action": "set_continuous_mode",
+            "project_id": "proj-1",
+            "surface": "messages"
+          }
+        }
+      ],
+      "context_package_id": "strategic-context:proj-1",
+      "context_sources": [
+        {
+          "count": 1,
+          "kind": "runtime"
+        }
+      ],
+      "conversation": {
+        "has_more": false,
+        "items": [
+          {
+            "content": "Keep it simple.",
+            "context": {},
+            "created_at": "2026-07-01T10:00:00Z",
+            "from_task_id": null,
+            "from_type": "user",
+            "id": "msg-1",
+            "message_type": "FEEDBACK",
+            "project_id": "proj-1",
+            "status": "open"
+          }
+        ],
+        "limit": 20,
+        "order": "oldest_first"
+      },
+      "curated_metrics": [
+        {
+          "id": "runtime.local_strategic_ready",
+          "label": "Local ready",
+          "provenance": {
+            "path": "runtime.local_runner.eligible_live_count",
+            "surface": "runtime"
+          },
+          "target": {
+            "runner_id": "runner-1",
+            "section": "devices",
+            "surface": "runtime"
+          },
+          "tone": "active",
+          "value": 1
+        }
+      ],
+      "events": {
+        "has_more": false,
+        "items": [
+          {
+            "action": "heartbeat",
+            "data": {
+              "runner_id": "runner-1"
+            },
+            "id": "event-1",
+            "occurred_at": "2026-07-01T10:00:00Z",
+            "project_id": "proj-1",
+            "ref": {
+              "id": "runner-1",
+              "kind": "local_runner"
+            },
+            "refetch": {
+              "surfaces": [
+                "runtime",
+                "strategic_session"
+              ]
+            },
+            "resource": "local_runner",
+            "schema_version": 1,
+            "source": "runtime",
+            "summary": "operator-desk connected",
+            "target": {
+              "runner_id": "runner-1",
+              "section": "devices",
+              "surface": "runtime"
+            },
+            "title": "Local runner ready",
+            "tone": "active"
+          }
+        ],
+        "limit": 24,
+        "version": 1
+      },
+      "id": "strategic-session:proj-1",
+      "jobs": {
+        "has_more": false,
+        "items": [
+          {
+            "command_id": "session.mode.continuous",
+            "completed_at": "2026-07-01T10:00:00Z",
+            "created_at": "2026-07-01T10:00:00Z",
+            "id": "receipt-1",
+            "label": "Workday mode",
+            "refetch_surfaces": [
+              "strategic_session",
+              "runtime"
+            ],
+            "result": {
+              "kind": "workbench_update"
+            },
+            "status": "succeeded",
+            "summary": "Command completed: Workday mode",
+            "target": {
+              "action": "reply",
+              "message_id": "msg-1",
+              "surface": "messages"
+            }
+          }
+        ],
+        "limit": 8,
+        "version": 1
+      },
+      "last_check_in": null,
+      "last_interaction_at": "2026-07-01T10:00:00Z",
+      "location": "locally",
+      "mode": "continuous",
+      "recent_outputs": [],
+      "runtime": {
+        "active_runner_id": null,
+        "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
+        "agent_unavailable_count": 0,
+        "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
+        "eligible_live_count": 1,
+        "fallback_reason": null,
+        "live_runner_count": 1,
+        "liveness_window_seconds": 300,
+        "location": "locally",
+        "mode": "local_ready",
+        "runners": [
+          {
+            "capabilities": {
+              "agent_available": true,
+              "has_gpu": false,
+              "max_concurrent": 1,
+              "runner_preset": "strategic_local",
+              "task_types": [
+                "design_doc_update",
+                "strategic_review"
+              ],
+              "workload": "strategic"
+            },
+            "created_at": "2026-07-01T09:00:00Z",
+            "eligible_for_active_task": true,
+            "handles_active_task_type": true,
+            "health": {
+              "active_compute_job_count": 0,
+              "active_task_count": 1,
+              "active_work_count": 1,
+              "agent_available": true,
+              "available_slots": 0,
+              "device_status": "connected",
+              "is_live": true,
+              "liveness_window_seconds": 300,
+              "max_concurrent": 1,
+              "seconds_since_last_seen": 12
+            },
+            "hostname": "operator-desk",
+            "id": "runner-1",
+            "is_active_runner": false,
+            "is_preferred": true,
+            "last_seen_at": "2026-07-01T10:00:00Z",
+            "status": "active"
+          }
+        ],
+        "stale_runner_count": 0,
+        "status": "idle",
+        "status_reason": null,
+        "strategic_runner_count": 1
+      },
+      "selected_ref_descriptors": [],
+      "selected_refs": [],
+      "session_started_at": "2026-07-01T09:55:00Z",
+      "since_last_check_in": {
+        "available": false,
+        "reason": "no_prior_check_in",
+        "since": null,
+        "until": "2026-07-01T10:00:00Z",
+        "version": 1
+      },
+      "status": "idle",
+      "status_reason": null,
+      "version": 1
+    },
+    "status": "idle",
+    "status_reason": null,
+    "strategic": {
+      "active_cycle": null,
+      "active_phase": null,
+      "active_task": null,
+      "latest_cycle": null,
+      "refresh": {
+        "last_fired_at": null,
+        "last_fired_origin": null,
+        "pending": null
+      }
+    },
+    "workbench": {
+      "active_surface": "strategic",
+      "interaction_mode": "continuous",
+      "last_interaction_at": "2026-07-01T10:00:00Z",
+      "preferred_runner_id": "runner-1",
+      "selected_refs": [],
+      "session_started_at": "2026-07-01T09:55:00Z",
+      "version": 1
+    }
+  },
+  "strategic_state_response": {
+    "attention": {
+      "counts": {
+        "approvals": 0,
+        "blocked_tasks": 0,
+        "blockers": 0,
+        "bug_reports": 0,
+        "compute_local_runner_holds": 0,
+        "error_alerts": 0,
+        "failed_tasks": 0,
+        "feedback": 1,
+        "local_runner_holds": 0,
+        "manual_directions": 0,
+        "needs_operator": 0,
+        "parked_tasks": 0,
+        "questions": 0,
+        "stale_provisioning_tasks": 0,
+        "stale_queued_tasks": 0,
+        "stale_runner_pins": 0,
+        "strategic_local_runner_holds": 0,
+        "unread": 1,
+        "visible_needs_operator": 0,
+        "visible_watch": 0,
+        "alerts": 0,
+        "warning_alerts": 0,
+        "watch": 1
+      },
+      "has_more": true,
+      "items": [],
+      "last_seen_at": null,
+      "limits": {
+        "items": 8,
+        "message_blocker_preview": 8,
+        "message_question_preview": 8,
+        "message_watch_preview": 24,
+        "stale_task_preview": 4,
+        "alert_error_preview": 4,
+        "alert_warning_preview": 4
+      },
+      "level": "watch",
+      "summary": "1 open message"
+    },
+    "context_package": {
+      "canvas": {
+        "drilldowns": [],
+        "edge_count": 0,
+        "edges": [],
+        "id": "strategic-canvas:proj-1",
+        "kind": "strategic_context",
+        "node_count": 1,
+        "nodes": [
+          {
+            "id": "runner:runner-1",
+            "kind": "local_runner",
+            "label": "operator-desk",
+            "status": "connected",
+            "target": {
+              "runner_id": "runner-1",
+              "section": "devices",
+              "surface": "runtime"
+            }
+          }
+        ],
+        "title": "Strategic context map"
+      },
+      "drilldowns": [],
+      "evidence": {
+        "artifacts": {
+          "items": [],
+          "total": 0
+        },
+        "knowledge": {
+          "items": [],
+          "total": 0
+        }
+      },
+      "id": "strategic-context:proj-1",
+      "item_count": 3,
+      "resources": [
+        {
+          "id": "strategic-canvas:proj-1",
+          "kind": "canvas",
+          "label": "Strategic context map",
+          "target": {
+            "section": "problem-model",
+            "surface": "project"
+          }
+        }
+      ],
+      "sources": [
+        {
+          "count": 1,
+          "kind": "runtime"
+        }
+      ],
+      "status": "ready",
+      "title": "Operator workbench contract",
+      "updated_at": "2026-07-01T10:00:00Z"
+    },
+    "design": {
+      "has_design_doc": false,
+      "revision": null
+    },
+    "directions": {
+      "active_count": 1,
+      "paused_count": 0,
+      "primary": {
+        "id": "direction-main",
+        "mode": "continuous",
+        "priority": "high",
+        "status": "active",
+        "text": "Keep operator commands aligned."
+      },
+      "total_count": 1
+    },
+    "messages": {
+      "counts": {
+        "linked": 0,
+        "open": 1
+      },
+      "items": []
+    },
+    "problem_model": {
+      "active_gap_count": 1,
+      "capability_count": 1,
+      "current_focus": "Operator workbench contracts",
+      "pending_confirmation_count": 0,
+      "purpose": "Keep commands and targets contract-driven.",
+      "revision": 1,
+      "top_gap": {
+        "id": "gap-contracts",
+        "name": "Command targets must stay canonical",
+        "priority": "high",
+        "status": "active"
+      }
+    },
+    "project_id": "proj-1",
+    "running_update": {
+      "acknowledged_at": null,
+      "char_count": 58,
+      "excerpt": "Strategic is validating the operator workbench contract."
+    },
+    "runtime": {
+      "local_runner": {
+        "active_runner_id": null,
+        "active_task_pinned": false,
+        "active_task_awaiting_local_runner_since": null,
+        "active_task_requires_local": false,
+        "active_task_runtime": null,
+        "agent_unavailable_count": 0,
+        "busy_runner_count": 0,
+        "continuation": {
+          "enabled": false,
+          "expires_at": null,
+          "fresh": false,
+          "last_seen_at": null,
+          "owned_by_current_operator": false,
+          "owner_session_started_at": null,
+          "owner_user_id": null,
+          "ownership": "none",
+          "preferred_runner_id": null,
+          "reason": "not_enabled",
+          "ttl_seconds": 43200,
+          "updated_at": null
+        },
+        "eligible_live_count": 1,
+        "fallback_reason": null,
+        "live_runner_count": 1,
+        "liveness_window_seconds": 300,
+        "location": "locally",
+        "mode": "local_ready",
+        "runners": [
+          {
+            "capabilities": {
+              "agent_available": true,
+              "has_gpu": false,
+              "max_concurrent": 1,
+              "runner_preset": "strategic_local",
+              "task_types": [
+                "design_doc_update",
+                "strategic_review"
+              ],
+              "workload": "strategic"
+            },
+            "created_at": "2026-07-01T09:00:00Z",
+            "eligible_for_active_task": true,
+            "handles_active_task_type": true,
+            "health": {
+              "active_compute_job_count": 0,
+              "active_task_count": 1,
+              "active_work_count": 1,
+              "agent_available": true,
+              "available_slots": 0,
+              "device_status": "connected",
+              "is_live": true,
+              "liveness_window_seconds": 300,
+              "max_concurrent": 1,
+              "seconds_since_last_seen": 12
+            },
+            "hostname": "operator-desk",
+            "id": "runner-1",
+            "is_active_runner": false,
+            "is_preferred": true,
+            "last_seen_at": "2026-07-01T10:00:00Z",
+            "status": "active"
+          }
+        ],
+        "stale_runner_count": 0,
+        "status": "idle",
+        "status_reason": null,
+        "strategic_runner_count": 1
+      },
+      "work": {
+        "compute_jobs": {
+          "counts": {
+            "active": 0,
+            "cancelled_recent": 0,
+            "criterion_measured": 0,
+            "criterion_met": 0,
+            "failed_recent": 0,
+            "polling": 0,
+            "queued": 0,
+            "running": 0,
+            "starting": 0,
+            "succeeded_recent": 0,
+            "terminal_recent": 0,
+            "timed_out_recent": 0,
+            "total": 0
+          },
+          "items": [],
+          "spend": {
+            "active_accrued_usd": 0,
+            "recent_terminal_usd": 0,
+            "window_total_usd": 0
+          },
+          "window_minutes": 60
+        },
+        "held_approvals": {
+          "count": 0,
+          "items": []
+        },
+        "local_runner_holds": {
+          "compute_count": 0,
+          "count": 0,
+          "items": [],
+          "strategic_count": 0
+        },
+        "parked_wakes": {
+          "counts": {
+            "active": 0,
+            "expired": 0,
+            "failed": 0,
+            "fired": 0,
+            "pending": 0,
+            "problem": 0
+          },
+          "items": []
+        }
+      }
+    },
+    "sha_freshness": {
+      "active_candidate_sha": null,
+      "checked_at": null,
+      "generated_at": null,
+      "integration_branch": null,
+      "integration_head_sha": null,
+      "stale": null,
+      "stale_reason": "no_open_version",
+      "verdict": "unknown"
+    },
+    "strategic": {
+      "active_cycle": null,
+      "active_phase": null,
+      "active_task": null,
+      "latest_cycle": null,
+      "refresh": {
+        "last_fired_at": null,
+        "last_fired_origin": null,
+        "pending": null
+      }
+    },
+    "tasks": {
+      "counts": {
+        "blocked": 0,
+        "cancelled": 0,
+        "completed": 0,
+        "evaluating": 0,
+        "failed": 0,
+        "parked": 0,
+        "queued": 0,
+        "running": 1,
+        "total": 1
+      },
+      "cumulative_estimated_cost_usd": 0,
+      "focus": {
+        "bucket_limit": 8,
+        "buckets": {},
+        "has_more": false,
+        "version": 1
+      }
+    },
+    "work_session": {
+      "active_surface": "strategic",
+      "attention_level": "watch",
+      "commands": [
+        {
+          "enabled": true,
+          "executable": true,
+          "group": "mode",
+          "id": "session.mode.continuous",
+          "label": "Workday mode",
+          "mutation": {
+            "body": {
+              "workbench": {
+                "interaction_mode": "continuous"
+              }
+            },
+            "method": "POST",
+            "path": "/api/admin/projects/proj-1/strategic-session"
+          },
+          "priority": "normal",
+          "refetch_surfaces": [
+            "strategic_session",
+            "runtime"
+          ],
+          "target": {
+            "action": "set_continuous_mode",
+            "project_id": "proj-1",
+            "surface": "messages"
+          }
+        }
+      ],
+      "context_package_id": "strategic-context:proj-1",
+      "context_sources": [
+        {
+          "count": 1,
+          "kind": "runtime"
+        }
+      ],
+      "curated_metrics": [
+        {
+          "id": "runtime.local_strategic_ready",
+          "label": "Local ready",
+          "provenance": {
+            "path": "runtime.local_runner.eligible_live_count",
+            "surface": "runtime"
+          },
+          "target": {
+            "runner_id": "runner-1",
+            "section": "devices",
+            "surface": "runtime"
+          },
+          "tone": "active",
+          "value": 1
+        }
+      ],
+      "events": {
+        "has_more": false,
+        "items": [
+          {
+            "action": "heartbeat",
+            "data": {
+              "runner_id": "runner-1"
+            },
+            "id": "event-1",
+            "occurred_at": "2026-07-01T10:00:00Z",
+            "project_id": "proj-1",
+            "ref": {
+              "id": "runner-1",
+              "kind": "local_runner"
+            },
+            "refetch": {
+              "surfaces": [
+                "runtime",
+                "strategic_session"
+              ]
+            },
+            "resource": "local_runner",
+            "schema_version": 1,
+            "source": "runtime",
+            "summary": "operator-desk connected",
+            "target": {
+              "runner_id": "runner-1",
+              "section": "devices",
+              "surface": "runtime"
+            },
+            "title": "Local runner ready",
+            "tone": "active"
+          }
+        ],
+        "limit": 24,
+        "version": 1
+      },
+      "id": "strategic-session:proj-1",
+      "jobs": {
+        "has_more": false,
+        "items": [
+          {
+            "command_id": "session.mode.continuous",
+            "completed_at": "2026-07-01T10:00:00Z",
+            "created_at": "2026-07-01T10:00:00Z",
+            "id": "receipt-1",
+            "label": "Workday mode",
+            "refetch_surfaces": [
+              "strategic_session",
+              "runtime"
+            ],
+            "result": {
+              "kind": "workbench_update"
+            },
+            "status": "succeeded",
+            "summary": "Command completed: Workday mode",
+            "target": {
+              "action": "reply",
+              "message_id": "msg-1",
+              "surface": "messages"
+            }
+          }
+        ],
+        "limit": 8,
+        "version": 1
+      },
+      "last_check_in": null,
+      "last_interaction_at": "2026-07-01T10:00:00Z",
+      "location": "locally",
+      "mode": "continuous",
+      "selected_ref_descriptors": [],
+      "selected_refs": [],
+      "session_started_at": "2026-07-01T09:55:00Z",
+      "since_last_check_in": {
+        "available": false,
+        "reason": "no_prior_check_in",
+        "since": null,
+        "until": "2026-07-01T10:00:00Z",
+        "version": 1
+      },
+      "status": "idle",
+      "status_reason": null,
+      "version": 1
+    },
+    "workbench": {
+      "active_surface": "strategic",
+      "interaction_mode": "continuous",
+      "last_interaction_at": "2026-07-01T10:00:00Z",
+      "preferred_runner_id": "runner-1",
+      "selected_refs": [],
+      "session_started_at": "2026-07-01T09:55:00Z",
+      "version": 1
+    }
+  },
+  "target_vocabulary": {
+    "pipeline_sections": [
+      "archive",
+      "board",
+      "flow"
+    ],
+    "project_sections": [
+      "access",
+      "alert-domains",
+      "auto-remediation",
+      "auto-review",
+      "branches",
+      "build-config",
+      "design-doc",
+      "directions",
+      "issue-implementation",
+      "manage",
+      "overview",
+      "problem-model",
+      "resource-envelope",
+      "running-update",
+      "selected_refs"
+    ],
+    "refetch_surfaces": [
+      "directions",
+      "messages",
+      "pipeline",
+      "runtime",
+      "strategic_session"
+    ],
+    "runtime_sections": [
+      "accounts",
+      "advanced",
+      "analytics",
+      "compute",
+      "deploy",
+      "devices",
+      "general",
+      "health",
+      "notifications",
+      "orchestrator",
+      "provider-routing",
+      "provider-settings",
+      "settings"
+    ],
+    "surfaces": [
+      "external",
+      "knowledge",
+      "messages",
+      "pipeline",
+      "project",
+      "runtime",
+      "task"
+    ],
+    "target_keys": [
+      "surface",
+      "id",
+      "project_id",
+      "section",
+      "task_id",
+      "message_id",
+      "direction_id",
+      "alert_id",
+      "action",
+      "document_id",
+      "artifact_id",
+      "cycle_id",
+      "runner_id",
+      "url"
+    ]
+  },
+  "task_detail_sideboard_context": {
+    "artifacts": {
+      "by_type": {},
+      "primary_commit": null,
+      "primary_pr_url": null,
+      "total": 0
+    },
+    "links": [
+      {
+        "id": "task",
+        "label": "Open task",
+        "target": {
+          "surface": "task",
+          "task_id": "task-1"
+        }
+      }
+    ],
+    "messages": {
+      "items": [],
+      "total_recent": 0
+    },
+    "pipeline": {
+      "blocked_reason": null,
+      "child_count": 0,
+      "dependency_count": 0,
+      "movement_explanation": null,
+      "parent_task_id": null
+    },
+    "project": {
+      "id": "proj-1",
+      "name": "Operator Workbench",
+      "repo": "owner/repo"
+    },
+    "purpose": "Keep commands and targets contract-driven.",
+    "strategic": {
+      "cycle": null,
+      "direction": {
+        "id": "direction-main",
+        "priority": "high",
+        "status": "active",
+        "text": "Keep operator commands aligned."
+      }
+    }
+  },
+  "workbench_event_payload": {
+    "action": "heartbeat",
+    "project_id": "proj-1",
+    "refetch": {
+      "surfaces": [
+        "runtime",
+        "strategic_session"
+      ]
+    },
+    "resource": "local_runner",
+    "schema_version": 1,
+    "target": {
+      "runner_id": "runner-1",
+      "section": "devices",
+      "surface": "runtime"
+    }
+  }
+}

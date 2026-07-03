@@ -35,6 +35,7 @@ from app.release_artifacts import required_release_artifact_kinds
 from app.release_promotion import _notify_operator, _resolve_github_with_session
 from app.release_reconciliation import (
     _confirm_serving_or_fail,
+    _reconcile_if_ci_unresolved_now_green,
     _reconcile_if_deploy_failed_recovered,
     _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
@@ -405,9 +406,12 @@ async def _redrive_not_promoted_qualification(
          HEAD advancement is the signal that warrants a fresh qualification.
       2. Re-invokes ``run_qualification``, which under its own ``FOR UPDATE`` lock
          re-resolves the candidate SHA.  If ``automain`` has NOT advanced (same
-         SHA), ``run_qualification`` returns ``cached_verdict`` and this returns
-         False — nothing to do.  If ``automain`` HAS advanced, the cached-verdict
-         guard is a miss (new SHA) and a fresh qualification spawns.
+         SHA), ``run_qualification`` normally returns ``cached_verdict``.  The
+         bounded exception is a stale keyless finding: it has no code anchor, so
+         the sweep marks the old verdict non-conclusive once and lets a fresh
+         qualification re-confirm or refute it on the current HEAD.  If
+         ``automain`` HAS advanced, the cached-verdict guard is a miss (new SHA)
+         and a fresh qualification spawns.
 
     Returns True only when the re-entry actually STARTED a new qualification
     (``status == "spawned"``).  Any guard no-op or readiness miss returns False.
@@ -419,8 +423,11 @@ async def _redrive_not_promoted_qualification(
     # Both ``run_qualification`` and ``compute_requalification_readiness`` live
     # in modules that import this one (directly or transitively), so import
     # them lazily to avoid load-time import cycles.
-    from app import release_qualifier
-    from app.release_readiness import compute_requalification_readiness
+    from app import github, release_qualifier
+    from app.release_readiness import (
+        _KEYLESS_FINDING_SENTINEL,
+        compute_requalification_readiness,
+    )
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as redrive_session:
@@ -445,11 +452,57 @@ async def _redrive_not_promoted_qualification(
         )
         if not readiness.get("requalification_ready"):
             return False
+        keyless_stale = any(
+            f.get("key") == _KEYLESS_FINDING_SENTINEL and f.get("state") == "stale"
+            for f in readiness.get("findings", [])
+            if isinstance(f, dict)
+        )
+        if keyless_stale and qual.get("keyless_requalification_consumed_at"):
+            project = await redrive_session.get(Project, version.project_id)
+            current_head_sha = None
+            if project is not None:
+                resolved = await release_qualifier._resolve_github_with_session(
+                    redrive_session, project
+                )
+                if resolved is not None:
+                    token, owner, repo = resolved
+                    integration_branch, _promotion_target = (
+                        release_qualifier._lts_branch_names(project)
+                    )
+                    try:
+                        current_head_sha = await github.get_branch_sha(
+                            token, owner, repo, integration_branch
+                        )
+                    except Exception:
+                        logger.warning(
+                            "[RELEASE_QUALIFIER] sweep: failed to resolve %s HEAD "
+                            "for version %s while checking consumed keyless marker",
+                            integration_branch,
+                            version_id,
+                        )
+            if current_head_sha is None or current_head_sha == qual.get(
+                "candidate_sha"
+            ):
+                logger.info(
+                    "[RELEASE_QUALIFIER] sweep: version v%d keyless stale blocker "
+                    "already consumed for this candidate — skipping re-drive",
+                    version.version_number,
+                )
+                return False
+        if keyless_stale:
+            version.last_qualification = {
+                **qual,
+                "status": "requalification_requested",
+                "previous_status": "not_promoted",
+                "keyless_requalification_consumed_at": _utcnow().isoformat(),
+            }
+            flag_modified(version, "last_qualification")
+            redrive_session.add(version)
         # The real backstop against redundant re-runs is run_qualification's cached-
         # verdict guard: under its FOR UPDATE lock, it re-resolves the candidate SHA.
-        # If automain has NOT advanced (same SHA), run_qualification returns cached_
-        # verdict (no-op).  If automain HAS advanced, the cached-verdict miss spawns a
-        # fresh qualification.
+        # Stale keyless findings are the bounded same-SHA exception because they
+        # have no code anchor; rewriting the old status to non-conclusive lets
+        # exactly one fresh pending qualification replace it.
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
@@ -782,10 +835,32 @@ async def _redrive_promotion_failed_qualification(
         if not readiness.get("requalification_ready"):
             return False
 
+        # Thread session_factory so run_qualification's passing-audit reuse
+        # (promotion_failed + unchanged audited surface → re-promote WITHOUT
+        # re-auditing) runs its DEDICATED promote session on the same factory.
+        # In production this is None → AsyncSessionLocal (a genuine second
+        # connection); tests inject a shared factory.
+        #
+        # allow_synchronous_reuse_promote=True: this sweep re-driver is the ONLY
+        # safe caller for the synchronous reuse-promote — it runs OUTSIDE any
+        # lock-holding request (redrive_session has no uncommitted version-row
+        # write on this path), so promote()'s nested staged-direction activation
+        # cannot hang on a caller-held Direction lock (review finding 1).  Every
+        # other caller (strategic / admin) defers to this path.
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            session_factory=session_factory,
+            allow_synchronous_reuse_promote=True,
         )
-        if result and result.get("status") == "spawned":
+        # "spawned" = a fresh audit ran; "reused_audit" = the passing-audit
+        # reuse-promote fired (it committed on its OWN dedicated session).  Both
+        # are forward progress; every other result is a no-op → roll back the
+        # read-only redrive_session.
+        if result and (
+            result.get("status") == "spawned" or result.get("reused_audit")
+        ):
             await redrive_session.commit()
             return True
         await redrive_session.rollback()
@@ -995,6 +1070,32 @@ async def sweep_stuck_qualifications(
                 "[RELEASE_QUALIFIER] sweep auto-staled %d finding(s) for "
                 "version %s (automain advanced past candidate SHA)",
                 staled,
+                version_id,
+            )
+
+    # Re-drive quiescent ``not_promoted`` versions whose only blocker was the
+    # transient ``ci_unresolved`` state.  If automain still equals the stored
+    # candidate SHA and CI has since gone green, Guard 3 must not treat the
+    # stale transient verdict as settled; this reconciliation path triggers the
+    # fresh qualification before the generic stale-not-promoted loop below.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_ci_unresolved_now_green(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: ci_unresolved-now-green reconcile "
+                "failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove ci_unresolved version %s "
+                "(CI green on unchanged automain — qualification spawned)",
                 version_id,
             )
 

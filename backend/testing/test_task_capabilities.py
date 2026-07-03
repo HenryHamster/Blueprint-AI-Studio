@@ -154,6 +154,12 @@ def test_strategic_task_types_match_legacy_tuple():
     }
 
 
+def test_strategic_local_runner_preset_tracks_registry():
+    from app.routers import admin_runners
+
+    assert set(admin_runners._STRATEGIC_LOCAL_TASK_TYPES) == set(STRATEGIC_TASK_TYPES)
+
+
 def test_strategic_phase_ordering_is_registry_declared():
     """Phase is an ORDERING within the strategic cycle, declared per-type.
     design_doc_update is Phase 1, strategic_review is Phase 2. The failure /

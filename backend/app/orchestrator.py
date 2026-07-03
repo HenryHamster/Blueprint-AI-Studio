@@ -61,10 +61,12 @@ from app.compute_cloud_run import (
     _resolve_machine_type as _cr_resolve_machine_type,
     launch_agent_cloud_run_job,
 )
-from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES
+from app.task_capabilities import CLOUD_RUN_CANDIDATE_TASK_TYPES, STRATEGIC_TASK_TYPES
 from app.database import AsyncSessionLocal, resolve_dialect_name
 from app.depends_on_provenance import remap_structural_depends_on
 from app.models import (
+    ComputeJob,
+    ComputeJobStatus,
     DeploymentState,
     LocalRunner,
     Project,
@@ -122,6 +124,16 @@ from app.time_utils import (
     exponential_backoff,
     rate_limit_retry_minutes,
     set_retry_after,
+)
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    emit_workbench_refetch,
+)
+from app.workbench_state import (
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+    STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
 )
 
 logger = logging.getLogger("blueprint")
@@ -516,6 +528,27 @@ def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> i
         return 0
 
 
+def _runner_active_compute_job_count(
+    runner: LocalRunner | RunnerDispatchSnapshot,
+) -> int:
+    """Best-effort compute-job load, from heartbeat-reported active job ids."""
+    active = (runner.capabilities or {}).get("active_compute_job_ids") or []
+    try:
+        return len(active)
+    except TypeError:
+        return 0
+
+
+def _runner_active_work_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
+    return _runner_active_task_count(runner) + _runner_active_compute_job_count(runner)
+
+
+def _runner_agent_available(runner: LocalRunner | RunnerDispatchSnapshot) -> bool:
+    """Old runners omit the field, which remains backward-compatible."""
+    available = (runner.capabilities or {}).get("agent_available")
+    return available is not False
+
+
 def _runner_at_capacity(
     runner: LocalRunner | RunnerDispatchSnapshot, pins_this_cycle: int = 0
 ) -> bool:
@@ -532,10 +565,21 @@ def _runner_at_capacity(
     per cycle at the runner's real pull capacity.
     """
     caps = runner.capabilities or {}
-    max_concurrent = caps.get("max_concurrent")
+    raw_max_concurrent = caps.get("max_concurrent")
+    if isinstance(raw_max_concurrent, bool):
+        max_concurrent = None
+    elif isinstance(raw_max_concurrent, float):
+        max_concurrent = (
+            int(raw_max_concurrent) if raw_max_concurrent.is_integer() else None
+        )
+    else:
+        try:
+            max_concurrent = int(raw_max_concurrent)
+        except (TypeError, ValueError):
+            max_concurrent = None
     if max_concurrent is None:
         return False
-    return _runner_active_task_count(runner) + pins_this_cycle >= max_concurrent
+    return _runner_active_work_count(runner) + pins_this_cycle >= max_concurrent
 
 
 async def _load_active_runners_cache(
@@ -572,15 +616,84 @@ async def _load_active_runners_cache(
     except Exception:
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
+    outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
+        session, [runner_id for runner_id, _project_id, _capabilities in rows]
+    )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
     for runner_id, project_id, capabilities in rows:
+        caps = dict(capabilities or {})
+        heartbeat_jobs = caps.get("active_compute_job_ids") or []
+        merged_job_ids: list[str] = []
+        seen_job_ids: set[str] = set()
+        for job_id in list(heartbeat_jobs) + outstanding_compute_by_runner.get(
+            runner_id, []
+        ):
+            if not isinstance(job_id, str) or job_id in seen_job_ids:
+                continue
+            merged_job_ids.append(job_id)
+            seen_job_ids.add(job_id)
+        if merged_job_ids:
+            caps["active_compute_job_ids"] = merged_job_ids
         snapshot = RunnerDispatchSnapshot(
             id=runner_id,
             project_id=project_id,
-            capabilities=dict(capabilities or {}),
+            capabilities=caps,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
+
+
+async def _load_runner_compute_job_assignments(
+    session: AsyncSession,
+    runner_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, list[str]]:
+    """Return outstanding runner-subprocess compute jobs keyed by runner id.
+
+    Heartbeat-reported compute ids lag direct ``compute_experiment`` launch by at
+    least one runner poll/heartbeat. Counting persisted runner-subprocess jobs
+    closes that window so a later orchestrator cycle cannot over-assign a runner
+    before it has claimed the first job.
+    """
+    if not runner_ids:
+        return {}
+    from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+
+    runner_id_strings = [str(runner_id) for runner_id in runner_ids]
+    runner_target_expr = ComputeJob.polling_metadata["runner_target_id"].as_string()
+    try:
+        rows = (
+            await session.execute(
+                select(ComputeJob.id, runner_target_expr)
+                .where(
+                    ComputeJob.backend == RUNNER_SUBPROCESS_BACKEND_NAME,
+                    ComputeJob.status.in_(
+                        [
+                            ComputeJobStatus.QUEUED,
+                            ComputeJobStatus.STARTING,
+                            ComputeJobStatus.RUNNING,
+                            ComputeJobStatus.POLLING,
+                        ]
+                    ),
+                    runner_target_expr.in_(runner_id_strings),
+                )
+                .order_by(ComputeJob.created_at.asc())
+            )
+        ).all()
+    except Exception:
+        logger.exception("[RUNNERS] Failed to load runner compute-job assignments")
+        return {}
+
+    by_runner: dict[uuid.UUID, list[str]] = {}
+    runner_ids_by_string = {
+        str(runner_id): runner_id
+        for runner_id in runner_ids
+    }
+    for job_id, raw_runner_id in rows:
+        runner_id = runner_ids_by_string.get(str(raw_runner_id))
+        if runner_id is None:
+            continue
+        by_runner.setdefault(runner_id, []).append(str(job_id))
+    return by_runner
 
 
 async def _try_runner_dispatch(
@@ -627,6 +740,7 @@ async def _try_runner_dispatch(
         task_type,
         accelerator,
         runner_pins_this_cycle,
+        preferred_runner_target_id=ctx.get("preferred_runner_target_id"),
     )
     if runner is None:
         return False
@@ -637,6 +751,7 @@ async def _try_runner_dispatch(
     # stale wait stamp — otherwise the bounded-timeout sweep could fail it after
     # it has already been claimed by a runner.
     new_ctx.pop("awaiting_local_runner_since", None)
+    new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
     task.context = new_ctx
     task.vm_instance_id = f"runner:{runner.id}"
     task.status = TaskStatus.PROVISIONING
@@ -663,6 +778,94 @@ async def _try_runner_dispatch(
         runner.id,
     )
     return True
+
+
+def _task_requires_strategic_local_runner(task: Task) -> bool:
+    payload = task.first_payload or {}
+    task_type = str(payload.get("type") or "")
+    return (
+        task_type in STRATEGIC_TASK_TYPES
+        and bool((task.context or {}).get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY))
+    )
+
+
+async def _hold_strategic_local_runner_task(
+    session: AsyncSession,
+    task: Task,
+) -> bool:
+    """Keep a local-required Strategic task queued instead of cloud-falling back."""
+
+    if not _task_requires_strategic_local_runner(task):
+        return False
+
+    ctx = dict(task.context or {})
+    changed = ctx.pop("runner_target_id", None) is not None
+    if not ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY):
+        ctx[STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY] = _utcnow().isoformat()
+        changed = True
+    if task.vm_instance_id is not None:
+        task.vm_instance_id = None
+        changed = True
+    if task.vm_provisioned_at is not None:
+        task.vm_provisioned_at = None
+        changed = True
+
+    intent_reason = str(
+        ctx.get(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY) or "workbench_continuous"
+    )
+    reason = (
+        "Strategic workbench is in continuous local mode; waiting for a live "
+        "Strategic-capable local runner instead of dispatching to cloud."
+    )
+    if task.latest_status_message != reason:
+        task.latest_status_message = reason
+        changed = True
+    if changed:
+        task.context = ctx
+        session.add(task)
+        await session.commit()
+        try:
+            from app.broadcast import broadcast_to_project
+
+            await broadcast_to_project(
+                str(task.project_id),
+                "task_updated",
+                {
+                    "task_id": str(task.id),
+                    "status": task.status,
+                    "message": task.latest_status_message,
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] task_updated broadcast failed for held Strategic "
+                "local-runner task %s",
+                task.id,
+            )
+    else:
+        await session.rollback()
+    logger.info(
+        "[RUNNERS] Holding Strategic task %s: continuous local mode requires "
+        "a live Strategic-capable runner (reason=%s)",
+        task.id,
+        intent_reason,
+    )
+    return True
+
+
+async def _try_strategic_local_required_runner_path(
+    session: AsyncSession,
+    task: Task,
+    runners_by_project: dict[uuid.UUID, list[LocalRunner]],
+    pins_this_cycle: dict[uuid.UUID, int],
+) -> bool:
+    """Dispatch or hold local-required Strategic tasks before cloud deferrals."""
+
+    if not _task_requires_strategic_local_runner(task):
+        return False
+    if await _try_runner_dispatch(session, task, runners_by_project, pins_this_cycle):
+        return True
+    return await _hold_strategic_local_runner_task(session, task)
 
 
 def _num_or_none(value) -> float | None:
@@ -696,15 +899,17 @@ def _select_eligible_runner(
     task_type: str,
     accelerator: str | None,
     runner_pins_this_cycle: dict[uuid.UUID, int],
+    preferred_runner_target_id: str | None = None,
 ) -> "LocalRunner | RunnerDispatchSnapshot | None":
     """Pick the least-loaded eligible runner for a task/job, or None.
 
     Eligibility: the runner handles ``task_type`` (its advertised allowlist) and is
     not at its per-cycle pull capacity; when an ``accelerator`` is declared it must
-    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). Selection prefers
-    the least EFFECTIVE load — heartbeat-reported active count plus pins already made
-    to the runner this cycle — so a same-cycle burst spreads across a fleet instead
-    of stacking onto one runner.
+    also advertise ``has_gpu`` (a CPU runner cannot provide a GPU). A preferred
+    runner wins only after those eligibility checks pass; otherwise selection
+    prefers the least EFFECTIVE load — heartbeat-reported active count plus pins
+    already made to the runner this cycle — so a same-cycle burst spreads across
+    a fleet instead of stacking onto one runner.
 
     Shared by agent-task dispatch (:func:`_try_runner_dispatch`) and direct
     compute-job dispatch (:func:`_dispatch_compute_experiment_directly`) so both use
@@ -715,15 +920,24 @@ def _select_eligible_runner(
         r
         for r in candidates
         if _runner_handles_task_type(r, task_type)
+        and (task_type == "compute_experiment" or _runner_agent_available(r))
         and not _runner_at_capacity(r, runner_pins_this_cycle.get(r.id, 0))
     ]
     if accelerator:
         eligible = [r for r in eligible if (r.capabilities or {}).get("has_gpu")]
     if not eligible:
         return None
+    if preferred_runner_target_id:
+        preferred_runner_id = str(preferred_runner_target_id).strip()
+        preferred = next(
+            (r for r in eligible if str(r.id) == preferred_runner_id),
+            None,
+        )
+        if preferred is not None:
+            return preferred
     return min(
         eligible,
-        key=lambda r: _runner_active_task_count(r)
+        key=lambda r: _runner_active_work_count(r)
         + runner_pins_this_cycle.get(r.id, 0),
     )
 
@@ -937,6 +1151,9 @@ async def _dispatch_compute_experiment_directly(
         "compute_experiment",
         accelerator,
         runner_pins_this_cycle,
+        preferred_runner_target_id=(task.context or {}).get(
+            "preferred_runner_target_id"
+        ),
     )
 
     project = await session.get(Project, task.project_id)
@@ -1128,10 +1345,17 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
     """
     from sqlalchemy import or_, update as _sa_update
 
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    stale_ids = (
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    stale_rows = (
         await session.execute(
-            select(LocalRunner.id).where(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+                LocalRunner.last_seen_at,
+            ).where(
                 LocalRunner.status == "active",
                 or_(
                     LocalRunner.last_seen_at.is_(None),
@@ -1139,9 +1363,16 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
                 ),
             )
         )
-    ).scalars().all()
+    ).all()
+    stale_ids = [row[0] for row in stale_rows]
     if not stale_ids:
         return
+    stale_counts_by_project: dict[uuid.UUID, int] = {}
+    for row in stale_rows:
+        project_id = row[1]
+        stale_counts_by_project[project_id] = (
+            stale_counts_by_project.get(project_id, 0) + 1
+        )
 
     await session.execute(
         _sa_update(LocalRunner)
@@ -1163,6 +1394,7 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
             )
         )
     ).scalars().all()
+    released_pins_by_project: dict[uuid.UUID, int] = {}
     for task in pinned:
         task.status = TaskStatus.QUEUED
         task.vm_instance_id = None
@@ -1171,6 +1403,9 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         new_ctx.pop("runner_target_id", None)
         task.context = new_ctx
         session.add(task)
+        released_pins_by_project[task.project_id] = (
+            released_pins_by_project.get(task.project_id, 0) + 1
+        )
         logger.info(
             "[RUNNERS] Released unpulled pin for task %s from a now-inactive "
             "runner (back to QUEUED for re-dispatch)",
@@ -1178,10 +1413,82 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
         )
 
     await session.commit()
+    # Alert the operator on each newly-dead runner (the status flip above is the
+    # active->inactive transition, so this fires exactly once per death; the
+    # dedupe_key upsert is a second guard). Runs AFTER the commit so the alert /
+    # webhook only announce a durably-recorded deactivation. Best-effort per
+    # runner so an alert failure never aborts the sweep. Runner counts are tiny
+    # (operator hardware), so the per-runner commit inside the helper is cheap.
+    from app.alert_dispatch import _maybe_create_runner_deactivated_alert
+
+    for row in stale_rows:
+        runner_id, project_id, hostname, capabilities, last_seen_at = row
+        caps = capabilities or {}
+        active_work_count = 0
+        for _work_key in ("active_task_ids", "active_compute_job_ids"):
+            _ids = caps.get(_work_key)
+            if isinstance(_ids, list):
+                active_work_count += len(_ids)
+        seconds_since_last_seen = (
+            max(0, int((now - last_seen_at).total_seconds()))
+            if last_seen_at is not None
+            else None
+        )
+        try:
+            await _maybe_create_runner_deactivated_alert(
+                session,
+                project_id=project_id,
+                runner_id=runner_id,
+                hostname=hostname,
+                had_active_work=active_work_count > 0,
+                active_work_count=active_work_count,
+                seconds_since_last_seen=seconds_since_last_seen,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create runner-deactivated alert for %s",
+                runner_id,
+            )
+            # Clear any half-staged alert so the next runner's creation starts
+            # from a clean transaction (each helper call commits its own row).
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception("[RUNNERS] rollback after alert failure failed")
+    for project_id, deactivated_count in stale_counts_by_project.items():
+        try:
+            await emit_workbench_refetch(
+                project_id,
+                resource="local_runner",
+                action="deactivated_stale",
+                refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+                summary_key="runners",
+                summary={
+                    "deactivated_count": deactivated_count,
+                    "released_unpulled_pins": released_pins_by_project.get(
+                        project_id, 0
+                    ),
+                },
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to emit stale-runner refetch for project %s",
+                project_id,
+            )
+
+
+def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
+    try:
+        stamped_at = datetime.fromisoformat(str(raw))
+    except (ValueError, TypeError):
+        return None
+    if stamped_at.tzinfo is not None:
+        stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return stamped_at
 
 
 async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
-    """Terminally fail compute_experiment tasks held too long for a local runner.
+    """Terminally fail tasks held too long for a local runner.
 
     A require-local project's compute_experiment is held QUEUED (with
     ``context['awaiting_local_runner_since']`` stamped) instead of provisioned in
@@ -1189,6 +1496,11 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     safety valve: a hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` is
     marked terminal-FAILED with an actionable reason so the project can never
     wedge forever when the operator's hardware stays offline.
+
+    Continuous local Strategic work uses the same bounded wait contract, with
+    ``context['awaiting_strategic_local_runner_since']`` and
+    ``context['strategic_local_runner_required']`` proving that the task was
+    intentionally held for the operator's local Strategic runner.
 
     Returns the number of tasks failed. Mirrors the terminal-fail pattern used by
     the stale-provisioning reaper: TaskStatus.FAILED + latest_status_message +
@@ -1215,26 +1527,45 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     failed = 0
     for task in rows:
         ctx = task.context or {}
-        stamped = ctx.get("awaiting_local_runner_since")
-        if not stamped:
+        task_type = str((task.first_payload or {}).get("type") or "")
+        compute_stamp = ctx.get("awaiting_local_runner_since")
+        strategic_stamp = ctx.get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY)
+        is_compute_hold = (
+            bool(compute_stamp)
+            and task_type == "compute_experiment"
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        is_strategic_hold = (
+            bool(strategic_stamp)
+            and task_type in STRATEGIC_TASK_TYPES
+            and ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+            and not task.archived
+            and task.requires_approval is not True
+        )
+        if not is_compute_hold and not is_strategic_hold:
             continue
-        # Belt-and-suspenders: only ever act on compute_experiment holds.
-        if str((task.first_payload or {}).get("type") or "") != "compute_experiment":
+
+        stamped = strategic_stamp if is_strategic_hold else compute_stamp
+        stamped_at = _parse_local_runner_hold_timestamp(stamped)
+        if stamped_at is None:
             continue
-        try:
-            stamped_at = datetime.fromisoformat(str(stamped))
-        except (ValueError, TypeError):
-            continue
-        if stamped_at.tzinfo is not None:
-            stamped_at = stamped_at.astimezone(timezone.utc).replace(tzinfo=None)
         if stamped_at > cutoff:
             continue  # within the wait window — keep holding
 
         hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
-        reason = (
-            f"require_local_runner: no self-hosted runner became available within "
-            f"{hours}h — operator hardware offline; bring a runner online and requeue"
-        )
+        if is_strategic_hold:
+            reason = (
+                f"strategic_local_runner_required: no Strategic-capable local "
+                f"runner became available within {hours}h — operator device "
+                f"offline; bring a Strategic runner online and requeue"
+            )
+        else:
+            reason = (
+                f"require_local_runner: no self-hosted runner became available "
+                f"within {hours}h — operator hardware offline; bring a runner "
+                f"online and requeue"
+            )
         task.status = TaskStatus.FAILED
         task.latest_status_message = reason[:500]
         persist_failure_category(task, PROVISION_FAILURE)
@@ -1249,12 +1580,13 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             success=False,
             failure_class=PROVISION_FAILURE,
             task_id=str(task.id),
-            task_type="compute_experiment",
+            task_type=task_type or "unknown",
         )
         logger.warning(
-            "[RUNNERS] Failed compute_experiment %s: no local runner within %sh "
-            "(held since %s)",
+            "[RUNNERS] Failed local-runner-held task %s (type=%s): no runner "
+            "within %sh (held since %s)",
             task.id,
+            task_type,
             hours,
             stamped,
         )
@@ -1936,6 +2268,9 @@ async def _filter_project_resource_dispatch_eligible(
     for task_id in eligible_ids:
         task = task_by_id.get(task_id)
         if task is None:
+            continue
+        if _task_requires_strategic_local_runner(task):
+            filtered.append(task_id)
             continue
         try:
             defer_msg = await _project_resource_dispatch_defer_message(
@@ -4291,6 +4626,15 @@ async def orchestrator_worker():
                         if task.requires_approval:
                             await session.rollback()
                             continue
+                        if await _try_strategic_local_required_runner_path(
+                            session,
+                            task,
+                            _active_runners_cache,
+                            _runner_pins_this_cycle,
+                        ):
+                            if str(task.vm_instance_id or "").startswith("runner:"):
+                                _cycle_dispatched += 1
+                            continue
                         resource_defer_msg = (
                             await _project_resource_dispatch_defer_message(
                                 session, task, project_active_counts
@@ -4362,6 +4706,9 @@ async def orchestrator_worker():
                             _runner_pins_this_cycle,
                         ):
                             _cycle_dispatched += 1
+                            continue
+
+                        if await _hold_strategic_local_runner_task(session, task):
                             continue
 
                         # Phase 2c: warm-VM continuity skip-provision branch.

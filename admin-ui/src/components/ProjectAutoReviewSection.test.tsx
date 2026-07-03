@@ -10,6 +10,8 @@ vi.mock('../api', () => ({
 vi.mock('../firebase', () => ({
   auth: { currentUser: null, onAuthStateChanged: () => () => {} },
   signInWithGoogle: vi.fn(),
+  getIdToken: vi.fn(async () => 'test-token'),
+  onAuthChange: vi.fn(() => () => {}),
   signOut: vi.fn(),
 }));
 

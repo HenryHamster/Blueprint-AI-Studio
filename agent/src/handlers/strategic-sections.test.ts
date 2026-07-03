@@ -6,6 +6,7 @@ import {
   buildCycleStartReconciliationSection,
   buildPruneCandidatesSection,
   buildDriftSection,
+  buildHeldDirectionsSection,
   buildOutcomeSection,
   buildClockAndRecentWorkSection,
   buildConversationThreadSection,
@@ -14,7 +15,11 @@ import {
   buildOpenMessagesText,
   buildDirSummaryText,
   buildDirHealthSummary,
+  buildCiComplianceSection,
+  buildSweepComparisonSection,
+  buildPayloadStalenessSection,
 } from './strategic-sections.js';
+import { buildThinkerPrompt } from '../prompts/thinker.js';
 
 describe('fmtScalar', () => {
   it('returns fallback for undefined/null', () => {
@@ -104,6 +109,134 @@ describe('buildDriftSection', () => {
     expect(result).toContain('Direction d-1');
     expect(result).toContain('over_claim');
     expect(result).toContain('0.20');
+  });
+});
+
+describe('buildDriftSection consecutive_flagged_cycles', () => {
+  it('appends flagged_cycles count to direction entry when >1', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-stuck': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 8,
+          actually_merged_prs: 1,
+          claim_shipped_consistency: 0.12,
+          consecutive_flagged_cycles: 4,
+        },
+      },
+    });
+    expect(result).toContain('Drift Signals');
+    expect(result).toContain('Direction d-stuck');
+    expect(result).toContain('over_claim');
+    expect(result).toContain('flagged_cycles=4');
+  });
+
+  it('omits flagged_cycles tail when consecutive_flagged_cycles is 1', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-once': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 5,
+          actually_merged_prs: 0,
+          claim_shipped_consistency: 0.0,
+          consecutive_flagged_cycles: 1,
+        },
+      },
+    });
+    expect(result).toContain('Direction d-once');
+    expect(result).not.toContain('flagged_cycles=');
+  });
+
+  it('omits flagged_cycles tail when consecutive_flagged_cycles is absent', () => {
+    const result = buildDriftSection({
+      window_days: 7,
+      by_direction: {
+        'd-no-trend': {
+          over_claim_flag: true,
+          stalled_despite_churn_flag: false,
+          claimed_changes_count: 3,
+          actually_merged_prs: 0,
+          claim_shipped_consistency: 0.0,
+        },
+      },
+    });
+    expect(result).toContain('Direction d-no-trend');
+    expect(result).not.toContain('flagged_cycles=');
+  });
+});
+
+describe('buildHeldDirectionsSection', () => {
+  it('returns empty string for undefined or empty input', () => {
+    expect(buildHeldDirectionsSection(undefined)).toBe('');
+    expect(buildHeldDirectionsSection([])).toBe('');
+  });
+
+  it('renders direction text, id, consecutive failures, last class, and fingerprint', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-held',
+      direction_text: 'improve test coverage',
+      consecutive_failures: 5,
+      last_failure_class: 'agent_stalled',
+      dominant_error_fingerprint: 'Force-terminated by timeout',
+      recent_failure_messages: ['agent timed out after 600s', 'agent timed out after 600s'],
+    }]);
+    expect(result).toContain('## Held directions — stuck on consecutive failures');
+    expect(result).toContain('improve test coverage (id: d-held)');
+    expect(result).toContain('Consecutive failures: 5');
+    expect(result).toContain('Last failure class: agent_stalled');
+    expect(result).toContain('Dominant fingerprint: Force-terminated by timeout');
+    expect(result).toContain('agent timed out after 600s');
+  });
+
+  it('renders "(none)" fingerprint when dominant_error_fingerprint is absent', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-nofp',
+      direction_text: 'auth work',
+      consecutive_failures: 3,
+      last_failure_class: 'ci_not_green',
+    }]);
+    expect(result).toContain('Dominant fingerprint: (none)');
+  });
+
+  it('omits Recent failure messages block when array is empty', () => {
+    const result = buildHeldDirectionsSection([{
+      direction_id: 'd-empty',
+      direction_text: 'some dir',
+      consecutive_failures: 2,
+      last_failure_class: 'test-coverage',
+      dominant_error_fingerprint: 'missing tests',
+      recent_failure_messages: [],
+    }]);
+    expect(result).not.toContain('Recent failure messages:');
+  });
+
+  it('renders multiple held directions', () => {
+    const result = buildHeldDirectionsSection([
+      {
+        direction_id: 'd-a',
+        direction_text: 'dir alpha',
+        consecutive_failures: 3,
+        last_failure_class: 'error',
+        dominant_error_fingerprint: 'fp-a',
+        recent_failure_messages: ['msg a'],
+      },
+      {
+        direction_id: 'd-b',
+        direction_text: 'dir beta',
+        consecutive_failures: 7,
+        last_failure_class: 'stalled',
+        dominant_error_fingerprint: 'fp-b',
+        recent_failure_messages: ['msg b'],
+      },
+    ]);
+    expect(result).toContain('dir alpha (id: d-a)');
+    expect(result).toContain('dir beta (id: d-b)');
+    expect(result).toContain('fp-a');
+    expect(result).toContain('fp-b');
   });
 });
 
@@ -251,6 +384,47 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('**active orphan** [high] (gap g-a)');
     expect(result).not.toContain('active orphan** [high] (gap g-a) — BLOCKED');
     expect(result).toContain('**blocked orphan** [low] (gap g-b) — BLOCKED');
+  });
+
+  it('renders qualification_prose_drift entries with header and per-entry bullets', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_prose_drift: [
+        { stale_sha: 'aabbccdd', active_candidate_sha: '11223344', cited_in: 'intent.current_focus' },
+        { stale_sha: 'deadbeef', active_candidate_sha: '11223344', cited_in: 'running_update' },
+      ],
+      counts: { qualification_prose_drift: 2 },
+    });
+
+    expect(result).toContain('Qualification prose-drift — stale candidate SHA in prose (2)');
+    expect(result).toContain('Active candidate: `11223344`');
+    expect(result).toContain('Rewrite the stale narrative to reflect the current candidate');
+    expect(result).toContain('`aabbccdd` cited in intent.current_focus (active: `11223344`)');
+    expect(result).toContain('`deadbeef` cited in running_update (active: `11223344`)');
+  });
+
+  it('buildCycleStartReconciliationSection renders stale active moves staffed deferrals and phantom refs', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      staffed_but_deferred: [{ gap_id: 'g-defer', name: 'deferred but staffed', priority: 'high', status: 'active' }],
+      ungrounded_directions: [],
+      stale_active_moves: [{ gap_id: 'g-stale', gap_name: 'stale staffed gap', stale_direction_ids: ['d-retired'] }],
+      phantom_direction_refs: [{ direction_id: 'd-4890df9e', cited_in: 'intent.current_focus' }, { direction_id: 'd-aaaabbbb', cited_in: 'running_update' }],
+      direction_pipeline: [],
+      counts: { staffed_but_deferred: 1, stale_active_moves: 1, phantom_direction_refs: 2 },
+    });
+
+    expect(result).toContain('Staffed-but-deferred gaps — contradictory staffing state (1)');
+    expect(result).toContain('**deferred but staffed** [high] (gap g-defer, status=active)');
+    expect(result).toContain('Stale gap active_moves — listed direction is no longer active (1)');
+    expect(result).toContain('**stale staffed gap** (gap g-stale) — stale active_moves: d-retired');
+    expect(result).toContain('Phantom direction refs — prose cites missing directions (2)');
+    expect(result).toContain('d-4890df9e cited in intent.current_focus');
+    expect(result).toContain('d-aaaabbbb cited in running_update');
   });
 
   it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
@@ -486,6 +660,44 @@ describe('buildOutcomeSection', () => {
     expect(result).toContain('improve perf');
     expect(result).toContain('Type mix: 2 refactor, 1 fix');
     expect(result).toContain('Confirmed (shipped): faster queries');
+  });
+
+  it('renders outcome_scaffolding_flagged warning with evidence', () => {
+    const result = buildOutcomeSection({
+      directions: [{
+        id: 'd-scaffold',
+        text: 'improve throughput',
+        status: 'active',
+        cycles: 15,
+        merged: 10,
+        failed: 2,
+        outcome_scaffolding_flagged: true,
+        outcome_scaffolding_evidence: {
+          total_cycles: 15,
+          lifetime_merged: 10,
+          lifetime_merge_rate: 0.667,
+          progress_stagnant_cycles: 5,
+        },
+      }],
+    });
+    expect(result).toContain('OUTCOME-SCAFFOLDING-FLAGGED');
+    expect(result).toContain('Scaffolding evidence: 15 cycles, 10 lifetime merged (rate=0.667), stagnant for 5 cycles');
+  });
+
+  it('omits outcome_scaffolding_flagged warning when flag is false or absent', () => {
+    const result = buildOutcomeSection({
+      directions: [{
+        id: 'd-normal',
+        text: 'normal direction',
+        status: 'active',
+        cycles: 5,
+        merged: 3,
+        failed: 1,
+        outcome_scaffolding_flagged: false,
+      }],
+    });
+    expect(result).not.toContain('OUTCOME-SCAFFOLDING-FLAGGED');
+    expect(result).not.toContain('Scaffolding evidence');
   });
 
   it('truncates failed_approaches to 5', () => {
@@ -761,6 +973,35 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 proven (1 consumed downstream)');
   });
 
+  it('renders plain merged when verified_prs_merged equals prs_merged (no badge-only noise)', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-allverified',
+      text: 'all verified direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 4,
+      verified_prs_merged: 4,
+    }]);
+    expect(result).toContain('4 merged');
+    expect(result).not.toContain('badge-only');
+    expect(result).not.toContain('verified,');
+  });
+
+  it('falls back to plain merged when verified_prs_merged is absent (legacy payload)', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy',
+      text: 'legacy no verified field',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      prs_merged: 7,
+    }]);
+    expect(result).toContain('7 merged');
+    expect(result).not.toContain('badge-only');
+    expect(result).not.toContain('verified,');
+  });
+
   it('omits zero-only proof fields from legacy summaries', () => {
     const result = buildDirSummaryText([{
       id: 'd-legacy-proof',
@@ -775,6 +1016,102 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('2 merged');
     expect(result).not.toContain('0 proven');
     expect(result).not.toContain('consumed downstream');
+  });
+
+  it('renders verified annotation when verified < merged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-verified',
+      text: 'direction with verified split',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      prs_merged: 5,
+      verified_prs_merged: 3,
+    }]);
+    expect(result).toContain('5 merged (3 verified)');
+  });
+
+  it('omits verified annotation when verified equals merged', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-all-verified',
+      text: 'complete credit direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 4,
+      verified_prs_merged: 4,
+    }]);
+    expect(result).toContain('4 merged');
+    expect(result).not.toContain('4 merged (');
+  });
+
+  it('omits verified annotation when field is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy-no-verified',
+      text: 'legacy direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      prs_merged: 3,
+    }]);
+    expect(result).toContain('3 merged');
+    expect(result).not.toContain('3 merged (');
+  });
+
+  it('renders reachable-vs-badge split when reachable_prs_merged is present', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-reachable',
+      text: 'ancestry tracking direction',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 4,
+      prs_merged: 5,
+      reachable_prs_merged: 3,
+    }]);
+    expect(result).toContain('5 merged (3 reachable, 2 badge-only)');
+  });
+
+  it('omits reachable split when field is absent (legacy-unknown)', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-legacy-no-reachable',
+      text: 'original direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 2,
+      prs_merged: 2,
+    }]);
+    expect(result).toContain('2 merged');
+    expect(result).not.toContain('2 merged (');
+  });
+
+  it('renders explicit known-zero reachability distinctly from legacy-unknown', () => {
+    // reachable_prs_merged: 0 (present, zero) — must emit the annotation so operators
+    // see "merged credit exists but nothing is ancestry-confirmed" rather than the
+    // same silent '3 merged' as a legacy-unknown direction.
+    const result = buildDirSummaryText([{
+      id: 'd-known-zero-reachable',
+      text: 'direction with zero reachable',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 3,
+      prs_merged: 3,
+      reachable_prs_merged: 0,
+    }]);
+    expect(result).toContain('3 merged (0 reachable, 3 badge-only)');
+  });
+
+  it('combines verified and reachable annotations with semicolon separator', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-both',
+      text: 'direction with both verified and reachable',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 5,
+      prs_merged: 6,
+      verified_prs_merged: 4,
+      reachable_prs_merged: 5,
+    }]);
+    expect(result).toContain('6 merged (4 verified; 5 reachable, 1 badge-only)');
   });
 
   it('shows SATURATED flag when applicable', () => {
@@ -916,6 +1253,30 @@ describe('buildDirSummaryText', () => {
     expect(result).toContain('Research spawn-gate');
     expect(result).not.toContain('refuted/unresolved reasons:');
   });
+
+  it('renders SCAFFOLDING marker when outcome_scaffolding_flagged is true', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-scaffolding',
+      text: 'direction with scaffolding flag',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 5,
+      outcome_scaffolding_flagged: true,
+    }]);
+    expect(result).toContain('[SCAFFOLDING]');
+  });
+
+  it('omits SCAFFOLDING marker when outcome_scaffolding_flagged is false or absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-scaffolding',
+      text: 'direction without scaffolding flag',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 3,
+      outcome_scaffolding_flagged: false,
+    }]);
+    expect(result).not.toContain('[SCAFFOLDING]');
+  });
 });
 
 describe('buildDirHealthSummary', () => {
@@ -1049,5 +1410,577 @@ describe('buildQuestionSection', () => {
     expect(result).toContain('from: operator');
     expect(result).toContain('What is the plan?');
     expect(result).toContain('./messages resolve');
+  });
+});
+
+describe('buildCiComplianceSection', () => {
+  it('returns empty for nullish and non-object input', () => {
+    expect(buildCiComplianceSection(null)).toBe('');
+    expect(buildCiComplianceSection(undefined)).toBe('');
+    expect(buildCiComplianceSection('bad')).toBe('');
+  });
+
+  it('returns empty when compliant is true', () => {
+    expect(buildCiComplianceSection({ compliant: true, violations: [{ section: 'backend', rel: 'app/foo.py', count: 200, cap: 100 }] })).toBe('');
+  });
+
+  it('renders capped and uncapped module-size violations', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      head_sha: 'deadbeefcafe1234',
+      violations: [
+        { section: 'backend', rel: 'app/canary.py', count: 150, cap: 100 },
+        { section: 'agent', rel: 'handlers/big.ts', count: 1700, cap: null },
+      ],
+      branch_literal_violations: [],
+    });
+    expect(result).toContain('## CI Compliance (automain HEAD)');
+    expect(result).toContain('Compliant: **no**  (SHA: deadbeef)');
+    expect(result).toContain('### Module-size violations');
+    expect(result).toContain('python3 backend/testing/check_size_limits.py --fix');
+    expect(result).toContain('  - [backend] app/canary.py: 150 lines (limit: 100)');
+    expect(result).toContain('  - [agent] handlers/big.ts: 1700 lines (limit: uncapped)');
+  });
+
+  it('renders without sha when head_sha is absent', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      violations: [{ section: 'backend', rel: 'app/foo.py', count: 200, cap: 100 }],
+      branch_literal_violations: [],
+    });
+    expect(result).toContain('Compliant: **no**');
+    expect(result).not.toContain('SHA:');
+  });
+
+  it('renders branch-literal violations', () => {
+    const result = buildCiComplianceSection({
+      compliant: false,
+      violations: [],
+      branch_literal_violations: [
+        { section: 'agent', rel: 'src/handlers/review-fix.ts', line: 12, text: 'if (baseBranch === "main") {' },
+        { section: 'agent', rel: 'src/prompt.ts', line: 9, text: 'if (branch !== "automain") {' },
+      ],
+    });
+    expect(result).toContain('### Branch-literal violations');
+    expect(result).toContain('resolveBaseBranch()');
+    expect(result).toContain('  - src/handlers/review-fix.ts:12: if (baseBranch === "main") {');
+    expect(result).toContain('  - src/prompt.ts:9: if (branch !== "automain") {');
+  });
+});
+
+describe('buildSweepComparisonSection', () => {
+  it('returns empty string for undefined or empty input', () => {
+    expect(buildSweepComparisonSection(undefined)).toBe('');
+    expect(buildSweepComparisonSection({})).toBe('');
+  });
+
+  it('returns empty string when no sweep has all arms verdicted', () => {
+    // One arm is UNMEASURED (criterion_met === null)
+    const result = buildSweepComparisonSection({
+      'sweep-1': [
+        { id: 'k-1', title: 'arm A', arm_label: 'arm-a', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'arm-b', criterion_met: null },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string for single-arm sweeps', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-single': [
+        { id: 'k-r', title: 'arm R', arm_label: 'r', criterion_met: true },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when an arm is unavailable', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-2': [
+        { id: 'k-3', title: 'arm A', arm_label: 'arm-a', criterion_met: true },
+        { id: 'k-4', title: 'arm B', arm_label: 'arm-b', criterion_met: false, unavailable_cause: 'compute_failed' },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('returns empty string when arms have duplicate labels', () => {
+    expect(buildSweepComparisonSection({
+      'sweep-duplicate-label': [
+        { id: 'k-1', title: 'arm A', arm_label: 'same', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'same', criterion_met: false },
+      ],
+    })).toBe('');
+  });
+
+  it('renders single-document arms-block sweeps (duplicate doc id, distinct arm_label)', () => {
+    // build_compute_sweep_groups emits one row per per_arm_verdict entry, all sharing
+    // the same knowledge document id from base_entry. Arms are identified by arm_label.
+    const result = buildSweepComparisonSection({
+      'sweep-single-doc': [
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-a',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'approach-a': { value: 0.95, met: true },
+            'approach-b': { value: 0.87, met: false },
+          },
+        },
+        {
+          id: 'k-shared',
+          title: 'Sweep result doc',
+          arm_label: 'approach-b',
+          criterion_met: false,
+        },
+      ],
+    });
+    expect(result).toContain('Sweep sweep-single-doc');
+    expect(result).toContain('Winner: **approach-a** (accuracy=0.95; margin=0.08 over approach-b=0.87)');
+    expect(result).toContain('margin: +0.08 accuracy over approach-b');
+    expect(result).toContain('**approach-a** [MET] [k-shared] (accuracy=0.95)');
+    expect(result).toContain('**approach-b** [NOT MET] [k-shared] (accuracy=0.87)');
+  });
+
+  it('returns empty string when criterion_met is not boolean', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-string-verdict': [
+        { id: 'k-1', title: 'arm A', arm_label: 'a', criterion_met: true },
+        { id: 'k-2', title: 'arm B', arm_label: 'b', criterion_met: 'false' },
+      ],
+    });
+    expect(result).toBe('');
+  });
+
+  it('renders metric values and best-arm margin for completed sweeps', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-abc': [
+        {
+          id: 'k-met',
+          title: 'Approach A: fast tokenizer',
+          arm_label: 'fast-tokenizer',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            'fast-tokenizer': { value: 0.93, met: true },
+            'slow-tokenizer': { value: 0.88, met: false },
+          },
+          summary: 'Achieved 98% accuracy at 2x throughput',
+        },
+        {
+          id: 'k-not',
+          title: 'Approach B: slow tokenizer',
+          arm_label: 'slow-tokenizer',
+          criterion_met: false,
+          summary: 'Only reached 85% accuracy',
+        },
+      ],
+    });
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).toContain('Sweep sweep-abc');
+    expect(result).toContain('Winner: **fast-tokenizer** (accuracy=0.93; margin=0.05 over slow-tokenizer=0.88)');
+    expect(result).toContain('margin: +0.05 accuracy over slow-tokenizer');
+    expect(result).toContain('**fast-tokenizer** [MET] [k-met] (accuracy=0.93)');
+    expect(result).toContain('**slow-tokenizer** [NOT MET] [k-not] (accuracy=0.88)');
+    expect(result).toContain('exactly ONE follow-on move');
+    expect(result).toContain('./fetch knowledge');
+  });
+
+  it('names the winning arm by measured value and renders the numeric margin', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-abc': [
+        {
+          id: 'k-alpha',
+          title: 'Approach A: alpha',
+          arm_label: 'alpha',
+          criterion_met: false,
+          criterion: { metric: 'loss', operator: '<=', threshold: 0.85 },
+          per_arm_verdicts: {
+            alpha: { value: 0.94, met: false },
+            beta: { value: 0.81, met: true },
+          },
+          summary: 'Higher loss and slower convergence',
+        },
+        {
+          id: 'k-beta',
+          title: 'Approach B: beta',
+          arm_label: 'beta',
+          criterion_met: true,
+          criterion: { metric: 'loss', operator: '<=', threshold: 0.85 },
+          per_arm_verdicts: {
+            alpha: { value: 0.94, met: false },
+            beta: { value: 0.81, met: true },
+          },
+          summary: 'Lower loss and better convergence',
+        },
+      ],
+    });
+    expect(result).toContain('Winner: **beta** (loss=0.81; margin=0.13 over alpha=0.94)');
+    expect(result).toContain('margin: +0.13 loss over alpha');
+    expect(result).toContain('**alpha** [NOT MET]');
+    expect(result).toContain('**beta** [MET]');
+  });
+
+  it('shows "none (all NOT MET)" as winner when no arm met the criterion', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-all-fail': [
+        {
+          id: 'k-a',
+          title: 'arm A',
+          arm_label: 'a',
+          criterion_met: false,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: {
+            a: { value: 0.82, met: false },
+            b: { value: 0.79, met: false },
+          },
+        },
+        {
+          id: 'k-b',
+          title: 'arm B',
+          arm_label: 'b',
+          criterion_met: false,
+        },
+      ],
+    });
+    expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: **a** (accuracy=0.82; margin=0.03 over b=0.79)');
+    expect(result).toContain('Winning: 0/2 arm(s) MET, 2/2 NOT MET');
+  });
+
+  it('falls back to the current label-only winner rendering when measured values are unavailable', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-fallback': [
+        { id: 'k-fast', title: 'arm A', arm_label: 'fast-tokenizer', criterion_met: true, summary: 'Fast path' },
+        { id: 'k-slow', title: 'arm B', arm_label: 'slow-tokenizer', criterion_met: false, summary: 'Slow path' },
+      ],
+    });
+    expect(result).toContain('Winner: **fast-tokenizer**');
+    expect(result).not.toContain('(accuracy=');
+    expect(result).not.toContain('margin:');
+  });
+
+  it('does not dereference a missing measured arm when all label-only arms are NOT MET', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-label-only-all-fail': [
+        { id: 'k-a', title: 'arm A', arm_label: 'a', criterion_met: false, summary: 'No pass' },
+        { id: 'k-b', title: 'arm B', arm_label: 'b', criterion_met: false, summary: 'No pass' },
+      ],
+    });
+    expect(result).toContain('Winner: **none (all NOT MET)**');
+    expect(result).toContain('Best measured arm: none (no numeric metric values available)');
+    expect(result).toContain('**a** [NOT MET] [k-a]');
+    expect(result).toContain('**b** [NOT MET] [k-b]');
+  });
+
+  it('omits the margin when there is only one numeric arm', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-one-numeric': [
+        {
+          id: 'k-solo',
+          title: 'Solo arm',
+          arm_label: 'solo',
+          criterion_met: true,
+          criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+          per_arm_verdicts: { solo: { value: 0.97, met: true } },
+          summary: 'Single-arm completion',
+        },
+        {
+          id: 'k-unmeasured',
+          title: 'Unmeasured arm',
+          arm_label: 'unmeasured',
+          criterion_met: false,
+          summary: 'No metric value',
+        },
+      ],
+    });
+    expect(result).toContain('Winner: **solo** (accuracy=0.97)');
+    expect(result).not.toContain('margin:');
+  });
+
+  it('renders multiple completed sweeps independently', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-x': [
+        { id: 'k-x1', title: 'arm X1', arm_label: 'x1', criterion_met: true },
+        { id: 'k-x2', title: 'arm X2', arm_label: 'x2', criterion_met: false },
+      ],
+      'sweep-y': [
+        { id: 'k-y1', title: 'arm Y1', arm_label: 'y1', criterion_met: false },
+        { id: 'k-y2', title: 'arm Y2', arm_label: 'y2', criterion_met: true },
+      ],
+    });
+    expect(result).toContain('Sweep sweep-x');
+    expect(result).toContain('Sweep sweep-y');
+    expect(result).toContain('Winner: **x1**');
+    expect(result).toContain('Winner: **y2**');
+  });
+
+  it('skips sweeps with fewer than two arms', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-empty': [],
+      'sweep-real': [
+        { id: 'k-r1', title: 'arm R1', arm_label: 'r1', criterion_met: true },
+        { id: 'k-r2', title: 'arm R2', arm_label: 'r2', criterion_met: false },
+      ],
+    });
+    // Only the real comparative sweep should appear.
+    expect(result).not.toContain('Sweep sweep-empty');
+    expect(result).toContain('Sweep sweep-real');
+  });
+
+  it('renders disposed-sweep block and omits synthesis mandate for sweeps with sweep_disposition', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-adopt-789', status: 'in_progress' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+    });
+    // Disposition block is rendered with heading, sweep id, task id, and status.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**');
+    expect(result).toContain('task-adopt-789');
+    expect(result).toContain('in_progress');
+    // Normal synthesis mandate must NOT appear — disposed sweeps must not be re-synthesized.
+    expect(result).not.toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).not.toContain('exactly ONE follow-on move');
+  });
+
+  it('renders disposed sweeps and completed sweeps independently in the same output', () => {
+    const result = buildSweepComparisonSection({
+      'sweep-disposed': [
+        {
+          id: 'k-d1',
+          title: 'arm A',
+          arm_label: 'arm-a',
+          criterion_met: true,
+          sweep_disposition: { task_id: 'task-xyz', status: 'pending' },
+        },
+        {
+          id: 'k-d2',
+          title: 'arm B',
+          arm_label: 'arm-b',
+          criterion_met: false,
+        },
+      ],
+      'sweep-completed': [
+        { id: 'k-c1', title: 'arm C1', arm_label: 'c1', criterion_met: true },
+        { id: 'k-c2', title: 'arm C2', arm_label: 'c2', criterion_met: false },
+      ],
+    });
+    // Disposition block rendered for disposed sweep.
+    expect(result).toContain('## Sweep dispositions in flight — do not re-synthesize');
+    expect(result).toContain('**sweep-disposed**: disposition task `task-xyz` (pending)');
+    // Completed sweep rendered with synthesis mandate.
+    expect(result).toContain('## Completed experiment sweeps — synthesis required');
+    expect(result).toContain('Sweep sweep-completed');
+    // Disposed sweep id must NOT appear under the completed sweeps section.
+    expect(result).not.toContain('Sweep sweep-disposed');
+  });
+});
+
+describe('buildPayloadStalenessSection', () => {
+  const STALE_SHA = 'a'.repeat(40);
+  const CANDIDATE_SHA = 'b'.repeat(40);
+
+  it('returns empty string for undefined', () => {
+    expect(buildPayloadStalenessSection(undefined)).toBe('');
+  });
+
+  it('returns empty string for object missing stale boolean and no verdict', () => {
+    expect(buildPayloadStalenessSection({ payload_compiled_sha: STALE_SHA })).toBe('');
+    expect(buildPayloadStalenessSection({})).toBe('');
+  });
+
+  it('unknown verdict — renders explicit UNKNOWN warning, not empty string', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'unknown', checked_at: '2026-06-30T12:00:00' });
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('⚠ UNKNOWN');
+    expect(result).toContain('freshness check could not be completed');
+    expect(result).toContain('2026-06-30T12:00:00');
+    expect(result).toContain('Treat this payload as potentially stale');
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).not.toContain('CURRENT');
+  });
+
+  it('unknown verdict without checked_at — still renders UNKNOWN section', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'unknown' });
+    expect(result).toContain('⚠ UNKNOWN');
+    expect(result).toContain('freshness check could not be completed');
+  });
+
+  it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs (legacy payload_compiled_sha fallback)', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_compiled_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain(STALE_SHA.slice(0, 12));
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('Do NOT treat unverified audit findings');
+    expect(result).toContain('payload-vs-candidate');
+  });
+
+  it('buildPayloadStalenessSection renders structured stale reasons for SHA divergence', () => {
+    const CANDIDATE_SHA = 'c'.repeat(40);
+    const INTEGRATION_SHA = 'd'.repeat(40);
+    // payload_sha as primary; differs from both candidate and integration head
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      payload_compiled_sha: 'e'.repeat(40),  // should be ignored when payload_sha present
+      active_candidate_sha: CANDIDATE_SHA,
+      integration_head_sha: INTEGRATION_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    // Uses payload_sha (STALE_SHA), not payload_compiled_sha
+    expect(result).toContain(STALE_SHA.slice(0, 12));
+    expect(result).not.toContain('e'.repeat(12));
+    // payload-vs-candidate bullet present
+    expect(result).toContain('payload-vs-candidate');
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
+    // payload-vs-integration-head bullet present
+    expect(result).toContain('payload-vs-integration-head');
+    expect(result).toContain(INTEGRATION_SHA.slice(0, 12));
+    expect(result).toContain('Do NOT treat unverified audit findings');
+  });
+
+  it('only candidate annotation when integration_head_sha absent', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('payload-vs-candidate');
+    expect(result).toContain(CANDIDATE_SHA.slice(0, 12));
+    expect(result).not.toContain('payload-vs-integration-head');
+  });
+
+  it('no stale bullets when payload SHA is missing (indeterminate guard)', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      active_candidate_sha: CANDIDATE_SHA,
+      integration_head_sha: 'c'.repeat(40),
+    });
+    expect(result).toContain('⚠ STALE');
+    // No specific SHA comparison bullets since payload SHA is unknown
+    expect(result).not.toContain('payload-vs-candidate');
+    expect(result).not.toContain('payload-vs-integration-head');
+  });
+
+  it('no false positive — stale=false shows CURRENT line, not ⚠ STALE', () => {
+    const result = buildPayloadStalenessSection({
+      stale: false,
+      payload_sha: STALE_SHA,
+      payload_compiled_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+    });
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).toContain('CURRENT');
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+  });
+
+  it('stale branch with generated_at — appends _Generated at <timestamp>_ line', () => {
+    const result = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+      generated_at: '2026-06-30T12:00:00Z',
+    });
+    expect(result).toContain('⚠ STALE');
+    expect(result).toContain('_Generated at 2026-06-30T12:00:00Z_');
+    expect(result).not.toContain('_Checked at');
+  });
+
+  it('current branch with generated_at — appends _Checked at <timestamp>_ line', () => {
+    const result = buildPayloadStalenessSection({
+      stale: false,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+      generated_at: '2026-06-30T12:00:00Z',
+    });
+    expect(result).toContain('CURRENT');
+    expect(result).toContain('_Checked at 2026-06-30T12:00:00Z_');
+    expect(result).not.toContain('_Generated at');
+  });
+
+  it('omits generated_at lines when generated_at field is absent', () => {
+    const staleResult = buildPayloadStalenessSection({
+      stale: true,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: CANDIDATE_SHA,
+    });
+    expect(staleResult).not.toContain('_Generated at');
+    const currentResult = buildPayloadStalenessSection({
+      stale: false,
+      payload_sha: STALE_SHA,
+      active_candidate_sha: STALE_SHA,
+    });
+    expect(currentResult).not.toContain('_Checked at');
+  });
+
+  it('position in prompt — staleness section appears before problem model', () => {
+    const stalenessMarker = 'STALENESS_MARKER_XYZ';
+    const problemModelMarker = 'PROBLEM_MODEL_MARKER_XYZ';
+    const prompt = buildThinkerPrompt({
+      contextPrefix: '',
+      projectName: 'test',
+      clockHeader: '',
+      isSelfRepo: false,
+      userStateLine: '',
+      packerMetaSection: '',
+      payloadStalenessSection: stalenessMarker,
+      strategicContext: '',
+      problemModelSection: problemModelMarker,
+      problemModelRecovery: 'present',
+      cycleStartReconciliationSection: '',
+      reflectionSection: '',
+      selfImprovementBlock: '',
+      runningUpdateSection: '',
+      designDocJson: '',
+      visionJson: '',
+      outcomeSection: '',
+      previousDecisionOutcomes: '',
+      pastRetirementCritiquesSection: '',
+      retiredDirectionsSummarySection: '',
+      dirSummaryText: '',
+      dirHealthSummary: '',
+      userPausedSection: '',
+      rejectedProposalsSection: '',
+      operatorOverridesSection: '',
+      portfolioCompositionText: '',
+      modelHealthSection: '',
+      systemMaturitySection: '',
+      driftSection: '',
+      recentWorkSection: '',
+      feedbackSection: '',
+      questionSection: '',
+      threadSection: '',
+      taskId: 'test-task',
+      versionPhaseSection: '',
+      memoCitationsSection: '',
+      efficiencySnapshotSection: '',
+    });
+    const stalenessPos = prompt.indexOf(stalenessMarker);
+    const problemModelPos = prompt.indexOf(problemModelMarker);
+    expect(stalenessPos).toBeGreaterThan(-1);
+    expect(problemModelPos).toBeGreaterThan(-1);
+    expect(stalenessPos).toBeLessThan(problemModelPos);
   });
 });

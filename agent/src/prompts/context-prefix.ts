@@ -412,22 +412,34 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
       const sourceKind = strVal(entry.source_kind);
       if (sourceKind) meta.push(sourceKind);
       const metaSuffix = meta.length > 0 ? ` (${meta.join(', ')})` : '';
-      let gradeBadge = '';
+      let badges = '';
       if (sourceKind === 'compute_experiment') {
-        const grade = strVal(entry.compute_acceptance_grade);
+        const criterionMet = entry.criterion_met;
         const unavailableCause = strVal(entry.unavailable_cause);
-        const acceptanceReason = strVal(entry.compute_acceptance_reason);
-        if (grade === 'acceptance') {
-          gradeBadge = ' [acceptance]';
-        } else if (unavailableCause) {
-          gradeBadge = ` [analysis_unavailable: ${unavailableCause}]`;
-        } else if (acceptanceReason) {
-          gradeBadge = ` [measured_only: ${acceptanceReason}]`;
+        let verdict: string;
+        if (unavailableCause) {
+          verdict = `analysis_unavailable: ${unavailableCause}`;
+        } else if (criterionMet === true) {
+          verdict = 'MET';
+        } else if (criterionMet === false) {
+          verdict = 'NOT MET';
         } else {
-          gradeBadge = ' [measured_only]';
+          verdict = 'UNMEASURED';
+        }
+        badges += ` [${verdict}]`;
+        if (!unavailableCause) {
+          const grade = strVal(entry.compute_acceptance_grade);
+          const acceptanceReason = strVal(entry.compute_acceptance_reason);
+          if (grade === 'acceptance') {
+            badges += ' [acceptance]';
+          } else if (acceptanceReason) {
+            badges += ` [measured_only: ${acceptanceReason}]`;
+          } else {
+            badges += ' [measured_only]';
+          }
         }
       }
-      kdLines.push(`- [${id}] ${title}${metaSuffix}${gradeBadge}`);
+      kdLines.push(`- [${id}] ${title}${metaSuffix}${badges}`);
       const summary = strVal(entry.summary);
       if (summary) kdLines.push(`  ${summary}`);
     }
@@ -436,9 +448,9 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
   }
 
   // Completed experiment sweeps — comparative arm results grouped by sweep_id.
-  // Presence-gated: only rendered for strategic_review tasks when the backend
-  // ships a non-empty compute_experiment_sweeps map.
-  if (taskType === 'strategic_review') {
+  // Presence-gated: rendered for strategic_review, research, and design_doc_update
+  // tasks when the backend ships a non-empty compute_experiment_sweeps map.
+  if (['strategic_review', 'research', 'design_doc_update'].includes(taskType)) {
     const sweepMap = payload?.compute_experiment_sweeps as Record<string, Array<Record<string, unknown>>> | undefined;
     if (sweepMap && typeof sweepMap === 'object' && !Array.isArray(sweepMap)) {
       const sweepIds = Object.keys(sweepMap);
@@ -447,24 +459,31 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
         sweepLines.push(
           'Comparative arm results from completed multi-arm compute experiments. Use `./fetch knowledge <id>` to retrieve the full analysis body for any arm.',
         );
+        let renderedSweepCount = 0;
         for (const sweepId of sweepIds) {
           const arms = sweepMap[sweepId];
           if (!Array.isArray(arms) || arms.length === 0) continue;
+          if (arms.some(arm => arm.sweep_disposition != null && typeof arm.sweep_disposition === 'object' && !Array.isArray(arm.sweep_disposition))) {
+            continue;
+          }
+          renderedSweepCount += 1;
           sweepLines.push(`\n### Sweep ${sweepId}`);
           for (const arm of arms) {
             const id = strVal(arm.id);
             const title = strVal(arm.title);
             if (!id || !title) continue;
             const armLabel = strVal(arm.arm_label);
-            const grade = strVal(arm.compute_acceptance_grade);
             const unavailableCause = strVal(arm.unavailable_cause);
+            const criterionMet = arm.criterion_met;
             let verdict: string;
             if (unavailableCause) {
               verdict = `unavailable (${unavailableCause})`;
-            } else if (grade === 'acceptance') {
+            } else if (criterionMet === true) {
               verdict = 'MET';
-            } else {
+            } else if (criterionMet === false) {
               verdict = 'NOT MET';
+            } else {
+              verdict = 'UNMEASURED';
             }
             const armPrefix = armLabel ? `**${armLabel}**` : id;
             sweepLines.push(`- ${armPrefix} [${verdict}] [${id}] ${title}`);
@@ -472,8 +491,10 @@ export function buildContextPrefix(task: Record<string, unknown>): string {
             if (summary) sweepLines.push(`  ${summary}`);
           }
         }
-        sweepLines.push('');
-        prefix += sweepLines.join('\n') + '\n';
+        if (renderedSweepCount > 0) {
+          sweepLines.push('');
+          prefix += sweepLines.join('\n') + '\n';
+        }
       }
     }
   }

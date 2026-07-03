@@ -27,25 +27,33 @@ const { apiFetchMock, fetchQualificationVerdictsMock, fetchTaskMock, fetchFleetU
   },
 }));
 
-vi.mock('../api', () => ({
-  apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
-  fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
-  fetchTask: (taskId: string) => fetchTaskMock(taskId),
-  fetchFleetUtilization: () => fetchFleetUtilizationMock(),
-  fetchAgentServingShas: (projectId: string) => fetchAgentServingShasMock(projectId),
-  fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
-  fetchSrCatchRateHealth: vi.fn().mockResolvedValue({
-    status: 'healthy',
-    last_sufficient_computed_at: null,
-    last_sufficient_age_hours: null,
-    signal_last_computed_at: null,
-    signal_age_hours: null,
-    data_sufficient: true,
-  }),
-  setVersionPhase: (projectId: string, phase: string, reasoning?: string) => setVersionPhaseMock(projectId, phase, reasoning),
-  setVersionGoal: vi.fn(),
-  triggerQualify: vi.fn(),
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    apiFetch: (path: string, init?: RequestInit) => apiFetchMock(path, init),
+    fetchQualificationVerdicts: (projectId: string, limit?: number) => fetchQualificationVerdictsMock(projectId, limit),
+    fetchTask: (taskId: string) => fetchTaskMock(taskId),
+    fetchFleetUtilization: () => fetchFleetUtilizationMock(),
+    fetchAgentServingShas: (projectId: string) => fetchAgentServingShasMock(projectId),
+    fetchSrUnhandledEdgesRetrospectives: vi.fn().mockResolvedValue({ tasks: [] }),
+    fetchSrCatchRateHealth: vi.fn().mockResolvedValue({
+      status: 'healthy',
+      last_sufficient_computed_at: null,
+      last_sufficient_age_hours: null,
+      signal_last_computed_at: null,
+      signal_age_hours: null,
+      data_sufficient: true,
+    }),
+    setVersionPhase: (projectId: string, phase: string, reasoning?: string) => setVersionPhaseMock(projectId, phase, reasoning),
+    setVersionGoal: vi.fn(),
+    triggerQualify: vi.fn(),
+    // LlmCostBreakdownPanel (not mocked as a component) calls fetchLlmCostBreakdown.
+    // Reject to simulate original behavior where the function was absent from the
+    // narrow mock and calling it threw — causing the panel's try/catch to fire and
+    // render nothing, avoiding a destructuring error on the undefined response.
+    fetchLlmCostBreakdown: vi.fn().mockRejectedValue(new Error('not configured')),
+  });
+});
 
 vi.mock('./RecentErrorsWidget', () => ({
   RecentErrorsWidget: () => <div data-testid="recent-errors-widget">RecentErrorsWidget</div>,
@@ -74,6 +82,10 @@ vi.mock('./DirectionAutoPauseWidget', () => ({
 
 vi.mock('./ImprovementLanesPanel', () => ({
   ImprovementLanesPanel: (props: Record<string, unknown>) => {
+    capturedProps.improvementLanes = props;
+    return <div data-testid="improvement-lanes-panel">ImprovementLanesPanel</div>;
+  },
+  default: (props: Record<string, unknown>) => {
     capturedProps.improvementLanes = props;
     return <div data-testid="improvement-lanes-panel">ImprovementLanesPanel</div>;
   },

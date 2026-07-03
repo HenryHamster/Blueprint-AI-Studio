@@ -10,6 +10,7 @@ import type {
   ResourceEnvelopeConfig,
 } from './types/project';
 import type { WarmStartOriginBreakdown } from './hooks/useEfficiencySnapshot';
+import type { Alert, AlertFilters, ProjectAlertDomainsResponse } from './types/alert';
 
 /** Base URL for API requests to the Blueprint backend. Defaults to empty string for same-origin requests. */
 export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
@@ -57,7 +58,8 @@ export async function apiFetch(
   options?: RequestInit,
   retries = 2,
   timeout = 30000,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  dedup = true
 ): Promise<Response> {
   const headers = await authHeaders();
   const fullUrl = url.startsWith('http') ? url : `${API_BASE_URL}${url}`;
@@ -71,7 +73,7 @@ export async function apiFetch(
   // Only dedup idempotent reads. POST/PUT/DELETE are intentionally separate
   // requests even when fired in parallel — the body's identity is too
   // expensive to hash reliably and the semantics rarely overlap.
-  const dedupKey = safeToRetry ? `${method} ${fullUrl}` : null;
+  const dedupKey = safeToRetry && dedup ? `${method} ${fullUrl}` : null;
   if (dedupKey) {
     const existing = inFlightRequests.get(dedupKey);
     if (existing) {
@@ -178,6 +180,55 @@ export async function fetchTaskTypeCatalog(
   if (!res.ok) throw new Error(`Failed to fetch task-type catalog: ${res.status}`);
   const data = await res.json();
   return Array.isArray(data?.task_types) ? data.task_types : [];
+}
+
+export async function fetchAlerts(
+  filters: AlertFilters = {},
+  signal?: AbortSignal,
+): Promise<Alert[]> {
+  const params = new URLSearchParams();
+  if (filters.projectId) params.set('project_id', filters.projectId);
+  if (filters.domain) params.set('domain', filters.domain);
+  if (filters.eventType) params.set('event_type', filters.eventType);
+  if (filters.source) params.set('source', filters.source);
+  const query = params.toString();
+  const res = await apiFetch(`/api/admin/alerts${query ? `?${query}` : ''}`, undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch alerts: ${res.status}`);
+  return res.json();
+}
+
+export async function fetchProjectAlertDomains(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectAlertDomainsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/alert-domains`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch alert domains: ${res.status}`);
+  return res.json();
+}
+
+export async function updateProjectAlertDomains(
+  projectId: string,
+  domains: Record<string, { enabled: boolean } | null>,
+): Promise<ProjectAlertDomainsResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/alert-domains`,
+    {
+      method: 'PATCH',
+      body: JSON.stringify({ domains }),
+    },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update alert domains: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update alert domains: ${res.status}`);
+  }
+  return res.json();
 }
 
 /** The closed set of comparison operators a compute success criterion may use.
@@ -289,6 +340,36 @@ export async function rerunComputeExperiment(
     const data = await res.json().catch(() => ({}));
     const msg = (data?.detail as string | undefined) || `Error ${res.status}`;
     throw new Error(msg);
+  }
+  return res.json();
+}
+
+/** Response from POST /compute-jobs/{job_id}/ask — grounded answer to a free-form question. */
+export interface ComputeJobAskResponse {
+  answer: string | null;
+  citations: string[];
+  grounding: { checked: boolean; file_citations: number; grounded: number; unresolved: string[] };
+  grounding_miss: boolean;
+  fallback_reason: string | null;
+}
+
+/**
+ * Ask a free-form question about a terminal compute job, grounded in that run's
+ * durable evidence (metrics, artifacts, logs). POST /api/admin/compute-jobs/{id}/ask.
+ */
+export async function askComputeJob(
+  jobId: string,
+  question: string,
+  history?: Array<{ question: string; answer: string }>,
+): Promise<ComputeJobAskResponse> {
+  const res = await apiFetch(`/api/admin/compute-jobs/${encodeURIComponent(jobId)}/ask`, {
+    method: 'POST',
+    body: JSON.stringify({ question, ...(history && history.length > 0 ? { history } : {}) }),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Error ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Error ${res.status}`);
   }
   return res.json();
 }
@@ -1975,15 +2056,6 @@ export interface AuditReconciliation {
   excluded_findings_count: number;
 }
 
-export interface ThemeDeliveryCert {
-  theme_class?: string | null;
-  assessed_grade?: number | null;
-  net_loc?: number | null;
-  directional_contradiction?: boolean | null;
-  state?: string | null;
-  shortfalls?: Array<{ criterion: string; why: string; evidence?: Record<string, unknown> }> | null;
-}
-
 export interface GoalAlignment {
   assessed_grade?: number | null;
   state?: string | null;  // 'aligned' | 'shortfall' | 'not_applicable'
@@ -2061,10 +2133,13 @@ export interface VersionQualification {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
+  // Whether the smoketest dimension was enabled for this qualification run.
+  // False means the dimension was disabled and the 0.0 sub-score is a
+  // zero-weighted placeholder, not an active lane. Null/absent on legacy records.
+  smoketest_enabled?: boolean | null;
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
-  theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
 }
@@ -2112,8 +2187,31 @@ export interface ManagedCheckWaitSnapshot {
   detail?: string | null;
 }
 
+// The authoritative closed vocabulary of qualification states. This mirrors
+// the backend's summarize_qualification_state (backend/app/release_version.py):
+// every branch there returns exactly one of these state strings. Keeping this
+// union in sync with that producer is what lets TypeScript catch a new backend
+// state that lacks a QUAL_STATE_STYLE entry or a stale literal comparison in
+// the lifecycle panels — the drift that let the 'qualifying' wait-guard
+// regression ship silently.
+export type QualificationStateValue =
+  | 'qualifying'
+  | 'audit_crashed'
+  | 'promotion_check_wait'
+  | 'promotion_in_flight'
+  | 'promotion_failed'
+  | 'required_check_failed'
+  | 'protection_blocked_review'
+  | 'not_promoted'
+  | 'dry_run'
+  | 'promoted'
+  | 'promoted_unconfirmed'
+  | 'promotion_deploy_failed'
+  | 'promotion_confirmation_timed_out'
+  | 'deferred_unsynced';
+
 export interface QualificationState {
-  state: string;
+  state: QualificationStateValue;
   summary: string;
   promotion_pr_number?: number | null;
   promotion_pr_url?: string | null;
@@ -2158,6 +2256,21 @@ export interface ChangelogEntry {
   title: string;
   pr_number: number | null;
   pr_url?: string | null;
+}
+
+export interface CriterionCoverageEntry {
+  criterion_key: string;
+  text: string;
+  coverage: 'covered' | 'partial' | 'uncovered';
+  evidence_count: number;
+}
+
+export interface VersionCriterionCoverage {
+  total: number;
+  covered: number;
+  partial: number;
+  uncovered: number;
+  criteria: CriterionCoverageEntry[];
 }
 
 export interface CurrentVersion {
@@ -2236,9 +2349,8 @@ export interface CurrentVersion {
   tasks_merged_has_more?: boolean;
   /** Acceptance-criteria bucket counts for all merged tasks in this version. */
   acceptance_aggregate?: Record<string, number> | null;
-  /** Delivery theme for this version (e.g. leanness, reliability, performance,
-   *  feature, mixed, none). Null when the thinker has not set one yet. */
-  theme?: string | null;
+  /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
+  criterion_coverage?: VersionCriterionCoverage | null;
 }
 
 export interface RecentVersion {
@@ -2278,6 +2390,8 @@ export interface RecentVersion {
   merged_count?: number | null;
   merged_task_count?: number | null;
   acceptance_aggregate?: Record<string, number> | null;
+  /** Version-scoped criterion coverage derived from the canonical acceptance contract. */
+  criterion_coverage?: VersionCriterionCoverage | null;
 }
 
 export interface PromotionReadinessConfidence {
@@ -2304,6 +2418,9 @@ export interface PromotionReadiness {
   // `deploy_failed_count`, and `resolved_outcome_sample` are populated.
   ground_truth_validated?: boolean;
   caveat?: string;
+  // Acceptance caveat when merged work is satisfied-but-not-machine-proven;
+  // omitted when no caveat (all work proven or no unproven work present).
+  acceptance_caveat?: string | null;
   // The readiness window only measures DRY-RUN-regime verdicts, so it reflects
   // *current* readiness only pre-go-live. Once promotion is effectively enabled
   // the window is frozen pre-go-live history: regime='live', is_current_readiness=false.
@@ -2535,27 +2652,6 @@ export async function setVersionGoal(
   return res.json();
 }
 
-export interface SetVersionThemeResponse {
-  version_number: number;
-  theme: string | null;
-}
-
-export async function setVersionTheme(
-  projectId: string,
-  theme: string | null,
-): Promise<SetVersionThemeResponse> {
-  const res = await apiFetch(`/api/admin/projects/${encodeURIComponent(projectId)}/version-theme`, {
-    method: 'POST',
-    body: JSON.stringify({ theme: theme ?? null }),
-  });
-  if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    const msg = data?.detail || `Failed to set version theme: ${res.status}`;
-    throw new Error(typeof msg === 'string' ? msg : `Failed to set version theme: ${res.status}`);
-  }
-  return res.json();
-}
-
 export interface CutVersionResponse {
   abandoned_version: {
     version_number: number;
@@ -2628,6 +2724,43 @@ export async function clearDeployFailed(
   return data;
 }
 
+export interface CreateCriterionResponse {
+  criterion_key: string;
+  text: string;
+  release_version_id: string;
+}
+
+export async function createAcceptanceCriterion(
+  projectId: string,
+  text: string,
+): Promise<CreateCriterionResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria`,
+    { method: 'POST', body: JSON.stringify({ text }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to create criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
+export async function deleteAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+): Promise<void> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}`,
+    { method: 'DELETE' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const detail = data?.detail || `Failed to delete criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'
@@ -2675,6 +2808,10 @@ export interface QualificationVerdictRecord {
   migration_apply_safety_detail?: string | null;
   test_erosion_detail?: Record<string, unknown> | null;
   smoketest_detail?: Record<string, unknown> | null;
+  // Whether the smoketest dimension was enabled for this qualification run.
+  // False means the 0.0 sub-score is a zero-weighted placeholder, not an
+  // active lane. Null/absent on legacy verdict rows that predate this field.
+  smoketest_enabled?: boolean | null;
   audit_reconciliation?: AuditReconciliation | null;
   would_promote: boolean | null;
   promotion_enabled: boolean | null;
@@ -2690,7 +2827,6 @@ export interface QualificationVerdictRecord {
   promotion_pr_url?: string | null;
   promotion_conflict?: boolean | null;
   promotion_error_detail?: string | null;
-  theme_delivery?: ThemeDeliveryCert | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
 }
@@ -3153,6 +3289,7 @@ export interface ComputeJob {
     met: boolean;
     measurable: boolean;
     binding_status?: string | null;
+    per_arm?: Record<string, number | null>;
   } | null;
   // Durable KnowledgeDocument auto-persisted on task completion for all
   // measured terminal jobs. Surfaced from task.plan_output.knowledge_document.id.
@@ -3162,6 +3299,14 @@ export interface ComputeJob {
   experiment?: string | null;
   benchmark?: string | null;
   hypothesis?: string | null;
+  // Per-arm criterion verdicts with apportioned costs; present when the task
+  // recorded per-arm evaluation (multi-arm experiments with a success criterion).
+  // Keyed by arm name. Absent on legacy rows or single-arm jobs.
+  per_arm_verdicts?: Record<string, {
+    value: number | null;
+    met: boolean | null;
+    cost_usd: number | null;
+  }> | null;
 }
 
 export interface ComputeJobsSummary {
@@ -3287,7 +3432,10 @@ export interface ComputeSweepKnowledgeEntry {
   id: string;
   title: string;
   summary?: string | null;
-  acceptance_grade?: string | null;
+  compute_acceptance_grade?: 'acceptance' | 'measured_only' | null;
+  criterion_met?: boolean | null;
+  criterion?: ComputeSuccessCriterion | null;
+  per_arm_verdicts?: Record<string, { value: number | null; met: boolean | null; cost_usd: number | null }> | null;
   arm_label?: string | null;
   created_at?: string | null;
   source_kind?: string | null;
@@ -3608,6 +3756,9 @@ export interface KnowledgeDocument {
   sweep_id?: string | null;
   /** Arm label within a sweep (e.g. 'baseline', 'variant'). Null for the aggregate sweep doc. */
   arm_label?: string | null;
+  /** Criterion verdict (True/False/None) from the success criterion evaluation for compute_experiment
+   *  documents. None = unmeasured/not evaluable. Distinct from compute_acceptance_grade. */
+  criterion_met?: boolean | null;
   /** Only present on get-by-id (the full markdown body). */
   body?: string;
 }
@@ -4062,17 +4213,63 @@ export interface FleetRunner {
     max_concurrent?: number;
     // Task ids the runner reported as currently executing in its last heartbeat.
     active_task_ids?: string[];
+    active_compute_job_ids?: string[];
+    runner_preset?: string;
+    workload?: string;
+    gpu_count?: number;
+    gpu_names?: string[];
+    // Display-only trust telemetry stashed on capabilities at heartbeat.
+    disk_free_bytes?: number;
+    gpu_utilization_pct?: number;
     [key: string]: unknown;
+  };
+  health?: {
+    device_status?: 'connected' | 'degraded' | 'stale' | 'offline' | string;
+    device_status_reason?: string | null;
+    is_live: boolean;
+    // "connected but failing": live (recent heartbeat) but its jobs are failing.
+    degraded?: boolean;
+    degraded_reason?: 'job_failure_streak' | 'success_stale' | string | null;
+    seconds_since_last_seen: number | null;
+    active_task_count: number;
+    active_compute_job_count?: number;
+    active_work_count?: number;
+    max_concurrent: number | null;
+    available_slots: number | null;
+    stale_reason: string | null;
+    agent_available?: boolean | null;
+    liveness_window_seconds: number;
+    // Trust telemetry surfaced from the backend health computation.
+    last_successful_job_at?: string | null;
+    seconds_since_last_success?: number | null;
+    consecutive_job_failures?: number;
+    disk_free_bytes?: number | null;
+    disk_low?: boolean;
+    gpu_utilization_pct?: number | null;
+    failure_streak_threshold?: number;
   };
   last_seen_at: string | null;
   created_at: string | null;
 }
 
 /** Register a new fleet runner for a project. Returns the one-time token. */
+export interface FleetRunnerRegistrationResult {
+  runner_id: string;
+  token: string;
+  token_expires_at?: string | null;
+  expires_at?: string | null;
+  expiresAt?: string | null;
+}
+
 export async function registerFleetRunner(
   projectId: string,
-  opts: { hostname?: string; version?: string; capabilities?: Record<string, unknown> } = {},
-): Promise<{ runner_id: string; token: string }> {
+  opts: {
+    hostname?: string;
+    version?: string;
+    capabilities?: Record<string, unknown>;
+    preset?: 'default' | 'strategic_local';
+  } = {},
+): Promise<FleetRunnerRegistrationResult> {
   const res = await apiFetch(
     `/api/admin/projects/${encodeURIComponent(projectId)}/runners/register`,
     { method: 'POST', body: JSON.stringify(opts) },

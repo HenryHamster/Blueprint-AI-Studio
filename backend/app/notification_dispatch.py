@@ -38,8 +38,8 @@ from app.models import (
 
 logger = logging.getLogger(__name__)
 
-# Module-level throttle tracking: event_type -> last dispatch monotonic time (seconds)
-_last_dispatch_time: dict[str, float] = {}
+# Module-level throttle tracking: (project_id, event_type) -> last dispatch monotonic time (seconds)
+_last_dispatch_time: dict[tuple[str, str], float] = {}
 
 # Delivery stats — module-level counters
 total_dispatched: int = 0
@@ -408,13 +408,14 @@ async def dispatch_external_notification(
             logger.warning(f"[NOTIFY] Rejecting internal webhook URL host: {_host}")
             return
 
-        # Per-event throttle: drop if last dispatch was too recent
+        # Per-project/event throttle: one noisy project must not suppress another.
         now = time.monotonic()
-        last = _last_dispatch_time.get(event_type, 0.0)
+        throttle_key = (str(project_id), event_type)
+        last = _last_dispatch_time.get(throttle_key, 0.0)
         if throttle_seconds > 0 and (now - last) < throttle_seconds:
             return
 
-        _last_dispatch_time[event_type] = now
+        _last_dispatch_time[throttle_key] = now
 
         # Drain any due retries before making the new request
         await _drain_retry_queue(webhook_url)
@@ -1456,6 +1457,57 @@ async def post_residual_fix_unsuspend_message(
                 "fingerprint": fingerprint,
                 "recovered_at": recovered_at,
                 "manual_intervention_required": False,
+                "summary": summary,
+            },
+        )
+    )
+    return msg
+
+
+async def post_residual_fix_auto_recovered_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    fingerprint: str,
+    recovery_attempts: int,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a NOTE-severity message when a suspended residual fingerprint
+    auto-recovers after its exponential-backoff cooldown elapses.
+
+    Paired with the BLOCKER escalation message so the message stream shows
+    suspend → auto-recover as a matched pair. Fires RESIDUAL_FIX_UNSUSPENDED
+    external webhook (same event type as manual unsuspend, different context).
+    """
+    recovered_at = datetime.now(timezone.utc).isoformat()
+    summary = (
+        f"Residual auto-fix re-enabled for fingerprint {fingerprint[:32]}. "
+        f"Case auto-recovered after cooldown (attempt {recovery_attempts}). "
+        f"Spawn will resume."
+    )
+    msg = await post_event_message(
+        session,
+        project_id,
+        event_type="residual_fix_unsuspended",
+        summary=summary,
+        context={
+            "fingerprint": fingerprint,
+            "recovered_at": recovered_at,
+            "manual_intervention_required": False,
+            "auto_recovered": True,
+            "recovery_attempts": recovery_attempts,
+        },
+        task_id=task_id,
+    )
+    asyncio.ensure_future(
+        dispatch_external_notification(
+            project_id,
+            "RESIDUAL_FIX_UNSUSPENDED",
+            {
+                "fingerprint": fingerprint,
+                "recovered_at": recovered_at,
+                "manual_intervention_required": False,
+                "auto_recovered": True,
+                "recovery_attempts": recovery_attempts,
                 "summary": summary,
             },
         )

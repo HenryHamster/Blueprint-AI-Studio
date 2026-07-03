@@ -78,8 +78,8 @@ describe('buildContextPrefix', () => {
         // compute_experiment_sweeps is a dict {sweepId: [_knowledge_index_entry, ...]}
         compute_experiment_sweeps: {
           'sw-abcd1234': [
-            { id: 'kd-aaa', title: 'arm baseline', arm_label: 'baseline', compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.88' },
-            { id: 'kd-bbb', title: 'arm treatment', arm_label: 'treatment', compute_acceptance_grade: 'acceptance', summary: 'accuracy 0.93' },
+            { id: 'kd-aaa', title: 'arm baseline', arm_label: 'baseline', criterion_met: false, compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.88' },
+            { id: 'kd-bbb', title: 'arm treatment', arm_label: 'treatment', criterion_met: true, compute_acceptance_grade: 'measured_only', summary: 'accuracy 0.93' },
           ],
         },
       }],
@@ -193,6 +193,32 @@ describe('buildContextPrefix', () => {
     expect(prefix).not.toContain('[acceptance]');
     expect(prefix).not.toContain('[measured_only');
     expect(prefix).not.toContain('[analysis_unavailable');
+  });
+
+  it('flat knowledge index renders criterion NOT MET for a failing standalone compute_experiment distinct from its trustworthiness grade', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        knowledge_index: [
+          {
+            id: 'kd-compute-failing',
+            title: 'Failed accuracy benchmark',
+            summary: 'Accuracy 0.85 < 0.9 threshold — criterion not met.',
+            topic: 'compute',
+            source_kind: 'compute_experiment',
+            criterion_met: false,
+            compute_acceptance_grade: 'measured_only',
+            compute_acceptance_reason: 'analysis_mode_not_llm',
+          },
+        ],
+      }],
+    });
+
+    expect(prefix).toContain('[kd-compute-failing] Failed accuracy benchmark');
+    expect(prefix).toContain('[NOT MET]');
+    expect(prefix).toContain('[measured_only: analysis_mode_not_llm]');
+    expect(prefix).not.toContain('[acceptance]');
+    expect(prefix).toContain('Accuracy 0.85 < 0.9 threshold');
   });
 
   it('renders the acceptance-evidence section when context.acceptance_evidence is present', () => {
@@ -608,7 +634,8 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               title: 'Arm A: baseline',
               summary: 'Baseline result summary.',
               arm_label: 'baseline',
-              compute_acceptance_grade: 'acceptance',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
               source_kind: 'compute_experiment',
             },
             {
@@ -616,6 +643,7 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
               title: 'Arm B: optimized',
               summary: 'Optimized result summary.',
               arm_label: 'optimized',
+              criterion_met: false,
               compute_acceptance_grade: 'measured_only',
               source_kind: 'compute_experiment',
             },
@@ -634,6 +662,68 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).toContain('[NOT MET]');
     expect(prefix).toContain('[kd-arm-2]');
     expect(prefix).toContain('./fetch knowledge <id>');
+  });
+
+  it('renders UNMEASURED when criterion_met is null/undefined', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-null': [
+            {
+              id: 'kd-arm-x',
+              title: 'Arm X: unmeasured',
+              summary: 'Metric not captured.',
+              arm_label: 'unmeasured',
+              criterion_met: null,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+            {
+              id: 'kd-arm-y',
+              title: 'Arm Y: met',
+              arm_label: 'met',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('[UNMEASURED]');
+    expect(prefix).toContain('[MET]');
+    expect(prefix).not.toContain('[NOT MET]');
+  });
+
+  it('criterion_met=true renders MET even when grade is measured_only (not acceptance)', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-det': [
+            {
+              id: 'kd-det-1',
+              title: 'Deterministic met arm',
+              arm_label: 'det',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+            {
+              id: 'kd-det-2',
+              title: 'Deterministic not-met arm',
+              arm_label: 'det2',
+              criterion_met: false,
+              compute_acceptance_grade: 'measured_only',
+              source_kind: 'compute_experiment',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('[MET]');
+    expect(prefix).toContain('[NOT MET]');
   });
 
   it('shows unavailable verdict when unavailable_cause is set', () => {
@@ -661,6 +751,34 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).not.toContain('[NOT MET]');
   });
 
+  it('omits sweeps that already have a disposition task in flight', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'strategic_review',
+        compute_experiment_sweeps: {
+          'sweep-disposed': [
+            {
+              id: 'kd-disposed-1',
+              title: 'Disposed arm A',
+              arm_label: 'a',
+              criterion_met: true,
+              sweep_disposition: { task_id: 'task-1', status: 'running' },
+            },
+            {
+              id: 'kd-disposed-2',
+              title: 'Disposed arm B',
+              arm_label: 'b',
+              criterion_met: false,
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).not.toContain('## Completed experiment sweeps');
+    expect(prefix).not.toContain('sweep-disposed');
+    expect(prefix).not.toContain('Disposed arm A');
+  });
+
   it('omits sweep section when compute_experiment_sweeps is absent', () => {
     const prefix = buildContextPrefix({
       payloads: [{ type: 'strategic_review', knowledge_index: [] }],
@@ -668,10 +786,31 @@ describe('buildContextPrefix — compute experiment sweeps', () => {
     expect(prefix).not.toContain('## Completed experiment sweeps');
   });
 
-  it('omits sweep section when taskType is not strategic_review', () => {
+  it('renders sweep section for research tasks when sweeps are present', () => {
     const prefix = buildContextPrefix({
       payloads: [{
         type: 'research',
+        compute_experiment_sweeps: {
+          'sweep-abc': [
+            {
+              id: 'kd-arm-1',
+              title: 'Some arm',
+              arm_label: 'a',
+              criterion_met: true,
+              compute_acceptance_grade: 'measured_only',
+            },
+          ],
+        },
+      }],
+    });
+    expect(prefix).toContain('## Completed experiment sweeps');
+    expect(prefix).toContain('sweep-abc');
+  });
+
+  it('omits sweep section when taskType is not research/strategic_review/design_doc_update', () => {
+    const prefix = buildContextPrefix({
+      payloads: [{
+        type: 'create',
         compute_experiment_sweeps: {
           'sweep-abc': [
             {

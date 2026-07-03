@@ -190,9 +190,46 @@ const STATUS_GROUPS: Array<{ key: 'proposed' | 'active' | 'staged' | 'paused' | 
 
 const priorityOrder: Record<string, number> = { high: 0, medium: 1, low: 2 };
 
-export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onNavigateToTask, selectedProjectId, projects = [], fetchDirectionsRef, strategistActive, cycleProgress, lastCycleCompletion }: { addToast: (message: string, type: 'success' | 'error' | 'info') => void; onViewFindings?: (directionId: string) => void; onViewKnowledge?: (directionId: string) => void; onNavigateToTask?: (taskId: string) => void; selectedProjectId: string | null; projects?: Project[]; fetchDirectionsRef?: React.MutableRefObject<() => void>; strategistActive?: boolean; cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null; lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null }) {
+export function DirectionsPanel({
+  addToast,
+  onViewFindings,
+  onViewKnowledge,
+  onNavigateToTask,
+  selectedProjectId,
+  projects = [],
+  fetchDirectionsRef,
+  strategistActive,
+  cycleProgress,
+  lastCycleCompletion,
+  activeTab: controlledActiveTab,
+  onActiveTabChange,
+  showHeaderTitle = true,
+  showCycleControls = true,
+  showInternalTabs = true,
+}: {
+  addToast: (message: string, type: 'success' | 'error' | 'info') => void;
+  onViewFindings?: (directionId: string) => void;
+  onViewKnowledge?: (directionId: string) => void;
+  onNavigateToTask?: (taskId: string) => void;
+  selectedProjectId: string | null;
+  projects?: Project[];
+  fetchDirectionsRef?: React.MutableRefObject<() => void>;
+  strategistActive?: boolean;
+  cycleProgress?: import('../hooks/useLogViewer').StrategicCycleProgress | null;
+  lastCycleCompletion?: import('../hooks/useLogViewer').StrategicCycleCompletion | null;
+  activeTab?: DirectionsTab;
+  onActiveTabChange?: (tab: DirectionsTab) => void;
+  showHeaderTitle?: boolean;
+  showCycleControls?: boolean;
+  showInternalTabs?: boolean;
+}) {
   // Active tab
-  const [activeTab, setActiveTab] = useState<DirectionsTab>('directions');
+  const [uncontrolledActiveTab, setUncontrolledActiveTab] = useState<DirectionsTab>('directions');
+  const activeTab = controlledActiveTab ?? uncontrolledActiveTab;
+  const setActiveTab = (tab: DirectionsTab) => {
+    if (controlledActiveTab === undefined) setUncontrolledActiveTab(tab);
+    onActiveTabChange?.(tab);
+  };
 
   // Collapsible sections — expired collapsed by default, others expanded
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({ expired: true });
@@ -236,16 +273,7 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
   const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
 
   return (
-      // Opt out of the 375px viewport overflow/truncation regression checks: the
-      // dense tab row + project select in DirectionsPanelHeader exceed mobile width
-      // by a few px under CI's Linux Chromium font fallback (passes locally). This
-      // is a desktop-only operator panel; a proper responsive fix is tracked
-      // separately.
-      <div
-        className="flex-1 overflow-hidden flex flex-col bg-neutral-950"
-        data-viewport-allow-overflow
-        data-viewport-allow-truncation
-      >
+      <div className="flex-1 overflow-hidden flex flex-col bg-neutral-950">
         <DirectionsPanelHeader
           selectedProjectId={selectedProjectId}
           projects={projects}
@@ -257,6 +285,9 @@ export function DirectionsPanel({ addToast, onViewFindings, onViewKnowledge, onN
           designDoc={data.designDoc}
           runningUpdate={data.runningUpdate}
           triggerCycle={data.triggerCycle}
+          showTitle={showHeaderTitle}
+          showCycleControls={showCycleControls}
+          showTabs={showInternalTabs}
         />
         {strategistActive && (
           <div className="px-5 py-2 border-b border-neutral-800 bg-indigo-950/40 flex items-start gap-2 shrink-0" role="status" aria-live="polite">

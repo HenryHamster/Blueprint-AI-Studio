@@ -26,7 +26,8 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.models import StrategicCycle
+from app.models import StrategicCycle, Task
+from app.strategic_runtime_work import task_is_strategic_local_runner_hold
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,7 @@ async def mark_phase1_completed(
 ) -> Optional[StrategicCycle]:
     """Phase 1 task reached a terminal status. If phase 2 is being spawned,
     pass its task id; this also flips outcome to phase2_running."""
+    await session.flush()
     cycle = await get(session, cycle_id)
     if cycle is None:
         return None
@@ -712,10 +714,18 @@ async def find_stalled(
                 and c.phase1_started_at < phase1_cutoff
                 and c.phase2_started_at is None
             ):
+                if c.phase1_task_id is not None:
+                    linked_task = await session.get(Task, c.phase1_task_id)
+                    if task_is_strategic_local_runner_hold(linked_task):
+                        continue
                 stalled.append(c)
         elif c.outcome == OUTCOME_PHASE2_RUNNING:
             ref = c.phase2_started_at or c.phase1_started_at
             if ref and ref < phase2_cutoff:
+                if c.phase2_task_id is not None:
+                    linked_task = await session.get(Task, c.phase2_task_id)
+                    if task_is_strategic_local_runner_hold(linked_task):
+                        continue
                 stalled.append(c)
         if len(stalled) >= limit:
             break

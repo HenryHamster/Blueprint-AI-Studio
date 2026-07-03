@@ -748,6 +748,8 @@ esac
       }
       if (scenario === 'harness') {
         realFs.mkdirSync(realPath.join(dir, 'scripts'), { recursive: true });
+        // Harness shim: does NOT advertise --standalone so the memory-based
+        // routing branch is exercised (BLUEPRINT_MEM_AVAIL_MB overrides /proc/meminfo).
         realFs.writeFileSync(realPath.join(dir, 'scripts', 'test-backend.sh'), '#!/bin/sh\necho harness-ran "$@" >> "$LOGFILE"\nexit 0\n', { mode: 0o755 });
         realFs.writeFileSync(realPath.join(bin, 'docker'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
       }
@@ -765,6 +767,9 @@ esac
             WORKSPACE: posix(dir),
             LOGFILE: posix(logfile),
             HOME: process.env.HOME ?? '',
+            // Inject synthetic memory so the harness routing branch fires
+            // deterministically on any VM (overrides /proc/meminfo reading).
+            ...(scenario === 'harness' ? { BLUEPRINT_MEM_AVAIL_MB: '8192' } : {}),
           },
           encoding: 'utf8',
           stdio: ['ignore', 'pipe', 'pipe'],

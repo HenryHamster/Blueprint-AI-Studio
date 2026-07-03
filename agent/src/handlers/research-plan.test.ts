@@ -1,5 +1,160 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
+const {
+  INDEX_EXPORT_NAMES,
+  WORKSPACE_PREP_EXPORT_NAMES,
+} = vi.hoisted(() => ({
+  INDEX_EXPORT_NAMES: [
+    'AUTH_MODE',
+    'AuthFailureError',
+    'ClaudeTimeoutError',
+    'GIT_REFERENCE_CACHE_ROOT',
+    'GracefulShutdownSignal',
+    'LLM_CLI_TRANSLATION',
+    'LLM_EXECUTION_MODE',
+    'MATERIALIZE_SCRIPT_PATH',
+    'NoProgressTimeoutError',
+    'PROVIDER',
+    'RateLimitError',
+    'TASK_BRANCH_NAMESPACE_DEFAULT',
+    'TASK_TYPE_BRANCH_PREFIX',
+    'VmConfigMissingError',
+    'WORKSPACE',
+    '__resetTaskCapabilityContractLoadedForTesting',
+    '__setRunClaudeCodeOverrideForSmoke',
+    '__setWarmRetargetDepsForTesting',
+    '_buildHeartbeatStatusForTesting',
+    '_captureBootCredentialSnapshotForTesting',
+    '_captureBootProviderConfigPresenceForTesting',
+    '_consumePendingParkDirectiveForTesting',
+    '_crashReportForTesting',
+    '_getActiveCredentialStateSourceForTesting',
+    '_getCrashReportTaskIdForTesting',
+    '_getFirstToolUseAtForTesting',
+    '_getHandlerDurationForTesting',
+    '_getJobModeForTesting',
+    '_getRoleClaimTimestampForTesting',
+    '_getWarmStartForTesting',
+    '_isCancelRequestedForTesting',
+    '_materializeClaimCredentialStateForTesting',
+    '_resetCancelRequestedForTesting',
+    '_resetCredentialStateForTesting',
+    '_resetTelemetryForTesting',
+    '_setAgentRuntimeFingerprintForTesting',
+    '_setAgentSourceShaForTesting',
+    '_setAgentTokenForTesting',
+    '_setCancelRequestedForTesting',
+    '_setHandlerDurationForTesting',
+    '_setInWarmPollWindowForTesting',
+    '_setJobModeForTesting',
+    '_setRoleClaimTimestampForTesting',
+    '_setWarmStartForTesting',
+    '_startHeartbeatForTesting',
+    '_stopHeartbeatForTesting',
+    'apiGet',
+    'apiPost',
+    'apiRequest',
+    'appendToLogBuffer',
+    'bootstrapPoolMode',
+    'buildTargetedPytestRunners',
+    'captureTestBaseline',
+    'clearLastProviderRunErrorReport',
+    'clearLogBuffer',
+    'clearToolTrace',
+    'cloneWithRetry',
+    'codexStreamHasTurnCompleted',
+    'collectFixLoopEventsForFlush',
+    'computePromptFingerprint',
+    'computeRefreshDelayMs',
+    'condensedAnalysisSections',
+    'continueWarmContinuation',
+    'createStaleResultEnvelope',
+    'deriveTaskBranch',
+    'detectLoopDivergence',
+    'detectTestRunners',
+    'ensureTaskCapabilityContractLoaded',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'execFileAsync',
+    'extractInvestigatedFiles',
+    'extractPytestSelectorsFromOutput',
+    'fetchTaskCapabilityContract',
+    'fetchVmImageIdentity',
+    'getAgentToken',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLastProviderRunErrorReport',
+    'getLlmTelemetry',
+    'getProviderRunner',
+    'git',
+    'gitAsync',
+    'isBootstrapToken',
+    'isTaskNoLongerActiveError',
+    'listOpenPullRequestsForBranch',
+    'log',
+    'main',
+    'markStaleResultFailure',
+    'matchesAuthFailure',
+    'matchesRateLimit',
+    'matchesVmConfigMissing',
+    'missingProviderConfigFiles',
+    'missingVmProviderConfigFiles',
+    'normalizePytestSelectorForRunner',
+    'parseFailingTests',
+    'parseFailingTestsFromVitestJson',
+    'parseLLMCliTranslation',
+    'parseStaleResultFile',
+    'performWarmRetarget',
+    'persistAndPostStatus',
+    'pollForNextRole',
+    'postTerminalStatusSync',
+    'providerSupportsNativeSubagents',
+    'pushAndCreatePR',
+    'readAgentRuntimeFingerprint',
+    'readAgentSourceSha',
+    'readHandlerOutput',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairSuccess',
+    'recordInitialOAuthAuthHash',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordToolUse',
+    'refreshRuntimeState',
+    'registerSizeCapMergeDriver',
+    'replayLogBufferRateLimited',
+    'requiredProviderConfigFiles',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'resetPerRoleModuleState',
+    'resolveBaseBranch',
+    'resolveCredentialsFromSecretVersion',
+    'resolveTaskBranchNamespace',
+    'rotateOAuthCredentialsIfChanged',
+    'runClaudeCode',
+    'runProviderAgent',
+    'sanitize',
+    'sanitizeError',
+    'sendHeartbeatSync',
+    'sendLog',
+    'setCurrentPromptFingerprint',
+    'setupWorkspace',
+    'shouldAbandonStaleResult',
+    'snapshotLogBuffer',
+    'snapshotToolTrace',
+    'staleResultBackoffMs',
+    'strVal',
+    'testFixLoop',
+    'validateBranchName',
+  ],
+  WORKSPACE_PREP_EXPORT_NAMES: [
+    'getLastWorkspacePrepOutcome',
+    'prepareWorkspaceForRole',
+    'resetWorkspacePrepOutcome',
+    'resolveReferenceRepo',
+  ],
+}));
+
 vi.mock('fs', () => ({
   default: {
     readFileSync: vi.fn().mockReturnValue(''),
@@ -10,6 +165,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   sendLog: vi.fn(),
   runClaudeCode: vi.fn().mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' }),
@@ -35,6 +191,7 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('child_process', () => ({
+  execFile: vi.fn(),
   // Route `git rev-parse` (HEAD and origin/<branch>) to a single stable sha so
   // verifyCloneDelivered sees a resolvable HEAD that matches its remote tracking
   // ref; every other git call returns empty output, which the handlers tolerate
@@ -47,6 +204,7 @@ vi.mock('child_process', () => ({
 }));
 
 vi.mock('../workspacePrep.js', () => ({
+  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
@@ -78,8 +236,10 @@ vi.mock('../prompt.js', async (importOriginal) => {
 });
 
 import fs from 'fs';
+import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
 import { execFileSync } from 'child_process';
+import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper } from '../prompt.js';
@@ -109,6 +269,24 @@ import {
   CAPABILITY_DECLARATION_DOC,
   normalizePlanSubtaskTypes,
 } from './research-plan.js';
+
+async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
+  const actual = await vi.importActual<Record<string, unknown>>(moduleId);
+  const mockedKeys = new Set(Object.keys(mockedModule));
+  for (const exportName of Object.keys(actual).filter((name) => name !== 'default')) {
+    expect(
+      mockedKeys.has(exportName),
+      `Mock for ${moduleId} is missing export ${exportName} -- add it to the factory.`,
+    ).toBe(true);
+  }
+}
+
+describe('mock factory completeness', () => {
+  it('covers every real named export for local full-replacement mocks', async () => {
+    await expectMockCoversActualNamedExports('../index.js', mockedIndexModule);
+    await expectMockCoversActualNamedExports('../workspacePrep.js', mockedWorkspacePrepModule);
+  });
+});
 
 describe('calcMessageAge', () => {
   beforeEach(() => {
@@ -1039,6 +1217,44 @@ describe('buildPortfolioComposition', () => {
     expect(out).not.toContain('may under-count');
     expect(out).not.toContain('coverage gaps not shown');
   });
+
+  // portfolio_composition_does_not_emit_definitive_ratio_warning_from_trimmed_subset
+  it('suppresses definitive LOW PRODUCT RATIO when list is trimmed (shipped < authoritativeTotal)', () => {
+    // 1 product of 2 shipped, authoritative total is 8 — many directions trimmed.
+    // The full portfolio might have many more product directions, so the definitive
+    // warning must not fire.
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 8);
+    expect(out).not.toContain('[LOW PRODUCT RATIO — <30%]');
+  });
+
+  it('shows tempered advisory instead of definitive warning when list is trimmed', () => {
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 8);
+    // productPct = 1/8 = 13%, which is <30%, but the list is trimmed —
+    // expect the softer advisory that names the caveat.
+    expect(out).toContain('LOW PRODUCT RATIO IN SHOWN SUBSET');
+    expect(out).toContain('omitted directions may alter the full mix');
+  });
+
+  it('still fires definitive LOW PRODUCT RATIO when list is complete (shipped === authoritativeTotal)', () => {
+    // 1 product of 4 shipped, authoritative total is also 4 — no trimming.
+    const dirs = [
+      { id: 'd-1', category: 'product', total_cycles: 1 },
+      { id: 'd-2', category: 'structural', total_cycles: 1 },
+      { id: 'd-3', category: 'structural', total_cycles: 1 },
+      { id: 'd-4', category: 'structural', total_cycles: 1 },
+    ];
+    const out = buildPortfolioComposition(dirs, [], undefined, 4);
+    expect(out).toContain('[LOW PRODUCT RATIO — <30%]');
+    expect(out).not.toContain('SHOWN SUBSET');
+  });
 });
 
 describe('buildEmptyRepoGuidance', () => {
@@ -1633,6 +1849,34 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
   });
 
+  it('renders qualification_state as the authoritative status when raw last_qualification.status is pending', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'pending', candidate_sha: 'deadbeefcafe0000' },
+      qualification_state: { state: 'promotion_check_wait' },
+    });
+    expect(result).toContain('status=promotion_check_wait');
+    expect(result).not.toContain('Last qualification: status=pending');
+    expect(result).not.toContain('currently **PENDING**');
+  });
+
+  it('renders qualifying state as pending wait-guard', () => {
+    // Wait-guard regression: when the raw last_qualification.status is 'pending'
+    // but the derived qualification_state.state is 'qualifying' (the audit is
+    // actively running), the agent must still see the PENDING wait-guard so it
+    // does NOT re-emit qualify_request while a run is in flight.
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'pending', candidate_sha: 'deadbeefcafe0000' },
+      qualification_state: { state: 'qualifying' },
+    });
+    expect(result).toContain('status=qualifying');
+    expect(result).toContain('currently **PENDING**');
+    expect(result).toMatch(/do NOT emit `?qualify_request`?/i);
+  });
+
   it('omits the pending warning when last_qualification is finalized (not pending)', () => {
     const result = buildVersionPhaseSection({
       version_number: 4,
@@ -1755,33 +1999,14 @@ describe('buildVersionPhaseSection', () => {
     expect(blank).not.toContain('Goal:');
   });
 
-  it('renders the version theme when present', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 4,
-      phase: 'build',
-      theme: 'reliability',
-    });
-    expect(result).toContain('Theme: reliability');
-  });
-
-  it('omits the Theme line when theme is absent or blank', () => {
-    const absent = buildVersionPhaseSection({ version_number: 4, phase: 'build' });
-    expect(absent).not.toContain('Theme:');
-    const blank = buildVersionPhaseSection({ version_number: 4, phase: 'build', theme: '   ' });
-    expect(blank).not.toContain('Theme:');
-  });
-
-  it('does not encourage re-authoring goal or theme when both are already set', () => {
+  it('does not encourage re-authoring goal when it is already set', () => {
     const result = buildVersionPhaseSection({
       version_number: 21,
       phase: 'build',
       goal: 'Make lifecycle context recovery reliable after promotion.',
-      theme: 'reliability',
     });
     expect(result).toContain('Goal: Make lifecycle context recovery reliable after promotion.');
-    expect(result).toContain('Theme: reliability');
     expect(result).not.toContain('ACTION NEEDED: Author the version goal');
-    expect(result).not.toContain('ACTION NEEDED: Author the version theme');
   });
 
   it('emits explicit author-the-goal instruction when goal_needed flag is true', () => {
@@ -1793,17 +2018,6 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('ACTION NEEDED: Author the version goal');
     expect(result).toContain('new_version_goal');
     expect(result).not.toContain('Goal:');
-  });
-
-  it('emits explicit author-the-theme instruction when theme_needed flag is true', () => {
-    const result = buildVersionPhaseSection({
-      version_number: 2,
-      phase: 'build',
-      theme_needed: true,
-    });
-    expect(result).toContain('ACTION NEEDED: Author the version theme');
-    expect(result).toContain('new_version_theme');
-    expect(result).not.toContain('Theme:');
   });
 
   it('instructs agent to emit version_phase_decision when flipping', () => {
@@ -1946,6 +2160,249 @@ describe('buildVersionPhaseSection', () => {
     expect(result).toContain('never let the phase sit idle');
     // Explicitly does not advocate rushing.
     expect(result).toContain('Do NOT rush to qualify');
+  });
+
+  it('renders criterion coverage counts and uncovered/partial criteria as the canonical acceptance contract', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 7,
+        covered: 3,
+        partial: 2,
+        uncovered: 2,
+        criteria: [
+          {
+            criterion_key: 'AC-1',
+            text: 'Release qualifier consumes per-criterion evidence.',
+            coverage: 'covered',
+            evidence_count: 4,
+          },
+          {
+            criterion_key: 'AC-2',
+            text: 'Strategist can see uncovered acceptance criteria.',
+            coverage: 'partial',
+            evidence_count: 1,
+          },
+          {
+            criterion_key: 'AC-3',
+            text: 'Qualification blocks on missing canonical evidence.',
+            coverage: 'uncovered',
+            evidence_count: 0,
+          },
+        ],
+      },
+    });
+
+    expect(result).toContain('Acceptance criteria coverage (canonical): 3/7 covered, 2 partial, 2 uncovered');
+    expect(result).toContain('Canonical release-readiness path: close uncovered and partial acceptance criteria with evidence');
+    expect(result).toContain('Acceptance criteria needing evidence:');
+    expect(result).toContain('AC-2: partial, evidence=1 — Strategist can see uncovered acceptance criteria.');
+    expect(result).toContain('AC-3: uncovered, evidence=0 — Qualification blocks on missing canonical evidence.');
+    expect(result).not.toContain('AC-1: covered');
+  });
+
+  it('renders counts-only criterion coverage without requiring a criteria list', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 4,
+        covered: 1,
+        partial: 1,
+        uncovered: 2,
+      },
+    });
+
+    expect(result).toContain('Acceptance criteria coverage (canonical): 1/4 covered, 1 partial, 2 uncovered');
+    expect(result).not.toContain('Acceptance criteria needing evidence:');
+  });
+
+  it('omits absent, zero-total, and malformed criterion coverage without crashing', () => {
+    const absent = buildVersionPhaseSection({ version_number: 5, phase: 'build' });
+    const zeroTotal = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 0,
+        covered: 0,
+        partial: 0,
+        uncovered: 0,
+      },
+    });
+    const malformed = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 3,
+        covered: '1',
+        partial: 1,
+        uncovered: 1,
+      },
+    });
+
+    expect(absent).not.toContain('Acceptance criteria coverage');
+    expect(zeroTotal).not.toContain('Acceptance criteria coverage');
+    expect(malformed).not.toContain('Acceptance criteria coverage');
+  });
+
+  it('renders criterion coverage before legacy drift and goal-alignment signals', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+      },
+      goal_coverage_drift: {
+        signal: 'drifting',
+        coverage: 0.45,
+      },
+      last_qualification: {
+        status: 'not_promoted',
+        goal_alignment: {
+          status: 'partial',
+        },
+      },
+    });
+
+    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Goal-coverage drift'));
+    expect(result.indexOf('Acceptance criteria coverage (canonical)')).toBeLessThan(result.indexOf('Legacy heuristic - Last qualification goal alignment'));
+  });
+
+  it('renders a drifting goal_coverage_drift signal with emphasis and biggest_gap', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      goal_coverage_drift: {
+        signal: 'drifting',
+        coverage: 0.45,
+        biggest_gap: 'feature Y not covered',
+        merges_since_grade: 3,
+        stale: true,
+        detail: 'Accumulated work deviates from frozen goal',
+      },
+    });
+    expect(result).toContain('drifting');
+    expect(result).toContain('biggest_gap=feature Y not covered');
+    expect(result).toContain('merges_since_grade=3');
+    expect(result).toContain('stale=true');
+    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
+    expect(result).toContain('course-correct or propose a goal amendment');
+    expect(result).toContain('Drift detail: Accumulated work deviates from frozen goal');
+  });
+
+  it('renders an on_track goal_coverage_drift signal without drifting emphasis', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'build',
+      goal_coverage_drift: {
+        signal: 'on_track',
+        coverage: 0.85,
+        biggest_gap: 'minor gap A',
+        merges_since_grade: 1,
+        stale: false,
+      },
+    });
+    expect(result).toContain('Goal-coverage drift: signal=on_track');
+    expect(result).toContain('Legacy heuristic - Goal-coverage drift');
+    expect(result).not.toContain('course-correct or propose a goal amendment');
+  });
+
+  it('omits the goal_coverage_drift section entirely when absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
+    expect(result).not.toContain('Goal-coverage drift');
+  });
+
+  it('omits goal_coverage_drift section when signal is missing', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      goal_coverage_drift: { coverage: 0.5 },
+    });
+    expect(result).not.toContain('Goal-coverage drift');
+  });
+
+  it('renders goal_alignment from last_qualification when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: {
+        status: 'not_promoted',
+        goal_alignment: {
+          status: 'partial',
+          coverage: 0.6,
+          biggest_gap: 'feature Y not shipped',
+        },
+      },
+    });
+    expect(result).toContain('Last qualification goal alignment: status=partial');
+    expect(result).toContain('Legacy heuristic - Last qualification goal alignment');
+    expect(result).toContain('coverage=0.6');
+    expect(result).toContain('biggest_gap=feature Y not shipped');
+  });
+
+  it('omits goal_alignment line when last_qualification is absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 2, phase: 'build' });
+    expect(result).not.toContain('Last qualification goal alignment');
+  });
+
+  it('omits goal_alignment line when last_qualification has no goal_alignment', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 2,
+      phase: 'build',
+      last_qualification: { status: 'pending' },
+    });
+    expect(result).not.toContain('Last qualification goal alignment');
+  });
+
+  it('renders candidate currency as CURRENT when last_qualification_candidate_currency.current is true', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        current: true,
+        candidate_sha: 'aabbcc001122',
+        head_sha: 'aabbcc001122',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: CURRENT');
+    expect(result).toContain('aabbcc001122');
+    expect(result).toContain('matches integration HEAD');
+    expect(result).not.toContain('STALE');
+  });
+
+  it('renders candidate currency as STALE when last_qualification_candidate_currency.current is false', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        current: false,
+        candidate_sha: 'oldsha1234567890',
+        head_sha: 'newsha9876543210',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: STALE');
+    expect(result).toContain('oldsha123456');
+    expect(result).toContain('newsha987654');
+    expect(result).toContain('fresh qualification');
+    expect(result).not.toContain('CURRENT');
+  });
+
+  it('omits candidate currency block when last_qualification_candidate_currency is absent', () => {
+    const result = buildVersionPhaseSection({ version_number: 3, phase: 'stabilize' });
+    expect(result).not.toContain('Qualification candidate currency');
+  });
+
+  it('omits candidate currency block when last_qualification_candidate_currency is null', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 3,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: null,
+    });
+    expect(result).not.toContain('Qualification candidate currency');
   });
 });
 
@@ -3264,6 +3721,15 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     // runThinkerWithGate's gate: thinker exit 0 + both handoff files present.
     // Returning true for every existsSync keeps the gate happy.
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(true);
+    // runThinkerWithGate now does a strict final re-parse of the problem_model
+    // file after the gate passes. Mock readFileSync to return valid JSON for the
+    // problem_model path so JSON.parse succeeds and runThinkerWithGate returns
+    // { ok: true } instead of { ok: false } (the strict re-parse was added after
+    // these tests were written against the old swallowing behavior).
+    vi.mocked(fs.readFileSync as (p: string | Buffer, opts?: unknown) => string).mockImplementation((path) => {
+      if (typeof path === 'string' && path.includes(`problem_model_${EX_TASK_ID}`)) return THINKER_JSON;
+      return '';
+    });
 
     await handleStrategic(
       EX_TASK_ID, EX_PAYLOAD, EX_TASK, EX_GH_TOKEN, EX_OWNER, EX_REPO, EX_WS, EX_STATUS_REF(),
@@ -3363,7 +3829,7 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
     // Usage string advertises the new op.
-    expect(script).toContain('set-evidence-progress <json-or-file>');
+    expect(script).toContain('set-evidence-progress|set-acceptance-criteria <json-or-file>');
   });
 });
 
@@ -3498,6 +3964,13 @@ describe('handlePlan structured-output self-repair', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // mockReset clears the once-queue that vi.clearAllMocks() leaves intact.
+    // Preceding test suites (e.g. strategic executor) may leave un-consumed
+    // mockResolvedValueOnce entries when their runThinkerWithGate call returns
+    // { ok: false } early, consuming only 1 of 3 queued values. Those leftovers
+    // contaminate the runClaudeCode sequence seen by handlePlan. Resetting here
+    // ensures this suite starts with a clean implementation queue.
+    vi.mocked(runClaudeCode).mockReset();
     vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
     vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
     vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);

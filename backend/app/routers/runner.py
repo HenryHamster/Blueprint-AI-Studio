@@ -23,19 +23,30 @@ and this endpoint hands those pinned tasks to the polling runner.
 """
 
 import logging
+import math
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import create_agent_token, get_current_runner
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
+from app.runner_rate_limiter import check_runner_rate_limit
 from app.database import get_session
 from app.models import ComputeJob, ComputeJobStatus, LocalRunner, Project, Task, TaskStatus, _utcnow
 from app.task_capabilities import agent_capability_slice
+from app.workbench_events import (
+    SURFACE_RUNTIME,
+    SURFACE_STRATEGIC_SESSION,
+    emit_workbench_refetch,
+)
+from app.workbench_state import (
+    refresh_strategic_local_continuation_on_runner_heartbeat,
+)
 
 _MAX_RUNNER_COMMAND_LOG_BYTES = 65536
 _MAX_RUNNER_RESULT_METRICS_KEYS = 256
@@ -45,18 +56,121 @@ _MAX_RUNNER_RESULT_METRICS_KEYS = 256
 _MAX_RUNNER_ARTIFACT_BYTES = 25 * 1024 * 1024  # 25 MiB
 # Allowance for multipart framing/headers when early-rejecting on Content-Length.
 _MULTIPART_BODY_MARGIN = 1 * 1024 * 1024  # 1 MiB
+_RUNNER_LIVENESS_SECONDS = 300
 
 logger = logging.getLogger("blueprint")
 
 router = APIRouter(prefix="/api/runner", tags=["runner"])
 
 
+def _filter_result_metrics(raw: dict) -> dict:
+    """Filter runner-supplied result_metrics to safe, serialisable values.
+
+    Mirrors the per-entry logic in compute_backends._decode_result_metrics:
+    - bool → float
+    - finite int/float → float
+    - "arms" key with a dict or non-empty list → preserved verbatim
+    - strings, None, non-finite floats, nested objects → dropped
+    - capped at _MAX_RUNNER_RESULT_METRICS_KEYS entries
+    """
+    out: dict[str, Any] = {}
+    for key, value in raw.items():
+        if len(out) >= _MAX_RUNNER_RESULT_METRICS_KEYS:
+            break
+        if not isinstance(key, str):
+            continue
+        if key == "arms" and isinstance(value, (dict, list)) and value:
+            out[key] = value
+            continue
+        if isinstance(value, bool):
+            out[key] = float(value)
+        elif isinstance(value, (int, float)):
+            numeric = float(value)
+            if not math.isfinite(numeric):
+                continue
+            out[key] = numeric
+        # strings, None, nested dicts/lists → dropped
+    return out
+
+
+def _runner_capability_list(capabilities: Dict[str, Any], key: str) -> List[Any]:
+    value = capabilities.get(key)
+    return value if isinstance(value, list) else []
+
+
+def _runner_liveness_health(
+    *,
+    status: str | None,
+    last_seen_at: datetime | None,
+    now: datetime,
+) -> dict[str, Any]:
+    if last_seen_at is None:
+        seconds_since_last_seen = None
+    else:
+        seconds_since_last_seen = max(0, int((now - last_seen_at).total_seconds()))
+
+    is_live = (
+        status == "active"
+        and seconds_since_last_seen is not None
+        and seconds_since_last_seen < _RUNNER_LIVENESS_SECONDS
+    )
+    if is_live:
+        device_status = "connected"
+        stale_reason = None
+    elif status != "active":
+        device_status = "offline"
+        stale_reason = "inactive" if status == "inactive" else status
+    elif seconds_since_last_seen is None:
+        device_status = "stale"
+        stale_reason = "never_seen"
+    else:
+        device_status = "stale"
+        stale_reason = "heartbeat_stale"
+
+    return {
+        "device_status": device_status,
+        "is_live": is_live,
+        "stale_reason": stale_reason,
+    }
+
+
+def _parse_heartbeat_timestamp(raw: str | None) -> datetime | None:
+    """Parse a runner-reported ISO-8601 timestamp to a naive-UTC datetime.
+
+    Tolerant of a trailing ``Z`` and of tz offsets (normalized to UTC then
+    stripped, matching the NaiveUTCDateTime column convention). Returns ``None``
+    for missing/blank/unparseable values so an old or misbehaving runner never
+    fails its heartbeat over a bad timestamp.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
+
+
 class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
+    active_compute_job_ids: List[str] = []
+    agent_available: Optional[StrictBool] = None
+    hostname: Optional[str] = None
+    version: Optional[str] = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
-    has_gpu: Optional[bool] = None
+    has_gpu: Optional[StrictBool] = None
     gpu_count: Optional[int] = None
     gpu_names: Optional[List[str]] = None
+    # Trust telemetry (optional; old runners omit these). last_successful_job_at
+    # is ISO-8601; consecutive_job_failures/disk_free_bytes/gpu_utilization_pct are
+    # ints. These drive the "connected but failing" degraded state so the operator
+    # console can tell a healthy runner from one heartbeating while every job fails.
+    last_successful_job_at: str | None = None
+    consecutive_job_failures: int | None = None
+    disk_free_bytes: int | None = None
+    gpu_utilization_pct: int | None = None
 
 
 @router.post("/next-task")
@@ -73,6 +187,10 @@ async def next_task(
     ``/api/agent/claim`` to perform the PROVISIONING → IN_PROGRESS transition
     (identical contract to GCP-provisioned VMs).
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_task")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     pinned_vm_id = f"runner:{runner.id}"
     result = await session.execute(
         select(Task)
@@ -118,6 +236,7 @@ async def next_task(
     return {
         "task_id": str(task.id),
         "agent_token": agent_token,
+        "vm_instance_id": pinned_vm_id,
         "payload": task.payloads,
         "task_type": task_type,
         "capability_slice": agent_capability_slice(task_type),
@@ -136,7 +255,27 @@ async def heartbeat(
     per-cycle dispatch cache can prefer less-loaded runners without an extra
     per-task query.
     """
-    runner.last_seen_at = _utcnow()
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "heartbeat")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
+    previous_status = runner.status
+    previous_hostname = runner.hostname
+    previous_version = runner.version
+    previous_last_seen_at = runner.last_seen_at
+    previous_last_successful_job_at = runner.last_successful_job_at
+    previous_consecutive_job_failures = runner.consecutive_job_failures
+    previous_caps = dict(runner.capabilities or {})
+    runner_id = runner.id
+    runner_project_id = runner.project_id
+    now = _utcnow()
+    previous_health = _runner_liveness_health(
+        status=previous_status,
+        last_seen_at=previous_last_seen_at,
+        now=now,
+    )
+
+    runner.last_seen_at = now
     # Re-arm an inactive runner on every authenticated heartbeat. The stale-runner
     # sweep flips active->inactive after a single missed 300s window (slept/network-
     # dropped host); a successful heartbeat is proof of liveness, so flip it back to
@@ -146,18 +285,107 @@ async def heartbeat(
     runner.status = "active"
     caps = dict(runner.capabilities or {})
     caps["active_task_ids"] = list(payload.active_task_ids)
+    caps["active_compute_job_ids"] = list(payload.active_compute_job_ids)
     # Merge runner-reported hardware capabilities when present.
     # These override the registration-time default but never clobber
     # operator-configured fields (task_types, max_concurrent).
+    if payload.agent_available is not None:
+        caps["agent_available"] = payload.agent_available
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:
         caps["gpu_count"] = payload.gpu_count
     if payload.gpu_names is not None:
         caps["gpu_names"] = payload.gpu_names
+    # Trust telemetry. last_successful_job_at / consecutive_job_failures are
+    # first-class columns (the degraded-state logic and panel key on them);
+    # disk_free_bytes / gpu_utilization_pct are display-only and ride in caps
+    # alongside the other heartbeat-reported hardware fields. All optional and
+    # tolerated as missing/null so older runners keep heartbeating.
+    parsed_last_success = _parse_heartbeat_timestamp(payload.last_successful_job_at)
+    if parsed_last_success is not None:
+        runner.last_successful_job_at = parsed_last_success
+    if payload.consecutive_job_failures is not None:
+        runner.consecutive_job_failures = max(0, int(payload.consecutive_job_failures))
+    if payload.disk_free_bytes is not None:
+        caps["disk_free_bytes"] = max(0, int(payload.disk_free_bytes))
+    if payload.gpu_utilization_pct is not None:
+        caps["gpu_utilization_pct"] = max(0, min(100, int(payload.gpu_utilization_pct)))
+    if payload.hostname:
+        runner.hostname = payload.hostname[:255]
+    if payload.version:
+        runner.version = payload.version[:64]
     runner.capabilities = caps
     session.add(runner)
     await session.commit()
+    await refresh_strategic_local_continuation_on_runner_heartbeat(
+        session,
+        project_id=runner_project_id,
+        runner_id=runner_id,
+        capabilities=caps,
+    )
+    current_health = _runner_liveness_health(
+        status=runner.status,
+        last_seen_at=runner.last_seen_at,
+        now=now,
+    )
+    liveness_recovered = (
+        not bool(previous_health.get("is_live"))
+        and bool(current_health.get("is_live"))
+    )
+    runtime_state_changed = (
+        liveness_recovered
+        or previous_status != runner.status
+        or previous_hostname != runner.hostname
+        or previous_version != runner.version
+        or _runner_capability_list(previous_caps, "active_task_ids")
+        != _runner_capability_list(caps, "active_task_ids")
+        or _runner_capability_list(previous_caps, "active_compute_job_ids")
+        != _runner_capability_list(caps, "active_compute_job_ids")
+        or previous_caps.get("agent_available") != caps.get("agent_available")
+        or previous_caps.get("has_gpu") != caps.get("has_gpu")
+        or previous_caps.get("gpu_count") != caps.get("gpu_count")
+        or previous_caps.get("gpu_names") != caps.get("gpu_names")
+        # Trust-telemetry transitions matter (a runner tipping into/out of the
+        # "connected but failing" state), so refetch the panel. gpu_utilization_pct
+        # and disk_free_bytes are deliberately excluded — they churn every
+        # heartbeat and would defeat the change-gated refetch.
+        or previous_last_successful_job_at != runner.last_successful_job_at
+        or previous_consecutive_job_failures != runner.consecutive_job_failures
+    )
+    if runtime_state_changed:
+        await emit_workbench_refetch(
+            runner.project_id,
+            resource="local_runner",
+            action="heartbeat",
+            refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+            summary_key="runner",
+            summary={
+                "id": str(runner.id),
+                "status": runner.status,
+                "active_task_count": len(caps.get("active_task_ids") or []),
+                "active_compute_job_count": len(caps.get("active_compute_job_ids") or []),
+                "agent_available": caps.get("agent_available"),
+            },
+        )
+    # Recovery: this heartbeat re-armed a previously-inactive runner (the sweep
+    # flips active->inactive and raises a runner-deactivated alert). Resolve that
+    # open alert so it does not linger falsely now that the runner is live again.
+    # Gated on the re-arm transition so a healthy runner's heartbeat never runs
+    # the resolve query. Best-effort — a resolve failure must not fail the
+    # heartbeat.
+    if previous_status != "active":
+        try:
+            from app.alert_dispatch import _resolve_runner_deactivated_alert
+
+            await _resolve_runner_deactivated_alert(
+                session, runner_project_id, runner_id
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve runner-deactivated alert for %s",
+                runner_id,
+            )
     return {"ok": True, "last_seen_at": runner.last_seen_at.isoformat()}
 
 
@@ -181,6 +409,10 @@ async def next_compute_job(
     double-claiming the same job. On a hit the job is atomically transitioned
     STARTING→RUNNING and the exec fields are returned to the runner.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "next_compute_job")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     now = _utcnow()
     result = await session.execute(
         select(ComputeJob)
@@ -278,6 +510,10 @@ async def report_compute_job(
     endpoint still returns ``{ok, cancel_requested}`` so the runner can observe
     the cancel signal even after the job has been finalized.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "report_compute_job")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     now = _utcnow()
     result = await session.execute(
         select(ComputeJob)
@@ -312,12 +548,7 @@ async def report_compute_job(
         if payload.exit_code is not None and isinstance(payload.exit_code, int):
             meta["runner_exit_code"] = payload.exit_code
         if payload.result_metrics is not None and isinstance(payload.result_metrics, dict):
-            # Bound server-side: cap at _MAX_RUNNER_RESULT_METRICS_KEYS keys
-            bounded_metrics = {
-                k: v for i, (k, v) in enumerate(payload.result_metrics.items())
-                if i < _MAX_RUNNER_RESULT_METRICS_KEYS
-            }
-            meta["runner_result_metrics"] = bounded_metrics
+            meta["runner_result_metrics"] = _filter_result_metrics(payload.result_metrics)
         if payload.command_log is not None:
             if isinstance(payload.command_log, dict):
                 log_text = payload.command_log.get("text", "")
@@ -417,6 +648,10 @@ async def upload_compute_job_artifact(
     for the monitor/finalize path. Scoped to the pinned runner exactly like the
     report endpoint, so runner A cannot upload to a job claimed by runner B.
     """
+    allowed, retry_after = await check_runner_rate_limit(str(runner.id), "upload_compute_job_artifact")
+    if not allowed:
+        raise HTTPException(status_code=429, headers={"Retry-After": str(retry_after)})
+
     # Early-reject obviously-oversized uploads before buffering the whole body.
     content_length = request.headers.get("content-length")
     if content_length is not None:

@@ -44,6 +44,10 @@ from app.playbook_storage import (
     _playbook_size_bytes,
     maybe_archive_for_capacity as _maybe_archive_for_capacity,
 )
+from app.project_message_projection import (
+    message_event_payload,
+    message_updated_event_payload,
+)
 from app.routers.agent import verify_agent_token
 from app.source_ref_validation import (
     compute_message_citation_warning as _compute_message_citation_warning,
@@ -99,6 +103,7 @@ logger = logging.getLogger(__name__)
 # uses this marker to include the sibling /api/agent endpoints in the same
 # auth scan as the admin routes.
 ADMIN_AGENT_OPS_MODULE = __name__
+STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
 
 
 def _cap_str(
@@ -651,7 +656,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
     data: Any = {}
 
 
@@ -1058,6 +1063,21 @@ async def strategic_operation(
                 )
             new_dir["conflicts_with"] = raw_conflicts_with
         directions.append(new_dir)
+        # Reconcile the problem-model gap this direction staffs, in the same
+        # locked transaction (the project row is already held via
+        # _lock_project_or_429; directions + problem_model are columns on it).
+        # A fresh active direction (not a staged, not-yet-live one) staffs its
+        # gap: add it to active_moves and clear any now-false deferral. Mirrors
+        # the retire-side reconciliation but in the staffing direction.
+        if new_dir.get("gap_id") and not staged_create:
+            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+
+            _reconciled_pm = reconcile_gap_staffing_raw(
+                project.problem_model, new_dir["id"], new_dir["gap_id"], None
+            )
+            if _reconciled_pm is not None:
+                project.problem_model = _reconciled_pm
+                flag_modified(project, "problem_model")
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1117,11 +1137,16 @@ async def strategic_operation(
             return _blk
         directions = list(project.directions or [])
         updated = False
+        # Re-ground reconciliation: capture the direction's prior gap_id BEFORE
+        # any change is applied so a gap_id change can prune the old gap. Holds
+        # ``(new_gap_id, prior_gap_id)`` once a gap_id change is observed.
+        _gap_reground: tuple[str | None, str | None] | None = None
         for d in directions:
             if d.get("id") == dir_id:
                 _pre_text = d.get("text")
                 _pre_se = (d.get("context") or {}).get("success_evidence")
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
+                _pre_gap_id = d.get("gap_id")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -1198,6 +1223,7 @@ async def strategic_operation(
                         d["gap_id"] = str(gid)
                     else:
                         d.pop("gap_id", None)
+                    _gap_reground = (d.get("gap_id"), _pre_gap_id)
                 if "conflicts_with" in changes:
                     cw = changes["conflicts_with"]
                     if cw is None or (isinstance(cw, list) and len(cw) == 0):
@@ -1275,6 +1301,20 @@ async def strategic_operation(
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        # Re-ground reconciliation, in the same locked transaction: when the
+        # direction's gap_id changed, stage the new gap (active_moves + clear
+        # deferral) and prune the old one. Mirrors create_direction and the
+        # retire-side reconciliation.
+        if _gap_reground is not None:
+            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+
+            _new_gap_id, _prior_gap_id = _gap_reground
+            _reconciled_pm = reconcile_gap_staffing_raw(
+                project.problem_model, str(dir_id), _new_gap_id, _prior_gap_id
+            )
+            if _reconciled_pm is not None:
+                project.problem_model = _reconciled_pm
+                flag_modified(project, "problem_model")
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1443,6 +1483,18 @@ async def strategic_operation(
         )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
+        # Reconcile the problem-model gap this direction was staffing in the SAME
+        # committed transaction: prune the retired id from gap.active_moves (->
+        # past_moves) and, if it was the gap's last active move, record a
+        # GapDeferral so the now-unstaffed gap is acknowledged instead of being
+        # flagged as a stale active-move / orphaned gap next strategic cycle.
+        from app.problem_model import reconcile_gaps_for_retired_directions
+        from app.task_locking import with_problem_model_locked
+
+        def _reconcile_pm(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm)
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
@@ -1791,6 +1843,18 @@ async def strategic_operation(
         except ValueError:
             msg_type = MessageType.NOTE
         msg_ctx = data.get("context") or {}
+        if not isinstance(msg_ctx, dict):
+            raise HTTPException(
+                status_code=400, detail="Message context must be an object"
+            )
+        if (
+            len(json.dumps(msg_ctx, separators=(",", ":"), default=str).encode("utf-8"))
+            > STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES
+        ):
+            raise HTTPException(
+                status_code=400, detail="Message context too large (max 50KB)"
+            )
+        msg_ctx = dict(msg_ctx)
         # Reproduce-on-HEAD citation grounding for strategist-authored bug-class
         # messages: a strategist-emitted BUG_REPORT/BLOCKER citing code already
         # fixed/refactored away would re-enter the strategist inbox fully
@@ -1816,11 +1880,7 @@ async def strategic_operation(
         await broadcast_to_project(
             str(project.id),
             "message_created",
-            {
-                "message_id": str(new_msg.id),
-                "type": msg_type.value,
-                "from": "strategic",
-            },
+            message_event_payload(new_msg),
         )
         return _resp(
             {"status": "ok", "op": "create_message", "message_id": str(new_msg.id)}
@@ -1860,6 +1920,11 @@ async def strategic_operation(
             )
             session.add(msg)
             await session.commit()
+            await broadcast_to_project(
+                str(project.id),
+                "message_updated",
+                message_updated_event_payload(msg),
+            )
             return _resp(
                 {
                     "status": "ok",
@@ -1876,26 +1941,52 @@ async def strategic_operation(
         msg.resolved_at = _utcnow()
         session.add(msg)
         await session.commit()
-        if msg.message_type == MessageType.QUESTION:
+        message_id_str = str(msg.id)
+        message_update_event = message_updated_event_payload(msg)
+        reply_msg: ProjectMessage | None = None
+        if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
             try:
-                from app.notification_dispatch import post_question_answer as _post_qa
-
-                await _post_qa(
-                    session,
-                    project.id,
-                    msg.id,
-                    msg.resolution or "Addressed by strategic review",
-                    task.id,
+                from app.notification_dispatch import (
+                    post_feedback_acknowledgment as _post_feedback_ack,
+                    post_question_answer as _post_qa,
                 )
+
+                resolution = msg.resolution or "Addressed by strategic review"
+                if msg.message_type == MessageType.QUESTION:
+                    pending_reply_msg = await _post_qa(
+                        session, project.id, msg.id, resolution, task.id
+                    )
+                else:
+                    pending_reply_msg = await _post_feedback_ack(
+                        session,
+                        project.id,
+                        msg.id,
+                        resolution,
+                        task.id,
+                    )
                 await session.commit()
+                reply_msg = pending_reply_msg
             except Exception:
-                import logging
-
-                logging.getLogger(__name__).warning(
-                    "post_question_answer failed for message %s", msg.id, exc_info=True
+                await session.rollback()
+                reply_msg = None
+                logger.warning(
+                    "post resolution reply failed for message %s",
+                    message_id_str,
+                    exc_info=True,
                 )
+        await broadcast_to_project(
+            str(project.id),
+            "message_updated",
+            message_update_event,
+        )
+        if reply_msg is not None:
+            await broadcast_to_project(
+                str(project.id),
+                "message_created",
+                message_event_payload(reply_msg),
+            )
         return _resp(
-            {"status": "ok", "op": "resolve_message", "message_id": str(msg.id)}
+            {"status": "ok", "op": "resolve_message", "message_id": message_id_str}
         )
 
     elif payload.op == "spawn_task":
@@ -2156,6 +2247,16 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
+        # Resolve criterion_keys from the direction row so they propagate to the
+        # spawned task's criterion_ids field.
+        _task_criterion_ids: list[str] = []
+        if direction_id:
+            from app.directions_repo import get_direction_row as _get_direction_row
+
+            _dir_row = await _get_direction_row(session, project.id, direction_id)
+            if _dir_row is not None and _dir_row.criterion_keys:
+                _task_criterion_ids = list(_dir_row.criterion_keys)
+
         new_task = Task(
             project_id=project.id,
             title=title,
@@ -2166,6 +2267,7 @@ async def strategic_operation(
             priority=100,  # ahead of default (50) — course-correction runs first
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             created_by="STRATEGIC_AGENT",
+            criterion_ids=_task_criterion_ids,
             **(
                 {"requires_approval": spawn_requires_approval}
                 if spawn_requires_approval is not None
@@ -2450,12 +2552,11 @@ async def strategic_operation(
         from app import strategic_cycle as _strategic_cycle
         from app.problem_model import apply_agent_update, operator_owned_subset
         from app.strategic_completion import (
+            NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
-            NEW_VERSION_THEME_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
             extract_new_version_goal,
-            extract_new_version_theme,
             extract_qualify_request,
             extract_version_phase_decision,
         )
@@ -2482,9 +2583,16 @@ async def strategic_operation(
         new_version_goal = extract_new_version_goal(
             pm_data.pop("new_version_goal", None)
         )
-        new_version_theme = extract_new_version_theme(
-            pm_data.pop("new_version_theme", None)
-        )
+        # new_acceptance_criteria: optional list of strings the strategist wants to
+        # create as version-scoped acceptance criteria. Lifted out before
+        # apply_agent_update validates (ProblemModel is extra="forbid"). The list
+        # rides task.context and is applied at strategic completion.
+        _raw_nac = pm_data.pop("new_acceptance_criteria", None)
+        new_acceptance_criteria: list[str] | None = None
+        if isinstance(_raw_nac, list):
+            cleaned_nac = [str(t).strip() for t in _raw_nac if isinstance(t, str) and str(t).strip()]
+            if cleaned_nac:
+                new_acceptance_criteria = cleaned_nac
         # Resolve the cycle's baseline problem model (snapshot at spawn) so a
         # concurrent operator edit to an operator-owned field is merged
         # operator-wins rather than silently clobbered. Mirrors the vision
@@ -2564,8 +2672,8 @@ async def strategic_operation(
             new_ctx[QUALIFY_REQUEST_CONTEXT_KEY] = qualify_request
         if new_version_goal is not None:
             new_ctx[NEW_VERSION_GOAL_CONTEXT_KEY] = new_version_goal
-        if new_version_theme is not None:
-            new_ctx[NEW_VERSION_THEME_CONTEXT_KEY] = new_version_theme
+        if new_acceptance_criteria is not None:
+            new_ctx[NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY] = new_acceptance_criteria
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
@@ -2598,10 +2706,11 @@ async def strategic_operation(
                 "task %s — applied to open version at strategic completion",
                 task.id,
             )
-        if new_version_theme is not None:
+        if new_acceptance_criteria is not None:
             logger.info(
-                "[STRATEGIC API] new_version_theme routed to task.context for "
-                "task %s — applied to open version at strategic completion",
+                "[STRATEGIC API] new_acceptance_criteria (%d items) routed to task.context "
+                "for task %s — criteria created at strategic completion",
+                len(new_acceptance_criteria),
                 task.id,
             )
         return _resp(
@@ -2613,7 +2722,7 @@ async def strategic_operation(
                 "version_phase_decision_received": version_phase_decision is not None,
                 "qualify_request_received": qualify_request is not None,
                 "new_version_goal_received": new_version_goal is not None,
-                "new_version_theme_received": new_version_theme is not None,
+                "new_acceptance_criteria_received": new_acceptance_criteria is not None,
             }
         )
 
@@ -2813,6 +2922,16 @@ async def strategic_operation(
                             "lesson": lesson[:300],
                         }
                     )
+            if not cleaned:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "set_retirement_critiques: list must contain at least one valid "
+                        "critique object (with direction_id, what_it_addressed, "
+                        'pattern_that_produced_it, and lesson). Use '
+                        '{"no_eligible_retirements": true} when no retirements exist.'
+                    ),
+                )
             critiques = cleaned
         else:
             raise HTTPException(
@@ -3092,6 +3211,121 @@ async def strategic_operation(
                 "retirement_approvals_count": ra_n,
                 "retirement_critique_quality_count": rc_n,
                 "portfolio_shape_risk_count": ps_n,
+            }
+        )
+
+    elif payload.op == "set_acceptance_criteria":
+        # Author criteria for the open release version and optionally map
+        # directions to them.  Restricted to strategic_review agents (enforced
+        # above by the task_type guard).  Deduplicates by text within the
+        # (project_id, release_version_id) scope so repeated calls are safe.
+        from app.acceptance_criteria import (
+            count_criteria_for_version as _count_criteria,
+            get_criterion_by_text as _get_criterion_by_text,
+            generate_criterion_key as _gen_criterion_key,
+            MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
+        )
+        from app.directions_repo import get_direction_row as _get_direction_row
+        from app.models import VersionAcceptanceCriterion as _VAC
+        from app.release_version import current_open_version as _cur_open_ver
+
+        if not isinstance(data, dict) or not isinstance(data.get("criteria"), list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: data must be {\"criteria\": [...]}",
+            )
+        criteria_input = data["criteria"]
+        for item in criteria_input:
+            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item["text"].strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
+                )
+
+        open_version = await _cur_open_ver(session, project.id)
+        if open_version is None:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp({"status": "error", "reason": "No open release version"}),
+                status_code=409,
+            )
+
+        existing_count = await _count_criteria(session, open_version.id)
+        new_added_count = 0
+        skipped_over_cap = 0
+        processed: list[dict] = []
+        for item in criteria_input:
+            text = item["text"].strip()
+            direction_keys_input: list[str] = list(item.get("direction_keys") or [])
+
+            existing = await _get_criterion_by_text(
+                session, project.id, open_version.id, text
+            )
+            if existing is not None:
+                criterion_key = existing.criterion_key
+                is_new = False
+            else:
+                if existing_count + new_added_count >= _MAX_CRITERIA:
+                    skipped_over_cap += 1
+                    continue
+                criterion_key = _gen_criterion_key()
+                new_row = _VAC(
+                    project_id=project.id,
+                    release_version_id=open_version.id,
+                    criterion_key=criterion_key,
+                    text=text,
+                    created_by="strategist",
+                )
+                session.add(new_row)
+                new_added_count += 1
+                is_new = True
+
+            mapped_keys: list[str] = []
+            for dk in direction_keys_input:
+                dir_row = await _get_direction_row(session, project.id, dk)
+                if dir_row is None:
+                    warnings.append(f"Unknown direction_key: {dk}")
+                    continue
+                merged = list(set(dir_row.criterion_keys or []) | {criterion_key})
+                dir_row.criterion_keys = merged
+                session.add(dir_row)
+                mapped_keys.append(dk)
+
+            processed.append(
+                {
+                    "criterion_key": criterion_key,
+                    "text": text,
+                    "is_new": is_new,
+                    "direction_keys": mapped_keys,
+                }
+            )
+
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_api_called": True,
+            "_strategic_criteria_authored": len(processed),
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d skipped (cap), %d warnings",
+            task.id,
+            len(processed),
+            skipped_over_cap,
+            len(warnings),
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "set_acceptance_criteria",
+                "criteria": processed,
+                "skipped_over_cap": skipped_over_cap,
             }
         )
 

@@ -4,7 +4,8 @@ import { type EventPref, effectiveSignal, isCriticalSeverity } from './eventPref
 import { type MuteWindow, isMuteWindowActive } from './muteWindow';
 import { type TemporaryMutes } from './temporaryMutes';
 import { type RoutineRow, groupRoutineMessages, collapseStaleRoutineRows, isFailingGroup } from './messageGrouping';
-import { type ProjectMessage, formatFromType } from './MessageBubble';
+import { formatFromType } from './MessageBubble';
+import type { ProjectMessage } from '../types/messages';
 
 export type MessageSummaryCounts = {
   blockers: number;

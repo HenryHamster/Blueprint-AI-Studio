@@ -91,6 +91,22 @@ logger = logging.getLogger(__name__)
 # the 4h stall alert and any realistic CI duration so it only fires on a
 # genuinely wedged promotion, never on a slow-but-progressing one.
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
+# A bare promotion CLAIM (``promotion_pending`` carrying ``claiming`` with no
+# ``pr_number`` yet) is written under-lock by promote() immediately before it
+# releases the row lock for its GitHub I/O, so a concurrent re-qualify cannot
+# clobber the in-flight promotion.  IMPORTANT: on the straight-through success
+# path promote() writes NO intermediate pr_number record — it goes claim →
+# create_branch → create_pull_request → merge → _record_promotion_success — so
+# the DB shows a bare claim for the ENTIRE promote() I/O, not merely between
+# claiming and opening the PR.  This bound must therefore sit safely ABOVE the
+# worst-case whole-I/O duration (nominally 30-120s, but GitHub secondary
+# rate-limit Retry-After backoff can stack across ~6 calls), or the reaper would
+# tear down a LIVE, slow promotion and REOPEN the clobber race this claim closes.
+# 30 min is far beyond any realistic promote() I/O yet far below the 24h cap a
+# real open-PR promotion inherits, so a genuinely crash-orphaned claim is still
+# GC'd promptly.  DO NOT lower this toward the "PR opens in seconds" figure — the
+# bare-claim window is the WHOLE I/O, not the pre-PR sliver.
+_PROMOTION_CLAIM_TIMEOUT_SECONDS = 30 * 60
 _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
 _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 # Number of consecutive sweeps where CI is red due to only transient conclusions
@@ -963,6 +979,163 @@ async def _reconcile_if_not_promoted_but_pr_merged(
             except Exception:
                 logger.exception(
                     "[RELEASE_QUALIFIER] reconcile not_promoted/ci_unresolved: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
+async def _reconcile_if_ci_unresolved_now_green(
+    version_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-qualify a quiescent not_promoted/ci_unresolved version once CI is green.
+
+    ``ci_unresolved`` means the prior finalization saw pending or absent CI, not
+    a settled quality failure.  If automain still points at that exact candidate
+    SHA and CI later resolves green, re-run qualification on the same candidate.
+    When automain has advanced, the existing stale-not-promoted re-drive owns the
+    fresh-SHA path.
+
+    Returns True iff a new qualification was spawned.
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version: release_version.ReleaseVersion | None = (
+                (
+                    await session.execute(
+                        select(release_version.ReleaseVersion)
+                        .where(release_version.ReleaseVersion.id == version_id)
+                        .with_for_update()
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if version is None:
+                return False
+            if version.status != "open" or version.phase != "stabilize":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "not_promoted":
+                return False
+            if qual.get("blocker") != "ci_unresolved":
+                return False
+            candidate_sha: str | None = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            integration_branch, _promotion_target = _lts_branch_names(project)
+
+            try:
+                await session.commit()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "failed to release row lock for v%d — skipping",
+                    version.version_number,
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                        "rollback failed for v%d after commit error",
+                        version.version_number,
+                    )
+                return False
+
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token,
+                    owner,
+                    repo,
+                    integration_branch,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            if automain_sha != candidate_sha:
+                return False
+
+            from app import release_qualifier as _rq_mod
+
+            ci_resolution = await _rq_mod._resolve_candidate_ci(
+                token,
+                owner,
+                repo,
+                candidate_sha,
+                project_id=str(version.project_id),
+            )
+            if ci_resolution.get("state") == _CI_NO_CHECKS:
+                # Integration-branch candidates structurally carry no check-runs
+                # when the CI workflow's automain trigger has been removed.
+                # Annotate with topology and proceed if CI is not required
+                # (topology-relaxed no_checks), mirroring _ci_required_for_finalize.
+                ci_resolution = (
+                    await _rq_mod._annotate_absent_ci_integration_topology(
+                        token=token,
+                        owner=owner,
+                        repo=repo,
+                        project=project,
+                        candidate_sha=candidate_sha,
+                        ci_resolution=ci_resolution,
+                    )
+                )
+                if _rq_mod._ci_required_for_finalize(project, ci_resolution):
+                    return False
+            elif ci_resolution.get("state") != _CI_GREEN or not ci_resolution.get(
+                "ci_green"
+            ):
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                "candidate %s for v%d now has green CI or topology-relaxed "
+                "no_checks on unchanged automain — spawning fresh qualification",
+                candidate_sha[:8],
+                version.version_number,
+            )
+            result = await _rq_mod.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile ci_unresolved_now_green: "
                     "rollback failed for version %s after unexpected error",
                     version_id,
                 )
@@ -2656,6 +2829,16 @@ async def _reconcile_if_promotion_pending_timed_out(
 
             age_seconds = (_utcnow() - enabled_at).total_seconds()
             cap_seconds = _promotion_pending_timeout_seconds()
+            # A bare promotion CLAIM (``claiming`` + no ``pr_number``) is only
+            # ever alive for promote()'s 30-120s I/O window; if it has aged past
+            # the short claim bound, promote() crashed between claiming and
+            # opening the PR, so GC it now instead of letting it inherit the 24h
+            # cap and wedge the version out of re-qualification.
+            _is_bare_claim = bool(pending.get("claiming")) and not pending.get(
+                "pr_number"
+            )
+            if _is_bare_claim:
+                cap_seconds = min(cap_seconds, _PROMOTION_CLAIM_TIMEOUT_SECONDS)
             if age_seconds < cap_seconds:
                 return False
 
@@ -2679,27 +2862,48 @@ async def _reconcile_if_promotion_pending_timed_out(
             # CLEARS the sub-state and re-arms the qualification-timeout backstop.
             base_record = {k: v for k, v in qual.items() if k != "promotion_pending"}
 
-            logger.warning(
-                "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: v%d "
-                "promotion PR #%s has been pending %.1fh (> %.1fh cap) — "
-                "force-failing as promotion_pending_timeout so the version "
-                "returns to stabilize and the normal backstop re-arms",
-                version.version_number,
-                pr_number,
-                age_hours,
-                cap_seconds / 3600.0,
-            )
-            await _record_promotion_failure(
-                session,
-                version,
-                base_record,
-                "promotion_pending_timeout",
-                detail=(
+            if _is_bare_claim:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_claim_abandoned: v%d "
+                    "held a bare promotion claim %.0fs (> %.0fs cap) with no PR "
+                    "recorded — promote() crashed somewhere in its promotion I/O "
+                    "(branch/PR/merge) before recording a terminal state; clearing "
+                    "the claim so the version returns to stabilize and re-qualifies",
+                    version.version_number,
+                    age_seconds,
+                    cap_seconds,
+                )
+                _timeout_error = "promotion_claim_abandoned"
+                _timeout_detail = (
+                    f"bare promotion claim stranded {age_seconds:.0f}s "
+                    f"(> {cap_seconds:.0f}s cap) with no PR recorded — promote() "
+                    f"crashed mid-I/O before a terminal state; cleared so the "
+                    f"version retries qualification"
+                )
+            else:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile promotion_pending_timeout: v%d "
+                    "promotion PR #%s has been pending %.1fh (> %.1fh cap) — "
+                    "force-failing as promotion_pending_timeout so the version "
+                    "returns to stabilize and the normal backstop re-arms",
+                    version.version_number,
+                    pr_number,
+                    age_hours,
+                    cap_seconds / 3600.0,
+                )
+                _timeout_error = "promotion_pending_timeout"
+                _timeout_detail = (
                     f"promotion PR #{pr_number} stranded in promotion_pending "
                     f"for {age_hours:.0f}h (> {cap_seconds / 3600.0:.0f}h cap) "
                     f"without a terminal merge/close/CI signal — force-failed so "
                     f"the version retries qualification"
-                ),
+                )
+            await _record_promotion_failure(
+                session,
+                version,
+                base_record,
+                _timeout_error,
+                detail=_timeout_detail,
                 pr_url=pr_url,
                 lock_released=False,
             )

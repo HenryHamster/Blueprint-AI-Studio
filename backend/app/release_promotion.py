@@ -295,6 +295,10 @@ def _recover_confidence_from_ci_unresolved(
         smoketest_score=smoketest_score,
         policy=_policy,
         smoketest_enabled=smoketest_enabled,
+        migration_collision=base_record.get("migration_safety") == "block",
+        migration_apply_blocked=base_record.get("migration_apply_safety") == "block",
+        criterion_coverage=base_record.get("criterion_coverage"),
+        merge_grade_misses=_merge_grade_misses_armed(base_record, _policy),
     )
 
     return {
@@ -303,6 +307,24 @@ def _recover_confidence_from_ci_unresolved(
         "blocker": recovered.get("blocker"),
         "confidence_recovered_from_ci_unresolved": True,
     }
+
+
+def _merge_grade_misses_armed(
+    base_record: dict[str, Any],
+    policy: dict[str, Any] | None = None,
+) -> bool:
+    if bool(base_record.get("merge_grade_misses")):
+        return True
+    try:
+        armed = float((policy or {}).get("merge_grade_block_threshold") or 0.0) > 0.0
+    except (TypeError, ValueError):
+        armed = False
+    if not armed:
+        return False
+    merge_grade = base_record.get("merge_grade")
+    return base_record.get("merge_grade_status") == "fail" or (
+        isinstance(merge_grade, dict) and bool(merge_grade.get("blocked"))
+    )
 
 
 async def _record_qualification_verdict(
@@ -338,10 +360,6 @@ async def _record_qualification_verdict(
         sub_scores = base_record.get("sub_scores") or {}
         if not isinstance(sub_scores, dict):
             sub_scores = {}
-        acceptance_aggregate = base_record.get("acceptance_aggregate")
-        if acceptance_aggregate is not None:
-            sub_scores = dict(sub_scores)
-            sub_scores["acceptance_aggregate"] = acceptance_aggregate
         # Embed CI resolution provenance in sub_scores.
         ci_resolution = base_record.get("ci_resolution")
         if isinstance(ci_resolution, dict):
@@ -351,6 +369,13 @@ async def _record_qualification_verdict(
                 "resolved_sha": ci_resolution.get("resolved_sha"),
                 "detail": ci_resolution.get("detail"),
             }
+        # Embed smoketest_enabled so the immutable verdict row carries per-attempt
+        # enablement state without requiring a dedicated DB column.
+        # None is preserved for absent keys (legacy base_records); False means the
+        # dimension was explicitly disabled for this run.
+        if "smoketest_enabled" in base_record:
+            sub_scores = dict(sub_scores)
+            sub_scores["smoketest_enabled"] = base_record["smoketest_enabled"]
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")
@@ -407,7 +432,6 @@ async def _record_qualification_verdict(
             test_erosion_detail=base_record.get("test_erosion_detail"),
             smoketest_detail=base_record.get("smoketest_detail"),
             audit_reconciliation=base_record.get("audit_reconciliation"),
-            theme_delivery=base_record.get("theme_delivery"),
             goal_alignment=base_record.get("goal_alignment"),
             blind_merge_grade=base_record.get("blind_merge_grade"),
             # Blind merge-grade goal-coverage verdict (dir d-c0fe439f) — durably
@@ -852,6 +876,36 @@ async def promote(
         )
 
     release_branch = f"release-v{version.version_number}"
+
+    # --- Promotion CLAIM: fence the in-flight promotion BEFORE the lock frees -
+    # promote() must release the row lock (the intermediate commit below) before
+    # its 30-120s of GitHub I/O, but the real ``promotion_pending`` record is
+    # only written AFTER that I/O.  Without a marker, a concurrent
+    # ``run_qualification`` on a newer HEAD acquires the freed lock DURING the
+    # I/O window, sees no ``promotion_pending``, sails past Guard 2b
+    # (``_promotion_in_flight_result``), re-cuts, and CLOBBERS the in-flight
+    # promotion's provenance (the PR #12492 incident).  So stamp a lightweight
+    # CLAIM here, carried on the SAME transaction the intermediate commit makes
+    # durable: ``summarize_qualification_state`` already classifies ANY
+    # ``promotion_pending`` dict as ``promotion_in_flight`` (a
+    # PROMOTION_BLOCKING_STATE), so from the instant this commits both Guard 2b
+    # and the version-cut lever refuse concurrent re-qualification.  promote()'s
+    # normal pending/success writers overwrite this claim with the real
+    # pr_number/url after the I/O; every failure path
+    # (``_record_promotion_failure``) drops ``promotion_pending`` and so clears
+    # it; and ``_reconcile_if_promotion_pending_timed_out`` GCs a claim orphaned
+    # by a crash between here and the PR opening on a SHORT bound (it carries
+    # ``claiming`` and has no ``pr_number``).
+    _claim_record = dict(version.last_qualification or {})
+    _claim_record.update(base_record or {})
+    _claim_record["status"] = "pending"
+    _claim_record["promotion_pending"] = {
+        "claiming": True,
+        "candidate_sha": candidate_sha,
+        "enabled_at": _utcnow().isoformat(),
+    }
+    version.last_qualification = _claim_record
+    session.add(version)
 
     # --- Release the ReleaseVersion row lock BEFORE any GitHub I/O ----------
     # Audit R4-H3 + concern 2: the caller-supplied dedicated session holds a

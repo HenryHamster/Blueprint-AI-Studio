@@ -12,7 +12,7 @@ export function ConfirmDialog({ title, message, confirmLabel = 'Confirm', onConf
   return (
     <ModalShell onClose={onCancel}>
       <h3 className="text-sm font-semibold text-neutral-100 mb-2">{title}</h3>
-      <p className="text-xs text-neutral-400 mb-5">{message}</p>
+      <p className="text-xs text-neutral-400 mb-5 whitespace-pre-line">{message}</p>
       <div className="flex gap-2 justify-end">
         <button
           onClick={onCancel}

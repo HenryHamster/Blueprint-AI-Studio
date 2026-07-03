@@ -53,7 +53,7 @@ def apply_operator_build_config_overrides(
     - ``git_user_email`` / ``git_user_name`` — preserved only when truthy.
     - ``env_vars``, reviewer/parallelism toggles, branch namespace/prefixes,
       ``pr_title_prefix``, staging/stale branch prefix lists,
-      ``protected_branches``, ``enable_self_improvement``,
+      ``protected_branches``, ``enable_self_improvement``, ``alert_domains``,
       ``requires_ci_checks`` and the per-project parallelism caps
       (``max_parallel_research``, ``max_total_research``,
       ``max_autonomous_tasks_per_hour``) — preserved whenever the key is
@@ -91,6 +91,8 @@ def apply_operator_build_config_overrides(
         detected["protected_branches"] = existing["protected_branches"]
     if "enable_self_improvement" in existing:
         detected["enable_self_improvement"] = existing["enable_self_improvement"]
+    if "alert_domains" in existing:
+        detected["alert_domains"] = existing["alert_domains"]
     # The no-CI merge policy is operator-owned and never emitted by repo
     # detection; carry an explicit choice (including False) forward so manual
     # re-detect and empty-config auto-refresh do not silently re-gate the repo.
@@ -111,6 +113,17 @@ def apply_operator_build_config_overrides(
         detected["promotion_ci_selfheal_enabled"] = existing[
             "promotion_ci_selfheal_enabled"
         ]
+    # Per-project promotion rubric override (threshold/weights) and smoketest
+    # opt-in are operator-owned and never emitted by repo detection; carry an
+    # explicit choice forward so a manual re-detect / empty-config auto-refresh
+    # does not silently revert the project to the fleet rubric (Fix 5).
+    for _promo_key in (
+        "promotion_threshold",
+        "promotion_weights",
+        "smoketest_enabled",
+    ):
+        if _promo_key in existing:
+            detected[_promo_key] = existing[_promo_key]
     # Per-project parallelism overrides are operator-owned and never emitted
     # by repo detection; carry them forward so re-detect does not silently
     # lift a deliberate throttle (see schemas.BuildConfig).

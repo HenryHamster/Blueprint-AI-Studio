@@ -1,9 +1,10 @@
 import { afterEach, describe, test, vi, expect } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
-import { MessagesPanel } from './MessagesPanel';
+import { MessagesPanel, type MessagesPanelProps } from './MessagesPanel';
 import type { ProjectMessage } from './MessageBubble';
 import { expectNoOverflowAt, expectMinTouchTargetAt, expectNoTextTruncationAt, stressStrings } from '../test/viewport';
+import type { StrategicStateResponse } from '../strategicStateApi';
 
 // React patches the input `value` setter on its prototype to track controlled-input
 // state. Assigning `input.value = 'x'` then dispatching an event won't trigger React's
@@ -34,11 +35,29 @@ function makeMsg(overrides: Partial<ProjectMessage> = {}): ProjectMessage {
   };
 }
 
-async function renderPanel(root: Root, messages: ProjectMessage[]) {
+async function renderPanel(root: Root, messages: ProjectMessage[], props: Partial<MessagesPanelProps> = {}) {
   const { apiFetch } = await import('../api');
-  (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
-    new Response(JSON.stringify({ messages }), { status: 200 }),
-  );
+  if (props.filterChrome === 'minimal') {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-session$/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: messages },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  } else {
+    (apiFetch as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      new Response(JSON.stringify({ messages }), { status: 200 }),
+    );
+  }
   await act(async () => {
     root.render(
       <MessagesPanel
@@ -46,6 +65,7 @@ async function renderPanel(root: Root, messages: ProjectMessage[]) {
         onClose={() => {}}
         addToast={() => {}}
         onMessageCountChange={() => {}}
+        {...props}
       />,
     );
   });
@@ -149,6 +169,168 @@ describe('MessagesPanel — viewport regression', () => {
       root = r;
       await renderPanel(r, msgs);
     }, { waitMs: 50 });
+  });
+
+  test('minimal chat context package strip does not overflow at 375px', async () => {
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, [], {
+        variant: 'page',
+        filterChrome: 'minimal',
+        showCloseButton: false,
+        strategicState: {
+          project_id: 'project-123',
+          strategic: {
+            active_cycle: null,
+            active_task: null,
+            active_phase: null,
+            latest_cycle: null,
+            refresh: { pending: null, last_fired_at: null, last_fired_origin: null },
+          },
+          running_update: { excerpt: null, char_count: 0, acknowledged_at: null },
+          problem_model: {
+            active_gap_count: 0,
+            capability_count: 0,
+            pending_confirmation_count: 0,
+            top_gap: null,
+          },
+          directions: { total_count: 0, active_count: 0, paused_count: 0, primary: null },
+          messages: { counts: { open: 0, linked: 0 }, items: [] },
+          tasks: {
+            counts: {
+              queued: 17,
+              running: 4,
+              evaluating: 0,
+              blocked: 0,
+              parked: 0,
+              failed: 0,
+              completed: 28,
+              total: 49,
+            },
+            cumulative_estimated_cost_usd: 0,
+          },
+          attention: {
+            level: 'needs_operator',
+            summary: '2 items need attention',
+            last_seen_at: null,
+            counts: {
+              needs_operator: 2,
+              watch: 5,
+              unread: 2,
+              questions: 1,
+              blockers: 1,
+              approvals: 0,
+              manual_directions: 0,
+              failed_tasks: 0,
+              blocked_tasks: 0,
+              parked_tasks: 0,
+            },
+            items: [{
+              id: 'message:long',
+              kind: 'message',
+              severity: 'needs_operator',
+              reason: 'question',
+              label: 'Question waiting about a very long local workday session',
+              ref: { kind: 'message', id: 'long', project_id: 'project-123' },
+            }],
+          },
+          context_package: {
+            id: 'strategic-context:project-123',
+            title: 'Strategic context for a long-running local workday session',
+            status: 'ready',
+            item_count: 42,
+            token_count: null,
+            canvas: null,
+            sources: [
+              { kind: 'running_update', count: 1 },
+              { kind: 'problem_model', count: 7 },
+              { kind: 'tasks', count: 34 },
+            ],
+            drilldowns: [],
+          },
+          workbench: {
+            version: 1,
+            interaction_mode: 'continuous',
+            active_surface: 'pipeline',
+            selected_refs: [],
+            session_started_at: null,
+            last_interaction_at: null,
+          },
+          design: { has_design_doc: false, revision: null },
+        } as StrategicStateResponse,
+      });
+    });
+
+    const strip = host!.querySelector('[data-testid="strategic-context-package-strip"]');
+    expect(strip).not.toBeNull();
+    expect(strip!.textContent).toContain('Strategic');
+    expect(strip!.textContent).toContain('Workday');
+    expect(strip!.textContent).toContain('2 needs attention');
+    expect(strip!.textContent).not.toContain('42 items');
+    expect(strip!.textContent).not.toContain('2 needs / 5 watch');
+    expect(strip!.textContent).not.toContain('canvas nodes');
+  });
+
+  test('minimal chat composer aligns to the conversation column at desktop widths', async () => {
+    await expectNoOverflowAt(1280, async () => {
+      host = document.createElement('div');
+      host.style.padding = '12px';
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await renderPanel(r, [
+        makeMsg({ id: 'conversation-alignment', message_type: 'FEEDBACK', from_type: 'operator', content: 'Align this message column with the composer.' }),
+      ], {
+        variant: 'page',
+        filterChrome: 'minimal',
+        showCloseButton: false,
+        strategicState: {
+          project_id: 'project-123',
+          strategic: {
+            active_cycle: null,
+            active_task: null,
+            active_phase: null,
+            latest_cycle: null,
+            refresh: { pending: null, last_fired_at: null, last_fired_origin: null },
+          },
+          context_package: {
+            id: 'strategic-context:project-123',
+            title: 'Strategic context',
+            status: 'ready',
+            item_count: 4,
+            token_count: null,
+            canvas: null,
+            sources: [],
+            drilldowns: [],
+          },
+        } as StrategicStateResponse,
+        onOpenCommandPalette: vi.fn(),
+      });
+    });
+
+    if (!host) throw new Error('Expected host to be mounted');
+    const conversationColumn = host.querySelector<HTMLElement>('[data-testid="strategic-conversation-column"]');
+    const composerBox = host.querySelector<HTMLElement>('[data-testid="strategic-composer-box"]');
+    const contextDescriptor = host.querySelector<HTMLElement>('[data-testid="strategic-context-descriptor"]');
+    if (!conversationColumn || !composerBox) {
+      throw new Error('Expected conversation column and composer box to be rendered');
+    }
+    if (!contextDescriptor) {
+      throw new Error('Expected live Strategic context descriptor to render above the composer');
+    }
+
+    const columnRect = conversationColumn.getBoundingClientRect();
+    const composerRect = composerBox.getBoundingClientRect();
+    const descriptorRect = contextDescriptor.getBoundingClientRect();
+    expect(Math.abs(columnRect.left - composerRect.left)).toBeLessThanOrEqual(1);
+    expect(Math.abs(columnRect.right - composerRect.right)).toBeLessThanOrEqual(1);
+    expect(descriptorRect.left).toBeGreaterThanOrEqual(columnRect.left - 1);
+    expect(descriptorRect.right).toBeLessThanOrEqual(columnRect.right + 1);
+    expect(composerRect.width).toBeLessThanOrEqual(942);
   });
 
   test('stale citation warning chip does not overflow at 375px', async () => {

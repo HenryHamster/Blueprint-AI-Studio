@@ -20,7 +20,7 @@ from sqlalchemy import String, cast, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.models import KnowledgeDocument, SourceKind
+from app.models import KnowledgeDocument, SourceKind, Task, TaskStatus
 
 
 COMPUTE_KNOWLEDGE_ACCEPTANCE_GRADE_ACCEPTANCE = "acceptance"
@@ -253,8 +253,6 @@ async def fetch_knowledge_substance_index(
     whose originating task is CANCELLED but whose substance persists as a durable
     KnowledgeDocument, preventing escalation-parking forever.
     """
-    from app.models import Task
-
     rows = (
         await session.execute(
             select(
@@ -329,6 +327,11 @@ def serialize_knowledge_document(doc: KnowledgeDocument, *, include_body: bool) 
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "release_evidence": verdict.get("release_evidence"),
         "unavailable_cause": verdict.get("unavailable_cause"),
+        "criterion_met": (
+            verdict.get("criterion_met")
+            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+            else None
+        ),
         "authoring_branch": doc.authoring_branch,
         "head_sha": doc.head_sha,
         "sweep_id": doc.sweep_id,
@@ -493,6 +496,13 @@ _KNOWLEDGE_INDEX_KEEP = 20
 # the agent knowledge-document endpoint.
 _KNOWLEDGE_INDEX_SUMMARY_CHARS = 200
 
+def derive_compute_arm_label_from_payload(payload: dict[str, Any] | None) -> str | None:
+    """Return the canonical planned arm label for a compute_experiment payload."""
+    if not isinstance(payload, dict):
+        return None
+    raw_arm = payload.get("experiment") or payload.get("arm_label") or None
+    return (str(raw_arm).strip()[:256] if raw_arm else None) or None
+
 
 def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
     """Build one compact, body-omitted index entry for a knowledge document.
@@ -515,6 +525,11 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         if isinstance(doc.forward_quality_verdict, dict)
         else {}
     )
+    is_compute = doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
+    # criterion_met: tri-state (True/False/None) read from the persisted verdict.
+    # True = criterion was met, False = not met, None = unmeasured/not evaluable.
+    # Distinct from compute_acceptance_grade (a trustworthiness signal).
+    criterion_met: bool | None = verdict.get("criterion_met") if is_compute else None
     return {
         "id": str(doc.id),
         "title": doc.title,
@@ -525,18 +540,17 @@ def _knowledge_index_entry(doc: KnowledgeDocument, summary_chars: int) -> dict:
         "sweep_id": doc.sweep_id,
         "arm_label": doc.arm_label,
         "analysis_fallback_reason": (
-            verdict.get("fallback_reason")
-            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
-            else None
+            verdict.get("fallback_reason") if is_compute else None
         ),
         "knowledge_acceptance_evidence": acceptance["knowledge_acceptance_evidence"],
         "compute_acceptance_grade": acceptance["compute_acceptance_grade"],
         "compute_acceptance_reason": acceptance["compute_acceptance_reason"],
         "unavailable_cause": (
-            verdict.get("unavailable_cause")
-            if doc.source_kind == SourceKind.COMPUTE_EXPERIMENT.value
-            else None
+            verdict.get("unavailable_cause") if is_compute else None
         ),
+        "criterion_met": criterion_met,
+        "criterion": verdict.get("criterion") if is_compute else None,
+        "per_arm_verdicts": verdict.get("per_arm_verdicts") if is_compute else None,
         "origin_provenance": serialize_origin_provenance(doc),
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
     }
@@ -675,6 +689,36 @@ async def build_sweep_knowledge_index(
 _SWEEP_GROUPS_LIMIT = 10
 _SWEEP_MIN_DOCS = 2
 
+_COMPUTE_SWEEP_TERMINAL_STATUSES = frozenset(
+    (
+        TaskStatus.COMPLETED,
+        TaskStatus.FAILED,
+        TaskStatus.CANCELLED,
+        TaskStatus.BLOCKED,
+    )
+)
+
+
+def _compute_sweep_task_is_terminal(task: Task) -> bool:
+    try:
+        status = TaskStatus(task.status)
+    except (TypeError, ValueError):
+        return False
+    return status in _COMPUTE_SWEEP_TERMINAL_STATUSES
+
+
+def _compute_sweep_doc_is_definitive(doc: KnowledgeDocument) -> bool:
+    verdict = (
+        doc.forward_quality_verdict
+        if isinstance(doc.forward_quality_verdict, dict)
+        else {}
+    )
+    if verdict.get("unavailable_cause"):
+        return False
+    if isinstance(verdict.get("criterion_met"), bool):
+        return True
+    return verdict.get("outcome") is not None
+
 
 async def build_compute_sweep_groups(
     session: AsyncSession,
@@ -684,37 +728,230 @@ async def build_compute_sweep_groups(
     limit: int = _SWEEP_GROUPS_LIMIT,
     summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
 ) -> dict[str, list[dict]]:
-    """Group compute_experiment docs by sweep_id for the strategist payload.
+    """Group complete compute_experiment sweeps by their planned task roster.
 
-    Returns ``{sweep_id: [entry, ...]}`` for sweeps that have at least
-    ``_SWEEP_MIN_DOCS`` docs (lone-arm sweeps already appear in the flat
-    knowledge_index). Bounded to ``limit`` distinct sweeps, newest-first.
-    Sweeps with no sweep_id are excluded.
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that pass the completeness
+    gate. Bounded to ``limit`` distinct sweeps, newest-first. Sweeps with no
+    sweep_id are excluded. Two paths populate the result:
+
+    1. Multi-doc path: sweeps with ``>= _SWEEP_MIN_DOCS`` KnowledgeDocuments.
+    2. Single-doc arms-block path: sweeps with exactly one KnowledgeDocument
+       whose ``per_arm_verdicts`` carries ``>= _SWEEP_MIN_DOCS`` arms, each
+       with a boolean ``met`` value. Used for single-task arms-block experiments
+       where all arm results are encoded in a single document.
+
+    Completeness gate (both paths): when compute_experiment Task rows for this
+    project carry a matching sweep_id in their first payload, every such task
+    must have a usable KnowledgeDocument (source_task_id match, no
+    unavailable_cause) before the sweep is returned. Sweeps that fail this
+    check are excluded so the strategist cannot synthesise from partial
+    evidence. When no Task manifest is discoverable for a sweep, the
+    docs-only behavior is preserved unchanged.
     """
-    stmt = build_knowledge_documents_stmt(
-        project_id,
-        source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
-        **({"direction": direction_id} if direction_id else {}),
-    ).where(KnowledgeDocument.sweep_id.is_not(None)).order_by(
-        KnowledgeDocument.sweep_id,
-        KnowledgeDocument.created_at.desc(),
+    docs_stmt = (
+        build_knowledge_documents_stmt(
+            project_id,
+            source_kind=SourceKind.COMPUTE_EXPERIMENT.value,
+        )
+        .where(KnowledgeDocument.sweep_id.is_not(None))
+        .order_by(KnowledgeDocument.sweep_id, KnowledgeDocument.created_at.desc())
     )
-    rows = (await session.execute(stmt)).scalars().all()
+    all_doc_rows = (await session.execute(docs_stmt)).scalars().all()
 
-    by_sweep: dict[str, list[dict]] = {}
-    for doc in rows:
+    all_sweep_ids: set[str] = set()
+    for doc in all_doc_rows:
         sid = doc.sweep_id
         if sid is None:
             continue
-        by_sweep.setdefault(sid, []).append(_knowledge_index_entry(doc, summary_chars))
+        all_sweep_ids.add(sid)
 
-    # Keep only sweeps with at least _SWEEP_MIN_DOCS, then cap at limit (newest sweep wins).
-    multi = {sid: entries for sid, entries in by_sweep.items() if len(entries) >= _SWEEP_MIN_DOCS}
-    if not multi:
+    if not all_sweep_ids:
         return {}
+
+    task_stmt = select(Task).where(
+        Task.project_id == project_id,
+        Task.payloads[0]["type"].as_string() == SourceKind.COMPUTE_EXPERIMENT.value,
+        Task.payloads[0]["sweep_id"].as_string().in_(list(all_sweep_ids)),
+    )
+    if direction_id:
+        task_stmt = task_stmt.where(
+            Task.context["direction_id"].as_string() == direction_id
+        )
+    tasks = (await session.execute(task_stmt)).scalars().all()
+
+    planned: dict[str, dict[str | None, list[Task]]] = {}
+    task_to_arm: dict[uuid.UUID, str | None] = {}
+    for task in tasks:
+        payload = task.first_payload or {}
+        raw_sweep_id = payload.get("sweep_id") or None
+        sweep_id = (str(raw_sweep_id).strip()[:128] if raw_sweep_id else None) or None
+        if sweep_id is None:
+            continue
+        arm_label = derive_compute_arm_label_from_payload(payload)
+        planned.setdefault(sweep_id, {}).setdefault(arm_label, []).append(task)
+        task_to_arm[task.id] = arm_label
+
+    if direction_id:
+        scoped_task_ids = set(task_to_arm)
+        doc_rows = [
+            doc
+            for doc in all_doc_rows
+            if doc.direction_id == direction_id or doc.source_task_id in scoped_task_ids
+        ]
+    else:
+        doc_rows = all_doc_rows
+
+    by_sweep_docs: dict[str, list[KnowledgeDocument]] = {}
+    for doc in doc_rows:
+        sid = doc.sweep_id
+        if sid is None:
+            continue
+        by_sweep_docs.setdefault(sid, []).append(doc)
+
+    if not by_sweep_docs:
+        return {}
+
+    multi_docs = {
+        sid: docs
+        for sid, docs in by_sweep_docs.items()
+        if len(docs) >= _SWEEP_MIN_DOCS
+    }
+    single_doc_candidates: dict[str, KnowledgeDocument] = {
+        sid: docs[0]
+        for sid, docs in by_sweep_docs.items()
+        if len(docs) == 1
+    }
+
+    docs_by_sweep_arm: dict[str, dict[str, KnowledgeDocument]] = {}
+    for doc in doc_rows:
+        if doc.source_task_id not in task_to_arm:
+            continue
+        arm_label = task_to_arm[doc.source_task_id]
+        if arm_label is None or doc.arm_label != arm_label:
+            continue
+        sweep_id = doc.sweep_id
+        if sweep_id is None:
+            continue
+        docs_by_sweep_arm.setdefault(sweep_id, {}).setdefault(arm_label, doc)
+
+    complete: dict[str, list[dict]] = {}
+    for sweep_id, docs in multi_docs.items():
+        arms = planned.get(sweep_id)
+        if not arms:
+            complete[sweep_id] = [
+                _knowledge_index_entry(doc, summary_chars) for doc in docs
+            ]
+            continue
+
+        labels = [label for label in arms if label is not None]
+        if len(labels) != len(arms) or len(set(labels)) < _SWEEP_MIN_DOCS:
+            continue
+        if any(
+            not _compute_sweep_task_is_terminal(task)
+            for arm_tasks in arms.values()
+            for task in arm_tasks
+        ):
+            continue
+
+        selected_docs: list[KnowledgeDocument] = []
+        sweep_docs = docs_by_sweep_arm.get(sweep_id, {})
+        for label in sorted(set(labels)):
+            doc = sweep_docs.get(label)
+            if doc is None or not _compute_sweep_doc_is_definitive(doc):
+                selected_docs = []
+                break
+            selected_docs.append(doc)
+        if not selected_docs:
+            continue
+        selected_docs.sort(
+            key=lambda d: d.created_at.isoformat() if d.created_at else "",
+            reverse=True,
+        )
+        complete[sweep_id] = [
+            _knowledge_index_entry(doc, summary_chars) for doc in selected_docs
+        ]
+
+    for sweep_id, doc in single_doc_candidates.items():
+        if sweep_id in complete:
+            continue
+        arms = planned.get(sweep_id)
+        if arms and any(
+            not _compute_sweep_task_is_terminal(task)
+            for arm_tasks in arms.values()
+            for task in arm_tasks
+        ):
+            continue
+        if arms and not all(
+            any(
+                doc.source_task_id == task.id and _compute_sweep_doc_is_definitive(doc)
+                for doc in by_sweep_docs.get(sweep_id, [])
+            )
+            for arm_tasks in arms.values()
+            for task in arm_tasks
+        ):
+            continue
+        fqv = (
+            doc.forward_quality_verdict
+            if isinstance(doc.forward_quality_verdict, dict)
+            else {}
+        )
+        verdicts = fqv.get("per_arm_verdicts")
+        if not isinstance(verdicts, dict):
+            continue
+        arm_items = list(verdicts.items())
+        if len(arm_items) < _SWEEP_MIN_DOCS:
+            continue
+        if not all(
+            isinstance(arm, dict) and arm.get("met") in (True, False)
+            for _, arm in arm_items
+        ):
+            continue
+        base_entry = _knowledge_index_entry(doc, summary_chars)
+        complete[sweep_id] = [
+            {**base_entry, "arm_label": str(arm_name), "criterion_met": arm.get("met")}
+            for arm_name, arm in arm_items
+        ]
+
+    if not complete:
+        return {}
+
+    # Annotate the first entry of each sweep with the disposition task (act-on-verdict
+    # sweep follow-on) when one exists, so the strategist can skip re-synthesizing sweeps
+    # that already have a follow-on in progress or completed.
+    _sweep_ids = list(complete.keys())
+    _disp_rows = (
+        await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.context["act_on_verdict_sweep_id"].as_string().in_(_sweep_ids),
+            )
+        )
+    ).scalars().all()
+    _disposition: dict[str, dict] = {}
+    for _t in _disp_rows:
+        _sid = (_t.context or {}).get("act_on_verdict_sweep_id")
+        if not _sid or _sid not in complete:
+            continue
+        _status = _t.status.value if hasattr(_t.status, "value") else str(_t.status)
+        _status_norm = _status.strip().lower()
+        if _status_norm not in {
+            TaskStatus.QUEUED.value.lower(),
+            TaskStatus.PROVISIONING.value.lower(),
+            TaskStatus.IN_PROGRESS.value.lower(),
+            TaskStatus.EVALUATING.value.lower(),
+            TaskStatus.COMPLETED.value.lower(),
+        }:
+            continue
+        _existing = _disposition.get(_sid)
+        # Prefer any non-terminal disposition over a completed one when multiple tasks exist.
+        if _existing is None or _existing.get("status") == TaskStatus.COMPLETED.value:
+            _disposition[_sid] = {"task_id": str(_t.id), "status": _status}
+    for _sid, _disp in _disposition.items():
+        if complete[_sid]:
+            complete[_sid][0]["sweep_disposition"] = _disp
     # Sort sweeps by the created_at of their newest entry (descending).
     ordered = sorted(
-        multi.items(),
+        complete.items(),
         key=lambda kv: (kv[1][0].get("created_at") or ""),
         reverse=True,
     )

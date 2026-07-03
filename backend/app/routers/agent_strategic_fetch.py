@@ -27,8 +27,11 @@ from sqlalchemy.orm import selectinload
 from sqlmodel import select
 
 from app.database import get_session
+from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
+from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, QualificationVerdict, ReleaseVersion, Task
+from app.project_message_projection import agent_fetch_message_dict
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -70,7 +73,6 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "promotion_error_detail",
         "error",
         "detail",
-        "theme_delivery",
         "goal_alignment",
         "blind_merge_grade",
         "merge_grade_status",
@@ -152,9 +154,16 @@ def _compose_serving_block(
     }
 
 
+_FINALIZED_TERMINAL_STATUSES = frozenset(
+    {"promoted", "not_promoted", "dry_run", "promotion_failed"}
+)
+
+
 def _compact_version_lifecycle(
     version: ReleaseVersion,
     project: Project,
+    *,
+    latest_verdict: "QualificationVerdict | None" = None,
 ) -> dict[str, Any]:
     from app import release_version as _release_version
     from app.release_artifacts import version_serving_summary
@@ -165,13 +174,32 @@ def _compact_version_lifecycle(
         if isinstance(version.last_qualification, dict)
         else {}
     )
-    return {
+
+    # Detect pending/verdict disagreement: last_qualification is in a transient
+    # promotion_pending state but the verdict row already has a finalized outcome.
+    verdict_disagreement: dict[str, Any] | None = None
+    effective_qual = qual
+    if (
+        latest_verdict is not None
+        and qual.get("status") == "pending"
+        and isinstance(qual.get("promotion_pending"), dict)
+        and latest_verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
+    ):
+        verdict_disagreement = {
+            "last_qualification_status": "pending",
+            "verdict_terminal_status": latest_verdict.terminal_status,
+        }
+        # Use the finalized verdict status so summarize_qualification_state sees
+        # the resolved outcome instead of the transient promotion_in_flight state.
+        effective_qual = {**qual, "status": latest_verdict.terminal_status}
+        effective_qual.pop("promotion_pending", None)
+
+    out = {
         "id": str(version.id),
         "version_number": version.version_number,
         "status": version.status,
         "phase": version.phase,
         "goal": version.goal,
-        "theme": version.theme,
         "opened_at": _iso(version.opened_at),
         "phase_changed_at": _iso(version.phase_changed_at),
         "phase_reasoning": version.phase_reasoning,
@@ -182,7 +210,7 @@ def _compact_version_lifecycle(
         "active_candidate_sha": qual.get("candidate_sha"),
         "last_qualification": _compact_last_qualification(qual),
         "qualification_state": _release_version.summarize_qualification_state(
-            qual,
+            effective_qual,
             version.serving_status,
             version.deploy_failure_reason,
             aggregate_serving_status=aggregate_serving["serving_status"],
@@ -199,6 +227,9 @@ def _compact_version_lifecycle(
         "artifacts": artifacts,
         "serving": _compose_serving_block(aggregate_serving, artifacts, version),
     }
+    if verdict_disagreement is not None:
+        out["qualification_state_disagreement"] = verdict_disagreement
+    return out
 
 
 async def _resolve_agent_project(
@@ -245,6 +276,38 @@ async def agent_fetch_direction(
     if direction is None:
         raise HTTPException(status_code=404, detail="Direction not found")
     out = dict(direction)
+    # Compute merge_credit summary from the full history before capping.
+    full_history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    _total_prs_merged = sum(h.get("prs_merged", 0) for h in full_history) + (
+        agg.get("total_prs_merged") or 0
+    )
+    _total_verified = sum(verified_merged_count(h) for h in full_history) + (
+        agg.get("total_verified_prs_merged", agg.get("total_prs_merged", 0)) or 0
+    )
+    _total_proven = sum(proven_merged_count(h) for h in full_history) + (
+        agg.get("total_acceptance_proven_merged", 0) or 0
+    )
+    _total_consumed = sum(
+        h.get("acceptance_consumed_merged", 0) for h in full_history
+    ) + (agg.get("total_acceptance_consumed_merged", 0) or 0)
+    _reachable_counts = [reachable_merged_count(h) for h in full_history]
+    _any_reachable_recorded = any(c is not None for c in _reachable_counts) or bool(
+        agg.get("total_reachable_prs_merged")
+    ) or (agg.get("total_reachable_recorded_cycles", 0) or 0) > 0
+    _total_reachable: int | None = None
+    if _any_reachable_recorded:
+        _total_reachable = sum(
+            c for c in _reachable_counts if c is not None
+        ) + (agg.get("total_reachable_prs_merged", 0) or 0)
+    out["merge_credit"] = {
+        "prs_merged": _total_prs_merged,
+        "verified_prs_merged": _total_verified,
+        "badge_only_prs_merged": max(0, _total_prs_merged - _total_verified),
+        "proven_prs_merged": _total_proven,
+        "consumed_prs_merged": _total_consumed,
+        **({"reachable_prs_merged": _total_reachable} if _total_reachable is not None else {}),
+    }
     history = out.get("research_history")
     if isinstance(history, list) and len(history) > _RESEARCH_HISTORY_KEEP_ON_FETCH:
         out["research_history"] = history[-_RESEARCH_HISTORY_KEEP_ON_FETCH:]
@@ -355,22 +418,12 @@ async def agent_fetch_message(
     too-short (400) refs, and matches across all statuses."""
     project = await _resolve_agent_project(project_id, token, session)
     msg = await resolve_message_ref(session, project.id, ref)
-    message_type = msg.message_type
-    type_value = (
-        message_type.value if hasattr(message_type, "value") else str(message_type)
-    )
     return {
         "status": "success",
-        "data": {
-            "id": str(msg.id),
-            "content": msg.content,
-            "type": type_value,
-            "from_type": msg.from_type,
-            "status": msg.status,
-            "resolution": msg.resolution,
-            "convergence_link": get_message_link(msg),
-            "created_at": msg.created_at.isoformat() if msg.created_at else None,
-        },
+        "data": agent_fetch_message_dict(
+            msg,
+            convergence_link=get_message_link(msg),
+        ),
     }
 
 
@@ -448,6 +501,24 @@ async def agent_fetch_qualification(
             project_id,
         )
 
+    # Goal-coverage drift signal (ADDITIVE). Best-effort: failure degrades to
+    # goal_coverage_drift: None without breaking the read.
+    goal_coverage_drift: dict | None = None
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_goal_coverage_drift_signal,
+        )
+
+        goal_coverage_drift = await compute_goal_coverage_drift_signal(
+            session, project_id
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] goal_coverage_drift compute failed for project %s; "
+            "serving qualification without the drift signal",
+            project_id,
+        )
+
     verdict = (
         (
             await session.execute(
@@ -465,21 +536,53 @@ async def agent_fetch_qualification(
     )
 
     if verdict is not None:
+        # Identity fields (candidate_sha, status, finalized_at) come from the
+        # Version Phase (last_qualification) when available — it is the
+        # authoritative current record and may be newer than the verdict row
+        # when a subsequent re-qualification overwrote the open-version record
+        # without producing a new verdict. Findings still come from the verdict
+        # row because its audit_findings column is immutable and survives
+        # re-qualification overwrites.
+        #
+        # Exception: when last_qualification is in a transient "pending" state
+        # with a promotion_pending sub-key AND the verdict row already carries a
+        # finalized terminal_status, the verdict is canonical — use it so the
+        # agent sees the resolved disposition instead of the stale pending.
+        lq = open_row.last_qualification or {}
+        lq_status = lq.get("status")
+        lq_has_promotion_pending = isinstance(lq.get("promotion_pending"), dict)
+        verdict_is_finalized = verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
+
+        source_disagreement: dict[str, Any] | None = None
+        if lq_status == "pending" and lq_has_promotion_pending and verdict_is_finalized:
+            resolved_status = verdict.terminal_status
+            resolved_finalized_at = (
+                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+            )
+            source_disagreement = {
+                "last_qualification_status": lq_status,
+                "verdict_terminal_status": verdict.terminal_status,
+            }
+        else:
+            resolved_status = lq_status or verdict.terminal_status
+            resolved_finalized_at = lq.get("finalized_at") or (
+                verdict.finalized_at.isoformat() if verdict.finalized_at else None
+            )
+
         return {
-            "candidate_sha": verdict.candidate_sha,
-            "finalized_at": verdict.finalized_at.isoformat()
-            if verdict.finalized_at
-            else None,
-            "status": verdict.terminal_status,
+            "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
+            "finalized_at": resolved_finalized_at,
+            "status": resolved_status,
             "confidence": verdict.confidence,
             "sub_scores": verdict.sub_scores,
             "findings": get_latest_qualification_audit_findings(open_row, verdict),
             "excluded_findings": verdict.excluded_audit_findings or [],
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
             or [],
-            "theme_delivery": verdict.theme_delivery,
             "goal_alignment": verdict.goal_alignment,
             "source": "qualification_verdict",
+            "source_disagreement": source_disagreement,
+            "goal_coverage_drift": goal_coverage_drift,
             **requalification_extra,
         }
 
@@ -494,9 +597,9 @@ async def agent_fetch_qualification(
         "excluded_findings": qual.get("excluded_audit_findings") or [],
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
-        "theme_delivery": qual.get("theme_delivery"),
         "goal_alignment": qual.get("goal_alignment"),
         "source": "last_qualification",
+        "goal_coverage_drift": goal_coverage_drift,
         **requalification_extra,
     }
 
@@ -552,18 +655,126 @@ async def agent_fetch_version_phase(
         .all()
     )
 
+    # Goal-coverage drift signal for the open version (ADDITIVE). Best-effort:
+    # failure degrades to goal_coverage_drift: None without breaking the read.
+    version_phase_drift: dict | None = None
+    if open_row is not None:
+        try:
+            from app.release_readiness import (  # noqa: PLC0415
+                compute_goal_coverage_drift_signal,
+            )
+
+            version_phase_drift = await compute_goal_coverage_drift_signal(
+                session, project_id
+            )
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] goal_coverage_drift compute failed for project %s",
+                project_id,
+            )
+
+    # Criterion coverage for the open version (ADDITIVE). Best-effort: failure
+    # degrades to criterion_coverage absent from current_version without breaking
+    # the read. Gives the agent the canonical per-criterion coverage ledger when
+    # the spawn payload was trimmed or dropped under budget pressure.
+    version_phase_criterion_coverage: dict | None = None
+    if open_row is not None:
+        try:
+            from app.acceptance_criteria import (  # noqa: PLC0415
+                get_version_coverage_summary,
+            )
+
+            version_phase_criterion_coverage = await get_version_coverage_summary(
+                session, open_row.id
+            )
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] criterion_coverage compute failed for project %s",
+                project_id,
+            )
+
+    open_version_verdict: QualificationVerdict | None = None
+    if open_row is not None:
+        open_version_verdict = (
+            (
+                await session.execute(
+                    select(QualificationVerdict)
+                    .where(
+                        QualificationVerdict.release_version_id == open_row.id,
+                        QualificationVerdict.audit_findings.is_not(None),
+                    )
+                    .order_by(QualificationVerdict.created_at.desc())
+                    .limit(1)
+                )
+            )
+            .scalars()
+            .first()
+        )
+
+    _current_version_data = (
+        _compact_version_lifecycle(open_row, project, latest_verdict=open_version_verdict)
+        if open_row is not None
+        else None
+    )
+    if _current_version_data is not None and version_phase_criterion_coverage is not None:
+        _current_version_data["criterion_coverage"] = version_phase_criterion_coverage
+
+    # Candidate-currency signal for the fetch/recovery path — same HEAD-vs-candidate
+    # comparison the spawn payload provides in payload_staleness.  Best-effort:
+    # a GitHub API failure must not break the endpoint. When freshness is
+    # indeterminate (currency=None), include a minimal marker with verdict="unknown"
+    # so the agent can distinguish indeterminate from absent/no-open-version.
+    candidate_currency: dict | None = None
+    if open_row is not None:
+        try:
+            from app.strategic_spawning import (  # noqa: PLC0415
+                _build_freshness_shas_block,
+                _freshness_generated_at,
+                _resolve_candidate_currency,
+                get_project_integration_branch,
+            )
+
+            _last_qual = open_row.last_qualification or {}
+            _integration_branch = get_project_integration_branch(project)
+            _raw_currency = await _resolve_candidate_currency(
+                session, project, _last_qual, _integration_branch
+            )
+            if _raw_currency is not None:
+                candidate_currency = {
+                    **_raw_currency,
+                    **_build_freshness_shas_block(_raw_currency),
+                }
+            else:
+                # Indeterminate: freshness could not be resolved (GitHub unreachable,
+                # no candidate SHA on record, etc.). Mark explicitly so agent knows
+                # the state is unknown, not current or stale.
+                candidate_currency = {
+                    "verdict": "unknown",
+                    "generated_at": _freshness_generated_at(),
+                }
+        except Exception:
+            logger.exception(
+                "[AGENT_FETCH] candidate_currency resolve failed for project %s",
+                project_id,
+            )
+            # On exception, also include the indeterminate marker.
+            from app.strategic_spawning import _freshness_generated_at  # noqa: PLC0415
+
+            candidate_currency = {
+                "verdict": "unknown",
+                "generated_at": _freshness_generated_at(),
+            }
+
     return {
         "status": "success",
         "data": {
             "source": "open_version" if open_row is not None else "no_open_version",
-            "current_version": (
-                _compact_version_lifecycle(open_row, project)
-                if open_row is not None
-                else None
-            ),
+            "current_version": _current_version_data,
             "recent_versions": [
                 _compact_version_lifecycle(row, project) for row in recent_closed_rows
             ],
+            "goal_coverage_drift": version_phase_drift,
+            **({"candidate_currency": candidate_currency} if candidate_currency is not None else {}),
         },
     }
 
@@ -699,6 +910,49 @@ async def agent_fetch_capability_trials(
             "verdicts": verdicts,
         },
     }
+
+
+@router.get("/projects/{project_id}/compute-sweeps")
+@limiter.limit("60/minute")
+async def agent_fetch_compute_sweeps(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return grouped compute-experiment sweep evidence for the project.
+
+    Returns ``{sweep_id: [entry, ...]}`` for sweeps that have at least two
+    documents (the same grouping that the strategic payload packs under
+    ``compute_experiment_sweeps``). Used for recovery when that field was
+    dropped under budget pressure. Read-only; cross-project access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    groups = await build_compute_sweep_groups(session, project_id)
+    return {"status": "success", "data": groups}
+
+
+@router.get("/projects/{project_id}/compute-sweeps/{sweep_id}")
+@limiter.limit("60/minute")
+async def agent_fetch_compute_sweep(
+    request: Request,
+    project_id: uuid.UUID,
+    sweep_id: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return all compute-experiment docs for a single sweep, oldest-first.
+
+    Covers both per-arm docs (arm_label set) and the sweep-aggregate doc
+    (arm_label null). Used when the strategist needs to recover the full arm
+    evidence for one sweep without fetching all groups. Read-only; cross-project
+    access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    docs = await build_sweep_knowledge_index(session, project_id, sweep_id)
+    if not docs:
+        raise HTTPException(status_code=404, detail="Sweep not found")
+    return {"status": "success", "data": docs}
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

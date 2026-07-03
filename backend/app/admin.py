@@ -20,7 +20,7 @@ import json
 import logging
 import asyncio
 from datetime import datetime, timedelta, timezone
-from sqlalchemy import func, update, case, delete
+from sqlalchemy import func, update, case, delete, and_, or_
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
@@ -44,6 +44,7 @@ from app.models import (
     ProjectMessage,
     Artifact,
     ArtifactType,
+    StrategicCycle,
     TaskWakeRegistration,
     DeploymentState,
     DeploymentStatus,
@@ -70,8 +71,15 @@ from app.vm_cost_rates import (
     validate_compute_request,
 )
 from app.resource_envelope import resolve_project_hardware_policy
-from app.schemas import TaskEvaluationSummary, TaskEvaluationSummaryItem
+from app.schemas import (
+    TaskEvaluationSummary,
+    TaskEvaluationSummaryItem,
+    redact_task_payloads,
+)
+from app.project_message_projection import compact_text, message_preview_dict
 from app.task_outcomes import build_task_evaluation_summary
+from app.task_direction_refs import first_task_direction_id, task_related_direction_ids
+from app.task_movement import build_task_movement_explanation
 from app.compute import _capture_serial_for_vm, get_vm_zone, get_vm_status
 from app.admin_helpers import (  # noqa: F401
     _ROLE_LEVEL,
@@ -82,6 +90,8 @@ from app.admin_helpers import (  # noqa: F401
     _get_user_task_with_role,
 )
 from app.admin_task_mutations import (
+    CANCEL_CASCADE_CHILD_STATUSES,
+    CANCEL_WAITING_DEPENDENT_STATUSES,
     _handle_rollup_pr_approval,
     _handle_task_pr_approval,
     modify_task_apply,
@@ -202,6 +212,7 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 # up to ~100KB of research_findings plus unbounded status_log, so 500 rows
 # x large-tail payload stays safely under Cloud Run's 32 MB response limit.
 ADMIN_TASKS_MAX_LIMIT = 500
+ADMIN_TASKS_DIRECTION_SCAN_BATCH = 500
 
 
 @router.get("/tasks")
@@ -256,8 +267,6 @@ async def get_all_tasks(
         if created_after.tzinfo is not None:
             created_after = created_after.astimezone(timezone.utc).replace(tzinfo=None)
         filters.append(Task.created_at >= created_after)
-    if direction_id:
-        filters.append(Task.context["direction_id"].as_string() == direction_id)
     if task_type:
         filters.append(Task.payloads[0]["type"].as_string() == task_type)
     if spawned_by:
@@ -268,17 +277,69 @@ async def get_all_tasks(
         # triage filter. Omitted (None) -> no change to existing behavior.
         filters.append(Task.requires_approval == approval_needed)
 
-    count_query = select(func.count()).select_from(Task)
-    for f in filters:
-        count_query = count_query.where(f)
-    total = (await session.execute(count_query)).scalar() or 0
+    if direction_id:
+        matching_task_ids: list[uuid.UUID] = []
+        last_seen_created_at: datetime | None = None
+        last_seen_id: uuid.UUID | None = None
+        while True:
+            scan_query = (
+                select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.created_at,
+                        Task.context,
+                        Task.payloads,
+                        Task.plan_output,
+                        raiseload=True,
+                    )
+                )
+                .order_by(Task.created_at.desc(), Task.id.desc())
+                .limit(ADMIN_TASKS_DIRECTION_SCAN_BATCH)
+            )
+            for f in filters:
+                scan_query = scan_query.where(f)
+            if last_seen_created_at is not None and last_seen_id is not None:
+                scan_query = scan_query.where(
+                    (Task.created_at < last_seen_created_at)
+                    | (
+                        (Task.created_at == last_seen_created_at)
+                        & (Task.id < last_seen_id)
+                    )
+                )
+            batch = (await session.execute(scan_query)).scalars().all()
+            if not batch:
+                break
+            for task in batch:
+                if direction_id in task_related_direction_ids(task):
+                    matching_task_ids.append(task.id)
+            last_seen = batch[-1]
+            last_seen_created_at = last_seen.created_at
+            last_seen_id = last_seen.id
+            if len(batch) < ADMIN_TASKS_DIRECTION_SCAN_BATCH:
+                break
 
-    query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
-    for f in filters:
-        query = query.where(f)
+        total = len(matching_task_ids)
+        page_task_ids = matching_task_ids[offset : offset + limit]
+        if page_task_ids:
+            page_order = {task_id: index for index, task_id in enumerate(page_task_ids)}
+            page_query = select(Task).where(Task.id.in_(page_task_ids))
+            result = await session.execute(page_query)
+            tasks = sorted(result.scalars().all(), key=lambda task: page_order[task.id])
+        else:
+            tasks = []
+    else:
+        count_query = select(func.count()).select_from(Task)
+        for f in filters:
+            count_query = count_query.where(f)
+        total = (await session.execute(count_query)).scalar() or 0
 
-    result = await session.execute(query)
-    tasks = result.scalars().all()
+        query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
+        for f in filters:
+            query = query.where(f)
+
+        result = await session.execute(query)
+        tasks = result.scalars().all()
 
     # Join artifacts to include all artifacts per task
     task_ids = [t.id for t in tasks]
@@ -419,7 +480,7 @@ async def get_all_tasks(
 
     result_list = []
     for t in tasks:
-        task_type = (t.first_payload).get("type", "create")
+        task_type = _task_payload_dict(t).get("type", "create")
         task_dict = {
             "id": str(t.id),
             "project_id": str(t.project_id),
@@ -457,7 +518,7 @@ async def get_all_tasks(
             # non-PARKED or pre-migration task; the admin UI guards on presence.
             "parked_at": t.parked_at.isoformat() if t.parked_at else None,
             "park_reason": t.park_reason,
-            "payloads": t.payloads,
+            "payloads": redact_task_payloads(t.payloads),
             "context": {
                 k: v
                 for k, v in (t.context or {}).items()
@@ -759,7 +820,7 @@ async def _bulk_retry_one_task(
             # task.id to _terminated_task_ids, revoking any outstanding JWT.
             # Drop the cache entry so the next provisioned VM can claim.
             _terminated_task_ids.pop(str(task.id), None)
-            task_type = (task.first_payload).get("type", "")
+            task_type = _task_payload_dict(task).get("type", "")
             is_parent_type = task_type in ("research", "plan")
             if preloaded_has_children is not None:
                 # Use pre-fetched boolean (batch query in bulk_action_tasks)
@@ -879,14 +940,7 @@ async def bulk_action_tasks(
         _child_result = await session.execute(
             select(Task).where(
                 Task.parent_task_id.in_(list(valid_map.values())),
-                Task.status.in_(
-                    [
-                        TaskStatus.QUEUED,
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                ),
+                Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
             )
         )
         for _child in _child_result.scalars().all():
@@ -899,7 +953,7 @@ async def bulk_action_tasks(
         _parent_type_ids = [
             task_obj.id
             for task_obj in fetched.values()
-            if (task_obj.first_payload or {}).get("type") in ("research", "plan")
+            if _task_payload_dict(task_obj).get("type") in ("research", "plan")
         ]
         if _parent_type_ids:
             _child_parent_rows = (
@@ -1144,6 +1198,394 @@ def _task_llm_cost_fields(task: Task) -> dict:
     }
 
 
+def _status_value(status: TaskStatus | str) -> str:
+    return status.value if isinstance(status, TaskStatus) else str(status)
+
+
+def _status_values(statuses: tuple[TaskStatus, ...]) -> list[str]:
+    return [_status_value(status) for status in statuses]
+
+
+def _task_payload_dict(task: Task | None) -> dict[str, Any]:
+    if task is None:
+        return {}
+    payload = task.first_payload or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _task_direction_id(task: Task) -> str | None:
+    return first_task_direction_id(task)
+
+
+def _find_task_direction_ref(task: Task, project: Project | None) -> dict[str, Any] | None:
+    direction_id = _task_direction_id(task)
+    if not direction_id:
+        return None
+    directions = project.directions if project and isinstance(project.directions, list) else []
+    row = next(
+        (
+            direction
+            for direction in directions
+            if isinstance(direction, dict) and str(direction.get("id") or "") == direction_id
+        ),
+        None,
+    )
+    if not row:
+        return {
+            "id": direction_id,
+            "text": None,
+            "priority": None,
+            "status": None,
+        }
+    return {
+        "id": direction_id,
+        "text": compact_text(row.get("text"), max_chars=240),
+        "priority": row.get("priority"),
+        "status": row.get("status") or "active",
+    }
+
+
+def _task_artifact_sideboard_summary(
+    artifacts: list[Artifact],
+    *,
+    primary_pr_url: str | None,
+    primary_commit: str | None,
+) -> dict[str, Any]:
+    by_type: dict[str, int] = {}
+    commit = primary_commit
+    for artifact in artifacts:
+        kind = str(_enum_value(artifact.artifact_type))
+        by_type[kind] = by_type.get(kind, 0) + 1
+        if commit is None and artifact.commit_hash:
+            commit = artifact.commit_hash
+    return {
+        "total": len(artifacts),
+        "by_type": by_type,
+        "primary_pr_url": primary_pr_url,
+        "primary_commit": commit,
+    }
+
+
+def _strategic_cycle_sideboard_ref(
+    task: Task,
+    cycle: StrategicCycle | None,
+) -> dict[str, Any] | None:
+    if cycle is None:
+        return None
+    phase = None
+    if cycle.phase1_task_id == task.id:
+        phase = "design_doc_update"
+    elif cycle.phase2_task_id == task.id:
+        phase = "strategic_review"
+    return {
+        "id": cycle.id,
+        "phase": phase,
+        "outcome": cycle.outcome,
+    }
+
+
+def _task_sideboard_next_action(task: Task) -> dict[str, Any]:
+    status = _status_value(task.status)
+    target = {"surface": "task", "id": str(task.id), "task_id": str(task.id)}
+    if status == "FAILED":
+        return {
+            "label": "Inspect failure",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": {**target, "section": "logs"},
+        }
+    if status == "BLOCKED":
+        return {
+            "label": "Resolve blocker",
+            "reason": compact_text(task.blocked_reason, max_chars=220),
+            "target": target,
+        }
+    if status == "PARKED":
+        return {
+            "label": "Review parked wake",
+            "reason": compact_text(task.park_reason, max_chars=220),
+            "target": target,
+        }
+    if task.requires_approval:
+        return {
+            "label": "Review approval",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": target,
+        }
+    if status == "QUEUED" and task.depends_on:
+        return {
+            "label": "Wait for dependencies",
+            "reason": f"{len(task.depends_on)} upstream task{'s' if len(task.depends_on) != 1 else ''}",
+            "target": {"surface": "pipeline", "id": str(task.id), "task_id": str(task.id)},
+        }
+    if status in _status_values(
+        (TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS, TaskStatus.EVALUATING)
+    ):
+        return {
+            "label": "Monitor progress",
+            "reason": compact_text(task.latest_status_message, max_chars=220),
+            "target": target,
+        }
+    return {
+        "label": "Open task detail",
+        "reason": compact_text(task.latest_status_message, max_chars=220),
+        "target": target,
+    }
+
+
+def _task_runner_sideboard_context(task: Task) -> dict[str, Any]:
+    ctx = task.context if isinstance(task.context, dict) else {}
+    return {
+        "vm_instance_id": compact_text(task.vm_instance_id, max_chars=120),
+        "runner_target_id": compact_text(ctx.get("runner_target_id"), max_chars=120),
+        "machine_type": compact_text(task.vm_machine_type, max_chars=80),
+        "spot": task.vm_spot,
+        "warm_start": task.vm_warm_start,
+        "provider": compact_text(task.provider, max_chars=80),
+        "account_id": compact_text(task.account_id, max_chars=120),
+    }
+
+
+def _task_sideboard_context(
+    task: Task,
+    *,
+    project: Project | None,
+    artifacts: list[Artifact],
+    child_count: int,
+    related_messages: list[ProjectMessage],
+    cycle: StrategicCycle | None,
+    primary_pr_url: str | None,
+    primary_commit: str | None,
+) -> dict[str, Any]:
+    repo = None
+    if project and project.github_owner and project.github_repo:
+        repo = f"{project.github_owner}/{project.github_repo}"
+    problem_model = project.problem_model if project and isinstance(project.problem_model, dict) else {}
+    intent = problem_model.get("intent") if isinstance(problem_model.get("intent"), dict) else {}
+    purpose = compact_text(
+        intent.get("current_focus") or intent.get("purpose"),
+        max_chars=220,
+    )
+    dependency_count = len(task.depends_on or [])
+    movement_explanation = build_task_movement_explanation(task)
+    llm_cost_fields = _task_llm_cost_fields(task)
+    task_type = _task_payload_dict(task).get("type", "create")
+    pipeline = {
+        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
+        "child_count": child_count,
+        "dependency_count": dependency_count,
+        "movement_explanation": compact_text(movement_explanation, max_chars=220),
+        "blocked_reason": compact_text(
+            task.blocked_reason or task.park_reason,
+            max_chars=220,
+        ),
+    }
+    links: list[dict[str, Any]] = [
+        {
+            "id": "pipeline",
+            "label": "Pipeline",
+            "target": {
+                "surface": "pipeline",
+                "id": str(task.id),
+                "task_id": str(task.id),
+            },
+        }
+    ]
+    if pipeline["parent_task_id"]:
+        links.append(
+            {
+                "id": "parent_task",
+                "label": "Parent",
+                "target": {
+                    "surface": "task",
+                    "id": pipeline["parent_task_id"],
+                    "task_id": pipeline["parent_task_id"],
+                },
+            }
+        )
+    direction = _find_task_direction_ref(task, project)
+    if direction:
+        links.append(
+            {
+                "id": "direction",
+                "label": "Direction",
+                "target": {
+                    "surface": "project",
+                    "section": "directions",
+                    "id": direction["id"],
+                    "direction_id": direction["id"],
+                },
+            }
+        )
+    if primary_pr_url:
+        links.append(
+            {
+                "id": "pull_request",
+                "label": "PR",
+                "target": {
+                    "surface": "external",
+                    "id": primary_pr_url,
+                    "url": primary_pr_url,
+                },
+            }
+        )
+
+    return {
+        "task": {
+            "id": str(task.id),
+            "title": compact_text(task.title, max_chars=160),
+            "status": _status_value(task.status),
+            "task_type": compact_text(task_type, max_chars=80),
+            "latest_status_message": compact_text(
+                task.latest_status_message,
+                max_chars=220,
+            ),
+            "blocker": {
+                "kind": compact_text(task.blocker_kind, max_chars=80),
+                "reason": compact_text(
+                    task.blocked_reason or task.park_reason,
+                    max_chars=220,
+                ),
+                "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
+                "recheck_after": task.recheck_after.isoformat()
+                if task.recheck_after
+                else None,
+                "parked_at": task.parked_at.isoformat() if task.parked_at else None,
+            },
+            "runner": _task_runner_sideboard_context(task),
+            "cost": {
+                "estimated_vm_usd": get_task_total_vm_cost_usd_or_none(task),
+                "llm_usd": llm_cost_fields["task_llm_cost_usd"],
+                "llm_any_unpriced": llm_cost_fields["task_llm_cost_any_unpriced"],
+            },
+            "next_action": _task_sideboard_next_action(task),
+        },
+        "project": {
+            "id": str(project.id) if project else str(task.project_id),
+            "name": project.name if project else None,
+            "repo": repo,
+        },
+        "purpose": purpose,
+        "strategic": {
+            "direction": direction,
+            "cycle": _strategic_cycle_sideboard_ref(task, cycle),
+        },
+        "pipeline": pipeline,
+        "artifacts": _task_artifact_sideboard_summary(
+            artifacts,
+            primary_pr_url=primary_pr_url,
+            primary_commit=primary_commit,
+        ),
+        "messages": {
+            "total_recent": len(related_messages),
+            "items": [message_preview_dict(message) for message in related_messages],
+        },
+        "links": links,
+    }
+
+
+def _task_has_cancel_pr_context_reference(task: Task) -> bool:
+    ctx = task.context or {}
+    if not isinstance(ctx, dict):
+        return False
+    if ctx.get("_pr_url") or ctx.get("pr_url"):
+        return True
+
+    review_loop = ctx.get("review_loop") or {}
+    if isinstance(review_loop, dict) and review_loop.get("pr_number") is not None:
+        return True
+
+    return bool(ctx.get("rollup_pr_url") or ctx.get("rollup_pr_number") is not None)
+
+
+@router.get("/tasks/{task_id}/cancel-impact")
+async def get_task_cancel_impact(
+    task_id: str,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    try:
+        tid = uuid.UUID(task_id)
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    task = await _get_user_task_with_role(
+        tid, current_user["user_id"], session, "member"
+    )
+
+    active_children = (
+        (
+            await session.execute(
+                select(Task).where(
+                    Task.parent_task_id == task.id,
+                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    dependent_candidates = (
+        await session.execute(
+            select(Task.id, Task.depends_on).where(
+                Task.project_id == task.project_id,
+                Task.id != task.id,
+                Task.status.in_(CANCEL_WAITING_DEPENDENT_STATUSES),
+            )
+        )
+    ).all()
+    waiting_dependent_count = sum(
+        1
+        for _dependent_id, depends_on in dependent_candidates
+        if str(task.id) in {str(dep_id) for dep_id in (depends_on or [])}
+    )
+
+    impact_task_ids = [task.id, *(child.id for child in active_children)]
+    pr_artifact_task_ids: set[str] = set()
+    if impact_task_ids:
+        pr_artifact_task_ids = {
+            str(row)
+            for row in (
+                await session.execute(
+                    select(Artifact.task_id).where(
+                        Artifact.task_id.in_(impact_task_ids),
+                        Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+    pr_context_reference_count = sum(
+        1
+        for candidate in [task, *active_children]
+        if _task_has_cancel_pr_context_reference(candidate)
+    )
+
+    return {
+        "task_id": str(task.id),
+        "status": _status_value(task.status),
+        "active_child_cascade_count": len(active_children),
+        "active_child_cascade_statuses": _status_values(CANCEL_CASCADE_CHILD_STATUSES),
+        "waiting_dependent_count": waiting_dependent_count,
+        "waiting_dependent_statuses": _status_values(
+            CANCEL_WAITING_DEPENDENT_STATUSES
+        ),
+        "target_vm_instance_id": task.vm_instance_id,
+        "target_has_vm_id": bool(task.vm_instance_id),
+        "target_vm_provisioned": task.vm_provisioned_at is not None,
+        "active_child_vm_id_count": sum(
+            1 for child in active_children if child.vm_instance_id
+        ),
+        "active_child_vm_provisioned_count": sum(
+            1 for child in active_children if child.vm_provisioned_at is not None
+        ),
+        "orphan_pr_cleanup_context_reference_count": pr_context_reference_count,
+        "pull_request_artifact_task_count": len(pr_artifact_task_ids),
+    }
+
+
 @router.get("/tasks/{task_id}")
 async def get_task(
     task_id: str,
@@ -1230,6 +1672,14 @@ async def get_task(
     _raw_child_ids = child_ids_result.scalars().all()
     child_task_ids_truncated = len(_raw_child_ids) > _CHILD_ID_LIMIT
     child_task_ids = [str(row) for row in _raw_child_ids[:_CHILD_ID_LIMIT]]
+    child_count = int(
+        (
+            await session.execute(
+                select(func.count(Task.id)).where(Task.parent_task_id == tid)
+            )
+        ).scalar_one()
+        or 0
+    )
 
     wake_registration_result = await session.execute(
         select(TaskWakeRegistration)
@@ -1239,7 +1689,73 @@ async def get_task(
     )
     wake_registration = wake_registration_result.scalars().first()
 
-    task_type = (task.first_payload).get("type", "create")
+    project = await session.get(Project, task.project_id)
+    cycle = (
+        await session.execute(
+            select(StrategicCycle)
+            .where(
+                StrategicCycle.project_id == task.project_id,
+                (StrategicCycle.phase1_task_id == tid)
+                | (StrategicCycle.phase2_task_id == tid),
+            )
+            .order_by(StrategicCycle.updated_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if cycle is None and task.strategic_cycle_id:
+        cycle = (
+            await session.execute(
+                select(StrategicCycle)
+                .where(
+                    StrategicCycle.id == task.strategic_cycle_id,
+                    StrategicCycle.project_id == task.project_id,
+                )
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+
+    task_id_str = str(tid)
+    operator_requested_reviewer_task_ids = select(Task.id).where(
+        Task.project_id == task.project_id,
+        Task.context["operator_requested_review_for"].as_string() == task_id_str,
+    )
+    related_messages = (
+        await session.execute(
+            select(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == task.project_id,
+                or_(
+                    ProjectMessage.from_task_id == tid,
+                    ProjectMessage.from_task_id.in_(operator_requested_reviewer_task_ids),
+                    ProjectMessage.context["task_id"].as_string() == task_id_str,
+                    ProjectMessage.context["source_task_id"].as_string() == task_id_str,
+                    ProjectMessage.context["operator_requested_review_for"].as_string()
+                    == task_id_str,
+                    and_(
+                        ProjectMessage.context["_convergence_link"]["kind"].as_string()
+                        == "task",
+                        ProjectMessage.context["_convergence_link"]["id"].as_string()
+                        == task_id_str,
+                    ),
+                ),
+            )
+            .order_by(ProjectMessage.created_at.desc())
+            .limit(5)
+        )
+    ).scalars().all()
+    sideboard_context = _task_sideboard_context(
+        task,
+        project=project,
+        artifacts=artifacts,
+        child_count=child_count,
+        related_messages=related_messages,
+        cycle=cycle,
+        primary_pr_url=pr_url,
+        primary_commit=commit_hash,
+    )
+
+    task_type = _task_payload_dict(task).get("type", "create")
+    movement_explanation = build_task_movement_explanation(task)
     return {
         "id": str(task.id),
         "project_id": str(task.project_id),
@@ -1273,6 +1789,7 @@ async def get_task(
         # non-BLOCKED or pre-migration task; the admin UI guards on presence.
         "blocker_kind": task.blocker_kind,
         "blocked_reason": task.blocked_reason,
+        "movement_explanation": movement_explanation,
         "blocked_at": task.blocked_at.isoformat() if task.blocked_at else None,
         "recheck_after": task.recheck_after.isoformat() if task.recheck_after else None,
         # Durable PARKED-state metadata (alembic 0199). Nullable for any
@@ -1280,7 +1797,7 @@ async def get_task(
         "parked_at": task.parked_at.isoformat() if task.parked_at else None,
         "park_reason": task.park_reason,
         "wake_registration": _serialize_task_wake_registration(wake_registration),
-        "payloads": task.payloads,
+        "payloads": redact_task_payloads(task.payloads),
         "context": {
             k: v
             for k, v in (task.context or {}).items()
@@ -1318,6 +1835,7 @@ async def get_task(
         "api_call_summary": task.api_call_summary,
         **_task_llm_cost_fields(task),
         "post_commit_pending": task.post_commit_pending,
+        "sideboard_context": sideboard_context,
     }
 
 
@@ -1997,11 +2515,11 @@ class ComputeExperimentDraftSuccessCriterion(BaseModel):
 
 class ComputeExperimentDraft(BaseModel):
     draft_available: bool
-    notes: str | None = None
-    title: str | None = None
-    prompt: str | None = None
-    hypothesis: str | None = None
-    command: str | None = None
+    notes: str | None = Field(default=None, max_length=1000)
+    title: str | None = Field(default=None, max_length=200)
+    prompt: str | None = Field(default=None, max_length=50000)
+    hypothesis: str | None = Field(default=None, max_length=500)
+    command: str | None = Field(default=None, max_length=50000)
     arms: list[dict[str, str]] | None = None
     declared_metric: str | None = None
     spend_cap_usd: float | None = None
@@ -2127,12 +2645,15 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
 
     declared_metric = _safe_metric(raw.get("declared_metric")) if arms else None
 
+    def _trunc(v: object, limit: int) -> str | None:
+        return str(v)[:limit] if isinstance(v, str) else None
+
     return ComputeExperimentDraft(
         draft_available=True,
-        title=raw.get("title") if isinstance(raw.get("title"), str) else None,
-        prompt=raw.get("prompt") if isinstance(raw.get("prompt"), str) else None,
-        hypothesis=raw.get("hypothesis") if isinstance(raw.get("hypothesis"), str) else None,
-        command=raw.get("command") if isinstance(raw.get("command"), str) and not arms else None,
+        title=_trunc(raw.get("title"), 200),
+        prompt=_trunc(raw.get("prompt"), 50000),
+        hypothesis=_trunc(raw.get("hypothesis"), 500),
+        command=_trunc(raw.get("command"), 50000) if not arms else None,
         arms=arms,
         declared_metric=declared_metric,
         spend_cap_usd=float(spend_cap),
@@ -2686,7 +3207,7 @@ async def rerun_compute_experiment(
     """
     source = await _get_user_task(task_id, current_user["user_id"], session)
 
-    source_payload = source.first_payload
+    source_payload = _task_payload_dict(source)
     if not source_payload or source_payload.get("type") != "compute_experiment":
         raise HTTPException(
             status_code=422,
@@ -2813,7 +3334,7 @@ async def request_changes(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    task_payload = task.first_payload
+    task_payload = _task_payload_dict(task)
     _project = await session.get(Project, task.project_id)
     branch = _resolve_task_branch(task, get_project_task_branch_namespace(_project))
     base_branch = task_payload.get("base_branch") or get_project_integration_branch(
@@ -2910,7 +3431,7 @@ async def request_fresh_reviewer(
         raise HTTPException(status_code=400, detail="No PR found for this task")
 
     pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
-    task_payload = task.first_payload
+    task_payload = _task_payload_dict(task)
     review_loop = ctx.get("review_loop") or {}
     _project = await session.get(Project, task.project_id)
     branch = (
@@ -3033,7 +3554,7 @@ async def reset_iteration_cap(
     )
     archived_count = 0
     for t in failed_result.scalars().all():
-        fp = t.first_payload
+        fp = _task_payload_dict(t)
         if fp.get("type") not in ("review", "fix"):
             continue
         t.archived = True

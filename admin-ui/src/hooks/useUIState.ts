@@ -1,9 +1,55 @@
 import { useState, useRef, useReducer, useCallback } from 'react';
+import type { ViewMode } from './useViewPreferences';
 
-export type PrimaryTab = 'cockpit' | 'home' | 'board' | 'directions' | 'compute';
+export type PrimaryTab =
+  | 'chat'
+  | 'pipeline'
+  | 'project'
+  | 'runtime';
+
+export type LegacyPrimaryTab =
+  | 'cockpit'
+  | 'home'
+  | 'board'
+  | 'directions'
+  | 'compute';
+
+export type PrimaryTabInput = PrimaryTab | LegacyPrimaryTab;
+
+export interface PrimaryTabTarget {
+  tab: PrimaryTab;
+  pipelineSection?: 'flow' | 'board' | 'archive';
+  projectSection?: 'running-update' | 'directions' | 'problem-model' | 'design-doc' | 'manage';
+  runtimeSection?: 'health' | 'devices' | 'compute' | 'accounts' | 'settings' | 'analytics';
+  viewMode?: ViewMode;
+  showArchive?: boolean;
+}
+
+export function resolvePrimaryTabTarget(value?: string | null): PrimaryTabTarget {
+  if (value === 'pipeline') return { tab: 'pipeline' };
+  if (value === 'project') return { tab: 'project' };
+  if (value === 'runtime') return { tab: 'runtime' };
+  if (value === 'cockpit') return { tab: 'project', projectSection: 'running-update' };
+  if (value === 'directions') return { tab: 'project', projectSection: 'directions' };
+  if (value === 'home') return { tab: 'runtime', runtimeSection: 'health' };
+  if (value === 'compute') return { tab: 'runtime', runtimeSection: 'compute' };
+  if (value === 'board') {
+    return {
+      tab: 'pipeline',
+      pipelineSection: 'board',
+      viewMode: 'kanban',
+      showArchive: false,
+    };
+  }
+  return { tab: 'chat' };
+}
+
+export function normalizePrimaryTab(value?: string | null): PrimaryTab {
+  return resolvePrimaryTabTarget(value).tab;
+}
 
 export function useUIState() {
-  const [activeTab, setActiveTab] = useState<PrimaryTab>('cockpit');
+  const [activeTab, setActiveTab] = useState<PrimaryTabInput>('chat');
   // Panel visibility
   const [showResearchBrowser, setShowResearchBrowser] = useState(false);
   const [showKnowledgeBrowser, setShowKnowledgeBrowser] = useState(false);
@@ -35,16 +81,11 @@ export function useUIState() {
     });
   }, []);
 
-  const [showMessages, setShowMessages] = useState(false);
-  const [showComposeDrawer, setShowComposeDrawer] = useState(false);
   const [showFleetDetail, setShowFleetDetail] = useState(false);
   const [showAlertsPopover, setShowAlertsPopover] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
   const [showDirections, setShowDirections] = useState(false);
   const [showMetrics, setShowMetrics] = useState(false);
   const [showUserManagement, setShowUserManagement] = useState(false);
-
-  const settingsRef = useRef<HTMLDivElement>(null);
 
   // Selection mode
   const [selectionMode, setSelectionMode] = useState(false);
@@ -121,15 +162,11 @@ export function useUIState() {
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
-    showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
     showUserManagement, setShowUserManagement,
-    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,

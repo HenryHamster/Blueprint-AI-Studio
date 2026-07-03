@@ -2226,18 +2226,18 @@ async def sweep_idle_pool_vms(session, now: datetime, *, runtime_config) -> int:
     # outside retire_and_delete_pool_vm (e.g. GCP console, API, or a crash
     # between VM deletion and the lane-state clear).
     try:
-        from app.improvement_lane_ops import reclaim_orphaned_lane_workspace_states
+        from app.improvement_lane_ops import reconcile_lane_workspaces
 
-        reclaimed = await reclaim_orphaned_lane_workspace_states(session)
-        if reclaimed:
+        reconciliation = await reconcile_lane_workspaces(session, now=now)
+        if reconciliation["lanes_cleared"] or reconciliation["reservations_cleared"]:
             await session.commit()
             logger.info(
-                "[WARM-POOL] periodic orphan reclaim cleared %d lane workspace state(s)",
-                reclaimed,
+                "[WARM-POOL] periodic lane workspace reconciliation: %s",
+                reconciliation,
             )
     except Exception:
         logger.warning(
-            "[WARM-POOL] periodic orphan reclaim failed",
+            "[WARM-POOL] periodic lane workspace reconciliation failed",
             exc_info=True,
         )
 

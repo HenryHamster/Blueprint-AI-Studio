@@ -3736,3 +3736,55 @@ class TestReclaimOrphanedLaneWorkspaces:
         resp = await client.post("/api/admin/improvement-lanes/reclaim-orphaned")
         assert resp.status_code == 200
         assert resp.json()["reclaimed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_reclaim_orphaned_dry_run_reports_without_mutating(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """dry_run=true returns structured counts without clearing workspace state."""
+        from app.models import Project
+
+        project_id = uuid.uuid4()
+        db_session.add(
+            Project(
+                id=project_id,
+                user_id="test-user",
+                name="dry-run-reclaim-project",
+                github_owner="owner",
+                github_repo="repo",
+                status="DEPLOYING",
+            )
+        )
+        await db_session.flush()
+        lane = ImprovementLane(
+            project_id=project_id,
+            direction_id="d-reclaim-dry-run",
+            title="Dry run orphan lane",
+            goal="Test dry-run endpoint",
+            branch_name="lane/reclaim-dry-run",
+            base_branch="main",
+            status=ImprovementLaneStatus.ACTIVE.value,
+            checkpoint_seq=0,
+            checkpoints=[],
+            manifest={},
+            workspace_state="LEASED",
+            workspace_vm_instance_id="ghost-vm-reclaim-dry-run",
+            phase_requeues=0,
+        )
+        db_session.add(lane)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/improvement-lanes/reclaim-orphaned?dry_run=true&project_id={project_id}"
+        )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["dry_run"] is True
+        assert body["reclaimed"] == 0
+        assert body["would_reclaim"] == 1
+        assert body["missing_backing_vm"] == 1
+
+        await db_session.refresh(lane)
+        assert lane.workspace_state == "LEASED"
+        assert lane.workspace_vm_instance_id == "ghost-vm-reclaim-dry-run"

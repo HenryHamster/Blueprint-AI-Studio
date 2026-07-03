@@ -2265,6 +2265,9 @@ async def test_knowledge_index_entry_shape(db_session):
         "compute_acceptance_grade",
         "compute_acceptance_reason",
         "unavailable_cause",
+        "criterion_met",
+        "criterion",
+        "per_arm_verdicts",
         "origin_provenance",
         "sweep_id",
         "arm_label",
@@ -2433,53 +2436,146 @@ def _acceptance_verdict():
     """forward_quality_verdict that classifies a compute doc as acceptance."""
     return {
         "analysis_mode": "llm",
+        "criterion_met": True,
         "probes": {"grounding": {"grounded": 1}},
     }
 
 
+async def _make_compute_sweep_task(
+    db_session,
+    *,
+    project_id,
+    sweep_id,
+    arm_label,
+    status=TaskStatus.COMPLETED,
+    direction_id=None,
+    created_at=None,
+):
+    payload = {
+        "type": "compute_experiment",
+        "base_branch": "main",
+        "sweep_id": sweep_id,
+        "experiment": arm_label,
+    }
+    task = Task(
+        project_id=project_id,
+        title=f"compute arm {arm_label}",
+        status=status,
+        payloads=[payload],
+        context=({"direction_id": direction_id} if direction_id else {}),
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    if created_at is not None:
+        task.created_at = created_at
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+async def _make_compute_sweep_doc(
+    db_session,
+    *,
+    project_id,
+    task,
+    title=None,
+    sweep_id=None,
+    arm_label=None,
+    criterion_met=True,
+    unavailable_cause=None,
+    forward_quality_verdict=None,
+    source_citations=None,
+    created_at=None,
+):
+    verdict = (
+        dict(forward_quality_verdict)
+        if isinstance(forward_quality_verdict, dict)
+        else {"analysis_mode": "deterministic", "criterion_met": criterion_met}
+    )
+    if unavailable_cause is not None:
+        verdict["unavailable_cause"] = unavailable_cause
+    payload = task.first_payload or {}
+    return await _make_knowledge_doc(
+        db_session,
+        project_id=project_id,
+        source_task_id=task.id,
+        title=title or f"arm {arm_label or payload.get('experiment')}",
+        source_kind="compute_experiment",
+        sweep_id=sweep_id if sweep_id is not None else payload.get("sweep_id"),
+        arm_label=arm_label if arm_label is not None else payload.get("experiment"),
+        forward_quality_verdict=verdict,
+        source_citations=source_citations,
+        created_at=created_at,
+    )
+
+
 @pytest.mark.asyncio
-async def test_build_compute_sweep_groups_groups_arms_by_sweep_id(db_session):
-    """Compute docs sharing a sweep_id group into one comparative block, with
-    criterion_met derived from the acceptance grade."""
+async def test_build_compute_sweep_groups_requires_all_planned_unique_arms(
+    db_session,
+):
+    """Only complete planned rosters become strategist-facing sweep groups."""
     from app.knowledge_query import build_compute_sweep_groups
 
-    project, task = await _make_web_research_task(db_session, project_name="SWG1")
-    # Two arms in one sweep: one accepted (criterion met), one measured-only.
-    await _make_knowledge_doc(
+    project, _task = await _make_web_research_task(db_session, project_name="SWG1")
+    baseline = await _make_compute_sweep_task(
         db_session,
         project_id=project.id,
-        source_task_id=task.id,
-        title="arm baseline",
-        source_kind="compute_experiment",
         sweep_id="sw-1111",
         arm_label="baseline",
-        forward_quality_verdict=None,  # not llm → measured_only → not met
     )
-    await _make_knowledge_doc(
+    treatment = await _make_compute_sweep_task(
         db_session,
         project_id=project.id,
-        source_task_id=task.id,
-        title="arm treatment",
-        source_kind="compute_experiment",
         sweep_id="sw-1111",
         arm_label="treatment",
-        forward_quality_verdict=_acceptance_verdict(),
-        source_citations=["gs://bucket/result.json"],
+    )
+    missing = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-missing",
+        arm_label="baseline",
+    )
+    await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-missing",
+        arm_label="treatment",
+    )
+    running = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-running",
+        arm_label="baseline",
+    )
+    still_running = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-running",
+        arm_label="treatment",
+        status=TaskStatus.IN_PROGRESS,
+    )
+
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=baseline, criterion_met=True
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=treatment, criterion_met=False
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=missing, criterion_met=True
+    )
+    await _make_compute_sweep_doc(db_session, project_id=project.id, task=running)
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=still_running
     )
 
     groups = await build_compute_sweep_groups(db_session, project.id)
-    # Returns {sweep_id: [_knowledge_index_entry, ...]}
-    assert "sw-1111" in groups
-    assert len(groups) == 1
-    entries = groups["sw-1111"]
-    assert len(entries) == 2
-    by_label = {e["arm_label"]: e for e in entries}
-    # baseline has no forward_quality_verdict → measured_only → not acceptance
-    assert by_label["baseline"]["compute_acceptance_grade"] != "acceptance"
-    # treatment has acceptance verdict → grade 'acceptance'
-    assert by_label["treatment"]["compute_acceptance_grade"] == "acceptance"
-    assert by_label["treatment"]["id"]
-    assert by_label["treatment"]["title"] == "arm treatment"
+    assert set(groups) == {"sw-1111"}
+    assert {e["arm_label"] for e in groups["sw-1111"]} == {
+        "baseline",
+        "treatment",
+    }
+    assert {e["criterion_met"] for e in groups["sw-1111"]} == {True, False}
 
 
 @pytest.mark.asyncio
@@ -2501,15 +2597,13 @@ async def test_build_compute_sweep_groups_excludes_null_sweep_and_single_arm(
         arm_label="lonely",
     )
     # Single-arm sweep — excluded (not comparative).
-    await _make_knowledge_doc(
+    solo = await _make_compute_sweep_task(
         db_session,
         project_id=project.id,
-        source_task_id=task.id,
-        title="solo arm",
-        source_kind="compute_experiment",
         sweep_id="sw-solo",
         arm_label="only-arm",
     )
+    await _make_compute_sweep_doc(db_session, project_id=project.id, task=solo)
     groups = await build_compute_sweep_groups(db_session, project.id)
     assert groups == {}
 
@@ -2521,19 +2615,23 @@ async def test_build_compute_sweep_groups_newest_first_and_bounded(db_session):
 
     from app.knowledge_query import build_compute_sweep_groups
 
-    project, task = await _make_web_research_task(db_session, project_name="SWG3")
+    project, _task = await _make_web_research_task(db_session, project_name="SWG3")
     base = datetime(2026, 1, 1, 12, 0, 0)
     # Three sweeps, each with two arms, at increasing timestamps.
     for i in range(3):
         for arm in ("a", "b"):
-            await _make_knowledge_doc(
+            arm_task = await _make_compute_sweep_task(
                 db_session,
                 project_id=project.id,
-                source_task_id=task.id,
-                title=f"sweep{i}-{arm}",
-                source_kind="compute_experiment",
                 sweep_id=f"sw-{i}",
                 arm_label=arm,
+                created_at=base + timedelta(hours=i),
+            )
+            await _make_compute_sweep_doc(
+                db_session,
+                project_id=project.id,
+                task=arm_task,
+                title=f"sweep{i}-{arm}",
                 created_at=base + timedelta(hours=i),
             )
     groups = await build_compute_sweep_groups(db_session, project.id, limit=2)
@@ -2549,19 +2647,750 @@ async def test_build_compute_sweep_groups_excludes_cross_project(db_session):
     """Sweep docs from other projects are never included."""
     from app.knowledge_query import build_compute_sweep_groups
 
-    project_a, task_a = await _make_web_research_task(db_session, project_name="SWGA")
-    project_b, task_b = await _make_web_research_task(db_session, project_name="SWGB")
+    project_a, _task_a = await _make_web_research_task(
+        db_session, project_name="SWGA"
+    )
+    project_b, _task_b = await _make_web_research_task(
+        db_session, project_name="SWGB"
+    )
     for arm in ("a", "b"):
-        await _make_knowledge_doc(
+        arm_task = await _make_compute_sweep_task(
             db_session,
             project_id=project_b.id,
-            source_task_id=task_b.id,
-            title=f"b-{arm}",
-            source_kind="compute_experiment",
             sweep_id="sw-b",
             arm_label=arm,
         )
+        await _make_compute_sweep_doc(
+            db_session, project_id=project_b.id, task=arm_task, title=f"b-{arm}"
+        )
     assert await build_compute_sweep_groups(db_session, project_a.id) == {}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_dedupes_retried_arm_documents(
+    db_session,
+):
+    from datetime import datetime, timedelta
+
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, _task = await _make_web_research_task(db_session, project_name="SWGRetry")
+    base = datetime(2026, 1, 1, 12, 0, 0)
+    baseline_old = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-retry",
+        arm_label="baseline",
+        created_at=base,
+    )
+    baseline_new = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-retry",
+        arm_label="baseline",
+        created_at=base + timedelta(minutes=1),
+    )
+    treatment = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-retry",
+        arm_label="treatment",
+        created_at=base + timedelta(minutes=2),
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=baseline_old,
+        title="old baseline",
+        created_at=base,
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=baseline_new,
+        title="new baseline",
+        created_at=base + timedelta(minutes=1),
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=treatment,
+        title="treatment",
+        created_at=base + timedelta(minutes=2),
+    )
+
+    entries = (await build_compute_sweep_groups(db_session, project.id))["sw-retry"]
+    assert {entry["arm_label"] for entry in entries} == {"baseline", "treatment"}
+    baseline_entry = next(
+        entry for entry in entries if entry["arm_label"] == "baseline"
+    )
+    assert baseline_entry["title"] == "new baseline"
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_omits_unusable_planned_arms(
+    db_session,
+):
+    from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
+
+    project, _task = await _make_web_research_task(db_session, project_name="SWGBad")
+    unavailable = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-unavailable",
+        arm_label="baseline",
+    )
+    ok = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-unavailable",
+        arm_label="treatment",
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=unavailable,
+        criterion_met=False,
+        unavailable_cause="compute_failed",
+    )
+    await _make_compute_sweep_doc(db_session, project_id=project.id, task=ok)
+
+    assert await build_compute_sweep_groups(db_session, project.id) == {}
+    raw = await build_sweep_knowledge_index(db_session, project.id, "sw-unavailable")
+    assert {entry["arm_label"] for entry in raw} == {"baseline", "treatment"}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_respects_direction_scope(db_session):
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, _task = await _make_web_research_task(db_session, project_name="SWGDir")
+    for arm in ("baseline", "treatment"):
+        arm_task = await _make_compute_sweep_task(
+            db_session,
+            project_id=project.id,
+            sweep_id="sw-dir-a",
+            arm_label=arm,
+            direction_id="d-a",
+        )
+        await _make_compute_sweep_doc(
+            db_session, project_id=project.id, task=arm_task
+        )
+    arm_task = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-dir-b",
+        arm_label="baseline",
+        direction_id="d-b",
+    )
+    await _make_compute_sweep_doc(db_session, project_id=project.id, task=arm_task)
+
+    scoped = await build_compute_sweep_groups(
+        db_session, project.id, direction_id="d-a"
+    )
+    assert set(scoped) == {"sw-dir-a"}
+    assert await build_compute_sweep_groups(
+        db_session, project.id, direction_id="d-b"
+    ) == {}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_surfaces_per_arm_value_and_criterion(
+    db_session,
+):
+    """Sweep groups include per-arm metric values and criterion so the strategist
+    can tell 'which arm won by how much' without fetching each document body."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, _task = await _make_web_research_task(
+        db_session, project_name="SWGMetric"
+    )
+
+    # Create two arms with a criterion and per-arm verdicts
+    verdict_arm_a = {
+        "analysis_mode": "deterministic",
+        "strategy": "metric",
+        "outcome": "SUCCESS",
+        "cost_usd": 0.05,
+        "criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.85,
+            "value": 0.92,
+            "measurable": True,
+            "met": True,
+        },
+        "criterion_met": True,
+        "per_arm_verdicts": {
+            "baseline": {"value": 0.88, "met": False, "cost_usd": 0.025},
+            "treatment": {"value": 0.92, "met": True, "cost_usd": 0.025},
+        },
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+    verdict_arm_b = {
+        "analysis_mode": "deterministic",
+        "strategy": "metric",
+        "outcome": "SUCCESS",
+        "cost_usd": 0.05,
+        "criterion": {
+            "metric": "accuracy",
+            "operator": ">=",
+            "threshold": 0.85,
+            "value": 0.92,
+            "measurable": True,
+            "met": True,
+        },
+        "criterion_met": True,
+        "per_arm_verdicts": {
+            "baseline": {"value": 0.88, "met": False, "cost_usd": 0.025},
+            "treatment": {"value": 0.92, "met": True, "cost_usd": 0.025},
+        },
+        "probes": {"grounding": {"grounded": 1}},
+    }
+
+    baseline = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-metric",
+        arm_label="baseline",
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=baseline,
+        title="arm baseline",
+        forward_quality_verdict=verdict_arm_a,
+        source_citations=["gs://bucket/result.json"],
+    )
+    treatment = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-metric",
+        arm_label="treatment",
+    )
+    await _make_compute_sweep_doc(
+        db_session,
+        project_id=project.id,
+        task=treatment,
+        title="arm treatment",
+        forward_quality_verdict=verdict_arm_b,
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-metric" in groups
+    entries = groups["sw-metric"]
+    assert len(entries) == 2
+
+    by_label = {e["arm_label"]: e for e in entries}
+
+    # Both arms should have the per-arm values available in the payload
+    for arm_name in ["baseline", "treatment"]:
+        entry = by_label[arm_name]
+        # Entry should have criterion information
+        assert entry["criterion"] is not None
+        assert entry["criterion"]["metric"] == "accuracy"
+        assert entry["criterion"]["threshold"] == 0.85
+        # Entry should have per_arm_verdicts with measured values
+        assert entry["per_arm_verdicts"] is not None
+        assert "baseline" in entry["per_arm_verdicts"]
+        assert "treatment" in entry["per_arm_verdicts"]
+        # Each arm should have value and met status
+        assert entry["per_arm_verdicts"]["baseline"]["value"] == 0.88
+        assert entry["per_arm_verdicts"]["baseline"]["met"] is False
+        assert entry["per_arm_verdicts"]["treatment"]["value"] == 0.92
+        assert entry["per_arm_verdicts"]["treatment"]["met"] is True
+
+
+# ── build_compute_sweep_groups: planned-arm completeness gate ─────────────────
+
+
+async def _make_compute_sweep_task(
+    db_session,
+    *,
+    project_id,
+    sweep_id,
+    arm_label=None,
+    status=None,
+    direction_id=None,
+    created_at=None,
+):
+    """Persist a compute_experiment Task carrying sweep_id in its first payload."""
+    from app.models import TaskStatus
+
+    task = make_task(
+        project_id=project_id,
+        title=f"compute_experiment: arm {arm_label or sweep_id}",
+        status=status or TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "experiment": arm_label or "sweep-test",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+            }
+        ],
+    )
+    if created_at is not None:
+        task.created_at = created_at
+    if direction_id:
+        task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_blocks_incomplete_planned_arms(db_session):
+    """A sweep with 3 planned arms but only 2 usable docs is excluded.
+
+    The acceptance requirement for this task: the test must exercise the
+    completeness gate that prevents partial-sweep overclaim.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGIncomplete")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Three planned arms — each backed by a Task row.
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="b"
+    )
+    task_c = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-inc", arm_label="c"
+    )
+
+    # Only two arms produced usable docs (task_c is missing).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a",
+        source_kind="compute_experiment",
+        sweep_id="sw-inc",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b",
+        source_kind="compute_experiment",
+        sweep_id="sw-inc",
+        arm_label="b",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/b.json"],
+    )
+    # task_c has no KnowledgeDocument — arm c never produced results.
+    _ = task_c  # referenced to make intent explicit
+
+    # The sweep has 2 docs (>= _SWEEP_MIN_DOCS) but the task manifest shows 3
+    # planned arms; the missing arm blocks the sweep.
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}, (
+        "Sweep with an unrepresented planned arm must be excluded from sweep groups"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_blocks_when_arm_doc_unavailable(db_session):
+    """A sweep where one arm's doc carries unavailable_cause is excluded."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGUnavail")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-unav", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-unav", arm_label="b"
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a ok",
+        source_kind="compute_experiment",
+        sweep_id="sw-unav",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    # arm b's doc has unavailable_cause — not usable.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b unavailable",
+        source_kind="compute_experiment",
+        sweep_id="sw-unav",
+        arm_label="b",
+        forward_quality_verdict={"unavailable_cause": "analysis_timed_out"},
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}, (
+        "Sweep with an unavailable arm doc must be excluded from sweep groups"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_respects_direction_scope_for_manifest(
+    db_session,
+):
+    """A same-sweep_id manifest in another direction must not block the scoped view."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGDirectionScoped")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="a1",
+        direction_id="d-a",
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="a2",
+        direction_id="d-a",
+    )
+    task_other = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-shared",
+        arm_label="b1",
+        direction_id="d-b",
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a1",
+        direction_id="d-a",
+        source_kind="compute_experiment",
+        sweep_id="sw-shared",
+        arm_label="a1",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a1.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm a2",
+        direction_id="d-a",
+        source_kind="compute_experiment",
+        sweep_id="sw-shared",
+        arm_label="a2",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a2.json"],
+    )
+    # Same sweep_id in another direction, but no usable doc.
+    _ = task_other
+
+    groups = await build_compute_sweep_groups(
+        db_session,
+        project.id,
+        direction_id="d-a",
+    )
+    assert "sw-shared" in groups
+    assert {entry["direction_id"] for entry in groups["sw-shared"]} == {"d-a"}
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_allows_measured_only_doc(db_session):
+    """A measured-only doc (no unavailable_cause) does not block the sweep."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGMeasured")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task_a = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-meas", arm_label="a"
+    )
+    task_b = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-meas", arm_label="b"
+    )
+
+    # arm a: acceptance verdict.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_a.id,
+        title="arm a",
+        source_kind="compute_experiment",
+        sweep_id="sw-meas",
+        arm_label="a",
+        forward_quality_verdict=_acceptance_verdict(),
+        source_citations=["gs://bucket/a.json"],
+    )
+    # arm b: deterministic/measured-only verdict — no unavailable_cause.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_b.id,
+        title="arm b measured",
+        source_kind="compute_experiment",
+        sweep_id="sw-meas",
+        arm_label="b",
+        forward_quality_verdict={"analysis_mode": "deterministic", "outcome": "SUCCESS"},
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-meas" in groups, (
+        "Sweep where all arms have usable (measured-only) docs must be included"
+    )
+    assert len(groups["sw-meas"]) == 2
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_falls_back_to_docs_only_when_no_task_manifest(
+    db_session,
+):
+    """When no Task rows carry the sweep_id, docs-only (>= 2) behavior is kept."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, web_task = await _make_web_research_task(
+        db_session, project_name="SWGFallback"
+    )
+    # Two compute docs with a sweep_id but sourced from a web_research task
+    # (type != 'compute_experiment') — no task manifest will be found.
+    for label in ("x", "y"):
+        await _make_knowledge_doc(
+            db_session,
+            project_id=project.id,
+            source_task_id=web_task.id,
+            title=f"arm {label}",
+            source_kind="compute_experiment",
+            sweep_id="sw-fallback",
+            arm_label=label,
+        )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-fallback" in groups, (
+        "Sweep with no task manifest must fall back to docs-only inclusion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_includes_single_doc_arms_block(db_session):
+    """A lone compute doc with >=2 measured per-arm verdicts is still a completed sweep."""
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWGBlock")
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-block",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="one-arm block",
+        source_kind="compute_experiment",
+        sweep_id="sw-solo",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.91},
+            "per_arm_verdicts": {
+                "only": {"value": 0.91, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-block" in groups
+    assert "sw-solo" not in groups
+    assert len(groups) == 1
+
+    entries = groups["sw-block"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    assert by_label["baseline"]["criterion_met"] is False
+    assert by_label["treatment"]["criterion_met"] is True
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_blocks_unmeasured_arm(db_session):
+    """A lone-doc sweep whose per_arm_verdicts has an unmeasured arm (met=None) is excluded.
+
+    This exercises the guard that prevents partial-sweep overclaim when the arms block
+    is incomplete — the invariant that every arm must carry a boolean met value.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, task = await _make_web_research_task(db_session, project_name="SWGUnmeasured")
+    # per_arm_verdicts has one boolean arm and one unmeasured arm (met=None).
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="partial arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-partial",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": None, "met": None},  # unmeasured — must disqualify
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-partial" not in groups, (
+        "A per_arm_verdicts block with an unmeasured arm must not be synthesised"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_blocks_when_sibling_task_missing_doc(
+    db_session,
+):
+    """A single-doc sweep is excluded when a sibling compute_experiment task lacks a doc.
+
+    Even though the one document's per_arm_verdicts appears fully measured, the Task
+    manifest shows a second planned arm with no usable KnowledgeDocument — the sweep
+    must be excluded to enforce the completeness invariant.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGSiblingMissing")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # task_main produces the single document.
+    task_main = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-sibling", arm_label="main"
+    )
+    # task_sibling is a second planned arm — it never produced a KnowledgeDocument.
+    await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-sibling", arm_label="sibling"
+    )
+
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task_main.id,
+        title="main arm result",
+        source_kind="compute_experiment",
+        sweep_id="sw-sibling",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-sibling" not in groups, (
+        "Single-doc sweep with an unrepresented sibling task must be excluded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_build_compute_sweep_groups_single_doc_with_manifest_included(db_session):
+    """A lone-doc sweep backed by a compute_experiment Task manifest is included.
+
+    This exercises the manifest-gating positive path: a single compute_experiment
+    Task with the same sweep_id exists, the document is sourced from that task
+    (so it is usable), and the per_arm_verdicts are fully measured — the sweep
+    must be promoted to a completed group entry.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project = make_project(name="SWGManifestOK")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # One compute_experiment task — the manifest contains exactly this task.
+    task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id="sw-manifest-ok", arm_label="arms"
+    )
+
+    # One document sourced from that task with fully measured per_arm_verdicts.
+    await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=task.id,
+        title="single-doc arms block",
+        source_kind="compute_experiment",
+        sweep_id="sw-manifest-ok",
+        arm_label="arms-block",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.92},
+            "per_arm_verdicts": {
+                "baseline": {"value": 0.88, "met": False},
+                "treatment": {"value": 0.92, "met": True},
+            },
+        },
+        source_citations=["gs://bucket/result.json"],
+    )
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert "sw-manifest-ok" in groups, (
+        "Single-doc sweep whose sole compute_experiment task produced a usable doc "
+        "must be included via the manifest-gating path"
+    )
+    entries = groups["sw-manifest-ok"]
+    assert len(entries) == 2
+    by_label = {e["arm_label"]: e for e in entries}
+    assert by_label["baseline"]["criterion_met"] is False
+    assert by_label["treatment"]["criterion_met"] is True
 
 
 @pytest.mark.asyncio
@@ -2891,3 +3720,203 @@ def test_build_compute_experiment_document_failed_arms_list():
     assert "result file not written" in failed_section
     # arm_b succeeded — must not appear in the failed section
     assert "arm_b" not in failed_section
+
+
+# ── criterion_met surfacing in knowledge index and sweep groups ───────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sweep_verdict_reflects_criterion_met(db_session):
+    """_knowledge_index_entry exposes criterion_met from forward_quality_verdict,
+    independent of compute_acceptance_grade.
+
+    A compute_experiment doc with criterion_met=True and grade 'measured_only'
+    (not 'acceptance') must surface criterion_met=True in the index entry —
+    proving the verdict is NOT derived from the acceptance grade.
+    A doc with criterion_met=False must surface False; a doc with no
+    criterion_met key in its verdict must surface None.
+    """
+    from app.knowledge_query import build_compute_sweep_groups, build_knowledge_index
+
+    project, _task = await _make_web_research_task(db_session, project_name="CRIT")
+
+    met_task = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-crit",
+        arm_label="met_arm",
+    )
+    not_met_task = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-crit",
+        arm_label="not_met_arm",
+    )
+    unmeasured_task = await _make_compute_sweep_task(
+        db_session,
+        project_id=project.id,
+        sweep_id="sw-crit",
+        arm_label="unmeasured_arm",
+    )
+
+    # ARM 1: criterion MET but grade is measured_only (deterministic path).
+    # This is the bug-case: old code would have shown NOT MET because grade != acceptance.
+    met_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=met_task.id,
+        title="arm met",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="met_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": True,
+            "criterion": {"metric": "accuracy", "value": 0.95},
+        },
+        # No source_citations → measured_only grade (not acceptance).
+        source_citations=None,
+    )
+
+    # ARM 2: criterion NOT MET, also measured_only grade.
+    not_met_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=not_met_task.id,
+        title="arm not met",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="not_met_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": False,
+            "criterion": {"metric": "accuracy", "value": 0.72},
+        },
+        source_citations=None,
+    )
+
+    # ARM 3: unmeasured — forward_quality_verdict has no criterion_met key.
+    unmeasured_doc = await _make_knowledge_doc(
+        db_session,
+        project_id=project.id,
+        source_task_id=unmeasured_task.id,
+        title="arm unmeasured",
+        source_kind="compute_experiment",
+        sweep_id="sw-crit",
+        arm_label="unmeasured_arm",
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            # criterion_met absent → None
+        },
+        source_citations=None,
+    )
+
+    # --- via build_knowledge_index ---
+    index = await build_knowledge_index(db_session, project.id)
+    by_id = {e["id"]: e for e in index}
+
+    met_entry = by_id[str(met_doc.id)]
+    not_met_entry = by_id[str(not_met_doc.id)]
+    unmeasured_entry = by_id[str(unmeasured_doc.id)]
+
+    # Verify grade is NOT 'acceptance' for met_arm — confirms verdict is not grade-derived.
+    assert met_entry["compute_acceptance_grade"] != "acceptance"
+    assert met_entry["criterion_met"] is True
+
+    assert not_met_entry["compute_acceptance_grade"] != "acceptance"
+    assert not_met_entry["criterion_met"] is False
+
+    assert unmeasured_entry["criterion_met"] is None
+
+    # --- via build_compute_sweep_groups ---
+    # The raw entries above are still listed in build_knowledge_index, but the
+    # strategist-facing sweep group refuses the planned roster because one arm
+    # lacks a definitive boolean criterion_met verdict.
+    groups = await build_compute_sweep_groups(db_session, project.id)
+    assert groups == {}
+
+
+# ── sweep disposition state in compute sweep groups ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_sweep_groups_expose_existing_disposition_state(db_session):
+    """build_compute_sweep_groups annotates the first arm entry of each sweep
+    with sweep_disposition when an act-on-verdict disposition task exists.
+
+    A sweep without a disposition task must NOT have sweep_disposition set.
+    A sweep whose disposition task is QUEUED must expose task_id and status.
+    A sweep whose disposition task is COMPLETED must expose COMPLETED status.
+    """
+    from app.knowledge_query import build_compute_sweep_groups
+
+    project, _source_task = await _make_web_research_task(db_session, project_name="DISP")
+
+    sweep_a = "sw-disposition-a"
+    sweep_b = "sw-no-disposition"
+
+    # Create compute_experiment tasks and docs for sweep_a (will have a disposition task).
+    arm1_task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id=sweep_a, arm_label="arm1"
+    )
+    arm2_task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id=sweep_a, arm_label="arm2"
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=arm1_task, criterion_met=True
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=arm2_task, criterion_met=False
+    )
+
+    # Create compute_experiment tasks and docs for sweep_b (no disposition task).
+    ctrl_task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id=sweep_b, arm_label="ctrl"
+    )
+    exp_task = await _make_compute_sweep_task(
+        db_session, project_id=project.id, sweep_id=sweep_b, arm_label="exp"
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=ctrl_task, criterion_met=False
+    )
+    await _make_compute_sweep_doc(
+        db_session, project_id=project.id, task=exp_task, criterion_met=False
+    )
+
+    # Spawn a disposition task for sweep_a via context key.
+    disposition_task = Task(
+        project_id=project.id,
+        title=f"act-on-verdict: sweep {sweep_a[:8]}",
+        description="Aggregate disposition follow-on",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        requires_approval=False,
+        payloads=[{"type": "create", "prompt": "act on sweep", "base_branch": "main"}],
+        context={"act_on_verdict_sweep_id": sweep_a},
+    )
+    db_session.add(disposition_task)
+    await db_session.commit()
+    await db_session.refresh(disposition_task)
+
+    groups = await build_compute_sweep_groups(db_session, project.id)
+
+    assert sweep_a in groups, f"sweep_a must appear in sweep groups; got {list(groups)}"
+    assert sweep_b in groups, f"sweep_b must appear in sweep groups; got {list(groups)}"
+
+    # sweep_a: first arm entry must carry sweep_disposition with task_id + status.
+    entries_a = groups[sweep_a]
+    first_a = entries_a[0]
+    assert "sweep_disposition" in first_a, (
+        "first arm entry of sweep_a must have sweep_disposition when a disposition task exists"
+    )
+    disp = first_a["sweep_disposition"]
+    assert isinstance(disp, dict)
+    assert disp["task_id"] == str(disposition_task.id)
+    assert disp["status"] == TaskStatus.QUEUED.value
+
+    # sweep_b: no disposition task — sweep_disposition must be absent.
+    entries_b = groups[sweep_b]
+    first_b = entries_b[0]
+    assert "sweep_disposition" not in first_b, (
+        "sweep_b must not have sweep_disposition when no disposition task exists"
+    )

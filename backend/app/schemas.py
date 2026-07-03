@@ -533,6 +533,40 @@ def serialize_compute_job_response(job: object) -> Dict[str, Any]:
 _POLLING_METADATA_LAUNCH_SPEC_KEYS = frozenset(
     {"env", "command", "cwd", "container_registry_auth"}
 )
+_TASK_PAYLOAD_SECRET_KEYS = frozenset({"env", "container_registry_auth"})
+
+
+def redact_task_payloads(payloads: Any) -> Any:
+    """Strip secret keys from operator-facing task payloads.
+
+    A ``compute_experiment`` task stores its launch contract inline in
+    ``Task.payloads`` — including ``container_registry_auth`` (a registry
+    password / NGC API key) and ``env`` (operator-supplied secrets). The
+    agent-claim path legitimately needs these (the claiming agent forwards them
+    when it creates the compute job, and a retried task re-reads them), so the
+    values must stay in the row. But the operator-facing task list/detail
+    endpoints must not echo those secret-bearing fields back, or the very
+    registry password redacted in one operator view leaks in another.
+
+    Returns a new list with the secret keys removed from each payload dict. The
+    input is never mutated (a fresh dict is built only for entries that carry a
+    secret key), so redaction can't leak back into an ORM-attached attribute and
+    accidentally persist. A non-list ``payloads`` and non-dict entries pass
+    through untouched.
+    """
+    if not isinstance(payloads, list):
+        return payloads
+    redacted = []
+    for entry in payloads:
+        if isinstance(entry, dict) and any(k in entry for k in _TASK_PAYLOAD_SECRET_KEYS):
+            entry = {
+                k: v
+                for k, v in entry.items()
+                if k not in _TASK_PAYLOAD_SECRET_KEYS
+            }
+        redacted.append(entry)
+    return redacted
+
 
 # Regex patterns for scrubbing secrets/credentials from RPC error messages.
 _URL_QUERY_RE = re.compile(r"\?[^\s'\"<>]*")
@@ -1010,6 +1044,21 @@ class BuildConfig(BaseModel):
     block_degraded_unverified_merge: bool = False
     # Read by ci_resolution.should_block_no_test_unverified_merge.
     block_no_test_unverified_merge: bool = False
+    # Per-project promotion rubric override (Fix 5, 2026-07-02). A project may
+    # legitimately promote at a different bar than Blueprint's trusted self-
+    # improvement core (e.g. an external research/witness repo). When set, these
+    # override the fleet-global promotion_threshold / promotion_weights;
+    # absent (None) means "use the fleet rubric". Resolved by
+    # release_qualifier._policy_from_build_config, which CLAMPS the threshold to a
+    # safety floor and ignores weights that don't sum ~1.0. Declared here (NOT
+    # extra-ignored) so they survive ``model_dump`` round-trips on every
+    # save/PATCH/re-detect — otherwise the override would be silently stripped and
+    # never persist. Carried across re-detect by apply_operator_build_config_overrides.
+    promotion_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    promotion_weights: dict[str, float] | None = None
+    # Per-project smoketest opt-in (a project may or may not have a smoke suite).
+    # None means "use the fleet-global smoketest_enabled runtime flag".
+    smoketest_enabled: bool | None = None
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.
@@ -1060,6 +1109,12 @@ class BuildConfig(BaseModel):
     # Validated by ResourceEnvelope; carried across re-detect by
     # ``apply_operator_build_config_overrides``.
     resource_envelope: "ResourceEnvelope | None" = None
+    # Reusable alert-domain enablement.  Core alerts are always enabled; optional
+    # domains such as release_lifecycle, sr_quality, warm_pool, research_directions,
+    # rollup_lts, migrations, and self_improvement are operator-owned and must
+    # survive detection/save/PATCH round-trips.  Shape:
+    # {"warm_pool": {"enabled": true}, "sr_quality": {"enabled": false}}.
+    alert_domains: Dict[str, Any] | None = None
     # Per-project 24h rolling-window spend ceiling. When set, autonomous spawning
     # is paused (and a deduped operator alert emitted) once the project's window
     # spend meets or exceeds this value. None = disabled (today's behavior).

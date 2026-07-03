@@ -5,8 +5,9 @@ import type { LogLevel } from './TaskDetailDrawerLogs';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
 import type { Task } from './TaskCard';
 import { DetailsTab } from './TaskDetailDrawerMeta';
-import { fetchTaskPrFiles } from '../api';
+import { API_BASE_URL, authGet, fetchTaskPrFiles } from '../api';
 import type { PrFileEntry } from '../api';
+import { isCancellableTaskStatus, taskCancelConsequence } from './taskCancelCopy';
 
 interface TaskDetailDrawerProps {
   task: Task;
@@ -32,6 +33,24 @@ interface TaskDetailDrawerProps {
   onTriggerRollup?: (id: string) => void;
 }
 
+interface CancelImpactResponse {
+  task_id?: string;
+  status?: string;
+  waiting_dependent_count: number;
+  waiting_dependent_statuses?: string[];
+  active_child_cascade_count: number;
+  active_child_cascade_statuses?: string[];
+  target_vm_instance_id?: string | null;
+  target_has_vm_id: boolean;
+  target_vm_provisioned?: boolean;
+  active_child_vm_id_count?: number;
+  active_child_vm_provisioned_count?: number;
+  orphan_pr_cleanup_context_reference_count?: number;
+  pull_request_artifact_task_count?: number;
+}
+
+type CancelImpactStatus = 'idle' | 'loading' | 'ready' | 'error';
+
 // A panel_review can be launched from a review/fix task only when that task
 // carries the PR context (number) the fixed workflow grades against.
 function panelReviewablePr(task: Task): boolean {
@@ -50,6 +69,43 @@ function hasReviewPr(task: Task): boolean {
 }
 
 type Tab = 'details' | 'logs' | 'changes';
+
+// Approval consequence wording differs by task type: a compute_experiment
+// approval releases real spend (it is NOT a code merge), so the label must say
+// so and surface the spend cap when the payload carries one. Mirrors the
+// TaskCard approval button so the two surfaces never disagree.
+function approveButtonLabel(task: Task): string {
+  if ((task.task_type as string) === 'compute_experiment') {
+    const cap = (task.payloads?.[0] as Record<string, unknown> | undefined)?.spend_cap_usd;
+    return cap != null ? `Approve Spend ($${Number(cap).toFixed(2)})` : 'Approve Spend';
+  }
+  return 'Approve & Merge';
+}
+
+// Visible impact only: this uses the loaded task set passed to the drawer, not
+// a global backend impact endpoint.
+function countVisibleWaitingDependents(taskId: string, tasks?: Task[]): number {
+  if (!tasks) return 0;
+  return tasks.filter(
+    t =>
+      t.id !== taskId &&
+      t.depends_on?.includes(taskId) &&
+      (t.status === 'QUEUED' || t.status === 'BLOCKED' || t.status === 'PROVISIONING' || t.status === 'PARKED'),
+  ).length;
+}
+
+function cancelConsequenceWithImpact(task: Task, impact: CancelImpactResponse | null): string {
+  const base = taskCancelConsequence(task);
+  if (
+    impact?.target_has_vm_id &&
+    !task.vm_instance_id &&
+    task.status !== 'IN_PROGRESS' &&
+    task.status !== 'PROVISIONING'
+  ) {
+    return `${base} A VM is recorded for this task; cancellation will request cleanup if it is still attached.`;
+  }
+  return base;
+}
 
 function hasMergedPr(task: Task): boolean {
   return !!(task.pr_url || task.artifacts?.some(a => a.pr_url));
@@ -252,7 +308,10 @@ export function TaskDetailDrawer({
   const [copiedLogs, setCopiedLogs] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [editingPrompt, setEditingPrompt] = useState(false);
-  const [editPromptValue, setEditPromptValue] = useState(task.description);
+  const [editPromptValue, setEditPromptValue] = useState(() => {
+    const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+    return (payload?.prompt as string) || task.description;
+  });
   const [drawerWidth, setDrawerWidth] = useState(680);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -264,6 +323,8 @@ export function TaskDetailDrawer({
   const [prFilesLoaded, setPrFilesLoaded] = useState(false);
   const [expandedPatches, setExpandedPatches] = useState<Set<string>>(new Set());
   const [includePatch, setIncludePatch] = useState(false);
+  const [cancelImpact, setCancelImpact] = useState<CancelImpactResponse | null>(null);
+  const [cancelImpactStatus, setCancelImpactStatus] = useState<CancelImpactStatus>('idle');
 
   // Detect mobile viewport (< 640px, Tailwind sm: breakpoint)
   useEffect(() => {
@@ -303,11 +364,48 @@ export function TaskDetailDrawer({
     setIncludePatch(false);
   }, [task.id]);
 
-  // Reset edit prompt state when task changes
+  // Reset all transient form state when task changes
   useEffect(() => {
     setEditingPrompt(false);
-    setEditPromptValue(task.description);
-  }, [task.id, task.description]);
+    const payload = task.payloads?.[0] as Record<string, unknown> | undefined;
+    setEditPromptValue((payload?.prompt as string) || task.description);
+    setConfirmCancel(false);
+    setShowChangesForm(false);
+    setChangesFeedback('');
+    setActiveTab('details');
+    setCancelImpact(null);
+    setCancelImpactStatus('idle');
+  }, [task.id, task.payloads, task.description]);
+
+  useEffect(() => {
+    setCancelImpact(null);
+    if (!confirmCancel) {
+      setCancelImpactStatus('idle');
+      return;
+    }
+
+    let cancelled = false;
+    setCancelImpactStatus('loading');
+    authGet(`${API_BASE_URL}/api/admin/tasks/${encodeURIComponent(task.id)}/cancel-impact`)
+      .then(async response => {
+        if (!response.ok) throw new Error(`Failed to fetch cancel impact: ${response.status}`);
+        return response.json() as Promise<CancelImpactResponse>;
+      })
+      .then(data => {
+        if (!cancelled) {
+          setCancelImpact(data);
+          setCancelImpactStatus('ready');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setCancelImpact(null);
+          setCancelImpactStatus('error');
+        }
+      });
+
+    return () => { cancelled = true; };
+  }, [confirmCancel, task.id]);
 
   const loadPrFiles = async (withPatch: boolean) => {
     setPrFilesLoading(true);
@@ -386,9 +484,8 @@ export function TaskDetailDrawer({
     URL.revokeObjectURL(url);
   };
 
-  const isActive = task.status === 'IN_PROGRESS' || task.status === 'PROVISIONING';
   const showApproval = task.requires_approval && !['FAILED', 'CANCELLED'].includes(task.status);
-  const showCancel = isActive && !task.requires_approval;
+  const showCancel = isCancellableTaskStatus(task.status) && !task.requires_approval;
   const showFailedActions = task.status === 'FAILED';
   const showResetCap = !!onResetIterationCap && hasReviewPr(task);
   const showTriggerRollup = !!onTriggerRollup && task.status === 'EVALUATING';
@@ -586,7 +683,7 @@ export function TaskDetailDrawer({
                     disabled={!!actionLoading}
                     className="flex-1 px-6 py-3 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-sm font-semibold transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
                   >
-                    {actionLoading === 'approve' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} Approve & Merge
+                    {actionLoading === 'approve' ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />} {approveButtonLabel(task)}
                   </button>
                   <button
                     onClick={() => setShowChangesForm(!showChangesForm)}
@@ -640,24 +737,87 @@ export function TaskDetailDrawer({
                 Cancel Task
               </button>
             )}
-            {showCancel && confirmCancel && (
-              <div className="flex items-center gap-2">
-                <span className="text-sm text-neutral-400">Cancel this task?</span>
-                <button
-                  onClick={() => { onCancel(task.id); setConfirmCancel(false); }}
-                  disabled={!!actionLoading}
-                  className="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
-                >
-                  {actionLoading === 'cancel' && <Loader2 className="w-3 h-3 animate-spin" />}Confirm
-                </button>
-                <button
-                  onClick={() => setConfirmCancel(false)}
-                  className="px-3 py-1.5 rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors"
-                >
-                  No
-                </button>
-              </div>
-            )}
+            {showCancel && confirmCancel && (() => {
+              const visibleWaiting = countVisibleWaitingDependents(task.id, tasks);
+              const cancelImpactPending = cancelImpactStatus === 'idle' || cancelImpactStatus === 'loading';
+              const cancelImpactError = cancelImpactStatus === 'error';
+              const waiting = cancelImpact?.waiting_dependent_count ?? (cancelImpactError ? visibleWaiting : 0);
+              const activeChildren = cancelImpact?.active_child_cascade_count ?? 0;
+              const childVmIds = cancelImpact?.active_child_vm_id_count ?? 0;
+              const childVmProvisioned = cancelImpact?.active_child_vm_provisioned_count ?? 0;
+              const prContextReferences = cancelImpact?.orphan_pr_cleanup_context_reference_count ?? 0;
+              const prArtifactTasks = cancelImpact?.pull_request_artifact_task_count ?? 0;
+              const vmImpactParts = [
+                cancelImpact?.target_has_vm_id
+                  ? `target VM ${cancelImpact.target_vm_provisioned ? 'provisioned' : 'recorded'}`
+                  : null,
+                childVmIds > 0
+                  ? `${childVmIds} child VM${childVmIds > 1 ? 's' : ''} recorded`
+                  : null,
+                childVmProvisioned > 0
+                  ? `${childVmProvisioned} child VM${childVmProvisioned > 1 ? 's' : ''} provisioned`
+                  : null,
+              ].filter((part): part is string => Boolean(part));
+              return (
+                <div className="flex flex-col gap-1.5 w-full">
+                  <span className="text-sm text-neutral-300 font-medium">Cancel this task?</span>
+                  <span className="text-xs text-neutral-500">
+                    {cancelConsequenceWithImpact(task, cancelImpact)}
+                  </span>
+                  {cancelImpactPending && !cancelImpact && (
+                    <span className="text-xs text-neutral-600" data-testid="cancel-impact-loading">
+                      Checking full cancel impact...
+                    </span>
+                  )}
+                  {cancelImpactError && (
+                    <span className="text-xs text-amber-300" data-testid="cancel-impact-fallback">
+                      Full impact check failed; showing visible loaded-task dependents only.
+                    </span>
+                  )}
+                  {waiting > 0 && (
+                    <span className="text-xs text-amber-400" data-testid="cancel-blast-radius">
+                      {cancelImpact
+                        ? `${waiting} waiting task${waiting > 1 ? 's' : ''} depend${waiting > 1 ? '' : 's'} on this and may be stranded.`
+                        : `${waiting} visible waiting task${waiting > 1 ? 's' : ''} depend${waiting > 1 ? '' : 's'} on this in the loaded task set and may be stranded.`}
+                    </span>
+                  )}
+                  {activeChildren > 0 && (
+                    <span className="text-xs text-amber-400" data-testid="cancel-child-cascade">
+                      {activeChildren} active child task{activeChildren > 1 ? 's' : ''} may be cancelled with this task.
+                    </span>
+                  )}
+                  {vmImpactParts.length > 0 && (
+                    <span className="text-xs text-amber-400" data-testid="cancel-vm-cleanup">
+                      VM cleanup: {vmImpactParts.join('; ')}. Cleanup will be requested where still attached.
+                    </span>
+                  )}
+                  {(prContextReferences > 0 || prArtifactTasks > 0) && (
+                    <span className="text-xs text-amber-400" data-testid="cancel-pr-cleanup">
+                      PR cleanup: {prContextReferences} task{prContextReferences === 1 ? '' : 's'} with PR context and {prArtifactTasks} PR artifact task{prArtifactTasks === 1 ? '' : 's'} are in the cancel scope.
+                    </span>
+                  )}
+                  <div className="flex items-center gap-2 mt-0.5">
+                    <button
+                      onClick={() => {
+                        if (cancelImpactPending) return;
+                        onCancel(task.id);
+                        setConfirmCancel(false);
+                      }}
+                      disabled={!!actionLoading || cancelImpactPending}
+                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-red-600 hover:bg-red-500 text-white text-sm font-medium transition-colors disabled:opacity-50 flex items-center gap-1.5"
+                    >
+                      {(actionLoading === 'cancel' || cancelImpactPending) && <Loader2 className="w-3 h-3 animate-spin" />}Confirm cancel
+                    </button>
+                    <button
+                      onClick={() => setConfirmCancel(false)}
+                      className="px-3 py-1.5 min-h-[44px] rounded-lg bg-neutral-800 hover:bg-neutral-700 text-neutral-300 text-sm font-medium transition-colors"
+                    >
+                      Keep running
+                    </button>
+                  </div>
+                </div>
+              );
+            })()}
 
             {showFailedActions && (
               <>

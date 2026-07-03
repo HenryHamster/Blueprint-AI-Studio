@@ -30,21 +30,24 @@ const mocks = vi.hoisted(() => ({
   })),
 }));
 
-vi.mock('../api', () => ({
-  apiFetch: vi.fn(async (url: string) => {
-    if (url.includes('/auto-remediation')) {
-      return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
-    }
-    if (url.includes('/issue-implementation')) {
-      return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
-    }
-    return new Response('{}', { status: 200 });
-  }),
-  authGet: vi.fn(async () => new Response(JSON.stringify({ repositories: [] }), { status: 200 })),
-  previewOnboardProject: mocks.previewOnboardProjectMock,
-  onboardProject: mocks.onboardProjectMock,
-  API_BASE_URL: 'http://localhost:3000',
-}));
+vi.mock('../api', async () => {
+  const { createApiMock } = await import('../test/api-mock-complete');
+  return createApiMock({
+    apiFetch: vi.fn(async (url: string) => {
+      if (url.includes('/auto-remediation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      if (url.includes('/issue-implementation')) {
+        return new Response(JSON.stringify({ config: { enabled: false } }), { status: 200 });
+      }
+      return new Response('{}', { status: 200 });
+    }),
+    authGet: vi.fn(async () => new Response(JSON.stringify({ repositories: [] }), { status: 200 })),
+    previewOnboardProject: mocks.previewOnboardProjectMock,
+    onboardProject: mocks.onboardProjectMock,
+    API_BASE_URL: 'http://localhost:3000',
+  });
+});
 
 describe('NewProjectModal onboarding steering', () => {
   it('previews the detected merge-gate draft and posts the edited override on create', async () => {

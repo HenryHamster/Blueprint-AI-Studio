@@ -25,6 +25,7 @@ from app.models import (
     SourceKind,
     Task,
     TaskStatus,
+    _utcnow,
 )
 
 TEST_USER_ID = "test-user-123"
@@ -201,7 +202,13 @@ async def test_list_compute_jobs_non_member_404(client: AsyncClient, db_session)
 async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     project = await _make_project(db_session, name="Killable")
     await _add_member(db_session, project.id, "member")
-    _task, job, _artifact = await _make_job(db_session, project)
+    task, job, artifact = await _make_job(
+        db_session,
+        project,
+        title="Killable compute task",
+        with_artifact=True,
+    )
+    assert artifact is not None
 
     resp = await client.post(f"/api/admin/compute-jobs/{job.id}/kill")
     assert resp.status_code == 200
@@ -209,6 +216,15 @@ async def test_kill_compute_job_member_ok(client: AsyncClient, db_session):
     assert body["status"] == ComputeJobStatus.CANCELLED.value
     assert body["outcome"] == ComputeJobOutcome.CANCELLED.value
     assert "operator" in (body["terminal_reason"] or "")
+    assert body["task_title"] == task.title
+    assert body["task_type"] == "compute_experiment"
+    assert body["artifact"] == {
+        "id": str(artifact.id),
+        "artifact_type": ArtifactType.COMPUTE_RESULT.value,
+        "storage_uri": "gs://bucket/jobs/job-1/result.parquet",
+        "logical_key": "compute-result-job-1",
+        "created_at": artifact.created_at.isoformat(),
+    }
 
 
 @pytest.mark.asyncio
@@ -628,7 +644,7 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
         machine_type="e2-standard-2",
         spend_cap_usd=2.0,
         accrued_cost_usd=1.0,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job)
     await db_session.commit()
@@ -642,6 +658,55 @@ async def test_list_compute_jobs_includes_success_criterion_and_verdict(
     assert jobs[0]["criterion_verdict"] == verdict
     assert jobs[0]["criterion_verdict"]["met"] is True
     assert jobs[0]["criterion_verdict"]["value"] == 0.95
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_per_arm_verdicts_exposed(
+    client: AsyncClient, db_session
+):
+    """The list endpoint exposes per_arm_verdicts from plan_output.knowledge_document."""
+    project = await _make_project(db_session, name="Per-Arm Verdicts Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    per_arm = {
+        "arm_a": {"value": 0.92, "met": True, "cost_usd": 0.30},
+        "arm_b": {"value": 0.88, "met": False, "cost_usd": 0.90},
+    }
+    task = Task(
+        project_id=project.id,
+        title="per-arm task",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment"}],
+        plan_output={
+            "compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.20},
+            "knowledge_document": {"per_arm_verdicts": per_arm},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=1.20,
+        completed_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    jobs = resp.json()["compute_jobs"]
+    assert len(jobs) == 1
+
+    assert jobs[0]["per_arm_verdicts"] == per_arm
+    assert jobs[0]["per_arm_verdicts"]["arm_a"]["cost_usd"] == pytest.approx(0.30)
+    assert jobs[0]["per_arm_verdicts"]["arm_b"]["met"] is False
 
 
 @pytest.mark.asyncio
@@ -692,7 +757,7 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_job_row(
         spend_cap_usd=2.0,
         accrued_cost_usd=1.0,
         final_cost_usd=1.0,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
         polling_metadata={"result_metrics": {"accuracy": 0.95}},
     )
     db_session.add(job)
@@ -743,7 +808,7 @@ async def test_list_compute_jobs_criterion_verdict_recovered_from_stdout(
         spend_cap_usd=2.0,
         accrued_cost_usd=0.5,
         final_cost_usd=0.5,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
         polling_metadata={
             "command_log": {"text": 'run complete\n{"f1": 0.88}\n', "truncated": False}
         },
@@ -994,6 +1059,7 @@ async def _make_terminal_job_with_task(
     status=ComputeJobStatus.SUCCEEDED,
     plan_output=None,
     result_reference="gs://bucket/jobs/job-1/result.json",
+    polling_metadata=None,
 ):
     """Seed a terminal compute job with an optional plan_output on its task."""
     task = Task(
@@ -1015,6 +1081,7 @@ async def _make_terminal_job_with_task(
         spend_cap_usd=5.0,
         accrued_cost_usd=1.5,
         result_reference=result_reference,
+        polling_metadata=polling_metadata,
     )
     session.add(job)
     await session.commit()
@@ -1142,7 +1209,7 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
         spend_cap_usd=5.0,
         accrued_cost_usd=1.0,
         final_cost_usd=1.5,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job1)
     await db_session.commit()
@@ -1175,7 +1242,7 @@ async def test_list_compute_jobs_includes_summary(client: AsyncClient, db_sessio
         spend_cap_usd=5.0,
         accrued_cost_usd=0.8,
         final_cost_usd=0.8,
-        completed_at=datetime.utcnow(),
+        completed_at=_utcnow(),
     )
     db_session.add(job2)
     await db_session.commit()
@@ -1410,8 +1477,24 @@ async def test_aggregate_summary_endpoint_empty_project(
 # ---------------------------------------------------------------------------
 
 
-async def _seed_sweep_doc(session, project, task, *, sweep_id, arm_label):
-    """Seed a compute-experiment KnowledgeDocument with sweep metadata."""
+async def _seed_sweep_doc(session, project, *, sweep_id, arm_label, criterion_met=True):
+    """Seed one planned compute arm and its matching KnowledgeDocument."""
+    task = Task(
+        project_id=project.id,
+        title=f"sweep task {arm_label}",
+        status=TaskStatus.COMPLETED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": sweep_id,
+                "experiment": arm_label,
+            }
+        ],
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
     doc = KnowledgeDocument(
         project_id=project.id,
         source_task_id=task.id,
@@ -1422,6 +1505,10 @@ async def _seed_sweep_doc(session, project, task, *, sweep_id, arm_label):
         topic="exp",
         sweep_id=sweep_id,
         arm_label=arm_label,
+        forward_quality_verdict={
+            "analysis_mode": "deterministic",
+            "criterion_met": criterion_met,
+        },
     )
     session.add(doc)
     await session.commit()
@@ -1434,18 +1521,11 @@ async def test_sweep_groups_endpoint_viewer_ok(client: AsyncClient, db_session):
     """A viewer can retrieve sweep groups; response shape includes sweep_id key."""
     project = await _make_project(db_session, name="Sweep Groups Viewer")
     await _add_member(db_session, project.id, "viewer")
-    task = Task(
-        project_id=project.id,
-        title="sweep task",
-        status=TaskStatus.COMPLETED,
-        payloads=[{"type": "compute_experiment"}],
-    )
-    db_session.add(task)
-    await db_session.commit()
-    await db_session.refresh(task)
     # Two arms in one sweep — minimum for build_compute_sweep_groups to include it.
-    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="baseline")
-    await _seed_sweep_doc(db_session, project, task, sweep_id="sw-abc", arm_label="treatment")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-abc", arm_label="baseline")
+    await _seed_sweep_doc(
+        db_session, project, sweep_id="sw-abc", arm_label="treatment"
+    )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
     assert resp.status_code == 200
@@ -1459,9 +1539,596 @@ async def test_sweep_groups_endpoint_viewer_ok(client: AsyncClient, db_session):
 
 
 @pytest.mark.asyncio
+async def test_sweep_groups_endpoint_omits_incomplete_planned_sweep(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session, name="Sweep Groups Incomplete")
+    await _add_member(db_session, project.id, "viewer")
+    await _seed_sweep_doc(db_session, project, sweep_id="sw-missing", arm_label="baseline")
+    missing_task = Task(
+        project_id=project.id,
+        title="missing sweep task",
+        status=TaskStatus.FAILED,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "base_branch": "main",
+                "sweep_id": "sw-missing",
+                "experiment": "treatment",
+            }
+        ],
+    )
+    db_session.add(missing_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
+    assert resp.status_code == 200
+    assert resp.json()["sweep_groups"] == {}
+
+
+@pytest.mark.asyncio
 async def test_sweep_groups_endpoint_non_member_404(client: AsyncClient, db_session):
     """A user with no project membership receives 404 from the sweep-groups endpoint."""
     project = await _make_project(db_session, name="Sweep Groups No Access")
     # No ProjectMember row — request must be rejected.
     resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs/sweep-groups")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/compute-jobs/{job_id}/ask — grounded Q&A endpoint tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_grounded_answer(client: AsyncClient, db_session):
+    """A member can ask a free-form question and receive a grounded answer with citations."""
+    project = await _make_project(db_session, name="Ask Grounded Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.5}},
+    )
+
+    canned = {
+        "answer": "The accuracy metric was 0.95, meeting the declared criterion.",
+        "citations": ["gs://bucket/results/exp.json#metric:accuracy=0.95"],
+        "grounding": {"checked": True, "file_citations": 1, "grounded": 1, "unresolved": []},
+        "grounding_miss": False,
+        "fallback_reason": None,
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=canned),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What accuracy did the experiment achieve?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "The accuracy metric was 0.95, meeting the declared criterion."
+    assert body["citations"] == ["gs://bucket/results/exp.json#metric:accuracy=0.95"]
+    assert body["grounding_miss"] is False
+    assert body["grounding"]["grounded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_viewer_forbidden(client: AsyncClient, db_session):
+    """Viewers must not be able to use the ask endpoint (member+ only)."""
+    project = await _make_project(db_session, name="Ask Viewer Forbidden")
+    await _add_member(db_session, project.id, "viewer")
+    _task, job = await _make_terminal_job_with_task(db_session, project)
+
+    resp = await client.post(
+        f"/api/admin/compute-jobs/{job.id}/ask",
+        json={"question": "What happened?"},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_nonterminal_returns_409(client: AsyncClient, db_session):
+    """Asking about a running job returns 409 (Q&A requires terminal job)."""
+    project = await _make_project(db_session, name="Ask Running Job")
+    await _add_member(db_session, project.id, "member")
+    _task, job, _artifact = await _make_job(
+        db_session, project, status=ComputeJobStatus.RUNNING
+    )
+
+    resp = await client.post(
+        f"/api/admin/compute-jobs/{job.id}/ask",
+        json={"question": "Is it done?"},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_no_evidence_declines_honestly(
+    client: AsyncClient, db_session
+):
+    """When the run has no durable evidence, the endpoint returns a polite decline."""
+    project = await _make_project(db_session, name="Ask No Evidence")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        result_reference=None,
+    )
+
+    with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test", "DISABLE_LLM_COMPUTE_ANALYSIS": "0"}):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What metrics were reported?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "answer" in body
+    assert "citations" in body
+    assert body["grounding_miss"] is True
+    assert isinstance(body["citations"], list)
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_metric_only_job_answers_grounded(
+    client: AsyncClient, db_session
+):
+    """Metric-only terminal jobs without artifact_id still support grounded Q&A."""
+    project = await _make_project(db_session, name="Ask Metric Only")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        result_reference=None,
+        polling_metadata={"result_metrics": {"accuracy": 0.95}},
+    )
+
+    metric_citation = f"compute-job:{job.id}#metric:accuracy=0.95"
+
+    class _FakeContent:
+        text = (
+            f'{{"answer": "The run achieved 0.95 accuracy.", '
+            f'"citations": ["{metric_citation}"]}}'
+        )
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What accuracy did it reach?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "The run achieved 0.95 accuracy."
+    assert body["grounding_miss"] is False
+    assert body["citations"] == [metric_citation]
+
+
+@pytest.mark.asyncio
+async def test_ask_endpoint_returns_grounded_answer_and_rejects_ungrounded(
+    client: AsyncClient, db_session
+):
+    """Grounded Q&A: answer path returns grounding_miss=False; no-evidence path returns grounding_miss=True."""
+    project = await _make_project(db_session, name="Ask Grounded vs Ungrounded")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+    )
+
+    # --- grounded answer path ---
+    grounded_response = {
+        "answer": "Sharpe ratio was 1.43, exceeding the 1.2 threshold.",
+        "citations": ["gs://bp-artifacts/proj/task/result/#metric:sharpe_ratio=1.43"],
+        "grounding": {"checked": True, "file_citations": 1, "grounded": 1, "unresolved": []},
+        "grounding_miss": False,
+        "fallback_reason": None,
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=grounded_response),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What was the Sharpe ratio?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["answer"] == "Sharpe ratio was 1.43, exceeding the 1.2 threshold."
+    assert body["grounding_miss"] is False
+    assert body["grounding"]["grounded"] == 1
+    assert body["fallback_reason"] is None
+
+    # --- ungrounded / no-evidence path ---
+    ungrounded_response = {
+        "answer": None,
+        "citations": [],
+        "grounding": {"checked": True, "file_citations": 0, "grounded": 0, "unresolved": []},
+        "grounding_miss": True,
+        "fallback_reason": "no-evidence",
+    }
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        new=AsyncMock(return_value=ungrounded_response),
+    ):
+        resp2 = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "What was the p-value?"},
+        )
+
+    assert resp2.status_code == 200
+    body2 = resp2.json()
+    assert body2["answer"] is None
+    assert body2["grounding_miss"] is True
+    assert body2["fallback_reason"] == "no-evidence"
+    assert body2["citations"] == []
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_includes_per_arm_evidence(
+    client: AsyncClient, db_session
+):
+    """_gather_compute_evidence exposes per-arm sweep results so operators can ask
+    'which arm won?' and receive a grounded, arm-citing answer."""
+    project = await _make_project(db_session, name="Ask Arm Evidence Project")
+    await _add_member(db_session, project.id, "member")
+
+    task = Task(
+        project_id=project.id,
+        title="sweep experiment",
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "compute_experiment", "experiment": "arm_sweep_v1"}],
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=2.0,
+        result_reference="gs://bucket/sweeps/sweep-1/result.json",
+        polling_metadata={
+            "result_metrics": {
+                "accuracy": 0.91,
+                "arms": {
+                    "control": {"accuracy": 0.85, "score": 0.80},
+                    "treatment": {"accuracy": 0.95, "score": 0.92},
+                },
+            }
+        },
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    captured_prompts: list[str] = []
+
+    class _FakeContent:
+        text = '{"answer": "treatment arm won with 0.95 accuracy", "citations": ["gs://bucket/sweeps/sweep-1/result.json#arms:treatment"]}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured_prompts.append(
+                (kwargs.get("messages") or [{}])[0].get("content", "")
+            )
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "Which arm performed better?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # New Q&A response shape: a successful grounded answer carries grounding_miss=False
+    # (this PR replaced the legacy top-level ``grounded`` boolean).
+    assert body["grounding_miss"] is False
+    # The arm citation must pass the allowed-set gate (arm refs added to evidence)
+    assert any("arms:treatment" in c for c in body["citations"])
+    # The prompt must have included the per-arm section so the LLM saw arm data
+    assert len(captured_prompts) >= 1
+    prompt_text = captured_prompts[0]
+    assert "Per-arm results" in prompt_text
+    assert "control" in prompt_text
+    assert "treatment" in prompt_text
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_supplementary_citation_not_grounded(
+    client: AsyncClient, db_session
+):
+    """When the LLM cites only supplementary citations (signed URLs, not durable evidence),
+    the response sets grounded=False and returns an empty citations list.
+
+    This test exercises the durable_cits gate: the job has real metrics so
+    _gather_compute_evidence returns a non-None evidence bundle, the signed URL
+    is injected into the supplementary set (allowed_set) via a mocked storage
+    helper, and the LLM mock cites that signed URL.  The durable_cits filter
+    strips it out (https:// is not durable), producing grounding_miss=True.
+    """
+    _SIGNED_URL = "https://storage.example.com/signed-url?token=xyz"
+
+    project = await _make_project(db_session, name="Ask Supplementary Project")
+    await _add_member(db_session, project.id, "member")
+    # Supply result_metrics so _gather_compute_evidence does not short-circuit
+    # at the 'file_count <= 0 and not metrics' guard before any citation work.
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.0}},
+        polling_metadata={"result_metrics": {"p_success": 0.95}},
+    )
+
+    class _FakeContent:
+        # LLM cites only the supplementary signed URL (not in real_evidence)
+        text = f'{{"answer": "The result was successful.", "citations": ["{_SIGNED_URL}"]}}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    async def _fake_signed_url(uri):
+        # Inject the signed URL into the supplementary set so the LLM's citation
+        # lands in allowed_set but is excluded from real_evidence_set — this is
+        # exactly the path the durable_cits filter must catch.
+        return _SIGNED_URL
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+        patch(
+            "app.storage.generate_download_signed_url",
+            side_effect=_fake_signed_url,
+        ),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": "Was it successful?"},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Grounding gate: supplementary citations (signed URLs) must not satisfy
+    # the durable-evidence requirement even when the LLM cites them correctly.
+    assert body["grounding_miss"] is True
+    # No durable citations means empty citations list
+    assert body["citations"] == []
+    assert body["grounding"]["grounded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_multi_turn_history_grounded(
+    client: AsyncClient, db_session
+):
+    """Multi-turn Q&A: prior turns appear as context-only in the prompt,
+    and the new answer is still independently grounded via durable citations."""
+    project = await _make_project(db_session, name="Multi-Turn History Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 2.0}},
+        polling_metadata={"result_metrics": {"accuracy": 0.93}},
+    )
+
+    captured_prompts: list[str] = []
+
+    class _FakeContent:
+        # Citation must match the durable ref format: artifact_uri#metric:name=value
+        text = '{"answer": "The accuracy was 0.93.", "citations": ["gs://bucket/jobs/job-1/result.json#metric:accuracy=0.93"]}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            captured_prompts.append(
+                (kwargs.get("messages") or [{}])[0].get("content", "")
+            )
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    prior_history = [
+        {"question": "Did this run succeed?", "answer": "Yes, it succeeded."},
+    ]
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={
+                "question": "What was the accuracy?",
+                "history": prior_history,
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Answer is grounded in durable evidence (real result_reference metric citation)
+    assert body["grounding_miss"] is False
+    assert len(body["citations"]) >= 1
+
+    # Prior conversation must appear in the prompt under a context-only label
+    assert len(captured_prompts) >= 1
+    prompt_text = captured_prompts[0]
+    assert "Prior conversation" in prompt_text
+    assert "Did this run succeed?" in prompt_text
+    assert "Yes, it succeeded." in prompt_text
+    # History label must indicate it is NOT citable evidence
+    assert "NOT evidence" in prompt_text or "context only" in prompt_text.lower()
+
+    # The allowed-citation list must NOT include any text from the prior answer
+    # (history must not bleed into the allowed-citation set)
+    assert "Yes, it succeeded." not in prompt_text.split("Choose citations ONLY")[1]
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_history_bounded_and_malformed_ignored(
+    client: AsyncClient, db_session
+):
+    """Oversized history is clamped at the route boundary; malformed entries are ignored."""
+    project = await _make_project(db_session, name="History Bounds Project")
+    await _add_member(db_session, project.id, "member")
+    _task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS"}},
+        polling_metadata={"result_metrics": {"score": 0.8}},
+    )
+
+    # 10 valid turns (exceeds _QA_HISTORY_MAX_TURNS=6) plus 2 malformed entries
+    oversized_history = [
+        {
+            "question": (
+                f"history-question-{i}-" + ("Q" * 1200) + "-question-overflow"
+                if i == 9
+                else f"history-question-{i}"
+            ),
+            "answer": (
+                f"history-answer-{i}-" + ("A" * 1200) + "-answer-overflow"
+                if i == 9
+                else f"history-answer-{i}"
+            ),
+        }
+        for i in range(10)
+    ] + [
+        {"bad_key": "no question or answer"},  # malformed — missing required fields
+        "not a dict",  # malformed — wrong type entirely
+    ]
+    long_question = "What did this very detailed compute run show? " + ("Q" * 600)
+    answer_mock = AsyncMock(
+        return_value={
+            "answer": "The score was 0.8.",
+            "citations": [],
+            "grounding_miss": False,
+            "fallback_reason": None,
+        }
+    )
+
+    with patch(
+        "app.knowledge_completion.answer_compute_experiment_question",
+        answer_mock,
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={"question": long_question, "history": oversized_history},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["grounding_miss"] is False
+
+    assert answer_mock.await_count == 1
+    assert answer_mock.await_args.kwargs["question"] == long_question
+    forwarded_history = answer_mock.await_args.kwargs["history"]
+    assert forwarded_history == [
+        {"question": "history-question-4", "answer": "history-answer-4"},
+        {"question": "history-question-5", "answer": "history-answer-5"},
+        {"question": "history-question-6", "answer": "history-answer-6"},
+        {"question": "history-question-7", "answer": "history-answer-7"},
+        {"question": "history-question-8", "answer": "history-answer-8"},
+        {
+            "question": "history-question-9-" + ("Q" * 981),
+            "answer": "history-answer-9-" + ("A" * 983),
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ask_compute_job_history_not_citable(
+    client: AsyncClient, db_session
+):
+    """History text must not satisfy the durable-citation gate even if the LLM cites it.
+
+    A prior answer's text is injected into the prompt as context-only. If the LLM
+    tries to cite a phrase from that prior answer, the durable_cits gate must still
+    reject it (it is not in the real_evidence_set).
+    """
+    project = await _make_project(db_session, name="History Not Citable Project")
+    await _add_member(db_session, project.id, "member")
+    task, job = await _make_terminal_job_with_task(
+        db_session,
+        project,
+        plan_output={"compute_result": {"outcome": "SUCCESS", "final_cost_usd": 1.0}},
+        polling_metadata={"result_metrics": {"p_val": 0.01}},
+    )
+
+    PRIOR_ANSWER_TEXT = "p_val was 0.01 in the prior run"
+
+    class _FakeContent:
+        # LLM cites text from the prior answer — this must NOT pass the durable gate
+        text = f'{{"answer": "Based on prior context.", "citations": ["{PRIOR_ANSWER_TEXT}"]}}'
+
+    class _FakeResponse:
+        content = [_FakeContent()]
+
+    class _FakeMessages:
+        async def create(self, **kwargs):
+            return _FakeResponse()
+
+    class _FakeClient:
+        messages = _FakeMessages()
+
+    with (
+        patch("anthropic.AsyncAnthropic", return_value=_FakeClient()),
+        patch.dict("os.environ", {"ANTHROPIC_API_KEY": "sk-test"}),
+    ):
+        resp = await client.post(
+            f"/api/admin/compute-jobs/{job.id}/ask",
+            json={
+                "question": "Confirm the p-value?",
+                "history": [{"question": "What was p_val?", "answer": PRIOR_ANSWER_TEXT}],
+            },
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    # Prior answer text is not durable evidence — must be rejected by the grounding gate
+    assert body["grounding_miss"] is True
+    assert body["citations"] == []

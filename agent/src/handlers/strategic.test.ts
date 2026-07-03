@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'fs';
 
 // Capture the prompt the handler hands to the thinker (analysis) pass.
@@ -6,6 +6,274 @@ let capturedThinkerPrompt: string | undefined;
 // Capture the params the handler passes to buildThinkerPrompt so tests can
 // assert on derived values (problem_model recovery framing).
 let capturedThinkerParams: Record<string, unknown> | undefined;
+
+const {
+  INDEX_EXPORT_NAMES,
+  WORKSPACE_PREP_EXPORT_NAMES,
+  STRATEGIC_HELPERS_EXPORT_NAMES,
+  DESIGN_DOC_PRESENCE_EXPORT_NAMES,
+  RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES,
+  RESEARCH_PLAN_EXPORT_NAMES,
+  STRATEGIC_SECTIONS_EXPORT_NAMES,
+  TELEMETRY_EXPORT_NAMES,
+} = vi.hoisted(() => ({
+  INDEX_EXPORT_NAMES: [
+    'AUTH_MODE',
+    'AuthFailureError',
+    'ClaudeTimeoutError',
+    'GIT_REFERENCE_CACHE_ROOT',
+    'GracefulShutdownSignal',
+    'LLM_CLI_TRANSLATION',
+    'LLM_EXECUTION_MODE',
+    'MATERIALIZE_SCRIPT_PATH',
+    'NoProgressTimeoutError',
+    'PROVIDER',
+    'RateLimitError',
+    'TASK_BRANCH_NAMESPACE_DEFAULT',
+    'TASK_TYPE_BRANCH_PREFIX',
+    'VmConfigMissingError',
+    'WORKSPACE',
+    '__resetTaskCapabilityContractLoadedForTesting',
+    '__setRunClaudeCodeOverrideForSmoke',
+    '__setWarmRetargetDepsForTesting',
+    '_buildHeartbeatStatusForTesting',
+    '_captureBootCredentialSnapshotForTesting',
+    '_captureBootProviderConfigPresenceForTesting',
+    '_consumePendingParkDirectiveForTesting',
+    '_crashReportForTesting',
+    '_getActiveCredentialStateSourceForTesting',
+    '_getCrashReportTaskIdForTesting',
+    '_getFirstToolUseAtForTesting',
+    '_getHandlerDurationForTesting',
+    '_getJobModeForTesting',
+    '_getRoleClaimTimestampForTesting',
+    '_getWarmStartForTesting',
+    '_isCancelRequestedForTesting',
+    '_materializeClaimCredentialStateForTesting',
+    '_resetCancelRequestedForTesting',
+    '_resetCredentialStateForTesting',
+    '_resetTelemetryForTesting',
+    '_setAgentRuntimeFingerprintForTesting',
+    '_setAgentSourceShaForTesting',
+    '_setAgentTokenForTesting',
+    '_setCancelRequestedForTesting',
+    '_setHandlerDurationForTesting',
+    '_setInWarmPollWindowForTesting',
+    '_setJobModeForTesting',
+    '_setRoleClaimTimestampForTesting',
+    '_setWarmStartForTesting',
+    '_startHeartbeatForTesting',
+    '_stopHeartbeatForTesting',
+    'apiGet',
+    'apiPost',
+    'apiRequest',
+    'appendToLogBuffer',
+    'bootstrapPoolMode',
+    'buildTargetedPytestRunners',
+    'captureTestBaseline',
+    'clearLastProviderRunErrorReport',
+    'clearLogBuffer',
+    'clearToolTrace',
+    'cloneWithRetry',
+    'codexStreamHasTurnCompleted',
+    'collectFixLoopEventsForFlush',
+    'computePromptFingerprint',
+    'computeRefreshDelayMs',
+    'condensedAnalysisSections',
+    'continueWarmContinuation',
+    'createStaleResultEnvelope',
+    'deriveTaskBranch',
+    'detectLoopDivergence',
+    'detectTestRunners',
+    'ensureTaskCapabilityContractLoaded',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'execFileAsync',
+    'extractInvestigatedFiles',
+    'extractPytestSelectorsFromOutput',
+    'fetchTaskCapabilityContract',
+    'fetchVmImageIdentity',
+    'getAgentToken',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLastProviderRunErrorReport',
+    'getLlmTelemetry',
+    'getProviderRunner',
+    'git',
+    'gitAsync',
+    'isBootstrapToken',
+    'isTaskNoLongerActiveError',
+    'listOpenPullRequestsForBranch',
+    'log',
+    'main',
+    'markStaleResultFailure',
+    'matchesAuthFailure',
+    'matchesRateLimit',
+    'matchesVmConfigMissing',
+    'missingProviderConfigFiles',
+    'missingVmProviderConfigFiles',
+    'normalizePytestSelectorForRunner',
+    'parseFailingTests',
+    'parseFailingTestsFromVitestJson',
+    'parseLLMCliTranslation',
+    'parseStaleResultFile',
+    'performWarmRetarget',
+    'persistAndPostStatus',
+    'pollForNextRole',
+    'postTerminalStatusSync',
+    'providerSupportsNativeSubagents',
+    'pushAndCreatePR',
+    'readAgentRuntimeFingerprint',
+    'readAgentSourceSha',
+    'readHandlerOutput',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairSuccess',
+    'recordInitialOAuthAuthHash',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordToolUse',
+    'refreshRuntimeState',
+    'registerSizeCapMergeDriver',
+    'replayLogBufferRateLimited',
+    'requiredProviderConfigFiles',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'resetPerRoleModuleState',
+    'resolveBaseBranch',
+    'resolveCredentialsFromSecretVersion',
+    'resolveTaskBranchNamespace',
+    'rotateOAuthCredentialsIfChanged',
+    'runClaudeCode',
+    'runProviderAgent',
+    'sanitize',
+    'sanitizeError',
+    'sendHeartbeatSync',
+    'sendLog',
+    'setCurrentPromptFingerprint',
+    'setupWorkspace',
+    'shouldAbandonStaleResult',
+    'snapshotLogBuffer',
+    'snapshotToolTrace',
+    'staleResultBackoffMs',
+    'strVal',
+    'testFixLoop',
+    'validateBranchName',
+  ],
+  WORKSPACE_PREP_EXPORT_NAMES: [
+    'getLastWorkspacePrepOutcome',
+    'prepareWorkspaceForRole',
+    'resetWorkspacePrepOutcome',
+    'resolveReferenceRepo',
+  ],
+  STRATEGIC_HELPERS_EXPORT_NAMES: [
+    'DESIGN_DOC_FETCH_VERBS',
+    'PLAN_FETCH_VERBS',
+    'RESEARCH_FETCH_VERBS',
+    'STRATEGIC_CHALLENGE_VERSION',
+    'STRATEGIC_FETCH_VERBS',
+    'blockedChallengeRecord',
+    'buildFetchGuidance',
+    'buildStrategicChallengeExecutorSection',
+    'buildStrategicChallengePrompt',
+    'parseStrategicChallengeRecord',
+    'portfolioOperationFingerprint',
+    'runStrategicChallenge',
+    'writeFetchHelper',
+    'writeStrategicHelpers',
+  ],
+  DESIGN_DOC_PRESENCE_EXPORT_NAMES: [
+    'extractEntryPaths',
+    'reconcileDesignDocIndex',
+    'reconcileDesignDocPresence',
+    'reconcileEntry',
+    'reconcileMissingCapabilities',
+    'reconcileSystemEntry',
+  ],
+  RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES: [
+    'differentiationHintFor',
+    'formatCochangeHints',
+    'formatDecompositionOutcomes',
+    'formatPastRetirementCritiques',
+    'formatPreviousDecisionOutcomes',
+    'formatRetiredDirectionsSummary',
+  ],
+  RESEARCH_PLAN_EXPORT_NAMES: [
+    'CAPABILITY_DECLARATION_DOC',
+    'PR_INELIGIBLE_TASK_TYPES',
+    'aggregateDirectionStats',
+    'buildAvailableCapabilitiesSection',
+    'buildCapabilityVerificationSection',
+    'buildEfficiencySnapshotSection',
+    'buildEmptyRepoGuidance',
+    'buildFilteredFindingsSection',
+    'buildMemoCitationsSection',
+    'buildOperatorOverridesSection',
+    'buildPortfolioComposition',
+    'buildRejectedProposalsSection',
+    'buildRunningUpdateSupersededSection',
+    'buildScopeCalibrationSignal',
+    'buildStrategicCompletionLogs',
+    'buildThinkerPrompt',
+    'buildUserPausedSection',
+    'buildVersionPhaseSection',
+    'calcMessageAge',
+    'classifyFailureCategory',
+    'formatCochangeHints',
+    'formatDecompositionOutcomes',
+    'formatPastRetirementCritiques',
+    'formatPreviousDecisionOutcomes',
+    'formatRetiredDirectionsSummary',
+    'handlePlan',
+    'handleResearch',
+    'normalizePlanSubtaskTypes',
+    'parseResearchContext',
+    'readProgressArtifact',
+    'resolveMemoHandles',
+    'runThinkerWithGate',
+  ],
+  STRATEGIC_SECTIONS_EXPORT_NAMES: [
+    'buildCapabilityVerificationSection',
+    'buildCiComplianceSection',
+    'buildClockAndRecentWorkSection',
+    'buildConversationThreadSection',
+    'buildCycleStartReconciliationSection',
+    'buildDirHealthSummary',
+    'buildDirSummaryText',
+    'buildDriftSection',
+    'buildFeedbackSection',
+    'buildHeldDirectionsSection',
+    'buildModelHealthSection',
+    'buildOpenMessagesText',
+    'buildOutcomeSection',
+    'buildPayloadStalenessSection',
+    'buildPruneCandidatesSection',
+    'buildQuestionSection',
+    'buildSweepComparisonSection',
+    'buildSystemMaturitySection',
+    'fmtScalar',
+  ],
+  TELEMETRY_EXPORT_NAMES: [
+    'computePromptFingerprint',
+    'errorFingerprint',
+    'estimateTokensFromChars',
+    'getCurrentPromptFingerprint',
+    'getFormatComplianceTelemetry',
+    'getLlmTelemetry',
+    'recordFormatMiss',
+    'recordFormatRepairAttempt',
+    'recordFormatRepairInfraFailure',
+    'recordFormatRepairMiss',
+    'recordFormatRepairSuccess',
+    'recordFormatRepairTokens',
+    'recordLlmCallStart',
+    'recordLlmTokens',
+    'recordViewportScreenshotDownload',
+    'resetFormatComplianceTelemetry',
+    'resetLlmTelemetry',
+    'setCurrentPromptFingerprint',
+  ],
+}));
 
 vi.mock('fs', () => ({
   default: {
@@ -16,6 +284,7 @@ vi.mock('fs', () => ({
 }));
 
 vi.mock('../index.js', () => ({
+  ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   WORKSPACE: '/tmp/workspace',
   strVal: (v: unknown, def = '') => (typeof v === 'string' ? v : def),
   sanitize: (s: string) => s,
@@ -30,16 +299,21 @@ vi.mock('../index.js', () => ({
 }));
 
 vi.mock('../workspacePrep.js', () => ({
+  ...Object.fromEntries(WORKSPACE_PREP_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   prepareWorkspaceForRole: vi.fn().mockResolvedValue(undefined),
 }));
 
-vi.mock('../prompt.js', () => ({
-  buildContextPrefix: () => '',
-  configureAgentPermissions: () => [],
-  writePlaybookHelper: vi.fn(),
-  writeMessagesHelper: vi.fn(),
-  DEFAULT_TOOL_GUIDANCE: 'Tool guidance: ...',
-}));
+vi.mock('../prompt.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompt.js')>();
+  return {
+    ...actual,
+    buildContextPrefix: () => '',
+    configureAgentPermissions: () => [],
+    writePlaybookHelper: vi.fn(),
+    writeMessagesHelper: vi.fn(),
+    DEFAULT_TOOL_GUIDANCE: 'Tool guidance: ...',
+  };
+});
 
 // Default challenge record the mocked runStrategicChallenge resolves with. Tests
 // that care about the challenge override it per-case via mockResolvedValueOnce.
@@ -56,6 +330,12 @@ const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
 }));
 
 vi.mock('./strategic-helpers.js', () => ({
+  ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  DESIGN_DOC_FETCH_VERBS: [],
+  PLAN_FETCH_VERBS: [],
+  RESEARCH_FETCH_VERBS: [],
+  STRATEGIC_CHALLENGE_VERSION: 1,
+  STRATEGIC_FETCH_VERBS: [],
   writeStrategicHelpers: vi.fn(),
   // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
   // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
@@ -99,6 +379,7 @@ vi.mock('../utils/time.js', () => ({
 }));
 
 vi.mock('../utils/design-doc-presence.js', () => ({
+  ...Object.fromEntries(DESIGN_DOC_PRESENCE_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   reconcileDesignDocPresence: (doc: unknown) => doc,
   // Identity stub: the handler now reconciles the compact index. Return it
   // unchanged so the overview-rendering assertions see the payload's index.
@@ -106,25 +387,35 @@ vi.mock('../utils/design-doc-presence.js', () => ({
 }));
 
 vi.mock('./research-direction-context.js', () => ({
+  ...Object.fromEntries(RESEARCH_DIRECTION_CONTEXT_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  differentiationHintFor: () => '',
+  formatCochangeHints: () => '',
+  formatDecompositionOutcomes: () => '',
   formatPreviousDecisionOutcomes: () => '',
   formatPastRetirementCritiques: () => '',
   formatRetiredDirectionsSummary: () => '',
 }));
 
-vi.mock('../prompts/thinker.js', () => ({
-  computeResearchPlanPromptFingerprint: () => 'fp',
-  buildThinkerPrompt: (p: Record<string, unknown>) => {
-    capturedThinkerParams = p;
-    return 'BASE_THINKER_PROMPT';
-  },
-  // Capture the rendered prompt, then short-circuit so the executor pass never runs.
-  runThinkerWithGate: vi.fn((prompt: string) => {
-    capturedThinkerPrompt = prompt;
-    return Promise.resolve({ ok: false });
-  }),
-}));
+vi.mock('../prompts/thinker.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../prompts/thinker.js')>();
+  return {
+    ...actual,
+    computeResearchPlanPromptFingerprint: () => 'fp',
+    buildThinkerPrompt: (p: Record<string, unknown>) => {
+      capturedThinkerParams = p;
+      return 'BASE_THINKER_PROMPT';
+    },
+    // Capture the rendered prompt, then short-circuit so the executor pass never runs.
+    runThinkerWithGate: vi.fn((prompt: string) => {
+      capturedThinkerPrompt = prompt;
+      return Promise.resolve({ ok: false });
+    }),
+  };
+});
 
 vi.mock('./research-plan.js', () => ({
+  ...Object.fromEntries(RESEARCH_PLAN_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  PR_INELIGIBLE_TASK_TYPES: [],
   buildStrategicCompletionLogs: () => ({ logs: '' }),
   readProgressArtifact: () => '',
   buildRejectedProposalsSection: () => '',
@@ -153,7 +444,13 @@ vi.mock('./research-plan.js', () => ({
 }));
 
 vi.mock('./strategic-sections.js', () => ({
+  ...Object.fromEntries(STRATEGIC_SECTIONS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+  fmtScalar: (v: unknown, fallback = '?') => {
+    if (v === undefined || v === null || v === '') return fallback;
+    return typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean' ? String(v) : fallback;
+  },
   buildSystemMaturitySection: () => '',
+  buildCapabilityVerificationSection: () => '',
   // Echo presence so wiring tests can assert the handler passes
   // payload.cycle_start_reconciliation through to this builder.
   buildCycleStartReconciliationSection: (recon: Record<string, unknown> | undefined) =>
@@ -177,13 +474,30 @@ vi.mock('./strategic-sections.js', () => ({
     maxActiveDirections: number,
     authoritative?: { active: number; paused: number },
   ) => `DIRHEALTH(max=${maxActiveDirections},auth=${authoritative ? authoritative.active : undefined})`,
+  buildSweepComparisonSection: () => '',
+  buildCiComplianceSection: () => '',
+  buildPayloadStalenessSection: (staleness: Record<string, unknown> | undefined) =>
+    staleness && staleness.stale === true ? 'STALENESS(stale)' : '',
+  buildHeldDirectionsSection: (held: Array<Record<string, unknown>> | undefined) =>
+    held && held.length ? `HELD(${held.length})` : '',
 }));
 
 vi.mock('../telemetry.js', () => ({
+  ...Object.fromEntries(TELEMETRY_EXPORT_NAMES.map((name) => [name, vi.fn()])),
   recordFormatMiss: vi.fn(),
   recordFormatRepairAttempt: vi.fn(),
   recordFormatRepairSuccess: vi.fn(),
   recordFormatRepairTokens: vi.fn(),
+  recordFormatRepairInfraFailure: vi.fn(),
+  recordFormatRepairMiss: vi.fn(),
+  recordLlmCallStart: vi.fn(),
+  recordLlmTokens: vi.fn(),
+  recordViewportScreenshotDownload: vi.fn(),
+  resetFormatComplianceTelemetry: vi.fn(),
+  resetLlmTelemetry: vi.fn(),
+  setCurrentPromptFingerprint: vi.fn(),
+  getCurrentPromptFingerprint: vi.fn().mockReturnValue(null),
+  getFormatComplianceTelemetry: vi.fn().mockReturnValue({}),
   getLlmTelemetry: vi.fn().mockReturnValue({
     llm_call_count: 0,
     total_input_tokens: 100,
@@ -198,11 +512,50 @@ import {
   renderDesignDocIndexOverview,
   handleStrategic,
 } from './strategic.js';
-import { runClaudeCode, apiPost } from '../index.js';
+import * as mockedIndexModule from '../index.js';
+import { runClaudeCode, apiPost, setCurrentPromptFingerprint, sendHeartbeatSync } from '../index.js';
+import * as mockedWorkspacePrepModule from '../workspacePrep.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { VmConfigMissingError } from '../providers/runners.js';
-import { runThinkerWithGate } from '../prompts/thinker.js';
+import {
+  computeStrategicPromptFingerprint,
+  runThinkerWithGate,
+  type ThinkerPromptParams,
+} from '../prompts/thinker.js';
+import * as mockedStrategicHelpersModule from './strategic-helpers.js';
 import { runStrategicChallenge } from './strategic-helpers.js';
+import * as mockedTimeModule from '../utils/time.js';
+import * as mockedDesignDocPresenceModule from '../utils/design-doc-presence.js';
+import * as mockedResearchDirectionContextModule from './research-direction-context.js';
+import * as mockedResearchPlanModule from './research-plan.js';
+import * as mockedStrategicSectionsModule from './strategic-sections.js';
+import * as mockedTelemetryModule from '../telemetry.js';
 import { recordFormatMiss, recordFormatRepairAttempt } from '../telemetry.js';
+
+async function expectMockCoversActualNamedExports(moduleId: string, mockedModule: Record<string, unknown>) {
+  const actual = await vi.importActual<Record<string, unknown>>(moduleId);
+  const mockedKeys = new Set(Object.keys(mockedModule));
+  for (const exportName of Object.keys(actual).filter((name) => name !== 'default')) {
+    expect(
+      mockedKeys.has(exportName),
+      `Mock for ${moduleId} is missing export ${exportName} -- add it to the factory.`,
+    ).toBe(true);
+  }
+}
+
+describe('mock factory completeness', () => {
+  it('covers every real named export for local full-replacement mocks', async () => {
+    await expectMockCoversActualNamedExports('../index.js', mockedIndexModule);
+    await expectMockCoversActualNamedExports('../workspacePrep.js', mockedWorkspacePrepModule);
+    await expectMockCoversActualNamedExports('./strategic-helpers.js', mockedStrategicHelpersModule);
+    await expectMockCoversActualNamedExports('../utils/time.js', mockedTimeModule);
+    await expectMockCoversActualNamedExports('../utils/design-doc-presence.js', mockedDesignDocPresenceModule);
+    await expectMockCoversActualNamedExports('./research-direction-context.js', mockedResearchDirectionContextModule);
+    await expectMockCoversActualNamedExports('./research-plan.js', mockedResearchPlanModule);
+    await expectMockCoversActualNamedExports('./strategic-sections.js', mockedStrategicSectionsModule);
+    await expectMockCoversActualNamedExports('../telemetry.js', mockedTelemetryModule);
+  });
+});
 
 describe('buildStagedDirectionsSection', () => {
   it('returns empty string when nothing is staged', () => {
@@ -309,6 +662,63 @@ describe('renderStrategicPromptSuffix', () => {
   it('returns empty string when prompt_suffix is absent', () => {
     expect(renderStrategicPromptSuffix({})).toBe('');
     expect(renderStrategicPromptSuffix({ prompt_suffix: '' })).toBe('');
+  });
+});
+
+describe('strategic prompt fingerprinting', () => {
+  const base: ThinkerPromptParams = {
+    contextPrefix: '',
+    projectName: 'Test Project',
+    clockHeader: 'Clock: 2026-05-04',
+    isSelfRepo: false,
+    userStateLine: 'User last active: today',
+    packerMetaSection: '',
+    strategicContext: '',
+    problemModelSection: '## Your current understanding (problem_model)\n```json\n{\n  "fingerprint": "strategic-prompt"\n}\n```',
+    problemModelRecovery: 'present',
+    reflectionSection: '## What you previously said was hard\n_(no prior)_',
+    selfImprovementBlock: '',
+    runningUpdateSection: '## Running update (living document — rewrite, don\'t append)\n_(empty)_',
+    designDocJson: '',
+    visionJson: '',
+    outcomeSection: '',
+    previousDecisionOutcomes: '',
+    pastRetirementCritiquesSection: '',
+    retiredDirectionsSummarySection: '',
+    dirSummaryText: 'No active directions.',
+    dirHealthSummary: 'Active: 0/10 slots.',
+    userPausedSection: '',
+    rejectedProposalsSection: '',
+    operatorOverridesSection: '',
+    portfolioCompositionText: 'No active directions — portfolio is empty.',
+    modelHealthSection: '',
+    systemMaturitySection: '',
+    driftSection: '',
+    recentWorkSection: '',
+    feedbackSection: '',
+    questionSection: '',
+    threadSection: '',
+    taskId: 'test-task-123',
+    versionPhaseSection: '',
+    memoCitationsSection: '',
+    efficiencySnapshotSection: '',
+  };
+
+  it('strategic_prompt_fingerprint_changes_with_strategic_prompt_content', () => {
+    const withoutSuffix = computeStrategicPromptFingerprint(base, '');
+    const withSuffix = computeStrategicPromptFingerprint({
+      ...base,
+      stagedDirectionsSection: '## Staged for next version\n- d-x [high] — work (auto-activates when v3 promotes)',
+    }, 'deployment framing');
+    const contentChanged = computeStrategicPromptFingerprint(
+      { ...base, projectName: 'Another Project', clockHeader: 'Later clock', userStateLine: 'User last active: yesterday', taskId: 'other-task' },
+      '',
+    );
+
+    expect(withoutSuffix).toHaveLength(12);
+    expect(withSuffix).toHaveLength(12);
+    expect(withoutSuffix).not.toBe(withSuffix);
+    expect(withoutSuffix).toBe(contentChanged);
   });
 });
 
@@ -488,7 +898,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
       statusRef,
     );
 
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toBeDefined();
     expect(executorPrompt).toContain('"staged": true');
     expect(executorPrompt).toContain('one atomic op');
@@ -520,7 +930,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
       statusRef,
     );
 
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toContain('if the file is still missing, empty, or the JSON is malformed after the bounded repair reopen');
   });
 
@@ -624,7 +1034,7 @@ describe('handleStrategic strategic challenge gate', () => {
 
     // The executor prompt carries the challenge section (only the APPROVED
     // advancing/met pair, d-7) plus the evidence-progress gate instruction.
-    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0]?.[0];
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(executorPrompt).toContain('CHALLENGE_SECTION(status=ok;approved=d-7:advancing;retirements=)');
     expect(executorPrompt).toContain('Challenge gate');
     expect(executorPrompt).toContain('the independent challenge APPROVED');
@@ -1010,6 +1420,8 @@ describe('handleStrategic design_doc index rendering', () => {
 describe('handleStrategic prompt_suffix wiring', () => {
   beforeEach(() => {
     capturedThinkerPrompt = undefined;
+    vi.mocked(setCurrentPromptFingerprint).mockClear();
+    vi.mocked(sendHeartbeatSync).mockClear();
   });
 
   it('appends backend prompt_suffix content to the rendered thinker prompt', async () => {
@@ -1030,6 +1442,30 @@ describe('handleStrategic prompt_suffix wiring', () => {
     // ...and the backend-supplied guidance reaches the rendered prompt.
     expect(capturedThinkerPrompt).toContain('Additional instructions:');
     expect(capturedThinkerPrompt).toContain(suffix);
+  });
+
+  it('records the strategic fingerprint in prompt telemetry and heartbeat metadata', async () => {
+    const suffix = 'STABILIZE GUIDANCE: audit finding F-123.';
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      prompt_suffix: suffix,
+    };
+    const statusRef = { value: '' };
+
+    await handleStrategic(
+      'task-fingerprint', payload, {}, 'tok', 'owner', 'repo', null, statusRef,
+    );
+
+    const expected = computeStrategicPromptFingerprint(
+      capturedThinkerParams as unknown as ThinkerPromptParams,
+      `\n\nAdditional instructions:\n${suffix}`,
+    );
+    expectCalledWith(setCurrentPromptFingerprint, expected);
+    expectCalledWith(sendHeartbeatSync,
+      'task-fingerprint',
+      'Cloning owner/repo for research...',
+      { prompt_fingerprint: expected },
+    );
   });
 
   it('leaves the thinker prompt unchanged when prompt_suffix is absent', async () => {
@@ -1116,9 +1552,9 @@ describe('handleStrategic executor prompt: version-signal sibling passthrough', 
   });
 });
 
-describe('handleStrategic pre-merge: new_version_theme written into problem_model JSON', () => {
-  it('pre-merges new_version_theme (and new_version_goal) into problem_model JSON when thinker emits them', async () => {
-    const taskId = 'task-premerge-theme';
+describe('handleStrategic pre-merge: new_version_goal written into problem_model JSON', () => {
+  it('pre-merges new_version_goal into problem_model JSON when the thinker emits it', async () => {
+    const taskId = 'task-premerge-goal';
     const pmPath = `/tmp/problem_model_${taskId}.json`;
     const initialPm = { intent: { purpose: 'ok' }, gaps: [] };
 
@@ -1127,7 +1563,6 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
       ok: true,
       analysisText: 'analysis',
       newVersionGoal: 'Ship reliable error recovery so ops incidents drop by 50%.',
-      newVersionTheme: 'reliability',
     });
 
     // fs.readFileSync returns the initial problem_model JSON for the pre-merge read.
@@ -1147,7 +1582,7 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
     const statusRef = { value: '' };
     await handleStrategic(taskId, { project_name: 'Blueprint' }, {}, 'tok', 'owner', 'repo', null, statusRef);
 
-    // writeFileSync must have been called with the pm path and a JSON that contains both fields.
+    // writeFileSync must have been called with the pm path and a JSON that contains the goal field.
     const writeCalls = vi.mocked(fs.writeFileSync).mock.calls;
     const pmWrite = writeCalls.find((c) => c[0] === pmPath);
     expect(pmWrite).toBeDefined();
@@ -1155,7 +1590,81 @@ describe('handleStrategic pre-merge: new_version_theme written into problem_mode
     expect(typeof writtenStr).toBe('string');
     const written = JSON.parse(writtenStr as string) as Record<string, unknown>;
     expect(written.new_version_goal).toBe('Ship reliable error recovery so ops incidents drop by 50%.');
-    expect(written.new_version_theme).toBe('reliability');
+  });
+});
+
+describe('handleStrategic executor prompt: proposed acceptance criteria handoff', () => {
+  beforeEach(() => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+  });
+
+  afterEach(() => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
+  });
+
+  it('injects the proposed criteria block and conditional command when the thinker wrote a non-empty file', async () => {
+    const taskId = 'task-criteria';
+    const criteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    const criteriaPayload = '{"criteria":[{"text":"Users can promote only when canonical criteria pass.","direction_keys":["d-abc"]}]}';
+    vi.mocked(fs.existsSync).mockImplementation(
+      (path: Parameters<typeof fs.existsSync>[0]) => String(path) === criteriaPath,
+    );
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => (path === criteriaPath ? criteriaPayload : ''),
+    );
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).toContain('# Proposed acceptance criteria');
+    expect(executorPrompt).toContain(criteriaPayload);
+    expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat ${criteriaPath})"`);
+    expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
+    expect(executorPrompt).toContain('do not fabricate a criteria list');
+    expect(executorPrompt.indexOf('# Proposed acceptance criteria')).toBeLessThan(
+      executorPrompt.indexOf('# Instructions'),
+    );
+  });
+
+  it('omits the proposed criteria block when the file is absent while keeping the command conditional', async () => {
+    const taskId = 'task-no-criteria';
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).not.toContain('# Proposed acceptance criteria');
+    expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"`);
+    expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
   });
 });
 
@@ -1289,6 +1798,166 @@ describe('handleStrategic create-direction recovery prompt', () => {
     expect(recoveryPrompt).not.toContain('system_id');
 
     // Restore shared default for subsequent tests
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+});
+
+describe('handleStrategic direction-op post-check: all portfolio verbs', () => {
+  // Required calls output shared across tests — satisfies the required-calls check
+  // so only the direction-op post-check fires as call 1.
+  const requiredCallsOutput =
+    './strategic set-problem-model "..." \n' +
+    './strategic set-running-update /tmp/running_update_task-portfolio-verbs.md\n' +
+    './strategic set-retirement-critiques \'{"no_eligible_retirements": true}\'';
+
+  it('retries_when_thinker_recommended_stage_or_retire_is_skipped: retire-direction recommended but skipped triggers retry', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Some analysis text.\n\n## Structured Output\n\nretire-direction: d-abc123 — stale direction\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('retire-direction');
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('update-direction recommended but skipped triggers retry with update-direction in prompt', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nupdate-direction: d-xyz — priority bump\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toBeDefined();
+    expect(recoveryPrompt).toContain('update-direction');
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('stage-direction recommended but skipped triggers retry; stage_direction in output suppresses retry', async () => {
+    // First: stage-direction recommended but executor output has no op → triggers retry
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toContain('stage-direction');
+
+    // Second: stage_direction op present in output → no spurious retry
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\nstage-direction: d-staged — next version\n',
+    });
+    const outputWithStageOp =
+      requiredCallsOutput +
+      '\n{"op":"stage_direction","status":"ok","direction_id":"d-staged"}';
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: outputWithStageOp, lastResultText: '' });
+
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    // Only one call: the executor. No recovery call.
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(1);
+
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+  });
+
+  it('approve-direction and reject-direction recommended but skipped triggers retry', async () => {
+    vi.mocked(runClaudeCode).mockReset();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText:
+        'Analysis.\n\n## Structured Output\n\napprove-direction: d-qa1\nreject-direction: d-qa2\n',
+    });
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: requiredCallsOutput, lastResultText: '' })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-portfolio-verbs',
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const recoveryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(recoveryPrompt).toContain('approve-direction');
+    expect(recoveryPrompt).toContain('reject-direction');
+
     vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
   });
 });

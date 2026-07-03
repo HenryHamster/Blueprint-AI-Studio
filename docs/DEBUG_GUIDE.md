@@ -8,14 +8,13 @@ This guide helps you troubleshoot why tasks fail and how to diagnose issues.
 
 ### In Admin UI
 
-1. Go to **Dashboard** tab
-2. Look for **"Failed Tasks"** card
-3. Click to expand recent failures
-4. Filter by:
-   - Status: `FAILED`
-   - Date range
-   - Task type
-   - Failure category
+The top nav has four tabs: **Home**, **Board**, **Directions**, **Compute**.
+
+1. On the **Home** tab, the task-status section surfaces recent failures and
+   failure groups; the **Board** tab shows a `Failed` column you can scan.
+2. Click any task to open its detail drawer (see "Using the Admin UI to
+   Debug" below).
+3. Filter the Board by status (`FAILED`), task type, or failure category.
 
 ### Via API
 
@@ -44,7 +43,8 @@ Tasks fail for different reasons. Blueprint categorizes them:
 | `rate_limited` | Hit API rate limits | Yes, retry later |
 | `fatal` | Unrecoverable error | No |
 
-**View category:** Click task → **Artifacts** tab → **Error Log**
+**View category:** Open the task drawer → **Details** tab (shows the failure
+category and status timeline); the raw error output is on the **Logs** tab.
 
 ---
 
@@ -52,8 +52,8 @@ Tasks fail for different reasons. Blueprint categorizes them:
 
 ### Real-time Logs (while task is running)
 
-1. Click on task in dashboard
-2. Switch to **Logs** tab
+1. Click the task to open its drawer
+2. Switch to the **Logs** tab
 3. Logs stream live via WebSocket
 4. Scroll up to see earlier lines
 
@@ -258,19 +258,23 @@ Task still marked IN_PROGRESS
 
 ## Using the Admin UI to Debug
 
-### Task Detail View
+### Task Detail Drawer
 
-Navigate to a failed task:
+Click a task to open its detail drawer. It has three tabs:
 
-1. **Overview tab** — Task metadata, status timeline
-2. **Logs tab** — Full output from agent
-3. **Artifacts tab** — Error log + any PR/commit links
-4. **Self-Review tab** — Agent's code quality assessment
-5. **Verdict tab** — Structured fix-loop telemetry
+1. **Details** — task metadata, status timeline, failure category, self-review
+   outcome, and fix-loop / execution telemetry
+2. **Logs** — full streaming output from the agent (live via WebSocket while
+   running, full history once terminal)
+3. **Changes** — the PR diff: changed files plus PR/commit links
 
-### Error Log Artifact
+For a FAILED task the drawer also shows action buttons (**Retry**, **Edit**,
+**Dismiss**) — see "Retry & Recovery" below for what each does.
 
-Every failed task has an `ERROR_LOG` artifact. Open it to see:
+### Error Log
+
+The agent's error output is on the **Logs** tab. A typical failure tail
+looks like:
 
 ```
 [2024-01-15 10:05:00] Task claimed by agent-vm-xyz
@@ -309,9 +313,9 @@ Each task carries execution telemetry:
 ```
 
 **View in admin UI:**
-1. Click task
-2. **Verdict** tab
-3. Scroll to **Telemetry** section
+1. Click the task to open its drawer
+2. Open the **Details** tab
+3. Scroll to the telemetry / self-review section
 
 ---
 
@@ -384,8 +388,9 @@ Admin UI shows "Circuit breaker open"
 
 **Fix:**
 1. Identify and fix the root cause
-2. Go to admin UI → Project → Settings
-3. Click **Reset Circuit Breaker**
+2. Click the **Autonomy** indicator in the top bar to expand the status popover
+3. When the breaker is `OPEN` a **Reset Circuit Breaker** button appears in the
+   popover — click it
 4. New tasks will start provisioning
 
 **Code:** `backend/app/task_completion.py` → `_check_circuit_breaker()`
@@ -410,14 +415,27 @@ Attempt 1: FAILED (clone_failed)
 
 ---
 
-### Manual Retry
+### Manual Retry, Dismiss, Cancel & Archive
 
-To retry a failed task:
+Operator task actions mutate the **existing** task — they do not spawn a fresh
+task row (the only exception is the automatic CI-driven `fix` tasks above):
 
-1. Click task in admin UI
-2. Click **Retry** button
-3. New task created with `attempt_number` incremented
-4. New task queued for provisioning
+| Action | Where | Effect |
+|--------|-------|--------|
+| **Retry** | FAILED task drawer | Re-queues the **same** task (`status → QUEUED`). It re-provisions and runs again under the same task id — no new task is created. |
+| **Dismiss** | FAILED task drawer | Cancels the task (`status → CANCELLED`) to clear it from attention without re-running it. |
+| **Cancel Task** | Non-approval QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, BLOCKED, or PARKED task drawer/card | Cancels the task (`status → CANCELLED`). Running/provisioning tasks stop the agent and clean up the VM; queued/blocked/parked tasks may have no VM to terminate. |
+| **Reject** | Approval-gated task drawer/card | Cancels the task (`status → CANCELLED`) instead of approving it. |
+| **Bulk cancel** | Selected QUEUED, PROVISIONING, IN_PROGRESS, EVALUATING, BLOCKED, or PARKED tasks | Cancels each selected non-terminal task through the bulk-action endpoint. |
+| **Edit** | FAILED task drawer | Updates the task prompt in place before you Retry it. |
+| **Archive** | task card / drawer | Moves a terminal task out of the active board into the archive view; does not change its status. |
+
+**Blast radius:**
+- **Retry** touches only the single task you act on. It re-uses the same id, so its history and prior attempts stay attached — check the **Logs** tab after it re-runs to confirm the new attempt actually made progress.
+- **Cancel** and **Dismiss** send `status → CANCELLED`. The backend also cancels direct active children whose `parent_task_id` is the cancelled task and whose status is `QUEUED`, `PROVISIONING`, `IN_PROGRESS`, or `EVALUATING`.
+- The cancel path closes orphan PRs for the cancelled task and for cascaded children when a PR can be resolved from task context. GitHub cleanup is best effort; cancellation still completes if the PR lookup/close fails.
+- VM cleanup only runs for cancelled rows that have a `vm_instance_id`. QUEUED, BLOCKED, and PARKED tasks often have no VM yet, so there may be nothing to terminate.
+- Waiting dependents can be stranded. The drawer asks `/api/admin/tasks/{task_id}/cancel-impact` for project-scoped dependent and child-cascade counts before showing exact impact. If that read fails, the drawer falls back to a visibly labeled loaded-task count rather than presenting page-scoped data as authoritative.
 
 ---
 
@@ -524,10 +542,12 @@ A: View the **Logs** tab in task details. The logs include:
 
 **Q: Can I manually edit a task and retry it?**
 
-A: Not recommended. Instead:
-1. Cancel the task
-2. Create a new task with corrected payload
-3. Or, use the **Retry** button to spawn a fresh attempt
+A: Yes. In the FAILED task drawer:
+1. Click **Edit** to update the prompt in place
+2. Click **Retry** to re-queue the same task (`status → QUEUED`) — it runs
+   again under the same task id rather than creating a new one
+3. Prefer launching a brand-new task only when you want a clean payload and a
+   separate history
 
 ---
 

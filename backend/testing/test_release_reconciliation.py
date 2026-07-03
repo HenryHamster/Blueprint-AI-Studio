@@ -25,7 +25,9 @@ import pytest
 from app import release_version as rv
 from app.models import Project
 from app.release_reconciliation import (
+    _PROMOTION_CLAIM_TIMEOUT_SECONDS,
     _promotion_pending_timeout_seconds,
+    _reconcile_if_ci_unresolved_now_green,
     _reconcile_if_managed_check_wait,
     _reconcile_if_not_promoted_but_pr_merged,
     _reconcile_if_pending_auto_merge_landed,
@@ -1181,6 +1183,87 @@ async def test_reconcile_promotion_pending_timeout_never_touches_main(db_session
     assert "promotion_pending" not in version.last_qualification
 
 
+@pytest.mark.asyncio
+async def test_reconcile_promotion_claim_abandoned_short_timeout(db_session):
+    """A bare promotion CLAIM orphaned by a promote() crash is GC'd on the SHORT
+    claim bound, not the 24h open-PR cap.
+
+    promote() stamps ``promotion_pending = {claiming: True, ...}`` under the row
+    lock before its GitHub I/O so a concurrent re-qualify can't clobber the
+    in-flight promotion. If promote() then crashes before opening the PR, the
+    claim (which has NO pr_number) would otherwise inherit the 24h pending cap
+    and wedge the version out of re-qualification for a day. The reaper must age
+    a bare claim against ``_PROMOTION_CLAIM_TIMEOUT_SECONDS`` instead — clearing
+    it back to stabilize so the version re-qualifies promptly. main is untouched.
+    """
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    # Older than the SHORT claim bound, but FAR younger than the 24h pending cap,
+    # so only the claim-specific short bound can be what clears it.
+    stranded_enabled = (
+        _utcnow() - timedelta(seconds=_PROMOTION_CLAIM_TIMEOUT_SECONDS + 60)
+    ).isoformat()
+    assert _PROMOTION_CLAIM_TIMEOUT_SECONDS + 60 < _promotion_pending_timeout_seconds()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "claiming": True,
+            "candidate_sha": "abcd" * 10,
+            "enabled_at": stranded_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert timed_out is True
+    await db_session.refresh(version)
+    assert version.status == "open"
+    assert version.phase == "stabilize"
+    assert version.last_qualification["status"] == "promotion_failed"
+    assert version.last_qualification["error"] == "promotion_claim_abandoned"
+    assert "promotion_pending" not in version.last_qualification
+
+
+@pytest.mark.asyncio
+async def test_reconcile_fresh_promotion_claim_is_left_alone(db_session):
+    """A FRESH claim (younger than the short bound) must NOT be cleared — the
+    reaper cannot race a promote() whose GitHub I/O is legitimately still in
+    flight, or it would tear down a live promotion mid-flight."""
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    fresh_enabled = (_utcnow() - timedelta(seconds=5)).isoformat()
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "claiming": True,
+            "candidate_sha": "abcd" * 10,
+            "enabled_at": fresh_enabled,
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    timed_out = await _reconcile_if_promotion_pending_timed_out(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert timed_out is False
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["promotion_pending"]["claiming"] is True
+
+
 # ===========================================================================
 # Incident 2026-06-09: not_promoted/ci_unresolved reconciliation net.
 #
@@ -1272,6 +1355,72 @@ async def test_reconcile_not_promoted_hard_blocker_is_inert(db_session, mocker):
     assert version.status == "open"
     assert version.last_qualification["status"] == "not_promoted"
     assert version.last_qualification["blocker"] == "ci_not_green"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_not_promoted_ci_unresolved_armed_merge_grade_propagates(
+    db_session, mocker
+):
+    """_reconcile_if_not_promoted_but_pr_merged: a not_promoted/ci_unresolved
+    record carrying merge_grade_misses=True reconciles to promoted AND the
+    armed merge-grade signal propagates through _recover_confidence_from_ci_unresolved
+    into the final promotion record.
+
+    Regression guard: _recover_confidence_from_ci_unresolved calls
+    _merge_grade_misses_armed which checks base_record["merge_grade_misses"]
+    first (before the policy threshold).  A stored True must survive the
+    recovery path so the promoted record reflects the actual merge-grade
+    verdict, not a silently-laundered clean bill of health.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=True))
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="release0" * 5),
+    )
+    mocker.patch(
+        "app.github.get_pr_files",
+        new=AsyncMock(return_value=[{"filename": "backend/app/foo.py"}]),
+    )
+    mocker.patch("app.github.create_tag", new=AsyncMock(return_value={}))
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="trunk", promotion_target="release"
+    )
+    candidate_sha = "abcd" * 10
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.0,
+        "merge_grade_misses": True,
+        "pr_url": "https://github.com/acme/widget/pull/9",
+        "sub_scores": {"audit": 0.91, "test_erosion": 0.85, "smoketest": 0.0},
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_not_promoted_but_pr_merged(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    qual = version.last_qualification
+    assert qual["status"] == "promoted"
+    # _recover_confidence_from_ci_unresolved re-runs compute_composite with
+    # merge_grade_misses=True (because base_record["merge_grade_misses"] is
+    # True, _merge_grade_misses_armed short-circuits to True).  compute_composite
+    # with merge_grade_misses=True returns blocker="merge_grade_misses" —
+    # the signal is NOT laundered away during reconciliation.
+    assert qual.get("blocker") == "merge_grade_misses"
+    assert qual.get("confidence") == pytest.approx(0.0)
+    assert qual.get("confidence_recovered_from_ci_unresolved") is True
 
 
 @pytest.mark.asyncio
@@ -6260,6 +6409,68 @@ async def test_managed_check_wait_no_checks_persists_snapshot_idempotently(
 
 
 @pytest.mark.asyncio
+async def test_managed_check_wait_no_checks_on_required_promotion_target_blocks(
+    db_session, mocker
+):
+    """A relaxed integration branch must not make promotion-target no_checks pass."""
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    pr_head = "cafe1234" * 5
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "state": "open",
+                "merged": False,
+                "head": {"sha": pr_head},
+            }
+        ),
+    )
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(
+            return_value={
+                "status": "no_checks",
+                "conclusion": None,
+                "details": [],
+            }
+        ),
+    )
+    merge_mock = mocker.patch("app.github.merge_pull_request", new=AsyncMock())
+
+    project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    project.build_config = {
+        "requires_ci_checks": False,
+        "has_ci": True,
+        "ci_required_branches": ["main"],
+    }
+    db_session.add(project)
+    candidate_sha = "abcd" * 10
+    version.last_qualification = _managed_check_wait_qual(candidate_sha)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_managed_check_wait(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    merge_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.status == "open"
+    pending = version.last_qualification["promotion_pending"]
+    assert pending["managed_check_wait"] is True
+    assert pending["ci_state"] == "no_checks"
+    assert pending["check_snapshot"]["state"] == "no_checks"
+
+
+@pytest.mark.asyncio
 async def test_managed_check_wait_no_checks_no_ci_repo_proceeds_to_merge(
     db_session, mocker
 ):
@@ -7252,3 +7463,138 @@ def test_is_ci_infra_flake_log_returns_false_for_real_failure():
     )
     assert not _is_ci_infra_flake_log("")
     assert not _is_ci_infra_flake_log("SyntaxError: invalid syntax at line 42")
+
+
+# ===========================================================================
+# _reconcile_if_ci_unresolved_now_green — topology-relaxed no_checks path
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_reconcile_ci_unresolved_now_green_no_checks_topology_relaxed_spawns(
+    db_session, mocker
+):
+    """A not_promoted/ci_unresolved version on a quiescent automain whose CI
+    re-resolves to topology-relaxed no_checks gets a fresh qualification spawned.
+
+    Regression for automain candidates that structurally carry no check-runs
+    (CI workflow automain trigger removed 2026-06-20): the sweep reconcile must
+    accept a definitive no_checks verdict when it is topology-relaxed, not only
+    when CI is literally green.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    candidate_sha = "cafe" * 10
+    # automain HEAD matches candidate SHA (branch is quiescent).
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    # CI resolves to no_checks on the candidate commit.
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "no_checks",
+                "ci_green": False,
+                "resolved_sha": None,
+                "detail": "no check-runs on candidate and no associated PR heads",
+            }
+        ),
+    )
+    # Topology check: candidate IS reachable from the integration branch.
+    mocker.patch(
+        "app.github.is_ancestor_of",
+        new=AsyncMock(return_value=True),
+    )
+    # Qualification spawn succeeds.
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    # Project explicitly declares no CI so requires_ci_checks=False and
+    # proceed_on_no_checks returns True for a topology-relaxed no_checks.
+    _project.build_config = {"requires_ci_checks": False}
+    db_session.add(_project)
+    version.phase = "stabilize"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": candidate_sha,
+        "confidence": 0.82,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_ci_unresolved_now_green(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is True
+
+
+@pytest.mark.asyncio
+async def test_reconcile_ci_unresolved_now_green_pending_ci_is_noop(
+    db_session, mocker
+):
+    """When CI is still pending (not green and not topology-relaxed no_checks),
+    the reconcile is a no-op and no qualification is spawned.
+
+    Confirms that a transient pending resolution does not trigger a spurious
+    re-qualification — only a fully resolved state (green or topology-relaxed
+    no_checks) may proceed.
+    """
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="tok"),
+    )
+    candidate_sha = "beef" * 10
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value=candidate_sha),
+    )
+    # CI is still pending — checks in progress.
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "pending",
+                "ci_green": False,
+                "resolved_sha": candidate_sha,
+                "detail": "check-runs in progress on the candidate commit",
+            }
+        ),
+    )
+    run_qualification = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    _project, version = await _make_project_and_version(
+        db_session, integration_branch="automain", promotion_target="main"
+    )
+    version.phase = "stabilize"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_unresolved",
+        "candidate_sha": candidate_sha,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    reconciled = await _reconcile_if_ci_unresolved_now_green(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert reconciled is False
+    run_qualification.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"

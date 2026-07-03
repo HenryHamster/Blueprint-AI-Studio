@@ -842,6 +842,7 @@ export function SystemMetricsSection({ task }: { task: Task }) {
 
 export function BlockerSection({ task, now30, tasks, onNavigateToTask }: { task: Task; now30: number; tasks?: Task[]; onNavigateToTask?: (taskId: string) => void }) {
   if (!(task.status === 'BLOCKED' || task.blocker_kind || task.blocked_reason || task.blocked_at || task.recheck_after)) return null;
+  const reason = task.movement_explanation?.trim() || task.blocked_reason;
   return (
     <>
       <SectionHeader>Blocker</SectionHeader>
@@ -850,8 +851,8 @@ export function BlockerSection({ task, now30, tasks, onNavigateToTask }: { task:
           <span className="text-xs uppercase tracking-wider font-mono bg-amber-500/10 text-amber-300 border border-amber-500/20 px-2 py-0.5 rounded">{task.blocker_kind}</span>
         </DetailRow>
       )}
-      {task.blocked_reason && (
-        <DetailRow label="Reason"><span className="text-sm text-amber-200/90 break-words">{task.blocked_reason}</span></DetailRow>
+      {reason && (
+        <DetailRow label="Reason"><span className="text-sm text-amber-200/90 break-words">{reason}</span></DetailRow>
       )}
       {task.blocked_at && <DetailRow label="Blocked at">{formatAbsolute(task.blocked_at)}</DetailRow>}
       {task.recheck_after && (
@@ -878,11 +879,12 @@ export function BlockerSection({ task, now30, tasks, onNavigateToTask }: { task:
 
 export function ParkedSection({ task }: { task: Task }) {
   if (!(task.status === 'PARKED' || task.parked_at || task.park_reason || task.wake_registration)) return null;
+  const reason = task.movement_explanation?.trim() || task.park_reason;
   return (
     <>
       <SectionHeader>Parked</SectionHeader>
-      {task.park_reason && (
-        <DetailRow label="Reason"><span className="text-sm text-sky-200/90 break-words">{task.park_reason}</span></DetailRow>
+      {reason && (
+        <DetailRow label="Reason"><span className="text-sm text-sky-200/90 break-words">{reason}</span></DetailRow>
       )}
       {task.parked_at && <DetailRow label="Parked at">{formatAbsolute(task.parked_at)}</DetailRow>}
       {task.wake_registration && (

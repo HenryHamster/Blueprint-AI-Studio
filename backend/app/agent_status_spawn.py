@@ -174,6 +174,11 @@ async def maybe_spawn_smoketest_fix(
         and payload.logs
         and not (task.context or {}).get("qualifier_smoketest")
     ):
+        # _smoketest_spawn_state captures the Task constructor kwargs before the
+        # first session.flush() so that the except block can rebuild and retry the
+        # spawn exactly once on the recovered session without re-running the
+        # expensive project/config lookups.
+        _smoketest_spawn_state: dict | None = None
         try:
             smoketest_data = await asyncio.to_thread(json.loads, payload.logs)
             if not smoketest_data.get("passed"):
@@ -324,6 +329,18 @@ async def maybe_spawn_smoketest_fix(
                                 status=TaskStatus.QUEUED,
                                 created_by="ORCHESTRATOR",
                             )
+                            _smoketest_spawn_state = {
+                                "project_id": task.project_id,
+                                "title": plan_task.title,
+                                "description": plan_task.description,
+                                "parent_task_id": task.id,
+                                "priority": fix_priority,
+                                "payloads": plan_task.payloads,
+                                "context": plan_task.context,
+                                "status": TaskStatus.QUEUED,
+                                "created_by": "ORCHESTRATOR",
+                                "failed_tests": failed_tests,
+                            }
                             session.add(plan_task)
                             await session.flush()
                             history = TaskHistory(
@@ -414,33 +431,99 @@ async def maybe_spawn_smoketest_fix(
                     not payload.artifact_type or payload.status == TaskStatus.FAILED
                 ):
                     task.latest_status_message = payload.logs[-8000:]
-            try:
-                spawn_alert = Alert(
-                    project_id=task.project_id,
-                    severity=AlertSeverity.ERROR,
-                    title=f"Smoketest fix-plan spawn failed for task {task_id_str}",
-                    message=(
-                        f"A smoketest reported failures on task {task_id_str} but the "
-                        f"follow-up plan task could not be spawned: {type(e).__name__}: {e!r}. "
-                        f"Operator must manually create a plan task to address the smoketest failures."
-                    )[:1000],
-                    task_id=task.id,
-                )
-                session.add(spawn_alert)
-                await broadcast_to_project(
-                    str(task.project_id),
-                    "alert_created",
-                    {
-                        "alert_id": str(spawn_alert.id),
-                        "severity": spawn_alert.severity,
-                        "title": spawn_alert.title,
-                    },
-                )
-            except Exception as alert_err:
-                logger.error(
-                    f"[SMOKETEST] Failed to create spawn-failed alert for task {task_id_str}: {alert_err}",
-                    exc_info=True,
-                )
+
+            # Retry the spawn once on the recovered session before alerting the
+            # operator. Transient serialization conflicts / poisoned sessions
+            # clear after rollback, so a single retry is usually sufficient.
+            #
+            # Guard: only retry when the session was actually rolled back. If
+            # _rolled_back is False the session is still healthy and plan_task
+            # is still pending — it will be committed by the outer handler, so
+            # spawning again would double-insert a second child task.
+            _spawn_retry_succeeded = False
+            if _smoketest_spawn_state is not None:
+                if not _rolled_back:
+                    # Original plan_task survived in the session; no retry needed.
+                    _spawn_retry_succeeded = True
+                    logger.info(
+                        "[SMOKETEST] Retry skipped — session not rolled back; "
+                        "original plan_task still pending for task %s",
+                        task_id_str,
+                    )
+                else:
+                    try:
+                        _retry_task = Task(
+                            project_id=_smoketest_spawn_state["project_id"],
+                            title=_smoketest_spawn_state["title"],
+                            description=_smoketest_spawn_state["description"],
+                            parent_task_id=_smoketest_spawn_state["parent_task_id"],
+                            priority=_smoketest_spawn_state["priority"],
+                            payloads=_smoketest_spawn_state["payloads"],
+                            context=_smoketest_spawn_state["context"],
+                            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+                            status=_smoketest_spawn_state["status"],
+                            created_by=_smoketest_spawn_state["created_by"],
+                        )
+                        session.add(_retry_task)
+                        await session.flush()
+                        session.add(
+                            TaskHistory(
+                                task_id=_retry_task.id,
+                                action="SPAWNED",
+                                details={
+                                    "spawned_by": "SMOKETEST_FAILURE",
+                                    "priority": _smoketest_spawn_state["priority"],
+                                    "failed_tests": [
+                                        t["name"]
+                                        for t in _smoketest_spawn_state["failed_tests"]
+                                    ],
+                                    "retry": True,
+                                },
+                            )
+                        )
+                        _spawn_retry_succeeded = True
+                        logger.info(
+                            "[SMOKETEST] Retry spawn succeeded for task %s -> plan task %s",
+                            task_id_str,
+                            _retry_task.id,
+                        )
+                    except Exception as _retry_err:
+                        logger.error(
+                            "[SMOKETEST] Retry spawn also failed for task %s: %s",
+                            task_id_str,
+                            _retry_err,
+                            exc_info=True,
+                        )
+                        await _recover_poisoned_session(session, task_id_str)
+
+            if not _spawn_retry_succeeded:
+                try:
+                    spawn_alert = Alert(
+                        project_id=task.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=f"Smoketest fix-plan spawn failed for task {task_id_str}",
+                        message=(
+                            f"A smoketest reported failures on task {task_id_str} but the "
+                            f"follow-up plan task could not be spawned: {type(e).__name__}: {e!r}. "
+                            f"Operator must manually create a plan task to address the smoketest failures."
+                        )[:1000],
+                        task_id=task.id,
+                    )
+                    session.add(spawn_alert)
+                    await broadcast_to_project(
+                        str(task.project_id),
+                        "alert_created",
+                        {
+                            "alert_id": str(spawn_alert.id),
+                            "severity": spawn_alert.severity,
+                            "title": spawn_alert.title,
+                        },
+                    )
+                except Exception as alert_err:
+                    logger.error(
+                        f"[SMOKETEST] Failed to create spawn-failed alert for task {task_id_str}: {alert_err}",
+                        exc_info=True,
+                    )
             session.add(task)
 
 

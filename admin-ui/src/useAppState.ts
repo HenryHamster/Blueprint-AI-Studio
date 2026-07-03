@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { useState, useEffect, useMemo, useRef, type MutableRefObject } from 'react';
 import type { Task } from './types/task';
 import type { Project } from './types/project';
 import { API_BASE_URL, apiFetch, authHeaders, authGet } from './api';
@@ -23,6 +23,7 @@ import { useProjectsState } from './hooks/useProjectsState';
 import { useAlertsState } from './hooks/useAlertsState';
 import { useProjectConfig } from './hooks/useProjectConfig';
 import { resolveTaskCapabilities } from './taskCapabilities';
+import { isEditableShortcutEvent } from './hooks/keyboardTargets';
 
 export type { DeployState } from './types/settings';
 
@@ -37,7 +38,12 @@ export type { DeployState } from './types/settings';
  * Behavior is preserved end-to-end: the domain hooks own their own state and
  * callbacks; only the shape of the source file changed, not the runtime API.
  */
-export function useAppState() {
+interface UseAppStateOptions {
+  refreshStrategicReadModelRef?: MutableRefObject<() => void>;
+  refreshMessagesRef?: MutableRefObject<() => void>;
+}
+
+export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
@@ -83,22 +89,26 @@ export function useAppState() {
     cycleProgress,
     lastCycleCompletion,
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
-  } = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, selectedProjectId });
+  } = useLogViewer({
+    fetchTasksRef,
+    setDeployState,
+    fetchDirectionsRef,
+    refreshStrategicReadModelRef,
+    refreshMessagesRef,
+    selectedProjectId,
+    realtimeWsEnabled: !authLoading && Boolean(user),
+  });
 
   const {
     activeTab, setActiveTab,
     showResearchBrowser, setShowResearchBrowser,
     showKnowledgeBrowser, setShowKnowledgeBrowser,
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
-    showSettings, setShowSettings,
     showDirections, setShowDirections,
     showMetrics, setShowMetrics,
     showUserManagement, setShowUserManagement,
-    settingsRef,
     selectionMode, setSelectionMode, selectedTaskIds, setSelectedTaskIds,
     toggleSelectionMode, toggleTaskSelection, bulkColumnToggle, shiftSelectRange,
     confirmDialog, setConfirmDialog,
@@ -388,10 +398,7 @@ export function useAppState() {
   // Keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      const tag = document.activeElement?.tagName;
-      const targetTag = (e.target as HTMLElement)?.tagName;
-      const isInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
-        || targetTag === 'INPUT' || targetTag === 'TEXTAREA' || targetTag === 'SELECT';
+      if (e.defaultPrevented) return;
 
       if (e.key === 'Escape') {
         if (showNewTaskModal) { setShowNewTaskModal(false); return; }
@@ -402,24 +409,16 @@ export function useAppState() {
         }
         if (showResearchBrowser) { setShowResearchBrowser(false); return; }
         if (showActivityFeed) { setShowActivityFeed(false); return; }
-        if (showMessages) { setShowMessages(false); return; }
         if (showArchive) { setShowArchive(false); return; }
-        if (activeTab === 'directions') { setActiveTab('cockpit'); return; }
-        if (showMetrics) { setShowMetrics(false); return; }
-        if (showSettings) { setShowSettings(false); return; }
         return;
       }
 
-      if (isInput) return;
+      if (isEditableShortcutEvent(e)) return;
 
       switch (e.key) {
-        case 'n':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
-            openNewTaskModal();
-          }
-          break;
         case 'r':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const failed = tasks.filter(t => selectedTaskIds.has(t.id) && t.status === 'FAILED');
             if (failed.length > 0) {
               setConfirmDialog({
@@ -433,12 +432,11 @@ export function useAppState() {
                 },
               });
             }
-          } else if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
-            fetchTasks();
           }
           break;
         case 'Delete':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const cancellable = tasks.filter(t => selectedTaskIds.has(t.id) && ['QUEUED', 'IN_PROGRESS', 'PROVISIONING', 'EVALUATING'].includes(t.status));
             if (cancellable.length > 0) {
               setConfirmDialog({
@@ -452,36 +450,11 @@ export function useAppState() {
           break;
         case 'Enter':
           if (selectionMode && selectedTaskIds.size > 0) {
+            e.preventDefault();
             const ids = Array.from(selectedTaskIds);
             const taskId = ids[ids.length - 1];
             const task = tasks.find(t => t.id === taskId);
             if (task) { handleViewLogs(task); }
-          }
-          break;
-        case '1':
-          setViewMode('kanban');
-          setActiveTab('board');
-          break;
-        case '2':
-          setViewMode('pipeline');
-          setActiveTab('board');
-          break;
-        case '3':
-          setActiveTab('cockpit');
-          break;
-        case 'd':
-          setActiveTab('directions');
-          break;
-        case 's':
-          setShowSettings(prev => !prev);
-          break;
-        case 'm':
-          setShowMetrics(prev => !prev);
-          break;
-        case 'a':
-        case 'A':
-          if (!showNewTaskModal && !logTask && !showResearchBrowser && activeTab !== 'directions' && !showSettings) {
-            setShowArchive(!showArchive);
           }
           break;
       }
@@ -489,7 +462,7 @@ export function useAppState() {
     document.addEventListener('keydown', handleKeyDown);
     return () => document.removeEventListener('keydown', handleKeyDown);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showMessages, activeTab, showMetrics, showSettings, showArchive, selectionMode, selectedTaskIds, tasks]);
+  }, [showNewTaskModal, logTask, showResearchBrowser, showActivityFeed, showArchive, selectionMode, selectedTaskIds, tasks]);
 
   // ── Cross-domain glue handlers ────────────────────────────────────────────
 
@@ -508,17 +481,12 @@ export function useAppState() {
     }
   };
 
-  const handleToggleSettings = () => {
-    setShowSettings(prev => {
-      if (!prev) {
-        fetchSettings();
-        // Refresh the authoritative roster every time the panel opens so a
-        // just-added/edited account is always present (fixes "new accounts
-        // don't appear") without waiting on the heavy settings payload.
-        fetchMaxPlanAccounts();
-      }
-      return !prev;
-    });
+  const refreshSettings = () => {
+    fetchSettings();
+    // Refresh the authoritative roster every time settings are entered so a
+    // just-added/edited account is always present without waiting on the heavy
+    // settings payload.
+    fetchMaxPlanAccounts();
   };
 
   const handleUpdateBuildConfig = async (config: import('./types/project').BuildConfig) => {
@@ -593,8 +561,6 @@ export function useAppState() {
     // Activity feed
     showActivityFeed, setShowActivityFeed, lastActivityFeedOpen, prevLastActivityFeedOpen,
     // Messages
-    showMessages, setShowMessages,
-    showComposeDrawer, setShowComposeDrawer,
     showFleetDetail, setShowFleetDetail,
     showAlertsPopover, setShowAlertsPopover,
     // New task modal
@@ -618,7 +584,7 @@ export function useAppState() {
     soundOnComplete, setSoundOnComplete,
     notifyOnHighSignalMessage, setNotifyOnHighSignalMessage,
     // Settings
-    showSettings, settingsRef, handleToggleSettings,
+    refreshSettings,
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour, usingMaxPlan,
     autonomousResearchIntervalMinutes, directionCooldownMinutes, strategicResearchFrequency,
     maxGlobalAutonomousTasksPerHour, maxPipelineSlots, reservedSlotsForTypes,
