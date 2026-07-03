@@ -166,6 +166,14 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_retirement_challenge_gate_mode",
         "strategic_max_interval_minutes",
         "strategic_research_frequency",
+        # Resident strategic session (dead-man's-switch safety + resident agent).
+        "strategic_session_enabled",
+        "strategic_continuation_ttl_seconds",
+        "strategic_local_hold_timeout_seconds",
+        "strategic_session_idle_tick_seconds",
+        "strategic_session_turn_timeout_seconds",
+        "strategic_session_max_unattended_seconds",
+        "resident_session_heartbeat_stale_seconds",
         "task_type_categories",
         "task_type_model_preferences",
         "task_type_provider_overrides",
@@ -459,6 +467,27 @@ async def get_settings(
         ),
         "ci_backstop_timeout_minutes": _runtime_config.get(
             "ci_backstop_timeout_minutes", 60
+        ),
+        "strategic_session_enabled": bool(
+            _runtime_config.get("strategic_session_enabled", False)
+        ),
+        "strategic_continuation_ttl_seconds": _runtime_config.get(
+            "strategic_continuation_ttl_seconds", 1500
+        ),
+        "strategic_local_hold_timeout_seconds": _runtime_config.get(
+            "strategic_local_hold_timeout_seconds", 900
+        ),
+        "strategic_session_idle_tick_seconds": _runtime_config.get(
+            "strategic_session_idle_tick_seconds", 5
+        ),
+        "strategic_session_turn_timeout_seconds": _runtime_config.get(
+            "strategic_session_turn_timeout_seconds", 120
+        ),
+        "strategic_session_max_unattended_seconds": _runtime_config.get(
+            "strategic_session_max_unattended_seconds", 14400
+        ),
+        "resident_session_heartbeat_stale_seconds": _runtime_config.get(
+            "resident_session_heartbeat_stale_seconds", 1500
         ),
         "promotion_enabled": bool(_runtime_config.get("promotion_enabled", False)),
         "promotion_enabled_by_project": {
@@ -1119,6 +1148,44 @@ async def _apply_settings(
                 detail="spend_approval_timeout_hours must be between 1 and 168",
             )
         _runtime_config["spend_approval_timeout_hours"] = val
+    if "strategic_session_enabled" in payload:
+        val = payload["strategic_session_enabled"]
+        if not isinstance(val, bool):
+            raise HTTPException(
+                status_code=400,
+                detail="strategic_session_enabled must be a boolean",
+            )
+        _runtime_config["strategic_session_enabled"] = val
+    # Resident strategic-session integer knobs. Each is clamped to a sane range:
+    # the continuation TTL and local-hold timeout are the safety windows (min 60s
+    # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
+    # operator can NEVER reintroduce a >12h local-pin wall — the exact regression
+    # the resident-session dead-man's switch removed); the idle tick and turn
+    # timeout bound the resident loop cadence; the unattended cap bounds total
+    # autonomous lifetime (ceiling 8h, still well under a 12h wall); the resident
+    # heartbeat-stale window is the reaper carve-out (<=2h so a dead runner is
+    # still reclaimed).
+    for _key, _lo, _hi in (
+        ("strategic_continuation_ttl_seconds", 60, 7_200),
+        ("strategic_local_hold_timeout_seconds", 60, 7_200),
+        ("strategic_session_idle_tick_seconds", 1, 300),
+        ("strategic_session_turn_timeout_seconds", 10, 3_600),
+        ("strategic_session_max_unattended_seconds", 60, 28_800),
+        ("resident_session_heartbeat_stale_seconds", 60, 7_200),
+    ):
+        if _key in payload:
+            try:
+                _val = int(payload[_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400, detail=f"{_key} must be a number"
+                )
+            if not (_lo <= _val <= _hi):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_key} must be between {_lo} and {_hi}",
+                )
+            _runtime_config[_key] = _val
     if "max_total_research_per_project" in payload:
         try:
             val = int(payload["max_total_research_per_project"])
@@ -3031,6 +3098,41 @@ async def _apply_settings(
                     # types are lost.
                     "cloud_run_task_type_allowlist": sorted(
                         _runtime_config.get("cloud_run_task_type_allowlist") or []
+                    ),
+                    # Persist the resident strategic-session settings so an operator
+                    # enable/tune survives a Cloud Run restart and propagates to the
+                    # leader across instances. runtime_config_state.sync_* reads these
+                    # keys back on boot / every sync cycle; without them an enable
+                    # reverts to the env default on restart and a multi-instance PATCH
+                    # never reaches the leader that owns the resident session.
+                    "strategic_session_enabled": bool(
+                        _runtime_config.get("strategic_session_enabled", False)
+                    ),
+                    "strategic_continuation_ttl_seconds": int(
+                        _runtime_config.get("strategic_continuation_ttl_seconds", 1500)
+                    ),
+                    "strategic_local_hold_timeout_seconds": int(
+                        _runtime_config.get(
+                            "strategic_local_hold_timeout_seconds", 900
+                        )
+                    ),
+                    "strategic_session_idle_tick_seconds": int(
+                        _runtime_config.get("strategic_session_idle_tick_seconds", 5)
+                    ),
+                    "strategic_session_turn_timeout_seconds": int(
+                        _runtime_config.get(
+                            "strategic_session_turn_timeout_seconds", 120
+                        )
+                    ),
+                    "strategic_session_max_unattended_seconds": int(
+                        _runtime_config.get(
+                            "strategic_session_max_unattended_seconds", 14400
+                        )
+                    ),
+                    "resident_session_heartbeat_stale_seconds": int(
+                        _runtime_config.get(
+                            "resident_session_heartbeat_stale_seconds", 1500
+                        )
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

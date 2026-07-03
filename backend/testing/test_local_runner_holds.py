@@ -122,12 +122,20 @@ class TestFailStaleLocalRunnerHolds:
         ).get("awaiting_local_runner_since") is not None
 
     @pytest.mark.asyncio
-    async def test_fails_strategic_local_hold_older_than_timeout(
+    async def test_strategic_local_hold_falls_back_to_cloud_after_timeout(
         self, db_session, mocker
     ):
+        """SAFETY: an abandoned required-local Strategic hold self-heals to CLOUD.
+
+        A stale Strategic hold (opened-and-left, dead/absent runner) is NOT
+        terminally failed — the local-required pin is cleared and the task is
+        returned to normal dispatch so it provisions in the cloud. No
+        PROVISION_FAILURE, no failed task result, and the operator alert is INFO
+        (a graceful fallback), not ERROR.
+        """
         project = await _make_project(db_session)
         held_since = _utcnow() - timedelta(
-            seconds=orch._LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS + 600
+            seconds=orch._strategic_local_hold_timeout_seconds() + 600
         )
         record_task_result = mocker.patch("app.routers.agent_status.record_task_result")
         task = Task(
@@ -138,45 +146,96 @@ class TestFailStaleLocalRunnerHolds:
                 STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
                 STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
                 STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since.isoformat(),
+                "preferred_runner_target_id": "runner-123",
             },
         )
         db_session.add(task)
         await db_session.commit()
         await db_session.refresh(task)
 
+        # Not counted as a failure — Strategic holds fall back to cloud.
         failed = await orch._fail_stale_local_runner_holds(db_session)
 
-        assert failed == 1
+        assert failed == 0
         await db_session.refresh(task)
-        assert task.status == TaskStatus.FAILED
+        # Stays QUEUED so the normal dispatch loop provisions it in the cloud.
+        assert task.status == TaskStatus.QUEUED
+        # The hard-local pin is fully cleared so dispatch no longer re-holds it.
+        ctx = task.context or {}
+        assert STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
+        assert STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY not in ctx
+        assert STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY not in ctx
+        assert "preferred_runner_target_id" not in ctx
+        # Not a failure: no failure category, no recorded failed result.
+        assert ctx.get("failure_category") is None
+        assert "cloud" in (task.latest_status_message or "").lower()
         assert "strategic_local_runner_required" in (
             task.latest_status_message or ""
         )
-        assert "Strategic-capable local runner" in (
-            task.latest_status_message or ""
-        )
-        assert "requeue" in (task.latest_status_message or "")
-        assert (task.context or {}).get("failure_category") == PROVISION_FAILURE
-        record_task_result.assert_called_once_with(
-            success=False,
-            failure_class=PROVISION_FAILURE,
-            task_id=str(task.id),
-            task_type="strategic_review",
-        )
+        record_task_result.assert_not_called()
+        # Operator is alerted, but at INFO/degraded severity (graceful fallback).
         alerts = (
             (
                 await db_session.execute(
-                    select(Alert).where(
-                        Alert.task_id == task.id,
-                        Alert.severity == AlertSeverity.ERROR,
-                    )
+                    select(Alert).where(Alert.task_id == task.id)
                 )
             )
             .scalars()
             .all()
         )
         assert len(alerts) == 1
-        assert "Strategic-capable local runner" in alerts[0].message
+        assert alerts[0].severity == AlertSeverity.INFO
+        error_alerts = [a for a in alerts if a.severity == AlertSeverity.ERROR]
+        assert error_alerts == []
+
+    @pytest.mark.asyncio
+    async def test_strategic_local_hold_uses_configured_timeout(
+        self, db_session, mocker
+    ):
+        """The strategic fallback cutoff comes from the runtime setting, and the
+        compute (6h) fallback is unaffected by it."""
+        mocker.patch.dict(
+            orch._runtime_config,
+            {"strategic_local_hold_timeout_seconds": 120},
+        )
+        project = await _make_project(db_session)
+        held_since = (_utcnow() - timedelta(seconds=200)).isoformat()  # > 120s
+        strategic_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+                STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: held_since,
+            },
+        )
+        # A compute hold at the SAME 200s age must NOT trip — compute keeps the 6h
+        # window, so the small strategic setting never fails compute work early.
+        compute_task = Task(
+            project_id=project.id,
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.QUEUED,
+            context={"awaiting_local_runner_since": held_since},
+        )
+        db_session.add_all([strategic_task, compute_task])
+        await db_session.commit()
+
+        failed = await orch._fail_stale_local_runner_holds(db_session)
+
+        assert failed == 0  # strategic → cloud fallback, compute → still holding
+        await db_session.refresh(strategic_task)
+        await db_session.refresh(compute_task)
+        assert strategic_task.status == TaskStatus.QUEUED
+        assert (
+            STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY
+            not in (strategic_task.context or {})
+        )
+        # Compute hold is untouched (well within its 6h window).
+        assert compute_task.status == TaskStatus.QUEUED
+        assert (
+            compute_task.context or {}
+        ).get("awaiting_local_runner_since") == held_since
 
     @pytest.mark.asyncio
     async def test_keeps_recent_strategic_local_hold(self, db_session):

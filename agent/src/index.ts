@@ -2642,6 +2642,21 @@ export function sendLog(ws: WebSocket | null, content: string) {
   }
 }
 
+/**
+ * Send an arbitrary typed WebSocket frame to the live viewer socket (e.g. the
+ * resident strategist's `{type:"strategic_session", payload:{…}}` transcript
+ * deltas the backend maps to `emit_strategic_session_delta`). Returns true when
+ * the frame went out on an OPEN socket; false when there is no live socket, so
+ * the caller can fall back to a buffered `sendLog`. Centralizes the same
+ * readyState guard `sendLog` uses so callers never touch `WebSocket.OPEN`.
+ */
+export function sendWsFrame(ws: WebSocket | null, frame: Record<string, unknown>): boolean {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify(frame)); return true; } catch { /* ignore */ }
+  }
+  return false;
+}
+
 // ── Git Helpers ─────────────────────────────────────────────────────────────
 export function git(args: string[], cwd = WORKSPACE): string {
   return execFileSync('git', args, { cwd, encoding: 'utf-8', timeout: 120_000 }).trim();

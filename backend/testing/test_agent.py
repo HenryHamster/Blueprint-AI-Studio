@@ -9210,6 +9210,75 @@ async def test_agent_ws_receive_loop_closes_on_periodic_recheck_terminal(
 
 
 @pytest.mark.asyncio
+async def test_agent_ws_strategic_session_frame_forwards_to_emit(mocker):
+    """A ``strategic_session`` WS frame forwards its payload to
+    ``emit_strategic_session_delta`` (the resident-session live transcript path).
+    """
+    import json as _json
+    import app.routers.projects as projects_module
+    from unittest.mock import AsyncMock, MagicMock
+    from fastapi import WebSocketDisconnect
+
+    task_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    token = create_agent_token(
+        str(task_id), "agent-vm-ss", project_id=str(project_id)
+    )
+
+    mock_task = MagicMock()
+    mock_task.id = task_id
+    mock_task.project_id = project_id
+    mock_task.vm_instance_id = "agent-vm-ss"
+    mock_task.status = TaskStatus.IN_PROGRESS
+
+    mock_execute_result = MagicMock()
+    mock_execute_result.scalars.return_value.first.return_value = mock_task
+
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_execute_result)
+    mock_session.get = AsyncMock(return_value=mock_task)
+
+    mock_session_cm = AsyncMock()
+    mock_session_cm.__aenter__.return_value = mock_session
+    mock_session_cm.__aexit__.return_value = None
+
+    mocker.patch("app.routers.projects.AsyncSessionLocal", return_value=mock_session_cm)
+    mocker.patch(
+        "app.routers.projects.manager.check_and_add_ip",
+        new_callable=AsyncMock,
+        return_value=True,
+    )
+    mocker.patch("app.routers.projects.manager.remove_ip")
+    mocker.patch("app.routers.projects.broadcast_to_project", new_callable=AsyncMock)
+    emit = mocker.patch(
+        "app.routers.projects.emit_strategic_session_delta",
+        new_callable=AsyncMock,
+    )
+
+    payload = {
+        "session_id": "ss-1",
+        "task_id": str(task_id),
+        "seq": 3,
+        "kind": "message",
+        "text": "hi operator",
+        "ts": "2026-07-02T00:00:00Z",
+    }
+    frame = _json.dumps({"type": "strategic_session", "payload": payload})
+    # A second frame whose payload is not a mapping must be ignored (no emit).
+    bad_frame = _json.dumps({"type": "strategic_session", "payload": "not-a-dict"})
+
+    ws = AsyncMock()
+    ws.receive_json = AsyncMock(return_value={"token": token})
+    ws.receive_text = AsyncMock(side_effect=[frame, bad_frame, WebSocketDisconnect()])
+    ws.close = AsyncMock()
+
+    await projects_module.agent_websocket_endpoint(ws, task_id)
+
+    # The valid frame forwarded its payload verbatim; the malformed one did not.
+    emit.assert_awaited_once_with(str(project_id), payload)
+
+
+@pytest.mark.asyncio
 async def test_agent_ws_closes_on_termination_without_messages(mocker):
     """
     Regression: WS must close ≤5s after task termination even when no messages

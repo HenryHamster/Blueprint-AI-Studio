@@ -717,6 +717,39 @@ export interface StrategicSessionMessageResponse {
   message?: StrategicStateMessage;
 }
 
+/**
+ * Bounded projection of the resident Strategic session state returned by the
+ * start/stop endpoints (mirrors `resident_session_snapshot` in
+ * `strategic_resident_session.py`). Null when no resident session exists.
+ */
+export interface StrategicResidentSessionSnapshot {
+  session_id?: string | null;
+  task_id?: string | null;
+  runner_id?: string | null;
+  status?: string | null;
+  stop_requested?: boolean;
+  started_at?: string | null;
+  updated_at?: string | null;
+  ended_at?: string | null;
+  last_progress_at?: string | null;
+  last_operator_interaction_at?: string | null;
+}
+
+export interface StrategicSessionStartRequest {
+  runner_id?: string | null;
+}
+
+export interface StrategicSessionStartResponse {
+  project_id: string;
+  enabled: boolean;
+  session: StrategicResidentSessionSnapshot | null;
+}
+
+export interface StrategicSessionStopResponse {
+  project_id: string;
+  session: StrategicResidentSessionSnapshot | null;
+}
+
 export interface StrategicWorkbenchStateResponse {
   status?: string;
   workbench: StrategicWorkbenchState;
@@ -774,6 +807,13 @@ export interface StrategicStateResponse {
       last_fired_origin?: string | null;
     };
   };
+  resident_session?: StrategicResidentSessionSnapshot | null;
+  /**
+   * Whether the resident-session feature flag (`strategic_session_enabled`) is
+   * on. The container gates the Start affordance on this so the button is hidden
+   * when the feature is off (a click would otherwise 403 at the start endpoint).
+   */
+  resident_session_available?: boolean;
   running_update: {
     excerpt: string | null;
     char_count: number;
@@ -1027,4 +1067,47 @@ export async function executeStrategicWorkSessionCommand(
     throw new Error('Failed to execute Strategic session command: missing command receipt');
   }
   return data;
+}
+
+export async function startStrategicSession(
+  projectId: string,
+  payload: StrategicSessionStartRequest = {},
+): Promise<StrategicSessionStartResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/start`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!res.ok) {
+    const detail = await strategicSessionErrorMessage(
+      res,
+      `Failed to start Strategic session: ${res.status}`,
+    );
+    throw new Error(detail);
+  }
+  return res.json() as Promise<StrategicSessionStartResponse>;
+}
+
+export async function stopStrategicSession(
+  projectId: string,
+): Promise<StrategicSessionStopResponse> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-session/stop`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    },
+  );
+  if (!res.ok) {
+    const detail = await strategicSessionErrorMessage(
+      res,
+      `Failed to stop Strategic session: ${res.status}`,
+    );
+    throw new Error(detail);
+  }
+  return res.json() as Promise<StrategicSessionStopResponse>;
 }

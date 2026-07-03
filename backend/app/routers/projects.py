@@ -44,6 +44,7 @@ from app.schemas import DeployPayload
 from app.shared_state import backfill_branch_columns, limiter
 from app.broadcast import manager, broadcast_to_project, _sanitize_log
 from app.event_fanout import enqueue_agent_log
+from app.strategic_events import emit_strategic_session_delta
 
 logger = logging.getLogger(__name__)
 
@@ -827,6 +828,20 @@ async def agent_websocket_endpoint(websocket: WebSocket, task_id: uuid.UUID):
                 elif data.get("type") == "status":
                     # Optionally handle status updates via WS too
                     pass
+                elif data.get("type") == "strategic_session":
+                    # Resident strategic-session live transcript delta. The
+                    # 100KB frame-size cap and the 20/sec rate-limit accounting
+                    # above already applied to this frame exactly like the log
+                    # path. emit_strategic_session_delta secret-sanitizes
+                    # ``text`` (broadcast._sanitize_log) and bounds the whole
+                    # payload under the NOTIFY ceiling internally, so we only
+                    # forward a mapping payload; anything else is ignored safely.
+                    session_payload = data.get("payload")
+                    if isinstance(session_payload, dict):
+                        await emit_strategic_session_delta(
+                            project_id, session_payload
+                        )
+                # Unknown frame types fall through and are ignored safely.
 
                 receive_task = asyncio.create_task(websocket.receive_text())
 

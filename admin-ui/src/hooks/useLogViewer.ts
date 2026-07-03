@@ -50,7 +50,25 @@ export interface StrategicCycleCompletion {
   strategic_judgment_challenge?: StrategicChallengeSummary;
 }
 
+/** One resident-session transcript delta, from a `strategic_session` event. */
+export interface StrategicSessionDelta {
+  /** Local monotonic id for stable React keys (the wire has no unique id). */
+  id: number;
+  session_id?: string;
+  task_id?: string;
+  seq?: number;
+  kind?: string;
+  text: string;
+  ts?: string;
+}
+
 let _trackLogIdCounter = 0;
+let _sessionDeltaIdCounter = 0;
+
+// Cap the live session transcript so a long-running resident session can't grow
+// it without bound; keep the most recent tail when the cap is hit.
+const SESSION_TRANSCRIPT_CAP = 2000;
+const SESSION_TRANSCRIPT_KEEP = 1500;
 
 const TERMINAL_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set(['COMPLETED', 'FAILED', 'CANCELLED']);
 const LOG_STREAM_TASK_STATUSES: ReadonlySet<TaskStatus> = new Set(['IN_PROGRESS', 'PROVISIONING']);
@@ -112,6 +130,8 @@ export function useLogViewer({
   const [cycleProgress, setCycleProgress] = useState<StrategicCycleProgress | null>(null);
   // Outcome receipt from the most recently completed cycle (null until first completion).
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
+  // Live resident-session transcript buffer, appended from strategic_session events.
+  const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectingProjectRef = useRef<string | null>(null);
@@ -160,6 +180,9 @@ export function useLogViewer({
     setStrategistActive(false);
     setCycleProgress(null);
     setLastCycleCompletion(null);
+    // The transcript is a per-project live buffer; a fresh project starts empty
+    // and the resident session re-streams its own strategic_session deltas.
+    setStrategicSessionTranscript([]);
   }, [selectedProjectId]);
 
   // Clean up WebSocket and timers on unmount
@@ -403,6 +426,30 @@ export function useLogViewer({
         fetchDirectionsDebounceRef.current = setTimeout(() => { fetchDirectionsRef?.current?.(); }, 500);
       };
       if (!projectEventApplies) {
+        return;
+      }
+      // Resident-session live transcript — mirror the agent_log append: each
+      // strategic_session event carries one coarsened delta whose text we push
+      // onto the transcript buffer the hook exposes. Deltas are already
+      // secret-sanitized + length-bounded server-side (strategic_events.py).
+      if (msg.event === 'strategic_session') {
+        const text = typeof msg.data?.text === 'string' ? msg.data.text : '';
+        if (text) {
+          const delta: StrategicSessionDelta = {
+            id: ++_sessionDeltaIdCounter,
+            session_id: msg.data?.session_id,
+            task_id: msg.data?.task_id,
+            seq: msg.data?.seq,
+            kind: msg.data?.kind,
+            text,
+            ts: msg.data?.ts,
+          };
+          setStrategicSessionTranscript(prev => (
+            prev.length >= SESSION_TRANSCRIPT_CAP
+              ? [...prev.slice(-SESSION_TRANSCRIPT_KEEP), delta]
+              : [...prev, delta]
+          ));
+        }
         return;
       }
       if (msg.event === 'strategic_updated' || refetchSurfaces.has('directions')) {
@@ -715,6 +762,9 @@ export function useLogViewer({
     strategistActive,
     cycleProgress,
     lastCycleCompletion,
+    // Resident-session live transcript (appended from strategic_session events).
+    strategicSessionTranscript,
+    clearStrategicSessionTranscript: () => setStrategicSessionTranscript([]),
     // Tracking
     trackedTaskIds, trackedLogs, trackTask, untrackTask, untrackAll,
   };

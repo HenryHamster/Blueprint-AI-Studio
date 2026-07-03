@@ -263,6 +263,14 @@ async def _resolve_local_continuation_runner_intent(
     A fresh continuation marker is a hard local intent, even when no runner is
     live at spawn time. The runner id remains advisory within the local fleet;
     the explicit required flag is what prevents cloud fallback later.
+
+    Freshness ("fresh") is resolved by
+    ``strategic_local_continuation_status_from_vision``, which reads the live
+    ``strategic_continuation_ttl_seconds`` runtime setting (default 1500s / 25
+    min) rather than the retired hardcoded 12h TTL — so a marker that stopped
+    renewing (no operator interaction / no applied strategic op) goes stale
+    within the short lease window and this hard-local intent is NOT applied,
+    letting the next spawn dispatch to cloud.
     """
 
     current_vision = (
@@ -4791,12 +4799,29 @@ async def _spawn_strategic_review(
     steering_excerpt: str | None = None,
     preferred_runner_target_id: str | None = None,
     local_runner_context: dict[str, Any] | None = None,
+    extra_context: dict[str, Any] | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
     Called by _handle_design_doc_completion after the design doc is updated.
     Uses type 'strategic_review' so it doesn't block tactical research.
     Returns True if a task was created, False if skipped.
+
+    ``extra_context`` (default ``None`` — every cadence caller is unaffected)
+    seeds additional keys into the created task's ``context`` in the SAME
+    INSERT/commit that creates the task, so the committed task is BORN already
+    carrying them (it never exists in a committed state without them). The
+    resident-strategic-session start path uses this to make its spawned
+    ``strategic_review`` claimable ONLY with ``_resident_session`` already set:
+    handler dispatch (one-shot ``handleStrategic`` vs streaming
+    ``handleStrategicResident``) is decided at claim time from the context flag,
+    so a warm local runner that claims the task in the sub-millisecond window
+    before the session blob is finalized still reads the resident flag and routes
+    to the streaming handler — closing the SPAWN-path race a separate post-spawn
+    stamping transaction previously left open. Merged over the context this
+    function derives, so an explicit ``extra_context`` value wins on any key
+    collision (e.g. the local-runner pin), leaving runner-pin semantics identical
+    to stamping it a beat later.
 
     ``operator_steered`` carries the operator-origin signal forward when this
     spawn is the Phase 2 tail of an architecture cycle. On that path the
@@ -6999,6 +7024,12 @@ async def _spawn_strategic_review(
         )
     if effective_preferred_runner_target_id:
         task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
+    # Seed any caller-supplied born-context LAST so the task is committed already
+    # carrying it in its first (and only) creating INSERT — no separate follow-up
+    # transaction, no claimable-without-the-flag window. Merged over the derived
+    # context so an explicit caller value wins on collision.
+    if extra_context:
+        task_context.update(extra_context)
 
     new_task = Task(
         project_id=_project_id,

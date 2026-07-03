@@ -52,7 +52,7 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
-import { checkInStrategicSession, updateStrategicWorkbenchState, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
+import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
@@ -414,6 +414,7 @@ export default function App() {
   const [optimisticStrategicWorkbench, setOptimisticStrategicWorkbench] = useState<StrategicWorkbenchState | null>(null);
   const [savingStrategicWorkbench, setSavingStrategicWorkbench] = useState(false);
   const [checkingInStrategicSession, setCheckingInStrategicSession] = useState(false);
+  const [strategicSessionBusy, setStrategicSessionBusy] = useState(false);
   const strategicWorkbenchStateRef = useRef<StrategicWorkbenchState | null>(null);
   const strategicWorkbenchSaveSeqRef = useRef(0);
   const strategicWorkbenchSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
@@ -430,6 +431,7 @@ export default function App() {
     strategicWorkbenchRestoreProjectRef.current = null;
     strategicCheckInIdempotencyKeyRef.current = null;
     setCheckingInStrategicSession(false);
+    setStrategicSessionBusy(false);
   }, [selectedProjectId]);
   const strategicReadModelWorkbench = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data?.workbench ?? null
@@ -437,6 +439,23 @@ export default function App() {
   const selectedStrategicReadModel = strategicReadModel.data?.project_id === selectedProjectId
     ? strategicReadModel.data
     : null;
+  // Resident Strategic session state is surfaced on the strategic read model as
+  // `resident_session` (mirrors `resident_session_snapshot`). The cast keeps
+  // this forward-compatible whether or not the read-model type already declares
+  // the field. `sessionActive` intentionally excludes a session whose stop was
+  // requested so the control flips back to Start immediately on stop.
+  const residentStrategicSession =
+    (selectedStrategicReadModel as { resident_session?: StrategicResidentSessionSnapshot | null } | null)?.resident_session
+    ?? null;
+  const strategicSessionActive = residentStrategicSession?.status === 'active' && !residentStrategicSession?.stop_requested;
+  const strategicSessionStatus = residentStrategicSession?.status ?? null;
+  // The Start affordance is gated on the resident-session feature flag, surfaced
+  // as `resident_session_available` on the read model. When the flag is off we
+  // withhold `onStartSession` so StrategicSessionControl (which self-gates on
+  // callback presence) hides Start, rather than letting a click 403 at the start
+  // endpoint. Stop stays wired unconditionally so an operator can always reclaim.
+  const residentStrategicSessionAvailable =
+    (selectedStrategicReadModel as { resident_session_available?: boolean } | null)?.resident_session_available === true;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
   const chatComposerContextDescriptor = useMemo(
     () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
@@ -532,6 +551,41 @@ export default function App() {
       if (selectedProjectIdRef.current === projectId) setCheckingInStrategicSession(false);
     }
   }, [checkingInStrategicSession, s, strategicReadModel, strategicReadModelWorkbench]);
+  const handleStartStrategicSession = useCallback(async () => {
+    const projectId = s.selectedProjectId;
+    if (!projectId || strategicSessionBusy) return;
+    setStrategicSessionBusy(true);
+    try {
+      const preferredRunnerId = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.preferred_runner_id ?? null;
+      await startStrategicSession(projectId, preferredRunnerId ? { runner_id: preferredRunnerId } : {});
+      if (selectedProjectIdRef.current !== projectId) return;
+      s.addToast('Strategic session starting', 'success');
+      void strategicReadModel.refresh();
+    } catch (err) {
+      if (selectedProjectIdRef.current === projectId) {
+        s.addToast(err instanceof Error ? err.message : 'Could not start Strategic session', 'error');
+      }
+    } finally {
+      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
+    }
+  }, [strategicSessionBusy, s, strategicReadModel, strategicReadModelWorkbench]);
+  const handleStopStrategicSession = useCallback(async () => {
+    const projectId = s.selectedProjectId;
+    if (!projectId || strategicSessionBusy) return;
+    setStrategicSessionBusy(true);
+    try {
+      await stopStrategicSession(projectId);
+      if (selectedProjectIdRef.current !== projectId) return;
+      s.addToast('Strategic session stopping', 'success');
+      void strategicReadModel.refresh();
+    } catch (err) {
+      if (selectedProjectIdRef.current === projectId) {
+        s.addToast(err instanceof Error ? err.message : 'Could not stop Strategic session', 'error');
+      }
+    } finally {
+      if (selectedProjectIdRef.current === projectId) setStrategicSessionBusy(false);
+    }
+  }, [strategicSessionBusy, s, strategicReadModel]);
   const taskContextSessionProps = { sessionRefs: strategicWorkbenchState?.selected_refs, savingSessionRefs: savingStrategicWorkbench, onUpdateSessionRefs: updateStrategicSessionRefs };
   const pipelineAttentionCount = useMemo(() => {
     const counts = strategicReadModel.data?.attention?.counts;
@@ -1329,6 +1383,11 @@ export default function App() {
         savingSessionRefs={savingStrategicWorkbench}
         accountSpend={strategicAccountSpend}
         checkingIn={checkingInStrategicSession}
+        sessionActive={strategicSessionActive}
+        sessionStatus={strategicSessionStatus}
+        sessionBusy={strategicSessionBusy}
+        onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
+        onStopSession={handleStopStrategicSession}
         onClose={closeStrategicContextWorkspace}
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
@@ -1392,6 +1451,11 @@ export default function App() {
                 sinceLastCheckIn={strategicReadModel.data?.work_session?.since_last_check_in ?? null}
                 accountSpend={strategicAccountSpend}
                 checkingIn={checkingInStrategicSession}
+                sessionActive={strategicSessionActive}
+                sessionStatus={strategicSessionStatus}
+                sessionBusy={strategicSessionBusy}
+                onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
+                onStopSession={handleStopStrategicSession}
                 onModeChange={setStrategicInteractionMode}
                 onCheckIn={handleStrategicCheckIn}
                 onOpenDevices={() => {
@@ -1440,6 +1504,7 @@ export default function App() {
                 strategistActive={s.strategistActive}
                 cycleProgress={s.cycleProgress}
                 lastCycleCompletion={s.lastCycleCompletion}
+                strategicSessionTranscript={s.strategicSessionTranscript}
                 focusComposerSignal={strategicComposerFocusSignal}
                 realtimeRefreshSignal={messageRealtimeRefreshSignal}
                 targetMessage={strategicMessageTarget.target} onTargetMessageHandled={strategicMessageTarget.clear}

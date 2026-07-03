@@ -22,6 +22,7 @@ import { handleReview, handleFix } from './review-fix.js';
 import { handlePanelReview } from './panel-review.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
+import { handleStrategicResident } from './strategic-resident.js';
 import { handleSecurityAudit, handleSelfAudit, handleReleaseAudit } from './audits.js';
 import { handleReleaseAuditChallenge } from './audit-challenge.js';
 import { handleReleaseMergeGrade } from './merge-grade.js';
@@ -51,12 +52,36 @@ export type Handler = (
   model?: string, effort?: string
 ) => Promise<void>;
 
+// A resident strategic session is a strategic_review task pinned to one runner
+// for the session's life. It is marked either on the payload (resident_session)
+// or on the task context (_resident_session), set by the backend start endpoint.
+// When present it routes to the persistent, streaming, chattable resident loop
+// instead of the one-shot thinker→challenge→executor pass.
+export function isResidentSessionTask(
+  task: Record<string, unknown>, payload: Record<string, unknown>,
+): boolean {
+  if (payload.resident_session === true) return true;
+  const ctx = task.context;
+  return !!ctx && typeof ctx === 'object' && !Array.isArray(ctx)
+    && (ctx as Record<string, unknown>)._resident_session === true;
+}
+
+// strategic_review (and research_mode === 'strategic') dispatch: a resident
+// session routes to handleStrategicResident; everything else keeps the one-shot
+// handleStrategic behavior unchanged.
+const dispatchStrategic: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
+  if (isResidentSessionTask(task, payload)) {
+    return handleStrategicResident(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+  }
+  return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+};
+
 // research task type forwards to the strategic handler when research_mode is
 // 'strategic'; otherwise it runs the tactical research path. strategic_review
-// always goes directly to handleStrategic.
+// always goes through dispatchStrategic.
 const dispatchResearch: Handler = (taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort) => {
   if (payload.research_mode === 'strategic') {
-    return handleStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
+    return dispatchStrategic(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
   }
   return handleResearch(taskId, payload, task, ghToken, owner, repo, ws, statusRef, model, effort);
 };
@@ -80,7 +105,7 @@ export const handlers: Record<AgentTaskType, Handler> = {
   perf: handlePerf,
   investigate: handleInvestigate,
   design_doc_update: handleDesignDocUpdate,
-  strategic_review: handleStrategic,
+  strategic_review: dispatchStrategic,
   release_audit: handleReleaseAudit,
   release_audit_challenge: handleReleaseAuditChallenge,
   release_merge_grade: handleReleaseMergeGrade,

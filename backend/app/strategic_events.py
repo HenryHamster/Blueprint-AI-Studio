@@ -20,9 +20,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
+from datetime import datetime, timezone
 from typing import Any
 
-from app.broadcast import broadcast_to_project
+from app.broadcast import _sanitize_log, broadcast_to_project
 from app.workbench_events import (
     SURFACE_DIRECTIONS,
     SURFACE_STRATEGIC_SESSION,
@@ -33,6 +34,31 @@ from app.workbench_events import (
 STRATEGIC_CYCLE_STARTED = "strategic_cycle_started"
 STRATEGIC_CYCLE_COMPLETED = "strategic_cycle_completed"
 STRATEGIC_UPDATED = "strategic_updated"
+# Resident strategic-session live transcript delta (warm standing agent). Each
+# emission is one coarsened per-sentence / per-turn chunk streamed to the operator
+# chat. Contract with admin-ui/src/hooks/useLogViewer.ts — do not rename.
+STRATEGIC_SESSION = "strategic_session"
+
+# Allowed ``kind`` values for a ``strategic_session`` delta. Scopes what the
+# resident agent may stream: chunk of reasoning, an applied strategic action, a
+# tool call, a lifecycle status line, or an assistant message.
+STRATEGIC_SESSION_KIND_REASONING = "reasoning"
+STRATEGIC_SESSION_KIND_ACTION = "action"
+STRATEGIC_SESSION_KIND_TOOL = "tool"
+STRATEGIC_SESSION_KIND_STATUS = "status"
+STRATEGIC_SESSION_KIND_MESSAGE = "message"
+_STRATEGIC_SESSION_KINDS = frozenset(
+    {
+        STRATEGIC_SESSION_KIND_REASONING,
+        STRATEGIC_SESSION_KIND_ACTION,
+        STRATEGIC_SESSION_KIND_TOOL,
+        STRATEGIC_SESSION_KIND_STATUS,
+        STRATEGIC_SESSION_KIND_MESSAGE,
+    }
+)
+# Per-delta text cap (chars). Kept below the NOTIFY soft-limit so a single
+# coarsened chunk rides the payload; the byte-level enforcer is the backstop.
+_STRATEGIC_SESSION_TEXT_MAX_CHARS = 5_000
 
 # Allowed ``kind`` values for a ``strategic_updated`` event. Scopes the signal
 # to the strategist's persisted OUTPUTS surfaced in the directions view.
@@ -350,6 +376,89 @@ async def emit_strategic_cycle_completed(
             phase_state=phase_state,
             completion=completion,
         ),
+    )
+
+
+def _session_ts_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _sanitize_session_text(
+    value: Any, *, max_chars: int = _STRATEGIC_SESSION_TEXT_MAX_CHARS
+) -> str:
+    """Redact secrets from a session-delta chunk and cap its length.
+
+    Runs the same secret-redaction pass the WS log stream uses
+    (``broadcast._sanitize_log``) so a tool echo or reasoning chunk can never
+    leak a token into the operator transcript, then bounds the length.
+    """
+    if value is None:
+        return ""
+    text = _sanitize_log(str(value))
+    if len(text) > max_chars:
+        return f"{text[: max_chars - 1]}…"
+    return text
+
+
+def _enforce_session_soft_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    """Trim the ``text`` field until the encoded payload fits the NOTIFY ceiling.
+
+    ``text`` is the only unbounded-by-caller field; every other key is a short
+    id / scalar. Trims iteratively (each pass strictly shrinks ``text``) so the
+    loop always terminates even for multibyte content.
+    """
+    trimmed = dict(payload)
+    while True:
+        encoded = json.dumps(trimmed, default=str).encode("utf-8")
+        if len(encoded) <= _NOTIFY_PAYLOAD_SOFT_LIMIT:
+            return trimmed
+        text = trimmed.get("text") or ""
+        if not text:
+            # Nothing left to shed; remaining fields are already tiny + bounded.
+            return trimmed
+        overflow = len(encoded) - _NOTIFY_PAYLOAD_SOFT_LIMIT
+        # chars≈bytes for ASCII; for multibyte we drop >= overflow chars, which
+        # sheds even more bytes — still converges. Keep a little headroom.
+        keep = min(len(text) - 1, max(0, len(text) - overflow - 32))
+        trimmed["text"] = f"{text[:keep]}…" if keep > 0 else ""
+
+
+def _strategic_session_payload(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    src = payload if isinstance(payload, Mapping) else {}
+    kind = src.get("kind")
+    if kind not in _STRATEGIC_SESSION_KINDS:
+        kind = STRATEGIC_SESSION_KIND_STATUS
+    out: dict[str, Any] = {
+        "session_id": _compact_str(src.get("session_id"), max_chars=80),
+        "task_id": _compact_str(src.get("task_id"), max_chars=80),
+        "seq": _as_int(src.get("seq")),
+        "kind": kind,
+        "text": _sanitize_session_text(src.get("text")),
+        "ts": _compact_str(src.get("ts"), max_chars=40) or _session_ts_now(),
+    }
+    return _enforce_session_soft_limit(out)
+
+
+async def emit_strategic_session_delta(
+    project_id,
+    payload: Mapping[str, Any] | None,
+) -> None:
+    """Broadcast one resident-session transcript delta (post-commit).
+
+    ``payload`` carries ``{ session_id, task_id, seq, kind, text, ts }`` where
+    ``kind`` is one of reasoning / action / tool / status / message. ``text`` is
+    secret-sanitized via ``broadcast._sanitize_log`` and the whole payload is
+    bounded under the NOTIFY soft-limit before it goes on the wire. Coarsen to
+    per-sentence / per-turn upstream — one emission == one visible chunk.
+
+    Like the other ``emit_strategic_*`` helpers this MUST be awaited AFTER the
+    DB commit; ``broadcast_to_project`` swallows its own exceptions so a failed
+    emit never escapes the caller.
+    """
+    await broadcast_to_project(
+        str(project_id),
+        STRATEGIC_SESSION,
+        _strategic_session_payload(payload),
     )
 
 

@@ -42,6 +42,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timedelta, timezone
 
 from blueprint_api import APIError, api, get_project_id, load_config
@@ -3309,6 +3310,180 @@ def _render_strategic_cycle(d: dict) -> None:
         print("  Phase 1 will chain into strategic_review (Phase 2) on completion.")
 
 
+# ── strategic (resident session: start / stop / chat) ─────────────────────────
+
+def cmd_strategic(args: argparse.Namespace) -> None:
+    """Dispatch resident Strategic session subcommands: start / stop / chat."""
+    sub = getattr(args, "strategic_cmd", None)
+    if sub == "start":
+        _strategic_start(args)
+    elif sub == "stop":
+        _strategic_stop(args)
+    elif sub == "chat":
+        _strategic_chat(args)
+    else:
+        print("Usage: blueprint strategic {start|stop|chat}", file=sys.stderr)
+        sys.exit(1)
+
+
+def _strategic_start(args: argparse.Namespace) -> None:
+    """Start (or adopt) a resident Strategic session on the operator's runner."""
+    _require_write_config("strategic start")
+    pid = get_project_id(getattr(args, "project_id", None))
+    body: dict = {}
+    runner = getattr(args, "runner_id", None)
+    if runner:
+        body["runner_id"] = runner
+    result = api("POST",
+                 f"/api/admin/projects/{pid}/strategic-session/start",
+                 body or None)
+    _emit(args, result, _render_strategic_session_start)
+
+
+def _render_strategic_session_start(d: dict) -> None:
+    print("=== STRATEGIC SESSION STARTED ===")
+    enabled = d.get("enabled")
+    if enabled is not None:
+        print(f"  enabled:    {enabled}")
+    sess = d.get("session") or {}
+    if not sess:
+        print("  (no active session returned)")
+        return
+    print(f"  session_id: {sess.get('session_id', '?')}")
+    print(f"  task_id:    {sess.get('task_id', '?')}")
+    print(f"  runner:     {sess.get('runner_id') or '-'}")
+    print(f"  status:     {sess.get('status', '?')}")
+    if sess.get("started_at"):
+        print(f"  started_at: {sess['started_at']}")
+
+
+def _strategic_stop(args: argparse.Namespace) -> None:
+    """Stop the resident Strategic session and release authority."""
+    _require_write_config("strategic stop")
+    pid = get_project_id(getattr(args, "project_id", None))
+    if not _confirm("Stop the resident Strategic session?", getattr(args, "yes", False)):
+        print("Aborted.")
+        return
+    result = api("POST", f"/api/admin/projects/{pid}/strategic-session/stop")
+    _emit(args, result, _render_strategic_session_stop)
+
+
+def _render_strategic_session_stop(d: dict) -> None:
+    print("=== STRATEGIC SESSION STOPPED ===")
+    sess = d.get("session") or {}
+    if not sess:
+        print("  (no active session)")
+        return
+    print(f"  session_id: {sess.get('session_id', '?')}")
+    print(f"  status:     {sess.get('status', '?')}")
+    if sess.get("ended_at"):
+        print(f"  ended_at:   {sess['ended_at']}")
+
+
+_CHAT_ROLE_LABELS = {
+    "user": "you",
+    "strategic": "strategist",
+    "agent": "agent",
+    "system": "system",
+}
+
+
+def _render_chat_message(m: dict, json_mode: bool = False) -> None:
+    if json_mode:
+        print(json.dumps(m, default=str))
+        return
+    role = _CHAT_ROLE_LABELS.get(m.get("from_type"), m.get("from_type") or "?")
+    content = (m.get("content") or "").strip()
+    ts = (m.get("created_at") or "")[:19]
+    ts_str = f"  [{ts}]" if ts else ""
+    print(f"\n{role}>{ts_str}\n{content}")
+
+
+def _strategic_chat(args: argparse.Namespace) -> None:
+    """Interactive terminal chat with the resident strategist.
+
+    Sends each typed line to the strategic-session messages endpoint, then polls
+    the session conversation (``GET .../strategic-session`` → ``conversation.items``)
+    and prints new strategist / agent / system replies as they arrive. An empty
+    line keeps polling without sending; ``/quit`` (or EOF / Ctrl-C) exits.
+    """
+    _require_write_config("strategic chat")
+    pid = get_project_id(getattr(args, "project_id", None))
+    json_mode = _json_mode(args)
+    interval = max(0.5, float(getattr(args, "interval", 3.0) or 3.0))
+    reply_timeout = max(interval, float(getattr(args, "timeout", 120.0) or 120.0))
+    msg_type = getattr(args, "type", None) or "NOTE"
+
+    seen: set = set()
+
+    def _conversation_items() -> list:
+        resp = api("GET", f"/api/admin/projects/{pid}/strategic-session")
+        conv = resp.get("conversation") or {}
+        return conv.get("items") or []
+
+    def _print_new(items: list) -> int:
+        """Print unseen non-operator messages oldest-first; return how many printed."""
+        fresh = [m for m in items if m.get("id") and m["id"] not in seen]
+        fresh.sort(key=lambda x: (x.get("created_at") or "", str(x.get("id"))))
+        printed = 0
+        for m in fresh:
+            seen.add(m["id"])
+            if m.get("from_type") == "user":
+                continue  # skip echoing the operator's own messages
+            _render_chat_message(m, json_mode)
+            printed += 1
+        return printed
+
+    # Seed the seen-set with existing history so we only surface NEW replies.
+    try:
+        for m in _conversation_items():
+            if m.get("id"):
+                seen.add(m["id"])
+    except APIError:
+        return
+
+    print("blueprint chat — resident strategist. Type a message and press Enter; "
+          "empty line polls, /quit or Ctrl-C exits.", file=sys.stderr)
+    try:
+        while True:
+            try:
+                line = input("you> ")
+            except EOFError:
+                print(file=sys.stderr)
+                break
+            content = line.strip()
+            if content in ("/quit", "/exit", "/q"):
+                break
+            if content:
+                sent = api("POST",
+                           f"/api/admin/projects/{pid}/strategic-session/messages",
+                           {"content": content, "message_type": msg_type})
+                sent_id = sent.get("id") if isinstance(sent, dict) else None
+                if sent_id:
+                    seen.add(sent_id)
+            # Poll for the strategist's reply until it goes quiet or times out.
+            waited = 0.0
+            replied = False
+            while waited < reply_timeout:
+                time.sleep(interval)
+                waited += interval
+                try:
+                    printed = _print_new(_conversation_items())
+                except APIError:
+                    break
+                if printed:
+                    replied = True
+                elif replied:
+                    # A quiet poll after a reply → treat the turn as complete.
+                    break
+            if not replied:
+                print("  (no reply yet — the strategist may still be working; "
+                      "press Enter to keep waiting or type another message)",
+                      file=sys.stderr)
+    except KeyboardInterrupt:
+        print("\nExiting chat.", file=sys.stderr)
+
+
 # ── trim-playbook-archive ─────────────────────────────────────────────────────
 
 def cmd_trim_playbook_archive(args: argparse.Namespace) -> None:
@@ -5259,6 +5434,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show design document pages; optionally pass a page KEY to show one page.",
     )
 
+    # strategic (resident session: start / stop / chat)
+    p_strategic = sub.add_parser(
+        "strategic", parents=[common],
+        help="Resident Strategic session: start, stop, or chat from the terminal.",
+        description="Start (or adopt) a resident strategist session on the operator's "
+                    "runner, stop it, or chat with it interactively.")
+    strategic_sub = p_strategic.add_subparsers(dest="strategic_cmd")
+    p_strat_start = strategic_sub.add_parser(
+        "start", parents=[common],
+        help="Start (or adopt) the resident Strategic session.")
+    p_strat_start.add_argument(
+        "--runner-id", dest="runner_id", default=None,
+        help="Pin the session to a specific local runner target id.")
+    p_strat_stop = strategic_sub.add_parser(
+        "stop", parents=[common],
+        help="Stop the resident Strategic session and release authority.")
+    p_strat_stop.add_argument("--yes", action="store_true",
+                              help="Skip the confirmation prompt.")
+    p_strat_chat = strategic_sub.add_parser(
+        "chat", parents=[common],
+        help="Interactive terminal chat with the resident strategist.")
+    p_strat_chat.add_argument(
+        "--interval", type=float, default=3.0,
+        help="Seconds between conversation polls (default 3).")
+    p_strat_chat.add_argument(
+        "--timeout", type=float, default=120.0,
+        help="Max seconds to wait for a reply per turn (default 120).")
+    p_strat_chat.add_argument(
+        "--type", dest="type", default="NOTE",
+        help="Message type to send (default NOTE).")
+
     # strategic-cycle
     p_sc = sub.add_parser("strategic-cycle", parents=[common],
                           help="Manually trigger a strategic cycle.")
@@ -5477,6 +5683,7 @@ _DISPATCH = {
     "health": cmd_health,
     "analytics": cmd_analytics,
     "vision": cmd_vision,
+    "strategic": cmd_strategic,
     "strategic-cycle": cmd_strategic_cycle,
     "trim-playbook-archive": cmd_trim_playbook_archive,
     "fingerprints": cmd_fingerprints,

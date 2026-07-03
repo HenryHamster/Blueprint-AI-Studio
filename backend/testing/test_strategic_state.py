@@ -36,6 +36,12 @@ from app.models import (
     _utcnow,
 )
 from app.messages_last_seen import naive_utc_to_epoch_ms
+from app.shared_state import runtime_config
+from app.strategic_resident_session import (
+    RESIDENT_SESSION_KEY,
+    STATUS_ACTIVE,
+    STRATEGIC_SESSION_ENABLED_SETTING,
+)
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
@@ -388,6 +394,12 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "persistent operator chat" in data["strategic"]["refresh"]["pending"]["excerpt"]
     assert len(data["strategic"]["refresh"]["pending"]["excerpt"]) <= 280
     assert "huge" not in data["strategic"]["refresh"]["pending"]
+    # No resident session started for this project → null-safe projection.
+    assert "resident_session" in data
+    assert data["resident_session"] is None
+    # The resident-session feature flag defaults off, so the read model reports
+    # the Start affordance as unavailable (the UI hides it in that case).
+    assert data["resident_session_available"] is False
     assert data["problem_model"]["current_focus"] == "Persistent Strategic interaction"
     assert data["problem_model"]["active_gap_count"] == 1
     assert data["problem_model"]["capability_count"] == 2
@@ -501,6 +513,96 @@ async def test_strategic_state_returns_persistent_workbench_projection(
     assert "A blocker is owned by a direction" not in str(package)
     assert "DO NOT EMBED KNOWLEDGE BODY" not in str(package)
     assert "DO NOT EMBED ARTIFACT LOGS" not in str(package)
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_surfaces_active_resident_session(
+    client: AsyncClient, db_session
+):
+    """An active resident session in Project.vision is projected to the UI.
+
+    The operator console polls /strategic-state and derives sessionActive from
+    ``resident_session.status == 'active' && !resident_session.stop_requested``,
+    so the read model must reflect the session-state blob written under
+    ``Project.vision[RESIDENT_SESSION_KEY]``.
+    """
+    project = await _make_project(db_session)
+    resident_task = Task(
+        project_id=project.id,
+        title="Resident strategic session",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(resident_task)
+    await db_session.commit()
+    await db_session.refresh(resident_task)
+
+    started_at = (_utcnow() - timedelta(minutes=3)).isoformat()
+    project.vision = {
+        **(project.vision or {}),
+        RESIDENT_SESSION_KEY: {
+            "version": 1,
+            "session_id": "ss-active-1234",
+            "task_id": str(resident_task.id),
+            "runner_id": "runner-abc",
+            "operator_user_id": TEST_USER_ID,
+            "status": STATUS_ACTIVE,
+            "stop_requested": False,
+            "started_at": started_at,
+            "updated_at": started_at,
+            "ended_at": None,
+            "last_progress_at": None,
+            "last_operator_interaction_at": started_at,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    resident = resp.json()["resident_session"]
+    assert resident is not None
+    assert resident["session_id"] == "ss-active-1234"
+    assert resident["task_id"] == str(resident_task.id)
+    assert resident["runner_id"] == "runner-abc"
+    assert resident["status"] == STATUS_ACTIVE
+    assert resident["stop_requested"] is False
+    assert resident["started_at"] == started_at
+    assert resident["last_operator_interaction_at"] == started_at
+    # The bounded projection must not leak internal-only session fields.
+    assert "operator_user_id" not in resident
+    assert "version" not in resident
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_surfaces_resident_session_availability_flag(
+    client: AsyncClient, db_session
+):
+    """`resident_session_available` mirrors the ``strategic_session_enabled`` flag.
+
+    The operator console gates the Start affordance on this boolean so the button
+    is hidden when the feature is off (a click would otherwise 403 at the start
+    endpoint). The default is off; toggling the runtime flag flips the field.
+    """
+    project = await _make_project(db_session)
+
+    original = runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False)
+    try:
+        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = False
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/strategic-state"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["resident_session_available"] is False
+
+        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = True
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/strategic-state"
+        )
+        assert resp.status_code == 200
+        assert resp.json()["resident_session_available"] is True
+    finally:
+        runtime_config[STRATEGIC_SESSION_ENABLED_SETTING] = original
 
 
 @pytest.mark.asyncio

@@ -1487,25 +1487,102 @@ def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
     return stamped_at
 
 
+_STRATEGIC_LOCAL_FALLBACK_ALERT_TITLE = (
+    "Strategic local runner offline — falling back to cloud"
+)
+
+
+async def _create_strategic_local_cloud_fallback_alert(
+    task: Task,
+    session: AsyncSession,
+    message: str,
+) -> None:
+    """Stage a non-failure INFO alert when a Strategic local hold falls back to cloud.
+
+    Distinct from ``_maybe_create_failure_alert`` (ERROR / failure semantics):
+    re-dispatching an abandoned required-local Strategic task to the cloud is a
+    graceful self-heal (the project keeps progressing), NOT a failure — so it
+    carries INFO severity and never records a failed task result. Deduplicates on
+    (task, stable title) so repeated sweep passes never create a second row.
+    Mirrors ``alert_dispatch._maybe_create_spend_hold_alert``: the caller commits
+    the session; this only stages the row and broadcasts ``alert_created``.
+    """
+    from app.models import Alert, AlertSeverity
+
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.title == _STRATEGIC_LOCAL_FALLBACK_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.INFO,
+        title=_STRATEGIC_LOCAL_FALLBACK_ALERT_TITLE,
+        message=message,
+        task_id=task.id,
+    )
+    session.add(alert)
+    try:
+        from app.broadcast import broadcast_to_project
+
+        await broadcast_to_project(
+            str(task.project_id),
+            "alert_created",
+            {
+                "alert_id": str(alert.id),
+                "severity": "INFO",
+                "title": alert.title,
+            },
+        )
+    except Exception:
+        logger.exception(
+            "[RUNNERS] alert_created broadcast failed for Strategic cloud "
+            "fallback on task %s",
+            task.id,
+        )
+
+
+def _strategic_local_hold_timeout_seconds() -> int:
+    """Bounded wait (seconds) before a required-local Strategic hold falls back to cloud.
+
+    Live value from the ``strategic_local_hold_timeout_seconds`` runtime setting
+    (default 900s / 15 min), replacing the old 6h hold-then-FAIL for Strategic
+    holds. Clamped defensively so a corrupted ``runtime_config_json`` never yields
+    a zero/negative window that would re-dispatch a just-held task instantly.
+    """
+    try:
+        value = int(_runtime_config.get("strategic_local_hold_timeout_seconds", 900))
+    except (TypeError, ValueError):
+        return 900
+    return value if value > 0 else 900
+
+
 async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
-    """Terminally fail tasks held too long for a local runner.
+    """Resolve tasks held too long for a local runner.
 
-    A require-local project's compute_experiment is held QUEUED (with
-    ``context['awaiting_local_runner_since']`` stamped) instead of provisioned in
-    the cloud when no live self-hosted runner claimed it. This sweep is the
-    safety valve: a hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` is
-    marked terminal-FAILED with an actionable reason so the project can never
-    wedge forever when the operator's hardware stays offline.
+    Two hold classes share the bounded-wait contract but resolve DIFFERENTLY:
 
-    Continuous local Strategic work uses the same bounded wait contract, with
-    ``context['awaiting_strategic_local_runner_since']`` and
-    ``context['strategic_local_runner_required']`` proving that the task was
-    intentionally held for the operator's local Strategic runner.
+    * **compute_experiment** (``context['awaiting_local_runner_since']``): held
+      QUEUED instead of cloud-provisioned when no live self-hosted runner claimed
+      it. A hold older than ``_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS`` (6h) is marked
+      terminal-FAILED (PROVISION_FAILURE) — a require-local compute run has no
+      safe cloud fallback (it needs the operator's GPU), so failing is correct.
 
-    Returns the number of tasks failed. Mirrors the terminal-fail pattern used by
-    the stale-provisioning reaper: TaskStatus.FAILED + latest_status_message +
-    failure_category (PROVISION_FAILURE, an INFRA class) + failure alert +
-    record_task_result, committed in one batch.
+    * **continuous local Strategic** (``context['awaiting_strategic_local_runner_since']``
+      + ``context['strategic_local_runner_required']``): SAFETY self-heal. A hold
+      older than ``strategic_local_hold_timeout_seconds`` (default 900s / 15 min)
+      is NOT failed — instead the local-required pin is cleared and the task is
+      returned to normal dispatch so it **falls back to CLOUD** and the project
+      keeps making progress. This fixes "opened the workbench and left → project
+      frozen": an abandoned session with a dead/absent runner recovers within the
+      short lease window instead of failing tasks for 6h. The operator is still
+      alerted, but at INFO/degraded severity (a graceful fallback, not a failure).
+
+    Returns the number of tasks terminally FAILED (compute holds only); Strategic
+    cloud-fallbacks are counted separately in the log line but are not failures.
     """
     from app.alert_dispatch import _maybe_create_failure_alert
     from app.failure_classification import (
@@ -1514,7 +1591,10 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     )
     from app.routers.agent_status import record_task_result
 
-    cutoff = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS)
+    now = _utcnow()
+    compute_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS)
+    strategic_timeout = _strategic_local_hold_timeout_seconds()
+    strategic_cutoff = now - timedelta(seconds=strategic_timeout)
     # JSON-path predicates differ across dialects (Postgres prod vs SQLite tests),
     # so select QUEUED tasks and filter the context stamp / payload type in
     # Python — the candidate set is tiny (only require-local projects ever stamp).
@@ -1525,6 +1605,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
     ).scalars().all()
 
     failed = 0
+    redispatched = 0
     for task in rows:
         ctx = task.context or {}
         task_type = str((task.first_payload or {}).get("type") or "")
@@ -1550,22 +1631,63 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         stamped_at = _parse_local_runner_hold_timestamp(stamped)
         if stamped_at is None:
             continue
+        cutoff = strategic_cutoff if is_strategic_hold else compute_cutoff
         if stamped_at > cutoff:
             continue  # within the wait window — keep holding
 
-        hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
         if is_strategic_hold:
+            # CLOUD FALLBACK (self-heal): drop the hard-local pin and hand the
+            # task back to normal dispatch so it provisions in the cloud. Once
+            # STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY is cleared,
+            # _task_requires_strategic_local_runner() is False, so the dispatch
+            # loop no longer re-holds it. Stays QUEUED — not FAILED.
+            minutes = max(1, strategic_timeout // 60)
             reason = (
                 f"strategic_local_runner_required: no Strategic-capable local "
-                f"runner became available within {hours}h — operator device "
-                f"offline; bring a Strategic runner online and requeue"
+                f"runner became available within {minutes}m — falling back to "
+                f"cloud dispatch so the project keeps making progress"
             )
-        else:
-            reason = (
-                f"require_local_runner: no self-hosted runner became available "
-                f"within {hours}h — operator hardware offline; bring a runner "
-                f"online and requeue"
+            new_ctx = dict(ctx)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY, None)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+            new_ctx.pop(STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY, None)
+            new_ctx.pop("preferred_runner_target_id", None)
+            new_ctx.pop("runner_target_id", None)
+            task.context = new_ctx
+            task.status = TaskStatus.QUEUED  # explicit: re-enter normal dispatch
+            task.vm_instance_id = None
+            task.vm_provisioned_at = None
+            task.latest_status_message = reason[:500]
+            session.add(task)
+            try:
+                await _create_strategic_local_cloud_fallback_alert(
+                    task, session, reason[:200]
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create Strategic cloud-fallback alert "
+                    "for task %s",
+                    task.id,
+                )
+            logger.info(
+                "[RUNNERS] Strategic local-runner hold expired for task %s "
+                "(type=%s): no live runner within %sm — falling back to cloud "
+                "(held since %s)",
+                task.id,
+                task_type,
+                minutes,
+                stamped,
             )
+            redispatched += 1
+            continue
+
+        # compute_experiment hold — terminal FAIL (no safe cloud fallback).
+        hours = _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS // 3600
+        reason = (
+            f"require_local_runner: no self-hosted runner became available "
+            f"within {hours}h — operator hardware offline; bring a runner "
+            f"online and requeue"
+        )
         task.status = TaskStatus.FAILED
         task.latest_status_message = reason[:500]
         persist_failure_category(task, PROVISION_FAILURE)
@@ -1592,7 +1714,7 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
         )
         failed += 1
 
-    if failed:
+    if failed or redispatched:
         await session.commit()
     return failed
 

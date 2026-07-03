@@ -9,7 +9,9 @@ import {
   LoaderCircle,
   MessageSquare,
   MonitorCog,
+  Play,
   Server,
+  Square,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { StrategicWorkSessionLastCheckIn, StrategicWorkSessionSinceLastCheckIn } from '../strategicStateApi';
@@ -132,6 +134,21 @@ export interface StrategicSessionControlProps {
   lastCheckIn?: StrategicWorkSessionLastCheckIn | null;
   sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null;
   checkingIn?: boolean;
+  /**
+   * Resident-session controls. The container passes `onStartSession` only when
+   * resident sessions are enabled (the `strategic_session_enabled` feature flag)
+   * and keeps `onStopSession` wired unconditionally so a live session can always
+   * be reclaimed. `sessionActive` reflects whether a resident session is
+   * currently live and `sessionStatus` is its status string (`active` or
+   * `ended`), used for the live-status chip. `sessionBusy` disables the button
+   * while a start/stop request is in flight. The Start/Stop affordance only
+   * renders in `continuous` ("Workday") mode.
+   */
+  sessionActive?: boolean;
+  sessionStatus?: string | null;
+  sessionBusy?: boolean;
+  onStartSession?: () => void;
+  onStopSession?: () => void;
   onModeChange?: (mode: StrategicInteractionMode) => void;
   onCheckIn?: () => void;
   onOpenDevices?: () => void;
@@ -629,6 +646,26 @@ function accountSpendDetail(status: StrategicAccountSpendStatus): string | null 
   return parts.length > 0 ? parts.join(' / ') : null;
 }
 
+// Resident-session status vocabulary is intentionally small: the backend emits
+// only `active` and `ended` (plus null/none when there is no session record).
+// Map those to the live-status chip's tone; treat anything unexpected as info.
+function sessionStatusTone(status: string | null | undefined): Tone {
+  const value = normalizedStatus(status);
+  if (value === 'active') return 'success';
+  if (value === 'ended') return 'neutral';
+  return 'info';
+}
+
+// The chip only renders for a live (`active`) session, but map the full backend
+// vocabulary (`active`, `ended`, null/none) explicitly so the label is accurate.
+function sessionStatusLabel(status: string | null | undefined): string {
+  const value = normalizedStatus(status);
+  if (value === 'ended') return 'Ended';
+  if (value === 'active') return 'Active';
+  const trimmed = cleanText(status);
+  return trimmed ? humanizeStatus(value) : 'Active';
+}
+
 function StatusDot({ tone }: { tone: Tone }) {
   return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${toneClasses[tone].dot}`} aria-hidden="true" />;
 }
@@ -645,6 +682,11 @@ export function StrategicSessionControl({
   lastCheckIn = null,
   sinceLastCheckIn = null,
   checkingIn = false,
+  sessionActive = false,
+  sessionStatus = null,
+  sessionBusy = false,
+  onStartSession,
+  onStopSession,
   onModeChange,
   onCheckIn,
   onOpenDevices,
@@ -663,6 +705,15 @@ export function StrategicSessionControl({
   const accountSpendOpenLabel = onOpenAccounts ? 'Open accounts' : 'Open spend';
   const checkInSummary = checkInDetail(lastCheckIn, sinceLastCheckIn);
   const checkInChanges = checkInChangeCount(sinceLastCheckIn);
+
+  // Resident session Start/Stop affordance: only meaningful in the "Workday"
+  // (continuous) mode, and only when the container has wired the callbacks (it
+  // passes them when resident sessions are enabled) or a session is already live.
+  const showSessionControl = selectedMode === 'continuous' && (
+    Boolean(onStartSession) || Boolean(onStopSession) || sessionActive
+  );
+  const sessionTone = sessionStatusTone(sessionStatus);
+  const sessionLabel = sessionStatusLabel(sessionStatus);
 
   const runner = runnerStatus
     ? (() => {
@@ -733,6 +784,62 @@ export function StrategicSessionControl({
       </div>
 
       <div className={`${compact ? 'flex flex-row items-center justify-end gap-1' : 'flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end'}`}>
+        {showSessionControl && (
+          sessionActive ? (
+            <>
+              <span
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                } ${toneClasses[sessionTone].border} ${toneClasses[sessionTone].bg}`}
+                role="status"
+                aria-label={`Resident Strategic session: ${sessionLabel}`}
+                title={`Resident Strategic session: ${sessionLabel}`}
+              >
+                <InfinityIcon className={`h-3.5 w-3.5 shrink-0 ${toneClasses[sessionTone].icon}`} aria-hidden="true" />
+                <StatusDot tone={sessionTone} />
+                <span className={`truncate text-xs font-semibold ${toneClasses[sessionTone].text} ${compact ? 'sr-only' : ''}`}>
+                  {sessionLabel}
+                </span>
+              </span>
+              <button
+                type="button"
+                onClick={onStopSession}
+                disabled={!onStopSession || sessionBusy}
+                className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-red-500/30 bg-red-500/10 text-left transition-colors hover:border-red-400/50 hover:bg-red-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+                  compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
+                }`}
+                aria-label="Stop resident Strategic session"
+                title="Stop resident Strategic session"
+              >
+                {sessionBusy ? (
+                  <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-red-300" aria-hidden="true" />
+                ) : (
+                  <Square className="h-3.5 w-3.5 shrink-0 text-red-400" aria-hidden="true" />
+                )}
+                <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-red-300'}>Stop</span>
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              onClick={onStartSession}
+              disabled={!onStartSession || sessionBusy}
+              className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 text-left transition-colors hover:border-emerald-400/50 hover:bg-emerald-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+                compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
+              }`}
+              aria-label="Start resident Strategic session"
+              title="Start resident Strategic session"
+            >
+              {sessionBusy ? (
+                <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300" aria-hidden="true" />
+              ) : (
+                <Play className="h-3.5 w-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
+              )}
+              <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-emerald-300'}>Start session</span>
+            </button>
+          )
+        )}
+
         {saving && (
           <span
             className={`inline-flex min-w-0 items-center gap-2 rounded border border-cyan-500/25 bg-neutral-950/70 font-mono text-ui-sm font-semibold uppercase text-cyan-300 ${

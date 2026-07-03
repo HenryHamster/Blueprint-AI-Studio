@@ -473,6 +473,72 @@ def test_operator_workbench_contract_fixture_is_current():
     assert _operator_workbench_fixture() == build_operator_workbench_contract_fixture()
 
 
+def test_continuation_marker_honors_renewal_reason():
+    """The continuation marker's FRESHNESS anchor (last_seen_at) advances only on
+    a genuine renewal (truthy renewal_reason); a None reason is a liveness-only
+    touch that records updated_at but preserves the prior freshness anchor — the
+    dead-man's switch depends on freshness tracking real progress/interaction,
+    not mere liveness (finding: dead renewal_reason)."""
+    from app.workbench_state import (
+        STRATEGIC_LOCAL_CONTINUATION_KEY,
+        apply_strategic_local_continuation_marker,
+    )
+
+    old = "2020-01-01T00:00:00"
+
+    # Truthy reason ('strategic_progress') bumps freshness to ~now.
+    vision = {
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {
+            "version": 1,
+            "active": True,
+            "operator_user_id": "op-1",
+            "owner_session_started_at": "s-1",
+            "updated_at": old,
+            "last_seen_at": old,
+        }
+    }
+    apply_strategic_local_continuation_marker(
+        vision,
+        {
+            "interaction_mode": "continuous",
+            "session_started_at": "s-1",
+            "last_interaction_at": old,
+        },
+        operator_user_id="op-1",
+        renewal_reason="strategic_progress",
+    )
+    bumped = vision[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert bumped["last_seen_at"] != old  # freshness advanced
+    assert bumped["last_renewal_reason"] == "strategic_progress"
+
+    # None reason = liveness-only: updated_at advances but the freshness anchor is
+    # preserved, even though the workbench carries a fresh last_interaction_at
+    # (the exact case that used to spuriously renew and pin authority forever).
+    vision2 = {
+        STRATEGIC_LOCAL_CONTINUATION_KEY: {
+            "version": 1,
+            "active": True,
+            "operator_user_id": "op-1",
+            "owner_session_started_at": "s-1",
+            "updated_at": old,
+            "last_seen_at": old,
+        }
+    }
+    apply_strategic_local_continuation_marker(
+        vision2,
+        {
+            "interaction_mode": "continuous",
+            "session_started_at": "s-1",
+            "last_interaction_at": "2099-01-01T00:00:00",
+        },
+        operator_user_id="op-1",
+        renewal_reason=None,
+    )
+    touched = vision2[STRATEGIC_LOCAL_CONTINUATION_KEY]
+    assert touched["last_seen_at"] == old  # freshness NOT advanced
+    assert touched["updated_at"] != old  # liveness WAS recorded
+
+
 def test_operator_workbench_fixture_attention_has_more_matches_counts():
     fixture_attention = _operator_workbench_fixture()["strategic_state_response"][
         "attention"

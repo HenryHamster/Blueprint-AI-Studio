@@ -19,9 +19,11 @@ from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
     STRATEGIC_KIND_RUNNING_UPDATE,
+    STRATEGIC_SESSION,
     STRATEGIC_UPDATED,
     emit_strategic_cycle_completed,
     emit_strategic_cycle_started,
+    emit_strategic_session_delta,
     emit_strategic_updated,
 )
 
@@ -50,6 +52,102 @@ def test_event_name_contract_is_stable():
     assert STRATEGIC_KIND_DIRECTIONS == "directions"
     assert STRATEGIC_KIND_RUNNING_UPDATE == "running_update"
     assert STRATEGIC_KIND_PROBLEM_MODEL == "problem_model"
+    # Resident-session transcript event — also a frontend contract (useLogViewer).
+    assert STRATEGIC_SESSION == "strategic_session"
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_routes_and_shapes_payload():
+    project_id = uuid.uuid4()
+    task_id = uuid.uuid4()
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            project_id,
+            {
+                "session_id": "sess-1",
+                "task_id": task_id,
+                "seq": 7,
+                "kind": "reasoning",
+                "text": "Weighing the two directions.",
+                "ts": "2026-07-02T00:00:00+00:00",
+            },
+        )
+
+    mock_bcast.assert_awaited_once()
+    assert mock_bcast.await_args.args[:2] == (str(project_id), "strategic_session")
+    payload = mock_bcast.await_args.args[2]
+    assert payload == {
+        "session_id": "sess-1",
+        "task_id": str(task_id),
+        "seq": 7,
+        "kind": "reasoning",
+        "text": "Weighing the two directions.",
+        "ts": "2026-07-02T00:00:00+00:00",
+    }
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_normalizes_unknown_kind_to_status():
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            uuid.uuid4(), {"kind": "bogus", "text": "hi", "seq": "3"}
+        )
+    payload = mock_bcast.await_args.args[2]
+    assert payload["kind"] == "status"
+    assert payload["seq"] == 3  # coerced from str
+    # ts is generated when absent — a valid ISO-8601 UTC timestamp.
+    from datetime import datetime, timedelta
+
+    parsed = datetime.fromisoformat(payload["ts"])
+    assert parsed.tzinfo is not None
+    assert parsed.utcoffset() == timedelta(0)
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_sanitizes_secret_in_text():
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            uuid.uuid4(),
+            {"kind": "tool", "text": "cloned with ghp_abcdef123456789 token"},
+        )
+    text = mock_bcast.await_args.args[2]["text"]
+    assert "ghp_abcdef123456789" not in text
+    assert "ghp_***" in text
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_trims_oversized_text_under_notify_ceiling():
+    import json
+
+    captured = {}
+
+    async def _capture(pid, event, data):
+        captured["data"] = data
+
+    with patch.object(se, "broadcast_to_project", new=_capture):
+        await emit_strategic_session_delta(
+            uuid.uuid4(),
+            {"kind": "message", "text": "x" * 40_000, "seq": 1},
+        )
+    data = captured["data"]
+    assert len(json.dumps(data).encode("utf-8")) <= se._NOTIFY_PAYLOAD_SOFT_LIMIT
+    assert data["text"].endswith("…")
+    # Still a substantial (non-empty) chunk survived the trim.
+    assert len(data["text"]) > 100
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_handles_missing_and_none_fields():
+    """Missing text / kind / ids degrade gracefully (empty text, status kind)."""
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(uuid.uuid4(), {})
+    payload = mock_bcast.await_args.args[2]
+    assert payload["kind"] == "status"
+    assert payload["text"] == ""
+    assert payload["seq"] == 0
+    assert payload["session_id"] is None
+    assert payload["task_id"] is None
+    assert isinstance(payload["ts"], str) and payload["ts"]
 
 
 @pytest.mark.asyncio
