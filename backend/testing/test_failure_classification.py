@@ -3864,19 +3864,34 @@ class TestCiInfraFlakeLogSignatures:
     doomed code-fix task — the #12492 incident, where a postgres:15 pull blip and
     an npm ci timeout blocked the promotion with zero real regression."""
 
-    def test_postgres_and_npm_setup_flakes_are_infra(self):
+    def test_postgres_setup_flakes_are_infra(self):
         from app.failure_classification import _is_ci_infra_flake_log
 
         for log in (
             "::error::could not pull postgres:15 from Docker Hub or mirror.gcr.io",
             "::error::PostgreSQL did not become ready",
-            "::warning::postgres:15 pull failed (attempt 2/3) — backing off",
-            "::error::npm ci failed after 3 attempts",
             # Pre-existing signatures still classify.
             "npm error network request failed",
             "toomanyrequests: you have reached your pull rate limit",
         ):
             assert _is_ci_infra_flake_log(log), log
+
+    def test_ambiguous_setup_signatures_are_not_infra(self):
+        """Signatures that can accompany a REAL, code-fixable failure must NOT be
+        classified as infra (dropped after review):
+          - "pull failed (attempt" is a per-attempt breadcrumb emitted even when
+            the pull RECOVERS on retry, co-mingled with real pytest output.
+          - "npm ci failed after" fires on a deterministic lockfile mismatch as
+            readily as on a registry outage.
+        Misrouting either to infra would defeat the self-heal (doomed re-qualify
+        loop) instead of spawning the fix."""
+        from app.failure_classification import _is_ci_infra_flake_log
+
+        for log in (
+            "::warning::postgres:15 pull failed (attempt 2/3) — backing off",
+            "::error::npm ci failed after 3 attempts",
+        ):
+            assert not _is_ci_infra_flake_log(log), log
 
     def test_real_test_failures_are_not_infra(self):
         from app.failure_classification import _is_ci_infra_flake_log

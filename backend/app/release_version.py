@@ -786,16 +786,33 @@ def summarize_qualification_state(
                 result["ci_state"] = promo.get("ci_state")
             return result
         if isinstance(promo, dict):
-            armed = promo.get("auto_merge_enabled")
-            summary = (
-                "Audit PASSED; a promotion PR is open and auto-merge is "
-                f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
-                "auditing' — the audit already cleared. Watch the promotion "
-                "PR's CI: if it goes red the version bounces back to "
-                "stabilize and needs a fresh qualify on a synced candidate."
-            )
+            # A bare CLAIM (``claiming`` with no ``pr_number``) is written
+            # under-lock by promote() before its GitHub I/O so a concurrent
+            # re-qualify can't clobber the in-flight promotion — there is NO PR
+            # yet.  Report that honestly rather than as "a promotion PR is open".
+            _is_claim = bool(promo.get("claiming")) and not promo.get("pr_number")
+            if _is_claim:
+                summary = (
+                    "Audit PASSED; a promotion is STARTING — promote() is cutting "
+                    "the release branch and opening the PR (no PR number yet). "
+                    "This is NOT 'still auditing' and is NOT a stuck promotion; it "
+                    "resolves within the promotion I/O window and re-qualification "
+                    "is blocked until then."
+                )
+            else:
+                armed = promo.get("auto_merge_enabled")
+                summary = (
+                    "Audit PASSED; a promotion PR is open and auto-merge is "
+                    f"{'armed' if armed else 'not confirmed'}. This is NOT 'still "
+                    "auditing' — the audit already cleared. Watch the promotion "
+                    "PR's CI: if it goes red the version bounces back to "
+                    "stabilize and needs a fresh qualify on a synced candidate."
+                )
             freshness = _promotion_in_flight_freshness(promo)
-            if freshness:
+            # Skip the auto-timeout messaging for a bare claim: its GC bound is
+            # the short claim timeout, not the 24h cap _promotion_in_flight_
+            # freshness reports, so that text would misstate the deadline.
+            if freshness and not _is_claim:
                 age_str = _humanize_seconds(freshness["promotion_age_seconds"])
                 cap_str = _humanize_seconds(freshness["promotion_timeout_seconds"])
                 summary += f" In flight ~{age_str} (auto-timeout cap {cap_str})."

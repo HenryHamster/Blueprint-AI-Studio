@@ -113,6 +113,17 @@ def apply_operator_build_config_overrides(
         detected["promotion_ci_selfheal_enabled"] = existing[
             "promotion_ci_selfheal_enabled"
         ]
+    # Per-project promotion rubric override (threshold/weights) and smoketest
+    # opt-in are operator-owned and never emitted by repo detection; carry an
+    # explicit choice forward so a manual re-detect / empty-config auto-refresh
+    # does not silently revert the project to the fleet rubric (Fix 5).
+    for _promo_key in (
+        "promotion_threshold",
+        "promotion_weights",
+        "smoketest_enabled",
+    ):
+        if _promo_key in existing:
+            detected[_promo_key] = existing[_promo_key]
     # Per-project parallelism overrides are operator-owned and never emitted
     # by repo detection; carry them forward so re-detect does not silently
     # lift a deliberate throttle (see schemas.BuildConfig).

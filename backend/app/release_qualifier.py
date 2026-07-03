@@ -391,6 +391,10 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
 # A project's per-project promotion threshold is clamped to this floor so a
 # project can never set a near-zero bar that silently disables its own gate.
 _SAFE_PROMOTION_THRESHOLD_FLOOR = 0.5
+# The audit dimension must carry real weight in any per-project rubric.
+# compute_composite only hard-blocks a MISSING audit, so a rubric that zeroes the
+# audit weight would let a terrible-but-present audit promote — reject it.
+_MIN_AUDIT_WEIGHT = 0.2
 
 
 def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
@@ -425,6 +429,12 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
                 raise ValueError(
                     f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
                 )
+            if weights["audit"] < _MIN_AUDIT_WEIGHT:
+                raise ValueError(
+                    f"build_config promotion_weights audit={weights['audit']:.3f} "
+                    f"below the {_MIN_AUDIT_WEIGHT} floor — the audit dimension "
+                    f"must carry real weight"
+                )
         else:
             weights = dict(_DEFAULT_POLICY["weights"])
         threshold = (
@@ -454,10 +464,23 @@ def _resolve_policy_with_provenance(
     whether the active rubric came from the project's build_config, runtime config,
     the YAML file, or the hardcoded defaults after a YAML failure.
     """
-    from_build_config = _policy_from_build_config(project)
-    if from_build_config is not None:
-        return from_build_config, "build_config", None
+    fleet_policy, fleet_source, fleet_error = _resolve_fleet_policy_with_provenance()
+    overrides = _policy_from_build_config(project)
+    if overrides is not None:
+        # Overlay ONLY the per-project threshold/weights onto the fleet policy so
+        # fleet-only keys (e.g. merge_grade_block_threshold) are PRESERVED — a
+        # per-project bar must not silently disarm the merge-grade goal-coverage
+        # blocker that the runtime_config / yaml tiers carry.
+        merged = dict(fleet_policy)
+        merged["weights"] = overrides["weights"]
+        merged["threshold"] = overrides["threshold"]
+        return merged, "build_config", fleet_error
+    return fleet_policy, fleet_source, fleet_error
 
+
+def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
+    """Resolve the FLEET promotion rubric (no per-project override): live
+    ``runtime_config`` → ``promotion_policy.yaml`` → hardcoded defaults."""
     from_config = _policy_from_runtime_config()
     if from_config is not None:
         return from_config, "runtime_config", None
@@ -1552,9 +1575,26 @@ async def run_qualification(
     #     (Henry, 2026-07-02).  Fail-open: list_repo_tree_paths_at_ref returns
     #     None on any error, so candidate_diff_hash is None → no reuse, the
     #     SHA-keyed cache path applies unchanged.
-    candidate_diff_hash = compute_audited_surface_hash(
-        await github.list_repo_tree_paths_at_ref(
-            token, owner, repo, candidate_sha, project_id=str(project_id)
+    #
+    #     Skip the tree call entirely when a SAME-SHA conclusive verdict already
+    #     stands: Guard 3 will serve that from the SHA cache and never reach the
+    #     cross-SHA reuse branch, so the hash (needed only for cross-SHA reuse +
+    #     storage on a fresh spawn) would be a wasted API call every strategic
+    #     cycle a version sits not_promoted.  The pre-lock read may be stale; a
+    #     wrong skip only forgoes reuse (candidate_diff_hash=None → fail-open),
+    #     never causes a wrong reuse.
+    _pre_lock_qual = version.last_qualification or {}
+    _same_sha_conclusive = (
+        _pre_lock_qual.get("status") in _CONCLUSIVE_VERDICT_STATUSES
+        and _pre_lock_qual.get("candidate_sha") == candidate_sha
+    )
+    candidate_diff_hash = (
+        None
+        if _same_sha_conclusive
+        else compute_audited_surface_hash(
+            await github.list_repo_tree_paths_at_ref(
+                token, owner, repo, candidate_sha, project_id=str(project_id)
+            )
         )
     )
 
@@ -1695,11 +1735,24 @@ async def run_qualification(
     # audit.  This is the "fixing CI / regenerating a snapshot must not re-run the
     # whole qualification" lever; it never wedges a not_promoted (real findings
     # are app-code, so fixing them changes the hash and re-audits).
+    # Content-hash reuse is valid ONLY for verdicts whose outcome is determined
+    # by the audited surface.  A CI-blocked not_promoted is NOT such a verdict:
+    # CI depends on the excluded .github/ workflow files plus the live CI state,
+    # neither captured by the audited-surface hash.  If a CI-blocked verdict were
+    # reused across SHAs, fixing ci.yml (an EXCLUDED file) would advance HEAD
+    # without changing the hash → the version would be permanently wedged
+    # not_promoted even though CI is now green (the exact "operator fixes CI"
+    # case).  So exclude CI-blocked verdicts from cross-SHA reuse; the same-SHA
+    # SHA-keyed path (with its ci_unresolved recovery exception) still applies.
+    _prior_ci_blocked = prior_status == "not_promoted" and prior_qual.get(
+        "blocker"
+    ) in ("ci_unresolved", "ci_not_green")
     _prior_diff_hash = prior_qual.get("candidate_diff_hash")
     _same_audited_surface = bool(
         candidate_diff_hash
         and _prior_diff_hash
         and candidate_diff_hash == _prior_diff_hash
+        and not _prior_ci_blocked
     )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES

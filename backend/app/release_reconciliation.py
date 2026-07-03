@@ -93,15 +93,20 @@ logger = logging.getLogger(__name__)
 _PROMOTION_PENDING_TIMEOUT_SECONDS_DEFAULT = 24 * 3600
 # A bare promotion CLAIM (``promotion_pending`` carrying ``claiming`` with no
 # ``pr_number`` yet) is written under-lock by promote() immediately before it
-# releases the row lock for its 30-120s of GitHub I/O, so a concurrent
-# re-qualify cannot clobber the in-flight promotion.  Its entire legitimate
-# lifetime is that I/O window; a claim older than this bound means promote()
-# crashed between claiming and opening the PR, so the reaper GCs it far sooner
-# than the 24h cap a real open-PR promotion inherits.  This is strict-dominance
-# behavior (an orphaned pre-PR claim is always garbage), not a tunable — but the
-# 24h resolver still governs a real stranded PR.  10 min is comfortably beyond
-# any real promote() I/O and well under the 24h cap.
-_PROMOTION_CLAIM_TIMEOUT_SECONDS = 10 * 60
+# releases the row lock for its GitHub I/O, so a concurrent re-qualify cannot
+# clobber the in-flight promotion.  IMPORTANT: on the straight-through success
+# path promote() writes NO intermediate pr_number record — it goes claim →
+# create_branch → create_pull_request → merge → _record_promotion_success — so
+# the DB shows a bare claim for the ENTIRE promote() I/O, not merely between
+# claiming and opening the PR.  This bound must therefore sit safely ABOVE the
+# worst-case whole-I/O duration (nominally 30-120s, but GitHub secondary
+# rate-limit Retry-After backoff can stack across ~6 calls), or the reaper would
+# tear down a LIVE, slow promotion and REOPEN the clobber race this claim closes.
+# 30 min is far beyond any realistic promote() I/O yet far below the 24h cap a
+# real open-PR promotion inherits, so a genuinely crash-orphaned claim is still
+# GC'd promptly.  DO NOT lower this toward the "PR opens in seconds" figure — the
+# bare-claim window is the WHOLE I/O, not the pre-PR sliver.
+_PROMOTION_CLAIM_TIMEOUT_SECONDS = 30 * 60
 _MANAGED_CHECK_WAIT_SNAPSHOT_DETAIL_LIMIT = 10
 _MANAGED_CHECK_WAIT_DETAIL_TEXT_LIMIT = 160
 # Number of consecutive sweeps where CI is red due to only transient conclusions
@@ -2860,10 +2865,10 @@ async def _reconcile_if_promotion_pending_timed_out(
             if _is_bare_claim:
                 logger.warning(
                     "[RELEASE_QUALIFIER] reconcile promotion_claim_abandoned: v%d "
-                    "held a bare promotion claim %.0fs (> %.0fs cap) with no PR — "
-                    "promote() crashed between claiming the promotion and opening "
-                    "the PR; clearing the claim so the version returns to "
-                    "stabilize and re-qualifies",
+                    "held a bare promotion claim %.0fs (> %.0fs cap) with no PR "
+                    "recorded — promote() crashed somewhere in its promotion I/O "
+                    "(branch/PR/merge) before recording a terminal state; clearing "
+                    "the claim so the version returns to stabilize and re-qualifies",
                     version.version_number,
                     age_seconds,
                     cap_seconds,
@@ -2871,9 +2876,9 @@ async def _reconcile_if_promotion_pending_timed_out(
                 _timeout_error = "promotion_claim_abandoned"
                 _timeout_detail = (
                     f"bare promotion claim stranded {age_seconds:.0f}s "
-                    f"(> {cap_seconds:.0f}s cap) with no PR opened — promote() "
-                    f"crashed mid-claim; cleared so the version retries "
-                    f"qualification"
+                    f"(> {cap_seconds:.0f}s cap) with no PR recorded — promote() "
+                    f"crashed mid-I/O before a terminal state; cleared so the "
+                    f"version retries qualification"
                 )
             else:
                 logger.warning(

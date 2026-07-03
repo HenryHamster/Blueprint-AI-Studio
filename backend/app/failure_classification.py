@@ -477,16 +477,20 @@ _CI_INFRA_LOG_PATTERNS: tuple[str, ...] = (
     # from Docker Hub; a registry blip / rate-limit outlasts the pull retries and
     # surfaces as these harness-emitted lines — the pytest step then never runs,
     # so it is NOT fixable by a code change (the #12492 promotion-gate incident,
-    # where two shards died here and blocked the whole promotion).  These strings
-    # are emitted only by the workflow's own setup step, never by test output, so
-    # they carry no false-positive risk against legitimate connection-refused tests.
+    # where two shards died here and blocked the whole promotion).  postgres:15 is
+    # a fixed public tag (a pull failure is essentially always transient) and
+    # readiness is a service-container health issue, not app code — negligible
+    # false-positive risk against legitimate connection-refused tests.
+    #
+    # Deliberately NOT matched (review, 2026-07-02): "pull failed (attempt" is a
+    # PER-ATTEMPT breadcrumb the retry loop emits even when the pull RECOVERS on
+    # attempt 2/3, and it co-mingles with real pytest output in the same shard log
+    # — it could mask a genuine regression.  "npm ci failed after" fires on a
+    # DETERMINISTIC package.json/lockfile mismatch as readily as on a registry
+    # outage (the retry wrapper can't tell them apart), so classifying it as infra
+    # would convert a self-healing lockfile fix into a doomed re-qualify loop.
     "could not pull postgres",
     "postgresql did not become ready",
-    "pull failed (attempt",
-    # npm ci exhausted its retries in the setup step (agent / frontend jobs) — the
-    # harness logs this exact line before failing; a code change cannot fix a
-    # registry outage.
-    "npm ci failed after",
 )
 
 

@@ -1044,6 +1044,21 @@ class BuildConfig(BaseModel):
     block_degraded_unverified_merge: bool = False
     # Read by ci_resolution.should_block_no_test_unverified_merge.
     block_no_test_unverified_merge: bool = False
+    # Per-project promotion rubric override (Fix 5, 2026-07-02). A project may
+    # legitimately promote at a different bar than Blueprint's trusted self-
+    # improvement core (e.g. an external research/witness repo). When set, these
+    # override the fleet-global promotion_threshold / promotion_weights;
+    # absent (None) means "use the fleet rubric". Resolved by
+    # release_qualifier._policy_from_build_config, which CLAMPS the threshold to a
+    # safety floor and ignores weights that don't sum ~1.0. Declared here (NOT
+    # extra-ignored) so they survive ``model_dump`` round-trips on every
+    # save/PATCH/re-detect — otherwise the override would be silently stripped and
+    # never persist. Carried across re-detect by apply_operator_build_config_overrides.
+    promotion_threshold: float | None = Field(None, ge=0.0, le=1.0)
+    promotion_weights: dict[str, float] | None = None
+    # Per-project smoketest opt-in (a project may or may not have a smoke suite).
+    # None means "use the fleet-global smoketest_enabled runtime flag".
+    smoketest_enabled: bool | None = None
     # Per-project alembic versions directory path. None means "use the project default".
     # NOTE: this single string feeds only the backend-side migration-file guard;
     # it is NOT the agent's full layout resolver — see ``migration`` below.

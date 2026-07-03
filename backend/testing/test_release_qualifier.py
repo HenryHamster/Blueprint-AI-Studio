@@ -705,6 +705,84 @@ class TestPolicyFromBuildConfig:
         assert rq._policy_from_build_config(self._proj(None)) is None
         assert rq._policy_from_build_config(None) is None
 
+    def test_audit_weight_floor_rejects(self):
+        # A rubric that zeroes/near-zeroes the audit dimension is rejected —
+        # compute_composite only hard-blocks a MISSING audit, so a near-zero audit
+        # weight would let a terrible-but-present audit promote.
+        proj = self._proj(
+            {
+                "promotion_weights": {
+                    "audit": 0.1,
+                    "test_erosion": 0.45,
+                    "smoketest": 0.45,
+                }
+            }
+        )
+        assert rq._policy_from_build_config(proj) is None
+
+    def test_build_config_schema_persists_promotion_keys(self):
+        # The review's HIGH finding: the keys must be DECLARED fields on the
+        # BuildConfig schema, or model_dump (run on every save/PATCH/re-detect)
+        # silently strips them and the override never persists.
+        from app.schemas import BuildConfig
+
+        dumped = BuildConfig(
+            promotion_threshold=0.75,
+            promotion_weights={"audit": 0.5, "test_erosion": 0.3, "smoketest": 0.2},
+            smoketest_enabled=True,
+        ).model_dump(exclude_none=True)
+        assert dumped["promotion_threshold"] == 0.75
+        assert dumped["promotion_weights"] == {
+            "audit": 0.5,
+            "test_erosion": 0.3,
+            "smoketest": 0.2,
+        }
+        assert dumped["smoketest_enabled"] is True
+
+    def test_redetect_preserves_promotion_keys(self):
+        # A fresh re-detect can't recover these operator-owned keys, so
+        # apply_operator_build_config_overrides must carry them forward or an
+        # unrelated re-detect silently reverts the project to the fleet rubric.
+        from app.build_config_detection import apply_operator_build_config_overrides
+
+        existing = {
+            "promotion_threshold": 0.7,
+            "promotion_weights": {"audit": 0.5, "test_erosion": 0.3, "smoketest": 0.2},
+            "smoketest_enabled": True,
+        }
+        merged = apply_operator_build_config_overrides({}, existing)
+        assert merged["promotion_threshold"] == 0.7
+        assert merged["promotion_weights"] == {
+            "audit": 0.5,
+            "test_erosion": 0.3,
+            "smoketest": 0.2,
+        }
+        assert merged["smoketest_enabled"] is True
+
+    def test_override_preserves_merge_grade_block_threshold(self, mocker):
+        # A per-project threshold override must NOT drop fleet-only keys like
+        # merge_grade_block_threshold (which arms the goal-coverage blocker) —
+        # the override overlays the fleet policy, it does not replace it.
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": {
+                    "audit": 0.4,
+                    "test_erosion": 0.3,
+                    "smoketest": 0.3,
+                },
+                "merge_grade_block_threshold": 0.5,
+            },
+            clear=False,
+        )
+        proj = self._proj({"promotion_threshold": 0.75})
+        policy, source, _ = rq._resolve_policy_with_provenance(proj)
+        assert source == "build_config"
+        assert policy["threshold"] == pytest.approx(0.75)
+        # Inherited from the fleet policy, not dropped by the override.
+        assert policy.get("merge_grade_block_threshold") == pytest.approx(0.5)
+
 
 class TestLoadPolicy:
     def test_parses_real_policy_file(self, mocker):
@@ -7171,6 +7249,85 @@ async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocke
         .all()
     )
     assert len(list(tasks)) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_ci_blocked_not_promoted_not_reused_cross_sha(
+    db_session, mocker
+):
+    """Content-hash reuse must NOT fire for a CI-BLOCKED not_promoted verdict.
+
+    CI depends on the EXCLUDED .github/ workflow files plus the live CI state,
+    neither captured by the audited-surface hash — so fixing ci.yml advances HEAD
+    without changing the hash. If reuse fired, the version would be permanently
+    wedged not_promoted even though CI is now green (the review's HIGH finding).
+    A fresh qualification must run instead."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "ciblokd0" * 5
+    new_sha = "cifixed0" * 5  # HEAD advanced after a ci.yml fix (excluded from hash)
+    version.last_qualification = {
+        "status": "not_promoted",
+        "blocker": "ci_not_green",
+        "candidate_sha": old_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": False,
+        "confidence": 0.55,
+        "threshold": 0.90,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=new_sha))
+    # CI is now GREEN (the .github/ fix worked).
+    mocker.patch(
+        "app.github.get_check_runs_cached",
+        new=AsyncMock(return_value={"conclusion": "success"}),
+    )
+    # Same audited surface (only the excluded ci.yml changed).
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            ]
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Must NOT reuse the stale CI-blocked verdict — a fresh qualification runs.
+    assert result["status"] != "cached_verdict"
+    assert result["status"] == "spawned"
 
 
 async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
