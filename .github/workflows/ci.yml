@@ -430,12 +430,19 @@ jobs:
           # docker run re-pulls and dies). mirror.gcr.io is Google's public
           # pull-through cache of Docker Hub's library images; it rides a
           # different network path, so we fall back to it and retag to
-          # postgres:15 (docker run below is then unchanged).
+          # postgres:15 (docker run below is then unchanged). public.ecr.aws is
+          # AWS ECR Public's rate-limit-free mirror of the Docker library on a
+          # THIRD network path — #12492 hard-failed when BOTH Docker Hub and
+          # mirror.gcr.io were down at once, so a third independent source (plus
+          # one extra retry) closes that window.
           ok=
-          for src in postgres:15 mirror.gcr.io/library/postgres:15; do
-            for i in 1 2 3; do
+          for src in \
+            postgres:15 \
+            mirror.gcr.io/library/postgres:15 \
+            public.ecr.aws/docker/library/postgres:15; do
+            for i in 1 2 3 4; do
               docker pull "$src" && { ok=1; break; }
-              echo "::warning::$src pull failed (attempt $i/3) — backing off"
+              echo "::warning::$src pull failed (attempt $i/4) — backing off"
               sleep $((i * 10))
             done
             if [ -n "$ok" ]; then
@@ -444,7 +451,7 @@ jobs:
             fi
           done
           if [ -z "$ok" ]; then
-            echo "::error::could not pull postgres:15 from Docker Hub or mirror.gcr.io"
+            echo "::error::could not pull postgres:15 from Docker Hub, mirror.gcr.io, or public.ecr.aws"
             exit 1
           fi
           docker run -d --name postgres --network host \
