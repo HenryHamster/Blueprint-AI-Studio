@@ -195,7 +195,6 @@ from app.release_scoring import (
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
-    compute_reproducible_audit_score,
     evaluate_merge_grade,
     is_contentless_goal,
 )
@@ -396,6 +395,9 @@ _SAFE_PROMOTION_THRESHOLD_FLOOR = 0.5
 # compute_composite only hard-blocks a MISSING audit, so a rubric that zeroes the
 # audit weight would let a terrible-but-present audit promote — reject it.
 _MIN_AUDIT_WEIGHT = 0.2
+# Margin by which the threshold is clamped above (1 - audit_weight) so a
+# zero-audit candidate strictly fails the composite (audit can always veto).
+_AUDIT_VETO_MARGIN = 0.05
 
 
 def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | None:
@@ -443,7 +445,19 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
             if threshold_raw is not None
             else float(_DEFAULT_POLICY["threshold"])
         )
-        threshold = max(threshold, _SAFE_PROMOTION_THRESHOLD_FLOOR)
+        # Audit-veto coupling (round-2 review finding B): the audit-weight floor
+        # and the threshold floor are independent, so at their joint minimum
+        # (audit_weight=0.2, threshold=0.5) a candidate with a PRESENT-but-terrible
+        # audit (score 0.0 — no audit_missing hard block) still promotes
+        # (0.2·0 + test_erosion + smoketest = 0.8 ≥ 0.5).  A zero-audit candidate
+        # scores at most (1 − audit_weight), so CLAMP the threshold up to strictly
+        # exceed that — the audit dimension can then ALWAYS veto a promotion, for
+        # any per-project weights.  (Clamping up rather than rejecting keeps the
+        # override usable; it only ever makes the gate stricter.)
+        _audit_veto_floor = 1.0 - weights["audit"] + _AUDIT_VETO_MARGIN
+        threshold = max(
+            threshold, _SAFE_PROMOTION_THRESHOLD_FLOOR, _audit_veto_floor
+        )
         return {"weights": weights, "threshold": threshold}
     except Exception as exc:  # noqa: BLE001 — a bad per-project override falls through
         logger.warning(
@@ -1736,24 +1750,24 @@ async def run_qualification(
     # audit.  This is the "fixing CI / regenerating a snapshot must not re-run the
     # whole qualification" lever; it never wedges a not_promoted (real findings
     # are app-code, so fixing them changes the hash and re-audits).
-    # Content-hash reuse is valid ONLY for verdicts whose outcome is determined
-    # by the audited surface.  A CI-blocked not_promoted is NOT such a verdict:
-    # CI depends on the excluded .github/ workflow files plus the live CI state,
-    # neither captured by the audited-surface hash.  If a CI-blocked verdict were
-    # reused across SHAs, fixing ci.yml (an EXCLUDED file) would advance HEAD
-    # without changing the hash → the version would be permanently wedged
-    # not_promoted even though CI is now green (the exact "operator fixes CI"
-    # case).  So exclude CI-blocked verdicts from cross-SHA reuse; the same-SHA
-    # SHA-keyed path (with its ci_unresolved recovery exception) still applies.
-    _prior_ci_blocked = prior_status == "not_promoted" and prior_qual.get(
-        "blocker"
-    ) in ("ci_unresolved", "ci_not_green")
+    # Content-hash CROSS-SHA reuse is valid ONLY for a verdict whose outcome is
+    # fully determined by the AUDITED SURFACE.  That holds for promoted / dry_run
+    # (a would-promote decision driven by audit + test-erosion), but NOT for
+    # not_promoted: a not_promoted can be blocked on state OUTSIDE the audited-
+    # surface hash — CI (.github/), operator criterion attestation, live
+    # migration-apply drift, an operator-lowered merge-grade threshold — any of
+    # which is fixable WITHOUT changing the hash.  Reusing such a verdict across
+    # SHAs would wedge the version not_promoted even after the real fix lands
+    # (round-2 review finding A, generalizing the CI-only wedge round 1 found).
+    # So restrict cross-SHA reuse to non-not_promoted conclusive verdicts; a
+    # not_promoted only reuses on the SAME SHA, so its externally-determined
+    # blocker is re-evaluated on any HEAD advance.
     _prior_diff_hash = prior_qual.get("candidate_diff_hash")
     _same_audited_surface = bool(
         candidate_diff_hash
         and _prior_diff_hash
         and candidate_diff_hash == _prior_diff_hash
-        and not _prior_ci_blocked
+        and prior_status != "not_promoted"
     )
     if (
         prior_status in _CONCLUSIVE_VERDICT_STATUSES
@@ -3492,20 +3506,7 @@ async def _finalize_qualification(
             return await _handle_infra_failure(session, version, qual, _challenge_hold)
 
     # Score using the reconciled report (refuted findings removed when challenge ran).
-    # test_erosion_score stays the deterministic git-diff signal from _score_audit.
-    # The audit sub-score is recomputed reproducibly over challenger-CONFIRMED
-    # findings only, anchored by the LLM's holistic self-score — this removes the
-    # uncertain/unbound-finding run-to-run variance that swung the gating audit
-    # score 0.33<->0.92 on the same candidate.  compute_composite is unchanged; it
-    # just receives a stable audit_score.  _compute_audit_reconciliation
-    # (model_reported_score / findings_derived_score) is still computed below for
-    # observability on the verdict record.
-    _, test_erosion_score = _score_audit(_audit_report_scored)
-    audit_score = compute_reproducible_audit_score(
-        _audit_report_scored,
-        challenge_verdicts,
-        candidate_sha=candidate_sha,
-    )
+    audit_score, test_erosion_score = _score_audit(_audit_report_scored)
     # Carry the confirmed (actionable) findings into last_qualification so the
     # strategic agent can target them.  Use reconciled report when available so
     # refuted findings are not surfaced as actionable blockers.

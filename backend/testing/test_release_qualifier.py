@@ -681,10 +681,33 @@ class TestPolicyFromBuildConfig:
         assert rq._load_policy(proj)["threshold"] == pytest.approx(0.75)
 
     def test_threshold_clamped_to_floor(self):
-        # A project cannot set a near-zero bar that silently disables its gate.
+        # A project cannot set a near-zero bar. With default weights (audit 0.4)
+        # the threshold clamps up to the audit-veto floor (1 - audit_weight +
+        # margin), which sits above the plain 0.5 safety floor.
         proj = self._proj({"promotion_threshold": 0.2})
         policy = rq._load_policy(proj)
-        assert policy["threshold"] == pytest.approx(rq._SAFE_PROMOTION_THRESHOLD_FLOOR)
+        expected = max(
+            rq._SAFE_PROMOTION_THRESHOLD_FLOOR,
+            1.0 - rq._DEFAULT_POLICY["weights"]["audit"] + rq._AUDIT_VETO_MARGIN,
+        )
+        assert policy["threshold"] == pytest.approx(expected)
+        assert policy["threshold"] >= rq._SAFE_PROMOTION_THRESHOLD_FLOOR
+
+    def test_audit_can_always_veto(self):
+        # Finding B: the audit-weight floor and threshold floor are independent,
+        # so at their joint minimum a zero-audit candidate could promote. The
+        # threshold clamp must guarantee that a present-but-terrible (0.0) audit
+        # always fails: a 0-audit candidate scores at most (1 - audit_weight), so
+        # the clamped threshold must strictly exceed that for any rubric.
+        for weights in (
+            {"audit": 0.2, "test_erosion": 0.4, "smoketest": 0.4},
+            {"audit": 0.5, "test_erosion": 0.25, "smoketest": 0.25},
+        ):
+            proj = self._proj(
+                {"promotion_threshold": 0.5, "promotion_weights": weights}
+            )
+            policy = rq._load_policy(proj)
+            assert policy["threshold"] > 1.0 - weights["audit"]
 
     def test_threshold_only_uses_default_weights(self):
         proj = self._proj({"promotion_threshold": 0.85})
@@ -7170,11 +7193,12 @@ class TestComputeAuditedSurfaceHash:
 
 @pytest.mark.asyncio
 async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocker):
-    """Content-hash reuse: when automain HEAD advances to a NEW commit whose
-    audited surface is byte-identical to a prior conclusive candidate (differs
-    only in an excluded fixture), run_qualification reuses that verdict instead
-    of re-auditing — fixing CI / regenerating a snapshot must not re-run the
-    whole qualification."""
+    """Content-hash cross-SHA reuse for a non-not_promoted verdict: when automain
+    HEAD advances to a NEW commit whose audited surface is byte-identical to a
+    prior dry_run candidate (differs only in an excluded fixture),
+    run_qualification reuses that verdict instead of re-auditing. Cross-SHA reuse
+    is restricted to promoted/dry_run (whose outcome IS determined by the audited
+    surface); not_promoted is excluded (it can be blocked on external state)."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     surface_hash = rq.compute_audited_surface_hash(
@@ -7193,11 +7217,11 @@ async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocke
     old_sha = "oldshaaa" * 5
     new_sha = "newshaaa" * 5  # HEAD advanced to a different commit
     version.last_qualification = {
-        "status": "not_promoted",
+        "status": "dry_run",
         "candidate_sha": old_sha,
         "candidate_diff_hash": surface_hash,
         "ci_green": True,
-        "confidence": 0.82,
+        "confidence": 0.95,
         "threshold": 0.90,
         "started_at": "2026-05-19T00:00:00",
         "finalized_at": "2026-05-19T00:05:00",
@@ -7237,7 +7261,7 @@ async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocke
     await db_session.commit()
 
     assert result["status"] == "cached_verdict"
-    assert result["cached_verdict_status"] == "not_promoted"
+    assert result["cached_verdict_status"] == "dry_run"
     await db_session.refresh(version)
     # No re-audit: attempts unchanged and no child tasks spawned.
     assert version.qualification_attempts == attempts_before
@@ -7255,13 +7279,15 @@ async def test_run_qualification_content_hash_reuse_across_sha(db_session, mocke
 async def test_run_qualification_ci_blocked_not_promoted_not_reused_cross_sha(
     db_session, mocker
 ):
-    """Content-hash reuse must NOT fire for a CI-BLOCKED not_promoted verdict.
+    """Content-hash cross-SHA reuse must NOT fire for a not_promoted verdict.
 
-    CI depends on the EXCLUDED .github/ workflow files plus the live CI state,
-    neither captured by the audited-surface hash — so fixing ci.yml advances HEAD
-    without changing the hash. If reuse fired, the version would be permanently
-    wedged not_promoted even though CI is now green (the review's HIGH finding).
-    A fresh qualification must run instead."""
+    A not_promoted can be blocked on state OUTSIDE the audited-surface hash — CI
+    (.github/), operator criterion attestation, migration-apply drift, an
+    operator-lowered merge-grade threshold — all fixable without changing the
+    hash. Reusing such a verdict cross-SHA would wedge the version not_promoted
+    even after the real fix lands (round-2 review finding A; the CI blocker here
+    is one instance). A fresh qualification must run instead — verified via a
+    CI-blocked not_promoted whose CI is now green on a same-surface new SHA."""
     project, version = await _make_project_and_version(db_session, phase="stabilize")
 
     surface_hash = rq.compute_audited_surface_hash(
@@ -11218,16 +11244,12 @@ async def test_finalize_refuted_finding_excluded_and_recorded(db_session, mocker
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Refuted finding does not deduct; the reproducible audit sub-score falls
-    # back to the model's holistic self-score (0.85) — not an inflated 1.0.
-    # audit = min(model_reported_score, 1 - Σ confirmed_deductions); the
-    # refutation leaves no confirmed findings, so nothing deducts, but the score
-    # is still capped at the model's own 0.85 assessment → dry_run passes.
+    # Refuted finding must not reduce the audit score → clean 1.0 → dry_run passes.
     assert result["status"] == "dry_run"
     await db_session.refresh(version)
     lq = version.last_qualification
-    # No confirmed deduction → audit == model_reported_score (0.85).
-    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01)
+    # No deduction applied (finding refuted) → audit score is 1.0.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01)
     # Refuted finding recorded in challenger_refuted_audit_findings.
     refuted = lq.get("challenger_refuted_audit_findings", [])
     assert len(refuted) == 1
@@ -11254,11 +11276,8 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
 
     A run with one unverified-primary drop AND one challenger-refuted finding must
     show each in its own count; neither may appear in the other.  Furthermore,
-    the applied audit sub-score is the reproducible model-anchored value
-    (min(model_reported_score, 1 - Σ confirmed_deductions)): with no CONFIRMED
-    findings left it equals the model's self-score (0.70), which is below the
-    0.90 threshold → not_promoted.  findings_derived_score stays in the record
-    for OBSERVABILITY and is no longer required to equal the applied score.
+    findings_derived_score in the reconciliation record must agree with the applied
+    audit sub-score (no contradiction visible to an operator reading the record).
     """
     from app import shared_state
 
@@ -11321,12 +11340,7 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # model_reported_score is 0.70 and the refutation leaves no confirmed
-    # findings, so the reproducible audit sub-score is min(0.70, 1.0) = 0.70 →
-    # composite falls below the 0.90 threshold → not_promoted.  The scored record
-    # (sub_scores, audit_reconciliation, challenge_binding_record) is written for
-    # not_promoted exactly as for dry_run, so the count assertions below hold.
-    assert result["status"] == "not_promoted"
+    assert result["status"] == "dry_run"
     await db_session.refresh(version)
     lq = version.last_qualification
 
@@ -11345,24 +11359,17 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
         == 2
     )
 
-    # 4. The applied audit sub-score is the reproducible model-anchored value:
-    #    audit = min(model_reported_score, 1 - Σ confirmed_deductions).  The
-    #    challenge refuted the only verified finding and the other finding is
-    #    unverified (never confirmed), so there are NO confirmed deductions → the
-    #    applied score equals the model's holistic self-score (0.70).
+    # 4. findings_derived_score agrees with the applied audit sub-score.
+    #    Only the unverified finding is left after challenge removes the verified one;
+    #    the unverified finding also passes through _score_audit untouched (it has no
+    #    verification_note so it is silently skipped) → derived score is 1.0.
     applied_audit = lq["sub_scores"]["audit"]
-    assert applied_audit == pytest.approx(0.70, abs=0.01)
-    assert applied_audit == pytest.approx(
-        recon["model_reported_score"], abs=0.01
-    ), (
-        f"applied audit sub-score {applied_audit} must equal the model-reported "
-        f"anchor {recon['model_reported_score']} when nothing is confirmed"
+    assert recon["findings_derived_score"] == pytest.approx(applied_audit, abs=0.01), (
+        f"findings_derived_score {recon['findings_derived_score']} disagrees with "
+        f"applied audit sub-score {applied_audit}"
     )
-    # findings_derived_score stays computed for OBSERVABILITY (the old punitive
-    # metric); it is intentionally NO LONGER required to equal the applied score.
-    # The lone remaining finding is unverified, so it is silently skipped and the
-    # derived score reads 1.0 — deliberately diverging from the applied 0.70.
-    assert recon["findings_derived_score"] == pytest.approx(1.0, abs=0.01)
+    # The refuted verified high finding no longer deducts → audit score is 1.0.
+    assert applied_audit == pytest.approx(1.0, abs=0.01)
 
     # 5. Binding record is persisted alongside audit_reconciliation and contains
     #    the refuted entry with verdict + summary fields.
@@ -11455,12 +11462,9 @@ async def test_challenger_refuted_finding_excluded_from_audit_score(db_session, 
     Fail-closed companion: when the challenge is absent, the deduction stands.
 
     Part 1 — refuted path: audit reports one verified HIGH finding; the
-    independent challenge marks it refuted_false_positive.  The refutation
-    removes the deduction, so the reproducible audit sub-score falls back to the
-    model's holistic self-score (0.85) — NOT an inflated 1.0
-    (audit = min(model_reported_score, 1 - Σ confirmed_deductions)) — and the
-    finding must appear in challenger_refuted_audit_findings with its auditable
-    reason.
+    independent challenge marks it refuted_false_positive.  The audit sub-score
+    must be 1.0 (no deduction) and the finding must appear in
+    challenger_refuted_audit_findings with its auditable reason.
 
     Part 2 — fail-closed path: same audit finding, but no challenge artifact
     seeded.  The qualifier must HOLD as infra_failure (audit_challenge_missing)
@@ -11524,14 +11528,10 @@ async def test_challenger_refuted_finding_excluded_from_audit_score(db_session, 
     )
     await db_session.refresh(version)
     lq = version.last_qualification
-    # Refuted finding must NOT deduct → the reproducible audit sub-score falls
-    # back to the model's holistic self-score (0.85), not an inflated 1.0
-    # (audit = min(model_reported_score, 1 - Σ confirmed_deductions); the
-    # refutation leaves no confirmed findings, so nothing deducts, but the score
-    # cannot exceed the model's own 0.85 assessment).
-    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01), (
-        f"Expected audit score 0.85 (model_reported anchor, no confirmed "
-        f"deduction) but got {lq['sub_scores']['audit']}"
+    # Refuted finding must NOT deduct → audit_score is 1.0.
+    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01), (
+        f"Expected audit score 1.0 but got {lq['sub_scores']['audit']} — "
+        "refuted finding should not deduct"
     )
     # Must be recorded in challenger_refuted_audit_findings with auditable reason.
     refuted = lq.get("challenger_refuted_audit_findings", [])
@@ -11795,10 +11795,9 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         db_session,
         project,
         version,
-        # model_reported 0.35 with two challenger-CONFIRMED highs → reproducible
-        # audit = min(0.35, 1 - 0.30) = 0.35; with erosion 1.0 and a half-passing
-        # smoketest the composite lands well under the 0.90 bar (soft-miss path,
-        # no hard blocker).
+        # Three findings derive audit 0.68; with erosion 1.0 and smoketest 0.5
+        # (half-passing), the composite lands at 0.722, under the 0.90
+        # bar and on the soft-miss path.
         audit_logs={
             "audit_score": 0.35,
             "test_erosion": {
@@ -20994,10 +20993,9 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session)
-    # model_reported 0.5 with two challenger-CONFIRMED highs → reproducible audit
-    # = min(0.5, 1 - 0.30) = 0.5; erosion 1.0, half-passing smoketest → composite
-    # well under the 0.90 threshold, but no hard blocker (audit present, no test
-    # deletion, CI green).
+    # 2 high + 1 low findings → derived audit 0.68, erosion 1.0, smoketest 0.5
+    # (half-passing) → composite 0.722, well under the 0.90 threshold, but no
+    # hard blocker (audit present, no test deletion, CI green).
     await _seed_qualification_children(
         db_session,
         project,
