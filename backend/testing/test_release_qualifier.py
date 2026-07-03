@@ -7482,6 +7482,10 @@ async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
         project.id,
         version,
         session_factory=_shared_session_factory(db_session),
+        # The synchronous reuse-promote fires only from the safe sweep re-driver
+        # context (review finding 1); other callers defer. This test exercises the
+        # sweep path.
+        allow_synchronous_reuse_promote=True,
     )
     await db_session.commit()
 
@@ -7500,6 +7504,65 @@ async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
     next_version = await rv.current_open_version(db_session, project.id)
     assert next_version is not None
     assert next_version.version_number == 2
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuse_defers_without_flag(
+    db_session, mocker
+):
+    """Default (allow_synchronous_reuse_promote=False): a promotion_failed +
+    unchanged surface DEFERS the reuse-promote to the sweep re-driver instead of
+    promoting synchronously (review finding 1 — a synchronous promote inside a
+    lock-holding strategic caller could hang on staged-direction activation). It
+    must NOT re-audit (no treadmill) and NOT open a PR here."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha="oldfaild" * 5, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain="fixedsha" * 5)
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}
+            ]
+        ),
+    )
+    create_mock = mocker.patch("app.github.create_pull_request", new=AsyncMock())
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task", new=AsyncMock()
+    )
+
+    # No allow_synchronous_reuse_promote → defer to the sweep.
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert result["status"] == "promotion_failed_reuse_deferred"
+    create_mock.assert_not_called()  # no synchronous promote / PR opened here
+    audit_spawn.assert_not_called()  # and NOT a re-audit either (no treadmill)
+    await db_session.refresh(version)
+    # Version untouched — still promotion_failed, awaiting the sweep's re-drive.
+    assert version.last_qualification["status"] == "promotion_failed"
 
 
 @pytest.mark.asyncio

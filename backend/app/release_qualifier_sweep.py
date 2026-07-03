@@ -840,13 +840,27 @@ async def _redrive_promotion_failed_qualification(
         # re-auditing) runs its DEDICATED promote session on the same factory.
         # In production this is None → AsyncSessionLocal (a genuine second
         # connection); tests inject a shared factory.
+        #
+        # allow_synchronous_reuse_promote=True: this sweep re-driver is the ONLY
+        # safe caller for the synchronous reuse-promote — it runs OUTSIDE any
+        # lock-holding request (redrive_session has no uncommitted version-row
+        # write on this path), so promote()'s nested staged-direction activation
+        # cannot hang on a caller-held Direction lock (review finding 1).  Every
+        # other caller (strategic / admin) defers to this path.
         result = await release_qualifier.run_qualification(
             redrive_session,
             version.project_id,
             version,
             session_factory=session_factory,
+            allow_synchronous_reuse_promote=True,
         )
-        if result and result.get("status") == "spawned":
+        # "spawned" = a fresh audit ran; "reused_audit" = the passing-audit
+        # reuse-promote fired (it committed on its OWN dedicated session).  Both
+        # are forward progress; every other result is a no-op → roll back the
+        # read-only redrive_session.
+        if result and (
+            result.get("status") == "spawned" or result.get("reused_audit")
+        ):
             await redrive_session.commit()
             return True
         await redrive_session.rollback()

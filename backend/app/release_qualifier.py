@@ -1434,6 +1434,7 @@ async def run_qualification(
     version: release_version.ReleaseVersion,
     *,
     session_factory=None,
+    allow_synchronous_reuse_promote: bool = False,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -1698,6 +1699,30 @@ async def run_qualification(
         int(_pre_lock_qual.get("promotion_failure_count") or 0)
         < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
     ):
+        if not allow_synchronous_reuse_promote:
+            # DEFER the reuse-promote to the sweep re-driver (review finding 1).
+            # promote() → _record_promotion_success synchronously activates staged
+            # directions via a nested UPDATE on a SEPARATE connection.  Run from a
+            # caller that holds row locks — notably the STRATEGIC transaction, which
+            # may hold the very Direction/Project rows that UPDATE needs — the
+            # await-suspended caller would hang forever (Postgres can't see the
+            # cross-connection wait cycle, so its deadlock detector never fires).
+            # ONLY the promotion_failed sweep re-driver runs OUTSIDE any lock-holding
+            # request AND re-drives promotion_failed every cycle, so it is the sole
+            # caller that sets allow_synchronous_reuse_promote.  Return a no-op
+            # deferral here (NOT a re-audit — that would re-introduce the treadmill);
+            # the sweep performs the promote safely on its next pass.
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d is promotion_failed with "
+                "an unchanged audited surface — DEFERRING the passing-audit "
+                "reuse-promote to the sweep re-driver (a synchronous promote inside "
+                "this lock-holding caller could hang on staged-direction activation)",
+                version.version_number,
+            )
+            return {
+                "status": "promotion_failed_reuse_deferred",
+                "candidate_sha": candidate_sha,
+            }
         _reuse_result = await _reattempt_promotion_failed_in_dedicated_session(
             version.id,
             candidate_sha,
