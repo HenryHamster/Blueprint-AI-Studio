@@ -12,6 +12,8 @@ vi.mock('../strategicStateApi', () => ({
   createStrategicSessionMessage: vi.fn(),
   checkInStrategicSession: vi.fn(),
   executeStrategicWorkSessionCommand: vi.fn(),
+  startStrategicSession: vi.fn(),
+  stopStrategicSession: vi.fn(),
 }));
 
 // Disable the poller so tests drive fetches via result.current.refresh().
