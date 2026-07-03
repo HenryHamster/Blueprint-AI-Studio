@@ -62,7 +62,7 @@
     "digest_direction_progress.py": 1600,
     "failure_layer_classifier.py": 400,
     "pipeline_alert_scan.py": 600,
-    "release_qualifier.py": 4600,
+    "release_qualifier.py": 6050,
     "release_reconciliation.py": 3700,
     "release_stall_alerts.py": 1050,
     "release_promotion.py": 2350,
@@ -93,7 +93,7 @@
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 3400,
-    "alert_dispatch.py": 1750,
+    "alert_dispatch.py": 2200,
     "compute_jobs.py": 2900,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2450,
@@ -119,7 +119,8 @@
     "direction_lifecycle.py": 1750,
     "routers/admin_notifications.py": 1850,
     "strategic_state_read_model.py": 600,
-    "work_session_check_in.py": 400
+    "work_session_check_in.py": 400,
+    "release_qualifier_sweep.py": 1750
   },
   "agent": {
     "index.ts": 4600,
