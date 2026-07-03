@@ -3857,6 +3857,40 @@ class TestPrereqEscalationClassification:
         )
         assert classify_failure(t) == BLOCKED_PRECONDITION
 
+
+class TestCiInfraFlakeLogSignatures:
+    """The promotion gate's Postgres/npm setup-flake signatures must classify as
+    infra flakes so the harvest self-heals (re-qualify) instead of spawning a
+    doomed code-fix task — the #12492 incident, where a postgres:15 pull blip and
+    an npm ci timeout blocked the promotion with zero real regression."""
+
+    def test_postgres_and_npm_setup_flakes_are_infra(self):
+        from app.failure_classification import _is_ci_infra_flake_log
+
+        for log in (
+            "::error::could not pull postgres:15 from Docker Hub or mirror.gcr.io",
+            "::error::PostgreSQL did not become ready",
+            "::warning::postgres:15 pull failed (attempt 2/3) — backing off",
+            "::error::npm ci failed after 3 attempts",
+            # Pre-existing signatures still classify.
+            "npm error network request failed",
+            "toomanyrequests: you have reached your pull rate limit",
+        ):
+            assert _is_ci_infra_flake_log(log), log
+
+    def test_real_test_failures_are_not_infra(self):
+        from app.failure_classification import _is_ci_infra_flake_log
+
+        # A genuine assertion / collection error must NOT be swallowed as infra —
+        # otherwise a real regression would be re-qualified into promotion.
+        for log in (
+            "E       AssertionError: assert 'open' == 'promoted'",
+            "ModuleNotFoundError: No module named 'app.does_not_exist'",
+            "<pytest crashed or hung; no FAILED summary captured>",
+            "",
+        ):
+            assert not _is_ci_infra_flake_log(log), log
+
     def test_prereq_escalation_is_in_infra_classes(self):
         from app.failure_classification import INFRA_CLASSES
 

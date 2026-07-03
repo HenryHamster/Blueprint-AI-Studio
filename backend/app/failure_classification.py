@@ -472,6 +472,21 @@ _CI_INFRA_LOG_PATTERNS: tuple[str, ...] = (
     "registry unreachable",
     "failed to fetch",
     "getaddrinfo enotfound",
+    # Postgres service-container startup failures (the CI "Start PostgreSQL"
+    # step).  The promotion gate runs 8 backend shards, each pulling postgres:15
+    # from Docker Hub; a registry blip / rate-limit outlasts the pull retries and
+    # surfaces as these harness-emitted lines — the pytest step then never runs,
+    # so it is NOT fixable by a code change (the #12492 promotion-gate incident,
+    # where two shards died here and blocked the whole promotion).  These strings
+    # are emitted only by the workflow's own setup step, never by test output, so
+    # they carry no false-positive risk against legitimate connection-refused tests.
+    "could not pull postgres",
+    "postgresql did not become ready",
+    "pull failed (attempt",
+    # npm ci exhausted its retries in the setup step (agent / frontend jobs) — the
+    # harness logs this exact line before failing; a code change cannot fix a
+    # registry outage.
+    "npm ci failed after",
 )
 
 
