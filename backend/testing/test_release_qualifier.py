@@ -7356,6 +7356,313 @@ async def test_run_qualification_ci_blocked_not_promoted_not_reused_cross_sha(
     assert result["status"] == "spawned"
 
 
+def _promotion_failed_record(
+    *,
+    candidate_sha: str,
+    surface_hash: str,
+    promotion_failure_count: int = 1,
+    confidence: float = 0.96,
+    threshold: float = 0.90,
+):
+    """A representative ``promotion_failed`` last_qualification record.
+
+    A promotion_failed verdict is the PASSING would-promote base_record PLUS the
+    promotion-outcome keys (status/error/promotion_failure_count) — see
+    ``_record_promotion_failure``.  Carries ``candidate_diff_hash`` so the
+    passing-audit reuse gate can compare it to the live audited surface.
+    """
+    return {
+        "status": "promotion_failed",
+        "error": "ci_red",
+        "promotion_failure_count": promotion_failure_count,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": surface_hash,
+        "ci_green": True,
+        "ci_resolution": {"state": "green", "ci_green": True},
+        "confidence": confidence,
+        "sub_scores": {"audit": 1.0, "test_erosion": 1.0},
+        "blocker": None,
+        "threshold": threshold,
+        "smoketest_enabled": False,
+        "started_at": "2026-07-01T00:00:00",
+        "finalized_at": "2026-07-01T00:05:00",
+        "migration_safety": "ok",
+        "migration_apply_safety": "ok",
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuses_audit_and_repromotes(
+    db_session, mocker
+):
+    """promotion_failed + UNCHANGED audited surface → RE-PROMOTE without re-audit.
+
+    A promotion_failed verdict ALWAYS means the audit PASSED and only the
+    promotion step failed.  When the harvested fix landed in an EXCLUDED path
+    (here: only the excluded fixture blob changed), the live audited surface is
+    byte-identical to the passing candidate, so run_qualification re-attempts the
+    promotion on the CURRENT candidate WITHOUT re-running the audit — it spawns NO
+    audit child and calls promote() with the composite reconstructed from the
+    passing verdict."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [
+            {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            {
+                "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                "size": 10,
+                "sha": "blobfixtureOLD",
+            },
+        ]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5  # 40-char placeholder — the SHA that failed to promote
+    new_sha = "fixedsha" * 5  # automain advanced after the CI/fixture-only fix
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    attempts_before = version.qualification_attempts
+
+    # automain advanced to new_sha; its tree hashes to the SAME audited surface
+    # (only the EXCLUDED fixture blob changed).
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="postmerg" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+                {
+                    "path": "backend/testing/__fixtures__/websocket_event_inventory_v1.json",
+                    "size": 11,
+                    "sha": "blobfixtureNEW",
+                },
+            ]
+        ),
+    )
+    # promote() GitHub surface.
+    _patch_promote_github_defaults(mocker)
+    mocker.patch("app.github.create_branch", new=_create_branch_mock())
+    mocker.patch(
+        "app.github.create_pull_request",
+        new=AsyncMock(return_value={"number": 91, "html_url": "http://pr/91"}),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        new=AsyncMock(return_value={"merged": True, "message": "Merged"}),
+    )
+    # A reuse must NOT spawn an audit child.
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+    # Isolate the promote — no post-commit strategic re-trigger / conflict recon.
+    mocker.patch(
+        "app.release_qualifier._maybe_reconcile_after_promotion_conflict",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.release_qualifier._maybe_trigger_strategic_after_qualification",
+        new=AsyncMock(),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    # A promotion outcome, NOT "spawned" — the audit was reused.
+    assert result["status"] == "promoted"
+    assert result.get("reused_audit") is True
+    # The CURRENT candidate (the one carrying the fix) was promoted.
+    assert result["promoted_sha"] == "postmerg" * 5
+    # No audit child spawned; qualification_attempts NOT bumped (no fresh spawn).
+    audit_spawn.assert_not_called()
+    merge_mock.assert_awaited()
+    await db_session.refresh(version)
+    assert version.status == "promoted"
+    assert version.qualification_attempts == attempts_before
+    # A fresh open v2 was created — the promotion actually landed.
+    next_version = await rv.current_open_version(db_session, project.id)
+    assert next_version is not None
+    assert next_version.version_number == 2
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_changed_surface_reaudits(
+    db_session, mocker
+):
+    """promotion_failed + CHANGED audited surface → normal re-audit (NO reuse).
+
+    When the fix touched APP CODE (an in-surface blob differs), the audit no
+    longer holds — reusing it would ship un-audited code.  run_qualification must
+    fall through to a fresh qualification (spawns an audit), NOT re-promote."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmainOLD"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5
+    new_sha = "appfixed" * 5  # automain advanced after an APP-CODE fix
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha, surface_hash=surface_hash
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="main0000" * 5),
+    )
+    # The app-code blob changed → the audited surface hash DIFFERS.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmainNEW"},
+            ]
+        ),
+    )
+    # Spy on the reuse chokepoint — it must NOT be reached for a changed surface.
+    reuse_spy = mocker.patch(
+        "app.release_qualifier._reattempt_promotion_failed_in_dedicated_session",
+        new=AsyncMock(),
+    )
+    audit_spawn = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    # A fresh qualification runs — NOT a reuse, NOT a promotion.
+    assert result["status"] == "spawned"
+    assert result.get("reused_audit") is None
+    reuse_spy.assert_not_called()
+    audit_spawn.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_promotion_failed_reuse_capped(db_session, mocker):
+    """promotion_failure_count at the cap → does NOT reuse (no infinite re-promote).
+
+    The circuit breaker caps autonomous promotion attempts.  With the count at
+    ``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS`` the reuse gate must NOT fire even
+    on an UNCHANGED surface — it falls through to the normal path instead of
+    re-promoting a persistently-red candidate forever."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    surface_hash = rq.compute_audited_surface_hash(
+        [{"path": "backend/app/main.py", "size": 100, "sha": "blobmain"}]
+    )
+    assert surface_hash is not None
+
+    old_sha = "oldfaild" * 5
+    new_sha = "cappedsh" * 5
+    version.last_qualification = _promotion_failed_record(
+        candidate_sha=old_sha,
+        surface_hash=surface_hash,
+        # At the cap — the breaker must refuse another autonomous re-promote.
+        promotion_failure_count=rq._MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_sha, main="main0000" * 5),
+    )
+    # SAME audited surface — so ONLY the cap prevents the reuse.
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[
+                {"path": "backend/app/main.py", "size": 100, "sha": "blobmain"},
+            ]
+        ),
+    )
+    reuse_spy = mocker.patch(
+        "app.release_qualifier._reattempt_promotion_failed_in_dedicated_session",
+        new=AsyncMock(),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+
+    result = await rq.run_qualification(
+        db_session,
+        project.id,
+        version,
+        session_factory=_shared_session_factory(db_session),
+    )
+    await db_session.commit()
+
+    # The cap blocks the reuse — the chokepoint is never reached, and no
+    # promotion happened.
+    reuse_spy.assert_not_called()
+    assert result.get("reused_audit") is None
+    assert result["status"] != "promoted"
+    await db_session.refresh(version)
+    assert version.status == "open"
+
+
 async def test_run_qualification_cached_not_promoted_same_sha_is_noop(
     db_session, mocker
 ):

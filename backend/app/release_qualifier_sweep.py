@@ -835,8 +835,16 @@ async def _redrive_promotion_failed_qualification(
         if not readiness.get("requalification_ready"):
             return False
 
+        # Thread session_factory so run_qualification's passing-audit reuse
+        # (promotion_failed + unchanged audited surface → re-promote WITHOUT
+        # re-auditing) runs its DEDICATED promote session on the same factory.
+        # In production this is None → AsyncSessionLocal (a genuine second
+        # connection); tests inject a shared factory.
         result = await release_qualifier.run_qualification(
-            redrive_session, version.project_id, version
+            redrive_session,
+            version.project_id,
+            version,
+            session_factory=session_factory,
         )
         if result and result.get("status") == "spawned":
             await redrive_session.commit()

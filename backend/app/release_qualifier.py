@@ -221,6 +221,7 @@ from app.release_qualifier_sweep import (
     # implementations live in release_qualifier_sweep.py; ``_finalize_locked_version``
     # in this module calls the timeout helpers. noqa pins keep a ruff --fix
     # sweep from dropping the re-exports as "unused".
+    _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS,
     _MAX_QUALIFICATION_DURATION_SECONDS,
     _MAX_SWEEP_CRASH_STREAK,  # noqa: F401 — re-exported for tests
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
@@ -330,6 +331,37 @@ def compute_audited_surface_hash(tree_entries: list[dict] | None) -> str | None:
         h.update(sha.encode("utf-8"))
         h.update(b"\n")
     return h.hexdigest()
+
+
+def _promotion_failed_reuse_eligible(
+    qual: dict[str, Any] | None, candidate_diff_hash: str | None
+) -> bool:
+    """True when a ``promotion_failed`` verdict can be re-used to RE-PROMOTE.
+
+    A ``promotion_failed`` verdict ALWAYS means the audit PASSED and only the
+    PROMOTION step failed (PR CI red / staleness / merge) — ``promote()`` is
+    only ever reached from ``_finalize_qualification`` for a would-promote
+    composite.  When the harvested fix landed ENTIRELY in an audit-EXCLUDED path
+    (CI workflow / test fixture / config), the live audited-surface hash is
+    byte-identical to the passing candidate, so that audit verdict still holds:
+    the CURRENT candidate can be re-promoted WITHOUT re-running the ~15min audit
+    (which also re-rolls a non-deterministic score — the v21 treadmill, passed
+    0.9657 → CI-failed → re-qualified 0.6171).  Henry, 2026-07-02.
+
+    Strictly gated (any miss ⇒ fall through to the normal re-audit — a CHANGED
+    surface, i.e. an app-code fix, MUST re-audit): the prior status is
+    ``promotion_failed`` AND the LIVE ``candidate_diff_hash`` is truthy AND it
+    equals the prior verdict's ``candidate_diff_hash``.  The cap
+    (``_MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS``) is enforced separately by the
+    caller so a persistently-red candidate cannot re-promote forever.
+    """
+    if not isinstance(qual, dict):
+        return False
+    if qual.get("status") != "promotion_failed":
+        return False
+    prior_hash = qual.get("candidate_diff_hash")
+    return bool(candidate_diff_hash and prior_hash and candidate_diff_hash == prior_hash)
+
 
 # ---------------------------------------------------------------------------
 # Policy — the trusted core.  weights + threshold come from a human-owned file.
@@ -1400,6 +1432,8 @@ async def run_qualification(
     session: AsyncSession,
     project_id: uuid.UUID,
     version: release_version.ReleaseVersion,
+    *,
+    session_factory=None,
 ) -> dict[str, Any]:
     """Kick off qualification for the open release ``version``.
 
@@ -1632,6 +1666,55 @@ async def run_qualification(
         )
         if _sync_gate is not None:
             return _sync_gate
+
+    # 3c. Passing-audit reuse across a promotion_failed → RE-PROMOTE without
+    #     re-auditing (Henry, 2026-07-02).  A promotion_failed verdict ALWAYS
+    #     means the audit PASSED and only the promotion step failed (PR CI red /
+    #     staleness / merge).  When the harvested fix landed ENTIRELY in an
+    #     audit-EXCLUDED path (CI workflow / test fixture / config), the live
+    #     audited-surface hash equals the passing candidate's, so the audit still
+    #     holds — re-attempt the promotion on the CURRENT candidate (it carries
+    #     the fix; its surface == the passed one by hypothesis) WITHOUT re-running
+    #     the ~15min audit or re-rolling the non-deterministic score (the v21
+    #     treadmill).  Strictly gated: prior status promotion_failed AND the live
+    #     candidate_diff_hash is truthy AND == the prior verdict's hash AND the
+    #     promotion-failure re-qualify cap is NOT exhausted.  ANY miss (a CHANGED
+    #     surface = an app-code fix, or the cap reached) FALLS THROUGH to the
+    #     normal re-audit below — fail-safe.
+    #
+    #     Lock/session discipline (critical): the promote runs in a DEDICATED
+    #     AsyncSessionLocal session, NEVER this caller's — otherwise promote()'s
+    #     intermediate commit (which it issues to free the row lock before its
+    #     30-120s of GitHub I/O) would prematurely commit the caller's unrelated
+    #     dirty work.  This runs BEFORE this function's own FOR UPDATE lock (step
+    #     4 below): the dedicated session must be free to SELECT..FOR UPDATE the
+    #     version row, which this caller has NOT yet locked, so there is no
+    #     self-deadlock.  The dedicated helper re-verifies the gate + cap under
+    #     its OWN row lock (authoritative — the pre-lock read may be stale) and
+    #     reconstructs composite/base_record from the passing fields the
+    #     promotion_failed record carries; a None return (state changed, cap hit,
+    #     candidate already on main, lock contended) falls through to re-audit.
+    if _promotion_failed_reuse_eligible(_pre_lock_qual, candidate_diff_hash) and (
+        int(_pre_lock_qual.get("promotion_failure_count") or 0)
+        < _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+    ):
+        _reuse_result = await _reattempt_promotion_failed_in_dedicated_session(
+            version.id,
+            candidate_sha,
+            candidate_diff_hash,
+            session_factory=session_factory,
+        )
+        if _reuse_result is not None:
+            logger.info(
+                "[RELEASE_QUALIFIER] run_qualification: v%d reused the PASSING "
+                "audit of a promotion_failed candidate (audited surface "
+                "unchanged) and re-attempted promotion on %s WITHOUT "
+                "re-auditing — result=%s",
+                version.version_number,
+                candidate_sha[:8],
+                _reuse_result.get("status"),
+            )
+            return {**_reuse_result, "reused_audit": True}
 
     # 4. Take the ReleaseVersion row lock (audit C3).  The strategic
     #    qualify_request path and the admin POST /qualify endpoint can both
@@ -4434,6 +4517,177 @@ async def _finalize_in_dedicated_session(
     await _maybe_trigger_strategic_after_qualification(
         version_id, result, session_factory=session_factory
     )
+    return result
+
+
+async def _reattempt_promotion_failed_locked(
+    session: AsyncSession,
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str,
+) -> dict[str, Any] | None:
+    """Lock + re-promote a ``promotion_failed`` version on an open dedicated session.
+
+    The body of ``_reattempt_promotion_failed_in_dedicated_session`` (which owns
+    the session + its rollback-on-error contract).  Re-verifies the reuse gate
+    AUTHORITATIVELY under a ``SELECT ... FOR UPDATE`` on the version row (the
+    pre-lock check in ``run_qualification`` may be stale), reconstructs the
+    ``composite`` / ``base_record`` from the PASSING fields the promotion_failed
+    record carries, and re-enters ``promote()`` on the CURRENT ``candidate_sha``
+    WITHOUT re-auditing.  Commits the dedicated session on the promote path
+    (``promote()`` issues its own intermediate commit but the FINAL state write
+    in ``_record_promotion_{success,failure}`` is committed by the caller —
+    mirrors ``_finalize_locked_version``).  Returns the ``promote()`` result, or
+    ``None`` for every no-op guard so ``run_qualification`` falls through to the
+    normal re-audit path.
+    """
+    version: release_version.ReleaseVersion | None = (
+        (
+            await session.execute(
+                select(release_version.ReleaseVersion)
+                .where(release_version.ReleaseVersion.id == version_id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        )
+        .scalars()
+        .first()
+    )
+    if version is None:
+        return None
+    # Only an OPEN, stabilize-phase version can be re-promoted.  A concurrent
+    # finalize/promote may have flipped it to promoted/abandoned or moved it out
+    # of stabilize between the pre-lock read and this lock — bail to re-audit.
+    if version.status != "open" or version.phase != "stabilize":
+        return None
+    qual = version.last_qualification or {}
+    # Authoritative re-verify of the reuse gate under the lock: a concurrent
+    # re-attempt may have already advanced the state (e.g. a new promotion_failed
+    # with a different hash, or a promoted verdict).
+    if not _promotion_failed_reuse_eligible(qual, candidate_diff_hash):
+        return None
+    # Cap re-check under the lock — a concurrent re-attempt may have bumped the
+    # promotion_failure_count to the cap since the pre-lock read.  Never
+    # re-promote a persistently-red candidate forever (mirrors the sweep
+    # re-driver's circuit breaker).
+    if (
+        int(qual.get("promotion_failure_count") or 0)
+        >= _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS
+    ):
+        return None
+
+    # Reconstruct the composite promote() needs (it only reads confidence, for
+    # the PR body) from the passing verdict — do NOT re-score.
+    composite = {
+        "confidence": qual.get("confidence"),
+        "promote": True,
+        "blocker": qual.get("blocker"),
+        "sub_scores": qual.get("sub_scores"),
+    }
+    # Reconstruct base_record from the promotion_failed record, which is exactly
+    # the passing base_record PLUS the promotion-outcome keys.  Strip those
+    # outcome keys, and pin candidate_sha + candidate_diff_hash to the CURRENT
+    # candidate (its audited surface equals the passed one by hypothesis, so the
+    # reused audit findings/scores are valid for it, but the promotion + the
+    # recorded verdict must target the commit that carries the fix).
+    _outcome_keys = {
+        "status",
+        "error",
+        "detail",
+        "conflict",
+        "pr_url",
+        "promotion_pending",
+        "promotion_failure_count",
+        "promotion_loop_escalated",
+    }
+    base_record = {k: v for k, v in qual.items() if k not in _outcome_keys}
+    base_record["candidate_sha"] = candidate_sha
+    base_record["candidate_diff_hash"] = candidate_diff_hash
+
+    result = await promote(
+        session,
+        version,
+        candidate_sha,
+        composite=composite,
+        base_record=base_record,
+    )
+    await session.commit()
+    return result
+
+
+async def _reattempt_promotion_failed_in_dedicated_session(
+    version_id: uuid.UUID,
+    candidate_sha: str,
+    candidate_diff_hash: str,
+    *,
+    session_factory=None,
+) -> dict[str, Any] | None:
+    """Re-attempt promotion of a ``promotion_failed`` version WITHOUT re-auditing.
+
+    The passing-audit-reuse chokepoint for ``run_qualification``'s promotion_failed
+    fast-promote path (Henry, 2026-07-02).  Mirrors
+    ``_finalize_in_dedicated_session``'s discipline exactly:
+
+    **Why a dedicated session.**  ``promote()`` issues an intermediate
+    ``session.commit()`` to release the ``ReleaseVersion`` row lock before its
+    30-120s of GitHub I/O.  ``run_qualification``'s caller session may hold
+    UNRELATED dirty work (the strategic path's post-commit chain); committing it
+    mid-run would destroy that caller's atomicity.  So this opens its OWN session
+    via ``AsyncSessionLocal`` (injectable for tests), whose only dirty state is
+    the qualifier's own promote write.
+
+    **Why it cannot self-deadlock.**  ``run_qualification`` calls this from its
+    PRE-LOCK section — before it takes its own FOR UPDATE on the version row — so
+    the fresh session's ``SELECT ... FOR UPDATE`` never blocks on a lock held by
+    the same logical caller.  The strategic caller's Project lock is
+    ``FOR NO KEY UPDATE`` (``lock_project_then_task``), which does NOT conflict
+    with the ``FOR KEY SHARE`` an ``open_version`` FK-insert takes on the Project
+    row, and the promote chain never UPDATEs the Project row — so the dedicated
+    promote cannot deadlock against a concurrent strategic cycle either.
+
+    **Idempotency / no double-promote.**  Reuses ``promote()``'s existing
+    machinery: the ``_candidate_already_on_main`` ancestry check routes an
+    already-landed candidate straight to success, the Fix-3 under-lock
+    ``promotion_pending`` claim fences concurrent re-qualification, and the
+    ``version.status != "open"`` re-check in ``_record_promotion_{success,failure}``
+    makes an overlapping promote bail.  A repeat failure records ``promotion_failed``
+    and increments ``promotion_failure_count`` exactly as today — the cap
+    eventually stops it.
+
+    Returns the ``promote()`` result dict, or ``None`` when the under-lock
+    re-verify no-oped (so ``run_qualification`` falls through to a normal
+    re-audit).
+    """
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            result = await _reattempt_promotion_failed_locked(
+                session, version_id, candidate_sha, candidate_diff_hash
+            )
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reuse-promote: rollback failed for "
+                    "version %s",
+                    version_id,
+                )
+            raise
+
+    # The dedicated session has now committed + closed.  Run the same post-commit
+    # hooks the finalize path runs (outside the session + row lock, best-effort):
+    # a merge-conflict failure triggers a main → automain reconciliation, and any
+    # resolved outcome re-triggers the strategic agent so it re-plans.  Only when
+    # a promote actually ran (result is not None) — a no-op reuse leaves the
+    # version exactly as it was.
+    if result is not None:
+        await _maybe_reconcile_after_promotion_conflict(
+            version_id, result, session_factory=session_factory
+        )
+        await _maybe_trigger_strategic_after_qualification(
+            version_id, result, session_factory=session_factory
+        )
     return result
 
 
