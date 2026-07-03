@@ -26,9 +26,16 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
   },
 ];
 
+// Distinct backend API base URL: the enroll snippet must point runners here (the
+// orchestrator API), NOT at the admin-UI hosting origin (window.location.origin,
+// which happy-dom serves at http://localhost). Firebase Hosting has no /api/** route,
+// so heartbeats POSTed to the UI origin silently vanish (SPA HTML 200).
+const API_BASE_URL_FIXTURE = 'https://blueprint-orchestrator-xyz.a.run.app';
+
 vi.mock('../api', async () => {
   const { createApiMock } = await import('../test/api-mock-complete');
   return createApiMock({
+    API_BASE_URL: 'https://blueprint-orchestrator-xyz.a.run.app',
     listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
@@ -145,6 +152,36 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('runner-new');
     // Security warning about one-time display
     expect(el.textContent).toContain('shown only once');
+  });
+
+  test('enroll snippet targets the API base URL, not the admin-UI hosting origin', async () => {
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    const el = await mount();
+
+    const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+    await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    // The generated command must set BLUEPRINT_ORCHESTRATOR_URL to the backend API base,
+    // not window.location.origin (the SPA host has no /api/** route → heartbeats vanish).
+    const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
+    const psCopyBtn = el.querySelector('button[title="Copy Windows PowerShell setup snippet"]');
+    expect(shellCopyBtn).not.toBeNull();
+    expect(psCopyBtn).not.toBeNull();
+
+    await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
+    const shellSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
+    expect(shellSnippet).toContain(`BLUEPRINT_ORCHESTRATOR_URL='${API_BASE_URL_FIXTURE}'`);
+    expect(shellSnippet).not.toContain(window.location.origin);
+
+    await act(async () => { (psCopyBtn as HTMLButtonElement).click(); });
+    const psSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
+    expect(psSnippet).toContain(`$env:BLUEPRINT_ORCHESTRATOR_URL = '${API_BASE_URL_FIXTURE}'`);
+    expect(psSnippet).not.toContain(window.location.origin);
   });
 
   test('enrolling a strategic runner sends the strategic preset', async () => {

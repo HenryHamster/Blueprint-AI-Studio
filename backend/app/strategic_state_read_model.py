@@ -21,7 +21,9 @@ from app.models import (
 from app import strategic_cycle
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
+    RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     STRATEGIC_SESSION_ENABLED_SETTING,
+    read_resident_session_blocked_reason,
     resident_session_snapshot,
 )
 from app.task_movement import build_task_movement_explanation
@@ -520,3 +522,80 @@ def _resident_session_available() -> bool:
     a click 403 at the start endpoint.
     """
     return bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
+
+
+def _resident_session_availability(
+    project: Project,
+    *,
+    eligible_live_runner_count: int | None = None,
+) -> Dict[str, Any]:
+    """Legible Workday resident-session state + the reason it isn't running.
+
+    Turns three signals — the ``strategic_session_enabled`` flag, the live
+    session blob, and the recorded ``no_runner`` / ``start_failed`` reason (plus
+    the eligible-live-runner count as a live "is a runner attached" hint) — into
+    a single state the operator UI renders without re-deriving backend rules:
+
+    * ``dark``    — feature flag off (reason ``sessions_disabled``).
+    * ``active``  — a resident session is live.
+    * ``error``   — the last auto-start failed (reason ``start_failed: <msg>``).
+    * ``blocked`` — enabled but can't run: no live local runner
+      (reason ``no_runner``), whether recorded by the last auto-start or inferred
+      from a zero eligible-runner count.
+    * ``ready``   — enabled, a live runner is attached, nothing started yet
+      (entering Workday auto-starts, so this is transient).
+
+    A recorded ``start_failed`` always wins — a real failure is never masked by a
+    runner count. A recorded ``no_runner``, by contrast, is only authoritative
+    while the live count is still 0/unknown: a POSITIVE
+    ``eligible_live_runner_count`` OVERRIDES a stale ``no_runner`` (recorded when
+    the operator entered Workday with no runner, and never cleared — no mode
+    transition re-runs the auto-start hook when a runner later attaches) and
+    reports ``ready`` instead of a phantom "blocked: no runner" with a runner
+    plainly attached.
+    """
+    enabled = bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
+    snapshot = resident_session_snapshot(project.vision)
+    active = bool(
+        isinstance(snapshot, dict)
+        and snapshot.get("status") == "active"
+        and not snapshot.get("stop_requested")
+    )
+    recorded_reason = read_resident_session_blocked_reason(project.vision)
+    recorded_start_failed = bool(
+        recorded_reason
+        and recorded_reason.startswith(RESIDENT_SESSION_REASON_START_FAILED_PREFIX)
+    )
+    has_live_runner = (
+        eligible_live_runner_count is not None and eligible_live_runner_count > 0
+    )
+
+    reason: str | None = None
+    if not enabled:
+        state = "dark"
+        reason = "sessions_disabled"
+    elif active:
+        state = "active"
+    elif recorded_start_failed:
+        # A recorded ``start_failed`` is authoritative and never masked by a live
+        # runner count — the last auto-start genuinely errored.
+        reason = recorded_reason
+        state = "error"
+    elif has_live_runner:
+        # A live runner is plainly attached. A positive count OVERRIDES a stale
+        # recorded ``no_runner`` — it is only authoritative while the live count
+        # is still 0. Nothing has started yet, so this is the transient ``ready``
+        # state (entering Workday auto-starts).
+        state = "ready"
+    elif recorded_reason:
+        # Enabled, no live runner attached, and a (non-``start_failed``) reason —
+        # ``no_runner`` — recorded: still authoritative while the live count is 0
+        # or unknown.
+        reason = recorded_reason
+        state = "blocked"
+    elif eligible_live_runner_count is not None and eligible_live_runner_count <= 0:
+        state = "blocked"
+        reason = "no_runner"
+    else:
+        state = "ready"
+    return {"available": enabled, "state": state, "reason": reason}

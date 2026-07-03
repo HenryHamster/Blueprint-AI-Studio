@@ -43,7 +43,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.database import get_session
+from app.database import AsyncSessionLocal, get_session
 from app.models import Project, ProjectMessage, Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -70,6 +70,20 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 # ``_strategic_workbench`` (per-operator prefs) and ``_strategic_local_continuation``
 # (the lease marker) so the three concerns never clobber one another.
 RESIDENT_SESSION_KEY = "_resident_strategic_session"
+
+# ``Project.vision`` key holding the reason the *last* Workday auto-start was
+# blocked or failed (surfaced by the strategic read model so the operator sees
+# WHY a Workday session isn't running instead of silence). Distinct from
+# ``RESIDENT_SESSION_KEY`` because a failed start compensates its own blob away —
+# the reason must outlive the (absent) session record. Set on a blocked/failed
+# auto-start; cleared on a clean start and on stop.
+RESIDENT_SESSION_REASON_KEY = "_resident_strategic_session_reason"
+
+# Blocked/failed reason codes. ``sessions_disabled`` (flag off) is derived by the
+# read model from the flag itself and never recorded here; these two ARE recorded
+# by the auto-start hook because they are runtime outcomes, not static config.
+RESIDENT_SESSION_REASON_NO_RUNNER = "no_runner"
+RESIDENT_SESSION_REASON_START_FAILED_PREFIX = "start_failed"
 
 # Runtime-config feature flag (default off). Registered by BE-safety in the
 # settings registry; referenced here by name only.
@@ -147,6 +161,102 @@ def read_resident_session(vision: dict[str, Any] | None) -> dict[str, Any] | Non
     """Return the raw session-state blob from ``Project.vision`` (or None)."""
     blob = (vision or {}).get(RESIDENT_SESSION_KEY)
     return blob if isinstance(blob, dict) else None
+
+
+def read_resident_session_blocked_reason(vision: dict[str, Any] | None) -> str | None:
+    """Return the recorded reason the last Workday auto-start was blocked (or None).
+
+    Read-only projection of the ``RESIDENT_SESSION_REASON_KEY`` blob for the
+    strategic read model. Bounded to a short string.
+    """
+    blob = (vision or {}).get(RESIDENT_SESSION_REASON_KEY)
+    if isinstance(blob, dict):
+        reason = blob.get("reason")
+        if isinstance(reason, str) and reason.strip():
+            return reason.strip()[:200]
+    return None
+
+
+def _short_error(exc: BaseException) -> str:
+    """Compact, single-line message for surfacing a failed auto-start reason.
+
+    Prefers an ``HTTPException.detail`` (the actionable cause the start path
+    raises) over the raw ``str(exc)``; falls back to the class name. Bounded.
+    """
+    detail = getattr(exc, "detail", None)
+    text = str(detail) if detail else (str(exc) or exc.__class__.__name__)
+    return " ".join(text.split())[:120]
+
+
+async def set_resident_session_blocked_reason(
+    session: AsyncSession,
+    project: Project,
+    reason: str | None,
+) -> None:
+    """Record (or, when *reason* is None, clear) why a Workday session isn't running.
+
+    Writes the ``RESIDENT_SESSION_REASON_KEY`` blob under a project row lock on the
+    CALLER session (so the identity-mapped ``project`` stays consistent and the
+    same request's read model reflects it), then commits + refreshes. Best-effort:
+    a failure here is logged and swallowed — recording *why* an auto-start was
+    blocked must never itself break the operator's mode switch. A no-op clear
+    (nothing recorded) is skipped so it never churns ``vision``.
+    """
+    if reason is None and read_resident_session_blocked_reason(project.vision) is None:
+        return
+    try:
+        def _apply(vision: dict[str, Any]) -> None:
+            if reason:
+                vision[RESIDENT_SESSION_REASON_KEY] = {
+                    "reason": reason[:200],
+                    "recorded_at": _utcnow().isoformat(),
+                }
+            else:
+                vision.pop(RESIDENT_SESSION_REASON_KEY, None)
+
+        await with_vision_locked(session, project.id, _apply, skip_locked=False)
+        await session.commit()
+        await session.refresh(project)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] failed to %s blocked-reason for project %s",
+            "clear" if reason is None else "record",
+            project.id,
+            exc_info=True,
+        )
+
+
+async def _record_blocked_reason_isolated(
+    project_id: uuid.UUID,
+    reason: str | None,
+    *,
+    session_factory=None,
+) -> None:
+    """Record (or clear) the Workday blocked-reason on a fresh, DEDICATED session.
+
+    Opens its own ``AsyncSessionLocal`` (injectable for tests, the same idiom as
+    ``_release_start_claim``), re-loads the project there, and delegates to
+    ``set_resident_session_blocked_reason``. Isolating the reason write on a fresh
+    connection means it is durably recorded even when the auto-start ran on a
+    now-poisoned session (a Cloud SQL drop / protocol-corruption class failure
+    invalidates that connection), and never touches the operator's request
+    session. Best-effort: any failure is logged and swallowed — recording *why* a
+    Workday auto-start was blocked must never itself break the mode switch.
+    """
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as session:
+            project = await session.get(Project, project_id)
+            if project is None:
+                return
+            await set_resident_session_blocked_reason(session, project, reason)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] isolated blocked-reason %s failed for project %s",
+            "clear" if reason is None else "record",
+            project_id,
+            exc_info=True,
+        )
 
 
 def resident_session_is_active(blob: dict[str, Any] | None) -> bool:
@@ -228,44 +338,58 @@ async def _latest_operator_interaction_at(
 
 
 async def _release_start_claim(
-    session: AsyncSession,
     project_id: uuid.UUID,
     session_id: str,
     spawned_task_id: uuid.UUID | None,
+    *,
+    session_factory=None,
 ) -> None:
     """Compensate a failed start: drop our claim + cancel any task we spawned.
 
-    Runs in a fresh transaction (after the caller rolled back) so a start that
-    fails between the atomic claim commit and the finalize commit never leaves
-    an active-but-taskless session record wedging future starts, nor an
-    untracked (orphaned) ``strategic_review`` task with no ``_resident_session``.
-    Guarded on ``session_id`` so it only ever clears OUR own claim, never a
-    session a concurrent starter legitimately owns.
+    Runs on a DEDICATED, fresh ``AsyncSession``/connection — NEVER the caller's
+    session, which the original in-``try`` failure may have poisoned (a Cloud SQL
+    drop / protocol-corruption class invalidates the connection and leaves the
+    session's async greenlet portal broken; any further op on it — including a
+    fresh pool checkout+pre-ping — then raises ``MissingGreenlet`` and MASKS the
+    real start failure the caller is about to re-raise). Opening its own session
+    via ``AsyncSessionLocal`` (injectable as ``session_factory`` for tests, the
+    same idiom as ``release_qualifier._finalize_in_dedicated_session``) means
+    compensation runs on a clean connection regardless of the caller session's
+    state, so a start that fails between the atomic claim commit and the finalize
+    commit never leaves an active-but-taskless session record wedging future
+    starts, nor an untracked (orphaned) ``strategic_review`` task with no
+    ``_resident_session``. Guarded on ``session_id`` so it only ever clears OUR
+    own claim, never a session a concurrent starter legitimately owns.
+
+    Best-effort: any failure here is logged and swallowed so it never masks the
+    original start failure. The ``async with`` block auto-rolls-back/closes the
+    dedicated session on error.
     """
+    factory = session_factory or AsyncSessionLocal
     try:
+        async with factory() as session:
 
-        def _clear(vision: dict[str, Any]) -> None:
-            current = read_resident_session(vision)
-            if isinstance(current, dict) and str(current.get("session_id")) == str(
-                session_id
-            ):
-                vision.pop(RESIDENT_SESSION_KEY, None)
+            def _clear(vision: dict[str, Any]) -> None:
+                current = read_resident_session(vision)
+                if isinstance(current, dict) and str(
+                    current.get("session_id")
+                ) == str(session_id):
+                    vision.pop(RESIDENT_SESSION_KEY, None)
 
-        await with_vision_locked(session, project_id, _clear, skip_locked=False)
-        if spawned_task_id is not None:
-            task = await session.get(Task, spawned_task_id)
-            if task is not None and task.status in _LIVE_TASK_STATUSES:
-                task.status = TaskStatus.CANCELLED
-                task.latest_status_message = (
-                    "Resident strategic session start failed; "
-                    "cancelling orphaned strategic_review task"
-                )
-                session.add(task)
-        await session.commit()
+            await with_vision_locked(session, project_id, _clear, skip_locked=False)
+            if spawned_task_id is not None:
+                task = await session.get(Task, spawned_task_id)
+                if task is not None and task.status in _LIVE_TASK_STATUSES:
+                    task.status = TaskStatus.CANCELLED
+                    task.latest_status_message = (
+                        "Resident strategic session start failed; "
+                        "cancelling orphaned strategic_review task"
+                    )
+                    session.add(task)
+            await session.commit()
     except Exception:
         # Compensation is best-effort — it must never mask the original start
         # failure the caller is about to re-raise.
-        await session.rollback()
         logger.exception(
             "[RESIDENT_SESSION] compensation failed releasing claim %s (project %s)",
             session_id,
@@ -520,6 +644,7 @@ async def start_resident_session(
     *,
     operator_user_id: str,
     runner_id: str | None = None,
+    session_factory=None,
 ) -> dict[str, Any]:
     """Start (or return the already-running) resident strategic session.
 
@@ -546,6 +671,13 @@ async def start_resident_session(
     A provisional spawn-claim carries ``task_id = None`` until the spawned task
     is finalized. A failure between the claim and the finalize is compensated
     (claim released, any spawned task cancelled) so no orphan / wedge remains.
+
+    ``session_factory`` is the dedicated-session factory the compensation path
+    (``_release_start_claim``) opens its FRESH cleanup session with — it defaults
+    to the real ``AsyncSessionLocal`` and is injectable only so a test can bind
+    compensation to the same engine/connection as its fixture session (the
+    production ``AsyncSessionLocal`` rebinds to a different engine under the
+    Postgres test harness, so a bare fresh session would clean up the wrong DB).
     """
     now = _utcnow()
     now_iso = now.isoformat()
@@ -769,9 +901,34 @@ async def start_resident_session(
             )
             await session.commit()
     except Exception:
-        await session.rollback()
+        # Log the ORIGINAL failure (with traceback) FIRST, before any
+        # compensation — so the true cause is visible next time even if the
+        # caller session is poisoned and its own rollback trips over the dead
+        # connection. Compensation below runs on a FRESH session/connection, so
+        # it can no longer mask this exception (the prior bug: a poisoned-session
+        # rollback inside compensation raised MissingGreenlet on a pool pre-ping
+        # and replaced the real error, leaving a half-initialized session behind).
+        logger.exception(
+            "[RESIDENT_SESSION] start failed for project %s (session %s); "
+            "compensating on a fresh session",
+            project.id,
+            session_id,
+        )
+        # Best-effort caller-session rollback so its connection is returned
+        # cleanly. If the connection was already poisoned this may itself raise;
+        # swallow it — compensation runs on a fresh session regardless, and we
+        # must still re-raise the ORIGINAL failure below, not the rollback error.
+        try:
+            await session.rollback()
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] caller-session rollback failed during start "
+                "compensation for project %s (continuing on a fresh session)",
+                project.id,
+                exc_info=True,
+            )
         await _release_start_claim(
-            session, project.id, session_id, spawned_task_id
+            project.id, session_id, spawned_task_id, session_factory=session_factory
         )
         raise
 
@@ -797,8 +954,20 @@ async def stop_resident_session(
     continuation lease (workbench back to ``chat`` mode pops the marker), and
     drives the resident ``strategic_review`` task to a terminal status so the
     legacy cadence reclaims authority immediately (instant manual reclaim).
+
+    No-op when there is no session-state blob at all: a stop against a project
+    that never ran a session (e.g. the auto-stop on a ``continuous``→non-continuous
+    transition while the feature is dark, or a manual stop with nothing running)
+    must NOT synthesize a phantom ``{session_id: null, status: "ended"}`` record —
+    that would spuriously churn ``Project.vision`` and surface a non-null null-id
+    "ended" session in API responses even though nothing ever started. A dark /
+    never-started feature stays fully inert.
     """
     blob = read_resident_session(project.vision)
+    if blob is None:
+        # Nothing to stop — leave ``Project.vision`` untouched (no synthetic
+        # ended blob, no lease pop, no mode churn) so the feature stays inert.
+        return resident_session_snapshot(project.vision) or {}
     now_iso = _utcnow().isoformat()
     op_id = operator_user_id or (blob or {}).get("operator_user_id")
 
@@ -833,14 +1002,13 @@ async def stop_resident_session(
         # the session blob ended, in one locked read-modify-write.
         vision.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
         current = vision.get(RESIDENT_SESSION_KEY)
-        if isinstance(current, dict):
-            ended = dict(current)
-        else:
-            ended = {
-                "version": 1,
-                "session_id": (blob or {}).get("session_id"),
-                "task_id": task_id,
-            }
+        if not isinstance(current, dict):
+            # The record vanished under us (a concurrent removal after the
+            # pre-lock read) — release the lease but do NOT resurrect a synthetic
+            # null-id ended blob (same phantom-write the top-level ``blob is None``
+            # guard prevents).
+            return
+        ended = dict(current)
         ended["status"] = STATUS_ENDED
         ended["stop_requested"] = True
         ended["ended_at"] = now_iso
@@ -856,6 +1024,183 @@ async def stop_resident_session(
         task_id,
     )
     return resident_session_snapshot(project.vision) or {}
+
+
+async def sync_resident_session_for_interaction_mode(
+    session: AsyncSession,
+    project: Project,
+    *,
+    operator_user_id: str,
+    previous_mode: str | None,
+    new_mode: str | None,
+    session_factory=None,
+) -> dict[str, Any] | None:
+    """Auto start/stop the resident session on an operator ``interaction_mode`` change.
+
+    Workday (``continuous``) is the on-switch. ENTERING it auto-starts the resident
+    session when the ``strategic_session_enabled`` flag is on AND a live, eligible
+    local runner exists (the session runs on the operator's box, not a cloud VM);
+    LEAVING it auto-stops. Called from the mode-change admin endpoint AFTER the
+    workbench state (the mode itself) has already been committed, so this is a
+    best-effort side effect — it NEVER raises and never blocks the mode switch.
+
+    **Session isolation (poison containment).** The auto-start + reason-recording
+    run on FRESH, dedicated ``AsyncSessionLocal`` sessions — NEVER the caller's
+    request ``session`` (mirrors ``_release_start_claim``'s Track-1 idiom). A
+    failed auto-start can invalidate its own connection (the Cloud SQL drop /
+    protocol-corruption class ``start_resident_session`` guards against); running
+    it on the request session would poison it, so the trailing
+    ``get_project_strategic_state`` read the endpoint runs on the SAME session
+    would 5xx a mode change that already committed — violating the "never breaks
+    the mode switch" guarantee, and the blocked-reason would fail to record too.
+    Isolating the work keeps the request session clean; a ``start_failed`` reason
+    is recorded on a session distinct from the (possibly poisoned) start session
+    so it is durably surfaced regardless. The caller's ``session`` is rolled back
+    up front purely to (a) release the shared connection under the single-connection
+    test pool and (b) expire its identity-mapped ``project`` so the trailing read
+    reflects the freshly-committed session blob / reason (``expire_on_commit`` is
+    False in prod, so a cached ``project`` would otherwise read stale).
+
+    **NOTE (follow-up #3 — mode-change latency).** The auto-start is still
+    ``await``-ed inline, so entering Workday delays the HTTP response by the whole
+    spawn/adopt (+ up to three 30s lock waits). It is deliberately NOT moved to a
+    fire-and-forget / FastAPI ``BackgroundTask``: on Cloud Run, CPU is throttled
+    to ~0 once the response is sent, so a ~30s post-response start would be
+    starved/killed and silently never complete, leaving the session wedged in a
+    "starting" limbo with no task. A lossy background start is strictly worse than
+    a slow-but-correct mode switch, so the real fix for #3 is to make the SPAWN
+    fast, not to background a start that may never finish. Tracked as a follow-up.
+
+    Resilience: a blocked/failed auto-start is recorded as a reason the strategic
+    read model surfaces (``no_runner`` / ``start_failed: <msg>``), never a silent
+    no-op or a 5xx. A clean start (or any stop) clears the recorded reason.
+    Returns the session snapshot on a successful auto-start, else None.
+
+    Only the ENTER/LEAVE transitions act; an unrelated workbench save (e.g. a
+    ``selected_refs`` edit that keeps the same mode) is a no-op here.
+    """
+    entered = new_mode == "continuous" and previous_mode != "continuous"
+    left = previous_mode == "continuous" and new_mode != "continuous"
+    if not entered and not left:
+        return None
+
+    if entered and not runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False):
+        # Feature off: the read model derives ``sessions_disabled`` from the flag
+        # itself — nothing to record, nothing to start. Short-circuit BEFORE
+        # touching the caller session or opening any dedicated session.
+        return None
+
+    factory = session_factory or AsyncSessionLocal
+
+    # Release the caller session's transaction / expire its cached ``project`` so
+    # (a) the shared single-connection test pool is free for the dedicated session
+    # below, and (b) the endpoint's trailing read reloads the freshly-committed
+    # state. The mode itself was already committed by the caller, so this discards
+    # nothing. Best-effort: a request session that is somehow unusable here must
+    # still not break the mode switch.
+    try:
+        await session.rollback()
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] caller-session rollback before sync failed for "
+            "project %s (continuing on a dedicated session)",
+            project.id,
+            exc_info=True,
+        )
+
+    try:
+        if entered:
+            return await _auto_start_on_workday_entry(
+                project.id,
+                operator_user_id=operator_user_id,
+                session_factory=factory,
+            )
+
+        # left continuous → auto-stop (hand authority back to the cadence) and
+        # clear any recorded reason, on a dedicated session.
+        try:
+            async with factory() as fresh:
+                fresh_project = await fresh.get(Project, project.id)
+                if fresh_project is not None:
+                    await stop_resident_session(
+                        fresh, fresh_project, operator_user_id=operator_user_id
+                    )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] auto-stop on Workday exit failed for project %s",
+                project.id,
+                exc_info=True,
+            )
+        await _record_blocked_reason_isolated(
+            project.id, None, session_factory=factory
+        )
+        return None
+    except Exception:
+        # Belt-and-suspenders: no part of the auto start/stop path may break the
+        # operator's mode switch (already persisted before this ran).
+        logger.warning(
+            "[RESIDENT_SESSION] sync for interaction_mode change failed for "
+            "project %s",
+            project.id,
+            exc_info=True,
+        )
+        return None
+
+
+async def _auto_start_on_workday_entry(
+    project_id: uuid.UUID,
+    *,
+    operator_user_id: str,
+    session_factory,
+) -> dict[str, Any] | None:
+    """Auto-start the resident session on Workday entry, on a dedicated session.
+
+    Gates on (and pins to) a LIVE, strategic-capable local runner — the same
+    eligibility the manual start path auto-selects with. No runner → record
+    ``no_runner`` and stand down (do NOT dispatch to a cloud VM; Workday runs on
+    the operator's box). The runner-gate + start run on ONE fresh session; a
+    ``start_failed`` reason is recorded on a SEPARATE fresh session because the
+    start session may be poisoned by the failure. Never raises.
+    """
+    try:
+        async with session_factory() as fresh:
+            project = await fresh.get(Project, project_id)
+            if project is None:
+                return None
+            runner_id = await _auto_select_local_runner(fresh, project_id)
+            if runner_id is None:
+                # Healthy session — record the gate reason directly on it.
+                await set_resident_session_blocked_reason(
+                    fresh, project, RESIDENT_SESSION_REASON_NO_RUNNER
+                )
+                return None
+            snapshot = await start_resident_session(
+                fresh,
+                project,
+                operator_user_id=operator_user_id,
+                runner_id=runner_id,
+            )
+            # Started cleanly — drop any stale blocked-reason on the same session.
+            await set_resident_session_blocked_reason(fresh, project, None)
+            return snapshot
+    except Exception as exc:
+        # Track-1 makes start fail fast + clean (real error logged, compensated
+        # on a fresh session, no half-initialized blob left). The dedicated
+        # session above may be poisoned by that failure, so record the surfaced
+        # reason on ANOTHER fresh session and stand down.
+        logger.warning(
+            "[RESIDENT_SESSION] auto-start on Workday entry failed for project "
+            "%s: %s",
+            project_id,
+            exc,
+            exc_info=True,
+        )
+        await _record_blocked_reason_isolated(
+            project_id,
+            f"{RESIDENT_SESSION_REASON_START_FAILED_PREFIX}: {_short_error(exc)}",
+            session_factory=session_factory,
+        )
+        return None
 
 
 async def renew_resident_session_lease(

@@ -46,6 +46,8 @@ interface StrategicContextWorkspaceProps {
   checkingIn?: boolean;
   sessionActive?: boolean;
   sessionStatus?: string | null;
+  sessionState?: string | null;
+  sessionReason?: string | null;
   sessionBusy?: boolean;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -586,6 +588,8 @@ export function StrategicContextWorkspace({
   checkingIn = false,
   sessionActive = false,
   sessionStatus = null,
+  sessionState = null,
+  sessionReason = null,
   sessionBusy = false,
   onStartSession,
   onStopSession,
@@ -774,6 +778,8 @@ export function StrategicContextWorkspace({
                   checkingIn={checkingIn}
                   sessionActive={sessionActive}
                   sessionStatus={sessionStatus}
+                  sessionState={sessionState}
+                  sessionReason={sessionReason}
                   sessionBusy={sessionBusy}
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}

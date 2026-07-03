@@ -456,6 +456,16 @@ export default function App() {
   // endpoint. Stop stays wired unconditionally so an operator can always reclaim.
   const residentStrategicSessionAvailable =
     (selectedStrategicReadModel as { resident_session_available?: boolean } | null)?.resident_session_available === true;
+  // Legible Workday session state + reason (from `resident_session_availability`):
+  // drives the status chip (dark / ready / active / blocked / error) so entering
+  // Workday is enough to go live. Falls back to a flag-derived state for older payloads.
+  const residentStrategicSessionAvailability =
+    (selectedStrategicReadModel as {
+      resident_session_availability?: { available?: boolean; state?: string | null; reason?: string | null } | null;
+    } | null)?.resident_session_availability ?? null;
+  const strategicSessionState = residentStrategicSessionAvailability?.state
+    ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'dark');
+  const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
   const chatComposerContextDescriptor = useMemo(
     () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
@@ -1385,6 +1395,8 @@ export default function App() {
         checkingIn={checkingInStrategicSession}
         sessionActive={strategicSessionActive}
         sessionStatus={strategicSessionStatus}
+        sessionState={strategicSessionState}
+        sessionReason={strategicSessionReason}
         sessionBusy={strategicSessionBusy}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
         onStopSession={handleStopStrategicSession}
@@ -1453,6 +1465,8 @@ export default function App() {
                 checkingIn={checkingInStrategicSession}
                 sessionActive={strategicSessionActive}
                 sessionStatus={strategicSessionStatus}
+                sessionState={strategicSessionState}
+                sessionReason={strategicSessionReason}
                 sessionBusy={strategicSessionBusy}
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}

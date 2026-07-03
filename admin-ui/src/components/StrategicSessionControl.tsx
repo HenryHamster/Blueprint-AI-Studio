@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   CheckCircle2,
   ChevronRight,
   Clock3,
@@ -146,6 +147,20 @@ export interface StrategicSessionControlProps {
    */
   sessionActive?: boolean;
   sessionStatus?: string | null;
+  /**
+   * Legible resident-session state from the read model's
+   * `resident_session_availability`: `dark` (feature off) / `ready` (Workday +
+   * runner live, auto-starting) / `active` / `blocked` (e.g. no runner) /
+   * `error` (last auto-start failed). Drives the status chip in Workday mode so
+   * the operator sees why a session isn't running instead of a bare Start button.
+   */
+  sessionState?: string | null;
+  /**
+   * Reason a Workday session isn't running (`sessions_disabled` / `no_runner` /
+   * `start_failed: <msg>`), shown as the status chip's detail. Always surfaced
+   * when the session can't start.
+   */
+  sessionReason?: string | null;
   sessionBusy?: boolean;
   onStartSession?: () => void;
   onStopSession?: () => void;
@@ -646,17 +661,7 @@ function accountSpendDetail(status: StrategicAccountSpendStatus): string | null 
   return parts.length > 0 ? parts.join(' / ') : null;
 }
 
-// Resident-session status vocabulary is intentionally small: the backend emits
-// only `active` and `ended` (plus null/none when there is no session record).
-// Map those to the live-status chip's tone; treat anything unexpected as info.
-function sessionStatusTone(status: string | null | undefined): Tone {
-  const value = normalizedStatus(status);
-  if (value === 'active') return 'success';
-  if (value === 'ended') return 'neutral';
-  return 'info';
-}
-
-// The chip only renders for a live (`active`) session, but map the full backend
+// The chip renders for a live (`active`) session, but map the full backend
 // vocabulary (`active`, `ended`, null/none) explicitly so the label is accurate.
 function sessionStatusLabel(status: string | null | undefined): string {
   const value = normalizedStatus(status);
@@ -664,6 +669,98 @@ function sessionStatusLabel(status: string | null | undefined): string {
   if (value === 'active') return 'Active';
   const trimmed = cleanText(status);
   return trimmed ? humanizeStatus(value) : 'Active';
+}
+
+// Turn a backend resident-session reason code into operator-readable detail.
+// `start_failed: <msg>` carries the real cause; strip the code prefix and show
+// the message. `no_runner` / `sessions_disabled` map to plain English.
+function humanizeResidentReason(reason: string | null | undefined): string | null {
+  const trimmed = cleanText(reason);
+  if (!trimmed) return null;
+  if (trimmed === 'sessions_disabled') return 'Resident sessions disabled';
+  if (trimmed === 'no_runner') return 'No live local runner';
+  const startFailed = /^start_failed\s*:?\s*(.*)$/i.exec(trimmed);
+  if (startFailed) {
+    const msg = cleanText(startFailed[1]);
+    return msg ? `Start failed: ${msg}` : 'Start failed';
+  }
+  return humanizeStatus(normalizedStatus(trimmed));
+}
+
+interface ResidentSessionView {
+  tone: Tone;
+  Icon: LucideIcon;
+  label: string;
+  detail: string | null;
+  showStop: boolean;
+  showStart: boolean;
+}
+
+// Map the resident-session state (+ reason) to a single legible status chip.
+// Entering Workday auto-starts the session, so the chip — not a Start button —
+// is the primary affordance: `ready` (auto-starting), `active` (runner attached
+// / replying), `blocked`/`error` (with the reason), `dark` (feature off). Stop
+// stays on a live session; Start remains only as an explicit fallback.
+function residentSessionView(
+  state: string | null | undefined,
+  reason: string | null | undefined,
+  sessionActive: boolean,
+  sessionStatus: string | null | undefined,
+  hasStart: boolean,
+  hasStop: boolean,
+): ResidentSessionView {
+  const normalized = normalizedStatus(state);
+  const active = sessionActive || normalized === 'active';
+  const detail = humanizeResidentReason(reason);
+  if (active) {
+    return {
+      tone: 'success',
+      Icon: InfinityIcon,
+      label: sessionStatusLabel(sessionStatus),
+      detail: 'Runner attached / replying',
+      showStop: hasStop,
+      showStart: false,
+    };
+  }
+  if (normalized === 'error') {
+    return {
+      tone: 'danger',
+      Icon: AlertTriangle,
+      label: 'Start failed',
+      detail: detail ?? 'Resident session could not start',
+      showStop: false,
+      showStart: hasStart,
+    };
+  }
+  if (normalized === 'blocked') {
+    return {
+      tone: 'warning',
+      Icon: AlertTriangle,
+      label: 'Not running',
+      detail: detail ?? 'Resident session unavailable',
+      showStop: false,
+      showStart: hasStart,
+    };
+  }
+  if (normalized === 'dark') {
+    return {
+      tone: 'neutral',
+      Icon: InfinityIcon,
+      label: 'Sessions off',
+      detail: detail ?? 'Resident sessions disabled',
+      showStop: false,
+      showStart: false,
+    };
+  }
+  // `ready` (or unknown): Workday on with a live runner, auto-starting on entry.
+  return {
+    tone: 'info',
+    Icon: InfinityIcon,
+    label: 'Ready',
+    detail: 'Starts on Workday entry',
+    showStop: false,
+    showStart: hasStart,
+  };
 }
 
 function StatusDot({ tone }: { tone: Tone }) {
@@ -684,6 +781,8 @@ export function StrategicSessionControl({
   checkingIn = false,
   sessionActive = false,
   sessionStatus = null,
+  sessionState = null,
+  sessionReason = null,
   sessionBusy = false,
   onStartSession,
   onStopSession,
@@ -706,14 +805,26 @@ export function StrategicSessionControl({
   const checkInSummary = checkInDetail(lastCheckIn, sinceLastCheckIn);
   const checkInChanges = checkInChangeCount(sinceLastCheckIn);
 
-  // Resident session Start/Stop affordance: only meaningful in the "Workday"
-  // (continuous) mode, and only when the container has wired the callbacks (it
-  // passes them when resident sessions are enabled) or a session is already live.
-  const showSessionControl = selectedMode === 'continuous' && (
-    Boolean(onStartSession) || Boolean(onStopSession) || sessionActive
+  // Resident session status: only meaningful in the "Workday" (continuous) mode.
+  // Entering Workday is the on-switch (the backend auto-starts the session), so
+  // the primary affordance is a legible status chip — dark / ready / active /
+  // blocked / error — that always shows the reason when it can't start. Stop
+  // stays on a live session; a manual Start remains only as an explicit fallback.
+  // Shown when the container wired session info (callbacks / active / explicit
+  // state); absent that, this stays inert so callers that don't use resident
+  // sessions render exactly as before.
+  const sessionView = residentSessionView(
+    sessionState,
+    sessionReason,
+    sessionActive,
+    sessionStatus,
+    Boolean(onStartSession),
+    Boolean(onStopSession),
   );
-  const sessionTone = sessionStatusTone(sessionStatus);
-  const sessionLabel = sessionStatusLabel(sessionStatus);
+  const showSessionControl = selectedMode === 'continuous' && (
+    Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState))
+  );
+  const SessionIcon = sessionView.Icon;
 
   const runner = runnerStatus
     ? (() => {
@@ -785,22 +896,35 @@ export function StrategicSessionControl({
 
       <div className={`${compact ? 'flex flex-row items-center justify-end gap-1' : 'flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end'}`}>
         {showSessionControl && (
-          sessionActive ? (
-            <>
-              <span
-                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
-                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
-                } ${toneClasses[sessionTone].border} ${toneClasses[sessionTone].bg}`}
-                role="status"
-                aria-label={`Resident Strategic session: ${sessionLabel}`}
-                title={`Resident Strategic session: ${sessionLabel}`}
-              >
-                <InfinityIcon className={`h-3.5 w-3.5 shrink-0 ${toneClasses[sessionTone].icon}`} aria-hidden="true" />
-                <StatusDot tone={sessionTone} />
-                <span className={`truncate text-xs font-semibold ${toneClasses[sessionTone].text} ${compact ? 'sr-only' : ''}`}>
-                  {sessionLabel}
+          <>
+            <span
+              className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border px-2 ${
+                compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+              } ${toneClasses[sessionView.tone].border} ${toneClasses[sessionView.tone].bg}`}
+              role="status"
+              aria-label={`Resident Strategic session: ${sessionView.label}${
+                sessionView.detail ? `, ${sessionView.detail}` : ''
+              }`}
+              title={
+                sessionView.detail
+                  ? `Resident Strategic session: ${sessionView.label} — ${sessionView.detail}`
+                  : `Resident Strategic session: ${sessionView.label}`
+              }
+            >
+              <SessionIcon className={`h-3.5 w-3.5 shrink-0 ${toneClasses[sessionView.tone].icon}`} aria-hidden="true" />
+              <StatusDot tone={sessionView.tone} />
+              {!compact && (
+                <span className="flex min-w-0 flex-col leading-tight">
+                  <span className={`truncate text-xs font-semibold ${toneClasses[sessionView.tone].text}`}>
+                    {sessionView.label}
+                  </span>
+                  {sessionView.detail && (
+                    <span className="truncate text-ui-sm text-neutral-400">{sessionView.detail}</span>
+                  )}
                 </span>
-              </span>
+              )}
+            </span>
+            {sessionView.showStop && (
               <button
                 type="button"
                 onClick={onStopSession}
@@ -818,26 +942,27 @@ export function StrategicSessionControl({
                 )}
                 <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-red-300'}>Stop</span>
               </button>
-            </>
-          ) : (
-            <button
-              type="button"
-              onClick={onStartSession}
-              disabled={!onStartSession || sessionBusy}
-              className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 text-left transition-colors hover:border-emerald-400/50 hover:bg-emerald-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
-                compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
-              }`}
-              aria-label="Start resident Strategic session"
-              title="Start resident Strategic session"
-            >
-              {sessionBusy ? (
-                <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300" aria-hidden="true" />
-              ) : (
-                <Play className="h-3.5 w-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
-              )}
-              <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-emerald-300'}>Start session</span>
-            </button>
-          )
+            )}
+            {sessionView.showStart && (
+              <button
+                type="button"
+                onClick={onStartSession}
+                disabled={!onStartSession || sessionBusy}
+                className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-emerald-500/30 bg-emerald-500/10 text-left transition-colors hover:border-emerald-400/50 hover:bg-emerald-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
+                  compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
+                }`}
+                aria-label="Start resident Strategic session"
+                title="Start resident Strategic session"
+              >
+                {sessionBusy ? (
+                  <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-emerald-300" aria-hidden="true" />
+                ) : (
+                  <Play className="h-3.5 w-3.5 shrink-0 text-emerald-400" aria-hidden="true" />
+                )}
+                <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-emerald-300'}>Start session</span>
+              </button>
+            )}
+          </>
         )}
 
         {saving && (

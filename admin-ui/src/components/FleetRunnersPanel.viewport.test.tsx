@@ -27,6 +27,12 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
 ];
 
 vi.mock('../api', () => ({
+  // FleetRunnersPanel now imports API_BASE_URL for the copy-paste runner
+  // registration snippet; the mock must provide it or the browser-mode ESM
+  // import fails with "does not provide an export named 'API_BASE_URL'".
+  // Empty string mirrors the production default (VITE_API_URL || '') so the
+  // component falls back to window.location.origin, as it does in same-origin dev.
+  API_BASE_URL: '',
   listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
   registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret' })),
   revokeFleetRunner: vi.fn(async () => {}),

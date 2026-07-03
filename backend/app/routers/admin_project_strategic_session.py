@@ -89,6 +89,7 @@ from app.strategic_state_read_model import (
     _is_live_strategic_task,
     _problem_model_summary,
     _resident_session_available,
+    _resident_session_availability,
     _resident_session_summary,
     _running_update_summary,
     _strategic_refresh_summary,
@@ -106,6 +107,7 @@ from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
     start_resident_session,
     stop_resident_session,
+    sync_resident_session_for_interaction_mode,
 )
 
 router = APIRouter(
@@ -1205,6 +1207,20 @@ async def get_project_strategic_state(
         },
         "resident_session": _resident_session_summary(project),
         "resident_session_available": _resident_session_available(),
+        "resident_session_availability": _resident_session_availability(
+            project,
+            eligible_live_runner_count=(
+                int(
+                    (runtime_summary.get("local_runner") or {}).get(
+                        "eligible_live_count"
+                    )
+                    or 0
+                )
+                if isinstance(runtime_summary, dict)
+                and isinstance(runtime_summary.get("local_runner"), dict)
+                else None
+            ),
+        ),
         "running_update": running_update_summary,
         "problem_model": problem_model_summary,
         "directions": directions_summary,
@@ -1275,7 +1291,7 @@ async def upsert_project_strategic_session(
 ):
     """Create or resume a Strategic operator session for an existing project."""
 
-    await _get_user_project_with_role(
+    project = await _get_user_project_with_role(
         project_id,
         current_user["user_id"],
         session,
@@ -1293,6 +1309,19 @@ async def upsert_project_strategic_session(
         current_user["user_id"],
         project_id,
         workbench,
+    )
+
+    # Workday (continuous) is the resident-session on-switch: entering it
+    # auto-starts the resident session (flag on + a live local runner), leaving
+    # it auto-stops. Runs AFTER the mode itself is committed and is fully
+    # resilient — a blocked/failed auto-start records a surfaced reason and never
+    # breaks this mode-change request.
+    await sync_resident_session_for_interaction_mode(
+        session,
+        project,
+        operator_user_id=current_user["user_id"],
+        previous_mode=workbench_write.previous_state.get("interaction_mode"),
+        new_mode=workbench_write.state.get("interaction_mode"),
     )
 
     state_response = await get_project_strategic_state(

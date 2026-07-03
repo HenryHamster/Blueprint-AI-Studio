@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Compass, Cpu, Copy, Check, RefreshCw, Trash2 } from 'lucide-react';
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
+import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
@@ -255,7 +255,11 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, onDi
     windowsPowerShell: false,
     macosLinux: false,
   });
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator';
+  // The runner POSTs heartbeats to the backend API, not the admin-UI hosting origin (Firebase
+  // Hosting only serves the SPA and has no /api/** route). Prefer the configured API base URL;
+  // fall back to window.location.origin only for same-origin dev where API_BASE_URL is empty.
+  const origin =
+    API_BASE_URL || (typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator');
   const snippets = runnerSetupSnippets(token, origin, preset);
   const setupSnippetItems: Array<{ id: keyof RunnerSetupSnippetCommands; label: string; command: string }> = [
     { id: 'windowsPowerShell', label: 'Windows PowerShell', command: snippets.windowsPowerShell },

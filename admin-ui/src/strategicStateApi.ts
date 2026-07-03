@@ -735,6 +735,18 @@ export interface StrategicResidentSessionSnapshot {
   last_operator_interaction_at?: string | null;
 }
 
+/**
+ * Legible Workday resident-session availability (mirrors
+ * `_resident_session_availability` in `strategic_state_read_model.py`).
+ * `state` maps to the operator status chip; `reason` is present whenever the
+ * session can't run (`sessions_disabled` / `no_runner` / `start_failed: <msg>`).
+ */
+export interface StrategicResidentSessionAvailability {
+  available: boolean;
+  state: 'dark' | 'ready' | 'active' | 'blocked' | 'error' | string;
+  reason?: string | null;
+}
+
 export interface StrategicSessionStartRequest {
   runner_id?: string | null;
 }
@@ -814,6 +826,13 @@ export interface StrategicStateResponse {
    * when the feature is off (a click would otherwise 403 at the start endpoint).
    */
   resident_session_available?: boolean;
+  /**
+   * Legible Workday resident-session state + the reason it isn't running
+   * (mirrors `_resident_session_availability`). Workday is the on-switch:
+   * entering `continuous` auto-starts the session, so the UI reads this to show
+   * dark / ready / active / blocked / error instead of relying on a Start click.
+   */
+  resident_session_availability?: StrategicResidentSessionAvailability | null;
   running_update: {
     excerpt: string | null;
     char_count: number;
