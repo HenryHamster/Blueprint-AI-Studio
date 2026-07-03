@@ -195,6 +195,7 @@ from app.release_scoring import (
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
+    compute_reproducible_audit_score,
     evaluate_merge_grade,
     is_contentless_goal,
 )
@@ -3491,7 +3492,20 @@ async def _finalize_qualification(
             return await _handle_infra_failure(session, version, qual, _challenge_hold)
 
     # Score using the reconciled report (refuted findings removed when challenge ran).
-    audit_score, test_erosion_score = _score_audit(_audit_report_scored)
+    # test_erosion_score stays the deterministic git-diff signal from _score_audit.
+    # The audit sub-score is recomputed reproducibly over challenger-CONFIRMED
+    # findings only, anchored by the LLM's holistic self-score — this removes the
+    # uncertain/unbound-finding run-to-run variance that swung the gating audit
+    # score 0.33<->0.92 on the same candidate.  compute_composite is unchanged; it
+    # just receives a stable audit_score.  _compute_audit_reconciliation
+    # (model_reported_score / findings_derived_score) is still computed below for
+    # observability on the verdict record.
+    _, test_erosion_score = _score_audit(_audit_report_scored)
+    audit_score = compute_reproducible_audit_score(
+        _audit_report_scored,
+        challenge_verdicts,
+        candidate_sha=candidate_sha,
+    )
     # Carry the confirmed (actionable) findings into last_qualification so the
     # strategic agent can target them.  Use reconciled report when available so
     # refuted findings are not surfaced as actionable blockers.

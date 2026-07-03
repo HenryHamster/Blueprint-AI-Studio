@@ -1265,6 +1265,145 @@ def _compute_challenge_synthesis_from_binding_verdicts(
     }
 
 
+def _confirmed_findings_from_binding_verdicts(
+    challenge_verdicts: dict[str, Any] | None,
+    *,
+    candidate_sha: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return the challenger-CONFIRMED findings from a binding RELEASE_AUDIT_CHALLENGE
+    verdict artifact, or ``None`` when the challenge is absent/unavailable/unparseable.
+
+    Each returned item is ``{"severity", "summary", "file"}``.  The severity is
+    read from the confirmed verdict entry: the audit-challenge handler
+    (agent/src/handlers/audit-challenge.ts) copies the primary finding's severity
+    verbatim onto an index-bound verdict, otherwise uses the challenger's own
+    label (defaulting ``"unknown"``) — so a confirmed verdict always carries a
+    usable severity string.
+
+    A finding counts as CONFIRMED iff its ``verdict`` string is exactly
+    ``"confirmed"`` (case-insensitive).  ``"uncertain"`` and
+    ``"refuted_false_positive"`` verdicts contribute nothing: the uncertain /
+    unbound batch (the primary auditor enumerates a different set each run) is the
+    run-to-run variance source this scoring path deliberately drops.
+
+    Returns ``None`` — the "challenge unusable" sentinel, distinct from an empty
+    list — when the artifact is not a dict, its ``verdicts`` field is not a list,
+    or a supplied ``candidate_sha`` disagrees with the challenge's
+    ``challenged_candidate_sha`` (a challenge run against a different candidate is
+    not a trustworthy signal).  Returns ``[]`` when the artifact is well-formed
+    but nothing was confirmed (a usable "zero confirmations" result).
+
+    Pure: no I/O, deterministic in its inputs.
+    """
+    if not isinstance(challenge_verdicts, dict):
+        return None
+    challenged_sha = str(challenge_verdicts.get("challenged_candidate_sha") or "").strip()
+    if candidate_sha and challenged_sha and challenged_sha != candidate_sha:
+        # Challenge ran against a different candidate — do not trust its verdicts.
+        return None
+    verdicts_list = challenge_verdicts.get("verdicts")
+    if not isinstance(verdicts_list, list):
+        return None
+    confirmed: list[dict[str, Any]] = []
+    for v in verdicts_list:
+        if not isinstance(v, dict):
+            continue
+        if str(v.get("verdict") or "").strip().lower() != "confirmed":
+            continue
+        confirmed.append(
+            {
+                "severity": str(v.get("severity") or "").strip().lower(),
+                "summary": str(v.get("summary") or "").strip(),
+                "file": str(v.get("file") or "").strip(),
+            }
+        )
+    return confirmed
+
+
+def compute_reproducible_audit_score(
+    primary_report: dict[str, Any] | None,
+    challenge_verdicts: dict[str, Any] | None,
+    *,
+    candidate_sha: str | None = None,
+) -> float | None:
+    """Reproducible audit sub-score over challenger-CONFIRMED findings only,
+    anchored by the LLM's low-variance holistic self-score.
+
+    ``audit_sub = min(model_reported_score,
+                      1 − Σ _AUDIT_DEDUCTIONS[severity] over confirmed findings)``
+    clamped to ``[0, 1]``.
+
+    This replaces the findings-derived deduction path (which scored over confirmed
+    *plus* uncertain / unbound findings — the primary auditor enumerates a
+    different batch each run, so the same candidate scored 0.33 one run and 0.92
+    the next) with a stable subset: the findings an adversarial challenge
+    independently CONFIRMED, anchored to the model's holistic self-assessment.
+    ``compute_composite`` is unchanged — it just receives a stable ``audit_score``.
+
+    Fallbacks (fail-soft; never re-introduce the noisy raw-findings path):
+
+    * challenge absent / unavailable / unparseable → ``model_reported_score``
+      ALONE (a ``None`` from ``_confirmed_findings_from_binding_verdicts``).
+    * ``model_reported_score`` absent → ``1 − Σ confirmed_deductions``.
+    * both absent → ``None`` — the unusable-audit-signal sentinel, exactly what
+      ``_score_audit`` returns today, so ``compute_composite`` hard-blocks
+      ``"audit_missing"``.
+
+    An absent / non-dict ``primary_report`` short-circuits to ``None`` regardless
+    of the challenge: a report that never existed is an ``audit_missing`` signal,
+    and a challenge artifact must never resurrect a score for it (this preserves
+    the exact ``_score_audit(None) -> None`` gate behaviour; in the live finalize
+    path an absent/empty/unscoreable report is already routed to
+    ``_handle_infra_failure`` upstream, so this branch is defensive).
+
+    Pure: no I/O, no session, deterministic in its inputs.
+    """
+    if not isinstance(primary_report, dict):
+        return None
+
+    # model_reported_score: the LLM's holistic self-assessment (low variance).
+    recon = _compute_audit_reconciliation(primary_report)
+    model_reported = recon.get("model_reported_score")
+    if not isinstance(model_reported, (int, float)) or isinstance(model_reported, bool):
+        model_reported = None
+
+    confirmed = _confirmed_findings_from_binding_verdicts(
+        challenge_verdicts, candidate_sha=candidate_sha
+    )
+
+    if confirmed is not None:
+        # Reproducible deduction: challenger-CONFIRMED findings only.  Mirror
+        # _score_audit's per-severity table (empty severity contributes nothing,
+        # unknown/unlisted severities fall back to _AUDIT_DEDUCTION_UNKNOWN).
+        deduction = 0.0
+        for f in confirmed:
+            sev = str(f.get("severity") or "").strip().lower()
+            if not sev:
+                continue
+            deduction += _AUDIT_DEDUCTIONS.get(sev, _AUDIT_DEDUCTION_UNKNOWN)
+        confirmed_derived = _clamp01(1.0 - deduction)
+        if model_reported is not None:
+            return _clamp01(min(model_reported, confirmed_derived))
+        # No self-score — fall back to the confirmed-deduction score alone.
+        return confirmed_derived
+
+    # Challenge unusable — fall back to the low-variance self-score ALONE, never
+    # the noisy findings-derived path when there is a real candidate to grade.
+    if model_reported is not None:
+        return _clamp01(model_reported)
+    # Neither a usable challenge NOR a self-score.  In the live finalize path an
+    # absent challenge is routed to infra_failure upstream, so this branch is
+    # reached only for a report that IS scoreable yet carries no signal of its
+    # own — in practice the CLEAN / empty-findings case.  Defer to the
+    # deterministic ``_score_audit``, which returns 1.0 for a clean report and
+    # None only for a parseable-but-unscoreable one.  This preserves the exact
+    # pre-reproducible-scoring behaviour for the no-signal case: a clean audit
+    # (no findings) must score 1.0, NOT read as audit_missing / 0.0.  There are no
+    # findings to enumerate here, so no run-to-run noise is re-introduced.
+    audit_only, _ = _score_audit(primary_report)
+    return audit_only
+
+
 def _extract_audit_findings(report: dict[str, Any] | None) -> list[dict[str, str]]:
     """Pull a compact, severity-sorted findings list from a RELEASE_AUDIT_REPORT.
 

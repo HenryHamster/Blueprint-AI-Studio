@@ -11218,12 +11218,16 @@ async def test_finalize_refuted_finding_excluded_and_recorded(db_session, mocker
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    # Refuted finding must not reduce the audit score → clean 1.0 → dry_run passes.
+    # Refuted finding does not deduct; the reproducible audit sub-score falls
+    # back to the model's holistic self-score (0.85) — not an inflated 1.0.
+    # audit = min(model_reported_score, 1 - Σ confirmed_deductions); the
+    # refutation leaves no confirmed findings, so nothing deducts, but the score
+    # is still capped at the model's own 0.85 assessment → dry_run passes.
     assert result["status"] == "dry_run"
     await db_session.refresh(version)
     lq = version.last_qualification
-    # No deduction applied (finding refuted) → audit score is 1.0.
-    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01)
+    # No confirmed deduction → audit == model_reported_score (0.85).
+    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01)
     # Refuted finding recorded in challenger_refuted_audit_findings.
     refuted = lq.get("challenger_refuted_audit_findings", [])
     assert len(refuted) == 1
@@ -11250,8 +11254,11 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
 
     A run with one unverified-primary drop AND one challenger-refuted finding must
     show each in its own count; neither may appear in the other.  Furthermore,
-    findings_derived_score in the reconciliation record must agree with the applied
-    audit sub-score (no contradiction visible to an operator reading the record).
+    the applied audit sub-score is the reproducible model-anchored value
+    (min(model_reported_score, 1 - Σ confirmed_deductions)): with no CONFIRMED
+    findings left it equals the model's self-score (0.70), which is below the
+    0.90 threshold → not_promoted.  findings_derived_score stays in the record
+    for OBSERVABILITY and is no longer required to equal the applied score.
     """
     from app import shared_state
 
@@ -11314,7 +11321,12 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
     result = await rq._finalize_qualification(db_session, version)
     await db_session.commit()
 
-    assert result["status"] == "dry_run"
+    # model_reported_score is 0.70 and the refutation leaves no confirmed
+    # findings, so the reproducible audit sub-score is min(0.70, 1.0) = 0.70 →
+    # composite falls below the 0.90 threshold → not_promoted.  The scored record
+    # (sub_scores, audit_reconciliation, challenge_binding_record) is written for
+    # not_promoted exactly as for dry_run, so the count assertions below hold.
+    assert result["status"] == "not_promoted"
     await db_session.refresh(version)
     lq = version.last_qualification
 
@@ -11333,17 +11345,24 @@ async def test_reconciliation_counts_challenge_exclusion_separately_from_verific
         == 2
     )
 
-    # 4. findings_derived_score agrees with the applied audit sub-score.
-    #    Only the unverified finding is left after challenge removes the verified one;
-    #    the unverified finding also passes through _score_audit untouched (it has no
-    #    verification_note so it is silently skipped) → derived score is 1.0.
+    # 4. The applied audit sub-score is the reproducible model-anchored value:
+    #    audit = min(model_reported_score, 1 - Σ confirmed_deductions).  The
+    #    challenge refuted the only verified finding and the other finding is
+    #    unverified (never confirmed), so there are NO confirmed deductions → the
+    #    applied score equals the model's holistic self-score (0.70).
     applied_audit = lq["sub_scores"]["audit"]
-    assert recon["findings_derived_score"] == pytest.approx(applied_audit, abs=0.01), (
-        f"findings_derived_score {recon['findings_derived_score']} disagrees with "
-        f"applied audit sub-score {applied_audit}"
+    assert applied_audit == pytest.approx(0.70, abs=0.01)
+    assert applied_audit == pytest.approx(
+        recon["model_reported_score"], abs=0.01
+    ), (
+        f"applied audit sub-score {applied_audit} must equal the model-reported "
+        f"anchor {recon['model_reported_score']} when nothing is confirmed"
     )
-    # The refuted verified high finding no longer deducts → audit score is 1.0.
-    assert applied_audit == pytest.approx(1.0, abs=0.01)
+    # findings_derived_score stays computed for OBSERVABILITY (the old punitive
+    # metric); it is intentionally NO LONGER required to equal the applied score.
+    # The lone remaining finding is unverified, so it is silently skipped and the
+    # derived score reads 1.0 — deliberately diverging from the applied 0.70.
+    assert recon["findings_derived_score"] == pytest.approx(1.0, abs=0.01)
 
     # 5. Binding record is persisted alongside audit_reconciliation and contains
     #    the refuted entry with verdict + summary fields.
@@ -11436,9 +11455,12 @@ async def test_challenger_refuted_finding_excluded_from_audit_score(db_session, 
     Fail-closed companion: when the challenge is absent, the deduction stands.
 
     Part 1 — refuted path: audit reports one verified HIGH finding; the
-    independent challenge marks it refuted_false_positive.  The audit sub-score
-    must be 1.0 (no deduction) and the finding must appear in
-    challenger_refuted_audit_findings with its auditable reason.
+    independent challenge marks it refuted_false_positive.  The refutation
+    removes the deduction, so the reproducible audit sub-score falls back to the
+    model's holistic self-score (0.85) — NOT an inflated 1.0
+    (audit = min(model_reported_score, 1 - Σ confirmed_deductions)) — and the
+    finding must appear in challenger_refuted_audit_findings with its auditable
+    reason.
 
     Part 2 — fail-closed path: same audit finding, but no challenge artifact
     seeded.  The qualifier must HOLD as infra_failure (audit_challenge_missing)
@@ -11502,10 +11524,14 @@ async def test_challenger_refuted_finding_excluded_from_audit_score(db_session, 
     )
     await db_session.refresh(version)
     lq = version.last_qualification
-    # Refuted finding must NOT deduct → audit_score is 1.0.
-    assert lq["sub_scores"]["audit"] == pytest.approx(1.0, abs=0.01), (
-        f"Expected audit score 1.0 but got {lq['sub_scores']['audit']} — "
-        "refuted finding should not deduct"
+    # Refuted finding must NOT deduct → the reproducible audit sub-score falls
+    # back to the model's holistic self-score (0.85), not an inflated 1.0
+    # (audit = min(model_reported_score, 1 - Σ confirmed_deductions); the
+    # refutation leaves no confirmed findings, so nothing deducts, but the score
+    # cannot exceed the model's own 0.85 assessment).
+    assert lq["sub_scores"]["audit"] == pytest.approx(0.85, abs=0.01), (
+        f"Expected audit score 0.85 (model_reported anchor, no confirmed "
+        f"deduction) but got {lq['sub_scores']['audit']}"
     )
     # Must be recorded in challenger_refuted_audit_findings with auditable reason.
     refuted = lq.get("challenger_refuted_audit_findings", [])
@@ -11769,9 +11795,10 @@ async def test_finalize_carries_audit_findings_into_last_qualification(
         db_session,
         project,
         version,
-        # Three findings derive audit 0.68; with erosion 1.0 and smoketest 0.5
-        # (half-passing), the composite lands at 0.722, under the 0.90
-        # bar and on the soft-miss path.
+        # model_reported 0.35 with two challenger-CONFIRMED highs → reproducible
+        # audit = min(0.35, 1 - 0.30) = 0.35; with erosion 1.0 and a half-passing
+        # smoketest the composite lands well under the 0.90 bar (soft-miss path,
+        # no hard blocker).
         audit_logs={
             "audit_score": 0.35,
             "test_erosion": {
@@ -20967,9 +20994,10 @@ async def test_finalize_below_threshold_posts_operator_message(db_session):
     shared_state.runtime_config["promotion_enabled"] = True
 
     project, version = await _make_project_and_version(db_session)
-    # 2 high + 1 low findings → derived audit 0.68, erosion 1.0, smoketest 0.5
-    # (half-passing) → composite 0.722, well under the 0.90 threshold, but no
-    # hard blocker (audit present, no test deletion, CI green).
+    # model_reported 0.5 with two challenger-CONFIRMED highs → reproducible audit
+    # = min(0.5, 1 - 0.30) = 0.5; erosion 1.0, half-passing smoketest → composite
+    # well under the 0.90 threshold, but no hard blocker (audit present, no test
+    # deletion, CI green).
     await _seed_qualification_children(
         db_session,
         project,
