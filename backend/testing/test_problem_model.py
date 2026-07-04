@@ -1473,6 +1473,63 @@ def test_apply_agent_update_does_not_preserve_agent_authored_intent():
     assert new_raw["intent"]["purpose"] == ""
 
 
+def test_apply_agent_update_heals_blank_purpose_from_user_purpose_when_source_null():
+    """Regression: purpose="" + source=null + user_purpose populated → self-heal.
+
+    This is the exact broken state that stalled strategic_review tasks: the
+    durable model had intent.purpose="" with source=null while user_purpose held
+    the operator's real text.  The source-gated guard (purpose_was_operator=False)
+    could not restore it; the new user_purpose fallback must.
+    """
+    current = {
+        "revision": 3,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next focus"}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    # purpose must be restored from user_purpose
+    assert new_raw["intent"]["purpose"] == "Make Blueprint handle any project well."
+    # source must be re-stamped as user_message so future cycles protect it
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # agent-owned current_focus advances freely
+    assert new_raw["intent"]["current_focus"] == "next focus"
+
+
+def test_apply_agent_update_heals_schema_placeholder_from_user_purpose():
+    """Purpose matches a schema-placeholder pattern → healed from user_purpose."""
+    for placeholder in ("...", "<from analysis>", "<placeholder>", ""):
+        current = {
+            "revision": 1,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        proposed = {"intent": {"purpose": placeholder}}
+        new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+        assert new_raw["intent"]["purpose"] == "Real operator purpose.", (
+            f"Failed to heal placeholder: {placeholder!r}"
+        )
+
+
+def test_apply_agent_update_no_heal_when_user_purpose_empty():
+    """If user_purpose is also empty there is nothing to restore; stay blank."""
+    current = {
+        "revision": 1,
+        "intent": {"purpose": "", "source": None, "user_purpose": ""},
+    }
+    proposed = {"intent": {"purpose": ""}}
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    assert new_raw["intent"]["purpose"] == ""
+
+
 # ---------------------------------------------------------------------------
 # apply_agent_update — append-only gap-memory restore after payload trim
 # ---------------------------------------------------------------------------

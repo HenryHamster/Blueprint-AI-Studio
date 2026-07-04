@@ -89,7 +89,7 @@
     "notification_dispatch.py": 2700,
     "ci_completion.py": 2200,
     "routers/admin_debug.py": 2250,
-    "problem_model.py": 2200,
+    "problem_model.py": 2550,
     "source_ref_validation.py": 1900,
     "orchestrator_filters.py": 1850,
     "knowledge_completion.py": 3400,

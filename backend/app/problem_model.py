@@ -28,6 +28,7 @@ are a projected view over directions, not a separate store.
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Iterable
 from typing import Any, Literal
 
@@ -1415,6 +1416,21 @@ def apply_user_intent_patch(
     return validated
 
 
+_PLACEHOLDER_PURPOSE_RE = re.compile(r"^<[^>]+>$")
+"""Matches XML-tag-style schema placeholders like ``<from analysis>``."""
+
+
+def _is_placeholder_purpose(purpose: str) -> bool:
+    """True when purpose is blank or a known schema-placeholder pattern.
+
+    Mirrors the agent-side ``isSchemaPlaceholder`` check in
+    ``agent/src/prompts/thinker.ts`` so the backend can detect and heal the
+    same broken states the agent rejects.
+    """
+    stripped = purpose.strip()
+    return not stripped or stripped == "..." or bool(_PLACEHOLDER_PURPOSE_RE.match(stripped))
+
+
 def _context_is_blank(context: ProjectContext) -> bool:
     """True when every ``ProjectContext`` field is empty/unset.
 
@@ -1462,6 +1478,19 @@ def _preserve_operator_intent(current: ProblemModel, proposed: ProblemModel) -> 
         # Restore the operator provenance unless the agent supplied its own.
         if proposed.intent.source is None:
             proposed.intent.source = current.intent.source
+
+    # Fallback: when user_purpose (the durable operator-set copy) is non-empty
+    # and proposed purpose is blank or a schema-placeholder, restore it
+    # regardless of intent.source.  This heals the state where source drifted
+    # to null while user_purpose still holds the operator's real text — a case
+    # the source-gated block above cannot reach (purpose_was_operator=False).
+    if _is_placeholder_purpose(proposed.intent.purpose) and current.intent.user_purpose.strip():
+        proposed.intent.purpose = current.intent.user_purpose
+        if proposed.intent.source is None:
+            proposed.intent.source = Source(
+                type="user_message",
+                excerpt=current.intent.user_purpose[:120],
+            )
 
     # ``context`` / ``constraints`` are operator-owned when the prior model was
     # last written by the user (the onboarding seed stamps last_updated_by).
