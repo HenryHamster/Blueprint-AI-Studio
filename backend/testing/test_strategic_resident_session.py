@@ -834,6 +834,7 @@ async def test_stop_helper_drives_task_terminal_and_releases_lease(db_session):
     # Resident task driven terminal.
     refreshed = await db_session.get(Task, task.id)
     assert refreshed.status == TaskStatus.CANCELLED
+    assert refreshed.context.get("failure_category") == "ADMIN_CANCEL"
 
     # Continuation lease marker released.
     fresh_project = await db_session.get(Project, project.id)

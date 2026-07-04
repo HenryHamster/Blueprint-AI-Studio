@@ -3589,6 +3589,59 @@ async def test_merge_held_on_migration_fetch_failure(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_migration_guard_hold_reason_includes_http_exception_detail(
+    db_session, mocker
+):
+    """HTTPException.detail is included in the hold-reason status message.
+
+    When github.get_pr_files raises an HTTPException (e.g. a 502 from
+    upstream), the hold reason surfaced in task.latest_status_message must
+    contain the detail string — not a bare 'HTTPException: ' with nothing
+    after the colon.
+    """
+    from fastapi import HTTPException
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.get_pr_files",
+        AsyncMock(
+            side_effect=HTTPException(
+                status_code=502, detail="GitHub 502: upstream error"
+            )
+        ),
+    )
+    merge_mock = mocker.patch(
+        "app.github.merge_pull_request",
+        AsyncMock(return_value={"merged": True}),
+    )
+
+    project = Project(name="guard http exc", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = _make_task(db_session, project)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is False, "HTTPException from guard must hold the merge"
+    merge_mock.assert_not_called()
+    status_msg = task.latest_status_message or ""
+    assert "upstream error" in status_msg, (
+        f"HTTPException detail must appear in status message, got: {status_msg!r}"
+    )
+    assert "HTTPException: " not in status_msg or "HTTPException(502)" in status_msg, (
+        "Must not render as bare 'HTTPException: ' with empty detail"
+    )
+
+
+@pytest.mark.asyncio
 async def test_clean_migration_pr_merges(db_session, mocker):
     """A migration PR that extends the chain cleanly merges normally."""
     from app.ci_completion import _attempt_merge_with_retry_and_escalation

@@ -703,8 +703,9 @@ _post_strategic() {
 if [ "$OP" = "send" ]; then
   CONTENT="\${2:?send requires '<content>'}"
   MSG_TYPE="\${3:-NOTE}"
-  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" \\
-    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c}}' | \\
+  IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
+  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
+    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}' | \\
     _post_strategic
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"

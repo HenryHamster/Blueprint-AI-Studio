@@ -18791,6 +18791,73 @@ async def test_strategic_create_message_rejects_oversized_context(
     assert rows == []
 
 
+@pytest.mark.asyncio
+async def test_agent_create_message_idempotency_dedupes(
+    client: AsyncClient, db_session
+):
+    """Two agent create_message calls sharing an idempotency_key collapse to one row.
+
+    This exercises the live-incident fix: './messages send' persisted server-side
+    but exited nonzero; a retry must not produce a second ProjectMessage row.
+    """
+    from app.auth import create_agent_token
+
+    project = Project(name="Agent Message Idem", user_id=TEST_USER_ID)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-agent-msg-idem",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "vm-agent-msg-idem",
+        task_type="strategic_review",
+    )
+    body = {
+        "task_id": str(task.id),
+        "op": "create_message",
+        "data": {
+            "type": "NOTE",
+            "content": "Found an issue with the build.",
+            "idempotency_key": "agent-idem-test-key-abc123",
+        },
+    }
+
+    resp1 = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=body,
+    )
+    assert resp1.status_code == 200, resp1.text
+    first_id = resp1.json()["message_id"]
+
+    # Simulate retry: same idempotency_key, same content
+    resp2 = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json=body,
+    )
+    assert resp2.status_code == 200, resp2.text
+    assert resp2.json()["message_id"] == first_id, "Retry must return the same message_id"
+
+    rows = (
+        await db_session.execute(
+            select(ProjectMessage).where(ProjectMessage.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(rows) == 1, f"Expected 1 message row, got {len(rows)}"
+    assert rows[0].idempotency_key == "agent-idem-test-key-abc123"
+
+
 class TestTriggerSelfAudit:
     @pytest.mark.asyncio
     async def test_self_audit_409_when_audit_in_flight(

@@ -44,6 +44,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import AsyncSessionLocal, get_session
+from app.failure_classification import ADMIN_CANCEL
 from app.models import Project, ProjectMessage, Task, TaskStatus, _utcnow
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
@@ -1221,6 +1222,10 @@ async def stop_resident_session(
         if task is not None and task.status in _LIVE_TASK_STATUSES:
             task.status = TaskStatus.CANCELLED
             task.latest_status_message = "Resident strategic session stopped by operator"
+            ctx = dict(task.context or {})
+            ctx["failure_category"] = ADMIN_CANCEL
+            task.context = ctx
+            flag_modified(task, "context")
             session.add(task)
 
     def _release_and_end(vision: dict[str, Any]) -> None:

@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import func as _func
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -1867,6 +1868,28 @@ async def strategic_operation(
             warning = await _compute_message_citation_warning(session, project, content)
             if warning:
                 msg_ctx = {**msg_ctx, "_provenance_warnings": warning}
+        # Idempotency guard: a network error can cause the caller to retry after
+        # the server already committed. Accept an optional idempotency_key from
+        # the agent and short-circuit if a matching row already exists.
+        raw_idem = str(data.get("idempotency_key") or "").strip()
+        idem_key: str | None = raw_idem[:255] if raw_idem else None
+        if idem_key:
+            existing = (
+                await session.execute(
+                    select(ProjectMessage).where(
+                        ProjectMessage.project_id == project.id,
+                        ProjectMessage.idempotency_key == idem_key,
+                    )
+                )
+            ).scalar_one_or_none()
+            if existing is not None:
+                return _resp(
+                    {
+                        "status": "ok",
+                        "op": "create_message",
+                        "message_id": str(existing.id),
+                    }
+                )
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
@@ -1874,9 +1897,31 @@ async def strategic_operation(
             from_task_id=task.id,
             content=content,
             context=msg_ctx,
+            idempotency_key=idem_key,
         )
         session.add(new_msg)
-        await session.commit()
+        try:
+            await session.commit()
+        except IntegrityError:
+            await session.rollback()
+            if idem_key:
+                existing = (
+                    await session.execute(
+                        select(ProjectMessage).where(
+                            ProjectMessage.project_id == project.id,
+                            ProjectMessage.idempotency_key == idem_key,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if existing is not None:
+                    return _resp(
+                        {
+                            "status": "ok",
+                            "op": "create_message",
+                            "message_id": str(existing.id),
+                        }
+                    )
+            raise
         # Broadcast so the UI can update immediately instead of waiting for poll
         await broadcast_to_project(
             str(project.id),
