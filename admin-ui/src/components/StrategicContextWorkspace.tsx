@@ -871,6 +871,44 @@ export function StrategicContextWorkspace({
               </div>
             </Section>
 
+            {state?.model_integrity && state.model_integrity.counts.total > 0 && (
+              <Section
+                title="Model integrity"
+                meta={`${state.model_integrity.counts.total} conflict${state.model_integrity.counts.total !== 1 ? 's' : ''}`}
+                testId="strategic-context-workspace-integrity"
+              >
+                <div className={CONTEXT_LIST_CLASS}>
+                  {state.model_integrity.orphaned_gaps.map(gap => (
+                    <div key={`orphan:${gap.id}`} className="border-t border-neutral-800/70 py-2 first:border-t-0">
+                      <span className="block truncate text-sm font-semibold text-neutral-100">{gap.name || gap.id}</span>
+                      <span className="mt-0.5 block text-ui-sm font-semibold uppercase text-amber-400">orphaned gap</span>
+                      <span className="mt-0.5 block truncate text-xs text-neutral-500">
+                        {gap.status === 'blocked' ? 'blocked gap' : 'gap'} {gap.id.slice(0, 8)} has no active direction
+                      </span>
+                    </div>
+                  ))}
+                  {state.model_integrity.ungrounded_directions.map(dir => (
+                    <div key={`ungrounded:${dir.id}`} className="border-t border-neutral-800/70 py-2 first:border-t-0">
+                      <span className="block truncate text-sm font-semibold text-neutral-100">{dir.text || dir.id}</span>
+                      <span className="mt-0.5 block text-ui-sm font-semibold uppercase text-amber-400">ungrounded direction</span>
+                      <span className="mt-0.5 block truncate text-xs text-neutral-500">
+                        {dir.reason === 'no_gap_id' ? 'no gap linked' : `gap ${dir.gap_id} is not active`}
+                      </span>
+                    </div>
+                  ))}
+                  {state.model_integrity.stale_active_moves.map(item => (
+                    <div key={`stale:${item.gap_id}`} className="border-t border-neutral-800/70 py-2 first:border-t-0">
+                      <span className="block truncate text-sm font-semibold text-neutral-100">{item.gap_name || item.gap_id}</span>
+                      <span className="mt-0.5 block text-ui-sm font-semibold uppercase text-amber-400">stale active_moves</span>
+                      <span className="mt-0.5 block truncate text-xs text-neutral-500">
+                        {`${item.stale_direction_ids.length} stale direction${item.stale_direction_ids.length !== 1 ? 's' : ''} in active_moves`}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </Section>
+            )}
+
             {workSessionEvents.length > 0 && (
               <Section
                 title="Recent flow"

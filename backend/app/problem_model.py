@@ -2079,7 +2079,12 @@ def apply_agent_update(
     proposed.last_updated = now_iso
     proposed.last_updated_by = "agent"
 
-    proposed.archived_gaps = list(current.archived_gaps) + list(proposed.archived_gaps)
+    # Deduplicate archived_gaps by id: keep current, add only proposed entries not already present.
+    archived_by_id = {g.id: g for g in current.archived_gaps}
+    for g in proposed.archived_gaps:
+        if g.id not in archived_by_id:
+            archived_by_id[g.id] = g
+    proposed.archived_gaps = list(archived_by_id.values())
     proposed.revision_log = list(current.revision_log)
 
     # 3-way operator-wins merge for operator-owned fields when a cycle baseline
@@ -2204,3 +2209,102 @@ def apply_agent_update(
                 gap.pop("past_moves_compacted_at", None)
 
     return result, diff
+
+
+# ---------------------------------------------------------------------------
+# Gap staffing normalization
+# ---------------------------------------------------------------------------
+
+
+def normalize_gap_active_moves(
+    model: ProblemModel,
+    active_direction_ids: set[str],
+    now_iso: str,
+) -> list[str]:
+    """Normalize gap.active_moves against the currently-active direction set.
+
+    For each gap, any direction ID in active_moves that is NOT in
+    active_direction_ids (paused, expired, staged, etc.) is pruned into
+    past_moves. A gap that becomes unstaffed as a result and has no existing
+    deferral is auto-deferred. Returns correction messages describing each
+    change. Mutates model in place. Pure (no I/O).
+    """
+    corrections: list[str] = []
+    for gap in model.gaps:
+        stale = [m for m in gap.active_moves if m not in active_direction_ids]
+        if not stale:
+            continue
+        gap.active_moves = [m for m in gap.active_moves if m in active_direction_ids]
+        past_seen = set(gap.past_moves)
+        for m in stale:
+            if m not in past_seen:
+                gap.past_moves.append(m)
+                past_seen.add(m)
+        corrections.append(f"gap {gap.id}: moved {stale} from active_moves to past_moves")
+        if not gap.active_moves and not gap.deferral:
+            trigger = ", ".join(stale)
+            gap.deferral = GapDeferral(
+                rationale=f"auto-deferred: staffing direction(s) {trigger} not active",
+                created_at=now_iso,
+            )
+            corrections.append(f"gap {gap.id}: auto-deferred (active_moves emptied)")
+    return corrections
+
+
+# ---------------------------------------------------------------------------
+# Direction–gap referential-integrity guard
+# ---------------------------------------------------------------------------
+
+GapLinkClassification = Literal["none", "valid", "closed", "dangling"]
+"""Classification of a direction's gap_id against the current problem model.
+
+``none``     — no gap_id set (ungrounded direction).
+``valid``    — gap_id resolves to an active or blocked gap.
+``closed``   — gap_id resolves to a closed/abandoned gap (still in ``gaps``
+               with a terminal status, or already in ``archived_gaps``).
+``dangling`` — gap_id matches no gap at all.
+"""
+
+
+def classify_gap_link(
+    gap_id: str | None,
+    model: ProblemModel,
+) -> GapLinkClassification:
+    """Classify a direction's gap_id link against the current problem model.
+
+    Pure and side-effect-free.  Used as the foundation for write-time
+    enforcement at every direction/gap write path.
+    """
+    if not gap_id:
+        return "none"
+    for gap in model.gaps:
+        if gap.id == gap_id:
+            return "valid" if gap.status in ("active", "blocked") else "closed"
+    for gap in model.archived_gaps:
+        if gap.id == gap_id:
+            return "closed"
+    return "dangling"
+
+
+def check_gap_id_write(
+    gap_id: str | None,
+    problem_model_raw: dict | None,
+) -> tuple[str | None, list[str]]:
+    """Return (error_reason, open_gap_ids) for a proposed gap_id write.
+
+    Returns ``(None, [])`` when the gap_id is absent, the problem model cannot
+    be parsed, or the gap resolves to an open (active/blocked) gap.
+    Returns ``(classification, open_ids)`` when the gap is closed or dangling,
+    where ``open_ids`` lists all currently-active or -blocked gap IDs so the
+    caller can surface them in an error response.
+    """
+    if not gap_id or not problem_model_raw:
+        return None, []
+    try:
+        pm = ProblemModel.model_validate(problem_model_raw)
+    except Exception:  # noqa: BLE001
+        return None, []
+    cls = classify_gap_link(gap_id, pm)
+    if cls in ("valid", "none"):
+        return None, []
+    return cls, [g.id for g in pm.gaps if g.status in ("active", "blocked")]

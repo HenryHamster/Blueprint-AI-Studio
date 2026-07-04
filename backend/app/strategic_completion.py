@@ -4497,9 +4497,19 @@ async def _handle_strategic_completion(
                     new_dir["source"] = str(op_entry["source"])[:64]
                 # Persist the direction→gap linkage (mirrors the API write path
                 # in admin_agent_ops.create_direction) so reconciliation can map
-                # an active direction back to its problem-model gap.
+                # an active direction back to its problem-model gap. Skip and warn
+                # when the gap_id resolves to a closed/nonexistent gap.
                 if op_entry.get("gap_id"):
-                    new_dir["gap_id"] = str(op_entry["gap_id"])
+                    _gid_fb = str(op_entry["gap_id"])
+                    from app.problem_model import check_gap_id_write
+                    _gap_err_fb, _ = check_gap_id_write(_gid_fb, project.problem_model)
+                    if _gap_err_fb:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: skipping gap_id link for %s: gap %s is %s",
+                            task.id, new_dir["id"], _gid_fb, _gap_err_fb,
+                        )
+                    else:
+                        new_dir["gap_id"] = _gid_fb
                 if op_entry.get("paths"):
                     new_dir["paths"] = op_entry["paths"]
                 raw_category = op_entry.get("category")
@@ -4615,16 +4625,29 @@ async def _handle_strategic_completion(
                         if "paths" in changes:
                             d["paths"] = changes["paths"]
                         # Update (or clear) the direction→gap linkage (mirrors the
-                        # API update_direction path in admin_agent_ops).
+                        # API update_direction path in admin_agent_ops). Skip and
+                        # warn when the new gap_id resolves to a closed/nonexistent gap.
                         if "gap_id" in changes:
                             gid = changes["gap_id"]
                             if gid:
-                                d["gap_id"] = str(gid)
+                                _gid_fb = str(gid)
+                                from app.problem_model import check_gap_id_write
+                                _gap_err_fb, _ = check_gap_id_write(_gid_fb, project.problem_model)
+                                if _gap_err_fb:
+                                    logger.warning(
+                                        "[STRATEGIC] Task %s: skipping gap_id link for %s: gap %s is %s",
+                                        task.id, dir_id, _gid_fb, _gap_err_fb,
+                                    )
+                                else:
+                                    d["gap_id"] = _gid_fb
+                                    _pending_gap_reconciles.append(
+                                        (str(dir_id), _gid_fb, _pre_gap_id_fb)
+                                    )
                             else:
                                 d.pop("gap_id", None)
-                            _pending_gap_reconciles.append(
-                                (str(dir_id), d.get("gap_id"), _pre_gap_id_fb)
-                            )
+                                _pending_gap_reconciles.append(
+                                    (str(dir_id), None, _pre_gap_id_fb)
+                                )
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])

@@ -1038,7 +1038,15 @@ async def strategic_operation(
         # direction back to the problem-model gap it works on. Optional and
         # string-cast; additive on the JSONB direction dict (no migration).
         if data.get("gap_id"):
-            new_dir["gap_id"] = str(data["gap_id"])
+            _gid = str(data["gap_id"])
+            from app.problem_model import check_gap_id_write
+            _gap_err, _open_ids = check_gap_id_write(_gid, project.problem_model)
+            if _gap_err:
+                raise HTTPException(
+                    status_code=400,
+                    detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+                )
+            new_dir["gap_id"] = _gid
         if data.get("paths"):
             new_dir["paths"] = data["paths"]
         if data.get("category") and data["category"] in ("product", "structural"):
@@ -1128,6 +1136,7 @@ async def strategic_operation(
             raise HTTPException(
                 status_code=400, detail="direction_id and changes required"
             )
+        now_iso = _utcnow().isoformat()
         rationale = _cap_str(
             data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
         )
@@ -1143,12 +1152,14 @@ async def strategic_operation(
         # any change is applied so a gap_id change can prune the old gap. Holds
         # ``(new_gap_id, prior_gap_id)`` once a gap_id change is observed.
         _gap_reground: tuple[str | None, str | None] | None = None
+        _pre_status: str | None = None
         for d in directions:
             if d.get("id") == dir_id:
                 _pre_text = d.get("text")
                 _pre_se = (d.get("context") or {}).get("success_evidence")
                 _pre_rc = (d.get("context") or {}).get("retirement_condition")
                 _pre_gap_id = d.get("gap_id")
+                _pre_status = d.get("status")
                 if "text" in changes:
                     d["text"] = _cap_str(
                         changes["text"],
@@ -1222,7 +1233,15 @@ async def strategic_operation(
                 if "gap_id" in changes:
                     gid = changes["gap_id"]
                     if gid:
-                        d["gap_id"] = str(gid)
+                        _gid = str(gid)
+                        from app.problem_model import check_gap_id_write
+                        _gap_err, _open_ids = check_gap_id_write(_gid, project.problem_model)
+                        if _gap_err:
+                            raise HTTPException(
+                                status_code=400,
+                                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+                            )
+                        d["gap_id"] = _gid
                     else:
                         d.pop("gap_id", None)
                     _gap_reground = (d.get("gap_id"), _pre_gap_id)
@@ -1317,6 +1336,28 @@ async def strategic_operation(
             if _reconciled_pm is not None:
                 project.problem_model = _reconciled_pm
                 flag_modified(project, "problem_model")
+        # Status-change gap staffing: pause prunes active_moves (auto-defers
+        # an emptied gap); reactivating from paused re-staffs the gap.
+        _updated_dir = next((x for x in directions if x.get("id") == dir_id), None)
+        _new_status = _updated_dir.get("status") if _updated_dir else None
+        if _new_status != _pre_status and _gap_reground is None:
+            _cur_gap = _updated_dir.get("gap_id") if _updated_dir else None
+            if _cur_gap:
+                if _new_status == "paused":
+                    from app.problem_model import reconcile_gaps_for_retired_directions  # noqa: PLC0415
+                    _pm_raw, _ = reconcile_gaps_for_retired_directions(
+                        dict(project.problem_model or {}), [str(dir_id)], now_iso
+                    )
+                    project.problem_model = _pm_raw
+                    flag_modified(project, "problem_model")
+                elif _new_status == "active" and _pre_status == "paused":
+                    from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+                    _pm = reconcile_gap_staffing_raw(
+                        project.problem_model, str(dir_id), _cur_gap, None
+                    )
+                    if _pm is not None:
+                        project.problem_model = _pm
+                        flag_modified(project, "problem_model")
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -2689,6 +2730,28 @@ async def strategic_operation(
             ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
+        # Normalize stale active_moves: if the agent's proposed model lists a
+        # paused/expired direction in a gap's active_moves, prune it to past_moves
+        # and (if the gap is now unstaffed) auto-defer. Corrections surface as
+        # response warnings and are recorded in the revision log.
+        from app.problem_model import (  # noqa: PLC0415
+            append_revision_log as _append_revision_log,
+            normalize_gap_active_moves as _normalize_gap_active_moves,
+            parse_problem_model as _parse_problem_model,
+        )
+        _active_dir_ids = {
+            str(d.get("id"))
+            for d in (project.directions or [])
+            if d.get("status") == "active"
+        }
+        _pm_obj = _parse_problem_model(new_pm_raw)
+        _norm = _normalize_gap_active_moves(_pm_obj, _active_dir_ids, _utcnow().isoformat())
+        if _norm:
+            for _c in _norm:
+                warnings.append(f"active_moves normalized: {_c}")
+            _append_revision_log(_pm_obj, "auto-normalized stale active_moves", {"active_moves_normalized": _norm})
+            new_pm_raw = _pm_obj.model_dump()
+            project.problem_model = new_pm_raw
         # Carry proof records and adoption verdicts onto survivor keys when a
         # capability consolidation occurred in this write.
         _consolidated = pm_diff.get("capabilities_consolidated")

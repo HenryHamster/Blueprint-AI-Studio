@@ -38,9 +38,12 @@ from app.problem_model import (
     apply_agent_update,
     apply_user_intent_patch,
     archive_closed_gaps,
+    check_gap_id_write,
+    classify_gap_link,
     compute_model_size_signal,
     gc_problem_model,
     is_empty,
+    normalize_gap_active_moves,
     parse_problem_model,
     reconcile_gap_staffing,
     reconcile_gap_staffing_raw,
@@ -419,6 +422,55 @@ def test_apply_agent_update_preserves_prior_archive_and_log():
     assert len(new_raw["revision_log"]) == 2
     assert new_raw["revision_log"][0]["summary"] == "prior"
     assert new_raw["revision_log"][1]["revision"] == 3
+
+
+def test_apply_agent_update_dedupes_archived_gaps():
+    """Agent that echoes its payload view re-appends already-archived gaps;
+    deduplication by id prevents accumulating duplicates every cycle."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-2", "name": "gap 2", "status": "closed"},
+            {"id": "g-3", "name": "gap 3", "status": "closed"},
+        ],
+    }
+    # Agent echoes back all three archived gaps in its payload view (common
+    # when the agent reads/edits archived gaps via strategic context).
+    proposed = {
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-2", "name": "gap 2", "status": "closed"},
+            {"id": "g-3", "name": "gap 3", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    # Deduplication by id: the three archived gaps appear exactly once.
+    archived_ids = [g["id"] for g in new_raw["archived_gaps"]]
+    assert archived_ids == ["g-1", "g-2", "g-3"]
+    assert len(new_raw["archived_gaps"]) == 3
+
+
+def test_apply_agent_update_archived_gaps_new_entries_added():
+    """When proposed includes a gap not in current, it is added to the archive."""
+    current = {
+        "revision": 5,
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+        ],
+    }
+    # Agent echoes back the existing gap and adds a new one to the archive
+    # (e.g., manually archived or archiving after closing).
+    proposed = {
+        "archived_gaps": [
+            {"id": "g-1", "name": "gap 1", "status": "closed"},
+            {"id": "g-4", "name": "gap 4", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    archived_ids = {g["id"] for g in new_raw["archived_gaps"]}
+    assert archived_ids == {"g-1", "g-4"}
+    assert len(new_raw["archived_gaps"]) == 2
 
 
 def test_gc_problem_model_keeps_most_recent_archived():
@@ -4373,3 +4425,187 @@ def test_reconcile_raw_malformed_model_fails_open():
     can never block a direction write."""
     # `gaps` must be a list of gap objects; a string is malformed.
     assert reconcile_gap_staffing_raw({"gaps": "nope"}, "d-1", "g-1", None) is None
+
+
+# ---------------------------------------------------------------------------
+# classify_gap_link — direction–gap referential-integrity guard
+# ---------------------------------------------------------------------------
+
+
+def test_classify_gap_link_none_when_no_gap_id():
+    """A direction with no gap_id (ungrounded) classifies as 'none'."""
+    model = ProblemModel(gaps=[Gap(id="g-1", name="x")])
+    assert classify_gap_link(None, model) == "none"
+    assert classify_gap_link("", model) == "none"
+
+
+def test_classify_gap_link_valid_for_active_gap():
+    """A gap_id pointing to an active gap classifies as 'valid'."""
+    model = ProblemModel(gaps=[Gap(id="g-active", name="x", status="active")])
+    assert classify_gap_link("g-active", model) == "valid"
+
+
+def test_classify_gap_link_valid_for_blocked_gap():
+    """A gap_id pointing to a blocked gap is still workable — 'valid'."""
+    model = ProblemModel(gaps=[Gap(id="g-blocked", name="x", status="blocked")])
+    assert classify_gap_link("g-blocked", model) == "valid"
+
+
+def test_classify_gap_link_closed_for_terminal_active_list_gap():
+    """A gap that is still in model.gaps but has a terminal status (closed or
+    abandoned) classifies as 'closed', not 'valid' or 'dangling'."""
+    model = ProblemModel(
+        gaps=[
+            Gap(id="g-closed", name="done", status="closed"),
+            Gap(id="g-abandoned", name="gave up", status="abandoned"),
+        ]
+    )
+    assert classify_gap_link("g-closed", model) == "closed"
+    assert classify_gap_link("g-abandoned", model) == "closed"
+
+
+def test_classify_gap_link_closed_for_archived_gap():
+    """A gap_id matching an archived gap (fully moved to archived_gaps)
+    classifies as 'closed'."""
+    model = ProblemModel(
+        archived_gaps=[Gap(id="g-old", name="historical", status="closed")]
+    )
+    assert classify_gap_link("g-old", model) == "closed"
+
+
+def test_classify_gap_link_dangling_when_no_match():
+    """A gap_id that matches nothing — neither active gaps nor archived — is
+    'dangling'. This is the orphaned-gap conflict class."""
+    model = ProblemModel(gaps=[Gap(id="g-real", name="x")])
+    assert classify_gap_link("g-nonexistent", model) == "dangling"
+
+
+def test_classify_gap_link_dangling_on_empty_model():
+    """On a blank problem model every gap_id is dangling."""
+    assert classify_gap_link("g-anything", ProblemModel()) == "dangling"
+
+
+def test_classify_gap_link_pure_no_mutation():
+    """classify_gap_link must not mutate the model (pure read)."""
+    model = ProblemModel(gaps=[Gap(id="g-1", name="x", status="active")])
+    before = model.model_dump()
+    classify_gap_link("g-1", model)
+    assert model.model_dump() == before
+
+
+# ---------------------------------------------------------------------------
+# check_gap_id_write — write-time guard for direction gap_id linkage
+# ---------------------------------------------------------------------------
+
+
+def test_check_gap_id_write_no_error_for_valid_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-open", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write("g-open", pm)
+    assert err is None
+    assert open_ids == []
+
+
+def test_check_gap_id_write_no_error_for_blocked_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-blk", name="x", status="blocked")]).model_dump()
+    err, open_ids = check_gap_id_write("g-blk", pm)
+    assert err is None
+
+
+def test_check_gap_id_write_error_for_closed_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-done", name="x", status="closed")]).model_dump()
+    err, open_ids = check_gap_id_write("g-done", pm)
+    assert err == "closed"
+    assert open_ids == []  # no open gaps in this model
+
+
+def test_check_gap_id_write_error_for_dangling_gap():
+    pm = ProblemModel(gaps=[Gap(id="g-real", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write("g-ghost", pm)
+    assert err == "dangling"
+    assert open_ids == ["g-real"]  # the one open gap is surfaced
+
+
+def test_check_gap_id_write_open_ids_exclude_closed_gaps():
+    pm = ProblemModel(gaps=[
+        Gap(id="g-open1", name="a", status="active"),
+        Gap(id="g-closed", name="b", status="closed"),
+        Gap(id="g-open2", name="c", status="blocked"),
+    ]).model_dump()
+    err, open_ids = check_gap_id_write("g-ghost", pm)
+    assert err == "dangling"
+    assert sorted(open_ids) == ["g-open1", "g-open2"]
+
+
+def test_check_gap_id_write_no_gap_id_is_ok():
+    pm = ProblemModel(gaps=[Gap(id="g-x", name="x", status="active")]).model_dump()
+    err, open_ids = check_gap_id_write(None, pm)
+    assert err is None
+    err2, _ = check_gap_id_write("", pm)
+    assert err2 is None
+
+
+def test_check_gap_id_write_no_problem_model_skips_validation():
+    """When the project has no problem model, validation is skipped (fail-open)."""
+    err, open_ids = check_gap_id_write("g-anything", None)
+    assert err is None
+    assert open_ids == []
+
+
+def test_check_gap_id_write_malformed_model_skips_validation():
+    """A malformed problem model dict skips validation rather than raising."""
+    err, open_ids = check_gap_id_write("g-x", {"gaps": "not-a-list"})
+    assert err is None
+
+
+# ---------------------------------------------------------------------------
+# normalize_gap_active_moves
+# ---------------------------------------------------------------------------
+
+_NORM_NOW = "2026-07-04T00:00:00"
+
+
+def test_normalize_gap_active_moves_prunes_non_active():
+    """A paused/expired direction ID in active_moves is moved to past_moves."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-active", "d-paused"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, {"d-active"}, _NORM_NOW)
+    assert model.gaps[0].active_moves == ["d-active"]
+    assert "d-paused" in model.gaps[0].past_moves
+    assert any("d-paused" in c for c in corrections)
+
+
+def test_normalize_gap_active_moves_auto_defers_emptied_gap():
+    """A gap whose active_moves becomes empty is auto-deferred."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-old"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].active_moves == []
+    assert model.gaps[0].deferral is not None
+    assert model.gaps[0].deferral.created_at == _NORM_NOW
+    assert any("auto-deferred" in c for c in corrections)
+
+
+def test_normalize_gap_active_moves_preserves_existing_deferral():
+    """An existing deferral is not overwritten when active_moves empties."""
+    existing = GapDeferral(rationale="operator hold", created_at="2026-01-01T00:00:00")
+    gap = Gap(id="g-1", name="x", active_moves=["d-1"], deferral=existing)
+    model = ProblemModel(gaps=[gap])
+    normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].deferral.rationale == "operator hold"
+
+
+def test_normalize_gap_active_moves_no_change_when_all_active():
+    """No corrections when all active_moves IDs are in active_direction_ids."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-1", "d-2"])
+    model = ProblemModel(gaps=[gap])
+    corrections = normalize_gap_active_moves(model, {"d-1", "d-2"}, _NORM_NOW)
+    assert corrections == []
+    assert model.gaps[0].active_moves == ["d-1", "d-2"]
+
+
+def test_normalize_gap_active_moves_no_duplicate_past_moves():
+    """A stale ID already in past_moves is not duplicated."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-1"], past_moves=["d-1"])
+    model = ProblemModel(gaps=[gap])
+    normalize_gap_active_moves(model, set(), _NORM_NOW)
+    assert model.gaps[0].past_moves.count("d-1") == 1

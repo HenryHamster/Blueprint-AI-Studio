@@ -675,3 +675,97 @@ def _resident_session_availability(
     else:
         state = "ready"
     return {"available": enabled, "state": state, "reason": reason}
+
+
+def compute_model_integrity_conflicts(
+    problem_model: Any,
+    directions: Any,
+) -> dict | None:
+    """Compute integrity conflict classes from the live problem model.
+
+    Returns None when the model is clean (no conflicts). When conflicts exist,
+    returns a dict with three lists — orphaned_gaps, ungrounded_directions,
+    stale_active_moves — and aggregate counts.
+
+    Pure and side-effect-free; operates only on the data handed in.
+    """
+    pm = problem_model if isinstance(problem_model, dict) else {}
+    dirs = directions if isinstance(directions, list) else []
+
+    gaps: list[Any] = pm.get("gaps") if isinstance(pm.get("gaps"), list) else []
+
+    active_dirs = [
+        d for d in dirs
+        if isinstance(d, dict) and (d.get("status") or "active") == "active"
+    ]
+    active_dir_ids: set[str] = {str(d["id"]) for d in active_dirs if d.get("id")}
+    referenced_gap_ids: set[str] = {
+        str(d["gap_id"]) for d in active_dirs if d.get("gap_id")
+    }
+    active_gap_ids: set[str] = {
+        str(g["id"])
+        for g in gaps
+        if isinstance(g, dict) and g.get("id") and g.get("status") == "active"
+    }
+
+    # 1. Open gaps with no active direction linked and no explicit deferral.
+    orphaned_gaps: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        gap_id = str(g.get("id") or "")
+        if not gap_id or g.get("deferral"):
+            continue
+        if gap_id not in referenced_gap_ids:
+            orphaned_gaps.append({
+                "id": gap_id,
+                "name": str(g.get("name") or "")[:80],
+                "status": g.get("status") or "active",
+            })
+
+    # 2. Active directions whose gap_id is absent or points to a non-active gap.
+    ungrounded_directions: list[dict] = []
+    for d in active_dirs:
+        gap_id = d.get("gap_id")
+        if not gap_id or str(gap_id) not in active_gap_ids:
+            ungrounded_directions.append({
+                "id": str(d.get("id") or ""),
+                "text": str(d.get("text") or "")[:120],
+                "gap_id": str(gap_id) if gap_id else None,
+                "reason": "no_gap_id" if not gap_id else "gap_not_active",
+            })
+
+    # 3. Gaps whose active_moves list cites direction IDs that are no longer active.
+    stale_active_moves: list[dict] = []
+    for g in gaps:
+        if not isinstance(g, dict) or g.get("status") not in ("active", "blocked"):
+            continue
+        gap_id = str(g.get("id") or "")
+        active_moves = g.get("active_moves")
+        if not isinstance(active_moves, list) or not active_moves:
+            continue
+        stale_ids = [
+            m for m in active_moves
+            if isinstance(m, str) and m not in active_dir_ids
+        ]
+        if stale_ids:
+            stale_active_moves.append({
+                "gap_id": gap_id,
+                "gap_name": str(g.get("name") or "")[:80],
+                "stale_direction_ids": stale_ids[:8],
+            })
+
+    if not orphaned_gaps and not ungrounded_directions and not stale_active_moves:
+        return None
+
+    return {
+        "orphaned_gaps": orphaned_gaps,
+        "ungrounded_directions": ungrounded_directions,
+        "stale_active_moves": stale_active_moves,
+        "counts": {
+            "orphaned_gaps": len(orphaned_gaps),
+            "ungrounded_directions": len(ungrounded_directions),
+            "stale_active_moves": len(stale_active_moves),
+            "total": len(orphaned_gaps) + len(ungrounded_directions) + len(stale_active_moves),
+        },
+    }

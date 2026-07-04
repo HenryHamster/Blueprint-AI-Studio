@@ -972,6 +972,26 @@ export interface StrategicStateResponse {
     stale?: boolean | null;
     stale_reason?: string | null;
   } | null;
+  model_integrity?: {
+    orphaned_gaps: Array<{ id: string; name: string; status: string }>;
+    ungrounded_directions: Array<{
+      id: string;
+      text: string;
+      gap_id: string | null;
+      reason: 'no_gap_id' | 'gap_not_active' | string;
+    }>;
+    stale_active_moves: Array<{
+      gap_id: string;
+      gap_name: string;
+      stale_direction_ids: string[];
+    }>;
+    counts: {
+      orphaned_gaps: number;
+      ungrounded_directions: number;
+      stale_active_moves: number;
+      total: number;
+    };
+  } | null;
 }
 
 export async function fetchStrategicState(

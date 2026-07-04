@@ -95,6 +95,7 @@ from app.strategic_state_read_model import (
     _strategic_refresh_summary,
     _task_summary,
     _build_task_focus,
+    compute_model_integrity_conflicts,
 )
 from app.work_session_check_in import (
     _CHECK_IN_EVENT_TYPE,
@@ -1202,6 +1203,11 @@ async def get_project_strategic_state(
     else:
         sha_freshness = _build_unknown_freshness_block()
 
+    model_integrity = compute_model_integrity_conflicts(
+        project.problem_model,
+        project.directions,
+    )
+
     return {
         "project_id": str(project.id),
         "strategic": {
@@ -1264,6 +1270,7 @@ async def get_project_strategic_state(
             else None,
         },
         "sha_freshness": sha_freshness,
+        "model_integrity": model_integrity,
     }
 
 

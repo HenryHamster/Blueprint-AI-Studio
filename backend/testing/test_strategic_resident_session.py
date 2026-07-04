@@ -52,7 +52,7 @@ from app.strategic_resident_session import (
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
 )
-from app.strategic_state_read_model import _resident_session_availability
+from app.strategic_state_read_model import _resident_session_availability, compute_model_integrity_conflicts
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
     strategic_local_continuation_status_from_vision,
@@ -2246,3 +2246,98 @@ async def test_born_context_unpinned_when_no_runner():
     assert ctx["strategic_session_id"] == "ss-nopin"
     assert "preferred_runner_target_id" not in ctx
     assert srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
+
+
+# ---------------------------------------------------------------------------
+# compute_model_integrity_conflicts unit tests
+# ---------------------------------------------------------------------------
+
+def _make_gap(id: str, name: str, status: str = "active", active_moves: list | None = None, deferral: dict | None = None) -> dict:
+    g: dict = {"id": id, "name": name, "status": status}
+    if active_moves is not None:
+        g["active_moves"] = active_moves
+    if deferral is not None:
+        g["deferral"] = deferral
+    return g
+
+
+def _make_dir(id: str, text: str, gap_id: str | None = None, status: str = "active") -> dict:
+    d: dict = {"id": id, "text": text, "status": status}
+    if gap_id is not None:
+        d["gap_id"] = gap_id
+    return d
+
+
+def test_compute_model_integrity_conflicts_clean_model_returns_none():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_empty_model_returns_none():
+    assert compute_model_integrity_conflicts({}, []) is None
+    assert compute_model_integrity_conflicts(None, None) is None
+
+
+def test_compute_model_integrity_conflicts_orphaned_gap():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1")]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id=None)]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    assert len(result["orphaned_gaps"]) == 1
+    assert result["orphaned_gaps"][0]["id"] == "g-1"
+    assert result["counts"]["orphaned_gaps"] == 1
+    assert result["counts"]["total"] >= 1
+
+
+def test_compute_model_integrity_conflicts_deferred_gap_not_orphaned():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", deferral={"reason": "parked"})]}
+    dirs = []
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_ungrounded_direction_no_gap():
+    pm = {"gaps": []}
+    dirs = [_make_dir("d-1", "Active direction with no gap")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"]
+    assert len(ud) == 1
+    assert ud[0]["id"] == "d-1"
+    assert ud[0]["reason"] == "no_gap_id"
+    assert ud[0]["gap_id"] is None
+
+
+def test_compute_model_integrity_conflicts_ungrounded_direction_closed_gap():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", status="closed")]}
+    dirs = [_make_dir("d-1", "Direction", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"]
+    assert len(ud) == 1
+    assert ud[0]["reason"] == "gap_not_active"
+    assert ud[0]["gap_id"] == "g-1"
+
+
+def test_compute_model_integrity_conflicts_stale_active_moves():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-old", "d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    sam = result["stale_active_moves"]
+    assert len(sam) == 1
+    assert sam[0]["gap_id"] == "g-1"
+    assert "d-old" in sam[0]["stale_direction_ids"]
+    assert "d-1" not in sam[0]["stale_direction_ids"]
+
+
+def test_compute_model_integrity_conflicts_paused_direction_not_active():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-paused"])]}
+    dirs = [_make_dir("d-paused", "Paused dir", gap_id="g-1", status="paused")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    # d-paused is paused, so it is not in active_dir_ids → stale_active_moves
+    assert len(result["stale_active_moves"]) == 1
+    # g-1 is not referenced by any active direction → orphaned
+    assert len(result["orphaned_gaps"]) == 1
+    assert result["counts"]["total"] >= 2

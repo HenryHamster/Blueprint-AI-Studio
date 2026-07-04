@@ -40,7 +40,7 @@ from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
 )
-from app.problem_model import compute_model_size_signal, ProblemModel
+from app.problem_model import check_gap_id_write, compute_model_size_signal, ProblemModel
 
 logger = logging.getLogger(__name__)
 
@@ -341,6 +341,14 @@ async def add_direction(
             status_code=400,
             detail=f"category must be one of: {sorted(VALID_CATEGORIES)}",
         )
+
+    if payload.gap_id:
+        _gap_err, _open_ids = check_gap_id_write(payload.gap_id, project.problem_model)
+        if _gap_err:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+            )
 
     from app.shared_state import runtime_config as _runtime_config
 
@@ -821,6 +829,13 @@ async def update_direction(
             status_code=400,
             detail="gap_id must be a string of at most 100 characters",
         )
+    if "gap_id" in payload and payload["gap_id"] is not None:
+        _gap_err, _open_ids = check_gap_id_write(payload["gap_id"], project.problem_model)
+        if _gap_err:
+            raise HTTPException(
+                status_code=400,
+                detail={"error": "gap_link_invalid", "reason": _gap_err, "open_gap_ids": _open_ids},
+            )
 
     # Resolve and validate the staging TARGET version. Triggered both when a
     # direction transitions to ``staged`` AND when an already-staged direction is
