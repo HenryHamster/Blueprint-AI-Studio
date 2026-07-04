@@ -1,4 +1,5 @@
 {
+  "description": "Reviewed backend websocket emitter inventory. Line numbers are informational; tests compare stable fields only.",
   "emitters": [
     {
       "callee": "broadcast_to_project",
@@ -3463,11 +3464,11 @@
       "event": "strategic_cycle_started",
       "event_expression": null,
       "event_is_literal": true,
-      "lineno": 7081,
+      "lineno": 5228,
       "notes": "",
       "occurrence": 1,
       "payload_arg_kind": "none",
-      "scope": "_spawn_strategic_review",
+      "scope": "_finalize_strategic_review_spawn",
       "source_path": "backend/app/strategic_spawning.py",
       "workbench_action": null,
       "workbench_resource": null
