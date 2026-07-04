@@ -107,7 +107,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
   }, [fetchDirectionsRef]);
 
   async function fetchDirections({ lite = false }: { lite?: boolean } = {}) {
-    setLoading(true);
+    if (!lite) setLoading(true);
     try {
       const baseUrl = `/api/admin/projects/${selectedProjectId}/directions`;
       const directionsUrl = lite ? `${baseUrl}?lite=1` : baseUrl;
@@ -153,7 +153,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
       console.error('Failed to fetch directions:', err);
       addToast('Failed to load directions', 'error');
     }
-    setLoading(false);
+    if (!lite) setLoading(false);
   }
 
   async function triggerCycle(phase: 'design_doc' | 'strategic_review' | 'full') {

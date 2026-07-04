@@ -1682,6 +1682,7 @@ export default function App() {
           }}
           flow={{
             tasks: filteredTasks,
+            loading: s.initialLoading,
             hasActiveFilters,
             onViewLogs: handleOpenTaskDetails,
             onNavigateToParent: (parentTaskId) => {

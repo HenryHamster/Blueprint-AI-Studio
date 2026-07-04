@@ -389,6 +389,7 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
   const [body, setBody] = useState<string | null>(null);
   const [releaseEvidence, setReleaseEvidence] = useState<LiveReleaseEvidence | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const projectId = task.project_id;
   const docId = doc?.id;
 
@@ -400,12 +401,13 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
     setExpanded(next);
     if (next && body === null && projectId && docId) {
       setLoading(true);
+      setError(null);
       fetchKnowledgeDocument(projectId, docId)
         .then(full => {
           setBody(full.body ?? '');
           setReleaseEvidence(full.release_evidence ?? null);
         })
-        .catch(() => setBody(''))
+        .catch(() => setError('Failed to load document body.'))
         .finally(() => setLoading(false));
     }
   };
@@ -489,7 +491,9 @@ export function KnowledgeDocumentSection({ task }: { task: Task }) {
         {expanded && (
           loading
             ? <p className="text-xs text-neutral-600">Loading document…</p>
-            : <div className="border-t border-violet-900/30 pt-2 text-sm text-neutral-200"><MarkdownContent content={body ?? ''} /></div>
+            : error
+              ? <p className="text-xs text-red-400">{error}</p>
+              : <div className="border-t border-violet-900/30 pt-2 text-sm text-neutral-200"><MarkdownContent content={body ?? ''} /></div>
         )}
       </div>
     </>

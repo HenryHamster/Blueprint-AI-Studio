@@ -202,6 +202,7 @@ const {
   RESEARCH_PLAN_EXPORT_NAMES: [
     'CAPABILITY_DECLARATION_DOC',
     'PR_INELIGIBLE_TASK_TYPES',
+    'QUALIFICATION_STATE_VOCAB',
     'aggregateDirectionStats',
     'buildAvailableCapabilitiesSection',
     'buildCapabilityVerificationSection',
@@ -427,6 +428,7 @@ vi.mock('./research-plan.js', () => ({
   buildUserPausedSection: () => '',
   buildVersionPhaseSection: () => '',
   buildMemoCitationsSection: () => '',
+  QUALIFICATION_STATE_VOCAB: new Set<string>(),
   resolveMemoHandles: () => [],
   buildEfficiencySnapshotSection: () => '',
   // Echo the authoritative active-total arg so wiring tests can assert the
@@ -1613,6 +1615,40 @@ describe('handleStrategic executor prompt: proposed acceptance criteria handoff'
   afterEach(() => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockReturnValue('');
+  });
+
+  it('retries_when_proposed_acceptance_criteria_handoff_missing', async () => {
+    const taskId = 'task-criteria-retry';
+    const criteriaPath = `/tmp/proposed_criteria_${taskId}.json`;
+    const criteriaPayload = '{"criteria":[{"text":"Users can promote only when canonical criteria pass."}]}';
+    vi.mocked(fs.existsSync).mockImplementation(
+      (path: Parameters<typeof fs.existsSync>[0]) => String(path) === criteriaPath,
+    );
+    vi.mocked(fs.readFileSync as (path: string, encoding: string) => string).mockImplementation(
+      (path: string) => (path === criteriaPath ? criteriaPayload : ''),
+    );
+    vi.mocked(runClaudeCode)
+      .mockResolvedValueOnce({
+        exitCode: 0,
+        allOutput: './strategic set-problem-model\n./strategic set-running-update\n./strategic set-retirement-critiques\nProblem model set at revision 42.',
+        lastResultText: 'Commands ran successfully.',
+      })
+      .mockResolvedValueOnce({ exitCode: 0, allOutput: '', lastResultText: '' });
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    expect(vi.mocked(runClaudeCode).mock.calls).toHaveLength(2);
+    const retryPrompt = vi.mocked(runClaudeCode).mock.calls[1]?.[0];
+    expect(retryPrompt).toContain('./strategic set-acceptance-criteria');
   });
 
   it('injects the proposed criteria block and conditional command when the thinker wrote a non-empty file', async () => {

@@ -1117,12 +1117,18 @@ ${proposedCriteriaBlock}
         /"op"\s*:\s*"set_retirement_critiques"/.test(allOutput)
         || /\.\/strategic\s+set-retirement-critiques\b/.test(allOutput)
         || /Retirement critiques recorded/i.test(allOutput);
+      const acceptanceCriteriaSetInOutput =
+        /"op"\s*:\s*"set_acceptance_criteria"/.test(allOutput)
+        || /\.\/strategic\s+set-acceptance-criteria\b/.test(allOutput)
+        || /Acceptance criteria recorded/i.test(allOutput);
+      const proposedCriteriaRequired = proposedCriteriaBlock.length > 0;
 
-      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput || !retirementCritiquesSetInOutput)) {
+      if (exitCode === 0 && (!problemModelSetInOutput || !runningUpdateSetInOutput || !retirementCritiquesSetInOutput || (proposedCriteriaRequired && !acceptanceCriteriaSetInOutput))) {
         const missing: string[] = [];
         if (!problemModelSetInOutput) missing.push('./strategic set-problem-model');
         if (!runningUpdateSetInOutput) missing.push('./strategic set-running-update');
         if (!retirementCritiquesSetInOutput) missing.push('./strategic set-retirement-critiques');
+        if (proposedCriteriaRequired && !acceptanceCriteriaSetInOutput) missing.push('./strategic set-acceptance-criteria');
         sendLog(ws, `\n[WARNING] Strategic executor completed but required calls missing: ${missing.join(', ')}. Retrying...\n`);
         const retryInstructions = [
           'Your previous attempt did not call one or more REQUIRED commands.',
@@ -1133,6 +1139,7 @@ ${proposedCriteriaBlock}
           !problemModelSetInOutput ? `- ./strategic set-problem-model "$(cat /tmp/problem_model_${taskId}.json)"  (if file missing: ${problemModelRecovery === 'fetch' ? 'run `./fetch problem-model` and edit the full model — NEVER construct a cold-start bootstrap, it wipes durable state' : 'construct from analysis grounded in the managed project — NEVER self-describe'})` : '',
           !runningUpdateSetInOutput ? `- ./strategic set-running-update /tmp/running_update_${taskId}.md  (if file missing: write a single clean markdown doc to that path first — describe the managed project's current state, NEVER self-describe)` : '',
           !retirementCritiquesSetInOutput ? `- ./strategic set-retirement-critiques '[{"direction_id":"d-xxx","what_it_addressed":"...","pattern_that_produced_it":"...","lesson":"..."}]'  OR  ./strategic set-retirement-critiques '{"no_eligible_retirements": true}'  (one of these two payloads, depending on whether there are retired directions to critique)` : '',
+          proposedCriteriaRequired && !acceptanceCriteriaSetInOutput ? `- ./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"` : '',
           '',
           'Nothing else.',
         ].filter(Boolean).join('\n');
