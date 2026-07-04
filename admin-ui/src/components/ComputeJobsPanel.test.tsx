@@ -21,6 +21,7 @@ const fetchKnowledgeDocument = vi.fn();
 const resolveArtifactDownloadUrl = vi.fn();
 const fetchComputeJobsAggregateSummary = vi.fn();
 const fetchHeldComputeExperiments = vi.fn();
+const fetchAwaitingLocalRunnerHolds = vi.fn();
 const fetchComputeSweepGroups = vi.fn();
 const rerunComputeExperiment = vi.fn();
 const askComputeJob = vi.fn();
@@ -39,6 +40,7 @@ vi.mock('../api', async () => {
     resolveArtifactDownloadUrl: (...args: unknown[]) => resolveArtifactDownloadUrl(...args),
     fetchComputeJobsAggregateSummary: (...args: unknown[]) => fetchComputeJobsAggregateSummary(...args),
     fetchHeldComputeExperiments: (...args: unknown[]) => fetchHeldComputeExperiments(...args),
+    fetchAwaitingLocalRunnerHolds: (...args: unknown[]) => fetchAwaitingLocalRunnerHolds(...args),
     fetchComputeSweepGroups: (...args: unknown[]) => fetchComputeSweepGroups(...args),
     rerunComputeExperiment: (...args: unknown[]) => rerunComputeExperiment(...args),
     askComputeJob: (...args: unknown[]) => askComputeJob(...args),
@@ -219,7 +221,9 @@ describe('ComputeJobsPanel render + kill', () => {
     resolveArtifactDownloadUrl.mockReset();
     fetchComputeJobsAggregateSummary.mockReset();
     fetchHeldComputeExperiments.mockReset();
+    fetchAwaitingLocalRunnerHolds.mockReset();
     fetchComputeSweepGroups.mockReset();
+    rerunComputeExperiment.mockReset();
     askComputeJob.mockReset();
     vi.restoreAllMocks();
   });
@@ -2233,6 +2237,79 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(queryByTestId('held-experiments-section')).toBeNull();
   });
 
+  test('renders awaiting-local-runner section with title, spend cap, and waiting indicator', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    // Held ~5 minutes ago so the duration formats to a stable "5m" scale
+    // regardless of the second-or-two of test drift.
+    const since = new Date(Date.now() - 300_000).toISOString();
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([
+      {
+        id: 'task-await-1',
+        title: 'local sweep: qlora',
+        awaiting_local_runner_since: since,
+        created_at: since,
+        requires_approval: false,
+        spend_cap_usd: 8.5,
+        command: 'python train.py',
+        machine_type: null,
+        accelerator: null,
+        container_image: null,
+        provisioning_model: null,
+        deadline_seconds: null,
+      },
+    ]);
+    const { findByTestId, findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const section = await findByTestId('awaiting-local-runner-section');
+    expect(section.textContent).toContain('local sweep: qlora');
+    expect(await findByText(/\$8\.50/)).toBeTruthy();
+    const waiting = await findByTestId('awaiting-local-runner-waiting');
+    expect(waiting.textContent).toContain('waiting for local runner');
+    expect(waiting.textContent).toMatch(/since .*ago/);
+    expect(waiting.textContent).toContain('5m');
+  });
+
+  test('awaiting-local-runner section is absent when no holds exist', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+    fetchAwaitingLocalRunnerHolds.mockResolvedValue([]);
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('No compute jobs');
+    expect(queryByTestId('awaiting-local-runner-section')).toBeNull();
+  });
+
+  test('awaiting-local-runner waiting indicator advances as the 1s clock ticks', async () => {
+    vi.useFakeTimers();
+    try {
+      const base = new Date('2026-07-04T00:00:00.000Z').getTime();
+      vi.setSystemTime(base);
+      fetchComputeJobs.mockResolvedValue(wrapJobs([]));
+      fetchAwaitingLocalRunnerHolds.mockResolvedValue([
+        {
+          id: 'task-await-2',
+          title: 'local sweep: clock',
+          awaiting_local_runner_since: new Date(base - 10_000).toISOString(),
+          created_at: new Date(base - 10_000).toISOString(),
+          requires_approval: false,
+          spend_cap_usd: null,
+          command: null,
+          machine_type: null,
+          accelerator: null,
+          container_image: null,
+          provisioning_model: null,
+          deadline_seconds: null,
+        },
+      ]);
+      const { getByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+      // Flush the leading poller promise so the hold state is applied.
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+      expect(getByTestId('awaiting-local-runner-waiting').textContent).toContain('10s');
+      // The local 1s clock should advance the live duration.
+      await act(async () => { vi.advanceTimersByTime(5_000); });
+      expect(getByTestId('awaiting-local-runner-waiting').textContent).toContain('15s');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test('renders View in Library button when knowledge doc present and onNavigateToKnowledge is provided, calls it with doc id', async () => {
     const terminal = makeJob({
       status: 'SUCCEEDED',
@@ -2520,6 +2597,30 @@ describe('ComputeJobsPanel render + kill', () => {
     await findByTestId('rerun-inline-panel');
     await act(async () => { (await findByTestId('rerun-submit')).click(); });
     expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
+  });
+
+  test('surfaces compute re-run response and held approval state', async () => {
+    rerunComputeExperiment.mockResolvedValue({ id: 'new-task-xyz', status: 'QUEUED', requires_approval: true });
+    const terminal = makeJob({
+      status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0, task_id: 'task-1',
+      spend_cap_usd: 4.0,
+      success_criterion: { metric: 'acc', operator: '>=' as const, threshold: 0.9 },
+    });
+    // Set default mock to return the terminal job for all subsequent load() calls after the initial render
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    // First call during render will use this override
+    fetchComputeJobs.mockResolvedValueOnce(wrapJobs([terminal]));
+    const { findByRole, findByTestId, getByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByRole('button', { name: 'Run analysis' });
+    await act(async () => { (await findByRole('button', { name: 'Re-run' })).click(); });
+    await findByTestId('rerun-inline-panel');
+    await act(async () => { (await findByTestId('rerun-submit')).click(); });
+    expect(rerunComputeExperiment).toHaveBeenCalledWith('task-1', expect.objectContaining({ spend_cap_usd: 4.0 }));
+    // Verify the new task id is displayed
+    await findByTestId('rerun-inline-panel');
+    expect(getByText('new-task-xyz')).toBeTruthy();
+    // Verify the approval requirement is displayed
+    expect(getByText('Held for approval')).toBeTruthy();
   });
 
   test('arms breakdown shows per-arm pass/fail chip and cost when per_arm_verdicts present', async () => {

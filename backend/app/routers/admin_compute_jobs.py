@@ -32,6 +32,10 @@ from app.compute_jobs_aggregation import (
 from app.database import get_session
 from app.models import Artifact, ComputeJob, ComputeJobStatus, LocalRunner, Task
 from app.schemas import serialize_compute_job_response_safe
+from app.strategic_runtime_work import (
+    local_runner_hold_task_filters,
+    task_awaiting_local_runner_since,
+)
 from app.task_evaluators import (
     _declared_success_criterion,
     evaluate_compute_success_criterion,
@@ -353,6 +357,84 @@ async def get_project_compute_jobs(
         "offset": offset,
         "summary": summary,
     }
+
+
+def _awaiting_local_runner_entry(task: Task) -> Dict[str, Any]:
+    """Serialize a compute_experiment task held awaiting a local runner.
+
+    These tasks have NO ComputeJob row (the orchestrator holds them QUEUED
+    before any job is created), so this is the only surface that exposes them.
+    The response shape is a stable contract the compute-workspace UI depends on:
+
+        {
+          "id": str,                            # task id
+          "title": str | None,
+          "awaiting_local_runner_since": str,   # ISO stamp from task.context
+          "created_at": str | None,             # ISO
+          "requires_approval": bool,
+          "spend_cap_usd": float | None,        # launch essentials from payload
+          "command": str | None,
+          "machine_type": str | None,
+          "accelerator": str | None,
+          "container_image": str | None,
+          "provisioning_model": str | None,
+          "deadline_seconds": int | None,
+        }
+    """
+    fp = task.first_payload
+    raw_spend = fp.get("spend_cap_usd")
+    raw_deadline = fp.get("deadline_seconds")
+    return {
+        "id": str(task.id),
+        "title": task.title,
+        "awaiting_local_runner_since": task_awaiting_local_runner_since(task),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "requires_approval": bool(task.requires_approval),
+        "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
+        "command": fp.get("command") or None,
+        "machine_type": fp.get("machine_type") or None,
+        "accelerator": fp.get("accelerator") or None,
+        "container_image": fp.get("container_image") or None,
+        "provisioning_model": fp.get("provisioning_model") or None,
+        "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
+    }
+
+
+@router.get("/projects/{project_id}/compute-jobs/awaiting-local-runner")
+async def get_project_awaiting_local_runner_holds(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """List compute_experiment tasks held QUEUED awaiting a local runner (viewer+).
+
+    When project policy requires local execution and no eligible runner is live,
+    the orchestrator holds a ``compute_experiment`` task in QUEUED with an
+    ``awaiting_local_runner_since`` stamp on ``task.context`` and never creates a
+    ComputeJob row. The regular ``/compute-jobs`` listing only surfaces ComputeJob
+    rows, so these blocked experiments are otherwise invisible in the workspace.
+
+    Returns a JSON list (newest ``created_at`` first). The filter is the shared
+    ``local_runner_hold_task_filters`` predicate: QUEUED, not archived,
+    ``requires_approval`` is not True, payload type ``compute_experiment``, and a
+    non-empty awaiting stamp. Each entry's shape is documented on
+    ``_awaiting_local_runner_entry`` and is a stable contract for the UI.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "viewer"
+    )
+    rows = (
+        (
+            await session.execute(
+                select(Task)
+                .where(*local_runner_hold_task_filters(project_id))
+                .order_by(Task.created_at.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_awaiting_local_runner_entry(task) for task in rows]
 
 
 @router.get("/projects/{project_id}/compute-jobs/summary")

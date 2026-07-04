@@ -3393,6 +3393,43 @@ export async function fetchHeldComputeExperiments(
   return Array.isArray(data) ? data : (data.tasks ?? []);
 }
 
+/**
+ * A compute_experiment task held QUEUED because project policy requires local
+ * execution and no eligible runner is live. These tasks have NO ComputeJob row,
+ * so this is the only surface that exposes them. Shape mirrors the backend
+ * `_awaiting_local_runner_entry` contract in admin_compute_jobs.py.
+ */
+export interface AwaitingLocalRunnerHold {
+  id: string;
+  title: string | null;
+  awaiting_local_runner_since: string;
+  created_at: string | null;
+  requires_approval: boolean;
+  spend_cap_usd: number | null;
+  command: string | null;
+  machine_type: string | null;
+  accelerator: string | null;
+  container_image: string | null;
+  provisioning_model: string | null;
+  deadline_seconds: number | null;
+}
+
+export async function fetchAwaitingLocalRunnerHolds(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<AwaitingLocalRunnerHold[]> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/compute-jobs/awaiting-local-runner`,
+    undefined,
+    2,
+    20000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch awaiting-local-runner holds: ${res.status}`);
+  const data = await res.json();
+  return Array.isArray(data) ? data : [];
+}
+
 export async function fetchComputeJobs(
   projectId: string,
   signal?: AbortSignal,

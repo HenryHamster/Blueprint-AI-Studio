@@ -422,7 +422,11 @@ export function useLogViewer({
         const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
       }
-      if (projectEventApplies && (msg.event === 'task_updated' || msg.event === 'artifact_created')) {
+      if (projectEventApplies && (
+        msg.event === 'task_updated'
+        || msg.event === 'artifact_created'
+        || refetchSurfaces.has('pipeline')
+      )) {
         if (fetchTasksDebounceRef.current) clearTimeout(fetchTasksDebounceRef.current);
         fetchTasksDebounceRef.current = setTimeout(() => { fetchTasksRef.current(); }, 500);
       }

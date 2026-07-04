@@ -81,6 +81,7 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
     patchAdminSettings: vi.fn(),
     setWarmPoolTargetForProject: vi.fn(),
     fetchHeldComputeExperiments: vi.fn(),
+    fetchAwaitingLocalRunnerHolds: vi.fn(),
     fetchComputeJobs: vi.fn(),
     fetchComputeJobsPaged: vi.fn(),
     fetchComputeSweepGroups: vi.fn(),

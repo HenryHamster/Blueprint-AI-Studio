@@ -55,7 +55,7 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
     });
-    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
+    return { lv, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
   });
 }
 
@@ -108,6 +108,35 @@ describe('useLogViewer strategist events', () => {
     act(() => { vi.advanceTimersByTime(500); });
 
     expect(refreshMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it('routes pipeline refetch envelopes to the task refresh path', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+    const fetchTasks = result.current.fetchTasksRef.current as ReturnType<typeof vi.fn>;
+    fetchTasks.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'pipeline_refetched',
+        data: {
+          schema_version: 1,
+          project_id: 'proj-live',
+          resource: 'pipeline',
+          action: 'updated',
+          refetch: { surfaces: ['pipeline'] },
+        },
+      });
+    });
+    act(() => { vi.advanceTimersByTime(500); });
+
+    expect(fetchTasks).toHaveBeenCalledTimes(1);
   });
 
   it('waits for realtime auth readiness before connecting the selected project websocket', async () => {

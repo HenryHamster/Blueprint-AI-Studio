@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
-import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
@@ -577,6 +577,45 @@ function budgetBarClass(pct: number): string {
   return 'bg-sky-500';
 }
 
+function AwaitingLocalRunnerSection({
+  holds,
+  nowMs,
+}: {
+  holds: AwaitingLocalRunnerHold[];
+  nowMs: number;
+}) {
+  if (!holds || holds.length === 0) return null;
+
+  return (
+    <div className="mb-3" data-testid="awaiting-local-runner-section">
+      <div className="text-ui-sm font-semibold text-amber-300 uppercase tracking-widest mb-1.5 flex items-center gap-1.5">
+        <AlertTriangle className="w-3 h-3 shrink-0" />
+        Waiting for local runner
+      </div>
+      <div className="flex flex-col gap-1.5">
+        {holds.map((hold) => {
+          const capLabel = hold.spend_cap_usd != null ? ` · $${Number(hold.spend_cap_usd).toFixed(2)}` : '';
+          const waitingMs = Date.parse(hold.awaiting_local_runner_since);
+          const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
+          return (
+            <div
+              key={hold.id}
+              className="rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2"
+              data-testid="awaiting-local-runner-row"
+            >
+              <div className="text-xs font-semibold text-amber-200 break-words">{hold.title ?? hold.id}{capLabel}</div>
+              <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="awaiting-local-runner-waiting">
+                waiting for local runner
+                {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function HeldExperimentsSection({
   experiments,
   onApprove,
@@ -707,6 +746,7 @@ interface ComputeJobsPanelProps {
 export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onCloneExperiment, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
+  const [awaitingHolds, setAwaitingHolds] = useState<AwaitingLocalRunnerHold[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [summary, setSummary] = useState<ComputeJobsSummary | null>(null);
   const [lifetimeSummary, setLifetimeSummary] = useState<ComputeJobsSummary | null>(null);
@@ -726,6 +766,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     criterion: { metric: string; operator: ComputeSuccessOperator } | null;
     submitting: boolean;
     error: string | null;
+    result?: { id: string; status?: string; requires_approval?: boolean };
   } | null>(null);
   const [analysisFeedback, setAnalysisFeedback] = useState<Record<string, { kind: 'running' | 'upgraded' | 'analysis_unavailable' | 'error'; message: string }>>({});
   const [analysisDocs, setAnalysisDocs] = useState<Record<string, KnowledgeDocument>>({});
@@ -804,6 +845,22 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
   );
 
+  // Poll compute_experiment tasks held QUEUED awaiting a local runner every 30s.
+  // These have no ComputeJob row, so this endpoint is the only surface for them.
+  usePoller(
+    async (signal) => {
+      if (!projectId) return;
+      try {
+        const holds = await fetchAwaitingLocalRunnerHolds(projectId, signal);
+        setAwaitingHolds(Array.isArray(holds) ? holds : []);
+      } catch (e) {
+        if (e instanceof Error && e.name === 'AbortError') return;
+        // Non-fatal: awaiting-local-runner section is supplementary
+      }
+    },
+    { intervalMs: 30_000, enabled: !!projectId, deps: [projectId] },
+  );
+
   // Poll sweep-grouped knowledge docs every 60s — complementary to the live job
   // poll, uses durable knowledge documents so changes are infrequent.
   usePoller(
@@ -844,13 +901,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
     }
   }, [jobs, projectId, knowledgeDocs]);
 
-  // Local 1s clock drives the live deadline countdowns between polls.
+  // Local 1s clock drives the live deadline countdowns between polls, plus the
+  // "waiting for local runner since … ago" indicator for awaiting-runner holds.
   const hasActive = jobs.some(isComputeJobActive);
+  const needsClock = hasActive || awaitingHolds.length > 0;
   useEffect(() => {
-    if (!hasActive) return;
+    if (!needsClock) return;
     const id = setInterval(() => setNowMs(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [hasActive]);
+  }, [needsClock]);
 
   const handleKill = useCallback(
     (job: ComputeJob) => {
@@ -956,8 +1015,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           threshold: parseFloat(rerunState.threshold),
         };
       }
-      await rerunComputeExperiment(rerunState.taskId, body);
-      setRerunState(null);
+      const response = await rerunComputeExperiment(rerunState.taskId, body);
+      setRerunState((prev) => prev ? { ...prev, submitting: false, result: response } : prev);
       await load();
     } catch (e) {
       setRerunState((prev) => prev ? { ...prev, submitting: false, error: e instanceof Error ? e.message : 'Re-run failed' } : prev);
@@ -1121,6 +1180,8 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
           </div>
         </div>
       )}
+
+      <AwaitingLocalRunnerSection holds={awaitingHolds} nowMs={nowMs} />
 
       <HeldExperimentsSection
         experiments={heldExperiments}
@@ -1377,66 +1438,92 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                       )}
                       {rerunState?.jobId === job.id ? (
                         <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
-                          <div className="font-semibold text-sky-200">Re-run with adjustments</div>
-                          <div className="flex flex-wrap gap-2">
-                            <label className="flex flex-col gap-0.5">
-                              <span className="text-neutral-400">Spend cap (USD)</span>
-                              <input
-                                type="number"
-                                min="0.01"
-                                step="0.01"
-                                value={rerunState.spendCap}
-                                onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
-                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                data-testid="rerun-spend-cap"
-                              />
-                            </label>
-                            <label className="flex flex-col gap-0.5">
-                              <span className="text-neutral-400">Deadline (sec)</span>
-                              <input
-                                type="number"
-                                min="1"
-                                step="1"
-                                value={rerunState.deadlineSec}
-                                onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
-                                className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                data-testid="rerun-deadline-sec"
-                              />
-                            </label>
-                            {rerunState.criterion && (
-                              <label className="flex flex-col gap-0.5">
-                                <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
-                                <input
-                                  type="number"
-                                  step="any"
-                                  value={rerunState.threshold}
-                                  onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
-                                  className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
-                                  data-testid="rerun-threshold"
-                                />
-                              </label>
-                            )}
-                          </div>
-                          {rerunState.error && (
-                            <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                          {rerunState.result ? (
+                            <>
+                              <div className="font-semibold text-emerald-200">Re-run launched</div>
+                              <div className="flex flex-col gap-1.5">
+                                <div>
+                                  <span className="text-neutral-400">New task ID:</span>{' '}
+                                  <span className="text-emerald-300 font-mono">{rerunState.result.id}</span>
+                                </div>
+                                {rerunState.result.requires_approval && (
+                                  <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1">
+                                    <span className="text-amber-300">Held for approval</span>
+                                  </div>
+                                )}
+                              </div>
+                              <button
+                                onClick={() => setRerunState(null)}
+                                className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm w-fit"
+                                data-testid="rerun-result-close"
+                              >
+                                Close
+                              </button>
+                            </>
+                          ) : (
+                            <>
+                              <div className="font-semibold text-sky-200">Re-run with adjustments</div>
+                              <div className="flex flex-wrap gap-2">
+                                <label className="flex flex-col gap-0.5">
+                                  <span className="text-neutral-400">Spend cap (USD)</span>
+                                  <input
+                                    type="number"
+                                    min="0.01"
+                                    step="0.01"
+                                    value={rerunState.spendCap}
+                                    onChange={(e) => setRerunState((p) => p ? { ...p, spendCap: e.target.value } : p)}
+                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    data-testid="rerun-spend-cap"
+                                  />
+                                </label>
+                                <label className="flex flex-col gap-0.5">
+                                  <span className="text-neutral-400">Deadline (sec)</span>
+                                  <input
+                                    type="number"
+                                    min="1"
+                                    step="1"
+                                    value={rerunState.deadlineSec}
+                                    onChange={(e) => setRerunState((p) => p ? { ...p, deadlineSec: e.target.value } : p)}
+                                    className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                    data-testid="rerun-deadline-sec"
+                                  />
+                                </label>
+                                {rerunState.criterion && (
+                                  <label className="flex flex-col gap-0.5">
+                                    <span className="text-neutral-400">Threshold ({rerunState.criterion.metric} {rerunState.criterion.operator})</span>
+                                    <input
+                                      type="number"
+                                      step="any"
+                                      value={rerunState.threshold}
+                                      onChange={(e) => setRerunState((p) => p ? { ...p, threshold: e.target.value } : p)}
+                                      className="w-24 rounded border border-neutral-700 bg-neutral-900 px-2 py-1 text-neutral-100 text-ui-sm"
+                                      data-testid="rerun-threshold"
+                                    />
+                                  </label>
+                                )}
+                              </div>
+                              {rerunState.error && (
+                                <div className="text-red-300 text-ui-xs" data-testid="rerun-error">{rerunState.error}</div>
+                              )}
+                              <div className="flex gap-2">
+                                <button
+                                  onClick={() => void handleRerunSubmit()}
+                                  disabled={rerunState.submitting}
+                                  className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
+                                  data-testid="rerun-submit"
+                                >
+                                  {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
+                                </button>
+                                <button
+                                  onClick={() => setRerunState(null)}
+                                  className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
+                                  data-testid="rerun-cancel"
+                                >
+                                  Cancel
+                                </button>
+                              </div>
+                            </>
                           )}
-                          <div className="flex gap-2">
-                            <button
-                              onClick={() => void handleRerunSubmit()}
-                              disabled={rerunState.submitting}
-                              className="rounded bg-sky-500/30 text-sky-200 hover:bg-sky-500/40 px-3 py-1.5 text-ui-sm font-semibold disabled:opacity-50"
-                              data-testid="rerun-submit"
-                            >
-                              {rerunState.submitting ? 'Launching…' : 'Launch re-run'}
-                            </button>
-                            <button
-                              onClick={() => setRerunState(null)}
-                              className="rounded bg-neutral-700/40 text-neutral-300 hover:bg-neutral-700/60 px-3 py-1.5 text-ui-sm"
-                              data-testid="rerun-cancel"
-                            >
-                              Cancel
-                            </button>
-                          </div>
                         </div>
                       ) : (
                         <button
