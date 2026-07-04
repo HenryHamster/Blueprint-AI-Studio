@@ -2275,3 +2275,161 @@ async def test_get_compute_job_detail_surfaces_runner_claim(
     assert j["runner_target_id"] == str(runner.id)
     assert j["runner_claimed_at"] == claimed_at
     assert j["runner"]["hostname"] == "detail-host"
+
+
+@pytest.mark.asyncio
+async def test_compute_job_payload_exposes_launch_params(
+    client: AsyncClient, db_session
+):
+    """launch_params must be projected from the task's first_payload fields so
+    the operator UI can pre-fill the launch form from a finished job."""
+    project = await _make_project(db_session, name="Launch Params Project")
+    await _add_member(db_session, project.id, "viewer")
+    task = Task(
+        project_id=project.id,
+        title="clone-me experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "command": "python train.py",
+                "declared_metric": "accuracy",
+                "metric": "accuracy",
+                "cwd": "/workspace",
+                "env": {"SEED": "42", "LR": "0.01"},
+                "accelerator": "T4",
+                "machine_type": "n1-standard-1",
+                "container_image": "nvcr.io/nvidia/pytorch:24.01",
+                "provisioning_model": "SPOT",
+                "spend_cap_usd": 5.0,
+                "deadline_seconds": 3600,
+                "require_live_release": True,
+                "require_durable_artifact": True,
+                "success_criterion": {
+                    "metric": "accuracy",
+                    "operator": ">=",
+                    "threshold": 0.9,
+                },
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="n1-standard-1",
+        spend_cap_usd=5.0,
+        accrued_cost_usd=2.0,
+        result_reference=None,
+        polling_metadata={},
+        completed_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+    lp = j["launch_params"]
+
+    assert lp is not None
+    assert lp["command"] == "python train.py"
+    assert lp["declared_metric"] == "accuracy"
+    assert lp["metric"] == "accuracy"
+    assert lp["cwd"] == "/workspace"
+    # Env values are operator-supplied secrets: only the sorted key names are
+    # projected; the raw mapping must never reach this viewer-readable payload.
+    assert lp["env_keys"] == ["LR", "SEED"]
+    assert "env" not in lp
+    assert "42" not in str(lp) and "0.01" not in str(lp)
+    assert lp["accelerator"] == "T4"
+    assert lp["machine_type"] == "n1-standard-1"
+    assert lp["container_image"] == "nvcr.io/nvidia/pytorch:24.01"
+    assert lp["provisioning_model"] == "SPOT"
+    assert lp["spend_cap_usd"] == 5.0
+    assert lp["deadline_seconds"] == 3600
+    assert lp["require_live_release"] is True
+    assert lp["require_durable_artifact"] is True
+
+
+@pytest.mark.asyncio
+async def test_compute_job_payload_launch_params_arms_mode(
+    client: AsyncClient, db_session
+):
+    """Arms-mode experiments must expose arms + declared_metric in launch_params."""
+    project = await _make_project(db_session, name="Arms Launch Params Project")
+    await _add_member(db_session, project.id, "viewer")
+    arms = [
+        {"name": "control", "command": "python run.py --lr 0.01"},
+        {"name": "treatment", "command": "python run.py --lr 0.001"},
+    ]
+    task = Task(
+        project_id=project.id,
+        title="arms experiment",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[
+            {
+                "type": "compute_experiment",
+                "arms": arms,
+                "declared_metric": "loss",
+            }
+        ],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.SUCCEEDED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+        accrued_cost_usd=0.5,
+        result_reference=None,
+        polling_metadata={},
+        completed_at=_utcnow(),
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    lp = resp.json()["compute_jobs"][0]["launch_params"]
+
+    assert lp["arms"] == arms
+    assert lp["declared_metric"] == "loss"
+    assert lp["command"] is None
+
+
+@pytest.mark.asyncio
+async def test_compute_job_launch_params_null_without_task(
+    client: AsyncClient, db_session
+):
+    """A job with no linked task must expose launch_params as null."""
+    project = await _make_project(db_session, name="No Task Project")
+    await _add_member(db_session, project.id, "viewer")
+    job = ComputeJob(
+        task_id=None,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.RUNNING,
+        machine_type="e2-standard-2",
+        spend_cap_usd=1.0,
+        accrued_cost_usd=0.1,
+        result_reference=None,
+        polling_metadata={},
+    )
+    db_session.add(job)
+    await db_session.commit()
+    await db_session.refresh(job)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    assert resp.json()["compute_jobs"][0]["launch_params"] is None

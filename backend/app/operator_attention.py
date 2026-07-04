@@ -89,6 +89,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "question"): 90,
     ("watch", "alert"): 200,
     ("watch", "dead_runner"): 205,
+    ("watch", "experiment_outcome"): 215,
     ("watch", "failed_task"): 210,
     ("watch", "blocked_task"): 220,
     ("watch", "parked_task"): 230,
@@ -201,6 +202,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "task_lifecycle",
         "clears_when": "task_requeued_archived_or_otherwise_resolved",
         "operator_action": "inspect_failed_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "experiment_outcome": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_outside_6h_window",
+        "operator_action": "inspect_experiment_result",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -948,6 +956,55 @@ async def _load_stale_queued_dependency_tasks(
     return len(stale), stale[:_STALE_TASK_PREVIEW_LIMIT]
 
 
+_EXPERIMENT_OUTCOME_WINDOW = timedelta(hours=6)
+_EXPERIMENT_OUTCOME_PREVIEW_LIMIT = 4
+_EXPERIMENT_TERMINAL_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.CANCELLED,
+)
+
+
+def _experiment_outcome_attention_item(task: Task) -> dict[str, Any]:
+    plan_output = task.plan_output or {}
+    compute_result = plan_output.get("compute_result") or {} if isinstance(plan_output, dict) else {}
+    criterion = compute_result.get("criterion") if isinstance(compute_result, dict) else {}
+    criterion = criterion if isinstance(criterion, dict) else {}
+    criterion_met = criterion.get("met")
+    if criterion_met is False and criterion.get("measurable") is not False:
+        outcome_label = "unmet"
+    else:
+        outcome_label = "inconclusive"
+    criterion_summary = _compact_text(
+        criterion.get("summary") or criterion.get("description"), max_chars=180
+    )
+    detail = criterion_summary or _compact_text(
+        task.latest_status_message or task.title, max_chars=180
+    )
+    return {
+        "id": f"task:{task.id}:experiment_outcome",
+        "kind": "task",
+        "severity": "watch",
+        "reason": "experiment_outcome",
+        "label": f"Experiment criterion {outcome_label}",
+        "detail": detail,
+        "status": _enum_value(task.status),
+        "created_at": task.created_at.isoformat() if task.created_at else None,
+        "updated_at": task.updated_at.isoformat() if task.updated_at else None,
+        "ref": {
+            "kind": "task",
+            "id": str(task.id),
+            "project_id": str(task.project_id),
+        },
+        "target": _attention_target({
+            "surface": "runtime",
+            "project_id": str(task.project_id),
+            "section": "compute",
+            "task_id": str(task.id),
+        }),
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -1212,6 +1269,45 @@ async def build_operator_attention(
         stale_queued_tasks,
     ) = await _load_stale_queued_dependency_tasks(session, project.id)
 
+    experiment_cutoff = _utcnow() - _EXPERIMENT_OUTCOME_WINDOW
+    # JSONB `->` yields JSON null (not SQL NULL) when "met" is present with a
+    # null value, so IS NOT NULL means the criterion carries a "met" key at
+    # all; `->>` then yields SQL NULL for JSON null, and IS DISTINCT FROM
+    # 'true' keeps both null (inconclusive) and false (unmet) verdicts.
+    experiment_criterion_met = Task.plan_output["compute_result"]["criterion"]["met"]
+    experiment_outcome_filters = (
+        Task.project_id == project.id,
+        Task.archived.is_(False),
+        Task.payloads[0]["type"].as_string() == "compute_experiment",
+        Task.status.in_(list(_EXPERIMENT_TERMINAL_STATUSES)),
+        Task.completed_at.is_not(None),
+        Task.completed_at >= experiment_cutoff,
+        experiment_criterion_met.is_not(None),
+        experiment_criterion_met.as_string().is_distinct_from("true"),
+    )
+    unmet_experiment_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(*experiment_outcome_filters)
+            )
+        ).scalar_one()
+        or 0
+    )
+    unmet_experiment_preview = list(
+        (
+            await session.execute(
+                select(Task)
+                .where(*experiment_outcome_filters)
+                .order_by(Task.completed_at.desc())
+                .limit(_EXPERIMENT_OUTCOME_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     alert_count_rows = (
         await session.execute(
             select(Alert.severity, func.count()).where(
@@ -1366,6 +1462,8 @@ async def build_operator_attention(
         add_candidate(_task_attention_item(task, reason=reason, severity="watch"))
     for task in failed_tasks:
         add_candidate(_task_attention_item(task, reason="failed_task", severity="watch"))
+    for task in unmet_experiment_preview:
+        add_candidate(_experiment_outcome_attention_item(task))
     for message in watch_messages:
         add_candidate(
             _message_attention_item(
@@ -1403,6 +1501,7 @@ async def build_operator_attention(
         + dead_runner_watch_count
         + bug_report_count
         + feedback_count
+        + unmet_experiment_count
     )
     level = (
         "needs_operator"
@@ -1460,6 +1559,7 @@ async def build_operator_attention(
             "failed_tasks": failed_count,
             "blocked_tasks": blocked_count,
             "parked_tasks": parked_count,
+            "experiment_outcomes": unmet_experiment_count,
         },
         "items": items,
     }

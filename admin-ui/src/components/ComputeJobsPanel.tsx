@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
 import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
+import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
@@ -655,17 +656,54 @@ function HeldExperimentsSection({
   );
 }
 
+function buildCloneForm(job: ComputeJob): ComputeExperimentForm {
+  const lp = job.launch_params ?? {};
+  const armsRaw = lp.arms;
+  const useArmsMode = Array.isArray(armsRaw) && armsRaw.length > 0;
+  const arms = useArmsMode
+    ? (armsRaw as Array<{ name: string; command: string }>)
+    : [{ name: '', command: '' }, { name: '', command: '' }];
+  // env values are redacted server-side; env_keys carries only the key names
+  const envVars = '';
+  const sc = job.success_criterion;
+  return {
+    ...defaultComputeExperimentForm(),
+    useArmsMode,
+    arms,
+    command: lp.command ?? '',
+    declaredMetric: lp.declared_metric ?? '',
+    metric: lp.metric ?? '',
+    cwd: lp.cwd ?? '',
+    envVars,
+    accelerator: lp.accelerator ?? '',
+    machineType: lp.machine_type ?? '',
+    containerImage: lp.container_image ?? '',
+    provisioningModel: lp.provisioning_model === 'SPOT' ? 'SPOT' : 'STANDARD',
+    spendCapUsd: lp.spend_cap_usd != null ? String(lp.spend_cap_usd) : '',
+    deadlineSeconds: lp.deadline_seconds != null ? String(lp.deadline_seconds) : '',
+    requireLiveRelease: lp.require_live_release ?? false,
+    requireDurableArtifact: lp.require_durable_artifact ?? false,
+    experiment: job.experiment ?? '',
+    benchmark: job.benchmark ?? '',
+    hypothesis: job.hypothesis ?? '',
+    successMetric: sc?.metric ?? '',
+    successOperator: (sc?.operator as ComputeSuccessOperator) ?? '>=',
+    successThreshold: sc?.threshold != null ? String(sc.threshold) : '',
+  };
+}
+
 interface ComputeJobsPanelProps {
   projectId: string | null;
   onNavigateToTask?: (taskId: string) => void;
   onLaunchCompute?: () => void;
+  onCloneExperiment?: (form: ComputeExperimentForm) => void;
   onDuplicateTask?: (taskId: string) => Promise<void>;
   onApproveExperiment?: (taskId: string) => Promise<void>;
   onDismissExperiment?: (taskId: string) => Promise<void>;
   onNavigateToKnowledge?: (documentId: string) => void;
 }
 
-export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
+export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute, onCloneExperiment, onApproveExperiment, onDismissExperiment, onNavigateToKnowledge }: ComputeJobsPanelProps) {
   const [jobs, setJobs] = useState<ComputeJob[]>([]);
   const [heldExperiments, setHeldExperiments] = useState<HeldComputeExperiment[]>([]);
   const [hasMore, setHasMore] = useState(false);
@@ -1187,6 +1225,41 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               )}
 
               {(() => {
+                const { experiment, benchmark, hypothesis } = job;
+                const hasIdentity = !!(experiment || benchmark || hypothesis);
+                if (!hasIdentity) return null;
+                return (
+                  <div className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
+                    <div
+                      className="flex flex-col gap-0.5 text-ui-sm font-mono"
+                      data-testid="compute-experiment-identity"
+                    >
+                      {(experiment || benchmark) && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
+                          <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
+                        </div>
+                      )}
+                      {hypothesis && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Hypothesis</span>
+                          <span className="text-neutral-300 break-words">{hypothesis}</span>
+                        </div>
+                      )}
+                      {job.success_criterion && (
+                        <div className="flex items-start gap-1.5">
+                          <span className="text-neutral-500 shrink-0">Criterion</span>
+                          <span className="text-neutral-300 break-words">
+                            {job.success_criterion.metric} {job.success_criterion.operator} {job.success_criterion.threshold}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {(() => {
                 if (!active) return null;
                 const burnRate = computeJobBurnRate(job, nowMs);
                 if (burnRate == null) return null;
@@ -1284,6 +1357,17 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         <Cpu className="w-3 h-3" />
                         {analyzingId === job.id ? 'Analyzing…' : 'Run analysis'}
                       </button>
+                      {onCloneExperiment && (
+                        <button
+                          onClick={() => onCloneExperiment(buildCloneForm(job))}
+                          disabled={!job.launch_params}
+                          className="min-h-[44px] flex items-center justify-center gap-1.5 rounded bg-emerald-500/20 text-emerald-200 hover:bg-emerald-500/30 text-ui-md font-semibold px-3 transition-colors disabled:opacity-50"
+                          title="Clone this experiment's configuration into the launch form"
+                          data-testid="clone-to-form"
+                        >
+                          Clone to form
+                        </button>
+                      )}
                       {rerunState?.jobId === job.id ? (
                         <div className="flex flex-col gap-2 rounded border border-sky-500/30 bg-sky-500/10 p-2 text-ui-sm" data-testid="rerun-inline-panel">
                           <div className="font-semibold text-sky-200">Re-run with adjustments</div>
@@ -1692,11 +1776,10 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
               })()}
               {(() => {
                 if (active) return null;
-                const { experiment, benchmark, hypothesis } = job;
+                const { hypothesis } = job;
                 const sc = job.success_criterion;
                 const verdict = job.criterion_verdict;
-                const hasIdentity = !!(experiment || benchmark || hypothesis);
-                if (!hasIdentity && !sc) return null;
+                if (!sc) return null;
 
                 // Derive top-level verdict state when hypothesis + criterion are both present.
                 type VerdictState = 'held' | 'refuted' | 'inconclusive';
@@ -1705,45 +1788,43 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                   verdictState = !verdict.measurable ? 'inconclusive' : verdict.met ? 'held' : 'refuted';
                 }
 
-                const expr = sc ? `${sc.metric} ${sc.operator} ${sc.threshold}` : null;
+                const expr = `${sc.metric} ${sc.operator} ${sc.threshold}`;
                 const margin = computeJobMargin(job);
 
                 let chip: React.ReactNode;
-                if (sc) {
-                  if (!verdict) {
-                    chip = (
-                      <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
-                        not reported
-                      </span>
-                    );
-                  } else if (verdict.met) {
-                    chip = (
-                      <span
-                        className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
-                        data-testid="criterion-met"
-                      >
-                        met
-                      </span>
-                    );
-                  } else if (!verdict.measurable) {
-                    chip = (
-                      <span
-                        className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
-                        data-testid="criterion-inconclusive"
-                      >
-                        inconclusive
-                      </span>
-                    );
-                  } else {
-                    chip = (
-                      <span
-                        className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
-                        data-testid="criterion-unmet"
-                      >
-                        unmet
-                      </span>
-                    );
-                  }
+                if (!verdict) {
+                  chip = (
+                    <span className="rounded border border-neutral-600/40 bg-neutral-800/60 px-1 py-0.5 text-neutral-400">
+                      not reported
+                    </span>
+                  );
+                } else if (verdict.met) {
+                  chip = (
+                    <span
+                      className="rounded border border-emerald-500/40 bg-emerald-500/15 px-1 py-0.5 text-emerald-300"
+                      data-testid="criterion-met"
+                    >
+                      met
+                    </span>
+                  );
+                } else if (!verdict.measurable) {
+                  chip = (
+                    <span
+                      className="rounded border border-amber-500/40 bg-amber-500/15 px-1 py-0.5 text-amber-300"
+                      data-testid="criterion-inconclusive"
+                    >
+                      inconclusive
+                    </span>
+                  );
+                } else {
+                  chip = (
+                    <span
+                      className="rounded border border-red-500/40 bg-red-500/15 px-1 py-0.5 text-red-300"
+                      data-testid="criterion-unmet"
+                    >
+                      unmet
+                    </span>
+                  );
                 }
 
                 return (
@@ -1767,70 +1848,45 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         </span>
                       </div>
                     )}
-                    {(hasIdentity || sc) && (
-                      <div className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5">
-                    {hasIdentity && (
-                      <div
-                        className="flex flex-col gap-0.5 text-ui-sm font-mono"
-                        data-testid="compute-experiment-identity"
-                      >
-                        {(experiment || benchmark) && (
-                          <div className="flex items-start gap-1.5">
-                            <span className="text-neutral-500 shrink-0">{experiment ? 'Experiment' : 'Benchmark'}</span>
-                            <span className="text-neutral-300 break-words">{experiment ?? benchmark}</span>
-                          </div>
+                    <div
+                      className="rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-1 text-ui-sm font-mono"
+                      data-testid="criterion-verdict-row"
+                    >
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-neutral-500 shrink-0">Criterion</span>
+                        <span className="text-neutral-300 break-words">{expr}</span>
+                        {verdict && verdict.value !== null && verdict.value !== undefined && (
+                          <span className="text-neutral-500">
+                            (measured: {verdict.value})
+                          </span>
                         )}
-                        {hypothesis && (
-                          <div className="flex items-start gap-1.5">
-                            <span className="text-neutral-500 shrink-0">Hypothesis</span>
-                            <span className="text-neutral-300 break-words">{hypothesis}</span>
-                          </div>
-                        )}
+                        {chip}
                       </div>
-                    )}
-                    {sc && (
-                      <div
-                        className="flex flex-col gap-1 text-ui-sm font-mono"
-                        data-testid="criterion-verdict-row"
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <span className="text-neutral-500 shrink-0">Criterion</span>
-                          <span className="text-neutral-300 break-words">{expr}</span>
-                          {verdict && verdict.value !== null && verdict.value !== undefined && (
-                            <span className="text-neutral-500">
-                              (measured: {verdict.value})
-                            </span>
-                          )}
-                          {chip}
+                      {verdict?.binding_status && (
+                        <div className="flex items-center gap-1.5 text-neutral-500">
+                          <span className="shrink-0">Binding status</span>
+                          <span
+                            className="font-semibold text-neutral-300"
+                            data-testid="criterion-binding-status"
+                          >
+                            {verdict.binding_status}
+                          </span>
                         </div>
-                        {verdict?.binding_status && (
-                          <div className="flex items-center gap-1.5 text-neutral-500">
-                            <span className="shrink-0">Binding status</span>
-                            <span
-                              className="font-semibold text-neutral-300"
-                              data-testid="criterion-binding-status"
-                            >
-                              {verdict.binding_status}
-                            </span>
-                          </div>
-                        )}
-                        {margin !== null && (
-                          <div className="flex items-center gap-1.5 text-neutral-500">
-                            <span className="shrink-0">Margin</span>
-                            <span
-                              className={`font-semibold ${
-                                margin >= 0 ? 'text-emerald-300' : 'text-red-300'
-                              }`}
-                              data-testid="criterion-margin"
-                            >
-                              {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
-                            </span>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                      </div>
-                    )}
+                      )}
+                      {margin !== null && (
+                        <div className="flex items-center gap-1.5 text-neutral-500">
+                          <span className="shrink-0">Margin</span>
+                          <span
+                            className={`font-semibold ${
+                              margin >= 0 ? 'text-emerald-300' : 'text-red-300'
+                            }`}
+                            data-testid="criterion-margin"
+                          >
+                            {margin >= 0 ? '+' : ''}{margin.toFixed(2)}
+                          </span>
+                        </div>
+                      )}
+                    </div>
                   </div>
                 );
               })()}

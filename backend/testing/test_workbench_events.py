@@ -21,6 +21,7 @@ from app.workbench_events import (
     SURFACE_RUNTIME,
     SURFACE_STRATEGIC_SESSION,
     WORKBENCH_EVENT_SCHEMA_VERSION,
+    _compute_job_feed_items,
     build_workbench_event_feed,
     build_workbench_event_payload,
     emit_workbench_refetch,
@@ -633,3 +634,74 @@ async def test_build_workbench_event_feed_tolerates_malformed_runtime_counts(
     assert item["data"]["strategic_runner_count"] == 0
     assert item["data"]["live_runner_count"] == 0
     assert item["data"]["eligible_live_count"] == 0
+
+
+def test_compute_job_feed_item_criterion_met_uses_active_tone():
+    project_id = uuid.uuid4()
+    job_id = str(uuid.uuid4())
+    items = _compute_job_feed_items(
+        project_id,
+        {
+            "compute_jobs": {
+                "items": [
+                    {
+                        "id": job_id,
+                        "task_id": str(uuid.uuid4()),
+                        "task_title": "GPU throughput benchmark",
+                        "task_type": "compute_experiment",
+                        "status": "SUCCEEDED",
+                        "experiment_outcome": {
+                            "outcome_label": "met",
+                            "criterion_met": True,
+                            "criterion_summary": "Throughput exceeded 100 req/s",
+                            "hypothesis_held": True,
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    assert len(items) == 1
+    item = items[0]
+    assert item["tone"] == "active"
+    assert "criterion met" in item["title"].lower()
+    assert "GPU throughput benchmark" in item["title"]
+    assert item["summary"] == "Throughput exceeded 100 req/s"
+    assert item["data"]["experiment_outcome"]["outcome_label"] == "met"
+    assert item["data"]["experiment_outcome"]["criterion_met"] is True
+    assert item["data"]["experiment_outcome"]["hypothesis_held"] is True
+
+
+def test_compute_job_feed_item_unmet_criterion_uses_warning_tone():
+    project_id = uuid.uuid4()
+    job_id = str(uuid.uuid4())
+    items = _compute_job_feed_items(
+        project_id,
+        {
+            "compute_jobs": {
+                "items": [
+                    {
+                        "id": job_id,
+                        "task_id": str(uuid.uuid4()),
+                        "task_title": "Latency regression check",
+                        "task_type": "compute_experiment",
+                        "status": "SUCCEEDED",
+                        "experiment_outcome": {
+                            "outcome_label": "unmet",
+                            "criterion_met": False,
+                            "criterion_summary": "P99 latency was 380ms, threshold was 200ms",
+                            "hypothesis_held": None,
+                        },
+                    }
+                ]
+            }
+        },
+    )
+    assert len(items) == 1
+    item = items[0]
+    assert item["tone"] == "warning"
+    assert "criterion unmet" in item["title"].lower()
+    assert "Latency regression check" in item["title"]
+    assert item["summary"] == "P99 latency was 380ms, threshold was 200ms"
+    assert item["data"]["experiment_outcome"]["outcome_label"] == "unmet"
+    assert item["data"]["experiment_outcome"]["criterion_met"] is False

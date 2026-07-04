@@ -127,12 +127,14 @@ export function NewTaskModal({
   const [ideaText, setIdeaText] = useState('');
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [draftNotes, setDraftNotes] = useState<string | null>(null);
   const [lastDraft, setLastDraft] = useState<ComputeExperimentDraftResponse | null>(null);
 
   const handleDraftContract = async () => {
     if (!ideaText.trim()) return;
     setDraftLoading(true);
     setDraftError(null);
+    setDraftNotes(null);
     try {
       const draft = await draftComputeExperiment({
         idea: ideaText.trim(),
@@ -141,7 +143,7 @@ export function NewTaskModal({
         ...(lastDraft ? { prior_draft: lastDraft } : {}),
       });
       if (!draft.draft_available) {
-        setDraftError('Draft not available — fill the form manually.');
+        setDraftError(draft.notes || 'Draft not available — fill the form manually.');
         return;
       }
       const hasArms = Array.isArray(draft.arms) && draft.arms.length >= 2;
@@ -167,6 +169,7 @@ export function NewTaskModal({
       }));
       if (draft.title) setNewTaskTitle(draft.title);
       if (draft.prompt) setNewTaskPrompt(draft.prompt);
+      setDraftNotes(draft.notes ?? null);
       setLastDraft(draft);
     } catch (err) {
       setDraftError(err instanceof Error ? err.message : 'Draft failed');
@@ -443,6 +446,7 @@ export function NewTaskModal({
                   </button>
                 </div>
                 {draftError && <p className="text-ui-sm text-red-400 mt-1">{draftError}</p>}
+                {draftNotes && !draftError && <p className="text-ui-sm text-neutral-400 mt-1">{draftNotes}</p>}
               </div>
               {computeExperiment.useArmsMode ? (
                 <div className="mb-3">

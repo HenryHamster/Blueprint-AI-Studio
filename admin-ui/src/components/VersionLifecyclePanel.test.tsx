@@ -3777,4 +3777,53 @@ describe('VersionLifecyclePanel', () => {
       expect(history.textContent).not.toContain('s:0');
     });
   });
+
+  describe('verdict-fetch error handling', () => {
+    it('shows verdicts-error when fetchQualificationVerdicts rejects', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockRejectedValue(new Error('Network error'));
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      const errorEl = await screen.findByTestId('verdicts-error');
+      expect(errorEl).toHaveTextContent('Failed to load verdict history.');
+      expect(screen.queryByTestId('verdict-history')).not.toBeInTheDocument();
+    });
+
+    it('re-fetches verdicts when data prop changes (refresh cycle)', async () => {
+      const { rerender } = render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse()}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(vi.mocked(api.fetchQualificationVerdicts)).toHaveBeenCalledTimes(1);
+
+      const secondData = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({ phase: 'stabilize' }),
+      });
+
+      rerender(
+        <VersionLifecyclePanel
+          data={secondData}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(vi.mocked(api.fetchQualificationVerdicts)).toHaveBeenCalledTimes(2);
+      });
+    });
+  });
 });

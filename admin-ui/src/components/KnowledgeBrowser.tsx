@@ -391,6 +391,7 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<KnowledgeDocument | null>(null);
+  const [docError, setDocError] = useState<string | null>(null);
 
   const syncRoute = useCallback((prev: KnowledgeQuery): KnowledgeQuery => (
     prev.routedDirectionId === routedDirectionId
@@ -448,9 +449,10 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
   const openDoc = useCallback((doc: KnowledgeDocument) => {
     if (!selectedProjectId) return;
     setSelected(doc); // optimistic (no body yet)
+    setDocError(null);
     fetchKnowledgeDocument(selectedProjectId, doc.id)
       .then(full => setSelected(full))
-      .catch(() => {/* keep summary view */});
+      .catch(() => { setDocError('Failed to load document body.'); });
   }, [selectedProjectId]);
 
   // When a specific document id is provided (e.g. from the compute jobs panel),
@@ -459,8 +461,8 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
     if (!initialDocumentId || !selectedProjectId) return;
     let cancelled = false;
     fetchKnowledgeDocument(selectedProjectId, initialDocumentId)
-      .then(full => { if (!cancelled) setSelected(full); })
-      .catch(() => {/* non-fatal: browser can navigate back */});
+      .then(full => { if (!cancelled) { setDocError(null); setSelected(full); } })
+      .catch(() => { if (!cancelled) setDocError('Failed to load document body.'); });
     return () => { cancelled = true; };
   }, [initialDocumentId, selectedProjectId]);
 
@@ -571,12 +573,15 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
 
             {selected.summary &&<p className="text-xs text-neutral-400 leading-relaxed italic">{selected.summary}</p>}
 
+            {docError && (
+              <p data-testid="doc-error" className="text-xs text-red-400">{docError}</p>
+            )}
             {selected.body !== undefined ? (
               <div className="border-t border-neutral-800 pt-3 text-sm text-neutral-200">
                 <MarkdownContent content={selected.body} />
               </div>
             ) : (
-              <p className="text-xs text-neutral-600">Loading document…</p>
+              !docError && <p className="text-xs text-neutral-600">Loading document…</p>
             )}
 
             {(selected.source_citations ?? []).length > 0 && (
@@ -715,6 +720,8 @@ export function KnowledgeBrowser({ selectedProjectId, onClose, onNavigateToTask,
             <div className="flex-1 overflow-y-auto p-4 space-y-2">
               {loading && docs.length === 0 && <div className="text-neutral-600 text-center py-12 text-sm" data-testid="loading-initial">Loading…</div>}
               {error && <div className="text-red-400 text-center py-12 text-sm">{error}</div>}
+              {/* Surfaces initialDocumentId body-load failures, which never reach the detail view. */}
+              {docError && <div data-testid="doc-error" className="text-red-400 text-center py-2 text-xs">{docError}</div>}
               {!loading && !error && docs.length === 0 && (
                 <div className="text-neutral-600 text-center py-12 text-sm space-y-3">
                   <div>No knowledge documents{search.trim() ? ' match your search' : ' yet'}.</div>

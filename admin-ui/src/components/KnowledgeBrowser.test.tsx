@@ -974,6 +974,82 @@ describe('KnowledgeBrowser — finding-challenge origin provenance', () => {
   });
 });
 
+describe('KnowledgeBrowser — document body load failure', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  afterEach(() => {
+    const r = root;
+    if (r) {
+      act(() => { r.unmount(); });
+      root = null;
+    }
+    if (host) { host.remove(); host = null; }
+    vi.resetAllMocks();
+  });
+
+  async function renderBrowser(props: { initialDocumentId?: string } = {}) {
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <KnowledgeBrowser
+          selectedProjectId="project-test"
+          onClose={() => {}}
+          onNavigateToTask={() => {}}
+          {...props}
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 350)); });
+    return host as HTMLDivElement;
+  }
+
+  test('clicking a document whose body fetch fails shows doc-error and suppresses the loading placeholder', async () => {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: [webResearchDoc], total: 1, limit: 50, offset: 0,
+    });
+    vi.mocked(fetchKnowledgeDocument).mockRejectedValue(new Error('body fetch failed'));
+
+    const container = await renderBrowser();
+    const docButton = Array.from(container.querySelectorAll('[role="button"]')).find(
+      b => b.textContent?.includes('Survey of reachable web sources'),
+    );
+    expect(docButton).toBeTruthy();
+    if (!docButton) throw new Error('expected knowledge document button');
+    await act(async () => { (docButton as HTMLElement).click(); });
+    await act(async () => { await new Promise<void>((resolve) => setTimeout(resolve, 50)); });
+
+    const errorEl = container.querySelector('[data-testid="doc-error"]');
+    expect(errorEl).toBeTruthy();
+    expect(errorEl?.textContent).toContain('Failed to load document body.');
+    // The optimistic detail view stays open (title visible) but the body
+    // placeholder must be suppressed in favor of the error message.
+    expect(container.textContent).toContain('Survey of reachable web sources');
+    expect(container.textContent).not.toContain('Loading document…');
+  });
+
+  test('initialDocumentId body fetch failure surfaces doc-error in the list view', async () => {
+    const { fetchKnowledgeDocuments, fetchKnowledgeDocument } = await import('../api');
+    vi.mocked(fetchKnowledgeDocuments).mockResolvedValue({
+      documents: [webResearchDoc], total: 1, limit: 50, offset: 0,
+    });
+    vi.mocked(fetchKnowledgeDocument).mockRejectedValue(new Error('body fetch failed'));
+
+    const container = await renderBrowser({ initialDocumentId: 'doc-web-research-grounded' });
+
+    // The detail view never opens (no document to select), so the error must
+    // be visible from the list view instead of failing silently.
+    const errorEl = container.querySelector('[data-testid="doc-error"]');
+    expect(errorEl).toBeTruthy();
+    expect(errorEl?.textContent).toContain('Failed to load document body.');
+    expect(container.textContent).not.toContain('Loading document…');
+  });
+});
+
 describe('KnowledgeBrowser — live proof release evidence', () => {
   let root: Root | null = null;
   let host: HTMLDivElement | null = null;

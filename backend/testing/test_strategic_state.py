@@ -6141,3 +6141,288 @@ async def test_strategic_state_sha_freshness_unknown_includes_checked_at(
     assert "checked_at" in freshness
     assert freshness["checked_at"] is not None
     assert "T" in freshness["checked_at"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_runtime_compute_job_preview_includes_experiment_outcome(
+    client: AsyncClient, db_session
+):
+    """_compute_job_preview populates experiment_outcome from task.plan_output.compute_result."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        title="Throughput regression check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": True,
+                    "measurable": True,
+                    "summary": "Throughput exceeded 100 req/s",
+                },
+                "hypothesis": {"held": True},
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        machine_type="gpu-small",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=3.5,
+        completed_at=now - timedelta(minutes=15),
+        updated_at=now - timedelta(minutes=15),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["runtime"]["work"]["compute_jobs"]["items"]
+    matched = [item for item in items if item.get("task_id") == str(task.id)]
+    assert matched, "compute job preview item not found for task"
+    outcome = matched[0].get("experiment_outcome")
+    assert outcome is not None, "experiment_outcome missing from compute job preview item"
+    assert outcome["outcome_label"] == "met"
+    assert outcome["criterion_met"] is True
+    assert outcome["hypothesis_held"] is True
+    assert "Throughput exceeded 100 req/s" in (outcome.get("criterion_summary") or "")
+
+
+@pytest.mark.asyncio
+async def test_strategic_runtime_compute_job_preview_inconclusive_when_not_measurable(
+    client: AsyncClient, db_session
+):
+    """met=false, measurable=false → outcome_label inconclusive, not unmet."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    task = Task(
+        project_id=project.id,
+        title="Non-measurable metric check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": False,
+                    "summary": "Metric not found in output",
+                },
+            }
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    job = ComputeJob(
+        project_id=project.id,
+        task_id=task.id,
+        backend="local",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=1.0,
+        completed_at=now - timedelta(minutes=5),
+        updated_at=now - timedelta(minutes=5),
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    items = data["runtime"]["work"]["compute_jobs"]["items"]
+    matched = [item for item in items if item.get("task_id") == str(task.id)]
+    assert matched, "compute job preview item not found"
+    outcome = matched[0].get("experiment_outcome")
+    assert outcome is not None
+    assert outcome["outcome_label"] == "inconclusive"
+    assert outcome["criterion_met"] is False
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_unmet_experiment_outcome(
+    client: AsyncClient, db_session
+):
+    """A recently-completed compute_experiment with criterion.met=False appears in attention."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    unmet_task = Task(
+        project_id=project.id,
+        title="Latency regression check",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=1),
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": True,
+                    "summary": "P99 latency was 380ms, threshold 200ms",
+                }
+            }
+        },
+    )
+    # met=True → should NOT appear
+    met_task = Task(
+        project_id=project.id,
+        title="Throughput benchmark met",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=2),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": True, "measurable": True, "summary": "All good"}
+            }
+        },
+    )
+    # older than 6 hours → should NOT appear
+    old_task = Task(
+        project_id=project.id,
+        title="Old benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=8),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": False, "measurable": True, "summary": "Old failure"}
+            }
+        },
+    )
+    # archived=True → should NOT appear
+    archived_task = Task(
+        project_id=project.id,
+        title="Archived benchmark",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=True,
+        completed_at=now - timedelta(hours=1),
+        plan_output={
+            "compute_result": {
+                "criterion": {"met": False, "measurable": True, "summary": "Archived"}
+            }
+        },
+    )
+    db_session.add_all([unmet_task, met_task, old_task, archived_task])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    assert attention["counts"]["watch"] >= 1
+    item_ids = {item["id"] for item in attention["items"]}
+    expected_id = f"task:{unmet_task.id}:experiment_outcome"
+    assert expected_id in item_ids
+    exp_item = next(item for item in attention["items"] if item["id"] == expected_id)
+    assert exp_item["reason"] == "experiment_outcome"
+    assert exp_item["severity"] == "watch"
+    assert "unmet" in exp_item["label"].lower()
+    assert exp_item["lifecycle"]["mode"] == "task_lifecycle"
+    assert "P99 latency" in (exp_item.get("detail") or "")
+
+    # met / old / archived tasks must not appear
+    assert f"task:{met_task.id}:experiment_outcome" not in item_ids
+    assert f"task:{old_task.id}:experiment_outcome" not in item_ids
+    assert f"task:{archived_task.id}:experiment_outcome" not in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_inconclusive_experiment_outcome_label(
+    client: AsyncClient, db_session
+):
+    """met=False, measurable=False → outcome_label inconclusive, not unmet."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    inconclusive_task = Task(
+        project_id=project.id,
+        title="Non-measurable criterion experiment",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=1),
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": False,
+                    "summary": "Metric absent from run output",
+                }
+            }
+        },
+    )
+    db_session.add(inconclusive_task)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    expected_id = f"task:{inconclusive_task.id}:experiment_outcome"
+    assert expected_id in item_ids
+    exp_item = next(item for item in attention["items"] if item["id"] == expected_id)
+    assert "inconclusive" in exp_item["label"].lower()
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_unmet_experiment_not_masked_by_newer_successes(
+    client: AsyncClient, db_session
+):
+    """An unmet outcome must be counted even when many successful experiments
+    complete after it within the window (no fixed-size scan cap)."""
+    project = await _make_project(db_session)
+    now = _utcnow()
+    unmet_task = Task(
+        project_id=project.id,
+        title="Buried unmet experiment",
+        payloads=[{"type": "compute_experiment"}],
+        status=TaskStatus.COMPLETED,
+        archived=False,
+        completed_at=now - timedelta(hours=5),
+        plan_output={
+            "compute_result": {
+                "criterion": {
+                    "met": False,
+                    "measurable": True,
+                    "summary": "Throughput below threshold",
+                }
+            }
+        },
+    )
+    met_tasks = [
+        Task(
+            project_id=project.id,
+            title=f"Successful experiment {i}",
+            payloads=[{"type": "compute_experiment"}],
+            status=TaskStatus.COMPLETED,
+            archived=False,
+            completed_at=now - timedelta(minutes=i),
+            plan_output={
+                "compute_result": {
+                    "criterion": {"met": True, "measurable": True, "summary": "ok"}
+                }
+            },
+        )
+        for i in range(25)
+    ]
+    db_session.add_all([unmet_task, *met_tasks])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["experiment_outcomes"] == 1
+    item_ids = {item["id"] for item in attention["items"]}
+    assert f"task:{unmet_task.id}:experiment_outcome" in item_ids

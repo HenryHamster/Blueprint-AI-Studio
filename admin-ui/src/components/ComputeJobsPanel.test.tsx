@@ -766,6 +766,71 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(subtitle.textContent).toContain('SPOT');
   });
 
+  test('clone-to-form button appears on terminal jobs and calls onCloneExperiment with mapped form fields', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.5,
+      experiment: 'My Experiment',
+      hypothesis: 'test hypothesis',
+      success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      launch_params: {
+        command: 'python train.py',
+        declared_metric: 'accuracy',
+        metric: 'accuracy',
+        cwd: '/workspace',
+        env_keys: ['SEED'],
+        accelerator: 'T4',
+        machine_type: 'n1-standard-1',
+        container_image: 'nvcr.io/test:latest',
+        provisioning_model: 'SPOT',
+        spend_cap_usd: 5.0,
+        deadline_seconds: 3600,
+        require_live_release: true,
+        require_durable_artifact: false,
+        arms: null,
+      },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const onCloneExperiment = vi.fn();
+    const { findByTestId } = render(
+      <ComputeJobsPanel projectId="proj-1" onCloneExperiment={onCloneExperiment} />
+    );
+    const cloneBtn = await findByTestId('clone-to-form');
+    await act(async () => { cloneBtn.click(); });
+    expect(onCloneExperiment).toHaveBeenCalledTimes(1);
+    const form = onCloneExperiment.mock.calls[0][0];
+    expect(form.command).toBe('python train.py');
+    expect(form.accelerator).toBe('T4');
+    expect(form.machineType).toBe('n1-standard-1');
+    expect(form.spendCapUsd).toBe('5');
+    expect(form.deadlineSeconds).toBe('3600');
+    expect(form.provisioningModel).toBe('SPOT');
+    expect(form.envVars).toBe('');
+    expect(form.requireLiveRelease).toBe(true);
+    expect(form.requireDurableArtifact).toBe(false);
+    expect(form.experiment).toBe('My Experiment');
+    expect(form.successMetric).toBe('accuracy');
+    expect(form.successOperator).toBe('>=');
+    expect(form.successThreshold).toBe('0.9');
+    expect(form.containerImage).toBe('nvcr.io/test:latest');
+    expect(form.useArmsMode).toBe(false);
+  });
+
+  test('clone-to-form button not rendered when onCloneExperiment is not provided', async () => {
+    const terminal = makeJob({
+      status: 'SUCCEEDED',
+      outcome: 'SUCCESS',
+      final_cost_usd: 1.0,
+      launch_params: { command: 'python train.py' },
+    });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    const { queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    // Wait for jobs to load
+    await new Promise(r => setTimeout(r, 50));
+    expect(queryByTestId('clone-to-form')).toBeNull();
+  });
+
   test('launch action calls onLaunchCompute from the empty compute workbench', async () => {
     const onLaunchCompute = vi.fn();
     fetchComputeJobs.mockResolvedValue(wrapJobs([]));
@@ -975,13 +1040,20 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(block.textContent).toContain('mlperf-v4');
   });
 
-  test('active job does not show experiment identity block even when fields present', async () => {
+  test('active job shows experiment identity block when fields present', async () => {
     fetchComputeJobs.mockResolvedValue(wrapJobs([
-      makeJob({ experiment: 'sweep-v3', hypothesis: 'some hypothesis' }),
+      makeJob({
+        experiment: 'sweep-v3',
+        hypothesis: 'some hypothesis',
+        success_criterion: { metric: 'accuracy', operator: '>=', threshold: 0.9 },
+      }),
     ]));
-    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     await findByText('compute_experiment: sweep');
-    expect(queryByTestId('compute-experiment-identity')).toBeNull();
+    const identityBlock = await findByTestId('compute-experiment-identity');
+    expect(identityBlock.textContent).toContain('sweep-v3');
+    expect(identityBlock.textContent).toContain('some hypothesis');
+    expect(identityBlock.textContent).toContain('accuracy >= 0.9');
   });
 
   test('terminal job without experiment/benchmark/hypothesis shows no identity block', async () => {
@@ -3148,5 +3220,27 @@ describe('ComputeJobsPanel render + kill', () => {
     // Thread must be gone after clearing
     expect(queryByTestId('compute-ask-result')).toBeNull();
     expect(queryByTestId('compute-ask-thread')).toBeNull();
+  });
+
+  test('shows experiment identity section for active jobs with experiment, hypothesis, and criterion', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'RUNNING',
+        experiment: 'model-accuracy-sweep',
+        hypothesis: 'Increasing batch size improves convergence speed without harming final accuracy',
+        success_criterion: {
+          metric: 'accuracy',
+          operator: '>=',
+          threshold: 0.92,
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+
+    // Verify experiment identity section renders for active job
+    const identitySection = await findByTestId('compute-experiment-identity');
+    expect(identitySection.textContent).toContain('model-accuracy-sweep');
+    expect(identitySection.textContent).toContain('Increasing batch size improves convergence speed');
+    expect(identitySection.textContent).toContain('accuracy >= 0.92');
   });
 });

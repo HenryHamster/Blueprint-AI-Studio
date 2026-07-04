@@ -580,7 +580,7 @@ def _local_operator_status(
 def _compute_job_preview(job: ComputeJob, task: Task | None) -> Dict[str, Any]:
     cost = job.final_cost_usd if job.final_cost_usd is not None else job.accrued_cost_usd
     payload = _task_payload(task)
-    return {
+    preview: Dict[str, Any] = {
         "id": str(job.id),
         "task_id": str(job.task_id) if job.task_id else None,
         "task_title": _compact_text(task.title, max_chars=120) if task else None,
@@ -600,6 +600,36 @@ def _compute_job_preview(job: ComputeJob, task: Task | None) -> Dict[str, Any]:
         "next_poll_at": _isoformat(job.next_poll_at),
         "terminal_reason": _compact_text(job.terminal_reason, max_chars=180),
     }
+    if task is not None:
+        plan_output = task.plan_output or {}
+        if isinstance(plan_output, dict):
+            compute_result = plan_output.get("compute_result") or {}
+            if isinstance(compute_result, dict):
+                criterion = compute_result.get("criterion")
+                if isinstance(criterion, dict) and "met" in criterion:
+                    criterion_met = criterion.get("met")
+                    if criterion_met is True:
+                        outcome_label = "met"
+                    elif criterion_met is False and criterion.get("measurable") is not False:
+                        outcome_label = "unmet"
+                    else:
+                        outcome_label = "inconclusive"
+                    hypothesis = compute_result.get("hypothesis")
+                    hypothesis_held = (
+                        hypothesis.get("held")
+                        if isinstance(hypothesis, dict)
+                        else None
+                    )
+                    preview["experiment_outcome"] = {
+                        "outcome_label": outcome_label,
+                        "criterion_met": criterion_met,
+                        "criterion_summary": _compact_text(
+                            criterion.get("summary") or criterion.get("description"),
+                            max_chars=200,
+                        ),
+                        "hypothesis_held": hypothesis_held,
+                    }
+    return preview
 
 
 def _wake_preview(

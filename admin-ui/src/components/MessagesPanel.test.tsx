@@ -1383,6 +1383,7 @@ describe('MessagesPanel chrome modes', () => {
 
   test('minimal chat target keeps non-replyable messages highlight-only', async () => {
     const onTargetMessageHandled = vi.fn();
+    const addToast = vi.fn();
     const operator = makeMsg({
       id: 'operator-target',
       from_type: 'user',
@@ -1396,11 +1397,13 @@ describe('MessagesPanel chrome modes', () => {
       filterChrome: 'minimal',
       targetMessage: { messageId: 'operator-target', action: 'reply' },
       onTargetMessageHandled,
+      addToast,
     }, [operator]);
 
     await waitFor(() => expect(onTargetMessageHandled).toHaveBeenCalledTimes(1));
     const bubble = el.querySelector('[data-message-id="operator-target"]');
     expect(bubble?.className).toContain('ring-1');
+    expect(addToast).toHaveBeenCalledWith('Reply not primed: target must be an open Agent or Strategic message.', 'info');
     expect(el.textContent).not.toContain('Replying to Operator');
     expect(el.querySelector('textarea')?.value).toBe('');
   });

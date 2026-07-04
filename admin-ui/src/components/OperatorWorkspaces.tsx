@@ -28,6 +28,7 @@ import {
   type SectionNavItem,
 } from './OperatorWorkspaceSections';
 import type { StrategicCycleCompletion, StrategicCycleProgress } from '../hooks/useLogViewer';
+import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import type { Project } from '../types/project';
 
 export type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './OperatorWorkspaceSections';
@@ -448,6 +449,7 @@ interface RuntimeWorkspaceProps {
   onOpenFleet: () => void;
   onCreateTask: () => void;
   onLaunchCompute: () => void;
+  onCloneExperiment?: (form: ComputeExperimentForm) => void;
   onDirectionClick: (directionId: string) => void;
   onConfigureTargets: () => void;
   onSpawnOrphanFix: DashboardHomeProps['onSpawnOrphanFix'];
@@ -480,6 +482,7 @@ export function RuntimeWorkspace({
   onOpenFleet,
   onCreateTask,
   onLaunchCompute,
+  onCloneExperiment,
   onDirectionClick,
   onConfigureTargets,
   onSpawnOrphanFix,
@@ -629,6 +632,7 @@ export function RuntimeWorkspace({
             projectId={selectedProjectId}
             onNavigateToTask={onViewTaskById}
             onLaunchCompute={onLaunchCompute}
+            onCloneExperiment={onCloneExperiment}
             onApproveExperiment={onApproveExperiment}
             onDismissExperiment={onDismissExperiment}
             onNavigateToKnowledge={onNavigateToKnowledge}

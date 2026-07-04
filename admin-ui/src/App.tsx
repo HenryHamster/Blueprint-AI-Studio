@@ -1630,6 +1630,10 @@ export default function App() {
               s.setComputeExperiment(defaultComputeExperimentForm());
               s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
             }}
+            onCloneExperiment={(form) => {
+              s.setComputeExperiment(form);
+              s.openPrefilledTaskModal({ taskType: 'compute_experiment', title: '', prompt: '' });
+            }}
             onDirectionClick={(dirId) => { setResearchBrowserDirectionId(dirId); s.setShowResearchBrowser(true); }}
             onConfigureTargets={handleConfigureTargets}
             onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task - investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })}

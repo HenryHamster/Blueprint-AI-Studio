@@ -231,6 +231,31 @@ async def _build_compute_job_payload(
             experiment = str(raw_experiment) if raw_experiment else None
             benchmark = str(raw_benchmark) if raw_benchmark else None
             hypothesis = str(raw_hypothesis) if raw_hypothesis else None
+        launch_params: dict | None = None
+        if task_obj is not None:
+            fp = task_obj.first_payload
+            raw_arms = fp.get("arms")
+            arms_val = raw_arms if isinstance(raw_arms, list) else None
+            raw_env = fp.get("env")
+            env_key_names = sorted(raw_env.keys()) if isinstance(raw_env, dict) else None
+            raw_spend = fp.get("spend_cap_usd")
+            raw_deadline = fp.get("deadline_seconds")
+            launch_params = {
+                "command": fp.get("command") or None,
+                "arms": arms_val,
+                "declared_metric": fp.get("declared_metric") or None,
+                "metric": fp.get("metric") or None,
+                "cwd": fp.get("cwd") or None,
+                "env_keys": env_key_names,
+                "accelerator": fp.get("accelerator") or None,
+                "machine_type": fp.get("machine_type") or None,
+                "container_image": fp.get("container_image") or None,
+                "provisioning_model": fp.get("provisioning_model") or None,
+                "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
+                "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
+                "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,
+                "require_durable_artifact": bool(fp.get("require_durable_artifact")) if fp.get("require_durable_artifact") is not None else None,
+            }
         data["task_title"] = title
         data["task_type"] = task_type
         data["success_criterion"] = success_criterion
@@ -240,6 +265,7 @@ async def _build_compute_job_payload(
         data["experiment"] = experiment
         data["benchmark"] = benchmark
         data["hypothesis"] = hypothesis
+        data["launch_params"] = launch_params
         linked_artifact = artifacts.get(job.artifact_id) if job.artifact_id else None
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None

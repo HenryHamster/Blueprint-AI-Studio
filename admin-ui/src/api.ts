@@ -442,9 +442,11 @@ export interface ComputeExperimentDraftRequest {
  * Response from the draft endpoint. `draft_available` is false when the model
  * could not produce a usable contract; callers should fall back to manual entry.
  * All contract fields are optional — only populated when `draft_available` is true.
+ * `notes` explains why a draft is unavailable or provides context on success.
  */
 export interface ComputeExperimentDraftResponse {
   draft_available: boolean;
+  notes?: string;
   title?: string;
   prompt?: string;
   hypothesis?: string;
@@ -3321,6 +3323,24 @@ export interface ComputeJob {
     id: string;
     hostname: string | null;
     status: string | null;
+  } | null;
+  // Original launch configuration from the task payload, projected for cloning.
+  // Absent on legacy rows where the task payload predates this field.
+  launch_params?: {
+    command?: string | null;
+    arms?: Array<{ name: string; command: string }> | null;
+    declared_metric?: string | null;
+    metric?: string | null;
+    cwd?: string | null;
+    env_keys?: string[] | null;
+    accelerator?: string | null;
+    machine_type?: string | null;
+    container_image?: string | null;
+    provisioning_model?: string | null;
+    spend_cap_usd?: number | null;
+    deadline_seconds?: number | null;
+    require_live_release?: boolean | null;
+    require_durable_artifact?: boolean | null;
   } | null;
 }
 

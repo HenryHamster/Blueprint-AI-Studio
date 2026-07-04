@@ -71,6 +71,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
+  const [verdictsError, setVerdictsError] = useState<string | null>(null);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
   const [goalInput, setGoalInput] = useState<string>('');
   const [optimisticOverrides, setOptimisticOverrides] = useState<Partial<CurrentVersion> | null>(null);
@@ -83,9 +84,11 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
   // a lost-response retry, cleared on success so the next cut gets a fresh key.
   const cutIdempotencyKeyRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!projectId) { setVerdicts([]); return; }
-    fetchQualificationVerdicts(projectId, 10).then(r => setVerdicts(r.verdicts)).catch(() => {});
-  }, [projectId]);
+    if (!projectId) { setVerdicts([]); setVerdictsError(null); return; }
+    fetchQualificationVerdicts(projectId, 10)
+      .then(r => { setVerdicts(r.verdicts); setVerdictsError(null); })
+      .catch(() => { setVerdictsError('Failed to load verdict history.'); });
+  }, [projectId, data]);
   useEffect(() => {
     if (data?.current_version?.goal !== undefined) {
       setGoalInput(data.current_version.goal || '');
@@ -809,6 +812,9 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
         )}
         {data.staged_directions && data.staged_directions.length > 0 && (
           <StagedDirectionsSummary staged={data.staged_directions} />
+        )}
+        {verdictsError && (
+          <p data-testid="verdicts-error" className="text-ui-sm text-red-400">{verdictsError}</p>
         )}
         {verdicts.length > 0 && (
           <div data-testid="verdict-history">

@@ -179,6 +179,90 @@ describe('NewTaskModal — Draft contract', () => {
     expect(setComputeExperimentSpy).not.toHaveBeenCalled();
   });
 
+  it('shows server-provided notes as the inline error when draft_available=false', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: false,
+      notes: 'Idea is too vague to draft a contract — add a metric.',
+    });
+    const setComputeExperimentSpy = vi.fn();
+
+    render(
+      <NewTaskModal
+        {...baseProps}
+        computeExperiment={makeComputeExperiment()}
+        setComputeExperiment={setComputeExperimentSpy}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'something');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText('Idea is too vague to draft a contract — add a metric.')).toBeInTheDocument();
+    });
+    // server notes replace the generic fallback message
+    expect(screen.queryByText(/draft not available — fill the form manually/i)).not.toBeInTheDocument();
+    expect(setComputeExperimentSpy).not.toHaveBeenCalled();
+  });
+
+  it('renders notes from a successful draft as context without an error', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment.mockResolvedValue({
+      draft_available: true,
+      command: 'python train.py',
+      notes: 'Assumed single-GPU since the idea did not mention scale.',
+    });
+
+    render(
+      <NewTaskModal
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'tune lr');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+
+    const notes = await screen.findByText('Assumed single-GPU since the idea did not mention scale.');
+    // rendered as neutral context, not the red draftError paragraph
+    expect(notes).toHaveClass('text-neutral-400');
+    expect(notes).not.toHaveClass('text-red-400');
+    expect(computeExperiment.command).toBe('python train.py');
+  });
+
+  it('clears stale notes when a later successful draft omits notes', async () => {
+    const user = userEvent.setup();
+    mockDraftComputeExperiment
+      .mockResolvedValueOnce({
+        draft_available: true,
+        command: 'python train.py --v1',
+        notes: 'First-draft caveat.',
+      })
+      .mockResolvedValueOnce({
+        draft_available: true,
+        command: 'python train.py --v2',
+      });
+
+    render(
+      <NewTaskModal
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/describe your experiment/i), 'tune lr');
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await screen.findByText('First-draft caveat.');
+
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await waitFor(() => {
+      expect(screen.queryByText('First-draft caveat.')).not.toBeInTheDocument();
+    });
+  });
+
   it('surfaces network error inline without clearing existing form state', async () => {
     const user = userEvent.setup();
     mockDraftComputeExperiment.mockRejectedValue(new Error('Network error'));

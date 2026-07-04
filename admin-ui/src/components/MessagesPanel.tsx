@@ -965,6 +965,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         status: visibleTarget.status,
       });
       textareaRef.current?.focus();
+    } else if (targetMessage?.action === 'reply') {
+      addToastRef.current('Reply not primed: target must be an open Agent or Strategic message.', 'info');
     }
     onTargetMessageHandled?.();
   }, [

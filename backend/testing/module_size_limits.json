@@ -121,7 +121,8 @@
     "strategic_state_read_model.py": 850,
     "strategic_resident_session.py": 1750,
     "work_session_check_in.py": 400,
-    "release_qualifier_sweep.py": 1750
+    "release_qualifier_sweep.py": 1750,
+    "operator_attention.py": 1800
   },
   "agent": {
     "index.ts": 4600,
@@ -160,7 +161,7 @@
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
     "handlers/strategic-sections.ts": 1500,
-    "providers/runners.ts": 1800,
+    "providers/runners.ts": 2650,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950,
     "providers/resident-session.ts": 560

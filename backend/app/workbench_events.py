@@ -746,7 +746,37 @@ def _compute_job_feed_items(
         title = f"Compute job {action.replace('_', ' ')}"
         if task_title:
             title = f"{title}: {task_title}"
-        data = {
+        summary: str | None = terminal_reason
+        tone = (
+            "critical"
+            if status in {"FAILED", "TIMED_OUT"}
+            else "warning"
+            if status == "CANCELLED"
+            else "active"
+            if status in {"QUEUED", "STARTING", "RUNNING", "POLLING"}
+            else "neutral"
+        )
+        experiment_outcome = job.get("experiment_outcome")
+        if isinstance(experiment_outcome, Mapping) and status in {
+            "SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELLED"
+        }:
+            outcome_label = _compact_str(
+                experiment_outcome.get("outcome_label"), max_chars=40
+            )
+            criterion_summary = _compact_str(
+                experiment_outcome.get("criterion_summary"), max_chars=240
+            )
+            if outcome_label == "met":
+                base_title = "Experiment: criterion met"
+                title = f"{base_title}: {task_title}" if task_title else base_title
+                tone = "active"
+                summary = criterion_summary or terminal_reason
+            elif outcome_label in {"unmet", "inconclusive"}:
+                base_title = f"Experiment: criterion {outcome_label}"
+                title = f"{base_title}: {task_title}" if task_title else base_title
+                tone = "warning"
+                summary = criterion_summary or terminal_reason
+        data: dict[str, Any] = {
             "job_id": job_id,
             "task_id": _compact_str(job.get("task_id"), max_chars=80),
             "task_type": _compact_str(job.get("task_type"), max_chars=80),
@@ -768,6 +798,19 @@ def _compute_job_feed_items(
             ),
             "terminal_reason": terminal_reason,
         }
+        if isinstance(experiment_outcome, Mapping):
+            outcome_label = _compact_str(
+                experiment_outcome.get("outcome_label"), max_chars=40
+            )
+            if outcome_label:
+                data["experiment_outcome"] = {
+                    "outcome_label": outcome_label,
+                    "criterion_met": experiment_outcome.get("criterion_met"),
+                    "criterion_summary": _compact_str(
+                        experiment_outcome.get("criterion_summary"), max_chars=240
+                    ),
+                    "hypothesis_held": experiment_outcome.get("hypothesis_held"),
+                }
         target = {"surface": "runtime", "section": "compute"}
         task_id = data["task_id"]
         if task_id:
@@ -786,14 +829,8 @@ def _compute_job_feed_items(
                 resource="compute_job",
                 action=action,
                 title=title,
-                summary=terminal_reason,
-                tone="critical"
-                if status in {"FAILED", "TIMED_OUT"}
-                else "warning"
-                if status == "CANCELLED"
-                else "active"
-                if status in {"QUEUED", "STARTING", "RUNNING", "POLLING"}
-                else "neutral",
+                summary=summary,
+                tone=tone,
                 ref={"kind": "compute_job", "id": job_id},
                 target=target,
                 refetch_surfaces=(SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION),
