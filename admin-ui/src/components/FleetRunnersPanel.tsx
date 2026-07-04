@@ -417,13 +417,14 @@ function TokenDialog({
 interface Props {
   projectId: string;
   requireLocalRunner?: boolean;
+  refreshSignal?: number;
 }
 
 function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
   return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -457,6 +458,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   }, [projectId]);
 
   useEffect(() => { setLoading(true); load(); }, [load]);
+  useEffect(() => { if (refreshSignal !== undefined) load(); }, [load, refreshSignal]);
 
   useEffect(() => {
     const interval = setInterval(load, 30000);

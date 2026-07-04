@@ -41,9 +41,10 @@ export type { DeployState } from './types/settings';
 interface UseAppStateOptions {
   refreshStrategicReadModelRef?: MutableRefObject<() => void>;
   refreshMessagesRef?: MutableRefObject<() => void>;
+  refreshFleetRunnersRef?: MutableRefObject<() => void>;
 }
 
-export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }: UseAppStateOptions = {}) {
+export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef }: UseAppStateOptions = {}) {
   // ── Composed hooks ──────────────────────────────────────────────────────
   const { user, authLoading, userRole, accessDenied, error, setError } = useAuth();
   const { toasts, addToast, dismissToast } = useToasts();
@@ -98,6 +99,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     refreshStrategicReadModelRef,
     refreshMessagesRef,
     fetchAlertsRef,
+    refreshFleetRunnersRef,
     selectedProjectId,
     realtimeWsEnabled: !authLoading && Boolean(user),
   });
@@ -117,6 +119,10 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     confirmDialog, setConfirmDialog,
   } = useUIState();
   const [researchFeed, setResearchFeed] = useState<Task[]>([]);
+  const [fleetRunnersRefreshSignal, setFleetRunnersRefreshSignal] = useState(0);
+  if (refreshFleetRunnersRef) {
+    refreshFleetRunnersRef.current = () => setFleetRunnersRefreshSignal(signal => signal + 1);
+  }
 
   const {
     maxConcurrentVMs, maxRetries, maxAutonomousTasksPerHour,
@@ -635,6 +641,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     updateProviderSettingsDefaults, updateTaskTypeProviderOverrides,
     // Orchestrator
     handleRestartOrchestrator,
+    fleetRunnersRefreshSignal,
     // GitHub
     githubAccount, connectGitHub,
     // Primary tab navigation

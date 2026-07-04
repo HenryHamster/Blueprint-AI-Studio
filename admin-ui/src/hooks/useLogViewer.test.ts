@@ -42,6 +42,7 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
     const refreshStrategicReadModelRef = useRef<() => void>(vi.fn());
     const refreshMessagesRef = useRef<() => void>(vi.fn());
     const fetchAlertsRef = useRef<() => void>(vi.fn());
+    const refreshFleetRunnersRef = useRef<() => void>(vi.fn());
     const setDeployState = vi.fn();
     const lv = useLogViewer({
       fetchTasksRef,
@@ -50,10 +51,11 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
       refreshStrategicReadModelRef,
       refreshMessagesRef,
       fetchAlertsRef,
+      refreshFleetRunnersRef,
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
     });
-    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef };
+    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef, refreshFleetRunnersRef };
   });
 }
 
@@ -918,7 +920,9 @@ describe('useLogViewer strategist events', () => {
     const { result } = setup({ selectedProjectId: 'proj1' });
     const ws = await connect(result);
     const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    const refreshFleetRunners = result.current.refreshFleetRunnersRef.current as ReturnType<typeof vi.fn>;
     fetchAlerts.mockClear();
+    refreshFleetRunners.mockClear();
 
     act(() => {
       ws.emit({
@@ -933,6 +937,7 @@ describe('useLogViewer strategist events', () => {
       });
     });
     expect(fetchAlerts).not.toHaveBeenCalled();
+    expect(refreshFleetRunners).toHaveBeenCalledTimes(1);
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchAlerts).toHaveBeenCalledTimes(1);
   });

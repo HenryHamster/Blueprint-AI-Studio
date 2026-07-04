@@ -82,9 +82,10 @@ function sameStringSet(a: readonly string[], b: readonly string[]): boolean {
 export default function App() {
   const refreshStrategicReadModelRef = useRef<() => void>(() => {});
   const refreshMessagesRef = useRef<() => void>(() => {});
+  const refreshFleetRunnersRef = useRef<() => void>(() => {});
   const [messageRealtimeRefreshSignal, setMessageRealtimeRefreshSignal] = useState(0);
   refreshMessagesRef.current = () => setMessageRealtimeRefreshSignal(value => value + 1);
-  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef });
+  const s = useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, refreshFleetRunnersRef });
   const searchInputRef = useRef<HTMLInputElement>(null);
   const [pipelineContextTask, setPipelineContextTask] = useState<Task | null>(null);
   const pipelineContextRequestRef = useRef(0);
@@ -1642,6 +1643,7 @@ export default function App() {
             onDismissExperiment={s.handleDismiss}
             onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
             onRestartOrchestrator={s.handleRestartOrchestrator}
+            fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
           />
         </ErrorBoundary>
       ) : (
@@ -2017,6 +2019,7 @@ export default function App() {
           onViewTask={handleViewTask}
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
+          fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
         />
       )}
 

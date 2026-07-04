@@ -458,6 +458,7 @@ interface RuntimeWorkspaceProps {
   onDismissExperiment: (taskId: string) => Promise<void>;
   onNavigateToKnowledge: (documentId: string) => void;
   onRestartOrchestrator: () => Promise<void>;
+  fleetRunnersRefreshSignal?: number;
 }
 
 export function RuntimeWorkspace({
@@ -491,6 +492,7 @@ export function RuntimeWorkspace({
   onDismissExperiment,
   onNavigateToKnowledge,
   onRestartOrchestrator,
+  fleetRunnersRefreshSignal,
 }: RuntimeWorkspaceProps) {
   const runtimeSettingsSections = visibleRuntimeSettingsSections(userRole);
   const activeRuntimeItem = resolveRuntimeItem(runtimeSection);
@@ -602,6 +604,7 @@ export function RuntimeWorkspace({
                 <FleetRunnersPanel
                   projectId={selectedProjectId}
                   requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
+                  refreshSignal={fleetRunnersRefreshSignal}
                 />
               ) : (
                 <div className="py-10 text-center text-xs text-neutral-500">

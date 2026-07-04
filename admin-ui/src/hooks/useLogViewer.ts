@@ -15,6 +15,7 @@ interface UseLogViewerDeps {
   refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
   refreshMessagesRef?: React.MutableRefObject<() => void>;
   fetchAlertsRef?: React.MutableRefObject<() => void>;
+  refreshFleetRunnersRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
 }
@@ -119,6 +120,7 @@ export function useLogViewer({
   refreshStrategicReadModelRef,
   refreshMessagesRef,
   fetchAlertsRef,
+  refreshFleetRunnersRef,
   selectedProjectId,
   realtimeWsEnabled = true,
 }: UseLogViewerDeps) {
@@ -443,6 +445,7 @@ export function useLogViewer({
         || refetchSurfaces.has('runtime')
       )) {
         refreshAlerts();
+        refreshFleetRunnersRef?.current?.();
       }
 
       // Strategist activity events — drive a live refresh of the directions view.
@@ -508,7 +511,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (hasActiveWsForProject(projectId)) return;
