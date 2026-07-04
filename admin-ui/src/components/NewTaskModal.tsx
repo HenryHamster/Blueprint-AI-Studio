@@ -3,7 +3,7 @@ import { GitBranch, X, Plus, GitFork, Microscope, CheckCircle, CheckSquare, Aler
 import type { LaunchableTaskTypeOption } from '../taskCapabilities';
 import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
-import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse } from '../api';
+import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse } from '../api';
 import { draftComputeExperiment } from '../api';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
@@ -127,6 +127,7 @@ export function NewTaskModal({
   const [ideaText, setIdeaText] = useState('');
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
+  const [lastDraft, setLastDraft] = useState<ComputeExperimentDraftResponse | null>(null);
 
   const handleDraftContract = async () => {
     if (!ideaText.trim()) return;
@@ -137,6 +138,7 @@ export function NewTaskModal({
         idea: ideaText.trim(),
         ...(newTaskRepo ? { github_repo: newTaskRepo } : {}),
         ...(newTaskBranch ? { base_branch: newTaskBranch } : {}),
+        ...(lastDraft ? { prior_draft: lastDraft } : {}),
       });
       if (!draft.draft_available) {
         setDraftError('Draft not available — fill the form manually.');
@@ -165,6 +167,7 @@ export function NewTaskModal({
       }));
       if (draft.title) setNewTaskTitle(draft.title);
       if (draft.prompt) setNewTaskPrompt(draft.prompt);
+      setLastDraft(draft);
     } catch (err) {
       setDraftError(err instanceof Error ? err.message : 'Draft failed');
     } finally {

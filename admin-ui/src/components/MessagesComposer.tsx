@@ -16,7 +16,10 @@ export interface MessagesComposerProps {
   /** Whether a strategic cycle is currently running (live WS-driven signal). */
   strategistBusy?: boolean;
   strategicContext?: StrategicContextDescriptorModel | null;
+  starterPrompts?: string[];
+  capabilityHint?: string | null;
   disabledReason?: string | null;
+  onPickStarterPrompt?: (value: string) => void;
   onOpenStrategicContext?: () => void;
   onOpenCommandPalette?: () => void;
   onChangeType: (value: string) => void;
@@ -43,6 +46,8 @@ export function MessagesComposer({
   lastArming,
   strategistBusy,
   strategicContext,
+  starterPrompts,
+  capabilityHint,
   disabledReason,
   onOpenStrategicContext,
   onOpenCommandPalette,
@@ -50,6 +55,7 @@ export function MessagesComposer({
   onChangeContent,
   onCancelReply,
   onSubmit,
+  onPickStarterPrompt,
   chrome = 'full',
 }: MessagesComposerProps) {
   // Auto-resize textarea — max 3 rows (~96px).
@@ -79,6 +85,25 @@ export function MessagesComposer({
     }>
       {minimal && strategicContext && (
         <StrategicContextDescriptor model={strategicContext} onOpen={onOpenStrategicContext} />
+      )}
+      {minimal && starterPrompts && starterPrompts.length > 0 && !newContent && (
+        <div className={`${minimalColumnClass} mb-1.5 flex flex-wrap gap-1.5 px-1`}>
+          {starterPrompts.map(prompt => (
+            <button
+              key={prompt}
+              type="button"
+              onClick={() => onPickStarterPrompt?.(prompt)}
+              className="rounded-full border border-neutral-800 bg-neutral-950/60 px-2.5 py-1 text-xs text-neutral-300 transition-colors hover:border-neutral-600 hover:bg-neutral-900"
+            >
+              {prompt}
+            </button>
+          ))}
+        </div>
+      )}
+      {minimal && !newContent && capabilityHint && (
+        <p className={`${minimalColumnClass} mb-1 px-1 text-ui-md text-neutral-600 leading-snug`}>
+          {capabilityHint}
+        </p>
       )}
       {/* Reply quote bar */}
       {replyTo && (

@@ -1121,6 +1121,33 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                     {job.external_compute_id ? ` · ${job.external_compute_id}` : ''}
                   </div>
                   {(() => {
+                    const runner = job.runner;
+                    const runnerName = runner?.hostname ?? (job.runner_target_id ? job.runner_target_id.slice(0, 8) : null);
+                    if (runnerName && job.runner_claimed_at) {
+                      const claimedMs = Date.parse(job.runner_claimed_at);
+                      const elapsedSec = isNaN(claimedMs) ? null : Math.max(0, Math.round((nowMs - claimedMs) / 1000));
+                      return (
+                        <div className="text-ui-sm text-neutral-400 font-mono mt-0.5" data-testid="compute-runner-claimed">
+                          runner: <span className="text-neutral-200">{runnerName}</span>
+                          {elapsedSec != null && (
+                            <> · claimed {fmtDuration(elapsedSec)} ago</>
+                          )}
+                        </div>
+                      );
+                    }
+                    if (job.awaiting_local_runner_since && !runner) {
+                      const waitingMs = Date.parse(job.awaiting_local_runner_since);
+                      const waitingSec = isNaN(waitingMs) ? null : Math.max(0, Math.round((nowMs - waitingMs) / 1000));
+                      return (
+                        <div className="text-ui-sm text-amber-400 font-mono mt-0.5" data-testid="compute-runner-waiting">
+                          waiting for local runner
+                          {waitingSec != null && <> since {fmtDuration(waitingSec)} ago</>}
+                        </div>
+                      );
+                    }
+                    return null;
+                  })()}
+                  {(() => {
                     const evidence = asLiveReleaseEvidence(job.polling_metadata?.live_release_evidence);
                     if (!evidence) return null;
                     return (

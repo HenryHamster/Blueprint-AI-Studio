@@ -434,6 +434,8 @@ export interface ComputeExperimentDraftRequest {
   idea: string;
   github_repo?: string;
   base_branch?: string;
+  /** Optional prior draft for multi-turn refinement — the backend threads it into the LLM conversation. */
+  prior_draft?: ComputeExperimentDraftResponse;
 }
 
 /**
@@ -3309,6 +3311,17 @@ export interface ComputeJob {
     met: boolean | null;
     cost_usd: number | null;
   }> | null;
+  // Runner identity fields — present when the job was dispatched to a registered
+  // local runner. Absent on legacy rows or cloud-dispatched jobs. Older backends
+  // may omit these fields entirely; consumers must treat absence as null.
+  runner_target_id?: string | null;
+  runner_claimed_at?: string | null;
+  awaiting_local_runner_since?: string | null;
+  runner?: {
+    id: string;
+    hostname: string | null;
+    status: string | null;
+  } | null;
 }
 
 export interface ComputeJobsSummary {
@@ -4280,6 +4293,23 @@ export async function registerFleetRunner(
     const data = await res.json().catch(() => ({}));
     const msg = data?.detail || `Failed to register runner: ${res.status}`;
     throw new Error(typeof msg === 'string' ? msg : `Failed to register runner: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Rotate a runner token. Returns the one-time replacement token. */
+export async function rotateFleetRunnerToken(
+  projectId: string,
+  runnerId: string,
+): Promise<FleetRunnerRegistrationResult> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/runners/${encodeURIComponent(runnerId)}/rotate-token`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to rotate runner token: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to rotate runner token: ${res.status}`);
   }
   return res.json();
 }

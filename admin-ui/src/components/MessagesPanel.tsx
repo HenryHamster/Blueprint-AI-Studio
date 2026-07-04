@@ -23,7 +23,7 @@ import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
 import { MessagesPanelHeader, type MessagesPanelFilterChrome, type WebhookStats } from './MessagesPanelHeader';
 import { MessagesComposer } from './MessagesComposer';
-import { armingToastCopy, parseArmingOutcome, type ArmingOutcome } from './messageArming';
+import { armingToastCopy, parseArmingOutcome, type ArmingOutcome, WORKDAY_CAPABILITY_HINT, WORKDAY_STARTER_PROMPTS } from './messageArming';
 import { MessagesBatchActionBar } from './MessagesBatchActionBar';
 import { usePoller, DEFAULT_POLL_MS } from '../hooks/usePoller';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
@@ -879,6 +879,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     } satisfies ProjectMessage;
     return [...conversationMessages, optimisticMessage];
   }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
+  const starterPrompts = conversationMode && !loading && conversationMessages.length === 0 ? WORKDAY_STARTER_PROMPTS : null;
 
   // Clear the working state once a FRESH strategist reply lands (compare reply
   // COUNT to the baseline captured at send time — robust to client/server clock
@@ -2182,6 +2183,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         onChangeContent={(value) => { setNewContent(value); if (value) { saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); } else { clearComposerDraft(auth.currentUser?.email, selectedProjectId); } }}
         onCancelReply={() => setReplyTo(null)}
         onSubmit={handleSubmit}
+        starterPrompts={starterPrompts ?? undefined}
+        capabilityHint={starterPrompts ? WORKDAY_CAPABILITY_HINT : undefined}
+        onPickStarterPrompt={(value) => { setNewContent(value); saveComposerDraft(auth.currentUser?.email, selectedProjectId, { type: effectiveNewType, content: value }); focusComposerTextarea(); }}
         chrome={conversationMode ? 'minimal' : 'full'}
         strategicContext={strategicComposerContext}
         onOpenStrategicContext={conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined}

@@ -388,6 +388,56 @@ async def list_runners(
     return [_runner_view(r) for r in result.scalars().all()]
 
 
+@router.post("/projects/{project_id}/runners/{runner_id}/rotate-token")
+async def rotate_runner_token(
+    project_id: uuid.UUID,
+    runner_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Rotate a runner secret and return the new plaintext token exactly once."""
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "owner"
+    )
+    result = await session.execute(
+        select(LocalRunner)
+        .where(
+            LocalRunner.id == runner_id,
+            LocalRunner.project_id == project_id,
+        )
+        .with_for_update()
+    )
+    runner = result.scalars().first()
+    if runner is None or runner.status == "deleted":
+        raise HTTPException(status_code=404, detail="Runner not found")
+
+    token = create_runner_token(runner.id)
+    runner.token_hash = hash_runner_token(token)
+    summary_status = runner.status
+    summary_hostname = runner.hostname
+    session.add(runner)
+    await session.commit()
+
+    logger.info(
+        "[RUNNERS] Rotated token for runner %s on project %s",
+        runner_id,
+        project_id,
+    )
+    await emit_workbench_refetch(
+        project_id,
+        resource="local_runner",
+        action="token_rotated",
+        refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
+        summary_key="runner",
+        summary={
+            "id": str(runner_id),
+            "status": summary_status,
+            "hostname": summary_hostname,
+        },
+    )
+    return {"runner_id": str(runner_id), "token": token}
+
+
 async def _release_unpulled_runner_pins(
     session: AsyncSession,
     runner_id: uuid.UUID,

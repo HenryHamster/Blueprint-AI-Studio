@@ -2505,6 +2505,9 @@ class ComputeExperimentDraftRequest(BaseModel):
         default=None, pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$"
     )
     base_branch: str | None = Field(default=None, max_length=255)
+    # Optional prior draft for multi-turn refinement: if present the LLM receives
+    # the prior response as context so follow-ups like "make it 3 arms" are coherent.
+    prior_draft: dict | None = None
 
 
 class ComputeExperimentDraftSuccessCriterion(BaseModel):
@@ -2667,7 +2670,13 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
     )
 
 
-async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base_branch: str | None) -> dict | None:
+async def _call_draft_llm(
+    api_key: str,
+    idea: str,
+    github_repo: str | None,
+    base_branch: str | None,
+    prior_draft: dict | None = None,
+) -> dict | None:
     """Call Anthropic to produce a draft compute-experiment contract. Returns dict or None."""
     context_parts = [f"Research idea: {idea}"]
     if github_repo:
@@ -2675,6 +2684,17 @@ async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base
     if base_branch:
         context_parts.append(f"Base branch: {base_branch}")
     user_message = "\n".join(context_parts)
+
+    if prior_draft is not None:
+        # Multi-turn: inject the prior draft as the assistant's previous response so
+        # the LLM can refine specific fields without starting from scratch.
+        messages: list[dict] = [
+            {"role": "user", "content": "Generate an experiment draft."},
+            {"role": "assistant", "content": json.dumps(prior_draft)},
+            {"role": "user", "content": user_message},
+        ]
+    else:
+        messages = [{"role": "user", "content": user_message}]
 
     for attempt in range(2):
         try:
@@ -2686,7 +2706,7 @@ async def _call_draft_llm(api_key: str, idea: str, github_repo: str | None, base
                 max_tokens=_DRAFT_LLM_MAX_TOKENS,
                 timeout=_DRAFT_LLM_TIMEOUT,
                 system=_DRAFT_LLM_SYSTEM,
-                messages=[{"role": "user", "content": user_message}],
+                messages=messages,
             )
             raw_text = resp.content[0].text.strip()
             parsed = _parse_draft_json(raw_text)
@@ -2734,7 +2754,7 @@ async def compute_experiment_draft(
             notes="Draft generation is unavailable: ANTHROPIC_API_KEY is not configured.",
         )
 
-    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch)
+    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch, payload.prior_draft)
     if raw is None:
         return ComputeExperimentDraft(
             draft_available=False,

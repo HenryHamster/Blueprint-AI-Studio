@@ -30,7 +30,7 @@ from app.compute_jobs_aggregation import (
     aggregate_criterion_summary,
 )
 from app.database import get_session
-from app.models import Artifact, ComputeJob, ComputeJobStatus, Task
+from app.models import Artifact, ComputeJob, ComputeJobStatus, LocalRunner, Task
 from app.schemas import serialize_compute_job_response_safe
 from app.task_evaluators import (
     _declared_success_criterion,
@@ -165,6 +165,29 @@ async def _build_compute_job_payload(
         )
         artifacts = {artifact.id: artifact for artifact in artifact_rows}
 
+    # Batch-load LocalRunner rows for jobs that carry a runner_target_id in
+    # their polling_metadata. One query covers all jobs in the page.
+    runner_target_ids: set[uuid.UUID] = set()
+    for job in jobs:
+        raw_id = (job.polling_metadata or {}).get("runner_target_id")
+        if raw_id:
+            try:
+                runner_target_ids.add(uuid.UUID(str(raw_id)))
+            except (ValueError, AttributeError):
+                pass
+    runner_map: Dict[uuid.UUID, LocalRunner] = {}
+    if runner_target_ids:
+        runner_rows = (
+            (
+                await session.execute(
+                    select(LocalRunner).where(LocalRunner.id.in_(runner_target_ids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        runner_map = {r.id: r for r in runner_rows}
+
     payload: list[Dict[str, Any]] = []
     for job in jobs:
         data = serialize_compute_job_response_safe(job)
@@ -221,6 +244,32 @@ async def _build_compute_job_payload(
         data["artifact"] = (
             _artifact_descriptor(linked_artifact) if linked_artifact else None
         )
+        # Runner identity and wait-state fields.
+        pm = job.polling_metadata or {}
+        raw_runner_id = pm.get("runner_target_id")
+        runner_target_id_str: str | None = str(raw_runner_id) if raw_runner_id else None
+        data["runner_target_id"] = runner_target_id_str
+        data["runner_claimed_at"] = pm.get("runner_claimed_at")
+        runner_descriptor: Dict[str, Any] | None = None
+        if runner_target_id_str:
+            try:
+                runner_obj = runner_map.get(uuid.UUID(runner_target_id_str))
+                if runner_obj is not None:
+                    runner_descriptor = {
+                        "id": str(runner_obj.id),
+                        "hostname": runner_obj.hostname,
+                        "status": runner_obj.status,
+                    }
+            except (ValueError, AttributeError):
+                pass
+        data["runner"] = runner_descriptor
+        # awaiting_local_runner_since lives on the launching task's context, not
+        # the job row. The task_obj is already loaded in the batch above.
+        awaiting: str | None = None
+        if task_obj is not None:
+            raw_awaiting = (task_obj.context or {}).get("awaiting_local_runner_since")
+            awaiting = str(raw_awaiting) if raw_awaiting else None
+        data["awaiting_local_runner_since"] = awaiting
         payload.append(data)
     return payload
 

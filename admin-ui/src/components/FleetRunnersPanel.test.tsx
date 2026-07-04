@@ -38,11 +38,12 @@ vi.mock('../api', async () => {
     API_BASE_URL: 'https://blueprint-orchestrator-xyz.a.run.app',
     listFleetRunners: vi.fn(async () => SAMPLE_RUNNERS),
     registerFleetRunner: vi.fn(async () => ({ runner_id: 'runner-new', token: 'tok-secret-xyz' })),
+    rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated-xyz' })),
     revokeFleetRunner: vi.fn(async () => {}),
   });
 });
 
-import { listFleetRunners, registerFleetRunner, revokeFleetRunner } from '../api';
+import { listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
 
 describe('FleetRunnersPanel — behavioral', () => {
   let root: Root | null = null;
@@ -325,6 +326,77 @@ describe('FleetRunnersPanel — behavioral', () => {
     const statusAfter = el.querySelector('[data-testid="runner-connection-status"]');
     expect(statusAfter?.textContent).toContain('Connected on this project');
     expect(statusAfter?.textContent).toContain('operator-laptop');
+  });
+
+  // ── Rotate runner token ──────────────────────────────────────────────────────
+
+  test('rotating a runner prompts, calls rotateFleetRunnerToken, and shows restart-focused token dialog', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+    const clipboardWrite = vi.fn(async () => {});
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: clipboardWrite },
+    });
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    expect(rotateBtn).not.toBeNull();
+
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('current token will stop working immediately'));
+    expect(rotateFleetRunnerToken).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
+    expect(el.textContent).toContain('Runner token rotated');
+    expect(el.textContent).toContain('tok-rotated-xyz');
+    expect(el.textContent).toContain('Restart the existing runner process');
+    expect(el.textContent).toContain('Restart required');
+    expect(el.textContent).not.toContain('Connected on this project');
+    expect(el.textContent).toContain('Windows PowerShell');
+    expect(el.textContent).toContain('macOS/Linux');
+    expect(el.textContent).toContain('py -3 scripts/blueprint_runner.py start');
+    expect(el.textContent).toContain('bash blueprint-runner start');
+
+    const tokenCopyBtn = el.querySelector('button[title="Copy token"]');
+    const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
+    expect(tokenCopyBtn).not.toBeNull();
+    expect(shellCopyBtn).not.toBeNull();
+
+    await act(async () => { (tokenCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith('tok-rotated-xyz');
+    await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining("bash blueprint-runner start --token 'tok-rotated-xyz'"));
+
+    confirmSpy.mockRestore();
+  });
+
+  test('cancelling the rotate confirm does not call rotateFleetRunnerToken', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(confirmSpy).toHaveBeenCalled();
+    expect(rotateFleetRunnerToken).not.toHaveBeenCalled();
+    expect(el.textContent).not.toContain('Runner token rotated');
+
+    confirmSpy.mockRestore();
+  });
+
+  test('rotate error is displayed in the panel', async () => {
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    vi.mocked(rotateFleetRunnerToken).mockRejectedValueOnce(new Error('Rotate failed'));
+    const el = await mount();
+
+    const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
+    await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(el.textContent).toContain('Rotate failed');
+    expect(el.textContent).not.toContain('Runner token rotated');
+    vi.restoreAllMocks();
   });
 
   // ── Revoke runner ────────────────────────────────────────────────────────────

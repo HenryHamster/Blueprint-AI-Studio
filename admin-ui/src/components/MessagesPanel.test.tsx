@@ -711,6 +711,21 @@ describe('MessagesPanel chrome modes', () => {
     expect(onOpenCommandPalette).toHaveBeenCalledTimes(1);
   });
 
+  test('starter prompts render on empty conversation and prefill the composer', async () => {
+    const el = await renderPanel({ filterChrome: 'minimal' });
+    const textarea = el.querySelector('textarea') as HTMLTextAreaElement | null;
+    if (!textarea) throw new Error('expected minimal composer textarea');
+
+    expect(el.textContent).toContain('Workday can research, plan, and spawn budgeted compute experiments from chat.');
+    const starter = Array.from(el.querySelectorAll('button')).find(button => button.textContent === 'What should I research next?');
+    if (!starter) throw new Error('starter prompt button not found');
+
+    await act(async () => { starter.click(); });
+
+    expect(textarea.value).toBe('What should I research next?');
+    expect(el.textContent).toContain('What should I research next?');
+  });
+
   test('legacy onClose usage keeps full controls and close action', async () => {
     const onClose = vi.fn();
     const el = await renderPanel({ onClose });

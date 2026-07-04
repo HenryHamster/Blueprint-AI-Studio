@@ -2792,6 +2792,22 @@
       "event": "workbench_refetch",
       "event_expression": null,
       "event_is_literal": true,
+      "lineno": 426,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "rotate_runner_token",
+      "source_path": "backend/app/routers/admin_runners.py",
+      "workbench_action": "token_rotated",
+      "workbench_resource": "local_runner"
+    },
+    {
+      "callee": "emit_workbench_refetch",
+      "canonical_callee": "emit_workbench_refetch",
+      "classification": "workbench_v1_helper",
+      "event": "workbench_refetch",
+      "event_expression": null,
+      "event_is_literal": true,
       "lineno": 455,
       "notes": "",
       "occurrence": 1,
@@ -4189,6 +4205,6 @@
     "strategic_v1_helper": 19,
     "transport": 5,
     "workbench_v1_emitter": 1,
-    "workbench_v1_helper": 9
+    "workbench_v1_helper": 10
   }
 }

@@ -20,6 +20,7 @@ from app.models import (
     ComputeJobOutcome,
     ComputeJobStatus,
     KnowledgeDocument,
+    LocalRunner,
     Project,
     ProjectMember,
     SourceKind,
@@ -2132,3 +2133,145 @@ async def test_ask_compute_job_history_not_citable(
     # Prior answer text is not durable evidence — must be rejected by the grounding gate
     assert body["grounding_miss"] is True
     assert body["citations"] == []
+
+
+# ---------------------------------------------------------------------------
+# Runner identity and wait-state surfacing tests
+# ---------------------------------------------------------------------------
+
+
+async def _make_runner(session, project, *, hostname="worker-01", status="active"):
+    """Seed a LocalRunner for the given project."""
+    import hashlib
+    token = "test-token-" + hostname
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash=token_hash,
+        hostname=hostname,
+        status=status,
+    )
+    session.add(runner)
+    await session.commit()
+    await session.refresh(runner)
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_surfaces_runner_claim(client: AsyncClient, db_session):
+    """A job pinned to a registered runner must surface runner_target_id,
+    runner_claimed_at, and a runner descriptor (id/hostname/status) in the response."""
+    project = await _make_project(db_session, name="Runner Claim Project")
+    await _add_member(db_session, project.id, "viewer")
+    runner = await _make_runner(db_session, project, hostname="worker-01")
+
+    claimed_at = "2026-07-04T10:00:00Z"
+    _task, job, _artifact = await _make_job(
+        db_session,
+        project,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "runner_claimed_at": claimed_at,
+        },
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["runner_target_id"] == str(runner.id)
+    assert j["runner_claimed_at"] == claimed_at
+    assert j["runner"] is not None
+    assert j["runner"]["id"] == str(runner.id)
+    assert j["runner"]["hostname"] == "worker-01"
+    assert j["runner"]["status"] == "active"
+    # token_hash must NOT be present in the descriptor.
+    assert "token_hash" not in j["runner"]
+    assert "token" not in j["runner"]
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_awaiting_local_runner_since(
+    client: AsyncClient, db_session
+):
+    """A queued job whose task carries awaiting_local_runner_since must surface that
+    field; when no runner has claimed it the runner descriptor must be null."""
+    project = await _make_project(db_session, name="Awaiting Runner Project")
+    await _add_member(db_session, project.id, "viewer")
+
+    waiting_since = "2026-07-04T09:30:00Z"
+    task = Task(
+        project_id=project.id,
+        title="queued compute task",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_local_runner_since": waiting_since},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    job = ComputeJob(
+        task_id=task.id,
+        project_id=project.id,
+        backend="local-subprocess",
+        status=ComputeJobStatus.QUEUED,
+        machine_type="e2-standard-2",
+        spend_cap_usd=2.0,
+    )
+    db_session.add(job)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["awaiting_local_runner_since"] == waiting_since
+    assert j["runner"] is None
+    assert j["runner_target_id"] is None
+    assert j["runner_claimed_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_list_compute_jobs_no_runner_fields_null(client: AsyncClient, db_session):
+    """A job with no runner pin must have all three runner fields null (backward-compat)."""
+    project = await _make_project(db_session, name="No Runner Project")
+    await _add_member(db_session, project.id, "viewer")
+    _task, _job, _artifact = await _make_job(db_session, project)
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/compute-jobs")
+    assert resp.status_code == 200
+    j = resp.json()["compute_jobs"][0]
+
+    assert j["runner_target_id"] is None
+    assert j["runner_claimed_at"] is None
+    assert j["awaiting_local_runner_since"] is None
+    assert j["runner"] is None
+
+
+@pytest.mark.asyncio
+async def test_get_compute_job_detail_surfaces_runner_claim(
+    client: AsyncClient, db_session
+):
+    """The single-job detail endpoint must also surface runner fields."""
+    project = await _make_project(db_session, name="Runner Detail Project")
+    await _add_member(db_session, project.id, "viewer")
+    runner = await _make_runner(db_session, project, hostname="detail-host")
+
+    claimed_at = "2026-07-04T11:00:00Z"
+    _task, job, _artifact = await _make_job(
+        db_session,
+        project,
+        polling_metadata={
+            "runner_target_id": str(runner.id),
+            "runner_claimed_at": claimed_at,
+        },
+    )
+
+    resp = await client.get(f"/api/admin/compute-jobs/{job.id}")
+    assert resp.status_code == 200
+    j = resp.json()["compute_job"]
+
+    assert j["runner_target_id"] == str(runner.id)
+    assert j["runner_claimed_at"] == claimed_at
+    assert j["runner"]["hostname"] == "detail-host"
