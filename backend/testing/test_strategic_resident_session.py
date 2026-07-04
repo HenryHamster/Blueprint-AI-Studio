@@ -461,6 +461,80 @@ async def test_start_auto_selects_local_runner_when_none_specified(db_session):
 
 
 @pytest.mark.asyncio
+async def test_start_adopt_pins_task_to_runner(db_session):
+    """ADOPT-path twin of the SPAWN-path birth pin: when a resident session adopts
+    an existing not-yet-dispatched cadence ``strategic_review`` AND a live runner
+    exists, the adopted task is hard runner-pinned IN PLACE — ``PROVISIONING`` +
+    ``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']`` (the exact
+    ``POST /api/runner/next-task`` contract) — so the operator's local runner pulls
+    it directly, independent of the general VM-dispatch cycle (which may be paused,
+    ``max_concurrent_vms=0``).
+
+    Regression: adoption only stamped the non-authoritative
+    ``preferred_runner_target_id`` hint, leaving the task ``QUEUED`` + ``agent-vm``
+    with no ``runner_target_id`` — so it matched none of the four next-task filters
+    and relied on the paused dispatch cycle to pin it.
+    """
+    project = await _make_project_with_member(db_session)
+    runner = await _make_live_local_runner(db_session, project)
+    # An adoptable cadence strategic_review (QUEUED, started_at NULL) that carries a
+    # cloud-vm id AND a stale strategic local-runner hold marker the pin must clear.
+    task = await _make_strategic_review_task(
+        db_session, project, vm="agent-vm-cadence"
+    )
+    task.context = {srs.STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY: "2020-01-01T00:00:00"}
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # The pre-existing adoptable task was ADOPTED (not a fresh spawn).
+    assert snapshot["task_id"] == str(task.id)
+
+    adopted = await db_session.get(Task, task.id)
+    # The four next-task pin fields now land on the adopted task in place.
+    assert adopted.status == TaskStatus.PROVISIONING
+    assert adopted.vm_instance_id == f"runner:{runner.id}"
+    assert adopted.started_at is None
+    assert adopted.vm_provisioned_at is not None
+    ctx = adopted.context or {}
+    assert ctx.get("runner_target_id") == str(runner.id)
+    # Resident flags + affinity hint preserved; stale hold marker cleared.
+    assert ctx.get("_resident_session") is True
+    assert ctx.get("strategic_session_id") == snapshot["session_id"]
+    assert ctx.get("preferred_runner_target_id") == str(runner.id)
+    assert ctx.get(srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert srs.STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY not in ctx
+
+
+@pytest.mark.asyncio
+async def test_start_adopt_unpinned_when_no_runner_leaves_task_queued(db_session):
+    """ADOPT with NO eligible runner (unpinned cloud fallback): only the resident
+    flags are stamped — the adopted task keeps its QUEUED status + cadence vm id and
+    gains no ``runner_target_id`` (unchanged pre-fix behavior; the runner-pin branch
+    is strictly runner-gated)."""
+    project = await _make_project_with_member(db_session)
+    # No runner registered → auto-selection yields None → unpinned adopt.
+    task = await _make_strategic_review_task(db_session, project, vm="agent-vm-cadence")
+
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snapshot["task_id"] == str(task.id)
+
+    adopted = await db_session.get(Task, task.id)
+    assert adopted.status == TaskStatus.QUEUED
+    assert adopted.vm_instance_id == "agent-vm-cadence"
+    ctx = adopted.context or {}
+    assert "runner_target_id" not in ctx
+    assert srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
+    # Resident routing flag still stamped even on the unpinned fallback.
+    assert ctx.get("_resident_session") is True
+
+
+@pytest.mark.asyncio
 async def test_start_explicit_runner_id_beats_autoselect(db_session):
     """An explicit ``runner_id`` is honored as-is (auto-selection is only a
     fallback for the no-runner case)."""
@@ -956,6 +1030,74 @@ async def test_start_spawn_path_is_minimal_and_lands_task_id(db_session, monkeyp
     # GitHub-derived keys absent (their builders were tripwired).
     for _heavy in ("recent_interventions", "design_doc", "conversation_thread"):
         assert _heavy not in payload
+
+
+@pytest.mark.asyncio
+async def test_resident_spawn_is_born_runner_pinned_and_pullable(db_session):
+    """The resident SPAWN path must birth its ``strategic_review`` ALREADY pinned to
+    the operator's local runner — the exact contract ``POST /api/runner/next-task``
+    filters on — so the runner claims it directly, independent of the general
+    VM-dispatch cycle (which may be paused, ``max_concurrent_vms=0``).
+
+    Regression: the task was born ``status=QUEUED`` + ``vm_instance_id='agent-vm-…'``
+    with NO ``context['runner_target_id']`` (only the non-authoritative
+    ``preferred_runner_target_id`` affinity hint). ``next-task`` — which requires
+    ``status==PROVISIONING AND vm_instance_id=='runner:{id}' AND
+    context['runner_target_id']==id AND started_at IS NULL`` — matched none of those,
+    returned 204, and the resident agent never ran (observed live: QUEUED, VM-pinned,
+    ``runner_target_id=None``).
+    """
+    project = await _make_project_with_member(db_session)
+    # is_self_repo short-circuits the bootstrap-pending guard so the real spawn runs.
+    project.is_self_repo = True
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = await _make_live_local_runner(db_session, project)
+
+    session_id = new_session_id()
+    task = await srs._spawn_resident_strategic_task(
+        db_session, project, str(runner.id), session_id=session_id
+    )
+    assert task is not None
+
+    # Read the COMMITTED task fresh and assert the four next-task pin fields.
+    committed = await db_session.get(Task, task.id)
+    assert committed.status == TaskStatus.PROVISIONING
+    assert committed.vm_instance_id == f"runner:{runner.id}"
+    assert committed.started_at is None
+    ctx = committed.context or {}
+    assert ctx.get("runner_target_id") == str(runner.id)
+    # Resident routing flags still born in the SAME creating INSERT.
+    assert ctx.get("_resident_session") is True
+    assert ctx.get("strategic_session_id") == session_id
+    # The affinity hint is preserved alongside the authoritative pin.
+    assert ctx.get("preferred_runner_target_id") == str(runner.id)
+
+
+@pytest.mark.asyncio
+async def test_resident_spawn_unpinned_born_queued_when_no_runner(db_session):
+    """With no runner id, the resident spawn falls back to the unpinned cloud path:
+    born QUEUED + fresh ``agent-vm`` id, no ``runner_target_id`` — identical to the
+    pre-fix cadence contract, so a degraded start still yields a valid task and no
+    cadence caller is affected by the runner-pin branch."""
+    project = await _make_project_with_member(db_session)
+    project.is_self_repo = True
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await srs._spawn_resident_strategic_task(
+        db_session, project, None, session_id=new_session_id()
+    )
+    assert task is not None
+    committed = await db_session.get(Task, task.id)
+    assert committed.status == TaskStatus.QUEUED
+    assert committed.vm_instance_id.startswith("agent-vm-")
+    assert committed.started_at is None
+    assert "runner_target_id" not in (committed.context or {})
+    # The resident routing flag is still born even on the unpinned fallback.
+    assert (committed.context or {}).get("_resident_session") is True
 
 
 # ---------------------------------------------------------------------------
