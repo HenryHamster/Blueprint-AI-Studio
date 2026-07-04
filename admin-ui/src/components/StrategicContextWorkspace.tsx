@@ -30,6 +30,7 @@ import {
   StrategicSessionControl,
   type StrategicAccountSpendStatus,
   type StrategicInteractionMode,
+  type StrategicResidentRunnerOption,
 } from './StrategicSessionControl';
 
 type StrategicContextTarget = StrategicContextPackageDrilldown['target'];
@@ -48,6 +49,9 @@ interface StrategicContextWorkspaceProps {
   sessionState?: string | null;
   sessionReason?: string | null;
   sessionBusy?: boolean;
+  sessionRunners?: StrategicResidentRunnerOption[] | null;
+  sessionSelectedRunnerId?: string | null;
+  onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
   onClose: () => void;
@@ -588,6 +592,9 @@ export function StrategicContextWorkspace({
   sessionState = null,
   sessionReason = null,
   sessionBusy = false,
+  sessionRunners = null,
+  sessionSelectedRunnerId = null,
+  onSelectRunner,
   onStartSession,
   onStopSession,
   onClose,
@@ -774,6 +781,9 @@ export function StrategicContextWorkspace({
                   sessionState={sessionState}
                   sessionReason={sessionReason}
                   sessionBusy={sessionBusy}
+                  sessionRunners={sessionRunners}
+                  sessionSelectedRunnerId={sessionSelectedRunnerId}
+                  onSelectRunner={onSelectRunner}
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}
                   onModeChange={onModeChange}

@@ -85,6 +85,12 @@ RESIDENT_SESSION_REASON_KEY = "_resident_strategic_session_reason"
 # by the auto-start hook because they are runtime outcomes, not static config.
 RESIDENT_SESSION_REASON_NO_RUNNER = "no_runner"
 RESIDENT_SESSION_REASON_START_FAILED_PREFIX = "start_failed"
+# Multi-device block reason: the runner the session is pinned to (an explicit
+# operator override at start, OR the auto-picked device mid-session) is offline /
+# no longer available. Derived by the read model from the live runner set + the
+# pinned ``runner_id`` — Workday does NOT auto-migrate to another device; the
+# operator restarts the session to pick another (operator decision (c)).
+RESIDENT_SESSION_REASON_RUNNER_OFFLINE = "runner_offline"
 
 # Runtime-config feature flag (default off). Registered by BE-safety in the
 # settings registry; referenced here by name only.
@@ -498,49 +504,156 @@ async def _spawn_resident_strategic_task(
     return await _find_adoptable_strategic_review_task(session, project.id)
 
 
-async def _auto_select_local_runner(
-    session: AsyncSession, project_id: uuid.UUID
-) -> str | None:
-    """Auto-select a LIVE, strategic-capable, agent-available local runner id.
+def _resident_runner_display_name(runner: Any) -> str:
+    """Human label for a runner in the device picker (hostname, else short id).
 
-    Reuses the exact runner-eligibility predicates the strategic spawn path uses
-    to resolve continuation affinity
-    (``strategic_spawning._local_runner_is_live`` / ``_local_runner_handles_task_type``
-    / ``_local_runner_agent_available``) so a resident session started WITHOUT an
-    explicit runner still pins to the operator's box instead of dispatching to a
-    fresh cloud VM. Ordered most-recently-seen first (matching
-    ``_resolve_local_continuation_runner_affinity``'s ordering). Returns the first
-    eligible runner id, or None when none is eligible — the degraded cloud
-    fallback the caller then proceeds with unpinned.
+    Shared by the block-reason messages and the read-model picker options so the
+    device the operator sees named in "device <name> offline …" matches the label
+    in the dropdown.
     """
-    from app.models import LocalRunner
+    hostname = getattr(runner, "hostname", None)
+    if isinstance(hostname, str) and hostname.strip():
+        return hostname.strip()[:160]
+    return f"runner-{str(runner.id)[:8]}"
+
+
+def _resident_runner_is_available(runner: Any) -> bool:
+    """True iff *runner* can host a resident session RIGHT NOW (multi-device gate).
+
+    "Available" (operator decision) == active status + recent heartbeat (LIVE) AND
+    handles the ``strategic_review`` task type AND its agent is ready
+    (``agent_available`` not False). This single predicate is shared by the
+    auto-pick, the explicit-override validation, and the read-model picker so all
+    three agree on which devices can run Workday. Reuses the exact
+    ``strategic_spawning`` eligibility predicates the dispatch path uses.
+    """
     from app.strategic_spawning import (
         _local_runner_agent_available,
         _local_runner_handles_task_type,
         _local_runner_is_live,
     )
 
-    rows = (
-        await session.execute(
-            select(LocalRunner)
-            .where(
-                LocalRunner.project_id == project_id,
-                LocalRunner.status != "deleted",
-            )
-            .order_by(
-                LocalRunner.last_seen_at.desc(),
-                LocalRunner.created_at.desc(),
+    return bool(
+        _local_runner_is_live(runner)
+        and _local_runner_handles_task_type(runner, _RESIDENT_STRATEGIC_TASK_TYPE)
+        and _local_runner_agent_available(runner)
+    )
+
+
+async def _load_resident_runner_rows(
+    session: AsyncSession, project_id: uuid.UUID
+) -> list[Any]:
+    """Load the project's non-deleted local runners, most-recently-seen first.
+
+    Shared query for auto-pick, the picker options, and override validation, so
+    they all scan the same ordered device set (matching
+    ``_resolve_local_continuation_runner_affinity``'s ordering).
+    """
+    from app.models import LocalRunner
+
+    return list(
+        (
+            await session.execute(
+                select(LocalRunner)
+                .where(
+                    LocalRunner.project_id == project_id,
+                    LocalRunner.status != "deleted",
+                )
+                .order_by(
+                    LocalRunner.last_seen_at.desc(),
+                    LocalRunner.created_at.desc(),
+                )
             )
         )
-    ).scalars().all()
-    for runner in rows:
-        if (
-            _local_runner_is_live(runner)
-            and _local_runner_handles_task_type(runner, _RESIDENT_STRATEGIC_TASK_TYPE)
-            and _local_runner_agent_available(runner)
-        ):
+        .scalars()
+        .all()
+    )
+
+
+async def _auto_select_local_runner(
+    session: AsyncSession, project_id: uuid.UUID
+) -> str | None:
+    """Auto-PICK a LIVE, strategic-capable, agent-available local runner id.
+
+    Returns the id of the first *available* runner (see
+    ``_resident_runner_is_available``) — most-recently-seen first — so a resident
+    session started WITHOUT an explicit override runs on the operator's box. When
+    NONE is available returns None; the caller then BLOCKS the session (Workday
+    does not fall back to a cloud VM — operator decision (c)).
+    """
+    for runner in await _load_resident_runner_rows(session, project_id):
+        if _resident_runner_is_available(runner):
             return str(runner.id)
     return None
+
+
+async def _resolve_override_runner(
+    session: AsyncSession, project_id: uuid.UUID, runner_id: str
+) -> Any | None:
+    """Resolve an explicit override ``runner_id`` to a runner OF THIS PROJECT.
+
+    Returns the ``LocalRunner`` when it exists, belongs to *project_id*, and is not
+    deleted — else None (the caller raises a clear "device not found" error rather
+    than silently pinning to an unknown/foreign device). Availability is checked
+    separately by the caller so it can distinguish "not found" (404) from
+    "offline" (409 block).
+    """
+    from app.models import LocalRunner
+
+    try:
+        runner_uuid = uuid.UUID(str(runner_id))
+    except (ValueError, TypeError):
+        return None
+    runner = await session.get(LocalRunner, runner_uuid)
+    if (
+        runner is None
+        or str(runner.project_id) != str(project_id)
+        or runner.status == "deleted"
+    ):
+        return None
+    return runner
+
+
+async def build_resident_runner_options(
+    session: AsyncSession, project_id: uuid.UUID
+) -> list[dict[str, Any]]:
+    """Build the device-picker options for the project's resident-session runners.
+
+    One entry per non-deleted local runner: ``id``, ``name`` (hostname or short
+    id), ``hostname``, ``online`` (LIVE: active + recent heartbeat), ``agent_ready``
+    (``agent_available`` not False), and ``eligible`` (online + agent-ready + can
+    handle ``strategic_review`` == the full availability gate). The read model
+    surfaces this so the UI can render the auto-pick/override dropdown and show
+    each device's online status; the pinned ``runner_id`` rides on the session
+    snapshot.
+    """
+    from app.strategic_spawning import (
+        _local_runner_agent_available,
+        _local_runner_handles_task_type,
+        _local_runner_is_live,
+    )
+
+    options: list[dict[str, Any]] = []
+    for runner in await _load_resident_runner_rows(session, project_id):
+        online = bool(_local_runner_is_live(runner))
+        agent_ready = bool(_local_runner_agent_available(runner))
+        handles = bool(
+            _local_runner_handles_task_type(runner, _RESIDENT_STRATEGIC_TASK_TYPE)
+        )
+        hostname = getattr(runner, "hostname", None)
+        options.append(
+            {
+                "id": str(runner.id),
+                "name": _resident_runner_display_name(runner),
+                "hostname": hostname.strip()[:160]
+                if isinstance(hostname, str) and hostname.strip()
+                else None,
+                "online": online,
+                "agent_ready": agent_ready,
+                "eligible": bool(online and agent_ready and handles),
+            }
+        )
+    return options
 
 
 def _resident_born_context(
@@ -716,10 +829,14 @@ async def start_resident_session(
     alone (adopting it would point the session at a task that never streams,
     finding 1) — else spawns a fresh resident task via the canonical path (which
     keeps the ``_has_active_strategic_task`` guard, so a spawn is refused, not
-    forced, while a one-shot is mid-flight). Pins to ``runner_id`` when given,
-    else auto-selects a LIVE strategic-capable local runner so the warm session
-    runs on the operator's box rather than a cloud VM (finding 2; unpinned cloud
-    fallback when none is eligible). Stamps the resident-session context flags;
+    forced, while a one-shot is mid-flight). Multi-device selection: an explicit
+    ``runner_id`` is an operator OVERRIDE (must be a real project runner that is
+    available now, else 404 "device not found" / 409 "device offline"); with no
+    override an available runner is AUTO-PICKED so the warm session runs on the
+    operator's box. When the selected/auto-picked device is unavailable the start
+    is BLOCKED (raises 409) rather than dispatched to a cloud VM — Workday runs on
+    the operator's box and never auto-migrates (operator decision (c)). Stamps the
+    resident-session context flags;
     arms the local-runner continuation lease by putting the operator workbench
     into ``continuous`` mode (the canonical marker-arming entry point); and
     records the session-state blob under ``RESIDENT_SESSION_KEY``. Idempotent: a
@@ -767,14 +884,47 @@ async def start_resident_session(
         # concurrent starter may have written since).
         stale_session_id = existing.get("session_id")
 
-    # Resolve the runner to pin the warm session to. An explicit ``runner_id``
-    # wins; otherwise auto-select a LIVE, strategic-capable local runner so the
-    # session runs on the operator's box rather than dispatching to a fresh cloud
-    # VM (finding 2). If none is eligible, ``effective_runner_id`` stays None and
-    # the session proceeds unpinned — the degraded cloud fallback, as today.
-    effective_runner_id = str(runner_id) if runner_id else None
-    if effective_runner_id is None:
+    # Resolve the runner to pin the warm session to (multi-device selection).
+    #
+    #  * OVERRIDE — an explicit ``runner_id`` is an operator override: it must be a
+    #    real runner OF THIS PROJECT (else 404 "device not found") AND available
+    #    right now (else BLOCK — never silently fall back to a different device or
+    #    to cloud).
+    #  * AUTO-PICK — with no override, auto-select an available runner so Workday
+    #    runs on the operator's box. If NONE is available the session is BLOCKED
+    #    (an enroll-a-runner reason), not dispatched to a cloud VM.
+    #
+    # The block is DEFERRED (captured, not raised here) so a start that turns out
+    # to back off to a concurrent in-flight session — resolved only under the claim
+    # row-lock below — never raises a spurious "no device" (that concurrent owner
+    # already resolved its own runner). Raised after the lock iff we actually own
+    # the claim, and BEFORE any claim blob is written, so no wedged claim leaks.
+    effective_runner_id: str | None = None
+    runner_block: HTTPException | None = None
+    if runner_id:
+        override = await _resolve_override_runner(session, project.id, str(runner_id))
+        if override is None:
+            runner_block = HTTPException(
+                status_code=404,
+                detail="Selected device not found for this project",
+            )
+        elif not _resident_runner_is_available(override):
+            runner_block = HTTPException(
+                status_code=409,
+                detail=(
+                    f"device {_resident_runner_display_name(override)} offline — "
+                    "restart the session to pick another device"
+                ),
+            )
+        else:
+            effective_runner_id = str(override.id)
+    else:
         effective_runner_id = await _auto_select_local_runner(session, project.id)
+        if effective_runner_id is None:
+            runner_block = HTTPException(
+                status_code=409,
+                detail="No device available — enroll a runner to run Workday",
+            )
 
     # Adopt a not-yet-executing strategic_review cadence cycle if one exists
     # (this is a HINT read; the finalize below re-validates it under a task row
@@ -805,6 +955,12 @@ async def start_resident_session(
                 # flight — back off rather than spawn a second task.
                 decision["mode"] = "existing"
                 return
+        if runner_block is not None:
+            # We are NOT backing off (no concurrent session to defer to) but the
+            # selected/auto-picked device is unavailable — BLOCK without writing a
+            # claim blob (so nothing wedges future starts). Raised after the lock.
+            decision["mode"] = "blocked"
+            return
         vision[RESIDENT_SESSION_KEY] = {
             "version": 1,
             "session_id": session_id,
@@ -830,6 +986,13 @@ async def start_resident_session(
     if decision["mode"] == "existing":
         # A concurrent start owns (or is mid-starting) the session — return it.
         return resident_session_snapshot(project.vision) or {}
+
+    if decision["mode"] == "blocked":
+        # The selected/auto-picked device is unavailable and we are not backing
+        # off to a concurrent session — surface the deferred block (no claim blob
+        # was written under the lock, so nothing is left to compensate).
+        assert runner_block is not None
+        raise runner_block
 
     # We own ``session_id``. Materialize the task (adopt or spawn), stamp the
     # resident context flags, arm the continuation lease, and finalize the blob.

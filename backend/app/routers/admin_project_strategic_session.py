@@ -105,6 +105,7 @@ from app.work_session_check_in import (
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
     STRATEGIC_SESSION_ENABLED_SETTING,
+    build_resident_runner_options,
     start_resident_session,
     stop_resident_session,
     sync_resident_session_for_interaction_mode,
@@ -1091,6 +1092,11 @@ async def get_project_strategic_state(
         project_vision=project.vision or {},
         operator_user_id=current_user["user_id"],
     )
+    # Multi-device resident-session picker: every enrolled runner with its
+    # online / agent-ready / eligible flags (for the auto-pick + override
+    # dropdown) and, via ``_resident_session_availability``, the block-on-offline
+    # verdict for a session pinned to a now-offline device.
+    resident_runner_options = await build_resident_runner_options(session, project.id)
     workbench_state = await get_strategic_workbench_state(
         session,
         current_user["user_id"],
@@ -1220,7 +1226,13 @@ async def get_project_strategic_state(
                 and isinstance(runtime_summary.get("local_runner"), dict)
                 else None
             ),
+            runner_options=resident_runner_options,
         ),
+        # Multi-device picker options: every enrolled runner with online /
+        # agent-ready / eligible flags so the UI can render the auto-pick +
+        # override dropdown. The currently pinned device rides on
+        # ``resident_session.runner_id``.
+        "resident_session_runners": resident_runner_options,
         "running_update": running_update_summary,
         "problem_model": problem_model_summary,
         "directions": directions_summary,

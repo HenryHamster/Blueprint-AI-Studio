@@ -109,6 +109,19 @@ export interface StrategicRuntimeWorkStatus {
   } | null;
 }
 
+/**
+ * One device-picker option for the resident (Workday) session (mirrors an entry
+ * of `build_resident_runner_options` in `strategic_resident_session.py`).
+ */
+export interface StrategicResidentRunnerOption {
+  id: string;
+  name: string;
+  hostname?: string | null;
+  online: boolean;
+  agent_ready: boolean;
+  eligible: boolean;
+}
+
 export interface StrategicAccountSpendStatus {
   totalAccounts?: number | null;
   availableAccounts?: number | null;
@@ -154,11 +167,22 @@ export interface StrategicSessionControlProps {
   sessionState?: string | null;
   /**
    * Reason a Workday session isn't running (`sessions_disabled` / `no_runner` /
-   * `start_failed: <msg>`), shown as the status chip's detail. Always surfaced
-   * when the session can't start.
+   * `runner_offline` / `start_failed: <msg>`), shown as the status chip's detail.
+   * Always surfaced when the session can't start. `runner_offline` is the
+   * mid-session block-on-offline verdict — the pinned device went offline and the
+   * operator must restart to pick another (no auto-migration).
    */
   sessionReason?: string | null;
   sessionBusy?: boolean;
+  /**
+   * Multi-device picker: the project's enrolled runners (auto-pick + override
+   * dropdown), the currently selected/pinned device id, and the change handler.
+   * `onSelectRunner(null)` selects auto-pick. Passing `sessionRunners` (with an
+   * `onSelectRunner`) renders the device dropdown in Workday mode.
+   */
+  sessionRunners?: StrategicResidentRunnerOption[] | null;
+  sessionSelectedRunnerId?: string | null;
+  onSelectRunner?: (runnerId: string | null) => void;
   onStartSession?: () => void;
   onStopSession?: () => void;
   onModeChange?: (mode: StrategicInteractionMode) => void;
@@ -628,17 +652,40 @@ function sessionStatusLabel(status: string | null | undefined): string {
 // Turn a backend resident-session reason code into operator-readable detail.
 // `start_failed: <msg>` carries the real cause; strip the code prefix and show
 // the message. `no_runner` / `sessions_disabled` map to plain English.
-function humanizeResidentReason(reason: string | null | undefined): string | null {
+function humanizeResidentReason(
+  reason: string | null | undefined,
+  selectedDeviceName?: string | null,
+): string | null {
   const trimmed = cleanText(reason);
   if (!trimmed) return null;
   if (trimmed === 'sessions_disabled') return 'Resident sessions disabled';
   if (trimmed === 'no_runner') return 'No live local runner';
+  if (trimmed === 'runner_offline') {
+    // Block-on-offline: name the pinned device and tell the operator to restart
+    // (Workday does not auto-migrate to another device).
+    const device = cleanText(selectedDeviceName);
+    return device
+      ? `Device ${device} offline — restart the session to pick another device`
+      : 'Device offline — restart the session to pick another device';
+  }
   const startFailed = /^start_failed\s*:?\s*(.*)$/i.exec(trimmed);
   if (startFailed) {
     const msg = cleanText(startFailed[1]);
     return msg ? `Start failed: ${msg}` : 'Start failed';
   }
   return humanizeStatus(normalizedStatus(trimmed));
+}
+
+// Dropdown label for one device: name plus an offline/busy suffix so the
+// operator sees each device's status inline while picking. An offline device is
+// still selectable (an explicit override) — the backend blocks the start with a
+// clear reason rather than silently choosing another.
+function runnerOptionLabel(option: StrategicResidentRunnerOption): string {
+  const name =
+    cleanText(option.name) ?? cleanText(option.hostname) ?? shortId(option.id) ?? 'device';
+  if (!option.online) return `${name} — offline`;
+  if (!option.eligible) return `${name} — busy`;
+  return name;
 }
 
 interface ResidentSessionView {
@@ -672,10 +719,28 @@ function residentSessionView(
   hasStart: boolean,
   hasStop: boolean,
   hasAddRunner: boolean,
+  selectedDeviceName?: string | null,
 ): ResidentSessionView {
   const normalized = normalizedStatus(state);
-  const active = sessionActive || normalized === 'active';
-  const detail = humanizeResidentReason(reason);
+  const reasonCode = normalizedStatus(reason);
+  // Block-on-offline: the pinned device went offline mid-session. The blob is
+  // still `active`, but the read model reports blocked/runner_offline. Prompt a
+  // RESTART (Stop, then re-pick a device and Start) — no auto-migration.
+  const runnerOffline = normalized === 'blocked' && reasonCode === 'runner_offline';
+  const active = (sessionActive || normalized === 'active') && !runnerOffline;
+  const detail = humanizeResidentReason(reason, selectedDeviceName);
+  if (runnerOffline) {
+    return {
+      tone: 'warning',
+      Icon: AlertTriangle,
+      label: 'Device offline',
+      detail: detail ?? 'Device offline — restart the session to pick another device',
+      // Keep Stop so the operator can restart (Stop → re-pick device → Start).
+      showStop: hasStop,
+      showStart: false,
+      showAddRunner: false,
+    };
+  }
   if (active) {
     return {
       tone: 'success',
@@ -763,6 +828,9 @@ export function StrategicSessionControl({
   sessionState = null,
   sessionReason = null,
   sessionBusy = false,
+  sessionRunners = null,
+  sessionSelectedRunnerId = null,
+  onSelectRunner,
   onStartSession,
   onStopSession,
   onModeChange,
@@ -790,6 +858,20 @@ export function StrategicSessionControl({
   // Shown when the container wired session info (callbacks / active / explicit
   // state); absent that, this stays inert so callers that don't use resident
   // sessions render exactly as before.
+  // Multi-device picker state. `runnerOptions` are the enrolled devices; the
+  // selected/pinned device drives the name shown in the block-on-offline prompt
+  // and the dropdown's current value. Auto-pick is the empty selection.
+  const runnerOptions = Array.isArray(sessionRunners) ? sessionRunners : [];
+  const selectedRunnerId = cleanText(sessionSelectedRunnerId);
+  const selectedRunner = selectedRunnerId
+    ? runnerOptions.find(option => cleanText(option.id) === selectedRunnerId) ?? null
+    : null;
+  const selectedDeviceName = selectedRunner
+    ? cleanText(selectedRunner.name)
+    : null;
+  const showDevicePicker =
+    selectedMode === 'continuous' && Boolean(onSelectRunner) && runnerOptions.length > 0;
+
   const sessionView = residentSessionView(
     sessionState,
     sessionReason,
@@ -798,9 +880,10 @@ export function StrategicSessionControl({
     Boolean(onStartSession),
     Boolean(onStopSession),
     Boolean(onOpenDevices),
+    selectedDeviceName,
   );
   const showSessionControl = selectedMode === 'continuous' && (
-    Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState))
+    Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState)) || showDevicePicker
   );
   const SessionIcon = sessionView.Icon;
 
@@ -902,6 +985,50 @@ export function StrategicSessionControl({
                 </span>
               )}
             </span>
+            {showDevicePicker && (
+              <label
+                className={`inline-flex min-w-0 shrink-0 items-center gap-1.5 rounded border border-neutral-800 bg-neutral-950/70 px-2 ${
+                  compact ? 'h-7 py-0' : 'min-h-11 py-1.5 sm:min-h-8'
+                }`}
+                title={
+                  selectedRunner
+                    ? `Workday device: ${selectedRunner.name}${selectedRunner.online ? '' : ' (offline)'}`
+                    : 'Workday device: auto-pick an available device'
+                }
+              >
+                <Server
+                  className={`h-3.5 w-3.5 shrink-0 ${
+                    selectedRunner
+                      ? selectedRunner.online
+                        ? 'text-emerald-400'
+                        : 'text-amber-400'
+                      : 'text-neutral-500'
+                  }`}
+                  aria-hidden="true"
+                />
+                {!compact && (
+                  <span className="shrink-0 font-mono text-ui-sm font-semibold uppercase text-neutral-500">
+                    Device
+                  </span>
+                )}
+                <select
+                  aria-label="Workday device"
+                  value={selectedRunnerId ?? ''}
+                  disabled={sessionBusy || !onSelectRunner}
+                  onChange={event =>
+                    onSelectRunner?.(event.target.value ? event.target.value : null)
+                  }
+                  className="min-w-0 max-w-[9rem] truncate bg-transparent text-xs font-semibold text-neutral-200 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  <option value="">Auto (recommended)</option>
+                  {runnerOptions.map(option => (
+                    <option key={option.id} value={option.id}>
+                      {runnerOptionLabel(option)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             {sessionView.showStop && (
               <button
                 type="button"
