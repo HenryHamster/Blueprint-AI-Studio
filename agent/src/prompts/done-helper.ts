@@ -1,5 +1,6 @@
 import fs from 'fs';
 import { WORKSPACE } from '../index.js';
+import { agentTokenShellFn } from '../token-file.js';
 import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
@@ -7,6 +8,7 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
   // Posts COMPLETED to the orchestrator with the PR URL from /tmp/pr_url_<task_id>.
   // Also writes /tmp/done_<task_id> as a marker for the wrapper to detect on
   // exit and skip its fallback push.
+  const agentTokenFn = agentTokenShellFn();
   const script = `#!/bin/bash
 # ./done — mark task COMPLETED. Requires ./pr open to have run first
 # (writes /tmp/pr_url_${cfg.taskId} which this reads). Posts the COMPLETED
@@ -58,6 +60,7 @@ export function writeDoneHelper(cfg: CodeChangeHelperConfig): void {
 #       incorrectly inferring a proven fix.
 
 set -uo pipefail
+${agentTokenFn}
 
 WARN_OUT_OF_SCOPE_REASON=""
 ALREADY_DONE_REASON=""
@@ -143,7 +146,7 @@ if [ "$_VERDICT_FLAG_COUNT" -gt 1 ]; then
 fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+_load_agent_token
 TASK="${cfg.taskId}"
 
 # ── --already-done: affirmative no-op completion (no PR, no diff) ──────────────

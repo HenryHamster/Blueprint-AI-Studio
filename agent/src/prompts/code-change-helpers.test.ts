@@ -1260,8 +1260,14 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
           ].join('\n'),
           { mode: 0o755 },
         );
+        // Extract the _load_agent_token function from the full check script header
+        // so the isolated upload block can call it (the block guard uses it now).
+        const fnStart = checkScript.indexOf('_load_agent_token()');
+        const fnEnd = checkScript.indexOf('\n}', fnStart) + 2;
+        const loadTokenFn = fnStart >= 0 ? checkScript.slice(fnStart, fnEnd) : '';
         const harness = [
           'set -uo pipefail',
+          loadTokenFn,
           `cd "${dir}"`,
           uploadBlock,
         ].join('\n');
@@ -1339,5 +1345,147 @@ describe('writeCodeChangeHelpers — viewport upload block', () => {
     expect(withPassing.exit).toBe(0);
     expect(withPassing.postLog).toEqual([]);
     expect(withPassing.putLog).toEqual([]);
+  });
+});
+
+// ── generated lifecycle helpers prefer AGENT_TOKEN_FILE over stale AGENT_API_TOKEN ──
+describe('writeCodeChangeHelpers — lifecycle helpers use live token file', () => {
+  let capturedScripts: Record<string, string> = {};
+  let nextSeq = 0;
+
+  const cfg = {
+    taskId: 'task-token-test',
+    workBranch: 'blueprint/task-token-test',
+    baseBranch: 'main',
+    owner: 'test-owner',
+    repo: 'test-repo',
+    testsOnMainBranch: false,
+  };
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+      if (typeof path === 'string' && path.endsWith('/.check-task')) {
+        capturedScripts[path.replace(/\.check-task$/, 'check')] = content;
+      }
+    });
+  });
+
+  it('generated ./fail embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const failScript = capturedScripts['/tmp/workspace/fail'];
+    expect(failScript).toBeDefined();
+    expect(failScript).toContain('_load_agent_token');
+    expect(failScript).toContain('_load_agent_token()');
+    // Must not use the stale env snapshot as the ONLY token source.
+    expect(failScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
+    // Env fallback must still exist inside the function (one-shot agents).
+    expect(failScript).toContain('AGENT_API_TOKEN');
+  });
+
+  it('generated ./blocked embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const blockedScript = capturedScripts['/tmp/workspace/blocked'];
+    expect(blockedScript).toBeDefined();
+    expect(blockedScript).toContain('_load_agent_token');
+    expect(blockedScript).toContain('_load_agent_token()');
+    expect(blockedScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
+    expect(blockedScript).toContain('AGENT_API_TOKEN');
+  });
+
+  it('generated ./done embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const doneScript = capturedScripts['/tmp/workspace/done'];
+    expect(doneScript).toBeDefined();
+    expect(doneScript).toContain('_load_agent_token');
+    expect(doneScript).toContain('_load_agent_token()');
+    expect(doneScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
+    expect(doneScript).toContain('AGENT_API_TOKEN');
+  });
+
+  it('generated ./pr embeds _load_agent_token and does not hard-bind from AGENT_API_TOKEN alone', async () => {
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers(cfg);
+    const prScript = capturedScripts['/tmp/workspace/pr'];
+    expect(prScript).toBeDefined();
+    expect(prScript).toContain('_load_agent_token');
+    expect(prScript).toContain('_load_agent_token()');
+    expect(prScript).not.toContain('TOKEN="${AGENT_API_TOKEN:?');
+    expect(prScript).toContain('AGENT_API_TOKEN');
+  });
+
+  // needs exec bit: runs the generated ./fail with a PATH-resolved curl stub and
+  // a live AGENT_TOKEN_FILE to prove the helper reads the FILE token, not the
+  // stale AGENT_API_TOKEN env snapshot.
+  it.skipIf(!SUPPORTS_EXEC_BIT)('generated ./fail uses AGENT_TOKEN_FILE token over stale AGENT_API_TOKEN for the orchestrator call', async () => {
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+
+    const taskId = `fail-live-token-${process.pid}-${nextSeq++}`;
+    const { writeCodeChangeHelpers } = await import('./code-change-helpers.js');
+    writeCodeChangeHelpers({ ...cfg, taskId });
+    try { realFs.unlinkSync(`/tmp/fail_${taskId}`); } catch { /* ignore */ }
+
+    const dir = realFs.mkdtempSync(realPath.join(realOs.tmpdir(), 'fail-live-tok-'));
+    try {
+      const scriptPath = realPath.join(dir, 'fail');
+      realFs.writeFileSync(scriptPath, capturedScripts['/tmp/workspace/fail'], { mode: 0o755 });
+
+      // Write the live token to a file — this is what the agent process keeps fresh.
+      const tokenFile = realPath.join(dir, 'agent-token.jwt');
+      realFs.writeFileSync(tokenFile, 'live-file-token', { mode: 0o600 });
+
+      // curl stub: capture the X-Agent-Token header value used in the request.
+      const bin = realPath.join(dir, 'bin');
+      realFs.mkdirSync(bin);
+      const headerLog = realPath.join(dir, 'header.log');
+      realFs.writeFileSync(
+        realPath.join(bin, 'curl'),
+        [
+          '#!/bin/bash',
+          'prev=""',
+          'for a in "$@"; do',
+          '  if [ "$prev" = "-H" ] || [ "$prev" = "--header" ]; then',
+          `    echo "$a" >> "${headerLog}"`,
+          '  fi',
+          '  prev="$a"',
+          'done',
+          // Drain stdin (the payload), emit a 200 status, exit 0.
+          'cat > /dev/null',
+          'printf "200"',
+          'exit 0',
+        ].join('\n'),
+        { mode: 0o755 },
+      );
+
+      // Run with a STALE AGENT_API_TOKEN and a fresh AGENT_TOKEN_FILE.
+      // The helper must use the file token, not the stale env snapshot.
+      const env: Record<string, string> = {
+        ...Object.fromEntries(Object.entries(process.env).filter(([, v]) => v !== undefined)) as Record<string, string>,
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        ORCHESTRATOR_URL: 'http://orchestrator.test',
+        AGENT_API_TOKEN: 'stale-env-token',
+        AGENT_TOKEN_FILE: tokenFile,
+      };
+      try {
+        realCp.execFileSync('bash', [scriptPath, 'test reason'], { stdio: 'pipe', env });
+      } catch { /* exit code from idempotency re-run is fine */ }
+
+      // The X-Agent-Token header must carry the FILE token, not the stale env snapshot.
+      const headers = realFs.existsSync(headerLog) ? realFs.readFileSync(headerLog, 'utf8') : '';
+      const agentTokenHeader = headers.split('\n').find(h => h.startsWith('X-Agent-Token:')) ?? '';
+      expect(agentTokenHeader).toContain('live-file-token');
+      expect(agentTokenHeader).not.toContain('stale-env-token');
+    } finally {
+      realFs.rmSync(dir, { recursive: true, force: true });
+      try { realFs.unlinkSync(`/tmp/fail_${taskId}`); } catch { /* ignore */ }
+    }
   });
 });

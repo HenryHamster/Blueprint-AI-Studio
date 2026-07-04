@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
+import { agentTokenShellFn } from '../token-file.js';
 import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
@@ -53,6 +54,7 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   // pick up the URL without re-querying GitHub.
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
   const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
+  const agentTokenFn = agentTokenShellFn();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -64,6 +66,7 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
 # Non-zero on any failure — error tail printed; fix and retry.
 
 set -uo pipefail
+${agentTokenFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -99,7 +102,7 @@ if [ "$OP" = "close" ]; then
   fi
 
   API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-  TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+  _load_agent_token
   TASK="${cfg.taskId}"
 
   # Refresh GitHub token
@@ -332,7 +335,7 @@ if [ "$COMMITS_AHEAD" = "0" ]; then
 fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+_load_agent_token
 TASK="${cfg.taskId}"
 
 # 3. Refresh GitHub token + remote URL right before push. The clone-time token
@@ -438,6 +441,11 @@ for attempt in 1 2 3 4 5; do
   if [ "$PR_HTTP" = "200" ] || [ "$PR_HTTP" = "201" ] || [ "$PR_HTTP" = "202" ]; then
     PR_RESP=$(cat /tmp/pr_create_resp_${cfg.taskId})
     PR_OK=1; break
+  fi
+  if [ "$PR_HTTP" = "401" ] || [ "$PR_HTTP" = "403" ]; then
+    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — re-reading token and retrying..." >&2
+    _load_agent_token 2>/dev/null || true
+    sleep 2; continue
   fi
   if [ "$PR_HTTP" = "429" ] || [ "\${PR_HTTP:0:1}" = "5" ] || [ "$PR_HTTP" = "000" ]; then
     BACKOFF=$((attempt * 3))
