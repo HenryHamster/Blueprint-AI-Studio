@@ -663,20 +663,26 @@ CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
 
 # Capture the JSON body from stdin ONCE so a 401 (rotated resident-session token)
 # can be retried after re-reading the live token — stdin is consumed on the first
-# curl and cannot be re-read.
+# curl and cannot be re-read. 429 (lock contention) and 5xx (transient) are also
+# retried up to max-1 times, honoring Retry-After when present.
 _post_strategic() {
-  local payload response http_code body attempt=0
+  local payload response http_code body attempt=0 max=4 delay dump
   payload=$(cat)
-  while [ $attempt -lt 2 ]; do
+  while [ $attempt -lt $max ]; do
     _load_agent_token || return 1
+    dump=$(mktemp)
     if ! response=$(printf '%s' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
       -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
       --data-binary @- \\
+      -D "$dump" \\
       -w '\\n%{http_code}'); then
+      rm -f "$dump"
       return 1
     fi
     http_code=$(printf '%s' "$response" | tail -n1)
     body=$(printf '%s' "$response" | head -n -1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
     if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
       printf '%s' "$body"
       return 0
@@ -685,6 +691,14 @@ _post_strategic() {
     if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $attempt -eq 0 ]; then
       echo "[AUTH] messages $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying once" >&2
       attempt=$((attempt + 1))
+      continue
+    fi
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      [ -z "$delay" ] && delay=$((attempt * 2))
+      echo "[RETRY $attempt/$((max - 1))] messages $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
       continue
     fi
     if [ -n "$body" ]; then
@@ -697,6 +711,10 @@ _post_strategic() {
     fi
     return 1
   done
+  if [ -n "$body" ]; then
+    printf '%s\\n' "$body" >&2
+  fi
+  echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
   return 1
 }
 

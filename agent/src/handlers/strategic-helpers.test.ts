@@ -166,6 +166,44 @@ describe('writeStrategicHelpers', () => {
         expect(() => execFileSync('bash', ['-n', p], { stdio: 'pipe' })).not.toThrow();
       }
     });
+
+    it('_call retries only on 429 and 5xx — not on permanent 4xx (400/422/404)', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // 429 is in the retry branch (string comparison form used in the condition)
+      expect(s).toContain('"429"');
+      // 5xx range is retried alongside 429
+      expect(s).toContain('-ge 500');
+      // Non-retryable permanent 4xx exits immediately with a clear label
+      expect(s).toContain('non-retryable');
+      // The non-retryable branch prints the body before reporting the error
+      expect(s).toContain('"$body" >&2');
+    });
+
+    it('_call honors Retry-After header on 429 contention', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Headers are captured to a dump file so Retry-After can be parsed
+      expect(s).toContain('-D "$dump"');
+      // Retry-After is read from the dump file (case-insensitive header match)
+      expect(s).toContain("grep -i '^retry-after:'");
+      // Delay is honoured in the sleep call
+      expect(s).toContain('sleep "$delay"');
+    });
+
+    it('_call terminal error includes HTTP status code', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Non-auth terminal error reports the actual HTTP status so the agent can diagnose
+      expect(s).toContain('failed after $max attempts (HTTP $http_code)');
+    });
+
+    it('_call prints response body on failed non-retryable attempt', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // Body is surfaced to stderr on non-retryable 4xx so the error detail is visible
+      expect(s).toContain('"$body" >&2');
+    });
   });
 
   it('supports fetching a message by short ref via the messages endpoint', () => {

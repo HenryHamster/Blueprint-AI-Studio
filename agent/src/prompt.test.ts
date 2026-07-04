@@ -3247,7 +3247,7 @@ describe('extractModuleInterfaces', () => {
     // Re-establish defaults so overrides from prior tests don't bleed through
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
   });
 
   it('returns empty string when relatedFiles is empty', () => {
@@ -3323,7 +3323,7 @@ describe('extractModuleInterfaces', () => {
       'export function buildPrompt(): string { return ""; }\n'
     );
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\nagent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\nagent/src/index.ts\n'
     );
     const result = extractModuleInterfaces(null, ['agent/src/prompt.ts']);
     expect(result).toContain('Imported by:');
@@ -3380,8 +3380,8 @@ describe('extractModuleInterfaces', () => {
     );
     // models callers include services (in related set); services has no related callers
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('backend/app/services.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('backend/app/services.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
     expect(result).toContain('## Suggested Change Order');
     expect(result).toContain('1. models.py');
@@ -3396,8 +3396,8 @@ describe('extractModuleInterfaces', () => {
     );
     // Both files' callers are outside the related set
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('other/caller.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('other/caller.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, ['backend/app/models.py', 'backend/app/services.py']);
     expect(result).not.toContain('## Suggested Change Order');
   });
@@ -3409,9 +3409,9 @@ describe('extractModuleInterfaces', () => {
     );
     // models callers: [services, admin]; services callers: [admin]; admin callers: []
     vi.mocked(execFileSync)
-      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('backend/app/admin.py\n' as unknown as ReturnType<typeof execFileSync>)
-      .mockReturnValueOnce('' as unknown as ReturnType<typeof execFileSync>);
+      .mockReturnValueOnce('backend/app/services.py\nbackend/app/admin.py\n')
+      .mockReturnValueOnce('backend/app/admin.py\n')
+      .mockReturnValueOnce('');
     const result = extractModuleInterfaces(null, [
       'backend/app/models.py',
       'backend/app/services.py',
@@ -3430,7 +3430,7 @@ describe('discoverAffectedConsumers', () => {
     vi.clearAllMocks();
     vi.mocked(fs.existsSync).mockReturnValue(false);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue('');
-    vi.mocked(execFileSync).mockReturnValue(Buffer.from('') as unknown as ReturnType<typeof execFileSync>);
+    vi.mocked(execFileSync).mockReturnValue(Buffer.from(''));
   });
 
   it('returns empty string when relatedFiles is empty', () => {
@@ -3439,7 +3439,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('skips test files in relatedFiles', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.test.ts', 'backend/testing/test_models.py']);
     expect(result).toBe('');
@@ -3459,7 +3459,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('returns empty string when consumer files do not exist on disk', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     // existsSync returns false by default — consumer file cannot be read
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
@@ -3468,7 +3468,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('filters out test files returned by git grep', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/prompt.test.ts\nbackend/testing/test_models.py\n'
     );
     const result = discoverAffectedConsumers(null, ['agent/src/prompt.ts']);
     expect(result).toBe('');
@@ -3476,7 +3476,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('extracts named TypeScript imports from consumer files', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3493,7 +3493,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('appends call-site usage counts to imported symbols', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/handlers/standard.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/handlers/standard.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     // Build a file: import line at line 0, then 79 padding lines so body starts at line 80
@@ -3517,7 +3517,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('extracts Python imports from consumer files', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'backend/app/orchestrator.py\n' as unknown as ReturnType<typeof execFileSync>
+      'backend/app/orchestrator.py\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3533,7 +3533,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('shows consumer without imports when no import line matches', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'backend/app/main.py\n' as unknown as ReturnType<typeof execFileSync>
+      'backend/app/main.py\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     // File mentions module name but no parseable import line
@@ -3548,7 +3548,7 @@ describe('discoverAffectedConsumers', () => {
 
   it('includes the Affected Consumers header and description', () => {
     vi.mocked(execFileSync).mockReturnValue(
-      'agent/src/index.ts\n' as unknown as ReturnType<typeof execFileSync>
+      'agent/src/index.ts\n'
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -3564,7 +3564,7 @@ describe('discoverAffectedConsumers', () => {
       `agent/src/consumers/module${i}.ts`
     ).join('\n') + '\n';
     vi.mocked(execFileSync).mockReturnValue(
-      manyConsumers as unknown as ReturnType<typeof execFileSync>
+      manyConsumers
     );
     vi.mocked(fs.existsSync).mockReturnValue(true);
     vi.mocked(fs.readFileSync as unknown as (p: string, e: string) => string).mockReturnValue(
@@ -4910,6 +4910,38 @@ describe('writeMessagesHelper', () => {
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_token_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('retries up to 3 times on 429/5xx, honors Retry-After, then fails loud', async () => {
+    writeMessagesHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    // Bounded retry loop with max=4 (3 retry slots + the initial attempt).
+    expect(script).toContain('max=4');
+    expect(script).toContain('while [ $attempt -lt $max ]');
+    // Header capture for Retry-After extraction.
+    expect(script).toContain('-D "$dump"');
+    expect(script).toContain('retry-after:');
+    expect(script).toContain('sleep "$delay"');
+    // Retries on 429 (lock contention) and 5xx (transient server error).
+    expect(script).toContain('"$http_code" = "429"');
+    expect(script).toContain('"$http_code" -ge 500');
+    // Progress message so the agent can see retry activity.
+    expect(script).toContain('[RETRY');
+    expect(script).toContain('retrying in');
+    // After all retries exhausted, surfaces a real error rather than silently returning 1.
+    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+
+    // Generated script must be syntactically valid bash.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_429_smoke_${process.pid}_${Date.now()}.sh`;
     realFs.writeFileSync(tmp, script);
     try {
       realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });

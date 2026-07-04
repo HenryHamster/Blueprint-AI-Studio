@@ -26,24 +26,25 @@ TASK="${taskId}"
 DATA="$1"
 
 _call() {
-  local attempt=0 saw_auth=0
-  while [ $attempt -lt 3 ]; do
+  local attempt=0 saw_auth=0 max=3 delay http_code body dump response
+  while [ $attempt -lt $max ]; do
     # Re-read the live token each attempt so a token that rotated between tries
     # (the agent refreshes at ~45min) is picked up — the resident-session
     # write-token-expiry fix.
     _load_agent_token || return 1
-    local response
+    dump=$(mktemp)
     response=$(printf '{"task_id":"%s","op":"%s","data":%s}' "$TASK" "$1" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
         -X POST "$API/api/agent/strategic" \\
         -H "Content-Type: application/json" \\
         -H "X-Agent-Token: $TOKEN" \\
         --data-binary @- \\
+        -D "$dump" \\
         -w '\\n%{http_code}')
-    local http_code
     http_code=$(printf '%s' "$response" | tail -n1)
-    local body
     body=$(printf '%s' "$response" | head -n -1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
     if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
       printf '%s' "$body"
       return 0
@@ -53,17 +54,26 @@ _call() {
       echo "[CONSTRAINT] $1 rejected (HTTP 409)" >&2
       return 0
     fi
-    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      [ -z "$delay" ] && delay=$((attempt * 2))
+      echo "[RETRY $attempt/$((max - 1))] $1 failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
+    elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
       saw_auth=1
       echo "[AUTH] $1 rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+      sleep 1
+    else
+      printf '%s' "$body" >&2
+      echo "[ERROR] $1 failed (HTTP $http_code, non-retryable)" >&2
+      return 1
     fi
-    attempt=$((attempt + 1))
-    [ $attempt -lt 3 ] && echo "[RETRY $attempt/3] $1 failed (HTTP $http_code), retrying in 5s..." >&2 && sleep 5
   done
-  if [ "$saw_auth" -eq 1 ]; then
+  if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
     echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The resident session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
   else
-    echo "[ERROR] $1 failed after 3 attempts" >&2
+    echo "[ERROR] $1 failed after $max attempts (HTTP $http_code)" >&2
   fi
   return 1
 }
