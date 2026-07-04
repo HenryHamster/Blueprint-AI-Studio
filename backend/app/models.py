@@ -4049,6 +4049,31 @@ class VersionAcceptanceCriterion(SQLModel, table=True):
     # Human-readable criterion description.
     text: str = Field(sa_column=Column(Text, nullable=False))
 
+    # Lifecycle status: 'active' | 'retracted' | 'superseded'.
+    status: str = Field(
+        default="active",
+        sa_column=Column(String(32), nullable=False, server_default="active"),
+    )
+
+    # Retraction/supersession audit metadata. Rows are retained so evidence
+    # history stays inspectable even when coverage no longer counts them.
+    retraction_reason: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+    retracted_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    retracted_by: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+    superseded_by_key: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
     # Provenance: 'strategist' | 'operator' | etc. Nullable.
     created_by: str | None = Field(
         default=None,

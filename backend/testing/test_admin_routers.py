@@ -11454,6 +11454,7 @@ class TestAcceptanceCriteriaRouter:
             "covered": 0,
             "partial": 0,
             "uncovered": 0,
+            "retracted": 0,
             "stuck_count": 0,
             "criteria": [],
         }

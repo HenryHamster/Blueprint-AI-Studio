@@ -18,6 +18,7 @@ from sqlalchemy import func
 from sqlmodel import select
 
 from app.models import CriterionEvidence, Direction, VersionAcceptanceCriterion
+from app.time_utils import _utcnow
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -382,6 +383,43 @@ async def delete_criterion(
     return True
 
 
+async def retract_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+    reason: str,
+    retracted_by: str | None = None,
+    superseded_by_key: str | None = None,
+) -> VersionAcceptanceCriterion | None:
+    """Retract or supersede a criterion without deleting its audit history.
+
+    Returns the scoped row when found and ``None`` when the key does not belong
+    to the requested project/version. The transition is idempotent: a criterion
+    already marked non-active is returned unchanged.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    if row.status == "active":
+        row.status = "superseded" if superseded_by_key else "retracted"
+        row.retraction_reason = reason
+        row.retracted_at = _utcnow()
+        row.retracted_by = retracted_by
+        row.superseded_by_key = superseded_by_key
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
 async def _classify_stuck_reasons(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -447,12 +485,14 @@ async def get_version_coverage_summary(
             'covered': N,
             'partial': N,
             'uncovered': N,
+            'retracted': N,
             'stuck_count': N,
             'criteria': [
                 {
                     'criterion_key': str,
                     'text': str,
                     'coverage': 'covered' | 'partial' | 'uncovered',
+                    'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
                     'stuck_reason': 'no_mapping' | 'direction_retired' | None,
                 },
@@ -469,6 +509,7 @@ async def get_version_coverage_summary(
     unchanged.
     """
     counts: dict[str, int] = {"covered": 0, "partial": 0, "uncovered": 0}
+    retracted_count = 0
     criteria_detail = []
 
     result = await session.execute(
@@ -497,7 +538,10 @@ async def get_version_coverage_summary(
         evidence = evidence_by_criterion.get(criterion.id, [])
         coverage = compute_criterion_coverage(evidence)
         coverage_by_criterion[criterion.id] = coverage
-        counts[coverage] += 1
+        if criterion.status == "active":
+            counts[coverage] += 1
+        else:
+            retracted_count += 1
 
     # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
     # merely in-progress. project_id is derived from a loaded criterion row —
@@ -505,7 +549,7 @@ async def get_version_coverage_summary(
     uncovered_keys = [
         c.criterion_key
         for c in criteria_in_order
-        if coverage_by_criterion[c.id] == "uncovered"
+        if c.status == "active" and coverage_by_criterion[c.id] == "uncovered"
     ]
     stuck_reasons: dict[str, str | None] = {}
     if uncovered_keys:
@@ -525,16 +569,18 @@ async def get_version_coverage_summary(
                 "criterion_key": criterion.criterion_key,
                 "text": criterion.text,
                 "coverage": coverage,
+                "status": criterion.status,
                 "evidence_count": len(evidence),
                 "stuck_reason": stuck_reason,
             }
         )
 
     return {
-        "total": len(criteria_in_order),
+        "total": sum(counts.values()),
         "covered": counts["covered"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
+        "retracted": retracted_count,
         "stuck_count": stuck_count,
         "criteria": criteria_detail,
     }

@@ -672,14 +672,15 @@ async def strategic_operation(
     if str(payload.task_id) != token.get("sub"):
         raise HTTPException(status_code=403, detail="Task ID mismatch")
     # Message ops (create/resolve) are available to all agent types.
-    # Direction/vision ops are restricted to strategic_review only.
+    # Direction/vision ops are restricted to strategic task types.
     MESSAGE_OPS = ("create_message", "resolve_message")
-    if payload.op not in MESSAGE_OPS and token.get("task_type") not in (
-        "strategic_review",
+    if (
+        payload.op not in MESSAGE_OPS
+        and token.get("task_type") not in STRATEGIC_TASK_TYPES
     ):
         raise HTTPException(
             status_code=403,
-            detail="Only strategic_review agents can modify directions/vision",
+            detail="Only strategic agents can modify directions/vision",
         )
 
     task = await session.get(Task, payload.task_id)
@@ -3224,22 +3225,64 @@ async def strategic_operation(
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
+            retract_criterion as _retract_criterion,
         )
         from app.directions_repo import get_direction_row as _get_direction_row
         from app.models import VersionAcceptanceCriterion as _VAC
         from app.release_version import current_open_version as _cur_open_ver
 
-        if not isinstance(data, dict) or not isinstance(data.get("criteria"), list):
+        if not isinstance(data, dict):
             raise HTTPException(
                 status_code=400,
-                detail="set_acceptance_criteria: data must be {\"criteria\": [...]}",
+                detail="set_acceptance_criteria: data must be an object",
             )
-        criteria_input = data["criteria"]
+        criteria_input = data.get("criteria", [])
+        if not isinstance(criteria_input, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: 'criteria' must be a list when provided",
+            )
         for item in criteria_input:
-            if not isinstance(item, dict) or not isinstance(item.get("text"), str) or not item["text"].strip():
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("text"), str)
+                or not item["text"].strip()
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail="set_acceptance_criteria: each criterion must have a non-empty 'text' string",
+                )
+        retract_input = data.get("retract", [])
+        if not isinstance(retract_input, list):
+            raise HTTPException(
+                status_code=400,
+                detail="set_acceptance_criteria: 'retract' must be a list when provided",
+            )
+        for item in retract_input:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("criterion_key"), str)
+                or not item["criterion_key"].strip()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each retract item must have a non-empty 'criterion_key' string",
+                )
+            if (
+                not isinstance(item.get("reason"), str)
+                or not item["reason"].strip()
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: each retract item must have a non-empty 'reason' string",
+                )
+            superseded_by_key = item.get("superseded_by_key")
+            if superseded_by_key is not None and not isinstance(
+                superseded_by_key, str
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="set_acceptance_criteria: 'superseded_by_key' must be a string when provided",
                 )
 
         open_version = await _cur_open_ver(session, project.id)
@@ -3258,6 +3301,7 @@ async def strategic_operation(
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
+        retracted: list[dict] = []
         for item in criteria_input:
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
@@ -3304,19 +3348,51 @@ async def strategic_operation(
                 }
             )
 
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            reason = item["reason"].strip()
+            superseded_by_key_raw = item.get("superseded_by_key")
+            superseded_by_key = (
+                superseded_by_key_raw.strip()
+                if isinstance(superseded_by_key_raw, str)
+                and superseded_by_key_raw.strip()
+                else None
+            )
+            row = await _retract_criterion(
+                session,
+                project_id=project.id,
+                release_version_id=open_version.id,
+                criterion_key=criterion_key,
+                reason=reason,
+                retracted_by="strategist",
+                superseded_by_key=superseded_by_key,
+            )
+            retracted.append(
+                {
+                    "criterion_key": criterion_key,
+                    "status": row.status if row is not None else None,
+                    "found": row is not None,
+                }
+            )
+
         ctx = task.context or {}
         task.context = {
             **ctx,
             "_strategic_api_called": True,
             "_strategic_criteria_authored": len(processed),
+            "_strategic_criteria_retracted": sum(
+                1 for item in retracted if item["found"]
+            ),
         }
         flag_modified(task, "context")
         session.add(task)
         await session.commit()
         logger.info(
-            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, %d skipped (cap), %d warnings",
+            "[STRATEGIC API] set_acceptance_criteria for task %s: %d criteria, "
+            "%d retracted, %d skipped (cap), %d warnings",
             task.id,
             len(processed),
+            sum(1 for item in retracted if item["found"]),
             skipped_over_cap,
             len(warnings),
         )
@@ -3325,6 +3401,7 @@ async def strategic_operation(
                 "status": "ok",
                 "op": "set_acceptance_criteria",
                 "criteria": processed,
+                "retracted": retracted,
                 "skipped_over_cap": skipped_over_cap,
             }
         )

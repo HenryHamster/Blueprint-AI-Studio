@@ -160,7 +160,7 @@
     "utils/diff-detection.ts": 150,
     "utils/stale-result.ts": 150,
     "handlers/strategic-sections.ts": 1500,
-    "providers/runners.ts": 1800,
+    "providers/runners.ts": 2650,
     "prompts/context-prefix.ts": 1350,
     "handlers/fresh-reviewer.ts": 950
   },

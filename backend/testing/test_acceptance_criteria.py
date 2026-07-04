@@ -25,7 +25,15 @@ from httpx import AsyncClient
 from sqlmodel import select
 
 from app import acceptance_criteria as ac
-from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseVersion, Task, TaskStatus
+from app.models import (
+    CriterionEvidence,
+    Direction,
+    Project,
+    ProjectMember,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+)
 
 _TEST_USER_ID = "test-user-123"
 
@@ -1165,6 +1173,206 @@ async def test_coverage_summary_partial_only(db_session):
     assert summary["partial"] == 1
     assert summary["uncovered"] == 0
     assert summary["criteria"][0]["evidence_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_retracted_criterion_clears_coverage_and_gate(db_session):
+    """Retracted criteria remain auditable but no longer block qualification."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.release_scoring import compute_composite
+
+    project = await _make_project(db_session, "RetractedGate")
+    version = await _make_version(db_session, project)
+
+    covered = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Covered by a proven merge-test verdict",
+    )
+    stale = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Stale criterion with no feasible evidence",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "prove covered criterion"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "targeted acceptance test passed under merge test",
+            },
+        },
+        criterion_ids=[covered.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    assert await ac.record_task_merge_evidence(db_session, task, project.id) == 1
+
+    before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert before["total"] == 2
+    assert before["covered"] == 1
+    assert before["uncovered"] == 1
+    assert before["retracted"] == 0
+    before_gate = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy={"threshold": 0.8},
+        criterion_coverage=before,
+    )
+    assert before_gate["blocker"] == "criterion_coverage_incomplete"
+
+    row = await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=stale.criterion_key,
+        reason="Criterion cannot be covered by the current strategy",
+        retracted_by="strategist",
+    )
+    assert row is not None
+    assert row.status == "retracted"
+
+    after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert after["total"] == 1
+    assert after["covered"] == 1
+    assert after["uncovered"] == 0
+    assert after["retracted"] == 1
+    by_key = {c["criterion_key"]: c for c in after["criteria"]}
+    assert by_key[covered.criterion_key]["status"] == "active"
+    assert by_key[stale.criterion_key]["status"] == "retracted"
+    assert by_key[stale.criterion_key]["coverage"] == "uncovered"
+    assert by_key[stale.criterion_key]["stuck_reason"] is None
+
+    after_gate = compute_composite(
+        ci_green=True,
+        audit_score=1.0,
+        test_erosion=1.0,
+        smoketest_score=1.0,
+        policy={"threshold": 0.8},
+        criterion_coverage=after,
+    )
+    assert after_gate["blocker"] is None
+    assert after_gate["promote"] is True
+
+
+@pytest.mark.asyncio
+async def test_retract_criterion_is_idempotent(db_session):
+    """Calling retract_criterion repeatedly returns the existing inactive row."""
+    project = await _make_project(db_session, "RetractIdempotent")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Criterion to retract once",
+    )
+
+    first = await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion.criterion_key,
+        reason="First retraction reason",
+        retracted_by="strategist",
+    )
+    assert first is not None
+    assert first.status == "retracted"
+    assert first.retraction_reason == "First retraction reason"
+    assert first.retracted_at is not None
+
+    second = await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion.criterion_key,
+        reason="Second call should not overwrite audit fields",
+        retracted_by="strategist",
+        superseded_by_key="c-replacement",
+    )
+    assert second is not None
+    assert second.id == first.id
+    assert second.status == "retracted"
+    assert second.retraction_reason == "First retraction reason"
+    assert second.superseded_by_key is None
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_op_retracts_criterion(
+    client: AsyncClient, db_session
+):
+    """The strategic HTTP op accepts a retract-only payload end-to-end."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "RetractStrategicOp")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Criterion retired by strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-retract-op",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "agent-vm-retract-op",
+        task_type="strategic_review",
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Superseded by direct release evidence",
+                        "superseded_by_key": "c-successor",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["criteria"] == []
+    assert body["retracted"] == [
+        {
+            "criterion_key": criterion.criterion_key,
+            "status": "superseded",
+            "found": True,
+        }
+    ]
+
+    await db_session.refresh(criterion)
+    assert criterion.status == "superseded"
+    assert criterion.retracted_by == "strategist"
+    assert criterion.superseded_by_key == "c-successor"
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 0
+    assert summary["uncovered"] == 0
+    assert summary["retracted"] == 1
 
 
 # ---------------------------------------------------------------------------
