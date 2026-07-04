@@ -55,6 +55,7 @@ from app.task_locking import (
 )
 from app.workbench_state import (
     STRATEGIC_LOCAL_CONTINUATION_KEY,
+    STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     apply_strategic_local_continuation_marker,
@@ -450,14 +451,23 @@ async def _spawn_resident_strategic_task(
     internally; on success it leaves a QUEUED (``started_at``-less) task the
     re-query adopts.
 
-    The resident-session flags + runner pin are seeded via ``extra_context`` so
-    the spawned task is committed ALREADY carrying ``_resident_session`` /
-    ``strategic_session_id`` (+ the local-runner pin) in the same INSERT — it is
-    never committed claimable without the flag, so a warm runner that claims it in
-    the sub-millisecond window before the session blob is finalized still routes
-    to the streaming ``handleStrategicResident`` (handler dispatch reads the
-    context flag at claim time). This is the SPAWN-path equivalent of the ADOPT
-    path's under-lock stamp; no separate post-spawn stamping transaction remains.
+    The resident-session flags are seeded via ``extra_context`` so the spawned
+    task is committed ALREADY carrying ``_resident_session`` /
+    ``strategic_session_id`` in the same INSERT — it is never committed claimable
+    without the flag, so a warm runner that claims it in the sub-millisecond
+    window before the session blob is finalized still routes to the streaming
+    ``handleStrategicResident`` (handler dispatch reads the context flag at claim
+    time). This is the SPAWN-path equivalent of the ADOPT path's under-lock stamp;
+    no separate post-spawn stamping transaction remains.
+
+    The HARD local-runner pin rides in via ``runner_pin_id`` (not just the
+    ``preferred_runner_target_id`` affinity hint): when a runner is resolved the
+    task is born PROVISIONING with ``vm_instance_id='runner:{id}'`` +
+    ``context['runner_target_id']`` — the exact contract
+    ``POST /api/runner/next-task`` filters on — so the operator's local runner
+    claims it directly, WITHOUT the general VM-dispatch cycle (which may be paused,
+    ``max_concurrent_vms=0``). Born QUEUED (unpinned cloud fallback) only when no
+    eligible runner exists (``runner_id`` is None).
     """
     from app.strategic_spawning import _spawn_strategic_review
 
@@ -465,6 +475,13 @@ async def _spawn_resident_strategic_task(
         project,
         session,
         preferred_runner_target_id=str(runner_id) if runner_id else None,
+        # Hard birth pin: the spawned strategic_review is born PROVISIONING with
+        # ``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']`` so the
+        # operator's local runner claims it directly via POST /api/runner/next-task
+        # — independent of the general VM-dispatch cycle (which may be paused,
+        # ``max_concurrent_vms=0``). When no runner is eligible (``runner_id`` None)
+        # this stays None and the task is born QUEUED (degraded cloud fallback).
+        runner_pin_id=str(runner_id) if runner_id else None,
         extra_context=_resident_born_context(session_id, runner_id),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
@@ -560,13 +577,36 @@ def _resident_born_context(
 def _stamp_resident_context(
     task: Task, *, session_id: str, runner_id: str | None
 ) -> None:
-    """Stamp the shared resident-session flags + runner pin onto *task*.
+    """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
     Used by the ADOPT path, which re-uses an existing (not-yet-executing) cadence
     ``strategic_review`` task under a row lock, so the flags are merged onto its
     already-committed context. The SPAWN path instead seeds the equivalent flags
     at task birth via ``_resident_born_context`` — see that helper for why the
     spawned task can never exist claimable without the flag.
+
+    When a session runner is resolved (``runner_id`` set) the adopted task is
+    ALSO hard runner-pinned IN PLACE — ``status=PROVISIONING``,
+    ``vm_instance_id='runner:{id}'``, ``context['runner_target_id']=str(id)``,
+    ``vm_provisioned_at`` stamped — the exact contract
+    ``POST /api/runner/next-task`` filters on and the same one
+    ``orchestrator._try_runner_dispatch`` (and the resident SPAWN path) apply. This
+    makes the adopted resident task directly pullable by the operator's local
+    runner WITHOUT the general VM-dispatch cycle, which may be paused
+    (``max_concurrent_vms=0``); otherwise a resident session that ADOPTS a cadence
+    cycle (rather than spawning fresh) would wedge un-runnable until dispatch
+    resumes — the SPAWN-path gap's twin. The caller only reaches here when
+    ``_task_is_adoptable`` held, so the task is QUEUED/PROVISIONING with
+    ``started_at IS NULL``; overwriting the pin is safe and leaves ``started_at``
+    NULL (the runner stamps it on pull, which also keeps the reaper carve-out
+    ``reaper_orphan_classify._is_runner_pinned_awaiting_pull`` protecting it). Any
+    stale cadence strategic-hold marker is cleared (mirroring
+    ``_try_runner_dispatch``) so the 6h local-runner hold sweep can't fail a task
+    we just pinned. The caller ``session.add(task)``s + commits under the same
+    lock, so the column pin lands atomically with the context flags.
+
+    With NO runner (unpinned cloud fallback) ONLY the resident flags are stamped
+    and the task keeps its existing status / vm id — unchanged from before.
     """
     context = dict(task.context or {})
     context["_resident_session"] = True
@@ -579,6 +619,18 @@ def _stamp_resident_context(
         context.setdefault(
             STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY, "resident_session"
         )
+        # AUTHORITATIVE runner pin (not merely the affinity hint above): the
+        # adopted task becomes directly pullable by POST /api/runner/next-task,
+        # independent of the (possibly paused) VM-dispatch cycle. Mirrors
+        # orchestrator._try_runner_dispatch + the resident SPAWN-path birth pin.
+        context["runner_target_id"] = str(runner_id)
+        # Drop any stale strategic local-runner hold marker so the hold sweep
+        # (orchestrator._fail_stale_local_runner_holds) can't fail a now-pinned
+        # task — same cleanup _try_runner_dispatch does on pin.
+        context.pop(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY, None)
+        task.status = TaskStatus.PROVISIONING
+        task.vm_instance_id = f"runner:{runner_id}"
+        task.vm_provisioned_at = _utcnow()
     task.context = context
     flag_modified(task, "context")
 

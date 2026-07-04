@@ -5108,6 +5108,7 @@ async def _finalize_strategic_review_spawn(
     extra_context: dict[str, Any] | None,
     operator_steered: bool,
     steering_excerpt: str | None,
+    runner_pin_id: str | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
 
@@ -5178,13 +5179,41 @@ async def _finalize_strategic_review_spawn(
     if extra_context:
         task_context.update(extra_context)
 
+    # Runner-pin AT BIRTH (resident-session spawn only; ``runner_pin_id`` is None
+    # for every cadence caller, leaving their QUEUED + fresh ``agent-vm`` id and
+    # normal VM-dispatch entry unchanged). A resident ``strategic_review`` must be
+    # born already PROVISIONING and pinned to the operator's local runner so
+    # ``POST /api/runner/next-task`` hands it straight to that runner — independent
+    # of the general VM-dispatch cycle (which may be paused, ``max_concurrent_vms=0``).
+    # This mirrors the orchestrator's own pin contract
+    # (``orchestrator._try_runner_dispatch``: ``vm_instance_id='runner:{id}'`` +
+    # ``context['runner_target_id']`` + PROVISIONING + ``vm_provisioned_at``) at the
+    # INSERT instead of a beat later. Without it the task is born QUEUED + VM-pinned
+    # (``agent-vm-…``), so ``next-task`` — which filters
+    # ``status==PROVISIONING AND vm_instance_id=='runner:{id}' AND
+    # context['runner_target_id']==id AND started_at IS NULL`` — never returns it and
+    # the resident agent never claims it. ``started_at`` stays NULL (the runner
+    # stamps it on pull), which also keeps the reaper carve-out
+    # (``reaper_orphan_classify._is_runner_pinned_awaiting_pull``) protecting it while
+    # the operator's runner is briefly offline.
+    if runner_pin_id:
+        task_context["runner_target_id"] = str(runner_pin_id)
+        born_vm_instance_id = f"runner:{runner_pin_id}"
+        born_status = TaskStatus.PROVISIONING
+        born_vm_provisioned_at: datetime | None = _utcnow()
+    else:
+        born_vm_instance_id = f"agent-vm-{uuid.uuid4().hex}"
+        born_status = TaskStatus.QUEUED
+        born_vm_provisioned_at = None
+
     new_task = Task(
         project_id=project_id,
         title=f"Strategic review: {project_name}",
         description="Vision and direction review",
         payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
+        vm_instance_id=born_vm_instance_id,
+        status=born_status,
+        vm_provisioned_at=born_vm_provisioned_at,
         created_by="ORCHESTRATOR",
         context=task_context,
         strategic_cycle_id=cycle_id,
@@ -5249,6 +5278,7 @@ async def _spawn_strategic_review(
     local_runner_context: dict[str, Any] | None = None,
     extra_context: dict[str, Any] | None = None,
     resident_minimal: bool = False,
+    runner_pin_id: str | None = None,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -5309,6 +5339,16 @@ async def _spawn_strategic_review(
     Either way it feeds ``_build_operator_steering_directive`` as the durable
     fallback so the directive survives the operator message aging out of the
     volatile conversation-thread snapshot.
+
+    ``runner_pin_id`` (default ``None`` — every cadence caller is unaffected, so
+    their task is born QUEUED + ``agent-vm`` and enters normal VM dispatch) is the
+    AUTHORITATIVE local-runner pin the resident-session START path supplies. When
+    set, the created ``strategic_review`` is born already PROVISIONING with
+    ``vm_instance_id='runner:{id}'`` + ``context['runner_target_id']`` (the exact
+    contract ``POST /api/runner/next-task`` filters on) so the operator's local
+    runner claims it directly, independent of the general VM-dispatch cycle (which
+    may be paused). Unlike ``preferred_runner_target_id`` (a non-authoritative
+    affinity hint dispatch may or may not honor), this is a hard birth pin.
 
     ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
     hint from the preceding architecture phase. Dispatch may honor it only if
@@ -5467,6 +5507,10 @@ async def _spawn_strategic_review(
             extra_context=extra_context,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,
+            # Born PROVISIONING + pinned to the operator's runner (only the resident
+            # spawn path passes this; cadence spawns leave it None → QUEUED as before)
+            # so POST /api/runner/next-task claims it directly.
+            runner_pin_id=runner_pin_id,
         )
 
     # Build direction stats with rich data (pure over ``project.directions``;
