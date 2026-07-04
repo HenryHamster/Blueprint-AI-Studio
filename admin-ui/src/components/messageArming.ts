@@ -13,7 +13,7 @@
  * so these helpers can be exported without tripping react-refresh's
  * only-export-components rule.
  */
-export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate';
+export type ArmingOutcome = 'steering' | 'passive_note' | 'routine_event' | 'not_armed' | 'duplicate' | 'resident_session';
 
 // Outcome → composer hint copy.
 const ARMING_HINT: Record<ArmingOutcome, string> = {
@@ -22,6 +22,7 @@ const ARMING_HINT: Record<ArmingOutcome, string> = {
   routine_event: 'Routine event — won’t wake the strategist.',
   not_armed: 'Couldn’t wake the strategist — try resending in a moment.',
   duplicate: 'Message already sent — steer already armed.',
+  resident_session: 'Workday is live — the strategist replies here directly.',
 };
 
 // Pre-send hint shown when a strategic cycle is already running: a steering
@@ -36,6 +37,7 @@ const ARMING_TOAST: Record<ArmingOutcome, string> = {
   routine_event: 'Recorded — routine event, won’t wake the strategist',
   not_armed: 'Message saved, but the strategist wasn’t woken — try resending',
   duplicate: 'Message already sent — steer already armed',
+  resident_session: 'Message sent — Workday is replying live',
 };
 
 const WORKBENCH_ARMING_TOAST: Record<Extract<ArmingOutcome, 'steering' | 'not_armed'>, string> = {
@@ -92,7 +94,8 @@ export function parseArmingOutcome(value: unknown): ArmingOutcome | null {
     value === 'passive_note' ||
     value === 'routine_event' ||
     value === 'not_armed' ||
-    value === 'duplicate'
+    value === 'duplicate' ||
+    value === 'resident_session'
     ? value
     : null;
 }

@@ -1809,9 +1809,13 @@ export interface ResidentTurnResult {
 }
 
 export interface ResidentSessionEvent {
-  kind: 'text' | 'tool' | 'error' | 'status';
+  kind: 'text' | 'tool' | 'error' | 'status' | 'activity';
   text?: string;
   toolName?: string;
+  /** compact one-liner for the LIVE, ephemeral Workday activity strip (a Bash
+   *  command, file edit, read, spawned sub-agent, or tool result). Present on
+   *  'tool' events (the tool call) and on 'activity' events (a tool result). */
+  activity?: { kind: string; text: string };
 }
 
 export interface ResidentSession {
@@ -2076,7 +2080,14 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         break;
       }
       case 'tool': {
-        emit({ kind: 'tool', toolName: ev.toolName, text: ev.command });
+        emit({
+          kind: 'tool',
+          toolName: ev.toolName,
+          text: ev.command,
+          activity: ev.activityKind
+            ? { kind: ev.activityKind, text: ev.activityText ?? (ev.toolName ?? 'tool') }
+            : undefined,
+        });
         const t = activeTurn;
         if (t) {
           t.sawToolUse = true;
@@ -2100,6 +2111,11 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         if (t && ev.toolUseId && t.pendingMessageSendIds.has(ev.toolUseId)) {
           t.pendingMessageSendIds.delete(ev.toolUseId);
           if (!ev.isError) t.sentOperatorMessage = true;
+        }
+        // Surface a compact tool-result one-liner on the LIVE activity strip
+        // (ephemeral; never persisted). Only when the parser produced a summary.
+        if (ev.activityText) {
+          emit({ kind: 'activity', activity: { kind: ev.activityKind ?? 'tool_result', text: ev.activityText } });
         }
         break;
       }

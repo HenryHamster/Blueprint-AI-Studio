@@ -1,0 +1,161 @@
+/**
+ * Pure derivations for the resident "Workday" LIVE session view — split out of
+ * MessagesPanel so the component file stays under its size cap and these
+ * reconciliation helpers can be unit-tested in isolation.
+ *
+ * A resident-session delta (one `strategic_session` WS frame) carries either the
+ * assistant's REPLY text (the only content that reaches the durable transcript,
+ * once the agent `./messages send`s it) or a LIVE, EPHEMERAL ACTIVITY one-liner
+ * (a command / file edit / read / spawned sub-agent / tool result). These helpers
+ * split those apart: the reply builds the streaming preview bubble; the activity
+ * builds the ephemeral strip. Neither is ever persisted.
+ */
+import type { ProjectMessage } from '../types/messages';
+import type { StrategicSessionDelta } from '../hooks/useLogViewer';
+import { parseTimestamp } from './time';
+
+export interface StrategicStreamingTurn {
+  /** Stable React key for the streaming bubble: session id + first visible seq. */
+  key: string;
+  sessionId: string;
+  text: string;
+}
+
+export interface StrategicActivityItem {
+  id: number;
+  kind: string;
+  text: string;
+}
+
+export interface StrategicLiveActivity {
+  /** The most recent activity one-liners for the current in-flight turn. */
+  items: StrategicActivityItem[];
+  /** The latest lifecycle marker seen for the current turn (or null). */
+  latestLifecycle: 'responding' | 'done' | null;
+}
+
+// Activity kinds mirror strategic_events.py `_STRATEGIC_SESSION_KINDS`.
+const STRATEGIC_ACTIVITY_KINDS = new Set([
+  'tool', 'command', 'file', 'read', 'subagent', 'tool_result', 'action',
+]);
+
+/** Reply text = message / reasoning (and legacy kind-less) deltas — never the
+ *  activity one-liners, so command noise stays out of the streaming reply. */
+export function isStrategicReplyDelta(kind: string | undefined): boolean {
+  return !kind || kind === 'message' || kind === 'reasoning';
+}
+
+/** Newest durable strategic reply time — the reconciliation high-water mark: a
+ *  streamed delta older than this has already been persisted (shown as a durable
+ *  bubble) so it is filtered out of the live preview / activity strip. */
+export function strategicReplyWatermark(conversationMessages: ProjectMessage[]): number {
+  let watermark = Number.NEGATIVE_INFINITY;
+  for (const msg of conversationMessages) {
+    const ft = (msg.from_type || '').toLowerCase();
+    if ((ft === 'strategic' || ft === 'strategist') && msg.created_at) {
+      const t = parseTimestamp(msg.created_at).getTime();
+      if (!Number.isNaN(t) && t > watermark) watermark = t;
+    }
+  }
+  return watermark;
+}
+
+/** Count of durable strategist replies — the clock-skew-proof baseline the panel
+ *  compares against to detect that a fresh reply has landed. */
+export function countStrategicReplies(conversationMessages: ProjectMessage[]): number {
+  let n = 0;
+  for (const msg of conversationMessages) {
+    const ft = (msg.from_type || '').toLowerCase();
+    if (ft === 'strategic' || ft === 'strategist') n += 1;
+  }
+  return n;
+}
+
+/** Deltas of the CURRENT (latest) session strictly newer than the durable-reply
+ *  water mark — the shared un-persisted window for both live views. */
+function visibleSessionDeltas(
+  deltas: StrategicSessionDelta[],
+  latestSessionId: string | undefined,
+  watermark: number,
+): StrategicSessionDelta[] {
+  return deltas.filter(d => {
+    if (latestSessionId && d.session_id && d.session_id !== latestSessionId) return false;
+    if (watermark === Number.NEGATIVE_INFINITY) return true;
+    if (!d.ts) return true; // no timestamp → treat as a fresh, unpersisted delta
+    const t = parseTimestamp(d.ts).getTime();
+    return Number.isNaN(t) ? true : t > watermark;
+  });
+}
+
+/**
+ * Derive the live streaming turn from the resident-session transcript deltas.
+ *
+ * Dedup / reconciliation key: the newest DURABLE strategic message's `created_at`
+ * acts as a high-water mark. Only REPLY-kind deltas (message / reasoning) from the
+ * most recent session whose `ts` is strictly newer than that water mark build the
+ * preview — the command / tool activity one-liners render in the ephemeral strip
+ * instead, so command noise never appears in the reply the operator keeps. When
+ * the durable `from_type=strategic` ProjectMessage lands, the water mark advances
+ * past the turn's deltas, the preview empties, and the durable bubble takes its
+ * place — no duplicate. A cadence / non-resident turn streams nothing, so this
+ * returns null and only the persisted message renders.
+ */
+export function computeStrategicStreamingTurn(
+  transcript: StrategicSessionDelta[] | undefined,
+  conversationMessages: ProjectMessage[],
+): StrategicStreamingTurn | null {
+  const deltas = transcript ?? [];
+  if (deltas.length === 0) return null;
+  const latestSessionId = deltas[deltas.length - 1]?.session_id;
+  const watermark = strategicReplyWatermark(conversationMessages);
+  const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
+
+  const replyDeltas = visible.filter(d => isStrategicReplyDelta(d.kind));
+  if (replyDeltas.length === 0) return null;
+
+  const text = replyDeltas.map(d => d.text).filter(Boolean).join('\n').trim();
+  if (!text) return null;
+
+  const firstSeq = replyDeltas[0].seq ?? replyDeltas[0].id;
+  const sessionId = latestSessionId ?? 'session';
+  return { key: `${sessionId}:${firstSeq}`, sessionId, text };
+}
+
+/**
+ * Derive the LIVE, EPHEMERAL activity feed (commands / tool calls / sub-agents)
+ * for the in-flight resident turn. Shares the streaming bubble's watermark so it
+ * only ever shows activity NOT yet superseded by a durable strategic reply, and
+ * drops everything up to and including the last `done` frame (that belongs to a
+ * completed turn). Returns at most the most recent handful so the strip stays
+ * compact. NEVER persisted — purely a live view of the transcript deltas.
+ */
+export function computeStrategicSessionActivity(
+  transcript: StrategicSessionDelta[] | undefined,
+  conversationMessages: ProjectMessage[],
+): StrategicLiveActivity {
+  const deltas = transcript ?? [];
+  if (deltas.length === 0) return { items: [], latestLifecycle: null };
+  const latestSessionId = deltas[deltas.length - 1]?.session_id;
+  const watermark = strategicReplyWatermark(conversationMessages);
+  const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
+
+  let latestLifecycle: 'responding' | 'done' | null = null;
+  let lastDoneSeq = Number.NEGATIVE_INFINITY;
+  for (const d of visible) {
+    if (d.status === 'responding' || d.status === 'done') latestLifecycle = d.status;
+    if (d.status === 'done') {
+      const s = d.seq ?? d.id;
+      if (s > lastDoneSeq) lastDoneSeq = s;
+    }
+  }
+
+  const items: StrategicActivityItem[] = visible
+    .filter(d => STRATEGIC_ACTIVITY_KINDS.has(d.kind ?? '') && Boolean(d.text) && (d.seq ?? d.id) > lastDoneSeq)
+    .map(d => ({ id: d.id, kind: d.kind ?? 'tool', text: d.text }));
+
+  const MAX_ACTIVITY = 8;
+  return {
+    items: items.length > MAX_ACTIVITY ? items.slice(-MAX_ACTIVITY) : items,
+    latestLifecycle,
+  };
+}

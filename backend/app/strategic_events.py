@@ -41,12 +41,22 @@ STRATEGIC_SESSION = "strategic_session"
 
 # Allowed ``kind`` values for a ``strategic_session`` delta. Scopes what the
 # resident agent may stream: chunk of reasoning, an applied strategic action, a
-# tool call, a lifecycle status line, or an assistant message.
+# tool call, a lifecycle status line, or an assistant message. The five
+# "activity" kinds (command / file / read / subagent / tool_result) are the
+# compact one-liners the resident handler emits for the LIVE, ephemeral activity
+# strip (a Bash command, a file edit, a read, a spawned sub-agent, a tool
+# result); they are never persisted (only ``message`` reaches the durable
+# transcript, and only as a ProjectMessage — never via this event).
 STRATEGIC_SESSION_KIND_REASONING = "reasoning"
 STRATEGIC_SESSION_KIND_ACTION = "action"
 STRATEGIC_SESSION_KIND_TOOL = "tool"
 STRATEGIC_SESSION_KIND_STATUS = "status"
 STRATEGIC_SESSION_KIND_MESSAGE = "message"
+STRATEGIC_SESSION_KIND_COMMAND = "command"
+STRATEGIC_SESSION_KIND_FILE = "file"
+STRATEGIC_SESSION_KIND_READ = "read"
+STRATEGIC_SESSION_KIND_SUBAGENT = "subagent"
+STRATEGIC_SESSION_KIND_TOOL_RESULT = "tool_result"
 _STRATEGIC_SESSION_KINDS = frozenset(
     {
         STRATEGIC_SESSION_KIND_REASONING,
@@ -54,6 +64,25 @@ _STRATEGIC_SESSION_KINDS = frozenset(
         STRATEGIC_SESSION_KIND_TOOL,
         STRATEGIC_SESSION_KIND_STATUS,
         STRATEGIC_SESSION_KIND_MESSAGE,
+        STRATEGIC_SESSION_KIND_COMMAND,
+        STRATEGIC_SESSION_KIND_FILE,
+        STRATEGIC_SESSION_KIND_READ,
+        STRATEGIC_SESSION_KIND_SUBAGENT,
+        STRATEGIC_SESSION_KIND_TOOL_RESULT,
+    }
+)
+
+# Optional lifecycle ``status`` on a ``strategic_session`` delta: ``responding``
+# marks the start of a turn the operator is waiting on (drives the "Workday's on
+# it" working indicator), ``done`` marks its end (clears the ephemeral activity
+# strip). Absent on ordinary text/activity deltas. NEVER persisted — a purely
+# live signal, like every other field on this event.
+STRATEGIC_SESSION_STATUS_RESPONDING = "responding"
+STRATEGIC_SESSION_STATUS_DONE = "done"
+_STRATEGIC_SESSION_STATUSES = frozenset(
+    {
+        STRATEGIC_SESSION_STATUS_RESPONDING,
+        STRATEGIC_SESSION_STATUS_DONE,
     }
 )
 # Per-delta text cap (chars). Kept below the NOTIFY soft-limit so a single
@@ -436,6 +465,12 @@ def _strategic_session_payload(payload: Mapping[str, Any] | None) -> dict[str, A
         "text": _sanitize_session_text(src.get("text")),
         "ts": _compact_str(src.get("ts"), max_chars=40) or _session_ts_now(),
     }
+    # Optional lifecycle status (``responding`` / ``done``). Only forwarded when it
+    # is one of the known values so a malformed frame can never inject arbitrary
+    # state onto the wire; absent otherwise so ordinary deltas stay lean.
+    status = src.get("status")
+    if status in _STRATEGIC_SESSION_STATUSES:
+        out["status"] = status
     return _enforce_session_soft_limit(out)
 
 

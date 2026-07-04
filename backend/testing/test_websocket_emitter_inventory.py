@@ -11,6 +11,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from regen_emitter_inventory import build_fixture
 from regen_emitter_inventory import main as regen_main
 from websocket_event_inventory import (
@@ -19,6 +21,12 @@ from websocket_event_inventory import (
     inventory_signature,
     read_app_sources,
 )
+
+# These are source-inventory tests that AST-scan the entire backend/app tree
+# (twice over, in the regen round-trip) — legitimately slow and prone to tripping
+# the 30s global pytest-timeout on a loaded CI shard. Give the file headroom; this
+# is a timeout accommodation for a correct-but-slow scan, not a weakened assertion.
+pytestmark = pytest.mark.timeout(120)
 
 
 SNAPSHOT_PATH = (

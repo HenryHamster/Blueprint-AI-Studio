@@ -11,6 +11,7 @@ describe('residentConfig', () => {
   it('uses contract defaults when the payload omits the knobs', () => {
     const c = residentConfig({});
     expect(c.idleTickMs).toBe(5000);
+    expect(c.messagePollMs).toBe(1500); // fast operator pickup default (1.5s)
     expect(c.turnTimeoutMs).toBe(120_000);
     expect(c.autonomousEnabled).toBe(true);
   });
@@ -18,19 +19,33 @@ describe('residentConfig', () => {
   it('reads the payload knobs (seconds → ms)', () => {
     const c = residentConfig({
       strategic_session_idle_tick_seconds: 3,
+      strategic_session_message_poll_seconds: 1,
       strategic_session_turn_timeout_seconds: 90,
     });
     expect(c.idleTickMs).toBe(3000);
+    expect(c.messagePollMs).toBe(1000);
     expect(c.turnTimeoutMs).toBe(90_000);
   });
 
   it('clamps to safe minimums', () => {
     const c = residentConfig({
       strategic_session_idle_tick_seconds: 0,
+      strategic_session_message_poll_seconds: 0,
       strategic_session_turn_timeout_seconds: 1,
     });
     expect(c.idleTickMs).toBe(1000);
+    // Floored at 750ms, but never slower than the idle tick (1000ms here).
+    expect(c.messagePollMs).toBe(750);
     expect(c.turnTimeoutMs).toBe(15_000);
+  });
+
+  it('never polls slower than the idle heartbeat tick', () => {
+    const c = residentConfig({
+      strategic_session_idle_tick_seconds: 1,
+      strategic_session_message_poll_seconds: 10,
+    });
+    expect(c.idleTickMs).toBe(1000);
+    expect(c.messagePollMs).toBe(1000); // clamped down to the idle tick
   });
 
   it('disables autonomous work in monitor mode', () => {
