@@ -1437,6 +1437,13 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
         version.id,
         "Criterion retired by strategist",
     )
+    # Create the real successor criterion that superseded_by_key will reference.
+    successor = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Replacement criterion",
+    )
 
     task = Task(
         project_id=project.id,
@@ -1463,7 +1470,7 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
                     {
                         "criterion_key": criterion.criterion_key,
                         "reason": "Superseded by direct release evidence",
-                        "superseded_by_key": "c-successor",
+                        "superseded_by_key": successor.criterion_key,
                     }
                 ]
             },
@@ -1484,14 +1491,157 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
     await db_session.refresh(criterion)
     assert criterion.status == "superseded"
     assert criterion.retracted_by == "strategist"
-    assert criterion.superseded_by_key == "c-successor"
+    assert criterion.superseded_by_key == successor.criterion_key
 
     summary = await ac.get_version_coverage_summary(db_session, version.id)
-    assert summary["total"] == 0
-    assert summary["uncovered"] == 0
+    assert summary["total"] == 1  # successor is still active
+    assert summary["uncovered"] == 1
     assert summary["retracted"] == 0
     assert summary["superseded"] == 1
     assert summary["inactive"] == 1
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_supersession_rejects_self_reference(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria rejects self-supersession (superseded_by_key == criterion_key)."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "SelfSupersede")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Criterion A")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-self-super",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-self-super", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Self-replace",
+                        "superseded_by_key": criterion.criterion_key,
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 400, f"Expected 400 for self-supersession, got {resp.status_code}: {resp.text}"
+    assert "cannot supersede itself" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_supersession_rejects_nonexistent_target(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria rejects a superseded_by_key that does not exist on the open version."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "NonexistentSuper")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Criterion B")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-nonexist-super",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-nonexist-super", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Replacing with something",
+                        "superseded_by_key": "c-does-not-exist",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 400, f"Expected 400 for nonexistent target, got {resp.status_code}: {resp.text}"
+    assert "does not refer to an active criterion" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_supersession_rejects_inactive_target(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria rejects a superseded_by_key that is already inactive."""
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "InactiveTargetSuper")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Source")
+    already_retracted = await ac.create_criterion(
+        db_session, project.id, version.id, "Already retracted"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=already_retracted.criterion_key,
+        reason="Pre-retracted",
+        retracted_by="test",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-inactive-target",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-inactive-target", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Pointing at retracted target",
+                        "superseded_by_key": already_retracted.criterion_key,
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 400, f"Expected 400 for inactive target, got {resp.status_code}: {resp.text}"
+    assert "does not refer to an active criterion" in resp.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -2292,3 +2442,134 @@ async def test_full_pipeline_end_to_end_via_refresh_after_merge(db_session):
     assert summary["total"] == 1
     assert summary["covered"] == 1
     assert summary["criteria"][0]["coverage"] == "covered"
+
+
+# ---------------------------------------------------------------------------
+# test_requeue_clone_drops_inactive_criterion_ids
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_requeue_clone_drops_inactive_criterion_ids(db_session, mocker):
+    """_requeue_parent_task drops retracted/superseded criterion_ids from the clone.
+
+    When a failed child carries criterion_ids that include inactive (retracted
+    or superseded) criteria, the requeued clone should carry only the active
+    subset so a retracted criterion stops propagating as live work.
+    """
+    project = await _make_project(db_session, "RequeueDropInactive")
+    version = await _make_version(db_session, project)
+
+    active_c = await ac.create_criterion(db_session, project.id, version.id, "Active crit")
+    retracted_c = await ac.create_criterion(db_session, project.id, version.id, "Retracted crit")
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=retracted_c.criterion_key,
+        reason="No longer needed",
+        retracted_by="test",
+    )
+
+    parent = Task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        context={"_requeue_count": 0},
+        payloads=[{"type": "research", "prompt": "parent"}],
+    )
+    child = Task(
+        project_id=project.id,
+        parent_task_id=parent.id,
+        status=TaskStatus.FAILED,
+        criterion_ids=[active_c.criterion_key, retracted_c.criterion_key],
+        latest_status_message="boom",
+        payloads=[{"type": "create", "prompt": "child"}],
+        context={"last_error": "boom"},
+    )
+    db_session.add(parent)
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    await db_session.refresh(child)
+
+    mocker.patch("app.task_lifecycle.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.task_lifecycle.classify_failure", return_value="CODE_ERROR")
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+
+    from app.task_lifecycle_requeue import _requeue_parent_task
+
+    await _requeue_parent_task(parent, db_session)
+
+    cloned = (
+        (
+            await db_session.execute(
+                select(Task).where(
+                    Task.parent_task_id == parent.id,
+                    Task.status == TaskStatus.QUEUED,
+                )
+            )
+        )
+        .scalars()
+        .one()
+    )
+
+    assert cloned.criterion_ids == [active_c.criterion_key], (
+        "Only the active criterion should be propagated; retracted one must be dropped"
+    )
+
+
+# ---------------------------------------------------------------------------
+# test_record_task_merge_evidence_skips_inactive_criteria
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_skips_inactive_criteria(db_session):
+    """record_task_merge_evidence does not record evidence for inactive criteria.
+
+    When a task's criterion_ids include retracted or superseded criteria, the
+    merge-evidence path must skip them so inactive criteria do not accrue new
+    evidence and cannot be revived by a late merge.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "MergeEvidenceActiveOnly")
+    version = await _make_version(db_session, project)
+
+    active_c = await ac.create_criterion(db_session, project.id, version.id, "Active")
+    retracted_c = await ac.create_criterion(db_session, project.id, version.id, "Retracted")
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=retracted_c.criterion_key,
+        reason="Stale criterion",
+        retracted_by="test",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "ship it"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green",
+            }
+        },
+        criterion_ids=[active_c.criterion_key, retracted_c.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    count = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert count == 1, "Only the active criterion should receive evidence"
+
+    active_evidence = await ac.get_evidence_for_criterion(db_session, active_c.id)
+    assert len(active_evidence) == 2  # task_merge + reachability
+
+    retracted_evidence = await ac.get_evidence_for_criterion(db_session, retracted_c.id)
+    assert retracted_evidence == [], "Retracted criterion must not receive new evidence"

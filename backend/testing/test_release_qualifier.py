@@ -7843,6 +7843,198 @@ async def test_run_qualification_ci_unresolved_bypasses_cached_verdict(
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_criterion_coverage_still_cached_while_uncovered(
+    db_session, mocker
+):
+    """A same-SHA not_promoted/criterion_coverage_incomplete verdict stays cached
+    while an uncovered ACTIVE criterion remains — the safety-valve exception must
+    NOT relax caching until coverage actually clears."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "covwedge" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-covered1", text="Covered criterion", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing1", text="Uncovered criterion",
+    )
+    attempts_before = version.qualification_attempts
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Coverage still incomplete (1 of 2 active covered) → the verdict is cached.
+    assert result["status"] == "cached_verdict"
+    assert result["cached_verdict_status"] == "not_promoted"
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+    assert version.qualification_attempts == attempts_before
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_criterion_retraction_clears_coverage_bypasses_cache(
+    db_session, mocker
+):
+    """The acceptance-contract safety valve: author a criterion, land a same-SHA
+    not_promoted/criterion_coverage_incomplete verdict, retract the uncoverable
+    criterion, and a fresh re-qualification is PERMITTED on the SAME SHA (not
+    served as cached_verdict) once the live coverage gate would no longer fire."""
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "critclr0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # A single uncoverable active criterion — coverage gate fires (0 of 1 covered).
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-uncoverable", text="Cannot ever be covered",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # Before retraction: the uncovered active criterion keeps the verdict cached.
+    cached = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert cached["status"] == "cached_verdict"
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+    # Retract the uncoverable criterion — no active criteria remain, so the
+    # coverage gate would no longer fire on the SAME candidate SHA.
+    await db_session.refresh(version)
+    row = await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-uncoverable",
+        reason="uncoverable — retracted by the safety valve",
+        retracted_by="strategist",
+    )
+    assert row is not None and row.status == "retracted"
+
+    # After retraction: a fresh qualification is permitted on the SAME SHA.
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
+async def test_reconcile_if_criterion_coverage_now_complete_respawns_after_retraction(
+    db_session, mocker
+):
+    """The scheduled trigger: the sweep reconciler re-drives a stranded
+    not_promoted/criterion_coverage_incomplete version once a retraction clears
+    coverage on the unchanged automain SHA."""
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "sweepcvr" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-sweep-uncoverable", text="Uncoverable criterion",
+    )
+    await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-sweep-uncoverable",
+        reason="uncoverable",
+        retracted_by="strategist",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    # The reconciler runs in its own dedicated session; feed it the shared test
+    # session factory so it operates against the same SQLite database.
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert reconciled is True
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
     """Idempotent qualification: when a conclusive promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification

@@ -516,6 +516,131 @@ async def _redrive_not_promoted_qualification(
         return False
 
 
+async def _reconcile_if_criterion_coverage_now_complete(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-qualify a not_promoted/criterion_coverage_incomplete version once coverage clears.
+
+    ``criterion_coverage_incomplete`` (release_scoring) means active version
+    acceptance criteria were uncovered when the candidate was scored — a state
+    that a criterion retraction / supersession (or fresh coverage evidence) can
+    clear WITHOUT the candidate SHA changing.  ``run_qualification`` caches the
+    ``not_promoted`` verdict by candidate SHA, so neither the strategist nor the
+    admin endpoint re-enters once coverage clears; the version strands
+    not_promoted with no operator in the loop — the exact deadlock the
+    acceptance-contract safety valve exists to break.
+
+    This is the scheduled trigger, mirroring
+    :func:`_reconcile_if_ci_unresolved_now_green`.  For an open, stabilize-phase
+    version whose ``last_qualification`` is ``not_promoted`` with blocker
+    ``criterion_coverage_incomplete``, when automain still points at the exact
+    candidate SHA AND the live coverage summary shows the coverage gate would no
+    longer fire (every active criterion covered, or zero active criteria remain),
+    it re-invokes ``run_qualification`` on the same candidate.
+    ``run_qualification``'s own ``criterion_coverage_recovered_same_sha``
+    exception then permits the fresh re-audit instead of serving the cached
+    verdict; every other gate still applies to that re-audit.
+
+    Returns True iff a new qualification was spawned.
+    """
+    from app import github, release_qualifier
+    from app.acceptance_criteria import get_version_coverage_summary
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return False
+            if version.status != "open" or version.phase != "stabilize":
+                return False
+            qual = version.last_qualification or {}
+            if qual.get("status") != "not_promoted":
+                return False
+            if qual.get("blocker") != "criterion_coverage_incomplete":
+                return False
+            candidate_sha = qual.get("candidate_sha")
+            if not candidate_sha:
+                return False
+
+            # Live coverage gate: mirror release_scoring — the gate fires when
+            # ``total > 0 and covered < total``, so it is CLEAR when no active
+            # criteria remain or every active one is covered.
+            coverage = await get_version_coverage_summary(session, version.id)
+            total = int(coverage.get("total") or 0)
+            covered = int(coverage.get("covered") or 0)
+            if not (total == 0 or covered >= total):
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+            integration_branch, _promotion_target = (
+                release_qualifier._lts_branch_names(project)
+            )
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token, owner, repo, integration_branch
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            # Only the SAME-SHA wedge is ours: a different HEAD is a fresh
+            # candidate the stale-not-promoted re-drive already owns.
+            if automain_sha != candidate_sha:
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                "coverage cleared for candidate %s of v%d on unchanged automain "
+                "(total=%d covered=%d) — spawning fresh qualification",
+                candidate_sha[:8],
+                version.version_number,
+                total,
+                covered,
+            )
+            result = await release_qualifier.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
 async def _auto_stale_not_promoted_findings(
     version_id,
     *,
@@ -1096,6 +1221,35 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove ci_unresolved version %s "
                 "(CI green on unchanged automain — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive quiescent ``not_promoted`` versions whose only blocker was the
+    # ``criterion_coverage_incomplete`` gate, once a criterion retraction /
+    # supersession (or fresh evidence) has cleared coverage on the UNCHANGED
+    # automain SHA.  The acceptance-contract safety valve: an uncoverable
+    # criterion that is retracted must let the version re-audit and clear the
+    # gate without a SHA change or operator action, rather than stranding
+    # not_promoted.  Mirrors the ci_unresolved reconciler above; runs before the
+    # generic stale-not-promoted loop.
+    for version_id in version_ids:
+        try:
+            reconciled = await _reconcile_if_criterion_coverage_now_complete(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: criterion_coverage-now-complete "
+                "reconcile failed for version %s",
+                version_id,
+            )
+            continue
+        if reconciled:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove criterion_coverage version %s "
+                "(coverage cleared on unchanged automain — qualification spawned)",
                 version_id,
             )
 

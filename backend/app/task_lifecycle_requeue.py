@@ -796,6 +796,34 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             validate_internal_payload(p, "task_lifecycle:requeue_child")
             for p in new_payloads
         ]
+        # Filter criterion_ids to active-only so a retracted/superseded criterion
+        # stops propagating to new clones and accruing fresh evidence.
+        _raw_criterion_ids = list(child.criterion_ids or [])
+        _active_criterion_ids = _raw_criterion_ids
+        if _raw_criterion_ids:
+            try:
+                from app.acceptance_criteria import (
+                    filter_active_criterion_keys as _filter_active_crit_requeue,
+                )
+                from app.release_version import (
+                    current_open_version as _cur_open_ver_requeue,
+                )
+
+                _open_ver_requeue = await _cur_open_ver_requeue(
+                    session, child.project_id
+                )
+                _active_criterion_ids = await _filter_active_crit_requeue(
+                    session,
+                    child.project_id,
+                    _raw_criterion_ids,
+                    release_version_id=_open_ver_requeue.id if _open_ver_requeue else None,
+                )
+            except Exception:
+                logger.exception(
+                    "[REQUEUE] Failed to filter criterion_ids for task %s — using raw list",
+                    child.id,
+                )
+
         new_child = Task(
             project_id=child.project_id,
             title=child.title,
@@ -803,7 +831,7 @@ async def _requeue_parent_task(parent: Task, session: AsyncSession):
             parent_task_id=parent.id,
             payloads=new_payloads,
             context=clone_ctx,  # Strip runtime-only fields; may include _scope_reduced
-            criterion_ids=list(child.criterion_ids or []),
+            criterion_ids=_active_criterion_ids,
             depends_on=[],  # Set in pass 2 after all clones exist
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
             status=TaskStatus.QUEUED,

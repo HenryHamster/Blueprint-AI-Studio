@@ -227,6 +227,7 @@ from app.release_qualifier_sweep import (
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
     _force_finalize_timed_out_qualification,
     _parse_started_at,
+    _reconcile_if_criterion_coverage_now_complete,  # noqa: F401 — re-exported for tests
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
@@ -1844,6 +1845,10 @@ async def run_qualification(
     # new candidate is unscored and a fresh qualification is always permitted.
     # ``ci_unresolved`` is the narrow transient exception: a same-SHA
     # not_promoted verdict may re-run once the fresh CI snapshot is green.
+    # ``criterion_coverage_incomplete`` is the second narrow exception: a
+    # same-SHA not_promoted verdict may re-run once the live coverage summary
+    # shows the coverage gate would no longer fire (a retracted/superseded
+    # criterion cleared the wedge) — the acceptance-contract safety valve.
     prior_qual = version.last_qualification or {}
     prior_status = prior_qual.get("status")
     ci_unresolved_recovered_same_sha = (
@@ -1852,6 +1857,39 @@ async def run_qualification(
         and prior_qual.get("candidate_sha") == candidate_sha
         and ci_green
     )
+    # Criterion-coverage recovery — the acceptance-contract safety valve.  A
+    # same-SHA not_promoted verdict whose blocker was
+    # ``criterion_coverage_incomplete`` (set in release_scoring when active
+    # criteria are uncovered) may re-run once the LIVE coverage summary shows the
+    # gate would no longer fire: every active criterion covered, or ZERO active
+    # criteria remain after a retraction/supersession cleared an uncoverable one.
+    # This is the deadlock this direction exists to break — retracting an
+    # uncoverable criterion must let the qualifier re-audit and clear the gate
+    # WITHOUT a SHA change or operator action.  Mirrors the ``ci_unresolved``
+    # narrow exception exactly: it relaxes caching for THIS blocker only and
+    # only on the SAME SHA (a different SHA already re-runs via the normal cache
+    # miss), and every downstream gate still applies to the fresh re-audit.
+    criterion_coverage_recovered_same_sha = False
+    if (
+        prior_status == "not_promoted"
+        and prior_qual.get("blocker") == "criterion_coverage_incomplete"
+        and prior_qual.get("candidate_sha") == candidate_sha
+    ):
+        try:
+            _coverage = await get_version_coverage_summary(session, version.id)
+            _total = int(_coverage.get("total") or 0)
+            _covered = int(_coverage.get("covered") or 0)
+            # Mirror the release_scoring gate exactly: it fires when
+            # ``total > 0 and covered < total``, so the gate is CLEAR when no
+            # active criteria remain (total == 0) or every active one is covered.
+            criterion_coverage_recovered_same_sha = _total == 0 or _covered >= _total
+        except Exception:  # noqa: BLE001 — a coverage lookup failure stays cached (safe: no wrong re-run)
+            logger.warning(
+                "[RELEASE_QUALIFIER] run_qualification: coverage-recovery check "
+                "failed for v%d — leaving the not_promoted verdict cached",
+                version.version_number,
+            )
+            criterion_coverage_recovered_same_sha = False
     # Content-hash reuse: a newer commit whose AUDITED SURFACE is byte-identical
     # to the prior conclusive candidate (differs only in excluded CI/fixture/
     # config files) carries the same verdict — reuse it instead of re-rolling the
@@ -1884,6 +1922,7 @@ async def run_qualification(
             or _same_audited_surface
         )
         and not ci_unresolved_recovered_same_sha
+        and not criterion_coverage_recovered_same_sha
     ):
         _reuse_reason = (
             "automain unchanged"

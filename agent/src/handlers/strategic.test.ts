@@ -1703,6 +1703,31 @@ describe('handleStrategic executor prompt: proposed acceptance criteria handoff'
     expect(executorPrompt).toContain(`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"`);
     expect(executorPrompt).toContain('If the file is absent or empty, SKIP');
   });
+
+  it('documents the retract shape and permanently-uncoverable trigger in the executor prompt', async () => {
+    const taskId = 'task-retract-doc';
+
+    await handleStrategic(
+      taskId,
+      { project_name: 'Blueprint' },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      { value: '' },
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    // The executor prompt must document the retract array shape so the strategist knows it can retract criteria.
+    expect(executorPrompt).toContain('retract');
+    expect(executorPrompt).toContain('criterion_key');
+    expect(executorPrompt).toContain('reason');
+    // Must mention the trigger condition: permanently uncoverable
+    expect(executorPrompt).toContain('permanently uncoverable');
+    // Must guard against fabrication
+    expect(executorPrompt).toContain('Never fabricate retractions');
+  });
 });
 
 describe('handleStrategic infra-error propagation (vm_config_missing)', () => {

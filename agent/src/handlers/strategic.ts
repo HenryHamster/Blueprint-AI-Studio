@@ -1061,6 +1061,8 @@ ${proposedCriteriaBlock}
 
 4.5. **Acceptance criteria (conditional).** If the proposed criteria block above is non-empty, call \`./strategic set-acceptance-criteria "$(cat /tmp/proposed_criteria_${taskId}.json)"\`. If the file is absent or empty, SKIP — do not fabricate a criteria list.
 
+   The payload may contain both a \`criteria\` additions array and an optional \`retract\` array. A \`retract\` item retracts or supersedes an existing **active** criterion that has become permanently uncoverable: \`{"criterion_key":"c-xxx","reason":"...","superseded_by_key":"c-yyy"}\` (\`superseded_by_key\` is optional; omit when retraction stands alone). Retractions are processed before additions. **Never fabricate retractions** — only retract when the Thinker's analysis shows the criterion is demonstrably uncoverable given the current direction portfolio.
+
 5. **Version phase / qualify siblings (conditional — do this BEFORE step 1's \`set-problem-model\` call).** If the Thinker's analysis includes a \`version_phase_decision\` field (look in Section 6 and throughout the analysis), edit \`/tmp/problem_model_${taskId}.json\` IN PLACE to add it as a top-level sibling key, so the file becomes:
    \`{"version_phase_decision": {"phase": "build" or "stabilize", "reasoning": "..."}, ...rest_of_problem_model}\`
    If the Thinker did NOT emit \`version_phase_decision\`, SKIP — do not fabricate one, and do not add the field. Absence means "no phase change this cycle."

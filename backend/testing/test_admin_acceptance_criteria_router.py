@@ -434,3 +434,118 @@ async def test_link_direction_400_rejects_closed_version_criterion_key(
         "criterion key from a closed version must be rejected with 400; "
         f"got {resp.status_code}: {resp.text}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Supersession-target validation via the strategic agent op
+# ---------------------------------------------------------------------------
+
+
+async def _make_strategic_task_and_token(session, project):
+    """Create a strategic_review Task and return (task, agent_token)."""
+    from app.auth import create_agent_token
+    from app.models import Task
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id=f"agent-vm-{project.id}",
+    )
+    session.add(task)
+    await session.commit()
+    await session.refresh(task)
+    token = create_agent_token(
+        str(task.id),
+        f"agent-vm-{project.id}",
+        task_type="strategic_review",
+    )
+    return task, token
+
+
+@pytest.mark.asyncio
+async def test_supersession_target_unknown_key_rejected(client: AsyncClient, db_session):
+    """set_acceptance_criteria returns 400 when superseded_by_key does not exist on the open version."""
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract",
+    )
+    task, token = await _make_strategic_task_and_token(db_session, project)
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Replacing with something",
+                        "superseded_by_key": "c-does-not-exist",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 400, (
+        f"Expected 400 for unknown superseded_by_key, got {resp.status_code}: {resp.text}"
+    )
+    assert "does not refer to an active criterion" in resp.json()["error"]["message"]
+
+    # Source criterion must remain active — the validation rejected the op before retraction.
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_supersession_target_valid_active_key_accepted(client: AsyncClient, db_session):
+    """set_acceptance_criteria returns 200 when superseded_by_key references a real active criterion."""
+    project = await _make_project_member(db_session, role="owner")
+    version = await _make_version(db_session, project)
+    source = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Old criterion",
+    )
+    successor = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="New replacement criterion",
+    )
+    task, token = await _make_strategic_task_and_token(db_session, project)
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": source.criterion_key,
+                        "reason": "Superseded by new criterion",
+                        "superseded_by_key": successor.criterion_key,
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, (
+        f"Expected 200 for valid active superseded_by_key, got {resp.status_code}: {resp.text}"
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["retracted"][0]["status"] == "superseded"
+    assert body["retracted"][0]["found"] is True
+
+    await db_session.refresh(source)
+    assert source.status == "superseded"
+    assert source.superseded_by_key == successor.criterion_key

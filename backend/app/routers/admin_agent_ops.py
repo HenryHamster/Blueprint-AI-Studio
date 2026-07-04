@@ -3341,6 +3341,7 @@ async def strategic_operation(
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
             count_active_criteria_for_version as _count_active_criteria,
+            get_criterion_by_key as _get_criterion_by_key,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
@@ -3415,6 +3416,32 @@ async def strategic_operation(
                 content=_resp({"status": "error", "reason": "No open release version"}),
                 status_code=409,
             )
+
+        # Validate supersession targets before executing any retractions.
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            superseded_by_key_raw = item.get("superseded_by_key")
+            superseded_by_key = (
+                superseded_by_key_raw.strip()
+                if isinstance(superseded_by_key_raw, str) and superseded_by_key_raw.strip()
+                else None
+            )
+            if superseded_by_key is None:
+                continue
+            if superseded_by_key == criterion_key:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"set_acceptance_criteria: criterion '{criterion_key}' cannot supersede itself",
+                )
+            target = await _get_criterion_by_key(session, open_version.id, superseded_by_key)
+            if target is None or target.status != "active":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"set_acceptance_criteria: superseded_by_key '{superseded_by_key}' "
+                        f"does not refer to an active criterion on the open release version"
+                    ),
+                )
 
         # Process retractions FIRST so freed headroom is available to additions
         # in the same call — this is the core safety-valve path.

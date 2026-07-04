@@ -363,9 +363,10 @@ async def record_task_merge_evidence(
             )
         if _release_version_id is None:
             return 0
-        rows = await get_criteria_by_keys(
+        all_rows = await get_criteria_by_keys(
             session, project_id, criterion_ids, release_version_id=_release_version_id
         )
+        rows = [r for r in all_rows if r.status == "active"]
         task_id_str = str(getattr(task, "id", "") or "")
         recorded = 0
         for row in rows:

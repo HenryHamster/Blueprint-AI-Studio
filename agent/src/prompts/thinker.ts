@@ -532,12 +532,19 @@ Skip entirely if criteria already exist and are reasonably mapped. Do NOT fabric
 When criteria are warranted, write \`/tmp/proposed_criteria_${p.taskId}.json\` ${READ_ONLY_BASH_WRITE_NOTE} as the backend payload shape:
 
 \`\`\`json
-{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}
+{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":[{"criterion_key":"c-old-key","reason":"All directions that could produce covering evidence have been retired; this criterion is permanently uncoverable.","superseded_by_key":"c-new-key"}]}
 \`\`\`
 
 Each \`criteria\` item has:
 - \`text\`: a short, concrete, independently verifiable criterion statement for the VERSION, not a direction description.
 - \`direction_keys\`: the \`d-xxx\` identifiers of directions that contribute to that criterion; use an empty array only when no active direction maps cleanly yet.
+
+The optional top-level \`retract\` array lets you retract or supersede an existing **active** criterion that has become permanently uncoverable — for example, when every direction that could produce covering evidence has been retired and no realistic path to covering the criterion remains. Each retraction item has:
+- \`criterion_key\` (required): the \`c-xxx\` key of the active criterion to retract.
+- \`reason\` (required): a short explanation of why the criterion is permanently uncoverable.
+- \`superseded_by_key\` (optional): the \`c-xxx\` key of a different active criterion that replaces this one. Omit when retraction stands alone.
+
+Retractions are processed before additions this cycle. Omit the \`retract\` key entirely when no active criterion needs retraction — absence is the default. **Never fabricate retractions.** Only retract a criterion when it is demonstrably uncoverable given the current direction portfolio (not merely hard or slow to cover).
 
 Keep the total to 5-7 criteria maximum. Frame text as outcomes ("Users can X", "System handles Y"), not implementation steps ("Implement Z"). Ground every criterion in the version goal and active gap descriptions. If no criteria are needed this cycle, do not write the file at all.
 
