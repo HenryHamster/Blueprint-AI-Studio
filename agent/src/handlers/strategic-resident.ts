@@ -9,10 +9,11 @@ import {
   writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
+import { provisionAmbientHelpers } from '../providers/runners.js';
 import {
-  startResidentClaudeSession, provisionAmbientHelpers,
+  startResidentClaudeSession,
   type ResidentSession, type ResidentTurnResult,
-} from '../providers/runners.js';
+} from '../providers/resident-session.js';
 import { buildDirSummaryText, buildOpenMessagesText } from './strategic-sections.js';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,

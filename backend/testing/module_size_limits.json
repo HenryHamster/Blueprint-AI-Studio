@@ -162,7 +162,8 @@
     "handlers/strategic-sections.ts": 1500,
     "providers/runners.ts": 2650,
     "prompts/context-prefix.ts": 1350,
-    "handlers/fresh-reviewer.ts": 950
+    "handlers/fresh-reviewer.ts": 950,
+    "providers/resident-session.ts": 560
   },
   "frontend": {
     "useAppState.ts": 3000,
