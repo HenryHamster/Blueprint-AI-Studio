@@ -126,22 +126,24 @@ async def test_failed_allowlisted_command_persists_bounded_receipt_and_jobs(
 
 
 @pytest.mark.asyncio
-async def test_executes_check_in_mode_command_through_shared_contract(db_session):
+async def test_executes_mode_command_through_shared_contract(db_session):
+    # The interaction vocabulary collapsed to Chat + Workday; exercise the shared
+    # contract with the Workday (continuous) mode command.
     project = await _make_project(db_session)
     command = {
-        "id": "session.mode.check_in",
-        "label": "Check-in mode",
+        "id": "session.mode.continuous",
+        "label": "Workday mode",
         "enabled": True,
         "target": {
             "surface": "messages",
             "project_id": str(project.id),
-            "action": "set_check_in_mode",
+            "action": "set_continuous_mode",
         },
         "refetch_surfaces": ["strategic_session"],
         "mutation": {
             "method": "POST",
             "path": f"/api/admin/projects/{project.id}/strategic-session",
-            "body": {"workbench": {"interaction_mode": "check_in"}},
+            "body": {"workbench": {"interaction_mode": "continuous"}},
         },
     }
 
@@ -150,19 +152,19 @@ async def test_executes_check_in_mode_command_through_shared_contract(db_session
         project_id=project.id,
         user_id=TEST_USER_ID,
         command=command,
-        idempotency_key="check-in-mode-1",
+        idempotency_key="continuous-mode-1",
     )
 
     assert result["status"] == "succeeded"
     assert result["applied"] is True
-    assert result["receipt"]["command_id"] == "session.mode.check_in"
+    assert result["receipt"]["command_id"] == "session.mode.continuous"
     prefs = await get_messages_noise_prefs_row(
         db_session,
         TEST_USER_ID,
         project.id,
     )
     assert prefs is not None
-    assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "check_in"
+    assert prefs.prefs["_strategic_workbench"]["interaction_mode"] == "continuous"
 
 
 @pytest.mark.asyncio

@@ -176,6 +176,21 @@ def _die(reason: str, code: int = 1) -> None:
     os._exit(code)
 
 
+def _hostname() -> str | None:
+    """Best-effort host name for this runner, sent on every heartbeat.
+
+    The orchestrator stores this on the runner row so the operator console shows
+    a real machine name instead of a bare id/None. Returns ``socket.gethostname()``
+    or None if it cannot be determined — the heartbeat schema tolerates a missing
+    hostname (old runners omit it), so a failure here never breaks the heartbeat.
+    """
+    try:
+        name = socket.gethostname()
+    except OSError:
+        return None
+    return name or None
+
+
 def _node_runtime_ok() -> bool:
     """Return True iff ``node --version`` actually runs (binary present + executable).
 
@@ -688,6 +703,11 @@ def _heartbeat_loop(
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
+    # Host identity is stable for the process lifetime — resolve it once and send
+    # it on every heartbeat so the console shows the real machine name (the runner
+    # is enrolled from the browser, which cannot know the host's name, so this is
+    # the only place the hostname is populated).
+    hostname = _hostname()
     consecutive_401 = 0
     while not _shutdown_event.is_set():
         try:
@@ -716,6 +736,7 @@ def _heartbeat_loop(
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
                 "agent_available": agent_available,
+                "hostname": hostname,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / idle-GPU.
                 "last_successful_job_at": last_success_at,
@@ -1652,7 +1673,9 @@ def _preflight(
     Performs the single authoritative orchestrator/token ping (a real heartbeat)
     so ``--check`` and normal boot share one code path.
     """
-    hostname = socket.gethostname()
+    # Use the same fail-safe helper as the heartbeat loop: a bare
+    # socket.gethostname() can raise OSError and would crash boot/--check.
+    hostname = _hostname()
     token_prefix = token[:8] + "..." if len(token) >= 8 else token
     workspace_root = _workspace_root()
     ws_writable = _workspace_writable(workspace_root)
@@ -1682,6 +1705,7 @@ def _preflight(
                 "active_task_ids": [],
                 "active_compute_job_ids": [],
                 "agent_available": claimable[iso.CLASS_AGENT],
+                "hostname": hostname,
                 **gpu_caps,
             },
         )
@@ -1697,7 +1721,7 @@ def _preflight(
         print(f"  {label:<16}: {value}", flush=True)
 
     print("Blueprint local fleet runner — preflight", flush=True)
-    _fmt("runner host", hostname)
+    _fmt("runner host", hostname or "unknown")
     if ping_error:
         _fmt("orchestrator", f"{orchestrator_url}   [UNREACHABLE: {ping_error}]")
     else:

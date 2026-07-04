@@ -1241,6 +1241,48 @@ class TestGpuDetection(unittest.TestCase):
         self.assertEqual(posted_bodies[0]["active_compute_job_ids"], ["job-a", "job-b"])
         self.assertFalse(posted_bodies[0]["agent_available"])
 
+    def test_hostname_included_in_heartbeat_body(self):
+        """Heartbeat carries the host name so the console shows a real machine name.
+
+        Regression: the runner is enrolled from a browser (which cannot know the
+        host's name), so the heartbeat is the ONLY place hostname is populated.
+        It was previously omitted from the body, so the panel showed None forever.
+        """
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_hostname", return_value="operator-box"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        self.assertIn("hostname", posted_bodies[0])
+        self.assertEqual(posted_bodies[0]["hostname"], "operator-box")
+
+    def test_hostname_helper_tolerates_failure(self):
+        """_hostname returns None (never raises) when the OS lookup fails, so a
+        heartbeat is never broken by a hostname resolution error."""
+        with patch.object(local_runner.socket, "gethostname", side_effect=OSError):
+            self.assertIsNone(local_runner._hostname())
+
 
 # ── Docker login helper ───────────────────────────────────────────────────────
 

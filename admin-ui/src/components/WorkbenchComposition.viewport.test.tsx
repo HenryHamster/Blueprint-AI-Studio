@@ -506,7 +506,8 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
     expect(sessionControl?.textContent).not.toContain('Mark checked');
     expect(sessionControl?.querySelector('button[aria-label="Switch Strategic mode to Workday"]')).toBeTruthy();
-    expect(sessionControl?.querySelector('button[aria-label^="Mark Strategic session checked:"]')).toBeTruthy();
+    // check-in is no longer a dedicated session-control button — it moved to the command palette with the mode collapse
+    expect(sessionControl?.querySelector('button[aria-label^="Mark Strategic session checked:"]')).toBeNull();
     expect(sessionControl?.querySelector('button[aria-label^="Open devices: runner"]')).toBeNull();
     expect(sessionControl?.querySelector('button[aria-label^="Open accounts:"]')).toBeNull();
     const devicesButton = railButtons.find(button => button.textContent?.trim() === 'Devices');

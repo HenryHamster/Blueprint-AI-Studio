@@ -12,29 +12,30 @@ describe('StrategicSessionControl', () => {
     expect(screen.getByRole('button', { name: /switch strategic mode to chat/i })).toHaveAttribute('aria-pressed', 'false');
   });
 
-  it('renders a compact header control without check-in prose', () => {
+  it('offers only the Chat and Workday modes (check-in / monitor retired)', () => {
+    render(<StrategicSessionControl currentMode="chat" onModeChange={vi.fn()} />);
+
+    const modeGroup = screen.getByRole('group', { name: /strategic interaction mode/i });
+    const modeButtons = within(modeGroup).getAllByRole('button');
+    expect(modeButtons).toHaveLength(2);
+    expect(within(modeGroup).getByRole('button', { name: /switch strategic mode to chat/i })).toBeInTheDocument();
+    expect(within(modeGroup).getByRole('button', { name: /switch strategic mode to workday/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /switch strategic mode to check-in/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /switch strategic mode to monitor/i })).toBeNull();
+  });
+
+  it('renders a compact header control without a check-in button', () => {
     const { container } = render(
       <StrategicSessionControl
         currentMode="continuous"
         density="compact"
         showMonitoringControls={false}
         onModeChange={vi.fn()}
-        onCheckIn={vi.fn()}
-        sinceLastCheckIn={{
-          version: 1,
-          available: true,
-          since: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-          until: new Date().toISOString(),
-          messages: { total: 1 },
-          tasks: { created: 0, updated: 1 },
-          alerts: { raised: 0 },
-          strategic: { cycles_completed: 0 },
-        }}
       />,
     );
 
     expect(screen.getByRole('button', { name: /switch strategic mode to workday/i })).toHaveAttribute('aria-pressed', 'true');
-    expect(screen.getByRole('button', { name: /mark strategic session checked/i })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /mark strategic session checked/i })).toBeNull();
     expect(container.querySelector('[data-testid="strategic-session-control"]')?.textContent).not.toContain('Mark checked');
     expect(screen.queryByRole('button', { name: /open devices/i })).toBeNull();
   });
@@ -43,22 +44,21 @@ describe('StrategicSessionControl', () => {
     const onModeChange = vi.fn();
     const user = userEvent.setup();
 
-    render(<StrategicSessionControl currentMode="chat" onModeChange={onModeChange} />);
+    const { rerender } = render(<StrategicSessionControl currentMode="chat" onModeChange={onModeChange} />);
 
-    await user.click(screen.getByRole('button', { name: /switch strategic mode to check-in/i }));
-    await user.click(screen.getByRole('button', { name: /switch strategic mode to monitor/i }));
     await user.click(screen.getByRole('button', { name: /switch strategic mode to workday/i }));
+    expect(onModeChange).toHaveBeenNthCalledWith(1, 'continuous');
 
-    expect(onModeChange).toHaveBeenNthCalledWith(1, 'check_in');
-    expect(onModeChange).toHaveBeenNthCalledWith(2, 'monitor');
-    expect(onModeChange).toHaveBeenNthCalledWith(3, 'continuous');
+    rerender(<StrategicSessionControl currentMode="continuous" onModeChange={onModeChange} />);
+    await user.click(screen.getByRole('button', { name: /switch strategic mode to chat/i }));
+    expect(onModeChange).toHaveBeenNthCalledWith(2, 'chat');
   });
 
   it('disables mode changes while saving', async () => {
     const onModeChange = vi.fn();
     const user = userEvent.setup();
 
-    render(<StrategicSessionControl currentMode="monitor" saving onModeChange={onModeChange} />);
+    render(<StrategicSessionControl currentMode="continuous" saving onModeChange={onModeChange} />);
 
     const modeGroup = screen.getByRole('group', { name: /strategic interaction mode/i });
     for (const button of within(modeGroup).getAllByRole('button')) {
@@ -68,60 +68,6 @@ describe('StrategicSessionControl', () => {
 
     await user.click(screen.getByRole('button', { name: /switch strategic mode to chat/i }));
     expect(onModeChange).not.toHaveBeenCalled();
-  });
-
-  it('renders the durable check-in action without confusing it with mode selection', async () => {
-    const onCheckIn = vi.fn();
-    const user = userEvent.setup();
-    const checkedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    render(
-      <StrategicSessionControl
-        currentMode="check_in"
-        lastCheckIn={{ message_id: 'msg-check', created_at: checkedAt, kind: 'manual' }}
-        sinceLastCheckIn={{
-          version: 1,
-          available: true,
-          since: checkedAt,
-          until: new Date().toISOString(),
-          messages: { total: 2 },
-          tasks: { created: 1, updated: 4 },
-          alerts: { raised: 1 },
-          strategic: { cycles_completed: 0 },
-        }}
-        onModeChange={vi.fn()}
-        onCheckIn={onCheckIn}
-      />,
-    );
-
-    expect(screen.getByRole('button', { name: /switch strategic mode to check-in/i })).toHaveAttribute('aria-pressed', 'true');
-    const checkIn = screen.getByRole('button', { name: /mark strategic session checked/i });
-    expect(checkIn).toHaveTextContent('Mark checked');
-    expect(checkIn).toHaveTextContent('7');
-
-    await user.click(checkIn);
-    expect(onCheckIn).toHaveBeenCalledTimes(1);
-  });
-
-  it('shows first-run and saving states for the durable check-in action', async () => {
-    const onCheckIn = vi.fn();
-    const user = userEvent.setup();
-
-    render(
-      <StrategicSessionControl
-        currentMode="chat"
-        sinceLastCheckIn={{ version: 1, available: false, reason: 'no_prior_check_in' }}
-        checkingIn
-        onModeChange={vi.fn()}
-        onCheckIn={onCheckIn}
-      />,
-    );
-
-    const checkIn = screen.getByRole('button', { name: /mark strategic session checked: never checked/i });
-    expect(checkIn).toBeDisabled();
-
-    await user.click(checkIn);
-    expect(onCheckIn).not.toHaveBeenCalled();
   });
 
   it('renders a local runner pill that opens devices', async () => {
@@ -348,7 +294,7 @@ describe('StrategicSessionControl', () => {
   it('does not describe an empty account set as ready', () => {
     render(
       <StrategicSessionControl
-        currentMode="monitor"
+        currentMode="continuous"
         accountSpend={{
           totalAccounts: 0,
           availableAccounts: 0,
@@ -373,7 +319,7 @@ describe('StrategicSessionControl', () => {
 
     render(
       <StrategicSessionControl
-        currentMode="check_in"
+        currentMode="chat"
         runtimeWorkStatus={{ status: 'running', runningCount: 2, queuedCount: 1 }}
         onModeChange={vi.fn()}
         onOpenCompute={onOpenCompute}
@@ -393,7 +339,7 @@ describe('StrategicSessionControl', () => {
 
     render(
       <StrategicSessionControl
-        currentMode="monitor"
+        currentMode="continuous"
         runtimeWorkStatus={{
           status: 'running',
           compute_jobs: { counts: { active: 0 } },
@@ -463,7 +409,7 @@ describe('StrategicSessionControl', () => {
   it('does not make idle runtime work open compute', () => {
     render(
       <StrategicSessionControl
-        currentMode="monitor"
+        currentMode="continuous"
         runtimeWorkStatus={{ status: 'idle' }}
         onModeChange={vi.fn()}
         onOpenCompute={vi.fn()}
@@ -474,7 +420,24 @@ describe('StrategicSessionControl', () => {
     expect(screen.getByLabelText(/runtime work idle/i)).toBeInTheDocument();
   });
 
-  it('shows a dark resident-session chip when the feature is off', () => {
+  it('shows an off resident-session chip when the feature is off', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="off"
+        sessionReason="sessions_disabled"
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: sessions off/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: /stop resident strategic session/i })).toBeNull();
+  });
+
+  it('still renders the legacy dark state as sessions off', () => {
     render(
       <StrategicSessionControl
         currentMode="continuous"
@@ -487,8 +450,27 @@ describe('StrategicSessionControl', () => {
     expect(
       screen.getByRole('status', { name: /resident strategic session: sessions off/i }),
     ).toBeInTheDocument();
+  });
+
+  it('shows a starting resident session with Stop and no Start', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="starting"
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    expect(
+      screen.getByRole('status', { name: /resident strategic session: starting/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/agent not yet streaming/i)).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: /stop resident strategic session/i }),
+    ).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
-    expect(screen.queryByRole('button', { name: /stop resident strategic session/i })).toBeNull();
   });
 
   it('surfaces a no-runner reason with a Start fallback in Workday mode', () => {
@@ -506,6 +488,42 @@ describe('StrategicSessionControl', () => {
     expect(
       screen.getByRole('button', { name: /start resident strategic session/i }),
     ).toBeInTheDocument();
+  });
+
+  it('offers an Add runner fix-it link for blocked:no_runner when Devices is wired', async () => {
+    const onOpenDevices = vi.fn();
+    const user = userEvent.setup();
+
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="blocked"
+        sessionReason="no_runner"
+        showMonitoringControls={false}
+        onModeChange={vi.fn()}
+        onOpenDevices={onOpenDevices}
+      />,
+    );
+
+    const addRunner = screen.getByRole('button', { name: /add a local runner: open devices/i });
+    expect(addRunner).toHaveTextContent('Add runner');
+
+    await user.click(addRunner);
+    expect(onOpenDevices).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not offer an Add runner link when Devices is not wired', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="blocked"
+        sessionReason="no_runner"
+        showMonitoringControls={false}
+        onModeChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /add a local runner/i })).toBeNull();
   });
 
   it('surfaces a start_failed reason as an error state', () => {

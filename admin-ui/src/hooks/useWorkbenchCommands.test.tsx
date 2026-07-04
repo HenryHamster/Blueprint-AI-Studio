@@ -234,8 +234,6 @@ describe('useWorkbenchCommands', () => {
 
     expect(captured.filter(command => command.id.startsWith('strategic.mode.')).map(command => command.id)).toEqual([
       'strategic.mode.chat',
-      'strategic.mode.check_in',
-      'strategic.mode.monitor',
       'strategic.mode.continuous',
     ]);
     const currentModeCommand = captured.find(command => command.id === 'strategic.mode.continuous');
@@ -243,9 +241,9 @@ describe('useWorkbenchCommands', () => {
     expect(currentModeCommand?.disabled).toBe(true);
     currentModeCommand?.run();
 
-    captured.find(command => command.id === 'strategic.mode.monitor')?.run();
+    captured.find(command => command.id === 'strategic.mode.chat')?.run();
 
-    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('chat');
     expect(switchStrategicInteractionMode).toHaveBeenCalledTimes(1);
     expect(handleTabChange).not.toHaveBeenCalledWith('chat');
     expect(setCommandPaletteOpen).toHaveBeenCalledWith(false);
@@ -465,19 +463,19 @@ describe('useWorkbenchCommands', () => {
     const switchStrategicInteractionMode = vi.fn<(mode: StrategicInteractionMode) => void>();
     const refreshWorkbench = vi.fn();
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
-    apiFetchMock.mockResolvedValue(commandExecutionResponse('session.mode.monitor', 'Monitor mode'));
+    apiFetchMock.mockResolvedValue(commandExecutionResponse('session.mode.continuous', 'Workday mode'));
     const commands: StrategicWorkSessionCommand[] = [
       {
-        id: 'session.mode.monitor',
-        label: 'Monitor mode',
+        id: 'session.mode.continuous',
+        label: 'Workday mode',
         group: 'mode',
         priority: 'normal',
         enabled: true,
-        target: { surface: 'messages', action: 'set_monitor_mode' },
+        target: { surface: 'messages', action: 'set_continuous_mode' },
         mutation: {
           method: 'PATCH',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: { workbench: { interaction_mode: 'monitor' } },
+          body: { workbench: { interaction_mode: 'continuous' } },
         },
       },
     ];
@@ -489,16 +487,16 @@ describe('useWorkbenchCommands', () => {
       setCommandPaletteOpen,
     });
 
-    const command = captured.find(item => item.id === 'session.mode.monitor');
+    const command = captured.find(item => item.id === 'session.mode.continuous');
     expect(command).toMatchObject({ detail: 'Set session mode', disabled: false });
 
     command?.run();
 
     expect(switchStrategicInteractionMode).not.toHaveBeenCalled();
-    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session/commands/session.mode.monitor/execute', {
+    expect(apiFetchMock).toHaveBeenCalledWith('/api/admin/projects/project-1/strategic-session/commands/session.mode.continuous/execute', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.mode\.monitor:/),
+      body: expect.stringMatching(/"idempotency_key":"work-session-command:session\.mode\.continuous:/),
     });
     await vi.waitFor(() => {
       expect(refreshWorkbench).toHaveBeenCalledTimes(1);
@@ -759,16 +757,16 @@ describe('useWorkbenchCommands', () => {
     }));
     const commands: StrategicWorkSessionCommand[] = [
       {
-        id: 'session.mode.monitor',
-        label: 'Monitor mode',
+        id: 'session.mode.continuous',
+        label: 'Workday mode',
         group: 'mode',
         priority: 'normal',
         enabled: true,
-        target: { surface: 'messages', action: 'set_monitor_mode' },
+        target: { surface: 'messages', action: 'set_continuous_mode' },
         mutation: {
           method: 'POST',
           path: '/api/admin/projects/project-1/strategic-session',
-          body: { workbench: { interaction_mode: 'monitor' } },
+          body: { workbench: { interaction_mode: 'continuous' } },
         },
       },
     ];
@@ -780,11 +778,11 @@ describe('useWorkbenchCommands', () => {
     });
 
     act(() => {
-      captured.find(item => item.id === 'session.mode.monitor')?.run();
+      captured.find(item => item.id === 'session.mode.continuous')?.run();
     });
 
     await vi.waitFor(() => {
-      expect(captured.find(item => item.id === 'session.mode.monitor')).toMatchObject({
+      expect(captured.find(item => item.id === 'session.mode.continuous')).toMatchObject({
         detail: 'Running command...',
         disabled: true,
       });
@@ -793,7 +791,7 @@ describe('useWorkbenchCommands', () => {
     resolveCommand(jsonResponse({ detail: 'Command is disabled' }, 409));
 
     await vi.waitFor(() => {
-      expect(captured.find(item => item.id === 'session.mode.monitor')).toMatchObject({
+      expect(captured.find(item => item.id === 'session.mode.continuous')).toMatchObject({
         detail: 'Failed: Command is disabled',
         disabled: false,
       });
@@ -860,15 +858,15 @@ describe('useWorkbenchCommands', () => {
     const setCommandPaletteOpen = vi.fn<(open: boolean) => void>();
     const commands: StrategicWorkSessionCommand[] = [
       {
-        id: 'session.mode.monitor',
-        label: 'Monitor mode',
+        id: 'session.mode.continuous',
+        label: 'Workday mode',
         group: 'mode',
         priority: 'normal',
         enabled: true,
-        target: { surface: 'messages', action: 'set_monitor_mode' },
+        target: { surface: 'messages', action: 'set_continuous_mode' },
         mutation: {
           ...mutation,
-          body: { workbench: { interaction_mode: 'monitor' } },
+          body: { workbench: { interaction_mode: 'continuous' } },
         },
       },
     ];
@@ -880,11 +878,11 @@ describe('useWorkbenchCommands', () => {
       setCommandPaletteOpen,
     });
 
-    captured.find(item => item.id === 'session.mode.monitor')?.run();
+    captured.find(item => item.id === 'session.mode.continuous')?.run();
 
     expect(apiFetchMock).not.toHaveBeenCalled();
     expect(refreshWorkbench).not.toHaveBeenCalled();
-    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('monitor');
+    expect(switchStrategicInteractionMode).toHaveBeenCalledWith('continuous');
   });
 
   test('does not execute unsafe runner preference mutation descriptors', () => {
@@ -1047,12 +1045,12 @@ describe('useWorkbenchCommands', () => {
         target: { surface: 'messages', action: 'set_chat_mode' },
       },
       {
-        id: 'session.mode.monitor',
-        label: 'Monitor mode',
+        id: 'session.mode.continuous',
+        label: 'Workday mode',
         group: 'mode',
         priority: 'normal',
         enabled: false,
-        target: { surface: 'messages', action: 'set_monitor_mode' },
+        target: { surface: 'messages', action: 'set_continuous_mode' },
       },
       {
         id: 'session.check_in',
@@ -1077,7 +1075,7 @@ describe('useWorkbenchCommands', () => {
     expect(currentMode).toMatchObject({ detail: 'Current mode', disabled: true });
     currentMode?.run();
 
-    const disabledMode = captured.find(command => command.id === 'session.mode.monitor');
+    const disabledMode = captured.find(command => command.id === 'session.mode.continuous');
     expect(disabledMode).toMatchObject({ detail: 'Unavailable', disabled: true });
     disabledMode?.run();
 

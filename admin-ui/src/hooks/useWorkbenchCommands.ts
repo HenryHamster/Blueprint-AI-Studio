@@ -34,7 +34,7 @@ type StrategicContextCanvas = NonNullable<StrategicContextPackageDescriptor['can
 const WORK_SESSION_ACTION_COMMAND_LIMIT = 4;
 const MESSAGE_COMMAND_LIMIT = 6;
 const TASK_FOCUS_COMMAND_LIMIT = 6;
-const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'check_in', 'monitor', 'continuous'];
+const STRATEGIC_INTERACTION_MODES: readonly StrategicInteractionMode[] = ['chat', 'continuous'];
 const WORK_SESSION_MUTATION_METHODS = new Set(['PATCH', 'POST', 'PUT']);
 
 type WorkSessionCommandRunStatus = {
@@ -1151,20 +1151,6 @@ export function useWorkbenchCommands({
         label: 'Switch Strategic to Chat',
         detail: 'Conversation-first steering',
         keywords: ['chat', 'conversation'],
-      },
-      {
-        id: 'strategic.mode.check_in',
-        mode: 'check_in',
-        label: 'Switch Strategic to Check-in',
-        detail: 'Ask for a concise status pass',
-        keywords: ['check in', 'check-in', 'status'],
-      },
-      {
-        id: 'strategic.mode.monitor',
-        mode: 'monitor',
-        label: 'Switch Strategic to Monitor',
-        detail: 'Watch work without waking Strategic',
-        keywords: ['monitor', 'passive'],
       },
       {
         id: 'strategic.mode.continuous',

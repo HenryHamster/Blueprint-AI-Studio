@@ -457,14 +457,15 @@ export default function App() {
   const residentStrategicSessionAvailable =
     (selectedStrategicReadModel as { resident_session_available?: boolean } | null)?.resident_session_available === true;
   // Legible Workday session state + reason (from `resident_session_availability`):
-  // drives the status chip (dark / ready / active / blocked / error) so entering
-  // Workday is enough to go live. Falls back to a flag-derived state for older payloads.
+  // drives the status chip (off / ready / starting / active / blocked / error) so
+  // entering Workday is enough to go live. Falls back to a flag-derived state for
+  // older payloads.
   const residentStrategicSessionAvailability =
     (selectedStrategicReadModel as {
       resident_session_availability?: { available?: boolean; state?: string | null; reason?: string | null } | null;
     } | null)?.resident_session_availability ?? null;
   const strategicSessionState = residentStrategicSessionAvailability?.state
-    ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'dark');
+    ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'off');
   const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
   const chatComposerContextDescriptor = useMemo(
@@ -1392,7 +1393,6 @@ export default function App() {
         savingSession={savingStrategicWorkbench}
         savingSessionRefs={savingStrategicWorkbench}
         accountSpend={strategicAccountSpend}
-        checkingIn={checkingInStrategicSession}
         sessionActive={strategicSessionActive}
         sessionStatus={strategicSessionStatus}
         sessionState={strategicSessionState}
@@ -1404,7 +1404,6 @@ export default function App() {
         onOpenTarget={openStrategicContextWorkspaceTarget}
         onOpenMessageTarget={strategicMessageTarget.open}
         onModeChange={setStrategicInteractionMode}
-        onCheckIn={handleStrategicCheckIn}
         onOpenAccounts={openRuntimeAccounts}
         onOpenSpend={openRuntimeAnalytics}
         onUpdateSessionRefs={updateStrategicSessionRefs}
@@ -1459,10 +1458,7 @@ export default function App() {
                 saving={savingStrategicWorkbench}
                 localRunner={strategicReadModel.data?.runtime?.local_runner ?? null}
                 runtimeWork={strategicReadModel.data?.runtime?.work ?? null}
-                lastCheckIn={strategicReadModel.data?.work_session?.last_check_in ?? null}
-                sinceLastCheckIn={strategicReadModel.data?.work_session?.since_last_check_in ?? null}
                 accountSpend={strategicAccountSpend}
-                checkingIn={checkingInStrategicSession}
                 sessionActive={strategicSessionActive}
                 sessionStatus={strategicSessionStatus}
                 sessionState={strategicSessionState}
@@ -1471,7 +1467,6 @@ export default function App() {
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}
                 onModeChange={setStrategicInteractionMode}
-                onCheckIn={handleStrategicCheckIn}
                 onOpenDevices={() => {
                   setRuntimeSection('devices');
                   handleTabChange('runtime');

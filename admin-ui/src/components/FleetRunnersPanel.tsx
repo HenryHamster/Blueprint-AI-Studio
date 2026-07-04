@@ -241,15 +241,31 @@ function readinessClasses(tone: ReadinessTone): string {
   return 'border-neutral-700 bg-neutral-950/40 text-neutral-400';
 }
 
+/** Compact "ready for Workday / not ready (reason)" statement for a runner row.
+ *  Workday (the resident strategic agent) runs on strategic-capable runners; for
+ *  compute-only runners the identical readiness applies to general task dispatch. */
+function workdayReadinessLine(
+  readiness: RunnerReadiness,
+  strategicRunner: boolean,
+): { text: string; ready: boolean } {
+  const target = strategicRunner ? 'Workday' : 'tasks';
+  if (readiness.ready) return { text: `Ready for ${target}`, ready: true };
+  return { text: `Not ready for ${target} — ${readiness.label}`, ready: false };
+}
+
 interface TokenDialogProps {
   runnerId: string;
   token: string;
   preset?: RunnerSetupPreset;
   tokenExpiresAt?: string | null;
+  /** True once the just-enrolled runner has heartbeated and shows connected. */
+  connected: boolean;
+  /** Hostname the connected runner reported, shown in the success line. */
+  connectedHostname?: string | null;
   onDismiss: () => void;
 }
 
-function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, onDismiss }: TokenDialogProps) {
+function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, connected, connectedHostname, onDismiss }: TokenDialogProps) {
   const [copied, setCopied] = useState<Record<CopyTarget, boolean>>({
     token: false,
     windowsPowerShell: false,
@@ -260,7 +276,7 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, onDi
   // fall back to window.location.origin only for same-origin dev where API_BASE_URL is empty.
   const origin =
     API_BASE_URL || (typeof window !== 'undefined' ? window.location.origin : 'https://your-orchestrator');
-  const snippets = runnerSetupSnippets(token, origin, preset);
+  const snippets = runnerSetupSnippets(token, origin);
   const setupSnippetItems: Array<{ id: keyof RunnerSetupSnippetCommands; label: string; command: string }> = [
     { id: 'windowsPowerShell', label: 'Windows PowerShell', command: snippets.windowsPowerShell },
     { id: 'macosLinux', label: 'macOS/Linux', command: snippets.macosLinux },
@@ -327,7 +343,30 @@ function TokenDialog({ runnerId, token, preset = 'default', tokenExpiresAt, onDi
               </div>
             ))}
           </div>
-          <div className="text-ui-md text-neutral-500">Next: start the runner; first heartbeat marks it live.</div>
+          <div className="text-ui-md text-neutral-500">Run this from the repo root; the first heartbeat connects it below.</div>
+        </div>
+
+        <div
+          className={`mb-4 flex items-center gap-2 rounded-md border px-3 py-2 text-xs ${
+            connected
+              ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+              : 'border-amber-500/30 bg-amber-500/10 text-amber-300'
+          }`}
+          data-testid="runner-connection-status"
+        >
+          {connected ? (
+            <>
+              <Check className="w-4 h-4 shrink-0 text-emerald-400" />
+              <span className="font-medium">
+                Connected on this project{connectedHostname ? ` — ${connectedHostname}` : ''}
+              </span>
+            </>
+          ) : (
+            <>
+              <span className="h-2.5 w-2.5 shrink-0 rounded-full bg-amber-400 animate-pulse" />
+              <span>Waiting for your runner to connect…</span>
+            </>
+          )}
         </div>
 
         <div className="text-xs text-neutral-500 mb-4">Runner ID: {runnerId}</div>
@@ -388,6 +427,21 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     const interval = setInterval(load, 30000);
     return () => clearInterval(interval);
   }, [load]);
+
+  // While the enroll dialog is open, resolve the just-enrolled runner from the
+  // list so the dialog can show live "waiting… / connected" feedback. Poll faster
+  // than the 30s baseline until it connects, closing the enrollment loop the
+  // operator was previously left guessing at.
+  const enrolledRunner = pendingToken
+    ? runners.find(r => r.id === pendingToken.runnerId)
+    : undefined;
+  const enrolledConnected = enrolledRunner ? isRunnerLive(enrolledRunner) : false;
+
+  useEffect(() => {
+    if (!pendingToken || enrolledConnected) return;
+    const interval = setInterval(load, 3000);
+    return () => clearInterval(interval);
+  }, [pendingToken, enrolledConnected, load]);
 
   const handleEnroll = async (preset: RunnerSetupPreset = 'default') => {
     setEnrollingPreset(preset);
@@ -593,6 +647,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
             const slots = runnerLive ? availableSlots(runner) : null;
             const strategicRunner = isStrategicRunner(runner);
             const readiness = runnerReadiness(runner, runnerLive, slots);
+            const workday = workdayReadinessLine(readiness, strategicRunner);
             const telemetry = telemetrySummary(runner);
             return (
               <div
@@ -607,6 +662,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                 </div>
                 <div className="flex-1 min-w-0">
                   <div className="flex flex-wrap items-center gap-1.5">
+                    <span className={`shrink-0 text-sm leading-none ${livCls}`} aria-hidden="true">●</span>
                     <span className="text-sm font-medium text-neutral-200 truncate">
                       {runner.hostname ?? runner.id.slice(0, 8)}
                     </span>
@@ -638,9 +694,26 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
                     {runner.capabilities.has_gpu && (
                       <span className="rounded border border-purple-500/30 bg-purple-500/10 px-1.5 py-0.5 text-xs text-purple-300">GPU</span>
                     )}
+                    {runner.health?.agent_available !== undefined && (
+                      <span
+                        className={`rounded border px-1.5 py-0.5 text-xs ${
+                          runner.health.agent_available
+                            ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300'
+                            : 'border-red-500/30 bg-red-500/10 text-red-300'
+                        }`}
+                      >
+                        {runner.health.agent_available ? 'agent ✓' : 'agent ✗'}
+                      </span>
+                    )}
                     <span className={`rounded border px-1.5 py-0.5 text-xs font-medium ${readinessClasses(readiness.tone)}`}>
                       {readiness.label}
                     </span>
+                  </div>
+                  <div
+                    className={`mt-1 text-xs font-medium ${workday.ready ? 'text-emerald-300' : 'text-amber-300'}`}
+                    data-testid="fleet-runner-workday-readiness"
+                  >
+                    {workday.ready ? '✓ ' : '⚠ '}{workday.text}
                   </div>
                   <div className="mt-1 text-xs text-neutral-500">{capsSummary(runner.capabilities)}</div>
                   {telemetry && (
@@ -677,6 +750,8 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           token={pendingToken.token}
           preset={pendingToken.preset}
           tokenExpiresAt={pendingToken.tokenExpiresAt}
+          connected={enrolledConnected}
+          connectedHostname={enrolledRunner?.hostname}
           onDismiss={() => setPendingToken(null)}
         />
       )}
