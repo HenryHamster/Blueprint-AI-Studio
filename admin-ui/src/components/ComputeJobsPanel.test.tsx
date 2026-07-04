@@ -271,15 +271,17 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('kill button calls killComputeJob and shows killed reason', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     const active = makeJob();
     fetchComputeJobs.mockResolvedValue(wrapJobs([active]));
     killComputeJob.mockResolvedValue(
       makeJob({ status: 'CANCELLED', outcome: 'CANCELLED', terminal_reason: 'killed by operator (a@b.com)', final_cost_usd: 1.0 }),
     );
-    const { findByText, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId, queryByText } = render(<ComputeJobsPanel projectId="proj-1" />);
     const killBtn = await findByText('Kill');
     await act(async () => { killBtn.click(); });
+    // ConfirmDialog should appear; confirm it
+    const confirmBtn = await findByTestId('confirm-dialog-confirm');
+    await act(async () => { confirmBtn.click(); });
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('Killed by operator');
     expect(queryByText('Kill')).toBeNull();
@@ -576,12 +578,13 @@ describe('ComputeJobsPanel render + kill', () => {
   });
 
   test('kill failure surfaces the backend explanation, not a generic message', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     fetchComputeJobs.mockResolvedValue(wrapJobs([makeJob()]));
     killComputeJob.mockRejectedValue(new Error('compute job already terminal: cannot kill'));
-    const { findByText } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const { findByText, findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
     const killBtn = await findByText('Kill');
     await act(async () => { killBtn.click(); });
+    const confirmBtn = await findByTestId('confirm-dialog-confirm');
+    await act(async () => { confirmBtn.click(); });
     await waitFor(() => expect(killComputeJob).toHaveBeenCalledWith('job-1'));
     await findByText('compute job already terminal: cannot kill');
   });

@@ -4,6 +4,7 @@ import { analyzeComputeJob, askComputeJob, fetchComputeJobsPaged, fetchComputeJo
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
+import { ConfirmDialog } from './ConfirmDialog';
 import { ReleaseEvidenceChip } from './ReleaseEvidence';
 import { asLiveReleaseEvidence } from './ReleaseEvidence.utils';
 import { AcceptanceGradeBadge } from './AcceptanceGradeBadge';
@@ -714,6 +715,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [finishedWindowMinutes, setFinishedWindowMinutes] = useState(360);
   const [allTerminal, setAllTerminal] = useState(false);
   const [killingId, setKillingId] = useState<string | null>(null);
+  const [pendingKill, setPendingKill] = useState<ComputeJob | null>(null);
   const [analyzingId, setAnalyzingId] = useState<string | null>(null);
   const [rerunState, setRerunState] = useState<{
     jobId: string;
@@ -851,10 +853,15 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   }, [hasActive]);
 
   const handleKill = useCallback(
+    (job: ComputeJob) => {
+      setPendingKill(job);
+    },
+    [],
+  );
+
+  const executeKill = useCallback(
     async (job: ComputeJob) => {
-      if (!window.confirm(`Kill compute job for "${job.task_title ?? job.id}"? This stops the running VM immediately.`)) {
-        return;
-      }
+      setPendingKill(null);
       setKillingId(job.id);
       try {
         const updated = await killComputeJob(job.id);
@@ -2164,6 +2171,16 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
             Load more
           </button>
         </div>
+      )}
+
+      {pendingKill && (
+        <ConfirmDialog
+          title="Kill compute job"
+          message={`Kill compute job for "${pendingKill.task_title ?? pendingKill.id}"? This stops the running VM immediately.`}
+          confirmLabel="Kill job"
+          onConfirm={() => void executeKill(pendingKill)}
+          onCancel={() => setPendingKill(null)}
+        />
       )}
     </div>
   );

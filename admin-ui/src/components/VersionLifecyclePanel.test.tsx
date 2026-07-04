@@ -13,9 +13,6 @@ vi.mock('../firebase', () => ({
 }));
 vi.mock('../api');
 
-// Mock window.confirm for cut version tests
-const mockConfirm = vi.spyOn(window, 'confirm');
-
 function makeCurrentVersion(overrides: Partial<api.CurrentVersion> = {}): api.CurrentVersion {
   return {
     version_number: 1,
@@ -90,7 +87,6 @@ describe('VersionLifecyclePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockRefresh.mockClear();
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
   });
 
@@ -350,9 +346,10 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.');
-      });
+      // ConfirmDialog appears with the fleet-wide warning
+      expect(screen.getByText('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(patchAdminSettingsMock).toHaveBeenCalledWith({ promotion_enabled: true });
       });
@@ -375,6 +372,7 @@ describe('VersionLifecyclePanel', () => {
       );
 
       fireEvent.click(screen.getByRole('button', { name: /Enable/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(screen.getByText('Request failed')).toBeInTheDocument();
@@ -408,6 +406,9 @@ describe('VersionLifecyclePanel', () => {
 
       expect(screen.getByText(/fleet default/)).toBeInTheDocument();
       fireEvent.click(screen.getByRole('button', { name: /^Arm$/ }));
+
+      // ConfirmDialog appears for project-level arming
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(setProjectPromotionEnabledMock).toHaveBeenCalledWith('proj-1', true);
@@ -467,7 +468,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -481,16 +481,15 @@ describe('VersionLifecyclePanel', () => {
       const cutButton = screen.getByRole('button', { name: /Cut\/Abandon/ });
       fireEvent.click(cutButton);
 
-      // Should show the input and buttons
+      // Should show the inline input and Cut button
       const reasonInput = screen.getByPlaceholderText('Optional reason for cut...');
       expect(reasonInput).toBeInTheDocument();
 
-      const cutButtonInForm = screen.getByRole('button', { name: /^Cut$/ });
-      fireEvent.click(cutButtonInForm);
+      fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
-      });
+      // ConfirmDialog appears with the abandon message
+      expect(screen.getByText('Abandon v1 and open a fresh version?')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(cutVersionMock).toHaveBeenCalledWith('proj-1', undefined, expect.any(String));
@@ -506,7 +505,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -523,15 +521,15 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.change(reasonInput, { target: { value: 'stalled in build' } });
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(cutVersionMock).toHaveBeenCalledWith('proj-1', 'stalled in build', expect.any(String));
       });
     });
 
-    it('cancels cut version action when confirm is rejected', async () => {
+    it('cancels cut version action when cancel is clicked in the dialog', async () => {
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(false);
 
       render(
         <VersionLifecyclePanel
@@ -545,9 +543,9 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
-      await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith('Abandon v1 and open a fresh version?');
-      });
+      // ConfirmDialog appears; click the dialog's Cancel button
+      expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
 
       expect(vi.mocked(api.cutVersion)).not.toHaveBeenCalled();
     });
@@ -559,7 +557,6 @@ describe('VersionLifecyclePanel', () => {
       });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -572,6 +569,7 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
 
       await waitFor(() => {
         expect(screen.getByText('Cut v5 → opened v6')).toBeInTheDocument();
@@ -588,7 +586,6 @@ describe('VersionLifecyclePanel', () => {
         });
       vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
       vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({ verdicts: [], total: 0 });
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -601,13 +598,13 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(1));
 
-      // Retry after the failure (the cut UI stays open on error). The waitFor
-      // above resolves as soon as the mock is INVOKED — the rejection may not
-      // have settled yet, so the button can still wear its in-flight
-      // "Cutting v…" label; findByRole waits for it to revert to "Cut".
+      // Retry after the failure (the cut UI stays open on error, dialog is closed).
+      // findByRole waits for the "Cut" button to re-appear after loading clears.
       fireEvent.click(await screen.findByRole('button', { name: /^Cut$/ }));
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => expect(cutVersionMock).toHaveBeenCalledTimes(2));
 
       // Both calls carried the SAME generated key (a lost-response retry must
@@ -844,13 +841,11 @@ describe('VersionLifecyclePanel', () => {
       expect(consequences).not.toHaveTextContent('No tasks are currently in flight.');
     });
 
-    it('folds consequences into the confirm message', async () => {
-      const cutVersionMock = vi.fn().mockResolvedValue({
+    it('folds consequences into the confirm dialog message', async () => {
+      vi.mocked(api.cutVersion).mockResolvedValue({
         abandoned_version: { version_number: 6, status: 'abandoned' },
         new_version: { version_number: 7, phase: 'build', goal: null, opened_at: '2026-01-02T00:00:00Z' },
       });
-      vi.mocked(api.cutVersion).mockImplementation(cutVersionMock);
-      mockConfirm.mockReturnValue(true);
 
       render(
         <VersionLifecyclePanel
@@ -869,11 +864,12 @@ describe('VersionLifecyclePanel', () => {
       fireEvent.click(screen.getByRole('button', { name: /Cut\/Abandon/ }));
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
+      // ConfirmDialog shows the consequences folded into the message
       await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith(
-          'Abandon v6 and open a fresh version?\n\nThis will: 1 staged direction will start now; 2 in-flight tasks will keep running against the new version.'
-        );
+        expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       });
+      expect(screen.getByText(/1 staged direction will start now/)).toBeInTheDocument();
+      expect(screen.getByText(/2 in-flight tasks will keep running against the new version/)).toBeInTheDocument();
     });
 
     it('surfaces promotion-in-flight context before confirming a cut', async () => {
@@ -914,11 +910,12 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByRole('button', { name: /^Cut$/ }));
 
+      // ConfirmDialog shows the promotion-in-flight context in the message
       await waitFor(() => {
-        expect(window.confirm).toHaveBeenCalledWith(
-          expect.stringContaining('promotion PR #7357 is open and auto-merging (in flight ~2h 5m (auto-timeout cap 4h))')
-        );
+        expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
       });
+      expect(screen.getByText(/promotion PR #7357 is open and auto-merging \(in flight ~2h 5m \(auto-timeout cap 4h\)\)/)).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
       await waitFor(() => {
         expect(screen.getByText(/wait for it to land or cancel it before cutting/)).toBeInTheDocument();
       });
@@ -2882,6 +2879,9 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByTestId('clear-deploy-failed'));
 
+      // ConfirmDialog appears — click confirm to proceed with the verify path
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(clearMock).toHaveBeenCalledWith('proj-1');
       });
@@ -2891,7 +2891,7 @@ describe('VersionLifecyclePanel', () => {
       expect(mockRefresh).toHaveBeenCalled();
     });
 
-    it('prompts for an attestation reason and force-clears when verify is refused', async () => {
+    it('prompts for an attestation reason via dialog and force-clears when verify is refused', async () => {
       const clearMock = vi
         .fn()
         .mockRejectedValueOnce(new Error('deploy could not be independently verified live — re-submit with force=true and a reason'))
@@ -2906,7 +2906,6 @@ describe('VersionLifecyclePanel', () => {
           attestation_reason: 'verified live by hand',
         });
       vi.mocked(api.clearDeployFailed).mockImplementation(clearMock);
-      const promptSpy = vi.spyOn(window, 'prompt').mockReturnValue('verified live by hand');
 
       render(
         <VersionLifecyclePanel
@@ -2920,16 +2919,24 @@ describe('VersionLifecyclePanel', () => {
 
       fireEvent.click(screen.getByTestId('clear-deploy-failed'));
 
+      // First dialog: plain confirm to attempt verify path
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      // First API call fails with force=true required → attestation dialog appears
       await waitFor(() => {
-        expect(promptSpy).toHaveBeenCalled();
+        expect(screen.getByTestId('confirm-dialog-attestation-input')).toBeInTheDocument();
       });
+      fireEvent.change(screen.getByTestId('confirm-dialog-attestation-input'), {
+        target: { value: 'verified live by hand' },
+      });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
       await waitFor(() => {
         expect(clearMock).toHaveBeenLastCalledWith('proj-1', true, 'verified live by hand');
       });
       await waitFor(() => {
         expect(screen.getByText(/operator-attested/)).toBeInTheDocument();
       });
-      promptSpy.mockRestore();
     });
   });
 

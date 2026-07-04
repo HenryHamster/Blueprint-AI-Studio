@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect, useRef, useMemo } from 'react';
 import { Compass, Cpu, Copy, Check, KeyRound, RefreshCw, Trash2 } from 'lucide-react';
 import { API_BASE_URL, listFleetRunners, registerFleetRunner, revokeFleetRunner, rotateFleetRunnerToken } from '../api';
 import type { FleetRunner, FleetRunnerRegistrationResult } from '../api';
+import { ConfirmDialog } from './ConfirmDialog';
 import { timeAgo, parseTimestamp, formatAbsolute, formatDurationSec } from '../utils/time';
 import {
   formatBytes,
@@ -436,6 +437,7 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
   } | null>(null);
   const [rotating, setRotating] = useState<string | null>(null);
   const [revoking, setRevoking] = useState<string | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ type: 'rotate' | 'revoke'; runner: FleetRunner } | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -497,36 +499,45 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
     }
   };
 
-  const handleRotate = async (runner: FleetRunner) => {
-    if (!window.confirm(`Rotate token for runner ${runner.hostname ?? runner.id}? The current token will stop working immediately.`)) return;
-    setRotating(runner.id);
-    try {
-      const result = await rotateFleetRunnerToken(projectId, runner.id);
-      setPendingToken({
-        runnerId: result.runner_id,
-        token: result.token,
-        mode: 'rotate',
-        preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
-        tokenExpiresAt: tokenExpiryFromRegisterResult(result),
-      });
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRotating(null);
-    }
+  const handleRotate = (runner: FleetRunner) => {
+    setPendingConfirm({ type: 'rotate', runner });
   };
 
-  const handleRevoke = async (runner: FleetRunner) => {
-    if (!window.confirm(`Revoke runner ${runner.hostname ?? runner.id}? It will no longer be able to authenticate.`)) return;
-    setRevoking(runner.id);
-    try {
-      await revokeFleetRunner(projectId, runner.id);
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    } finally {
-      setRevoking(null);
+  const handleRevoke = (runner: FleetRunner) => {
+    setPendingConfirm({ type: 'revoke', runner });
+  };
+
+  const executeConfirmedAction = async () => {
+    if (!pendingConfirm) return;
+    const { type, runner } = pendingConfirm;
+    setPendingConfirm(null);
+    if (type === 'rotate') {
+      setRotating(runner.id);
+      try {
+        const result = await rotateFleetRunnerToken(projectId, runner.id);
+        setPendingToken({
+          runnerId: result.runner_id,
+          token: result.token,
+          mode: 'rotate',
+          preset: runner.capabilities.runner_preset === 'strategic_local' ? 'strategic_local' : 'default',
+          tokenExpiresAt: tokenExpiryFromRegisterResult(result),
+        });
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRotating(null);
+      }
+    } else {
+      setRevoking(runner.id);
+      try {
+        await revokeFleetRunner(projectId, runner.id);
+        await load();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setRevoking(null);
+      }
     }
   };
 
@@ -817,6 +828,18 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false }: Pro
           connected={pendingToken.mode === 'enroll' ? enrolledConnected : false}
           connectedHostname={pendingToken.mode === 'enroll' ? enrolledRunner?.hostname : null}
           onDismiss={() => setPendingToken(null)}
+        />
+      )}
+
+      {pendingConfirm && (
+        <ConfirmDialog
+          title={pendingConfirm.type === 'rotate' ? 'Rotate runner token' : 'Revoke runner'}
+          message={pendingConfirm.type === 'rotate'
+            ? `Rotate token for runner ${pendingConfirm.runner.hostname ?? pendingConfirm.runner.id}? The current token will stop working immediately.`
+            : `Revoke runner ${pendingConfirm.runner.hostname ?? pendingConfirm.runner.id}? It will no longer be able to authenticate.`}
+          confirmLabel={pendingConfirm.type === 'rotate' ? 'Rotate token' : 'Revoke'}
+          onConfirm={() => void executeConfirmedAction()}
+          onCancel={() => setPendingConfirm(null)}
         />
       )}
     </div>

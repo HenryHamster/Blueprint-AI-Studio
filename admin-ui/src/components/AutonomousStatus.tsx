@@ -681,6 +681,7 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
   const [expanded, setExpanded] = useState(false);
   const [toggling, setToggling] = useState<string | null>(null);
   const [resettingBreaker, setResettingBreaker] = useState<string | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   // Bumped on a slow interval so staleness is re-evaluated even when the poll
   // loop has stalled (no fetch -> no re-render of its own).
@@ -807,14 +808,21 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
 
   const resetCircuitBreaker = async (projectId: string) => {
     setResettingBreaker(projectId);
+    setErrors(e => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { [projectId]: _, ...rest } = e;
+      return rest;
+    });
     try {
       const res = await apiFetch(`/api/admin/projects/${projectId}/circuit-breaker/reset`, { method: 'POST' });
-      if (res.ok) {
-        await fetchSummary();
-        await fetchDebug();
+      if (!res.ok) {
+        setErrors(e => ({ ...e, [projectId]: 'Failed to reset circuit breaker' }));
+        return;
       }
+      await fetchSummary();
+      await fetchDebug();
     } catch {
-      // silent
+      setErrors(e => ({ ...e, [projectId]: 'Failed to reset circuit breaker' }));
     } finally {
       setResettingBreaker(null);
     }
@@ -822,17 +830,26 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
 
   const toggleAutonomy = async (projectId: string, enabled: boolean) => {
     setToggling(projectId);
+    setErrors(e => {
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      const { [projectId]: _, ...rest } = e;
+      return rest;
+    });
     try {
       const headers = await authHeaders();
-      await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}/autonomous`, {
+      const res = await fetch(`${API_BASE_URL}/api/admin/projects/${projectId}/autonomous`, {
         method: 'PATCH',
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({ enabled }),
       });
+      if (!res.ok) {
+        setErrors(e => ({ ...e, [projectId]: 'Failed to toggle autonomy' }));
+        return;
+      }
       await fetchSummary();
       onRefreshTasks?.();
     } catch {
-      // silent
+      setErrors(e => ({ ...e, [projectId]: 'Failed to toggle autonomy' }));
     } finally {
       setToggling(null);
     }
@@ -945,6 +962,12 @@ export function AutonomousStatus({ onRefreshTasks, wsRef, pauseReason }: Autonom
                     {p.autonomous_enabled ? 'Enabled' : 'Disabled'}
                   </button>
                 </div>
+                {errors[p.project_id] && (
+                  <div className="mb-2 rounded-md bg-red-500/10 border border-red-500/30 px-2 py-1 flex items-center gap-1.5">
+                    <AlertTriangle className="w-3 h-3 shrink-0 text-red-400" />
+                    <span className="text-ui-sm text-red-300">{errors[p.project_id]}</span>
+                  </div>
+                )}
 
                 <div className="space-y-1.5">
                   {/* Circuit breaker — enhanced with state pill when debug available */}

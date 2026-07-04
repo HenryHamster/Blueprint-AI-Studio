@@ -41,6 +41,7 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
     const fetchDirectionsRef = useRef<() => void>(vi.fn());
     const refreshStrategicReadModelRef = useRef<() => void>(vi.fn());
     const refreshMessagesRef = useRef<() => void>(vi.fn());
+    const fetchAlertsRef = useRef<() => void>(vi.fn());
     const setDeployState = vi.fn();
     const lv = useLogViewer({
       fetchTasksRef,
@@ -48,10 +49,11 @@ function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?:
       fetchDirectionsRef,
       refreshStrategicReadModelRef,
       refreshMessagesRef,
+      fetchAlertsRef,
       selectedProjectId: options.selectedProjectId,
       realtimeWsEnabled: options.realtimeWsEnabled,
     });
-    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef };
+    return { lv, fetchDirectionsRef, refreshStrategicReadModelRef, refreshMessagesRef, fetchAlertsRef };
   });
 }
 
@@ -886,6 +888,67 @@ describe('useLogViewer strategist events', () => {
     expect(fetchDirections).not.toHaveBeenCalled();
     expect(refreshStrategicReadModel).not.toHaveBeenCalled();
     expect(result.current.lv.strategistActive).toBe(false);
+  });
+
+  it('debounces a fetchAlerts call on alert_created event', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => { ws.emit({ event: 'alert_created', data: { alert_id: 'a-1' } }); });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces a fetchAlerts call on alert_dismissed event', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => { ws.emit({ event: 'alert_dismissed', data: { alert_id: 'a-1' } }); });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces a fetchAlerts call on workbench_refetch with runtime surface', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => {
+      ws.emit({
+        event: 'workbench_refetch',
+        data: {
+          schema_version: 1,
+          project_id: 'proj1',
+          resource: 'runner',
+          action: 'updated',
+          refetch: { surfaces: ['runtime'] },
+        },
+      });
+    });
+    expect(fetchAlerts).not.toHaveBeenCalled();
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
+  });
+
+  it('debounces multiple alert events into a single fetchAlerts call', async () => {
+    const { result } = setup({ selectedProjectId: 'proj1' });
+    const ws = await connect(result);
+    const fetchAlerts = result.current.fetchAlertsRef.current as ReturnType<typeof vi.fn>;
+    fetchAlerts.mockClear();
+
+    act(() => {
+      ws.emit({ event: 'alert_created', data: { alert_id: 'a-1' } });
+      ws.emit({ event: 'alert_dismissed', data: { alert_id: 'a-2' } });
+    });
+    act(() => { vi.advanceTimersByTime(500); });
+    expect(fetchAlerts).toHaveBeenCalledTimes(1);
   });
 
   it('test_tracks_strategic_cycle_progress_and_completion_outcome', async () => {

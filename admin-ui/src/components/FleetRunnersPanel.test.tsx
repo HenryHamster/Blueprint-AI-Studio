@@ -330,8 +330,7 @@ describe('FleetRunnersPanel — behavioral', () => {
 
   // ── Rotate runner token ──────────────────────────────────────────────────────
 
-  test('rotating a runner prompts, calls rotateFleetRunnerToken, and shows restart-focused token dialog', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  test('rotating a runner shows ConfirmDialog, calls rotateFleetRunnerToken on confirm, and shows restart-focused token dialog', async () => {
     const clipboardWrite = vi.fn(async () => {});
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
@@ -345,7 +344,16 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalledWith(expect.stringContaining('current token will stop working immediately'));
+    // ConfirmDialog should be visible with rotate-specific text
+    expect(el.textContent).toContain('current token will stop working immediately');
+    expect(rotateFleetRunnerToken).not.toHaveBeenCalled();
+
+    // Confirm the dialog
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    expect(confirmBtn).not.toBeNull();
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
     expect(rotateFleetRunnerToken).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
     expect(el.textContent).toContain('Runner token rotated');
     expect(el.textContent).toContain('tok-rotated-xyz');
@@ -366,27 +374,28 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(clipboardWrite).toHaveBeenLastCalledWith('tok-rotated-xyz');
     await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
     expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining("bash blueprint-runner start --token 'tok-rotated-xyz'"));
-
-    confirmSpy.mockRestore();
   });
 
   test('cancelling the rotate confirm does not call rotateFleetRunnerToken', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     const el = await mount();
 
     const rotateBtn = el.querySelector('button[title="Rotate runner token"]');
     await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalled();
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
+
+    // Cancel the dialog
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    await act(async () => { (cancelBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
     expect(rotateFleetRunnerToken).not.toHaveBeenCalled();
     expect(el.textContent).not.toContain('Runner token rotated');
-
-    confirmSpy.mockRestore();
   });
 
   test('rotate error is displayed in the panel', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(rotateFleetRunnerToken).mockRejectedValueOnce(new Error('Rotate failed'));
     const el = await mount();
 
@@ -394,15 +403,17 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (rotateBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
     expect(el.textContent).toContain('Rotate failed');
     expect(el.textContent).not.toContain('Runner token rotated');
-    vi.restoreAllMocks();
   });
 
   // ── Revoke runner ────────────────────────────────────────────────────────────
 
-  test('revoking a runner prompts window.confirm before calling revokeFleetRunner', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
+  test('revoking a runner shows ConfirmDialog before calling revokeFleetRunner', async () => {
     const el = await mount();
 
     const revokeBtn = el.querySelector('button[title="Revoke runner"]');
@@ -411,28 +422,35 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(revokeFleetRunner).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
+    expect(revokeFleetRunner).not.toHaveBeenCalled();
 
-    confirmSpy.mockRestore();
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(revokeFleetRunner).toHaveBeenCalledWith('proj-test', SAMPLE_RUNNERS[0].id);
   });
 
   test('cancelling the revoke confirm does not call revokeFleetRunner', async () => {
-    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
     const el = await mount();
 
     const revokeBtn = el.querySelector('button[title="Revoke runner"]');
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    expect(confirmSpy).toHaveBeenCalled();
-    expect(revokeFleetRunner).not.toHaveBeenCalled();
+    // ConfirmDialog should be visible
+    expect(el.querySelector('[data-testid="confirm-dialog-confirm"]')).not.toBeNull();
 
-    confirmSpy.mockRestore();
+    const cancelBtn = Array.from(el.querySelectorAll('button')).find(b => b.textContent === 'Cancel');
+    await act(async () => { (cancelBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    expect(revokeFleetRunner).not.toHaveBeenCalled();
   });
 
   test('revoke error is displayed in the panel', async () => {
-    vi.spyOn(window, 'confirm').mockReturnValue(true);
     vi.mocked(revokeFleetRunner).mockRejectedValueOnce(new Error('Network error'));
     const el = await mount();
 
@@ -440,8 +458,11 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (revokeBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
+    const confirmBtn = el.querySelector('[data-testid="confirm-dialog-confirm"]');
+    await act(async () => { (confirmBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
     expect(el.textContent).toContain('Network error');
-    vi.restoreAllMocks();
   });
 
   // ── capsSummary ──────────────────────────────────────────────────────────────

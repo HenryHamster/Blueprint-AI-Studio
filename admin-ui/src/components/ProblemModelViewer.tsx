@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { Pencil, ChevronDown, ChevronRight, AlertCircle, Target, Box, CheckCircle2, Circle, Clock, Flag, GitBranch, Plus } from 'lucide-react';
-import { timeAgo } from '../utils/time';
+import { timeAgo, formatAbsolute } from '../utils/time';
 import { MarkdownContent } from './MarkdownContent';
 import { ProblemModelEditor } from './ProblemModelEditor';
 import { PendingConfirmationList } from './ProblemModelAttention';
@@ -137,8 +137,8 @@ function CapabilityBar({ capability }: { capability: Capability }) {
                   <span className="font-mono">
                     <span className="text-neutral-500 font-sans">commit</span> {record.commit_sha.slice(0, 12) || 'n/a'}
                   </span>
-                  <span title={record.proved_at}>
-                    <span className="text-neutral-500">proved</span> {record.proved_at}
+                  <span title={formatAbsolute(record.proved_at)}>
+                    <span className="text-neutral-500">proved</span> {timeAgo(record.proved_at)}
                   </span>
                 </div>
               </div>

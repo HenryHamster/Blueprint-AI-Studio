@@ -5,6 +5,7 @@ import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse } from '../api';
 import { draftComputeExperiment } from '../api';
+import { usePersistedState } from '../hooks/usePersistedState';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -124,10 +125,12 @@ export function NewTaskModal({
   const [registryAuthOpen, setRegistryAuthOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const [ideaText, setIdeaText] = useState('');
+  const [ideaText, setIdeaText] = usePersistedState('compute-experiment-idea', '');
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
-  const [draftNotes, setDraftNotes] = useState<string | null>(null);
+  const [draftNotes, setDraftNotes] = usePersistedState<string | null>('compute-experiment-draft-notes', null);
+  // Keep the last backend draft only for the current modal session. Persisting
+  // it across remounts would replay an old `prior_draft` into a later launch.
   const [lastDraft, setLastDraft] = useState<ComputeExperimentDraftResponse | null>(null);
 
   const handleDraftContract = async () => {

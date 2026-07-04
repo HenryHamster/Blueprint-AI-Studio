@@ -62,6 +62,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
 
   // ── Shared refs (cross-domain glue owned by the facade) ──────────────────
   const fetchTasksRef = useRef<() => Promise<void>>(async () => {});
+  const fetchAlertsRef = useRef<() => void>(() => {});
   // Populated by useDirectionsData (when the directions panel is mounted) so the
   // shared WS handler in useLogViewer can live-refresh the directions view.
   const fetchDirectionsRef = useRef<() => void>(() => {});
@@ -96,6 +97,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
     fetchDirectionsRef,
     refreshStrategicReadModelRef,
     refreshMessagesRef,
+    fetchAlertsRef,
     selectedProjectId,
     realtimeWsEnabled: !authLoading && Boolean(user),
   });
@@ -211,6 +213,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef }
 
   // ── Alerts domain ────────────────────────────────────────────────────────
   const { alerts, fetchAlerts, dismissAlert, dismissAllAlerts } = useAlertsState(addToast, selectedProjectId);
+  fetchAlertsRef.current = fetchAlerts;
 
   // ── Tasks domain ─────────────────────────────────────────────────────────
   const {

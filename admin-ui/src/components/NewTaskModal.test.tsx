@@ -316,4 +316,62 @@ describe('NewTaskModal — Draft contract', () => {
     expect(computeExperiment.arms[0].name).toBe('arm-A');
     expect(computeExperiment.declaredMetric).toBe('accuracy');
   });
+
+  it('persists research idea and draft notes across component remounts', async () => {
+    const user = userEvent.setup();
+
+    // Clear localStorage before test to ensure clean state
+    localStorage.removeItem('blueprint-admin:compute-experiment-idea');
+    localStorage.removeItem('blueprint-admin:compute-experiment-draft-notes');
+    localStorage.removeItem('blueprint-admin:compute-experiment-last-draft');
+
+    const draftResponse = {
+      draft_available: true,
+      command: 'python train.py --lr 0.01',
+      spend_cap_usd: 5,
+      deadline_seconds: 1800,
+      notes: 'Assumed single-GPU configuration',
+    };
+    mockDraftComputeExperiment.mockResolvedValue(draftResponse);
+
+    // First render: type the idea and draft
+    const { unmount } = render(
+      <NewTaskModal
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    const ideaInput = screen.getByPlaceholderText(/describe your experiment/i);
+    await user.type(ideaInput, 'Tune learning rate on ImageNet');
+
+    // Click draft to populate the form and set draft notes
+    await user.click(screen.getByRole('button', { name: /draft contract/i }));
+    await waitFor(() => {
+      expect(screen.getByText('Assumed single-GPU configuration')).toBeInTheDocument();
+    });
+
+    // Verify that localStorage has the persisted values
+    const storedIdea = localStorage.getItem('blueprint-admin:compute-experiment-idea');
+    expect(storedIdea).toBe(JSON.stringify('Tune learning rate on ImageNet'));
+
+    // Unmount the component
+    unmount();
+
+    // Second render: component should restore the persisted idea and notes
+    mockDraftComputeExperiment.mockResolvedValue(draftResponse);
+    render(
+      <NewTaskModal
+        {...baseProps}
+        computeExperiment={computeExperiment}
+        setComputeExperiment={setComputeExperiment}
+      />,
+    );
+
+    // Verify the idea is restored from localStorage
+    expect(screen.getByPlaceholderText(/describe your experiment/i)).toHaveValue('Tune learning rate on ImageNet');
+    // Verify the draft notes are restored
+    expect(screen.getByText('Assumed single-GPU configuration')).toBeInTheDocument();
+  });
 });

@@ -108,10 +108,9 @@ describe('ColumnArchiveButton', () => {
     }
   });
 
-  it('second click on >10-task column shows window.confirm and fires when confirmed', async () => {
+  it('second click on >10-task column shows ConfirmDialog and fires onArchiveColumn when confirmed', async () => {
     const user = userEvent.setup();
     const onArchiveColumn = vi.fn();
-    vi.stubGlobal('confirm', vi.fn(() => true));
     const ids = Array.from({ length: 11 }, (_, i) => String(i));
     render(
       <ColumnArchiveButton
@@ -122,16 +121,18 @@ describe('ColumnArchiveButton', () => {
     );
     await user.click(screen.getByTitle('Archive all Completed tasks'));
     await user.click(screen.getByTitle('Archive 11 tasks? (4s)'));
-    expect(window.confirm).toHaveBeenCalledWith(
-      'Archive all 11 Completed tasks? This cannot be undone.'
-    );
+    // ConfirmDialog should be visible
+    expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+    expect(screen.getByText('Archive all 11 Completed tasks? This cannot be undone.')).toBeInTheDocument();
+    expect(onArchiveColumn).not.toHaveBeenCalled();
+    // Confirm the dialog
+    await user.click(screen.getByTestId('confirm-dialog-confirm'));
     expect(onArchiveColumn).toHaveBeenCalledWith(ids, 'Completed');
   });
 
-  it('second click on >10-task column does NOT fire when confirm is cancelled', async () => {
+  it('second click on >10-task column does NOT fire when ConfirmDialog is cancelled', async () => {
     const user = userEvent.setup();
     const onArchiveColumn = vi.fn();
-    vi.stubGlobal('confirm', vi.fn(() => false));
     const ids = Array.from({ length: 11 }, (_, i) => String(i));
     render(
       <ColumnArchiveButton
@@ -142,6 +143,8 @@ describe('ColumnArchiveButton', () => {
     );
     await user.click(screen.getByTitle('Archive all Failed tasks'));
     await user.click(screen.getByTitle('Archive 11 tasks? (4s)'));
+    expect(screen.getByTestId('confirm-dialog-confirm')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
     expect(onArchiveColumn).not.toHaveBeenCalled();
   });
 });

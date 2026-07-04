@@ -14,6 +14,7 @@ interface UseLogViewerDeps {
   fetchDirectionsRef?: React.MutableRefObject<() => void>;
   refreshStrategicReadModelRef?: React.MutableRefObject<() => void>;
   refreshMessagesRef?: React.MutableRefObject<() => void>;
+  fetchAlertsRef?: React.MutableRefObject<() => void>;
   selectedProjectId?: string | null;
   realtimeWsEnabled?: boolean;
 }
@@ -117,6 +118,7 @@ export function useLogViewer({
   fetchDirectionsRef,
   refreshStrategicReadModelRef,
   refreshMessagesRef,
+  fetchAlertsRef,
   selectedProjectId,
   realtimeWsEnabled = true,
 }: UseLogViewerDeps) {
@@ -145,6 +147,7 @@ export function useLogViewer({
   const fetchDirectionsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshStrategicReadModelDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const refreshMessagesDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const fetchAlertsDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsPingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastPongRef = useRef<number>(0);
   const wsPongTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -215,6 +218,9 @@ export function useLogViewer({
       }
       if (refreshMessagesDebounceRef.current) {
         clearTimeout(refreshMessagesDebounceRef.current);
+      }
+      if (fetchAlertsDebounceRef.current) {
+        clearTimeout(fetchAlertsDebounceRef.current);
       }
     };
   }, []);
@@ -332,6 +338,17 @@ export function useLogViewer({
     }, 500);
   }, [refreshMessagesRef]);
 
+  const refreshAlerts = useCallback(() => {
+    if (!fetchAlertsRef?.current) return;
+    if (fetchAlertsDebounceRef.current) {
+      clearTimeout(fetchAlertsDebounceRef.current);
+    }
+    fetchAlertsDebounceRef.current = setTimeout(() => {
+      fetchAlertsDebounceRef.current = null;
+      fetchAlertsRef.current();
+    }, 500);
+  }, [fetchAlertsRef]);
+
   // Shared WS message handler — dispatches to log drawer AND tracked tasks
   const handleWsMessage = useCallback((event: MessageEvent) => {
     try {
@@ -420,6 +437,13 @@ export function useLogViewer({
       )) {
         refreshMessages();
       }
+      if (projectEventApplies && (
+        msg.event === 'alert_created'
+        || msg.event === 'alert_dismissed'
+        || refetchSurfaces.has('runtime')
+      )) {
+        refreshAlerts();
+      }
 
       // Strategist activity events — drive a live refresh of the directions view.
       // These only trigger refetches (the data still comes from the REST endpoints);
@@ -484,7 +508,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (hasActiveWsForProject(projectId)) return;

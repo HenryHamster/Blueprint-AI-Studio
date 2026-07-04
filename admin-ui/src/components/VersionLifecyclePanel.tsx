@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import { ConfirmDialog } from './ConfirmDialog';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
   clearDeployFailed,
@@ -67,9 +68,18 @@ interface VersionLifecyclePanelProps {
   agentServingShas?: AgentServingShasResponse | null;
 }
 
+interface LocalDialogConfig {
+  title: string;
+  message: string;
+  confirmLabel?: string;
+  attestationInput?: { label: string; placeholder?: string };
+  onConfirm: (reason?: string) => void;
+}
+
 export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, userRole, refreshError, lastSuccessfulRefreshAt, refreshing = false, agentServingShas }: VersionLifecyclePanelProps) {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  const [localDialog, setLocalDialog] = useState<LocalDialogConfig | null>(null);
   const [verdicts, setVerdicts] = useState<QualificationVerdictRecord[]>([]);
   const [verdictsError, setVerdictsError] = useState<string | null>(null);
   const [editingGoal, setEditingGoal] = useState<boolean>(false);
@@ -218,41 +228,63 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     }
   };
 
-  const handleTogglePromotionEnabled = async () => {
+  const handleTogglePromotionEnabled = () => {
     const nextValue = !optimisticPromotionEnabled;
-    if (nextValue && !window.confirm('Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.')) return;
-    setActionLoading('promotion');
-    setActionMsg(null);
-    setPromotionEnabledOverride(nextValue);
-    try {
-      await patchAdminSettings({ promotion_enabled: nextValue });
-      setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-      setPromotionEnabledOverride(null);
-    } finally {
-      setActionLoading(null);
+    const doAction = async () => {
+      setActionLoading('promotion');
+      setActionMsg(null);
+      setPromotionEnabledOverride(nextValue);
+      try {
+        await patchAdminSettings({ promotion_enabled: nextValue });
+        setActionMsg(nextValue ? 'Live promotion enabled' : 'Live promotion disabled');
+        onRefresh();
+      } catch {
+        setActionMsg('Request failed');
+        setPromotionEnabledOverride(null);
+      } finally {
+        setActionLoading(null);
+      }
+    };
+    if (nextValue) {
+      setLocalDialog({
+        title: 'Enable fleet-wide live promotion?',
+        message: 'Enable live promotion for ALL PROJECTS? Passing qualify runs will push to main fleet-wide.',
+        confirmLabel: 'Enable',
+        onConfirm: () => { setLocalDialog(null); doAction(); },
+      });
+    } else {
+      doAction();
     }
   };
 
-  const handleSetProjectPromotion = async (enabled: boolean | null) => {
+  const handleSetProjectPromotion = (enabled: boolean | null) => {
     if (!projectId) return;
-    if (enabled === true && !window.confirm('Arm live promotion for THIS project only? Passing qualify runs will push this project to main.')) return;
-    setActionLoading('project-promotion');
-    setActionMsg(null);
-    try {
-      await setProjectPromotionEnabled(projectId, enabled);
-      setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
-      onRefresh();
-    } catch {
-      setActionMsg('Request failed');
-    } finally {
-      setActionLoading(null);
+    const doAction = async () => {
+      setActionLoading('project-promotion');
+      setActionMsg(null);
+      try {
+        await setProjectPromotionEnabled(projectId, enabled);
+        setActionMsg(enabled === null ? 'Using fleet default' : enabled ? 'Project live promotion armed' : 'Project live promotion held');
+        onRefresh();
+      } catch {
+        setActionMsg('Request failed');
+      } finally {
+        setActionLoading(null);
+      }
+    };
+    if (enabled === true) {
+      setLocalDialog({
+        title: 'Arm project live promotion?',
+        message: 'Arm live promotion for THIS project only? Passing qualify runs will push this project to main.',
+        confirmLabel: 'Arm',
+        onConfirm: () => { setLocalDialog(null); doAction(); },
+      });
+    } else {
+      doAction();
     }
   };
 
-  const handleCutVersion = async () => {
+  const handleCutVersion = () => {
     if (!projectId || !cv) return;
     const activating = stagedActivatedByCut(data?.staged_directions ?? [], cv.version_number);
     const inFlight = cv.in_flight_task_count ?? 0;
@@ -275,64 +307,87 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     const msg = consequences.length
       ? `Abandon v${cv.version_number} and open a fresh version?\n\nThis will: ${consequences.join('; ')}.`
       : `Abandon v${cv.version_number} and open a fresh version?`;
-    if (!window.confirm(msg)) return;
-    setActionLoading('cut');
-    setActionMsg(null);
-    if (!cutIdempotencyKeyRef.current) {
-      cutIdempotencyKeyRef.current = generateIdempotencyKey();
-    }
-    try {
-      const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
-      setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
-      setCuttingVersion(false);
-      setCutReason('');
-      cutIdempotencyKeyRef.current = null;
-      onRefresh();
-    } catch (error) {
-      setActionMsg(error instanceof Error ? error.message : 'Request failed');
-    } finally {
-      setActionLoading(null);
-    }
+    setLocalDialog({
+      title: `Abandon v${cv.version_number}?`,
+      message: msg,
+      confirmLabel: 'Abandon',
+      onConfirm: async () => {
+        setLocalDialog(null);
+        setActionLoading('cut');
+        setActionMsg(null);
+        if (!cutIdempotencyKeyRef.current) {
+          cutIdempotencyKeyRef.current = generateIdempotencyKey();
+        }
+        try {
+          const result = await cutVersion(projectId, cutReason || undefined, cutIdempotencyKeyRef.current);
+          setActionMsg(`Cut v${result.abandoned_version.version_number} → opened v${result.new_version.version_number}`);
+          setCuttingVersion(false);
+          setCutReason('');
+          cutIdempotencyKeyRef.current = null;
+          onRefresh();
+        } catch (error) {
+          setActionMsg(error instanceof Error ? error.message : 'Request failed');
+        } finally {
+          setActionLoading(null);
+        }
+      },
+    });
   };
 
   // Clear a stale post-promotion deploy_failed serving state. First attempts the
   // verify path (no force) — the backend clears only if the promoted SHA is
-  // independently observed serving. If it refuses (live SHA unobservable), prompt
-  // for an attestation reason and retry the operator-attested force path.
-  const handleClearDeployFailed = async () => {
+  // independently observed serving. If it refuses (live SHA unobservable), show
+  // an attestation-reason dialog and retry the operator-attested force path.
+  const handleClearDeployFailed = () => {
     if (!projectId) return;
-    if (!window.confirm('Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.')) return;
-    setActionLoading('clear-deploy-failed');
-    setActionMsg(null);
-    try {
-      const result = await clearDeployFailed(projectId);
-      setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
-      onRefresh();
-    } catch (verifyError) {
-      const msg = verifyError instanceof Error ? verifyError.message : '';
-      // Only offer the attested override when the backend explicitly asked for it
-      // (the verify path could not confirm the deploy live).
-      if (!msg.includes('force=true')) {
-        setActionMsg(msg || 'Request failed');
-        setActionLoading(null);
-        return;
-      }
-      const reason = window.prompt('The deploy could not be independently verified live. To force-clear, enter an attestation reason (required):');
-      if (!reason || !reason.trim()) {
-        setActionMsg(msg);
-        setActionLoading(null);
-        return;
-      }
-      try {
-        const result = await clearDeployFailed(projectId, true, reason.trim());
-        setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
-        onRefresh();
-      } catch (forceError) {
-        setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
-      }
-    } finally {
-      setActionLoading(null);
-    }
+    setLocalDialog({
+      title: 'Clear deploy-failed?',
+      message: 'Clear the stale deploy-failed serving state for the promoted version?\n\nThe deploy must be independently confirmed serving, or you will be asked to attest it is live.',
+      confirmLabel: 'Clear',
+      onConfirm: async () => {
+        setLocalDialog(null);
+        setActionLoading('clear-deploy-failed');
+        setActionMsg(null);
+        try {
+          const result = await clearDeployFailed(projectId);
+          setActionMsg(`Deploy-failed cleared (${result.clear_mode}) → ${result.serving_status ?? 'n/a'}`);
+          onRefresh();
+          setActionLoading(null);
+        } catch (verifyError) {
+          const msg = verifyError instanceof Error ? verifyError.message : '';
+          // Only offer the attested override when the backend explicitly asked for it.
+          if (!msg.includes('force=true')) {
+            setActionMsg(msg || 'Request failed');
+            setActionLoading(null);
+            return;
+          }
+          setActionLoading(null);
+          setLocalDialog({
+            title: 'Attest deploy is live',
+            message: 'The deploy could not be independently verified live. To force-clear, enter an attestation reason (required).',
+            confirmLabel: 'Force clear',
+            attestationInput: { label: 'Attestation reason', placeholder: 'e.g. verified live by hand' },
+            onConfirm: async (reason?: string) => {
+              setLocalDialog(null);
+              if (!reason || !reason.trim()) {
+                setActionMsg(msg);
+                return;
+              }
+              setActionLoading('clear-deploy-failed');
+              try {
+                const result = await clearDeployFailed(projectId, true, reason.trim());
+                setActionMsg(`Deploy-failed cleared (operator-attested) → ${result.serving_status ?? 'n/a'}`);
+                onRefresh();
+              } catch (forceError) {
+                setActionMsg(forceError instanceof Error ? forceError.message : 'Request failed');
+              } finally {
+                setActionLoading(null);
+              }
+            },
+          });
+        }
+      },
+    });
   };
 
   return (
@@ -902,6 +957,16 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
           </div>
         )}
       </div>
+      {localDialog && (
+        <ConfirmDialog
+          title={localDialog.title}
+          message={localDialog.message}
+          confirmLabel={localDialog.confirmLabel}
+          attestationInput={localDialog.attestationInput}
+          onConfirm={localDialog.onConfirm}
+          onCancel={() => setLocalDialog(null)}
+        />
+      )}
     </section>
   );
 }

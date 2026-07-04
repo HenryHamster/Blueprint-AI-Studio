@@ -1,5 +1,6 @@
 import { ShieldCheck } from 'lucide-react';
 import { type LiveReleaseEvidence } from '../api';
+import { timeAgo, formatAbsolute } from '../utils/time';
 import { shortPromotedSha, servingStatusClass } from './ReleaseEvidence.utils';
 
 /**
@@ -66,7 +67,7 @@ export function ReleaseEvidencePanel({ evidence }: { evidence?: LiveReleaseEvide
                   {artifact.served_identifier && (
                     <span className="font-mono text-neutral-500">id {artifact.served_identifier}</span>
                   )}
-                  {artifact.served_at && <span className="text-neutral-600">{artifact.served_at}</span>}
+                  {artifact.served_at && <span className="text-neutral-600" title={formatAbsolute(artifact.served_at)}>{timeAgo(artifact.served_at)}</span>}
                   {artifact.reason_code && <span className="text-red-300/80">{artifact.reason_code}</span>}
                 </div>
               );
