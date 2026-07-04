@@ -16,6 +16,13 @@ Optional environment variables:
                                       Max simultaneous compute jobs (default: 2, floor 1).
                                       Agents and compute have SEPARATE capacity pools.
     BLUEPRINT_AGENT_BINARY            Path to node agent entry point (auto-detected if absent)
+    BLUEPRINT_AGENT_IMAGE             Prod agent container image (e.g. agent/Dockerfile build).
+                                      When set AND docker is usable, read-only agent task
+                                      types run in this image (prod-parity, non-root) instead
+                                      of bwrap. Unset → bwrap-only (unchanged behavior).
+    BLUEPRINT_AGENT_BACKEND           Agent backend preference: auto (default) | bwrap | docker.
+                                      "bwrap" forces the host bwrap path even if an image is
+                                      set (disables the docker agent backend).
     BLUEPRINT_RUNNER_POLL_INTERVAL    Base poll interval in seconds (default: 2, floor 0.5)
     BLUEPRINT_RUNNER_AGENT_MAX_SECONDS Wall-clock deadline for an agent subprocess before the
                                       reaper terminates its process group (default: 14400 = 4h,
@@ -202,6 +209,41 @@ def _node_runtime_ok() -> bool:
     try:
         result = subprocess.run(
             ["node", "--version"], capture_output=True, timeout=5
+        )
+        return result.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _docker_agent_possible(caps: "iso.Capabilities", agent_image: str | None) -> bool:
+    """Whether the DOCKER agent backend can run agent work on this host.
+
+    Requires ``BLUEPRINT_AGENT_IMAGE`` set AND a usable docker daemon. The agent
+    runtime + node live INSIDE the prod image, so a host agent binary / node is
+    NOT required here (unlike bwrap). This is the coarse advertisement gate: the
+    per-task read-only enforcement (only read-only agent types get docker) is done
+    by ``iso.decide_agent_backend(task_type=...)`` at claim time. When
+    ``agent_image`` is None this is always False → behavior is bwrap-only, i.e.
+    identical to before the docker agent backend existed.
+    """
+    return bool(agent_image) and bool(caps.docker_usable)
+
+
+def _agent_image_present(agent_image: str) -> bool:
+    """Whether ``docker image inspect <agent_image>`` succeeds (image locally present).
+
+    Guards against a wrong/absent ``BLUEPRINT_AGENT_IMAGE`` that would otherwise
+    advertise "ready" and drain agent tasks whose container run then dies with
+    nothing reported — stranding/looping the task (claim-and-crash-loop). Called
+    ONCE at startup in ``main()`` (NOT per-heartbeat — that would shell out on every
+    beat). Any failure (missing image, docker error, timeout) reads as absent, so
+    the caller disables the docker-agent path and falls back to bwrap-or-decline.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "image", "inspect", agent_image],
+            capture_output=True,
+            timeout=15,
         )
         return result.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -628,6 +670,7 @@ def _reap_loop(
     agent_started_at: dict | None = None,
     agent_max_seconds: float | None = None,
     telemetry: "_TelemetryState | None" = None,
+    agent_teardown: dict | None = None,
 ) -> None:
     """Reap finished agents and terminate any that blow past their wall-clock deadline.
 
@@ -638,7 +681,8 @@ def _reap_loop(
     while not _shutdown_event.is_set():
         try:
             now = time.monotonic()
-            overdue: list[tuple[str, object]] = []
+            # (task_id, proc, backend, container_name) for the docker-aware teardown.
+            overdue: list[tuple[str, object, "str | None", "str | None"]] = []
             with lock:
                 done = [tid for tid, proc in active_tasks.items() if proc.poll() is not None]
                 for tid in done:
@@ -647,6 +691,10 @@ def _reap_loop(
                     del active_tasks[tid]
                     if agent_started_at is not None:
                         agent_started_at.pop(tid, None)
+                    if agent_teardown is not None:
+                        # Cleanly-exited agent: the docker run was attached, so the
+                        # container is already gone — just drop the tracking entry.
+                        agent_teardown.pop(tid, None)
                     _release_capacity(capacity)
                     if telemetry is not None:
                         if code == 0:
@@ -663,19 +711,29 @@ def _reap_loop(
                     for tid, proc in list(active_tasks.items()):
                         started = agent_started_at.get(tid)
                         if started is not None and (now - started) >= agent_max_seconds:
-                            overdue.append((tid, proc))
-                    for tid, _proc in overdue:
+                            backend, cname = (
+                                (agent_teardown or {}).get(tid, (None, None))
+                            )
+                            overdue.append((tid, proc, backend, cname))
+                    for tid, _proc, _b, _c in overdue:
                         del active_tasks[tid]
                         agent_started_at.pop(tid, None)
+                        if agent_teardown is not None:
+                            agent_teardown.pop(tid, None)
 
-            for tid, proc in overdue:
+            for tid, proc, backend, container_name in overdue:
                 print(
                     f"[runner] agent task {tid} exceeded {agent_max_seconds:.0f}s wall-clock "
                     f"deadline - terminating process group (SIGTERM then SIGKILL).",
                     flush=True,
                 )
                 try:
-                    iso.terminate_process_tree(proc)
+                    # For the docker backend this also issues `docker stop <name>` so
+                    # the container is not orphaned (the client group signal alone
+                    # never reaches the daemon-run workload). Mirrors compute teardown.
+                    iso.terminate_process_tree(
+                        proc, backend=backend, container_name=container_name
+                    )
                 except Exception as exc:  # noqa: BLE001 — always settle capacity below
                     print(f"[runner] error terminating overdue agent {tid}: {exc}", flush=True)
                 _release_capacity(capacity)
@@ -700,6 +758,8 @@ def _heartbeat_loop(
     telemetry: "_TelemetryState | None" = None,
     workspace_root: str | None = None,
     max_auth_failures: int = 0,
+    caps: "iso.Capabilities | None" = None,
+    agent_image: str | None = None,
 ) -> None:
     url = f"{orchestrator_url}/api/runner/heartbeat"
     has_gpu = bool(gpu_capabilities.get("has_gpu"))
@@ -718,17 +778,35 @@ def _heartbeat_loop(
                     compute_job_ids = sorted(active_compute_jobs)
             else:
                 compute_job_ids = []
-            # FAIL-CLOSED advertisement: only advertise agent capability when an
-            # agent SANDBOX can be built (bwrap+userns) AND the binary exists AND
-            # the node runtime actually runs. A file-exists check is not enough — a
-            # broken/absent node would show "ready" while every agent task dies at
-            # spawn. If any leg fails, agent_available=False and the orchestrator
-            # stops pinning agent tasks here.
-            agent_available = (
+            # FAIL-CLOSED advertisement across BOTH agent backends:
+            #  * bwrap  — needs the HOST toolchain: a bwrap sandbox (bwrap+userns,
+            #    passed in as agent_sandbox_ok) AND the agent dist AND a working node
+            #    runtime. A file-exists check is not enough — a broken/absent node
+            #    would show "ready" while every agent task dies at spawn.
+            #  * docker — needs BLUEPRINT_AGENT_IMAGE + a usable docker daemon; the
+            #    runtime + agent live in the prod image, so the host node/binary are
+            #    irrelevant. Only read-only agent types actually run here; that
+            #    per-type gate is enforced at claim time by decide_agent_backend.
+            # If NEITHER leg is satisfiable, agent_available=False and the
+            # orchestrator stops pinning agent tasks here. When agent_image is None
+            # this collapses to the prior bwrap-only behavior (no regression).
+            bwrap_agent_ok = (
                 agent_sandbox_ok
                 and _locate_agent_binary() is not None
                 and _node_runtime_ok()
             )
+            # LIMITATION (docker-only box): this leg advertises agent_available=True
+            # on docker+image WITHOUT bwrap, but such a box can run ONLY the
+            # read-only slice (iso.AGENT_DOCKER_TYPES). The runner cannot narrow the
+            # advertisement to those types — task_types is operator-configured
+            # server-side and the heartbeat handler preserves it (backend
+            # routers/runner.py) — so the orchestrator can still pin a write/heavy
+            # type here, which decides DECLINE at claim time and strands/loops the
+            # task. The end-to-end fix (orchestrator honoring a runner-advertised
+            # task_types) is a follow-up; today a LOUD startup warning in main()
+            # tells the operator to restrict this runner's enrolled task_types.
+            docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
+            agent_available = bwrap_agent_ok or docker_agent_ok
             last_success_at, consecutive_failures = (
                 telemetry.snapshot() if telemetry is not None else (None, 0)
             )
@@ -1667,6 +1745,7 @@ def _preflight(
     gpu_state: dict,
     max_concurrent: int,
     max_concurrent_compute: int,
+    agent_image: str | None = None,
 ) -> dict:
     """Print the aligned preflight block; return a dict of the decisions.
 
@@ -1685,6 +1764,12 @@ def _preflight(
     allowlist_str = ",".join(str(i) for i in allowlist) or "none"
 
     claimable = iso.claimable_classes(caps, agent_binary is not None)
+    # A docker+image box claims (read-only) agent work even without bwrap; the
+    # host agent binary is carried by the image, so claimable_classes (which only
+    # knows about the bwrap path) under-reports it. Relax it here.
+    docker_agent = _docker_agent_possible(caps, agent_image)
+    if docker_agent:
+        claimable = {**claimable, iso.CLASS_AGENT: True}
     agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
     compute_reason = None
     if not claimable[iso.CLASS_COMPUTE]:
@@ -1783,7 +1868,11 @@ def _preflight(
 
     print("  task classes:", flush=True)
     if claimable[iso.CLASS_AGENT]:
-        print("    agent        : CLAIMED via bwrap", flush=True)
+        if caps.bwrap_ok:
+            agent_via = "bwrap" + (f" + docker image {agent_image}" if docker_agent else "")
+        else:
+            agent_via = f"docker image {agent_image} (read-only types)"
+        print(f"    agent        : CLAIMED via {agent_via}", flush=True)
     else:
         print(f"    agent        : DECLINED — {agent_reason}", flush=True)
     if claimable[iso.CLASS_COMPUTE]:
@@ -1818,6 +1907,111 @@ def _preflight(
     }
 
 
+def _spawn_agent_task(
+    *,
+    task_id: str,
+    task_type: str,
+    agent_token: str,
+    vm_instance_id: str,
+    orchestrator_url: str,
+    workspace: str,
+    caps: "iso.Capabilities",
+    agent_binary: str | None,
+    agent_image: str | None,
+    active_tasks: dict,
+    agent_started_at: dict,
+    agent_teardown: dict,
+    lock: threading.Lock,
+) -> bool:
+    """Plan (fail-closed) + spawn one claimed agent task; record it for reaping.
+
+    Routes the per-task backend choice through ``iso.decide_agent_backend`` with the
+    task_type + agent_image so only READ-ONLY task types get the docker backend when
+    only a (read-only) image is present. The runner-set identity env
+    (AGENT_SECRET_TOKEN / ORCHESTRATOR_URL / TASK_ID / VM_INSTANCE_ID) flows through
+    the isolation layer unchanged — into bwrap's env or the docker ``-e`` set.
+
+    On success, records ``(proc, start_time, (backend, container_name))`` into the
+    shared maps under ``lock`` and returns True — the CALLER must NOT release the
+    capacity permit (the reaper releases it when the task exits). Returns False on
+    DECLINE / spawn failure (the caller releases the permit).
+    """
+    present = agent_binary is not None
+    backend = iso.decide_agent_backend(
+        caps, present, task_type=task_type, agent_image=agent_image
+    )
+    if backend == iso.DECLINE:
+        # No isolation boundary for THIS task type on this host (fail-closed).
+        reason = iso.agent_decline_reason(caps, present) or "no agent sandbox"
+        print(
+            f"[runner] DECLINED agent task {task_id} (fail-closed): {reason}",
+            flush=True,
+        )
+        return False
+    # The bwrap backend needs the HOST agent dist; the docker backend carries the
+    # agent in the image, so a missing host binary is only fatal off the docker path.
+    if backend != iso.BACKEND_DOCKER and not agent_binary:
+        print(
+            f"[runner] agent binary unavailable — cannot run agent task {task_id}; "
+            "skipping (build it with `cd agent && npm run build` or set "
+            "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
+            flush=True,
+        )
+        return False
+
+    # Only hand the image to the planner when THIS task's decision is docker; a
+    # bwrap-eligible task on a docker+image box still takes the bwrap path.
+    plan_image = agent_image if backend == iso.BACKEND_DOCKER else None
+
+    # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
+    # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN /
+    # BLUEPRINT_ORCHESTRATOR_URL into the task.
+    plan = iso.plan_agent_execution(
+        caps=caps,
+        agent_binary=agent_binary,
+        workspace_host=workspace,
+        injected_env={
+            "AGENT_SECRET_TOKEN": agent_token,
+            "ORCHESTRATOR_URL": orchestrator_url,
+            "TASK_ID": task_id,
+            "VM_INSTANCE_ID": vm_instance_id,
+        },
+        source_env=dict(os.environ),
+        task_type=task_type,
+        agent_image=plan_image,
+    )
+    if plan.declined:
+        print(
+            f"[runner] DECLINED agent task {task_id} (fail-closed): {plan.decline_reason}",
+            flush=True,
+        )
+        return False
+
+    popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
+    if hasattr(os, "setsid"):
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(plan.argv, **popen_kwargs)
+    except Exception as exc:
+        print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
+        return False
+
+    with lock:
+        active_tasks[task_id] = proc
+        agent_started_at[task_id] = time.monotonic()
+        # Parallel map keyed by task_id: the reaper/shutdown teardown needs the
+        # backend + container_name to issue `docker stop` for the docker backend
+        # (bwrap → container_name None → group-signal only). Mirrors compute.
+        agent_teardown[task_id] = (plan.backend, plan.container_name)
+    print(
+        f"[START] task_id={task_id} type={task_type} vm={vm_instance_id} "
+        f"workspace={workspace} pid={proc.pid} sandbox={plan.backend}"
+        + (f" container={plan.container_name}" if plan.container_name else ""),
+        flush=True,
+    )
+    return True
+
+
 def main() -> None:
     check_mode = "--check" in sys.argv[1:]
 
@@ -1841,7 +2035,72 @@ def main() -> None:
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
 
+    # Prod agent container image (agent/Dockerfile). When set AND docker is usable,
+    # read-only agent task types run in this image (prod-parity, non-root) instead
+    # of bwrap. Empty → None → bwrap-only (unchanged). BLUEPRINT_AGENT_BACKEND=bwrap
+    # is an operator override that force-disables the docker agent backend.
+    agent_image = os.environ.get("BLUEPRINT_AGENT_IMAGE", "").strip() or None
+    agent_backend_pref = (
+        os.environ.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() or "auto"
+    )
+    if agent_backend_pref == "bwrap" and agent_image is not None:
+        print(
+            "[runner] BLUEPRINT_AGENT_BACKEND=bwrap — ignoring BLUEPRINT_AGENT_IMAGE "
+            "and using the host bwrap agent backend.",
+            flush=True,
+        )
+        agent_image = None
+
     caps = _get_capabilities()
+
+    # FAIL-CLOSED image check (Fix 3): a docker-usable box with BLUEPRINT_AGENT_IMAGE
+    # set but the image ABSENT would still advertise agent_available=True and drain
+    # tasks whose `docker run` then dies with nothing reported → strand/loop. Verify
+    # the image exists ONCE here at startup (not per-heartbeat); if it does not,
+    # disable the docker-agent path (agent_image=None) so the runner falls back to
+    # the host bwrap backend — or declines agent work — instead of claim-and-crash.
+    if agent_image is not None and caps.docker_usable and not _agent_image_present(
+        agent_image
+    ):
+        print(
+            f"[runner] ERROR: BLUEPRINT_AGENT_IMAGE={agent_image!r} is not present "
+            "locally (`docker image inspect` failed) — DISABLING the docker agent "
+            "backend. Pull/build the image (or fix the tag) and restart. Falling "
+            "back to the host bwrap agent backend, or declining agent work if bwrap "
+            "is unavailable.",
+            flush=True,
+        )
+        agent_image = None
+
+    # LOUD warning (Fix 2): a docker-only box (docker + agent image usable, but NO
+    # bwrap) can run ONLY the read-only agent slice (iso.AGENT_DOCKER_TYPES). The
+    # runner CANNOT self-restrict its task_types — that is operator-configured
+    # server-side and the heartbeat handler preserves it — so the orchestrator can
+    # still pin a write/heavy type here, which then declines-after-dispatch and
+    # strands/loops the task. Until the end-to-end fix lands (orchestrator honoring
+    # a runner-advertised task_types), the operator MUST restrict this runner's
+    # enrolled task_types to the read-only slice. No warning when bwrap is also
+    # present — bwrap can attempt the rest.
+    if agent_image is not None and caps.docker_usable and not caps.bwrap_ok:
+        _slice = ", ".join(sorted(iso.AGENT_DOCKER_TYPES))
+        print(
+            "[runner] ============================================================\n"
+            "[runner] WARNING: docker-ONLY agent backend (docker + agent image "
+            "present, but bubblewrap is NOT available).\n"
+            "[runner] This runner can run ONLY the READ-ONLY agent slice in the prod "
+            "image; it CANNOT run write/heavy agent types (create/fix/refactor/...).\n"
+            "[runner] The runner CANNOT self-restrict its task_types (operator-set "
+            "server-side; the heartbeat preserves it), so you MUST restrict this "
+            "runner's enrolled task_types to exactly the read-only slice below, or "
+            "the orchestrator may pin an unsupported type here that gets DECLINED "
+            "after dispatch — stranding/looping the task.\n"
+            f"[runner] read-only slice (iso.AGENT_DOCKER_TYPES): {_slice}\n"
+            "[runner] (Install bubblewrap to let this runner attempt the rest via "
+            "the host bwrap backend.)\n"
+            "[runner] ============================================================",
+            flush=True,
+        )
+
     gpu_state = _make_gpu_state(caps)
 
     # Best-effort startup sweep of any stray tagged containers from a prior crash.
@@ -1849,7 +2108,7 @@ def main() -> None:
 
     result = _preflight(
         orchestrator_url, token, agent_binary, caps, gpu_state,
-        max_concurrent, max_concurrent_compute,
+        max_concurrent, max_concurrent_compute, agent_image,
     )
     claimable = result["claimable"]
     gpu_capabilities = result["gpu_caps"]
@@ -1890,6 +2149,10 @@ def main() -> None:
     active_tasks: dict[str, subprocess.Popen] = {}
     # Per-agent monotonic start time, for the reaper's wall-clock deadline (I4).
     agent_started_at: dict[str, float] = {}
+    # Per-agent (backend, container_name) so the reaper/shutdown teardown can issue
+    # `docker stop` for the docker backend instead of leaking the container (bwrap
+    # tasks map to (BACKEND_BWRAP, None) → group-signal only). Keyed by task_id.
+    agent_teardown: dict[str, tuple[str, str | None]] = {}
     lock = threading.Lock()
     # SEPARATE capacity pools (I5): agents and compute never contend for one
     # shared semaphore, so the advertised concurrency is honest and a saturated
@@ -1909,6 +2172,7 @@ def main() -> None:
             "agent_started_at": agent_started_at,
             "agent_max_seconds": agent_max_seconds,
             "telemetry": telemetry,
+            "agent_teardown": agent_teardown,
         },
         daemon=True,
     )
@@ -1924,12 +2188,16 @@ def main() -> None:
             gpu_capabilities,
             active_compute_jobs,
             compute_lock,
-            caps.bwrap_ok,  # agent_sandbox_ok — gates advertised agent_available
+            caps.bwrap_ok,  # agent_sandbox_ok — gates the bwrap advertisement leg
         ),
         kwargs={
             "telemetry": telemetry,
             "workspace_root": workspace_root,
             "max_auth_failures": max_auth_failures,
+            # Docker advertisement leg: advertise (read-only) agent work on a
+            # docker+image box even without bwrap.
+            "caps": caps,
+            "agent_image": agent_image,
         },
         daemon=True,
     )
@@ -1966,6 +2234,10 @@ def main() -> None:
     poll_interval = base_poll_interval
     next_task_url = f"{orchestrator_url}/api/runner/next-task"
 
+    # An agent sandbox exists iff bwrap can be built OR a docker+image backend is
+    # available. When agent_image is None this is exactly caps.bwrap_ok (unchanged).
+    agent_sandbox_ok = caps.bwrap_ok or _docker_agent_possible(caps, agent_image)
+
     # Agent poll loop — only runs when an agent sandbox can be built (fail-closed).
     # Otherwise we idle on the shutdown event while compute/heartbeat continue.
     # The whole body is wrapped so a transient error keeps the runner alive; the
@@ -1974,8 +2246,9 @@ def main() -> None:
         try:
             _supervise_threads(background_threads)
 
-            if not caps.bwrap_ok:
-                # No agent sandbox — never claim agent work. Wait for shutdown.
+            if not agent_sandbox_ok:
+                # No agent sandbox (no bwrap, no docker+image) — never claim agent
+                # work. Wait for shutdown.
                 time.sleep(1)
                 continue
 
@@ -2049,18 +2322,12 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
+            # Refresh the host agent dist lazily (only the bwrap backend needs it;
+            # the docker backend carries the agent in the image). _spawn_agent_task
+            # decides which backend applies and declines fail-closed if neither can
+            # run THIS task type.
             if not agent_binary:
                 agent_binary = _locate_agent_binary()
-            if not agent_binary:
-                print(
-                    f"[runner] agent binary unavailable — cannot run agent task {task_id}; "
-                    "skipping (build it with `cd agent && npm run build` or set "
-                    "BLUEPRINT_AGENT_BINARY). Compute jobs are unaffected.",
-                    flush=True,
-                )
-                _release_capacity(agent_capacity)
-                time.sleep(poll_interval)
-                continue
 
             try:
                 workspace = _agent_workspace_for_task(task_id)
@@ -2070,48 +2337,27 @@ def main() -> None:
                 time.sleep(poll_interval)
                 continue
 
-            # Build the FAIL-CLOSED sandbox plan. The env is assembled from an explicit
-            # allowlist (never os.environ.copy) and NEVER carries BLUEPRINT_RUNNER_TOKEN
-            # / BLUEPRINT_ORCHESTRATOR_URL into the task.
-            plan = iso.plan_agent_execution(
+            spawned = _spawn_agent_task(
+                task_id=task_id,
+                task_type=task_type,
+                agent_token=agent_token,
+                vm_instance_id=vm_instance_id,
+                orchestrator_url=orchestrator_url,
+                workspace=workspace,
                 caps=caps,
                 agent_binary=agent_binary,
-                workspace_host=workspace,
-                injected_env={
-                    "AGENT_SECRET_TOKEN": agent_token,
-                    "ORCHESTRATOR_URL": orchestrator_url,
-                    "TASK_ID": task_id,
-                    "VM_INSTANCE_ID": vm_instance_id,
-                },
-                source_env=dict(os.environ),
+                agent_image=agent_image,
+                active_tasks=active_tasks,
+                agent_started_at=agent_started_at,
+                agent_teardown=agent_teardown,
+                lock=lock,
             )
-            if plan.declined:
-                print(
-                    f"[runner] DECLINED agent task {task_id} (fail-closed): {plan.decline_reason}",
-                    flush=True,
-                )
+            if not spawned:
+                # DECLINE / spawn failure — the reaper never sees this task, so the
+                # permit must be released here.
                 _release_capacity(agent_capacity)
                 time.sleep(poll_interval)
                 continue
-
-            popen_kwargs: dict = {"env": plan.env, "stdout": sys.stdout, "stderr": sys.stderr}
-            if hasattr(os, "setsid"):
-                popen_kwargs["start_new_session"] = True
-            try:
-                proc = subprocess.Popen(plan.argv, **popen_kwargs)
-            except Exception as exc:
-                print(f"[runner] failed to spawn agent for task {task_id}: {exc}", flush=True)
-                _release_capacity(agent_capacity)
-                continue
-
-            with lock:
-                active_tasks[task_id] = proc
-                agent_started_at[task_id] = time.monotonic()
-            print(
-                f"[START] task_id={task_id} type={task_type} vm={vm_instance_id} "
-                f"workspace={workspace} pid={proc.pid} sandbox={plan.backend}",
-                flush=True,
-            )
         except Exception as exc:  # noqa: BLE001 — a transient error must not crash the runner
             print(f"[runner] agent poll loop error (continuing): {exc}", flush=True)
             time.sleep(5)
@@ -2128,8 +2374,13 @@ def main() -> None:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
+                backend, container_name = agent_teardown.get(tid, (None, None))
                 print(f"[runner] timeout waiting for task {tid} (pid={proc.pid}) — tearing down group", flush=True)
-                iso.terminate_process_tree(proc)
+                # docker backend → also `docker stop <name>` so the container is not
+                # left running past shutdown (bwrap → container_name None → group only).
+                iso.terminate_process_tree(
+                    proc, backend=backend, container_name=container_name
+                )
 
     print("[runner] Exiting.", flush=True)
 

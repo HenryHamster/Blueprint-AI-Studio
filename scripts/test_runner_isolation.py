@@ -41,6 +41,99 @@ class TestDecisionTable(unittest.TestCase):
         self.assertIn("not built", iso.agent_decline_reason(bwrap, False))
         self.assertIn("bwrap", iso.agent_decline_reason(_caps(), True))
 
+    def test_agent_docker_when_image_docker_and_readonly_type(self):
+        # agent_image + usable docker + a read-only-eligible type → docker.
+        caps = _caps(docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                caps, True, task_type="research", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_DOCKER,
+        )
+        # task_type=None (unclassified) is eligible too.
+        self.assertEqual(
+            iso.decide_agent_backend(caps, True, agent_image="reg/agent:latest"),
+            iso.BACKEND_DOCKER,
+        )
+        # The docker path does NOT need the host agent binary (image ships its own).
+        self.assertEqual(
+            iso.decide_agent_backend(
+                caps, False, task_type="plan", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_DOCKER,
+        )
+
+    def test_agent_docker_needs_usable_docker(self):
+        # Image + eligible type but docker NOT usable → falls back to bwrap table.
+        no_docker = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True)  # docker_usable=False
+        self.assertEqual(
+            iso.decide_agent_backend(
+                no_docker, True, task_type="research", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_BWRAP,
+        )
+
+    def test_agent_docker_declined_for_write_task_type(self):
+        # A write/heavy type is NOT eligible for the read-only image → it falls
+        # through to the bwrap/decline table unchanged.
+        both = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                both, True, task_type="fix", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_BWRAP,
+        )
+        # Docker-only box + write type → decline (no bwrap fallback, no docker route).
+        docker_only = _caps(docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                docker_only, True, task_type="fix", agent_image="reg/agent:latest"
+            ),
+            iso.DECLINE,
+        )
+
+    def test_agent_image_none_is_byte_identical_bwrap_only(self):
+        # CRITICAL no-regression: with agent_image falsy the result is identical to
+        # the historical bwrap-or-decline table — docker must NEVER sneak in.
+        bwrap = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(iso.decide_agent_backend(bwrap, True), iso.BACKEND_BWRAP)
+        self.assertEqual(iso.decide_agent_backend(bwrap, False), iso.DECLINE)
+        # Docker usable + eligible type but NO image → still bwrap-gated.
+        both = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(
+            iso.decide_agent_backend(both, True, task_type="research"),
+            iso.BACKEND_BWRAP,
+        )
+        docker_only = _caps(docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(docker_only, True, task_type="research"),
+            iso.DECLINE,
+        )
+
+    def test_agent_docker_types_membership(self):
+        # The MUST-include read-only slice is present.
+        for t in (
+            "strategic_review", "research", "web_research", "plan", "design",
+            "memo", "investigate", "design_doc_update",
+        ):
+            self.assertIn(t, iso.AGENT_DOCKER_TYPES)
+        # Write/heavy types are excluded (no postgres/pytest/docker-in-docker).
+        # ``docs`` is a WRITE/PR type (agent_mode="write", output_kind="pr") and
+        # must NOT run in the read-only image.
+        for t in (
+            "create", "fix", "refactor", "verify_tests", "smoketest",
+            "compute_experiment", "qa", "migrate", "docs",
+        ):
+            self.assertNotIn(t, iso.AGENT_DOCKER_TYPES)
+
+    def test_agent_docker_types_excludes_all_write_types(self):
+        # Machine-checkable guard: NO write/PR task type may ever appear in the
+        # read-only docker slice. Hardcoded because runner_isolation is stdlib-only
+        # and cannot import the backend registry (app.task_capabilities) — mirror
+        # its agent_mode=="write" set here.
+        write_types = {"create", "fix", "refactor", "migrate", "qa", "deps", "docs"}
+        self.assertEqual(iso.AGENT_DOCKER_TYPES & write_types, set())
+
     def test_compute_image_with_docker_uses_docker(self):
         caps = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
         self.assertEqual(iso.decide_compute_backend(caps, has_image=True), iso.BACKEND_DOCKER)
@@ -319,6 +412,27 @@ class TestDockerArgv(unittest.TestCase):
         self.assertIn("--cpus", argv)
         self.assertIn("--memory", argv)
 
+    def test_command_none_runs_image_cmd(self):
+        # command=None → the image is the terminal token; NO bash -lc suffix, so
+        # the container runs its own ENTRYPOINT/CMD.
+        argv = iso.build_docker_argv(
+            image="reg/agent:latest", command=None, container_name="bp-agent-x",
+            gpu_indices=None, binds=[], env_keys=["AGENT_SECRET_TOKEN"], cwd=None,
+        )
+        self.assertEqual(argv[-1], "reg/agent:latest")
+        self.assertNotIn("bash", argv)
+        self.assertNotIn("-lc", argv)
+        # Env still forwarded as `-e KEY` (value read from the subprocess env).
+        self.assertIn("-e AGENT_SECRET_TOKEN", " ".join(argv))
+
+    def test_command_string_keeps_bash_lc_suffix(self):
+        # Back-compat: a string command still appends the bash -lc override.
+        argv = iso.build_docker_argv(
+            image="img", command="python train.py", container_name="bp-x",
+            gpu_indices=None, binds=[], env_keys=[], cwd=None,
+        )
+        self.assertEqual(argv[-3:], ["bash", "-lc", "python train.py"])
+
 
 class TestApptainerArgv(unittest.TestCase):
     def test_containall_and_no_home_mandatory(self):
@@ -463,6 +577,68 @@ class TestAgentPlan(unittest.TestCase):
         # Workspace bound; AGENT_WORKSPACE points inside the sandbox.
         self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace")
         self.assertIn("/tmp/ws/t1", plan.argv)
+
+    def test_agent_plan_docker_backend(self):
+        plan = iso.plan_agent_execution(
+            caps=_caps(docker_usable=True),
+            agent_binary=None,  # image ships its own build; host binary irrelevant
+            workspace_host="/tmp/ws/t1",
+            injected_env={
+                "AGENT_SECRET_TOKEN": "SUPER-SECRET-JWT",
+                "ORCHESTRATOR_URL": "https://api.example.com",
+                "TASK_ID": "abcdef0123456789",
+                "VM_INSTANCE_ID": "runner:local",
+            },
+            source_env={
+                "PATH": "/usr/bin",
+                "ANTHROPIC_API_KEY": "sk-ant",
+                "BLUEPRINT_RUNNER_TOKEN": "SECRET",
+            },
+            task_type="research",
+            agent_image="reg/blueprint-agent-job:latest",
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_DOCKER)
+        # container_name = bp-agent-<task_id[:12]> (bp- prefix convention).
+        self.assertEqual(plan.container_name, "bp-agent-abcdef012345")
+        joined = " ".join(plan.argv)
+        # docker run of the prod image; image is terminal; NO bash -lc override.
+        self.assertEqual(plan.argv[:2], ["docker", "run"])
+        self.assertEqual(plan.argv[-1], "reg/blueprint-agent-job:latest")
+        self.assertNotIn("bash", plan.argv)
+        self.assertNotIn("-lc", plan.argv)
+        # NO host /workspace bind — the container owns /workspace.
+        self.assertNotIn("-v", plan.argv)
+        self.assertNotIn("/tmp/ws/t1", plan.argv)
+        # Identity + cred keys forwarded via `-e KEY` (value read from client env).
+        self.assertIn("-e AGENT_SECRET_TOKEN", joined)
+        self.assertIn("-e ANTHROPIC_API_KEY", joined)
+        self.assertIn("-e TASK_ID", joined)
+        self.assertIn("-e VM_INSTANCE_ID", joined)
+        # Secret VALUES never on argv.
+        self.assertNotIn("SUPER-SECRET-JWT", joined)
+        self.assertNotIn("sk-ant", joined)
+        # Values live in the docker CLIENT env for `-e` to read; token stripped.
+        self.assertEqual(plan.env["AGENT_SECRET_TOKEN"], "SUPER-SECRET-JWT")
+        self.assertEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant")
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
+        # Host PATH is NOT forwarded into the container (`-e PATH` absent).
+        self.assertNotIn("-e PATH", joined)
+
+    def test_agent_plan_no_image_stays_bwrap(self):
+        # An eligible task_type but NO image → the existing bwrap plan; backend
+        # and container_name unchanged (container_name stays None on bwrap).
+        plan = iso.plan_agent_execution(
+            caps=_caps(bwrap_path="/usr/bin/bwrap", userns_ok=True),
+            agent_binary="/opt/agent/dist/index.js",
+            workspace_host="/tmp/ws/t1",
+            injected_env={"AGENT_SECRET_TOKEN": "jwt", "TASK_ID": "t1"},
+            source_env={"PATH": "/usr/bin"},
+            task_type="research",
+        )
+        self.assertFalse(plan.declined)
+        self.assertEqual(plan.backend, iso.BACKEND_BWRAP)
+        self.assertIsNone(plan.container_name)
 
 
 class TestComputePlan(unittest.TestCase):
