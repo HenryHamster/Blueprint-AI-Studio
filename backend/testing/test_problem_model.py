@@ -2529,6 +2529,71 @@ def test_constraints_survive_full_agent_cycle_wipe_legacy_path():
     )
 
 
+def test_intent_purpose_restores_when_blank_regardless_of_source():
+    """Regression: intent.purpose auto-heals from user_purpose when source is None.
+
+    Observed incident (2026-07-04, direction d-d3cb208c): intent.purpose was
+    found blank with intent.source=null and intent.user_purpose holding the
+    correct operator text.  _preserve_operator_intent previously gated on
+    source.type=="user_message", so source=None caused purpose_was_operator=False
+    and the blank purpose propagated through.  The thinker-gate then rejected the
+    problem model (schema-placeholder check: empty string) and every spawned
+    strategic_review sub-task failed 3/3 retries, stalling direction retirement
+    for 5 cycles.
+    """
+    # Onboarding seeds purpose, user_purpose, and source=user_message.
+    seeded = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Operator real purpose", "current_focus": ""}},
+        "2026-07-04T00:00:00",
+    )
+    assert seeded.intent.user_purpose == "Operator real purpose"
+    assert seeded.intent.source is not None and seeded.intent.source.type == "user_message"
+
+    # Agent cycle 1: rewrites purpose with non-blank text, dropping provenance.
+    # This is the known legacy-path behaviour: source becomes None.
+    cycle1, _ = apply_agent_update(
+        seeded.model_dump(),
+        {
+            "intent": {
+                "purpose": "Agent rewritten purpose",
+                "current_focus": "Something",
+                # source intentionally absent — models that don't carry it end up null
+            }
+        },
+        "2026-07-04T01:00:00",
+        baseline_raw=None,
+    )
+    assert cycle1["intent"].get("source") is None, (
+        "agent rewrite drops provenance — precondition for the regression"
+    )
+
+    # Corrupted state: simulate the exact live incident — purpose blanked,
+    # source=null, user_purpose has the real text.
+    corrupted = dict(cycle1)
+    corrupted["intent"] = dict(cycle1["intent"])
+    corrupted["intent"]["purpose"] = ""
+    corrupted["intent"]["source"] = None
+    # user_purpose is the durable backstop — must still have the operator value.
+    assert corrupted["intent"]["user_purpose"] == "Operator real purpose"
+
+    # Agent cycle 2: proposes anything; the auto-heal must fire regardless.
+    cycle2, _ = apply_agent_update(
+        corrupted,
+        {
+            "intent": {
+                "purpose": "",  # blank — the thinker-gate would reject this
+                "current_focus": "New focus",
+            }
+        },
+        "2026-07-04T02:00:00",
+        baseline_raw=None,
+    )
+    assert cycle2["intent"]["purpose"] == "Operator real purpose", (
+        "intent.purpose must be restored from user_purpose when blank and source=null"
+    )
+
+
 # ---------------------------------------------------------------------------
 # apply_agent_update — non-destructive merge of AGENT-OWNED collections
 #
