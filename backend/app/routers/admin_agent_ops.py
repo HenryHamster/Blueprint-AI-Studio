@@ -2298,10 +2298,21 @@ async def strategic_operation(
         _task_criterion_ids: list[str] = []
         if direction_id:
             from app.directions_repo import get_direction_row as _get_direction_row
+            from app.release_version import current_open_version as _current_open_version
 
             _dir_row = await _get_direction_row(session, project.id, direction_id)
             if _dir_row is not None and _dir_row.criterion_keys:
-                _task_criterion_ids = list(_dir_row.criterion_keys)
+                from app.acceptance_criteria import (
+                    filter_active_criterion_keys as _filter_active_crit,
+                )
+                _open_version = await _current_open_version(session, project.id)
+                if _open_version is not None:
+                    _task_criterion_ids = await _filter_active_crit(
+                        session,
+                        project.id,
+                        list(_dir_row.criterion_keys),
+                        release_version_id=_open_version.id,
+                    )
 
         new_task = Task(
             project_id=project.id,
@@ -3266,7 +3277,7 @@ async def strategic_operation(
         # above by the task_type guard).  Deduplicates by text within the
         # (project_id, release_version_id) scope so repeated calls are safe.
         from app.acceptance_criteria import (
-            count_criteria_for_version as _count_criteria,
+            count_active_criteria_for_version as _count_active_criteria,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
@@ -3342,11 +3353,45 @@ async def strategic_operation(
                 status_code=409,
             )
 
-        existing_count = await _count_criteria(session, open_version.id)
+        # Process retractions FIRST so freed headroom is available to additions
+        # in the same call — this is the core safety-valve path.
+        retracted: list[dict] = []
+        retracted_active_count = 0
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            reason = item["reason"].strip()
+            superseded_by_key_raw = item.get("superseded_by_key")
+            superseded_by_key = (
+                superseded_by_key_raw.strip()
+                if isinstance(superseded_by_key_raw, str)
+                and superseded_by_key_raw.strip()
+                else None
+            )
+            row = await _retract_criterion(
+                session,
+                project_id=project.id,
+                release_version_id=open_version.id,
+                criterion_key=criterion_key,
+                reason=reason,
+                retracted_by="strategist",
+                superseded_by_key=superseded_by_key,
+            )
+            if row is not None and row.status != "active":
+                # Row was active and is now retracted/superseded — headroom freed
+                retracted_active_count += 1
+            retracted.append(
+                {
+                    "criterion_key": criterion_key,
+                    "status": row.status if row is not None else None,
+                    "found": row is not None,
+                }
+            )
+
+        # Active-only count minus what we just retracted in this call
+        existing_active_count = await _count_active_criteria(session, open_version.id)
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
-        retracted: list[dict] = []
         for item in criteria_input:
             text = item["text"].strip()
             direction_keys_input: list[str] = list(item.get("direction_keys") or [])
@@ -3358,7 +3403,7 @@ async def strategic_operation(
                 criterion_key = existing.criterion_key
                 is_new = False
             else:
-                if existing_count + new_added_count >= _MAX_CRITERIA:
+                if existing_active_count + new_added_count >= _MAX_CRITERIA:
                     skipped_over_cap += 1
                     continue
                 criterion_key = _gen_criterion_key()
@@ -3390,33 +3435,6 @@ async def strategic_operation(
                     "text": text,
                     "is_new": is_new,
                     "direction_keys": mapped_keys,
-                }
-            )
-
-        for item in retract_input:
-            criterion_key = item["criterion_key"].strip()
-            reason = item["reason"].strip()
-            superseded_by_key_raw = item.get("superseded_by_key")
-            superseded_by_key = (
-                superseded_by_key_raw.strip()
-                if isinstance(superseded_by_key_raw, str)
-                and superseded_by_key_raw.strip()
-                else None
-            )
-            row = await _retract_criterion(
-                session,
-                project_id=project.id,
-                release_version_id=open_version.id,
-                criterion_key=criterion_key,
-                reason=reason,
-                retracted_by="strategist",
-                superseded_by_key=superseded_by_key,
-            )
-            retracted.append(
-                {
-                    "criterion_key": criterion_key,
-                    "status": row.status if row is not None else None,
-                    "found": row is not None,
                 }
             )
 

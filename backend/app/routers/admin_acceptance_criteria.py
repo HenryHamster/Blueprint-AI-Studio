@@ -79,7 +79,7 @@ async def create_acceptance_criterion(
     if not text:
         raise HTTPException(status_code=422, detail="text must not be empty")
 
-    existing_count = await ac.count_criteria_for_version(session, open_version.id)
+    existing_count = await ac.count_active_criteria_for_version(session, open_version.id)
     if existing_count >= ac.MAX_CRITERIA_PER_VERSION:
         raise HTTPException(
             status_code=409,

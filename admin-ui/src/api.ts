@@ -2266,15 +2266,20 @@ export interface CriterionCoverageEntry {
   criterion_key: string;
   text: string;
   coverage: 'covered' | 'partial' | 'uncovered';
+  status?: 'active' | 'retracted' | 'superseded';
   evidence_count: number;
   stuck_reason?: 'no_mapping' | 'direction_retired' | null;
 }
 
 export interface VersionCriterionCoverage {
+  // Active criteria only; inactive criteria may still appear in criteria for audit.
   total: number;
   covered: number;
   partial: number;
   uncovered: number;
+  retracted?: number;
+  superseded?: number;
+  inactive?: number;
   stuck_count?: number;
   criteria: CriterionCoverageEntry[];
 }

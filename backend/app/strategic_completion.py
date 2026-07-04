@@ -1228,7 +1228,8 @@ async def _apply_new_acceptance_criteria(
             return
         existing = await _ac.get_criteria_for_version(session, _open_ver.id)
         existing_texts = {c.text for c in existing}
-        headroom = _ac.MAX_CRITERIA_PER_VERSION - len(existing)
+        active_count = sum(1 for c in existing if c.status == "active")
+        headroom = _ac.MAX_CRITERIA_PER_VERSION - active_count
         created_count = 0
         skipped_over_cap = 0
         for text in criteria_texts:

@@ -316,6 +316,8 @@ async def _serialize_version_history_entry(
         "merged_count": merged_count,
         "merged_task_count": merged_task_count,
         "acceptance_aggregate": acceptance_aggregate,
+        # Same shape as current_version. total/covered/partial/uncovered count
+        # active criteria only; inactive audit rows may still appear in criteria.
         "criterion_coverage": criterion_coverage,
     }
 
@@ -721,10 +723,11 @@ async def get_version_lifecycle(
                 # tasks; the UI can show a "showing N of total" indicator.
                 "tasks_merged_has_more": tasks_merged_has_more,
                 # Version-scoped acceptance criterion coverage (additive; nullable
-                # when the signal could not be computed). Shape:
-                # {total, covered, partial, uncovered, criteria:[{criterion_key,
-                # text, coverage, evidence_count}]}. total=0 with empty criteria
-                # list when no criteria are defined.
+                # when the signal could not be computed). Active totals are kept
+                # separate from the audit trail: total/covered/partial/uncovered
+                # count active criteria only, while inactive criteria can still
+                # appear in criteria with status=retracted|superseded and
+                # inactive lifecycle counts.
                 "criterion_coverage": criterion_coverage,
             }
 

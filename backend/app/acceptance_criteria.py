@@ -131,10 +131,28 @@ async def count_criteria_for_version(
     session: AsyncSession,
     release_version_id: uuid.UUID,
 ) -> int:
-    """Return the count of acceptance criteria for a release version."""
+    """Return the count of acceptance criteria for a release version (all statuses)."""
     result = await session.execute(
         select(func.count()).where(
             VersionAcceptanceCriterion.release_version_id == release_version_id
+        )
+    )
+    return result.scalar_one()
+
+
+async def count_active_criteria_for_version(
+    session: AsyncSession,
+    release_version_id: uuid.UUID,
+) -> int:
+    """Return the count of ACTIVE acceptance criteria for a release version.
+
+    Retracted and superseded rows are excluded so the authoring cap only
+    counts criteria that still participate in the qualification gate.
+    """
+    result = await session.execute(
+        select(func.count()).where(
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.status == "active",
         )
     )
     return result.scalar_one()
@@ -241,6 +259,36 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     if any(_evidence_proves_covered(e) for e in evidence):
         return "covered"
     return "partial"
+
+
+async def filter_active_criterion_keys(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    keys: list[str],
+    release_version_id: uuid.UUID | None = None,
+) -> list[str]:
+    """Return only the criterion keys from *keys* whose status is 'active'.
+
+    Retracted and superseded keys are excluded so they cannot propagate into
+    newly spawned tasks and record fresh evidence against inactive criteria.
+    When *release_version_id* is supplied, the lookup is also scoped to that
+    version so stale keys from a closed version cannot leak into a new task.
+    """
+    if not keys:
+        return []
+    conditions = [
+        VersionAcceptanceCriterion.project_id == project_id,
+        VersionAcceptanceCriterion.criterion_key.in_(keys),
+        VersionAcceptanceCriterion.status == "active",
+    ]
+    if release_version_id is not None:
+        conditions.append(
+            VersionAcceptanceCriterion.release_version_id == release_version_id
+        )
+    result = await session.execute(
+        select(VersionAcceptanceCriterion.criterion_key).where(*conditions)
+    )
+    return list(result.scalars().all())
 
 
 async def get_criteria_by_keys(
@@ -486,6 +534,8 @@ async def get_version_coverage_summary(
             'partial': N,
             'uncovered': N,
             'retracted': N,
+            'superseded': N,
+            'inactive': N,
             'stuck_count': N,
             'criteria': [
                 {
@@ -500,16 +550,18 @@ async def get_version_coverage_summary(
             ],
         }
 
-    ``stuck_reason`` is only non-``None`` for *uncovered* criteria that have no
-    active Direction mapping (see :func:`_classify_stuck_reasons`); covered and
-    partial criteria always carry ``None``. ``stuck_count`` is the number of
-    uncovered criteria whose ``stuck_reason`` is non-``None`` — i.e. criteria
-    that need direction remapping or operator attestation to ever become
-    covered. These fields are strictly additive; the pre-existing keys are
-    unchanged.
+    ``total`` and the coverage buckets count active criteria only. Inactive rows
+    remain in ``criteria`` for audit, with ``retracted``/``superseded`` split by
+    lifecycle status and ``inactive`` carrying their aggregate. ``stuck_reason``
+    is only non-``None`` for *uncovered* active criteria that have no active
+    Direction mapping (see :func:`_classify_stuck_reasons`); covered, partial,
+    and inactive criteria always carry ``None``. ``stuck_count`` is the number
+    of uncovered active criteria whose ``stuck_reason`` is non-``None`` — i.e.
+    criteria that need direction remapping or operator attestation to ever
+    become covered.
     """
     counts: dict[str, int] = {"covered": 0, "partial": 0, "uncovered": 0}
-    retracted_count = 0
+    inactive_counts: dict[str, int] = {"retracted": 0, "superseded": 0}
     criteria_detail = []
 
     result = await session.execute(
@@ -541,7 +593,9 @@ async def get_version_coverage_summary(
         if criterion.status == "active":
             counts[coverage] += 1
         else:
-            retracted_count += 1
+            inactive_counts[criterion.status] = (
+                inactive_counts.get(criterion.status, 0) + 1
+            )
 
     # Diagnose uncovered criteria: which ones are stuck (no active direction) vs.
     # merely in-progress. project_id is derived from a loaded criterion row —
@@ -580,7 +634,9 @@ async def get_version_coverage_summary(
         "covered": counts["covered"],
         "partial": counts["partial"],
         "uncovered": counts["uncovered"],
-        "retracted": retracted_count,
+        "retracted": inactive_counts["retracted"],
+        "superseded": inactive_counts["superseded"],
+        "inactive": sum(inactive_counts.values()),
         "stuck_count": stuck_count,
         "criteria": criteria_detail,
     }

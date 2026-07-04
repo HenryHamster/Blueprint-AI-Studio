@@ -3641,6 +3641,46 @@ describe('VersionLifecyclePanel', () => {
       expect(screen.getByTestId('criterion-row-k3')).toBeInTheDocument();
     });
 
+    it('renders inactive criterion audit rows from current_version criterion_coverage when active total is zero', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 0,
+        covered: 0,
+        partial: 0,
+        uncovered: 0,
+        retracted: 1,
+        superseded: 0,
+        inactive: 1,
+        criteria: [
+          {
+            criterion_key: 'inactive-k1',
+            text: 'Retracted criterion remains visible',
+            coverage: 'uncovered',
+            status: 'retracted',
+            evidence_count: 0,
+          },
+        ],
+      };
+      const TASKS: api.ChangelogEntry[] = [
+        { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+      ];
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(
+        <VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />
+      );
+
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+      expect(await screen.findByTestId('criterion-row-inactive-k1')).toHaveTextContent('Retracted criterion remains visible');
+      expect(screen.getByTestId('criterion-status-inactive-k1')).toHaveTextContent('retracted');
+      expect(screen.queryByText('No acceptance criteria defined for this version.')).not.toBeInTheDocument();
+    });
+
     it('does not render criterion coverage panel when criterion_coverage is null', async () => {
       const TASKS: api.ChangelogEntry[] = [
         { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },

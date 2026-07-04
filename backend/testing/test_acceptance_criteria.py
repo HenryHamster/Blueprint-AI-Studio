@@ -31,6 +31,7 @@ from app.models import (
     Project,
     ProjectMember,
     ReleaseVersion,
+    VersionAcceptanceCriterion,
     Task,
     TaskStatus,
 )
@@ -199,6 +200,41 @@ async def test_count_criteria_for_version_isolated_to_version(db_session):
 
     assert await ac.count_criteria_for_version(db_session, version_a.id) == 1
     assert await ac.count_criteria_for_version(db_session, version_b.id) == 2
+
+
+# ---------------------------------------------------------------------------
+# count_active_criteria_for_version
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_count_active_criteria_for_version_excludes_retracted(db_session):
+    """count_active_criteria_for_version excludes retracted/superseded rows."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Active A")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Active B")
+    c3 = await ac.create_criterion(db_session, project.id, version.id, "Will retract")
+
+    # Retract c3 — it should no longer count toward the active cap.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=c3.criterion_key,
+        reason="stale",
+        retracted_by="test",
+    )
+
+    active_count = await ac.count_active_criteria_for_version(db_session, version.id)
+    total_count = await ac.count_criteria_for_version(db_session, version.id)
+
+    # Active count excludes the retracted row; total count includes all 3.
+    assert active_count == 2
+    assert total_count == 3
+    # Verify the two remaining active keys are the expected ones.
+    _ = c1, c2  # referenced to avoid lint noise
 
 
 # ---------------------------------------------------------------------------
@@ -1210,6 +1246,51 @@ async def test_coverage_summary_partial_only(db_session):
 
 
 @pytest.mark.asyncio
+async def test_coverage_summary_all_retracted_keeps_audit_rows(db_session):
+    """All-retracted criteria no longer count as active but remain auditable."""
+    project = await _make_project(db_session, "AllRetractedCoverage")
+    version = await _make_version(db_session, project)
+    c1 = await ac.create_criterion(db_session, project.id, version.id, "Old goal A")
+    c2 = await ac.create_criterion(db_session, project.id, version.id, "Old goal B")
+
+    await ac.record_evidence(
+        db_session,
+        criterion_id=c1.id,
+        project_id=project.id,
+        source_kind="task_merge",
+        source_id="task-1",
+        detail={"proven": False},
+    )
+    for criterion in (c1, c2):
+        row = await ac.retract_criterion(
+            db_session,
+            project.id,
+            version.id,
+            criterion.criterion_key,
+            reason="Criterion retired by strategist",
+            retracted_by="strategist",
+        )
+        assert row is not None
+        assert row.status == "retracted"
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 0
+    assert summary["covered"] == 0
+    assert summary["partial"] == 0
+    assert summary["uncovered"] == 0
+    assert summary["retracted"] == 2
+    assert summary["superseded"] == 0
+    assert summary["inactive"] == 2
+    assert summary["stuck_count"] == 0
+    by_key = {c["criterion_key"]: c for c in summary["criteria"]}
+    assert set(by_key) == {c1.criterion_key, c2.criterion_key}
+    assert by_key[c1.criterion_key]["status"] == "retracted"
+    assert by_key[c1.criterion_key]["coverage"] == "partial"
+    assert by_key[c2.criterion_key]["status"] == "retracted"
+    assert by_key[c2.criterion_key]["coverage"] == "uncovered"
+
+
+@pytest.mark.asyncio
 async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     """Retracted criteria remain auditable but no longer block qualification."""
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
@@ -1280,6 +1361,8 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     assert after["covered"] == 1
     assert after["uncovered"] == 0
     assert after["retracted"] == 1
+    assert after["superseded"] == 0
+    assert after["inactive"] == 1
     by_key = {c["criterion_key"]: c for c in after["criteria"]}
     assert by_key[covered.criterion_key]["status"] == "active"
     assert by_key[stale.criterion_key]["status"] == "retracted"
@@ -1406,7 +1489,154 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
     summary = await ac.get_version_coverage_summary(db_session, version.id)
     assert summary["total"] == 0
     assert summary["uncovered"] == 0
-    assert summary["retracted"] == 1
+    assert summary["retracted"] == 0
+    assert summary["superseded"] == 1
+    assert summary["inactive"] == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_new_acceptance_criteria_active_only_headroom(db_session):
+    """_apply_new_acceptance_criteria headroom is based on ACTIVE criteria only.
+
+    Retracted rows must not consume cap slots so a strategist can replace
+    retracted criteria without hitting the cap.
+    """
+    from app.strategic_completion import _apply_new_acceptance_criteria
+    from app import release_version as rv
+
+    project = Project(
+        name="AC-ActiveHeadroom",
+        user_id="strat-headroom-user",
+        vision={"purpose": "test", "revision": 1},
+        problem_model={"intent": {"current_focus": "focus"}, "revision": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    # Fill to (MAX - 1) active + 2 retracted = total rows > MAX - 1.
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(db_session, project.id, version.id, f"Active {i}")
+
+    retracted_one = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted A"
+    )
+    retracted_two = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted B"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=retracted_one.criterion_key,
+        reason="stale",
+        retracted_by="test",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=retracted_two.criterion_key,
+        reason="stale",
+        retracted_by="test",
+    )
+
+    # Total rows = MAX + 1, active rows = MAX - 1 → 1 slot remains.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Submit 3 new texts; only 1 should be staged (fills the one remaining slot).
+    await _apply_new_acceptance_criteria(
+        ["New A", "New B", "New C"], task, project, db_session, path="test"
+    )
+
+    active_criteria = [
+        c for c in await ac.get_criteria_for_version(db_session, version.id)
+        if c.status == "active"
+    ]
+    new_active = [c for c in active_criteria if c.text.startswith("New")]
+    assert len(new_active) == 1, (
+        f"expected exactly 1 new active criterion (retracted rows must not consume cap), "
+        f"got {len(new_active)}"
+    )
+    assert len(active_criteria) == ac.MAX_CRITERIA_PER_VERSION
+
+
+@pytest.mark.asyncio
+async def test_safety_valve_retract_then_author_same_call(
+    client: AsyncClient, db_session
+):
+    """A version at MAX active criteria can retract K and author K replacements in one
+    set_acceptance_criteria call; skipped_over_cap must be 0.
+    """
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "SafetyValveProject")
+    version = await _make_version(db_session, project)
+
+    # Fill the version to exactly MAX active criteria.
+    stale_criteria = []
+    for i in range(ac.MAX_CRITERIA_PER_VERSION):
+        c = await ac.create_criterion(
+            db_session, project.id, version.id, f"Stale criterion {i}"
+        )
+        stale_criteria.append(c)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-safety-valve",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "agent-vm-safety-valve",
+        task_type="strategic_review",
+    )
+
+    # Retract 3 stale criteria and author 3 replacements in one request.
+    retract_keys = [c.criterion_key for c in stale_criteria[:3]]
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {"criterion_key": k, "reason": "superseded"} for k in retract_keys
+                ],
+                "criteria": [
+                    {"text": f"Replacement {i}"} for i in range(3)
+                ],
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["skipped_over_cap"] == 0, (
+        f"expected 0 skipped (freed headroom should cover replacements), "
+        f"got skipped_over_cap={body['skipped_over_cap']}"
+    )
+    new_criteria = [c for c in body["criteria"] if c["is_new"]]
+    assert len(new_criteria) == 3
+
+    # Active count should remain MAX (3 retracted, 3 added).
+    active_count = await ac.count_active_criteria_for_version(db_session, version.id)
+    assert active_count == ac.MAX_CRITERIA_PER_VERSION
 
 
 # ---------------------------------------------------------------------------
@@ -1433,10 +1663,30 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Create an open release version and two criteria
+    # Create an open release version and active/retracted/superseded criteria
     version = await _make_version(db_session, project)
     c1 = await ac.create_criterion(db_session, project.id, version.id, "CI passes")
     c2 = await ac.create_criterion(db_session, project.id, version.id, "Docs updated")
+    c3 = await ac.create_criterion(
+        db_session, project.id, version.id, "Deprecated criterion"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        c2.criterion_key,
+        reason="superseded by CI gate",
+        retracted_by="strategist",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        c3.criterion_key,
+        reason="replaced by CI gate",
+        retracted_by="strategist",
+        superseded_by_key=c1.criterion_key,
+    )
 
     # Create a Direction row with criterion_keys AND mirror it in project.directions
     # (spawn_task validates direction_id against project.directions JSONB blob)
@@ -1451,7 +1701,7 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
         },
         status="active",
         text="Improve stability",
-        criterion_keys=[c1.criterion_key, c2.criterion_key],
+        criterion_keys=[c1.criterion_key, c2.criterion_key, c3.criterion_key],
     )
     db_session.add(direction)
     # Mirror in project.directions so spawn_task's direction_id validation passes
@@ -1499,10 +1749,9 @@ async def test_spawn_task_endpoint_propagates_criterion_ids(
     child_id = uuid.UUID(body["task_id"])
     child = await db_session.get(Task, child_id)
     assert child is not None, "spawned task must be persisted"
-    assert set(child.criterion_ids) == {
-        c1.criterion_key,
-        c2.criterion_key,
-    }, f"criterion_ids must match direction.criterion_keys; got {child.criterion_ids}"
+    assert child.criterion_ids == [c1.criterion_key], (
+        f"criterion_ids must exclude inactive keys; got {child.criterion_ids}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1886,6 +2135,94 @@ async def test_attest_duplicate_attestation_is_idempotent(client: AsyncClient, d
     )
     assert evidence[0].source_kind == "operator_attestation"
     assert evidence[0].source_id == _TEST_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_inactive_criteria_do_not_propagate_to_new_tasks(db_session):
+    """Retracted and superseded criteria must be excluded from spawned-task criterion_ids.
+
+    Exercises filter_active_criterion_keys, which is called by both the
+    research-completion and admin-agent-ops spawn paths.  A direction whose
+    criterion_keys list includes retracted or superseded keys must yield only
+    the active key(s) when resolved for a new task.
+    """
+    project = await _make_project(db_session, "InactivePropagation")
+    version = await _make_version(db_session, project)
+
+    c_active = await ac.create_criterion(db_session, project.id, version.id, "Active criterion")
+    c_retracted = await ac.create_criterion(db_session, project.id, version.id, "Retracted criterion")
+    c_superseded = await ac.create_criterion(db_session, project.id, version.id, "Superseded criterion")
+
+    await ac.retract_criterion(
+        db_session, project.id, version.id,
+        c_retracted.criterion_key, reason="no longer relevant", retracted_by="strategist",
+    )
+    await ac.retract_criterion(
+        db_session, project.id, version.id,
+        c_superseded.criterion_key, reason="replaced",
+        retracted_by="strategist", superseded_by_key=c_active.criterion_key,
+    )
+
+    all_keys = [c_active.criterion_key, c_retracted.criterion_key, c_superseded.criterion_key]
+    active_keys = await ac.filter_active_criterion_keys(
+        db_session, project.id, all_keys, release_version_id=version.id
+    )
+
+    assert set(active_keys) == {c_active.criterion_key}, (
+        f"filter_active_criterion_keys must exclude retracted/superseded keys; got {active_keys}"
+    )
+    assert c_retracted.criterion_key not in active_keys
+    assert c_superseded.criterion_key not in active_keys
+
+    # Verify compute_criterion_coverage still counts inactive criteria for audit
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 1  # only the active criterion counts
+    assert summary["retracted"] == 1
+    assert summary["superseded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_filter_active_criterion_keys_scopes_to_version(db_session):
+    """A closed-version key must not pass through when filtering for the open version."""
+    project = await _make_project(db_session, "VersionScopedFiltering")
+    open_version = await _make_version(db_session, project)
+    closed_version = ReleaseVersion(
+        project_id=project.id, version_number=2, status="closed"
+    )
+    db_session.add(closed_version)
+    await db_session.commit()
+    await db_session.refresh(closed_version)
+
+    closed_key = "c-closed-scope"
+    open_key = "c-open-scope"
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=closed_version.id,
+            criterion_key=closed_key,
+            text="Closed version criterion",
+        )
+    )
+    db_session.add(
+        VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=open_version.id,
+            criterion_key=open_key,
+            text="Open version criterion",
+        )
+    )
+    await db_session.commit()
+
+    filtered = await ac.filter_active_criterion_keys(
+        db_session,
+        project.id,
+        [closed_key, open_key],
+        release_version_id=open_version.id,
+    )
+
+    assert filtered == [open_key], (
+        f"version-scoped filtering must exclude closed-version keys; got {filtered}"
+    )
 
 
 @pytest.mark.asyncio

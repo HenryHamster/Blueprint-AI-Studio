@@ -361,6 +361,42 @@ describe('VersionSummaryPanel — viewport regression', () => {
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
   });
 
+  test('all-retracted criterion coverage renders audit rows instead of no-criteria empty state', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 0,
+      covered: 0,
+      partial: 0,
+      uncovered: 0,
+      retracted: 2,
+      superseded: 0,
+      inactive: 2,
+      criteria: [
+        { criterion_key: 'crit-old-a', text: 'Old acceptance target A', coverage: 'uncovered', status: 'retracted', evidence_count: 0 },
+        { criterion_key: 'crit-old-b', text: 'Old acceptance target B', coverage: 'partial', status: 'retracted', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+
+    const panel = host.querySelector('[data-testid="criterion-coverage-panel"]');
+    if (panel === null) throw new Error('Expected criterion coverage panel');
+    const text = panel.textContent ?? '';
+    if (text.includes('No acceptance criteria defined')) {
+      throw new Error('All-retracted coverage must render audit rows, not the no-criteria empty state');
+    }
+    expect(text).toContain('0 active criteria');
+    expect(text).toContain('2 inactive');
+    expect(host.querySelector('[data-testid="criterion-row-crit-old-a"]')?.textContent).toContain('Old acceptance target A');
+    expect(host.querySelector('[data-testid="criterion-status-crit-old-a"]')?.textContent).toBe('retracted');
+    expect(host.querySelector('[data-testid="criterion-row-crit-old-b"]')?.textContent).toContain('Old acceptance target B');
+    expect(host.querySelector('[data-testid="criterion-status-crit-old-b"]')?.textContent).toBe('retracted');
+  });
+
   // ── stuck-criterion diagnosis ───────────────────────────────────────────────
 
   test('stuck_count badge renders when stuck_count > 0', async () => {

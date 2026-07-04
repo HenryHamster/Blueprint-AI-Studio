@@ -3494,6 +3494,19 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # task would inherit no criterion_ids even though its direction has some.
     # Best-effort: a lookup failure leaves that direction absent from the cache.
     _direction_criterion_cache: dict[str, list[str]] = {}
+    _criterion_release_version_id = None
+    try:
+        from app.release_version import current_open_version as _current_open_version
+
+        _open_version = await _current_open_version(session, task.project_id)
+        if _open_version is not None:
+            _criterion_release_version_id = _open_version.id
+    except Exception:
+        logger.debug(
+            "[RESEARCH] open version lookup failed for project %s; "
+            "criterion cache will stay version-unscoped",
+            task.project_id,
+        )
     _dirs_to_prefetch: set[str] = set()
     if _parent_direction_id:
         _dirs_to_prefetch.add(_parent_direction_id)
@@ -3509,9 +3522,17 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 try:
                     _pf_row = await _get_dir_row(session, task.project_id, _pf_dir_id)
                     if _pf_row is not None and _pf_row.criterion_keys:
-                        _direction_criterion_cache[_pf_dir_id] = list(
-                            _pf_row.criterion_keys
+                        from app.acceptance_criteria import (
+                            filter_active_criterion_keys as _filter_active,
                         )
+                        _active_keys = await _filter_active(
+                            session,
+                            task.project_id,
+                            list(_pf_row.criterion_keys),
+                            release_version_id=_criterion_release_version_id,
+                        )
+                        if _active_keys:
+                            _direction_criterion_cache[_pf_dir_id] = _active_keys
                 except Exception:
                     logger.debug(
                         "[RESEARCH] criterion_keys lookup failed for direction %s",

@@ -14979,6 +14979,37 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         text="All endpoints documented",
         created_by="strategist",
     )
+    inactive = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Deprecated endpoint docs",
+        created_by="strategist",
+    )
+    superseded = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Superseded endpoint docs",
+        created_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        inactive.criterion_key,
+        reason="superseded",
+        retracted_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        superseded.criterion_key,
+        reason="replaced",
+        retracted_by="strategist",
+        superseded_by_key=criterion.criterion_key,
+    )
 
     # Create a Direction ORM row with criterion_keys set (as the link-direction
     # endpoint would produce).
@@ -14987,7 +15018,11 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
         direction_key=direction_id,
         data=direction_data,
         status="active",
-        criterion_keys=[criterion.criterion_key],
+        criterion_keys=[
+            criterion.criterion_key,
+            inactive.criterion_key,
+            superseded.criterion_key,
+        ],
     )
     db_session.add(dir_row)
     await db_session.commit()
@@ -15037,7 +15072,7 @@ async def test_criterion_ids_propagated_from_parent_direction(db_session, mocker
     assert len(children) == 1, "expected exactly one spawned child task"
     child = children[0]
     assert child.criterion_ids == [criterion.criterion_key], (
-        f"spawned task must inherit criterion_ids from parent direction; "
+        f"spawned task must inherit only active criterion_ids from parent direction; "
         f"got {child.criterion_ids!r}"
     )
 
@@ -15080,12 +15115,47 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
         text="Child direction criterion",
         created_by="strategist",
     )
+    inactive = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Deprecated child direction criterion",
+        created_by="strategist",
+    )
+    superseded = await _ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Superseded child direction criterion",
+        created_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        inactive.criterion_key,
+        reason="superseded",
+        retracted_by="strategist",
+    )
+    await _ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        superseded.criterion_key,
+        reason="replaced",
+        retracted_by="strategist",
+        superseded_by_key=criterion.criterion_key,
+    )
     child_dir_row = _Direction(
         project_id=project.id,
         direction_key=child_dir_id,
         data=child_direction_data,
         status="active",
-        criterion_keys=[criterion.criterion_key],
+        criterion_keys=[
+            criterion.criterion_key,
+            inactive.criterion_key,
+            superseded.criterion_key,
+        ],
     )
     # Parent direction has NO criterion_keys.
     parent_dir_row = _Direction(
@@ -15145,8 +15215,8 @@ async def test_criterion_ids_propagated_from_finding_direction(db_session, mocke
     assert len(children) == 1, "expected exactly one spawned child task"
     child = children[0]
     assert child.criterion_ids == [criterion.criterion_key], (
-        f"spawned task must inherit criterion_ids from the finding's direction "
-        f"(cross-direction); got {child.criterion_ids!r}"
+        f"spawned task must inherit only active criterion_ids from the finding's "
+        f"direction (cross-direction); got {child.criterion_ids!r}"
     )
 
 

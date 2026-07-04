@@ -227,6 +227,59 @@ async def test_create_criterion_per_version_cap(client: AsyncClient, db_session)
     assert resp.status_code == 409, f"expected 409 cap enforcement, got {resp.status_code}: {resp.text}"
 
 
+@pytest.mark.asyncio
+async def test_cap_counts_only_active_criteria(client: AsyncClient, db_session):
+    """Retracted criteria do not count toward the cap; a version at cap with some
+    retracted rows can still accept new active criteria via the operator endpoint."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    # Fill to (cap - 1) with active criteria, plus 1 extra that we then retract.
+    # Total rows = cap, but active rows = cap - 1, so there is still one slot.
+    for i in range(ac.MAX_CRITERIA_PER_VERSION - 1):
+        await ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text=f"Active {i}",
+        )
+    to_retract = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Will be retracted",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=to_retract.criterion_key,
+        reason="superseded by new work",
+        retracted_by="test",
+    )
+
+    # Total rows = MAX_CRITERIA_PER_VERSION; active rows = MAX_CRITERIA_PER_VERSION - 1.
+    # The endpoint should allow one more active criterion.
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={"text": "Replacement criterion"},
+    )
+    assert resp.status_code == 200, (
+        f"expected 200 (retracted rows should not block cap), got {resp.status_code}: {resp.text}"
+    )
+    data = resp.json()
+    assert data["criterion_key"].startswith("c-")
+
+    # Now we are exactly at the active cap — a further create should be rejected.
+    resp2 = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria",
+        json={"text": "One too many"},
+    )
+    assert resp2.status_code == 409, (
+        f"expected 409 after active cap reached, got {resp2.status_code}: {resp2.text}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /api/admin/projects/{project_id}/acceptance-criteria/link-direction
 # ---------------------------------------------------------------------------
