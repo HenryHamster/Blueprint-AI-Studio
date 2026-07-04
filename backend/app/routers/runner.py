@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from pydantic import BaseModel, StrictBool
+from pydantic import BaseModel, StrictBool, StrictStr
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -157,6 +157,13 @@ class HeartbeatRequest(BaseModel):
     active_task_ids: List[str] = []
     active_compute_job_ids: List[str] = []
     agent_available: Optional[StrictBool] = None
+    # Runner-DECLARED agent capability floor (optional; old runners omit it). A
+    # docker-only runner (docker+image, NO bwrap) can run only the read-only agent
+    # slice and declares those types here so the orchestrator intersects them with
+    # the operator-configured `task_types` ceiling. This is a runner CAPABILITY,
+    # distinct from operator config — the handler stores it under a separate caps key
+    # and never touches `task_types`.
+    supported_agent_task_types: list[StrictStr] | None = None
     hostname: Optional[str] = None
     version: Optional[str] = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
@@ -291,6 +298,13 @@ async def heartbeat(
     # operator-configured fields (task_types, max_concurrent).
     if payload.agent_available is not None:
         caps["agent_available"] = payload.agent_available
+    # Runner-DECLARED agent capability floor. Stored under its own caps key so the
+    # orchestrator can intersect it with the operator-configured `task_types`
+    # ceiling. CRITICAL: this is a runner capability, NOT operator config — we never
+    # write `task_types` here (that stays operator-owned; see the invariant below).
+    # Tolerated as absent so older runners keep heartbeating unchanged.
+    if payload.supported_agent_task_types is not None:
+        caps["supported_agent_task_types"] = list(payload.supported_agent_task_types)
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:

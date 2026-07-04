@@ -360,6 +360,56 @@ def test_parse_heartbeat_timestamp_tolerates_bad_input():
     assert _parse_heartbeat_timestamp("2026-07-02T12:00:00+02:00") == parsed
 
 
+def _snapshot(caps: dict) -> "orch.RunnerDispatchSnapshot":
+    """A minimal dispatch snapshot carrying just the capabilities under test."""
+    return orch.RunnerDispatchSnapshot(
+        id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities=caps
+    )
+
+
+def test_runner_handles_task_type_intersects_operator_policy_and_runner_floor():
+    """`_runner_handles_task_type` intersects the operator policy CEILING with the
+    runner-declared agent-capability FLOOR (`supported_agent_task_types`).
+
+    A docker-only runner declares only the read-only agent slice; a write/heavy
+    agent type must NOT dispatch there even though the operator policy is "all".
+    """
+    read_only = ["research", "plan", "review", "design"]
+
+    # Runner declared the read-only slice under an "all" operator policy.
+    docker_only = _snapshot(
+        {"task_types": "all", "supported_agent_task_types": read_only}
+    )
+    # A read-only agent type is in the floor → handled.
+    assert orch._runner_handles_task_type(docker_only, "research") is True
+    # A WRITE/heavy agent type is NOT in the floor → declined (the whole point).
+    assert orch._runner_handles_task_type(docker_only, "create") is False
+    assert orch._runner_handles_task_type(docker_only, "smoketest") is False
+
+    # compute_experiment is a COMPUTE-class task (different backend) → never gated
+    # by the agent-only floor, so a docker-only runner still handles it.
+    assert orch._runner_handles_task_type(docker_only, "compute_experiment") is True
+
+    # Absent floor (older runner / bwrap box) → no extra restriction: any type the
+    # operator policy allows is handled.
+    no_floor = _snapshot({"task_types": "all"})
+    assert orch._runner_handles_task_type(no_floor, "create") is True
+    assert orch._runner_handles_task_type(no_floor, "research") is True
+    # Explicit None floor behaves identically to absent.
+    null_floor = _snapshot(
+        {"task_types": "all", "supported_agent_task_types": None}
+    )
+    assert orch._runner_handles_task_type(null_floor, "create") is True
+
+    # Operator policy remains the CEILING: a type outside the operator allowlist is
+    # declined even if the runner floor would permit it.
+    policy_limited = _snapshot(
+        {"task_types": ["research"], "supported_agent_task_types": read_only}
+    )
+    assert orch._runner_handles_task_type(policy_limited, "research") is True
+    assert orch._runner_handles_task_type(policy_limited, "review") is False
+
+
 # ── Admin endpoints ──────────────────────────────────────────────────────────
 
 
@@ -1503,6 +1553,51 @@ class TestRunnerEndpoints:
         # has_gpu persists from the previous heartbeat.
         assert runner.capabilities["has_gpu"] is True
         assert runner.capabilities["active_task_ids"] == ["x"]
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_stores_runner_declared_supported_agent_task_types(
+        self, client: AsyncClient, db_session
+    ):
+        """A docker-only runner DECLARES supported_agent_task_types; the handler
+        stores it under its own caps key WITHOUT clobbering the operator-configured
+        `task_types` ceiling, and tolerates its absence on older runners.
+        """
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(
+            db_session,
+            project.id,
+            capabilities={"task_types": "all", "max_concurrent": 4},
+        )
+
+        read_only_slice = ["design", "plan", "research", "review"]
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "active_task_ids": [],
+                "agent_available": True,
+                "supported_agent_task_types": read_only_slice,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        # Runner-declared capability stored under its OWN key.
+        assert runner.capabilities["supported_agent_task_types"] == read_only_slice
+        # Operator-configured CEILING must NOT be clobbered (the core invariant).
+        assert runner.capabilities["task_types"] == "all"
+        assert runner.capabilities["max_concurrent"] == 4
+
+        # Backward-compat: omitting it in a later heartbeat must not wipe the stored
+        # value (an older runner that never advertises it keeps heartbeating).
+        resp2 = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": ["x"]},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.capabilities["supported_agent_task_types"] == read_only_slice
+        assert runner.capabilities["task_types"] == "all"
 
     @pytest.mark.asyncio
     async def test_heartbeat_rejects_malformed_boolean_capabilities(

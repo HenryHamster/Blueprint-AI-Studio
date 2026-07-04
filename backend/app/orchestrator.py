@@ -509,14 +509,49 @@ class RunnerDispatchSnapshot(NamedTuple):
 def _runner_handles_task_type(
     runner: LocalRunner | RunnerDispatchSnapshot, task_type: str
 ) -> bool:
-    """Whether a runner's declared capabilities cover this task type."""
-    task_types = (runner.capabilities or {}).get("task_types", "all")
+    """Whether a runner covers this task type, honoring BOTH policy and capability.
+
+    Two independent gates, intersected:
+
+    * **Operator policy (ceiling)** — ``capabilities['task_types']`` is
+      operator-configured (``"all"`` or an allowlist). It is the maximum set the
+      operator permits this runner to serve.
+    * **Runner-declared capability (floor)** — ``capabilities['supported_agent_task_types']``
+      is advertised by the runner itself over the heartbeat: a docker-only box
+      (docker+image, no bwrap) declares the read-only agent slice it can actually
+      run. When present (not None), an AGENT task type must also appear in it, so
+      the orchestrator never pins a write/heavy type this box would decline after
+      dispatch. Absent/None → no extra restriction (backward compatible with
+      runners that never advertise it).
+
+    ``compute_experiment`` is a COMPUTE-class task fulfilled by a different backend
+    (the runner's ``decide_compute_backend``, not the agent path), so the
+    agent-only floor never applies to it — a docker-only runner still handles
+    compute jobs. This mirrors the ``task_type == "compute_experiment"`` carve-out
+    the caller already applies to ``_runner_agent_available``.
+    """
+    caps = runner.capabilities or {}
+    task_types = caps.get("task_types", "all")
     if task_types == "all":
-        return True
-    if isinstance(task_types, (list, tuple, set)):
-        return task_type in task_types
-    # Malformed capability shape — be conservative and treat as no-cover.
-    return False
+        policy_ok = True
+    elif isinstance(task_types, (list, tuple, set)):
+        policy_ok = task_type in task_types
+    else:
+        # Malformed capability shape — be conservative and treat as no-cover.
+        policy_ok = False
+    if not policy_ok:
+        return False
+
+    # Runner-declared agent-capability floor. Only constrains AGENT task types;
+    # compute_experiment is exempt (handled by the compute backend, not the agent).
+    supported_agent = caps.get("supported_agent_task_types")
+    if (
+        supported_agent is not None
+        and task_type != "compute_experiment"
+        and isinstance(supported_agent, (list, tuple, set))
+    ):
+        return task_type in supported_agent
+    return True
 
 
 def _runner_active_task_count(runner: LocalRunner | RunnerDispatchSnapshot) -> int:
