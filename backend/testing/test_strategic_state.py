@@ -47,6 +47,7 @@ from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
     sanitize_strategic_session_snapshot,
+    sanitize_workbench_state,
 )
 from app.workbench_events import SURFACE_MESSAGES, SURFACE_RUNTIME, SURFACE_STRATEGIC_SESSION
 from app.work_session_command_execution import OPERATOR_COMMAND_EVENT_TYPE
@@ -123,6 +124,59 @@ def _assert_curated_metric_provenance(metrics: dict[str, dict]) -> None:
         provenance = metrics[metric_id]["provenance"]
         assert provenance["surface"] == surface
         assert provenance["path"] == path
+
+
+def test_workbench_state_accepts_only_chat_and_continuous():
+    """The interaction vocabulary is collapsed to chat + continuous; the
+    sanitizer accepts those two and coerces any retired / unknown value to chat
+    (never crashes on legacy data)."""
+    assert sanitize_workbench_state({"interaction_mode": "chat"}, touch=False)[
+        "interaction_mode"
+    ] == "chat"
+    assert sanitize_workbench_state({"interaction_mode": "continuous"}, touch=False)[
+        "interaction_mode"
+    ] == "continuous"
+    # Retired modes tolerated on read -> coerced to chat.
+    for legacy in ("check_in", "monitor", "totally_unknown"):
+        assert sanitize_workbench_state({"interaction_mode": legacy}, touch=False)[
+            "interaction_mode"
+        ] == "chat"
+
+
+def test_session_snapshot_coerces_retired_interaction_modes_to_chat():
+    """The per-message snapshot sanitizer also coerces legacy check_in / monitor
+    to chat so an old snapshot never surfaces a retired mode."""
+    for legacy in ("check_in", "monitor"):
+        snapshot = sanitize_strategic_session_snapshot({"interaction_mode": legacy})
+        assert snapshot["interaction_mode"] == "chat"
+    assert (
+        sanitize_strategic_session_snapshot({"interaction_mode": "continuous"})[
+            "interaction_mode"
+        ]
+        == "continuous"
+    )
+
+
+def test_mode_collapse_migration_rewrites_legacy_modes_to_chat():
+    """The 0367 migration rewrites any persisted check_in / monitor workbench
+    mode to chat in messagesnoiseprefs (JSONB), chained off 0366. DB-free shape
+    check (per CLAUDE.md) — the applied transform is exercised by the DB suite."""
+    import pathlib
+
+    migration = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "alembic"
+        / "versions"
+        / "0367_collapse_strategic_interaction_modes.py"
+    ).read_text()
+    assert 'revision = "0367"' in migration
+    assert 'down_revision = "0366"' in migration
+    assert "messagesnoiseprefs" in migration
+    # Targets the nested workbench interaction_mode and sets it to "chat".
+    assert "{_strategic_workbench,interaction_mode}" in migration
+    assert '\'"chat"\'::jsonb' in migration
+    # Filters exactly the two retired modes.
+    assert "'check_in', 'monitor'" in migration
 
 
 def test_strategic_session_snapshot_preserves_canonical_context_target_fields():
@@ -1667,7 +1721,7 @@ async def test_strategic_state_includes_operator_workbench_state(
             prefs={
                 "_strategic_workbench": {
                     "version": 1,
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {
@@ -1711,7 +1765,7 @@ async def test_strategic_state_includes_operator_workbench_state(
     assert resp.status_code == 200
     workbench = resp.json()["workbench"]
 
-    assert workbench["interaction_mode"] == "check_in"
+    assert workbench["interaction_mode"] == "continuous"
     assert workbench["active_surface"] == "pipeline"
     assert workbench["selected_refs"] == [
         {"kind": "task", "id": str(context_task.id), "label": "Stale task label"},
@@ -1724,7 +1778,7 @@ async def test_strategic_state_includes_operator_workbench_state(
 
     work_session = resp.json()["work_session"]
     assert work_session["version"] == 1
-    assert work_session["mode"] == "check_in"
+    assert work_session["mode"] == "continuous"
     assert work_session["active_surface"] == "pipeline"
     assert work_session["context_package_id"] == f"strategic-context:{project.id}"
     assert work_session["selected_refs"] == [
@@ -2306,7 +2360,7 @@ async def test_strategic_session_create_persists_project_session(
             f"/api/admin/projects/{project.id}/strategic-session",
             json={
                 "workbench": {
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "project",
                     "selected_refs": [
                         {
@@ -2328,12 +2382,12 @@ async def test_strategic_session_create_persists_project_session(
     assert event_payload["refetch"] == {
         "surfaces": [SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME],
     }
-    assert event_payload["workbench"]["interaction_mode"] == "check_in"
+    assert event_payload["workbench"]["interaction_mode"] == "continuous"
     assert event_payload["workbench"]["active_surface"] == "project"
     assert event_payload["workbench"]["arming"] == "steering"
     data = resp.json()
     assert data["arming"] == "steering"
-    assert data["session"]["mode"] == "check_in"
+    assert data["session"]["mode"] == "continuous"
     assert data["session"]["active_surface"] == "project"
     assert data["session"]["selected_refs"] == [
         {
@@ -2353,7 +2407,7 @@ async def test_strategic_session_create_persists_project_session(
             )
         )
     ).scalar_one()
-    assert stored.prefs["_strategic_workbench"]["interaction_mode"] == "check_in"
+    assert stored.prefs["_strategic_workbench"]["interaction_mode"] == "continuous"
     await db_session.refresh(project)
     marker = (project.vision or {})["_strategic_refresh"]
     assert marker["reason"] == "workbench_interaction_mode"
@@ -3138,7 +3192,7 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
         f"/api/admin/projects/{project.id}/strategic-session",
         json={
             "workbench": {
-                "interaction_mode": "monitor",
+                "interaction_mode": "continuous",
                 "active_surface": "pipeline",
                 "selected_refs": [
                     {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -3152,7 +3206,7 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
         "content": "Keep this session pinned to the local Strategic runner.",
         "idempotency_key": "strategic-session-message-1",
         "workbench_context": {
-            "interaction_mode": "monitor",
+            "interaction_mode": "continuous",
             "active_surface": "pipeline",
             "selected_refs": [
                 {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -3209,7 +3263,7 @@ async def test_strategic_session_message_records_operator_message_and_snapshot(
     assert msg.message_type == MessageType.FEEDBACK
     assert msg.idempotency_key == "strategic-session-message-1"
     session_snapshot = (msg.context or {})["strategic_session"]
-    assert session_snapshot["interaction_mode"] == "monitor"
+    assert session_snapshot["interaction_mode"] == "continuous"
     assert session_snapshot["active_surface"] == "pipeline"
     assert session_snapshot["selected_refs"] == [
         {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -3456,7 +3510,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
             prefs={
                 "_strategic_workbench": {
                     "version": 1,
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "continuous",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -3488,7 +3542,7 @@ async def test_strategic_session_message_touches_workbench_freshness(
         )
     ).scalar_one()
     workbench = stored.prefs["_strategic_workbench"]
-    assert workbench["interaction_mode"] == "monitor"
+    assert workbench["interaction_mode"] == "continuous"
     assert workbench["active_surface"] == "pipeline"
     assert workbench["selected_refs"] == [
         {"kind": "task", "id": "task-9", "label": "Watch task"}
@@ -3531,7 +3585,7 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
         "kind": "daily",
         "idempotency_key": "daily-check-in-2026-06-30",
         "workbench_context": {
-            "interaction_mode": "check_in",
+            "interaction_mode": "continuous",
             "active_surface": "strategic",
             "selected_refs": [
                 {"kind": "task", "id": "task-check", "label": "Release task"}
@@ -3576,7 +3630,7 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
     assert msg.context["event_type"] == "strategic_check_in"
     assert msg.context["check_in"]["operator_user_id"] == TEST_USER_ID
     assert msg.context["check_in"]["kind"] == "daily"
-    assert msg.context["strategic_session"]["interaction_mode"] == "check_in"
+    assert msg.context["strategic_session"]["interaction_mode"] == "continuous"
     assert msg.context["strategic_session"]["selected_refs"] == [
         {"kind": "task", "id": "task-check", "label": "Release task"}
     ]
@@ -3590,7 +3644,7 @@ async def test_strategic_session_check_in_records_quiet_durable_receipt(
         )
     ).scalar_one()
     stored_workbench = (prefs_row.prefs or {})["_strategic_workbench"]
-    assert stored_workbench["interaction_mode"] == "check_in"
+    assert stored_workbench["interaction_mode"] == "continuous"
     assert stored_workbench["active_surface"] == "strategic"
     assert stored_workbench["selected_refs"] == [
         {"kind": "task", "id": "task-check", "label": "Release task"}

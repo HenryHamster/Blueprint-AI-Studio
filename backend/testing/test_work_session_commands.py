@@ -154,12 +154,13 @@ def test_work_session_commands_include_fixed_session_commands_and_canvas():
     assert {
         "session.check_in",
         "session.mode.continuous",
-        "session.mode.check_in",
-        "session.mode.monitor",
         "session.mode.chat",
         "session.clear_selected_refs",
         "context.canvas.open",
     }.issubset(by_id)
+    # The retired check-in / monitor mode commands are no longer offered.
+    assert "session.mode.check_in" not in by_id
+    assert "session.mode.monitor" not in by_id
 
     check_in = by_id["session.check_in"]
     assert "mutation" not in check_in
@@ -176,18 +177,17 @@ def test_work_session_commands_include_fixed_session_commands_and_canvas():
     assert workday["target"]["surface"] == "messages"
     assert workday["refetch_surfaces"] == ["strategic_session", "runtime"]
 
-    check_in_mode = by_id["session.mode.check_in"]
-    assert check_in_mode["label"] == "Check-in mode"
-    assert check_in_mode["enabled"] is True
-    assert check_in_mode["mutation"] == {
+    chat_mode = by_id["session.mode.chat"]
+    assert chat_mode["label"] == "Chat mode"
+    # Chat is the current mode in this fixture, so its command is disabled.
+    assert chat_mode["enabled"] is False
+    assert chat_mode["mutation"] == {
         "method": "POST",
         "path": "/api/admin/projects/project-1/strategic-session",
-        "body": {"workbench": {"interaction_mode": "check_in"}},
+        "body": {"workbench": {"interaction_mode": "chat"}},
     }
-    assert check_in_mode["target"]["action"] == "set_check_in_mode"
-    assert check_in_mode["refetch_surfaces"] == ["strategic_session"]
-
-    assert by_id["session.mode.chat"]["enabled"] is False
+    assert chat_mode["target"]["action"] == "set_chat_mode"
+    assert chat_mode["refetch_surfaces"] == ["strategic_session"]
     assert by_id["session.clear_selected_refs"]["enabled"] is False
     assert by_id["context.canvas.open"]["target"] == {
         "surface": "project",
@@ -437,8 +437,6 @@ def test_work_session_command_contract_classifies_emitted_executable_commands():
 
     assert executable_command_ids == {
         session_mode_command_id("continuous"),
-        session_mode_command_id("check_in"),
-        session_mode_command_id("monitor"),
         session_mode_command_id("chat"),
         COMMAND_ID_SESSION_CLEAR_SELECTED_REFS,
         runner_preference_command_id("runner-1"),

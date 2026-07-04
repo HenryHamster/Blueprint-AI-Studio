@@ -110,10 +110,12 @@ COMMAND_GROUPS = frozenset(
     )
 )
 COMMAND_PRIORITIES = frozenset(("critical", "high", "normal", "low"))
+# Command-id classification set (session_mode_from_command_id). Intentionally
+# retains the retired ``check_in`` / ``monitor`` ids so a stale command from an
+# old client is still recognized as a mode command and tolerated (its persisted
+# value is coerced to ``chat`` by sanitize_workbench_state). Only ``chat`` and
+# ``continuous`` mode commands are emitted going forward.
 EXECUTABLE_SESSION_MODES = frozenset(("chat", "check_in", "continuous", "monitor"))
-STRATEGIC_INTERACTION_MODES = frozenset(
-    ("chat", "check_in", "monitor", "continuous")
-)
 
 COMMAND_ID_SESSION_CHECK_IN = "session.check_in"
 COMMAND_ID_SESSION_CLEAR_SELECTED_REFS = "session.clear_selected_refs"

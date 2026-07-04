@@ -8,7 +8,9 @@ export const MAX_STRATEGIC_SELECTED_REFS = 12;
 export type StrategicSelectedRef = StrategicWorkbenchState['selected_refs'][number];
 
 export function normalizeStrategicInteractionMode(mode?: string | null): StrategicInteractionMode {
-  if (mode === 'check_in' || mode === 'monitor' || mode === 'continuous') return mode;
+  // The vocabulary collapsed to Chat + Workday; a retired `check_in` / `monitor`
+  // value (from old data or a stale client) coerces to `chat`.
+  if (mode === 'continuous') return 'continuous';
   return 'chat';
 }
 

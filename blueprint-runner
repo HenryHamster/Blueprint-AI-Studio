@@ -1,0 +1,9 @@
+#!/bin/bash
+# ./blueprint-runner — start a Blueprint self-hosted runner with only a token.
+# Thin wrapper over scripts/blueprint_runner.py; the orchestrator URL is baked in.
+# Usage:
+#   ./blueprint-runner start --token <token>   # run the runner
+#   ./blueprint-runner check --token <token>   # preflight only
+set -euo pipefail
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
+exec python3 "$REPO_ROOT/scripts/blueprint_runner.py" "$@"

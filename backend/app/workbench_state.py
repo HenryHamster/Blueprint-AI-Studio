@@ -72,13 +72,18 @@ def _strategic_local_continuation_ttl_seconds() -> int:
         return STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
     return value if value > 0 else STRATEGIC_LOCAL_CONTINUATION_TTL_SECONDS
 
-_ALLOWED_INTERACTION_MODES = frozenset(
-    {"chat", "check_in", "monitor", "continuous"}
-)
+# The strategic interaction vocabulary collapsed to two modes: ``chat`` and
+# ``continuous`` ("Workday"). The retired ``check_in`` / ``monitor`` modes are no
+# longer accepted going forward — a legacy value read off old data (or a stale
+# client) is tolerated by coercing it to ``chat`` (never a crash). The 0367
+# migration rewrites any persisted ``check_in`` / ``monitor`` to ``chat``.
+_ALLOWED_INTERACTION_MODES = frozenset({"chat", "continuous"})
 _ALLOWED_ACTIVE_SURFACES = frozenset({"strategic", "pipeline", "project", "runtime"})
 _MAX_SELECTED_REFS = 12
 _MAX_SELECTED_REF_DESCRIPTORS = 24
-_STRATEGIC_ARMING_INTERACTION_MODES = frozenset({"check_in", "continuous"})
+# Only "Workday" (``continuous``) arms the strategic refresh on entry now that
+# ``check_in`` is retired (it was the other arming mode).
+_STRATEGIC_ARMING_INTERACTION_MODES = frozenset({"continuous"})
 _OPERATOR_CONTEXT_TARGET_KEYS = (
     "surface",
     "section",
@@ -786,7 +791,7 @@ def workbench_mode_should_arm_strategic_refresh(
 
 def workbench_mode_refresh_excerpt(state: dict[str, Any]) -> str:
     mode = state.get("interaction_mode")
-    mode_label = "workday" if mode == "continuous" else "check-in"
+    mode_label = "workday" if mode == "continuous" else "chat"
     active_surface = state.get("active_surface") or "strategic"
     refs = state.get("selected_refs") if isinstance(state.get("selected_refs"), list) else []
     ref_labels = [

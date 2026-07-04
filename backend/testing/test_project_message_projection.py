@@ -260,7 +260,7 @@ async def test_legacy_project_message_create_snapshots_strategic_session(
                 "message_type": "NOTE",
                 "content": "Keep this canvas around.",
                 "workbench_context": {
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "project",
                     "selected_refs": [
                         {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}
@@ -289,7 +289,7 @@ async def test_legacy_project_message_create_snapshots_strategic_session(
         )
     ).scalar_one()
     session = (msg.context or {})["strategic_session"]
-    assert session["interaction_mode"] == "check_in"
+    assert session["interaction_mode"] == "continuous"
     assert session["active_surface"] == "project"
     assert session["selected_refs"] == [
         {"kind": "canvas", "id": "strategic-canvas:proj-1", "label": "Context map"}

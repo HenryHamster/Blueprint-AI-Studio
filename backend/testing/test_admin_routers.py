@@ -4063,7 +4063,7 @@ class TestMessages:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "continuous",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {"kind": "task", "id": "task-1", "label": "Watch task"},
@@ -4090,7 +4090,7 @@ class TestMessages:
             )
         ).scalar_one()
         session = (msg.context or {})["strategic_session"]
-        assert session["interaction_mode"] == "monitor"
+        assert session["interaction_mode"] == "continuous"
         assert session["active_surface"] == "pipeline"
         assert session["selected_refs"] == [
             {"kind": "task", "id": "task-1", "label": "Watch task"}
@@ -5152,7 +5152,7 @@ class TestMessages:
             json={
                 "resolution": "Direction finished.",
                 "workbench_context": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "continuous",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {"kind": "task", "id": "task-linked", "label": "Linked blocker"}
@@ -5178,7 +5178,7 @@ class TestMessages:
                 )
             )
         ).scalar_one()
-        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "monitor"
+        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "continuous"
         assert prefs_row.prefs["_strategic_workbench"]["active_surface"] == "pipeline"
         assert prefs_row.prefs["_strategic_workbench"]["selected_refs"] == [
             {"kind": "task", "id": "task-linked", "label": "Linked blocker"}
@@ -5235,7 +5235,7 @@ class TestMessages:
             f"/api/admin/messages/{msg.id}",
             json={
                 "workbench_context": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "continuous",
                     "active_surface": "project",
                     "selected_refs": [
                         {"kind": "message", "id": str(msg.id), "label": "Resolved note"}
@@ -5256,7 +5256,7 @@ class TestMessages:
                 )
             )
         ).scalar_one()
-        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "monitor"
+        assert prefs_row.prefs["_strategic_workbench"]["interaction_mode"] == "continuous"
         assert prefs_row.prefs["_strategic_workbench"]["active_surface"] == "project"
         assert prefs_row.prefs["_strategic_workbench"]["selected_refs"] == [
             {"kind": "message", "id": str(msg.id), "label": "Resolved note"}
@@ -5676,7 +5676,7 @@ class TestMessages:
             json={
                 "resolution": "Deploy summary now cites the active release.",
                 "workbench_context": {
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "pipeline",
                     "selected_refs": [
                         {
@@ -5718,7 +5718,7 @@ class TestMessages:
             == "Deploy summary now cites the active release."
         )
         session = note.context.get("strategic_session")
-        assert session["interaction_mode"] == "check_in"
+        assert session["interaction_mode"] == "continuous"
         assert session["active_surface"] == "pipeline"
         assert session["selected_refs"] == [
             {"kind": "release", "id": "release:v2", "label": "v2 release"}
@@ -6601,7 +6601,7 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "strategic",
                     "selected_refs": [
                         {
@@ -6621,7 +6621,7 @@ class TestMessagesWorkbenchState:
         assert marker["origin"] == "operator"
         assert marker["reason"] == "workbench_interaction_mode"
         assert marker["operator_count"] == 1
-        assert "check-in mode" in marker["excerpt"]
+        assert "workday mode" in marker["excerpt"]
         assert "Operator workbench" in marker["excerpt"]
 
     @pytest.mark.asyncio
@@ -6784,7 +6784,7 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "chat",
                     "active_surface": "runtime",
                 },
             },
@@ -6828,14 +6828,14 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "chat",
                     "active_surface": "runtime",
                 },
             },
         )
 
         assert resp.status_code == 200
-        assert resp.json()["workbench"]["interaction_mode"] == "monitor"
+        assert resp.json()["workbench"]["interaction_mode"] == "chat"
         await db_session.refresh(project)
         assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (project.vision or {})
 
@@ -6876,7 +6876,7 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "chat",
                     "active_surface": "runtime",
                 },
             },
@@ -6913,7 +6913,7 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "chat",
                     "active_surface": "runtime",
                 },
             },
@@ -6944,7 +6944,7 @@ class TestMessagesWorkbenchState:
                 json={
                     "project_id": str(project.id),
                     "workbench": {
-                        "interaction_mode": "check_in",
+                        "interaction_mode": "continuous",
                         "active_surface": "strategic",
                     },
                 },
@@ -6952,27 +6952,29 @@ class TestMessagesWorkbenchState:
 
         assert resp.status_code == 200
         assert resp.json()["arming"] == "not_armed"
-        assert resp.json()["workbench"]["interaction_mode"] == "check_in"
+        assert resp.json()["workbench"]["interaction_mode"] == "continuous"
 
         get_resp = await client.get(
             f"/api/admin/messages/workbench-state?project_id={project.id}"
         )
         assert get_resp.status_code == 200
-        assert get_resp.json()["workbench"]["interaction_mode"] == "check_in"
+        assert get_resp.json()["workbench"]["interaction_mode"] == "continuous"
         await db_session.refresh(project)
         assert not (project.vision or {}).get("_strategic_refresh")
 
     @pytest.mark.asyncio
-    async def test_monitor_mode_does_not_arm_strategic_refresh(
+    async def test_chat_mode_does_not_arm_strategic_refresh(
         self, client: AsyncClient, db_session
     ):
+        # Chat is the sole non-arming mode after the collapse; entering it (or
+        # staying in it) must not arm a strategic refresh.
         project = await _make_project(db_session)
         resp = await client.put(
             "/api/admin/messages/workbench-state",
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "monitor",
+                    "interaction_mode": "chat",
                     "active_surface": "pipeline",
                 },
             },
@@ -6993,7 +6995,7 @@ class TestMessagesWorkbenchState:
             json={
                 "project_id": str(project.id),
                 "workbench": {
-                    "interaction_mode": "check_in",
+                    "interaction_mode": "continuous",
                     "active_surface": "strategic",
                 },
             },
@@ -7017,7 +7019,7 @@ class TestMessagesWorkbenchState:
         workbench_resp = await client.get(
             f"/api/admin/messages/workbench-state?project_id={project.id}"
         )
-        assert workbench_resp.json()["workbench"]["interaction_mode"] == "check_in"
+        assert workbench_resp.json()["workbench"]["interaction_mode"] == "continuous"
 
         noise_resp = await client.get(
             f"/api/admin/messages/noise-prefs?project_id={project.id}"

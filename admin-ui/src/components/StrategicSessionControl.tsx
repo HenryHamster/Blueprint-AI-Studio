@@ -1,11 +1,8 @@
 import {
   AlertTriangle,
-  CheckCircle2,
   ChevronRight,
-  Clock3,
   CreditCard,
   Cpu,
-  Eye,
   Infinity as InfinityIcon,
   LoaderCircle,
   MessageSquare,
@@ -15,9 +12,12 @@ import {
   Square,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
-import type { StrategicWorkSessionLastCheckIn, StrategicWorkSessionSinceLastCheckIn } from '../strategicStateApi';
 
-export type StrategicInteractionMode = 'chat' | 'check_in' | 'monitor' | 'continuous';
+// The strategic interaction vocabulary is collapsed to two modes: conversational
+// "Chat" and the resident "Workday" (``continuous``) session. The retired
+// ``check_in`` / ``monitor`` modes are no longer offered here; a legacy value read
+// off old data is coerced to ``chat`` by ``normalizeStrategicInteractionMode``.
+export type StrategicInteractionMode = 'chat' | 'continuous';
 
 export interface StrategicLocalRunnerStatus {
   status?: string | null;
@@ -132,9 +132,6 @@ export interface StrategicSessionControlProps {
   runtimeWorkStatus?: StrategicRuntimeWorkStatus | null;
   runtimeWork?: StrategicRuntimeWorkStatus | null;
   accountSpend?: StrategicAccountSpendStatus | null;
-  lastCheckIn?: StrategicWorkSessionLastCheckIn | null;
-  sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null;
-  checkingIn?: boolean;
   /**
    * Resident-session controls. The container passes `onStartSession` only when
    * resident sessions are enabled (the `strategic_session_enabled` feature flag)
@@ -165,7 +162,6 @@ export interface StrategicSessionControlProps {
   onStartSession?: () => void;
   onStopSession?: () => void;
   onModeChange?: (mode: StrategicInteractionMode) => void;
-  onCheckIn?: () => void;
   onOpenDevices?: () => void;
   onOpenCompute?: () => void;
   onOpenAccounts?: () => void;
@@ -179,8 +175,6 @@ type Tone = 'neutral' | 'success' | 'warning' | 'danger' | 'info';
 
 const MODE_OPTIONS: Array<{ value: StrategicInteractionMode; label: string; Icon: LucideIcon }> = [
   { value: 'chat', label: 'Chat', Icon: MessageSquare },
-  { value: 'check_in', label: 'Check-in', Icon: Clock3 },
-  { value: 'monitor', label: 'Monitor', Icon: Eye },
   { value: 'continuous', label: 'Workday', Icon: InfinityIcon },
 ];
 
@@ -270,46 +264,6 @@ function formatUsd(value: number | null | undefined): string | null {
     currency: 'USD',
     maximumFractionDigits: 2,
   }).format(amount);
-}
-
-function formatRelativeTime(timestamp?: string | null): string | null {
-  if (!timestamp) return null;
-  const date = new Date(timestamp);
-  if (Number.isNaN(date.getTime())) return null;
-  const diffMs = Date.now() - date.getTime();
-  if (diffMs < 60_000) return 'just now';
-  const minutes = Math.floor(diffMs / 60_000);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  if (days < 7) return `${days}d ago`;
-  return date.toLocaleDateString();
-}
-
-function checkInChangeCount(since?: StrategicWorkSessionSinceLastCheckIn | null): number | null {
-  if (!since?.available) return null;
-  return (
-    (since.messages?.total ?? 0)
-    + (since.tasks?.updated ?? 0)
-    + (since.alerts?.raised ?? 0)
-    + (since.strategic?.cycles_completed ?? 0)
-  );
-}
-
-function checkInDetail(
-  lastCheckIn?: StrategicWorkSessionLastCheckIn | null,
-  sinceLastCheckIn?: StrategicWorkSessionSinceLastCheckIn | null,
-): string {
-  if (!lastCheckIn?.created_at) return 'Never checked';
-  const relative = formatRelativeTime(lastCheckIn.created_at);
-  const changeCount = checkInChangeCount(sinceLastCheckIn);
-  const changeLabel = changeCount == null
-    ? null
-    : changeCount === 0
-      ? '0 new'
-      : `${changeCount} new`;
-  return [relative ? `Last ${relative}` : null, changeLabel].filter(Boolean).join(' / ') || 'Checked';
 }
 
 function shortId(value?: string | null): string | null {
@@ -694,13 +648,22 @@ interface ResidentSessionView {
   detail: string | null;
   showStop: boolean;
   showStart: boolean;
+  // Fix-it affordance: `blocked:no_runner` surfaces an "Add runner" link that
+  // routes the operator to Devices to enroll a local runner.
+  showAddRunner: boolean;
 }
 
 // Map the resident-session state (+ reason) to a single legible status chip.
 // Entering Workday auto-starts the session, so the chip — not a Start button —
-// is the primary affordance: `ready` (auto-starting), `active` (runner attached
-// / replying), `blocked`/`error` (with the reason), `dark` (feature off). Stop
-// stays on a live session; Start remains only as an explicit fallback.
+// is the primary affordance across the formal state machine:
+//   off      — feature flag off (no controls).
+//   ready    — Workday on + live runner, auto-starting on entry.
+//   starting — session created / task pinning, agent not yet streaming.
+//   active   — runner attached / replying (Stop only).
+//   blocked  — enabled but can't run; `no_runner` shows an "Add runner" fix-it.
+//   error    — the last auto-start failed (reason surfaced).
+// Stop stays on a live/starting session; Start remains only as an explicit
+// fallback.
 function residentSessionView(
   state: string | null | undefined,
   reason: string | null | undefined,
@@ -708,6 +671,7 @@ function residentSessionView(
   sessionStatus: string | null | undefined,
   hasStart: boolean,
   hasStop: boolean,
+  hasAddRunner: boolean,
 ): ResidentSessionView {
   const normalized = normalizedStatus(state);
   const active = sessionActive || normalized === 'active';
@@ -720,6 +684,18 @@ function residentSessionView(
       detail: 'Runner attached / replying',
       showStop: hasStop,
       showStart: false,
+      showAddRunner: false,
+    };
+  }
+  if (normalized === 'starting') {
+    return {
+      tone: 'info',
+      Icon: LoaderCircle,
+      label: 'Starting',
+      detail: detail ?? 'Bringing up session, agent not yet streaming',
+      showStop: hasStop,
+      showStart: false,
+      showAddRunner: false,
     };
   }
   if (normalized === 'error') {
@@ -730,9 +706,11 @@ function residentSessionView(
       detail: detail ?? 'Resident session could not start',
       showStop: false,
       showStart: hasStart,
+      showAddRunner: false,
     };
   }
   if (normalized === 'blocked') {
+    const noRunner = normalizedStatus(reason) === 'no_runner';
     return {
       tone: 'warning',
       Icon: AlertTriangle,
@@ -740,9 +718,11 @@ function residentSessionView(
       detail: detail ?? 'Resident session unavailable',
       showStop: false,
       showStart: hasStart,
+      showAddRunner: noRunner && hasAddRunner,
     };
   }
-  if (normalized === 'dark') {
+  // `off` (feature flag off) — also tolerate the legacy `dark` value.
+  if (normalized === 'off' || normalized === 'dark') {
     return {
       tone: 'neutral',
       Icon: InfinityIcon,
@@ -750,6 +730,7 @@ function residentSessionView(
       detail: detail ?? 'Resident sessions disabled',
       showStop: false,
       showStart: false,
+      showAddRunner: false,
     };
   }
   // `ready` (or unknown): Workday on with a live runner, auto-starting on entry.
@@ -760,6 +741,7 @@ function residentSessionView(
     detail: 'Starts on Workday entry',
     showStop: false,
     showStart: hasStart,
+    showAddRunner: false,
   };
 }
 
@@ -776,9 +758,6 @@ export function StrategicSessionControl({
   runtimeWorkStatus = null,
   runtimeWork = null,
   accountSpend = null,
-  lastCheckIn = null,
-  sinceLastCheckIn = null,
-  checkingIn = false,
   sessionActive = false,
   sessionStatus = null,
   sessionState = null,
@@ -787,7 +766,6 @@ export function StrategicSessionControl({
   onStartSession,
   onStopSession,
   onModeChange,
-  onCheckIn,
   onOpenDevices,
   onOpenCompute,
   onOpenAccounts,
@@ -802,14 +780,13 @@ export function StrategicSessionControl({
   const workStatus = runtimeWorkStatus ?? runtimeWork;
   const openAccountSpend = onOpenAccounts ?? onOpenSpend;
   const accountSpendOpenLabel = onOpenAccounts ? 'Open accounts' : 'Open spend';
-  const checkInSummary = checkInDetail(lastCheckIn, sinceLastCheckIn);
-  const checkInChanges = checkInChangeCount(sinceLastCheckIn);
 
   // Resident session status: only meaningful in the "Workday" (continuous) mode.
   // Entering Workday is the on-switch (the backend auto-starts the session), so
-  // the primary affordance is a legible status chip — dark / ready / active /
-  // blocked / error — that always shows the reason when it can't start. Stop
-  // stays on a live session; a manual Start remains only as an explicit fallback.
+  // the primary affordance is a legible status chip — off / ready / starting /
+  // active / blocked / error — that always shows the reason when it can't start.
+  // Stop stays on a live session; a manual Start remains only as an explicit
+  // fallback, and `blocked:no_runner` surfaces an "Add runner" fix-it link.
   // Shown when the container wired session info (callbacks / active / explicit
   // state); absent that, this stays inert so callers that don't use resident
   // sessions render exactly as before.
@@ -820,6 +797,7 @@ export function StrategicSessionControl({
     sessionStatus,
     Boolean(onStartSession),
     Boolean(onStopSession),
+    Boolean(onOpenDevices),
   );
   const showSessionControl = selectedMode === 'continuous' && (
     Boolean(onStartSession) || Boolean(onStopSession) || sessionActive || Boolean(cleanText(sessionState))
@@ -962,6 +940,20 @@ export function StrategicSessionControl({
                 <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-emerald-300'}>Start session</span>
               </button>
             )}
+            {sessionView.showAddRunner && (
+              <button
+                type="button"
+                onClick={onOpenDevices}
+                className={`group inline-flex min-w-0 shrink-0 items-center gap-2 rounded border border-amber-500/30 bg-amber-500/10 text-left transition-colors hover:border-amber-400/50 hover:bg-amber-500/15 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 ${
+                  compact ? 'h-7 px-2 py-0' : 'min-h-11 px-2 py-1.5 sm:min-h-8'
+                }`}
+                aria-label="Add a local runner: open Devices"
+                title="Add a local runner: open Devices to enroll one"
+              >
+                <Server className="h-3.5 w-3.5 shrink-0 text-amber-400" aria-hidden="true" />
+                <span className={compact ? 'sr-only' : 'truncate text-xs font-semibold text-amber-300'}>Add runner</span>
+              </button>
+            )}
           </>
         )}
 
@@ -978,36 +970,6 @@ export function StrategicSessionControl({
             <span className={compact ? 'sr-only' : undefined}>Saving</span>
           </span>
         )}
-
-        <button
-          type="button"
-          onClick={onCheckIn}
-          disabled={!onCheckIn || checkingIn}
-          className={`group min-w-0 items-center gap-2 rounded border border-neutral-800 bg-neutral-950/70 text-left transition-colors hover:border-neutral-600 hover:bg-neutral-900/80 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-400 disabled:cursor-not-allowed disabled:opacity-60 ${
-            compact
-              ? 'inline-flex h-7 shrink-0 px-2 py-0'
-              : 'inline-grid min-h-11 w-full grid-cols-[auto,minmax(0,1fr),auto] px-2 py-1.5 sm:min-h-8 sm:w-auto sm:max-w-[16rem]'
-          }`}
-          aria-label={`Mark Strategic session checked: ${checkInSummary}`}
-          title={`Mark Strategic session checked: ${checkInSummary}`}
-        >
-          {checkingIn ? (
-            <LoaderCircle className="h-3.5 w-3.5 shrink-0 animate-spin text-cyan-300" aria-hidden="true" />
-          ) : (
-            <CheckCircle2 className="h-3.5 w-3.5 shrink-0 text-neutral-500 transition-colors group-hover:text-neutral-200" aria-hidden="true" />
-          )}
-          {!compact && (
-            <span className="min-w-0 flex-1">
-              <span className="block truncate text-xs font-semibold text-neutral-200">Mark checked</span>
-              <span className="block truncate text-ui-sm text-neutral-400">{checkInSummary}</span>
-            </span>
-          )}
-          {checkInChanges != null && checkInChanges > 0 && (
-            <span className="shrink-0 rounded border border-cyan-500/25 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-ui-sm font-semibold text-cyan-300">
-              {checkInChanges}
-            </span>
-          )}
-        </button>
 
         {showMonitoringControls && (
           <>

@@ -524,6 +524,26 @@ def _resident_session_available() -> bool:
     return bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
 
 
+def _resident_session_has_begun_streaming(snapshot: Dict[str, Any] | None) -> bool:
+    """Whether a live resident session's agent has begun (vs still starting).
+
+    Derived purely from the vision snapshot (no queries). The agent has begun
+    when either progress has been reported (``last_progress_at`` — advanced by
+    the resident heartbeat on an applied strategic op) OR a post-start operator
+    interaction landed. The start seeds ``last_operator_interaction_at`` equal to
+    ``started_at``, so a *later* (differing) interaction timestamp means the
+    operator<->agent loop is live. Absent both, the session is still bringing up
+    (task pinning / agent not yet streaming) — the ``starting`` state.
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    if snapshot.get("last_progress_at"):
+        return True
+    started = snapshot.get("started_at")
+    last_op = snapshot.get("last_operator_interaction_at")
+    return bool(last_op and started and last_op != started)
+
+
 def _resident_session_availability(
     project: Project,
     *,
@@ -536,13 +556,17 @@ def _resident_session_availability(
     the eligible-live-runner count as a live "is a runner attached" hint) — into
     a single state the operator UI renders without re-deriving backend rules:
 
-    * ``dark``    — feature flag off (reason ``sessions_disabled``).
-    * ``active``  — a resident session is live.
-    * ``error``   — the last auto-start failed (reason ``start_failed: <msg>``).
-    * ``blocked`` — enabled but can't run: no live local runner
+    * ``off``      — feature flag off (reason ``sessions_disabled``).
+    * ``starting`` — a session blob exists (created + task pinning) but the agent
+      has not begun streaming yet (no progress, no post-start operator
+      interaction) — the transient bring-up window.
+    * ``active``   — a resident session is live and the agent has begun
+      (runner-attached / replying).
+    * ``error``    — the last auto-start failed (reason ``start_failed: <msg>``).
+    * ``blocked``  — enabled but can't run: no live local runner
       (reason ``no_runner``), whether recorded by the last auto-start or inferred
       from a zero eligible-runner count.
-    * ``ready``   — enabled, a live runner is attached, nothing started yet
+    * ``ready``    — enabled, a live runner is attached, nothing started yet
       (entering Workday auto-starts, so this is transient).
 
     A recorded ``start_failed`` always wins — a real failure is never masked by a
@@ -572,10 +596,13 @@ def _resident_session_availability(
 
     reason: str | None = None
     if not enabled:
-        state = "dark"
+        state = "off"
         reason = "sessions_disabled"
     elif active:
-        state = "active"
+        # A live session blob: distinguish the transient ``starting`` bring-up
+        # window (task pinning, agent not yet streaming) from a genuinely
+        # ``active`` session where the agent has begun.
+        state = "active" if _resident_session_has_begun_streaming(snapshot) else "starting"
     elif recorded_start_failed:
         # A recorded ``start_failed`` is authoritative and never masked by a live
         # runner count — the last auto-start genuinely errored.

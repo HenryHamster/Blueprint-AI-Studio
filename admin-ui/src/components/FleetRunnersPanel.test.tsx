@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
-import { runnerSetupSnippets } from './FleetRunnersPanel.utils';
+import { runnerSetupSnippets, DEFAULT_ORCHESTRATOR_URL } from './FleetRunnersPanel.utils';
 import type { FleetRunner } from '../api';
 
 const SAMPLE_RUNNERS: FleetRunner[] = [
@@ -70,20 +70,28 @@ describe('FleetRunnersPanel — behavioral', () => {
     return host as HTMLDivElement;
   }
 
-  test('runnerSetupSnippets safely quotes setup commands', () => {
-    const snippets = runnerSetupSnippets("tok'abc", 'https://blueprint.test/a path', 'strategic_local');
+  test('runnerSetupSnippets builds the blueprint-runner command with safe quoting', () => {
+    const snippets = runnerSetupSnippets("tok'abc", 'https://blueprint.test/a path');
 
     expect(Object.keys(snippets)).toEqual(expect.arrayContaining(['windowsPowerShell', 'macosLinux']));
-    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_RUNNER_TOKEN = 'tok''abc'");
-    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_ORCHESTRATOR_URL = 'https://blueprint.test/a path'");
-    expect(snippets.windowsPowerShell).toContain("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'");
-    expect(snippets.windowsPowerShell).toContain('py -3 scripts/local_runner.py');
-    expect(snippets.macosLinux).toContain("BLUEPRINT_RUNNER_TOKEN='tok'\\''abc'");
-    expect(snippets.macosLinux).toContain("BLUEPRINT_ORCHESTRATOR_URL='https://blueprint.test/a path'");
-    expect(snippets.macosLinux).toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT=1');
-    expect(snippets.macosLinux).toContain('python3 scripts/local_runner.py');
+    // Windows invokes the python launcher directly; macOS/Linux invoke the wrapper
+    // via `bash blueprint-runner` (works regardless of the tracked file's exec bit).
+    expect(snippets.windowsPowerShell).toContain('py -3 scripts/blueprint_runner.py start');
+    expect(snippets.macosLinux).toContain('bash blueprint-runner start');
+    // The token rides on --token, quoted safely for each shell.
+    expect(snippets.windowsPowerShell).toContain("--token 'tok''abc'");
+    expect(snippets.macosLinux).toContain("--token 'tok'\\''abc'");
+    // A non-default backend surfaces an explicit --url override.
+    expect(snippets.windowsPowerShell).toContain("--url 'https://blueprint.test/a path'");
+    expect(snippets.macosLinux).toContain("--url 'https://blueprint.test/a path'");
+    // The orchestrator URL is baked into blueprint-runner — no env-var plumbing remains.
+    expect(snippets.macosLinux).not.toContain('BLUEPRINT_ORCHESTRATOR_URL');
+    expect(snippets.windowsPowerShell).not.toContain('local_runner.py');
 
-    expect(runnerSetupSnippets('tok', 'https://blueprint.test').macosLinux).not.toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT');
+    // When the project's backend matches the baked-in prod default, --url is omitted.
+    const prod = runnerSetupSnippets('tok', DEFAULT_ORCHESTRATOR_URL);
+    expect(prod.macosLinux).toBe("bash blueprint-runner start --token 'tok'");
+    expect(prod.macosLinux).not.toContain('--url');
   });
 
   // ── livenessLabel ────────────────────────────────────────────────────────────
@@ -166,8 +174,8 @@ describe('FleetRunnersPanel — behavioral', () => {
     await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
     await act(async () => {});
 
-    // The generated command must set BLUEPRINT_ORCHESTRATOR_URL to the backend API base,
-    // not window.location.origin (the SPA host has no /api/** route → heartbeats vanish).
+    // The command must point the runner at the backend API base (via --url), not
+    // window.location.origin (the SPA host has no /api/** route → heartbeats vanish).
     const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
     const psCopyBtn = el.querySelector('button[title="Copy Windows PowerShell setup snippet"]');
     expect(shellCopyBtn).not.toBeNull();
@@ -175,12 +183,12 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
     const shellSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
-    expect(shellSnippet).toContain(`BLUEPRINT_ORCHESTRATOR_URL='${API_BASE_URL_FIXTURE}'`);
+    expect(shellSnippet).toContain(`--url '${API_BASE_URL_FIXTURE}'`);
     expect(shellSnippet).not.toContain(window.location.origin);
 
     await act(async () => { (psCopyBtn as HTMLButtonElement).click(); });
     const psSnippet = clipboardWrite.mock.calls.at(-1)?.[0] as string;
-    expect(psSnippet).toContain(`$env:BLUEPRINT_ORCHESTRATOR_URL = '${API_BASE_URL_FIXTURE}'`);
+    expect(psSnippet).toContain(`--url '${API_BASE_URL_FIXTURE}'`);
     expect(psSnippet).not.toContain(window.location.origin);
   });
 
@@ -202,9 +210,11 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('Strategic runner enrolled');
     expect(el.textContent).toContain('Windows PowerShell');
     expect(el.textContent).toContain('macOS/Linux');
-    expect(el.textContent).toContain("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'");
-    expect(el.textContent).toContain('BLUEPRINT_RUNNER_MAX_CONCURRENT=1');
-    expect(el.textContent).toContain('Next: start the runner; first heartbeat marks it live.');
+    // The clean baked-in-URL command replaces the old env-var plumbing; it is the
+    // same for every preset (the preset is encoded server-side on the runner row).
+    expect(el.textContent).toContain('py -3 scripts/blueprint_runner.py start');
+    expect(el.textContent).toContain('bash blueprint-runner start');
+    expect(el.textContent).toContain('Run this from the repo root; the first heartbeat connects it below.');
 
     const psCopyBtn = el.querySelector('button[title="Copy Windows PowerShell setup snippet"]');
     const shellCopyBtn = el.querySelector('button[title="Copy macOS/Linux setup snippet"]');
@@ -212,12 +222,12 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(shellCopyBtn).not.toBeNull();
 
     await act(async () => { (psCopyBtn as HTMLButtonElement).click(); });
-    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining("$env:BLUEPRINT_RUNNER_MAX_CONCURRENT = '1'"));
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('scripts/blueprint_runner.py start'));
     expect((psCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
     expect((shellCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).toBeNull();
 
     await act(async () => { (shellCopyBtn as HTMLButtonElement).click(); });
-    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('BLUEPRINT_RUNNER_MAX_CONCURRENT=1'));
+    expect(clipboardWrite).toHaveBeenLastCalledWith(expect.stringContaining('bash blueprint-runner start'));
     expect((psCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
     expect((shellCopyBtn as HTMLButtonElement).querySelector('.text-emerald-400')).not.toBeNull();
   });
@@ -267,6 +277,54 @@ describe('FleetRunnersPanel — behavioral', () => {
 
     expect(el.textContent).toContain('HTTP 500');
     expect(el.textContent).not.toContain('Runner enrolled');
+  });
+
+  test('enroll dialog shows waiting, then connected once the runner heartbeats', async () => {
+    const connectedNew: FleetRunner = {
+      id: 'runner-new',
+      hostname: 'operator-laptop',
+      version: null,
+      status: 'active',
+      capabilities: { task_types: 'all', has_gpu: false, max_concurrent: 1 },
+      health: {
+        device_status: 'connected',
+        device_status_reason: null,
+        is_live: true,
+        seconds_since_last_seen: 3,
+        active_task_count: 0,
+        active_compute_job_count: 0,
+        active_work_count: 0,
+        max_concurrent: 1,
+        available_slots: 1,
+        stale_reason: null,
+        agent_available: true,
+        liveness_window_seconds: 300,
+      },
+      last_seen_at: new Date().toISOString(),
+      created_at: '2026-07-03T00:00:00Z',
+    };
+    const el = await mount();
+
+    const enrollBtn = [...el.querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+    // Post-enroll load still lacks the new runner (it has not heartbeated yet).
+    await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    const status = el.querySelector('[data-testid="runner-connection-status"]');
+    expect(status).not.toBeNull();
+    expect(status?.textContent).toContain('Waiting for your runner to connect');
+
+    // Simulate the runner's first heartbeat arriving: the next list poll shows it
+    // connected. Drive a poll via the panel refresh control (deterministic; the
+    // background fast-poll uses a real 3s interval).
+    vi.mocked(listFleetRunners).mockResolvedValue([...SAMPLE_RUNNERS, connectedNew]);
+    const refreshBtn = el.querySelector('button[aria-label="Refresh runners"]');
+    await act(async () => { (refreshBtn as HTMLButtonElement).click(); });
+    await act(async () => {});
+
+    const statusAfter = el.querySelector('[data-testid="runner-connection-status"]');
+    expect(statusAfter?.textContent).toContain('Connected on this project');
+    expect(statusAfter?.textContent).toContain('operator-laptop');
   });
 
   // ── Revoke runner ────────────────────────────────────────────────────────────

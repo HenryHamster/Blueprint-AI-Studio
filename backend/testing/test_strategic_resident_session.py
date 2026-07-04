@@ -1401,10 +1401,10 @@ def _project_with_vision(vision: dict) -> Project:
     return Project(name="avail", user_id=TEST_USER_ID, vision=vision)
 
 
-def test_resident_session_availability_dark_when_flag_off():
+def test_resident_session_availability_off_when_flag_off():
     runtime_config.pop(STRATEGIC_SESSION_ENABLED_SETTING, None)
     result = _resident_session_availability(_project_with_vision({}))
-    assert result == {"available": False, "state": "dark", "reason": "sessions_disabled"}
+    assert result == {"available": False, "state": "off", "reason": "sessions_disabled"}
 
 
 def test_resident_session_availability_reasons(enable_strategic_session_flag):
@@ -1426,14 +1426,71 @@ def test_resident_session_availability_reasons(enable_strategic_session_flag):
     assert failed["state"] == "error"
     assert failed["reason"] == "start_failed: boom"
 
-    # Active session -> active (reason cleared).
+    # Active session that has begun streaming (progress recorded) -> active.
     active = _resident_session_availability(
         _project_with_vision(
-            {RESIDENT_SESSION_KEY: {"status": "active", "stop_requested": False}}
+            {
+                RESIDENT_SESSION_KEY: {
+                    "status": "active",
+                    "stop_requested": False,
+                    "started_at": "2026-01-01T00:00:00",
+                    "last_progress_at": "2026-01-01T00:05:00",
+                }
+            }
         )
     )
     assert active["state"] == "active"
     assert active["reason"] is None
+
+
+def test_resident_session_availability_starting_before_agent_streams(
+    enable_strategic_session_flag,
+):
+    """A live session blob whose agent has not begun (no progress, only the
+    start-seeded operator interaction) reads as ``starting`` — the transient
+    bring-up window — not yet ``active``."""
+    # Freshly started: last_progress_at is None and last_operator_interaction_at
+    # equals started_at (the seed). The agent has not begun -> starting.
+    starting = _resident_session_availability(
+        _project_with_vision(
+            {
+                RESIDENT_SESSION_KEY: {
+                    "status": "active",
+                    "stop_requested": False,
+                    "started_at": "2026-01-01T00:00:00",
+                    "last_progress_at": None,
+                    "last_operator_interaction_at": "2026-01-01T00:00:00",
+                }
+            }
+        )
+    )
+    assert starting["state"] == "starting"
+    assert starting["reason"] is None
+
+    # A provisional claim (no task pinned yet, no progress) is also starting.
+    provisional = _resident_session_availability(
+        _project_with_vision(
+            {RESIDENT_SESSION_KEY: {"status": "active", "stop_requested": False}}
+        )
+    )
+    assert provisional["state"] == "starting"
+
+    # Once a post-start operator interaction lands (a later timestamp), the
+    # operator<->agent loop is live -> active.
+    active = _resident_session_availability(
+        _project_with_vision(
+            {
+                RESIDENT_SESSION_KEY: {
+                    "status": "active",
+                    "stop_requested": False,
+                    "started_at": "2026-01-01T00:00:00",
+                    "last_progress_at": None,
+                    "last_operator_interaction_at": "2026-01-01T00:02:00",
+                }
+            }
+        )
+    )
+    assert active["state"] == "active"
 
     # Enabled, no reason, zero eligible runners -> inferred no_runner.
     inferred = _resident_session_availability(

@@ -211,24 +211,14 @@ def _fixed_session_commands(
             },
             refetch_surfaces=DEFAULT_REFETCH_SURFACES,
         ),
+        # The strategic interaction vocabulary is collapsed to Chat + Workday;
+        # the retired check-in / monitor mode commands are no longer offered.
         _mode_command(
             project_id=project_id,
             current_mode=current_mode,
             mode="continuous",
             label="Workday mode",
             refetch_surfaces=(SURFACE_STRATEGIC_SESSION, SURFACE_RUNTIME),
-        ),
-        _mode_command(
-            project_id=project_id,
-            current_mode=current_mode,
-            mode="check_in",
-            label="Check-in mode",
-        ),
-        _mode_command(
-            project_id=project_id,
-            current_mode=current_mode,
-            mode="monitor",
-            label="Monitor mode",
         ),
         _mode_command(
             project_id=project_id,

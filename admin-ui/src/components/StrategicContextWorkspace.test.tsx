@@ -358,15 +358,13 @@ describe('StrategicContextWorkspace', () => {
     expect(host.querySelector('[data-testid="strategic-context-workspace-map"]')).not.toBeNull();
   });
 
-  test('exposes Strategic mode, check-in, and account controls from the drawer', () => {
+  test('exposes Strategic mode and account controls from the drawer', () => {
     const onClose = vi.fn();
     const onModeChange = vi.fn();
-    const onCheckIn = vi.fn();
     const onOpenAccounts = vi.fn();
     const { host } = mount({
       onClose,
       onModeChange,
-      onCheckIn,
       onOpenAccounts,
       accountSpend: {
         totalAccounts: 3,
@@ -379,7 +377,8 @@ describe('StrategicContextWorkspace', () => {
 
     const control = host.querySelector('[data-testid="strategic-session-control"]');
     expect(control?.textContent).toContain('Workday');
-    expect(control?.textContent).toContain('Mark checked');
+    // The check-in "Mark checked" affordance was retired with the mode collapse.
+    expect(control?.textContent).not.toContain('Mark checked');
     expect(control?.textContent).toContain('Accounts');
 
     const buttons = Array.from(host.querySelectorAll('button'));
@@ -387,16 +386,16 @@ describe('StrategicContextWorkspace', () => {
     expect(buttons.filter(button => button.title === 'Open Compute')).toHaveLength(1);
     expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open devices: runner'))).toBe(false);
     expect(buttons.some(button => button.getAttribute('aria-label')?.startsWith('Open compute: runtime work'))).toBe(false);
+    // Only Chat and Workday remain in the mode picker.
+    expect(buttons.some(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Monitor')).toBe(false);
+    expect(buttons.some(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Check-in')).toBe(false);
 
+    // The drawer opens in Workday (continuous); switching to the other mode, Chat,
+    // routes through onModeChange with the backend value.
     buttons
-      .find(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Monitor')
+      .find(button => button.getAttribute('aria-label') === 'Switch Strategic mode to Chat')
       ?.click();
-    expect(onModeChange).toHaveBeenCalledWith('monitor');
-
-    buttons
-      .find(button => button.getAttribute('aria-label')?.startsWith('Mark Strategic session checked:'))
-      ?.click();
-    expect(onCheckIn).toHaveBeenCalledTimes(1);
+    expect(onModeChange).toHaveBeenCalledWith('chat');
 
     buttons
       .find(button => button.getAttribute('aria-label')?.startsWith('Open accounts: accounts'))

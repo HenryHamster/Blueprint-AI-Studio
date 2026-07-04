@@ -43,7 +43,6 @@ interface StrategicContextWorkspaceProps {
   savingSession?: boolean;
   savingSessionRefs?: boolean;
   accountSpend?: StrategicAccountSpendStatus | null;
-  checkingIn?: boolean;
   sessionActive?: boolean;
   sessionStatus?: string | null;
   sessionState?: string | null;
@@ -55,7 +54,6 @@ interface StrategicContextWorkspaceProps {
   onOpenTarget: (target?: StrategicContextTarget | null) => void;
   onOpenMessageTarget?: (target?: StrategicMessageTarget) => void;
   onModeChange?: (mode: StrategicInteractionMode) => void;
-  onCheckIn?: () => void;
   onOpenAccounts?: () => void;
   onOpenSpend?: () => void;
   onUpdateSessionRefs?: (
@@ -585,7 +583,6 @@ export function StrategicContextWorkspace({
   savingSession = false,
   savingSessionRefs = false,
   accountSpend = null,
-  checkingIn = false,
   sessionActive = false,
   sessionStatus = null,
   sessionState = null,
@@ -597,7 +594,6 @@ export function StrategicContextWorkspace({
   onOpenTarget,
   onOpenMessageTarget,
   onModeChange,
-  onCheckIn,
   onOpenAccounts,
   onOpenSpend,
   onUpdateSessionRefs,
@@ -773,9 +769,6 @@ export function StrategicContextWorkspace({
                   mode={sessionMode}
                   saving={savingSession}
                   accountSpend={accountSpend}
-                  lastCheckIn={workSession?.last_check_in ?? null}
-                  sinceLastCheckIn={workSession?.since_last_check_in ?? null}
-                  checkingIn={checkingIn}
                   sessionActive={sessionActive}
                   sessionStatus={sessionStatus}
                   sessionState={sessionState}
@@ -784,7 +777,6 @@ export function StrategicContextWorkspace({
                   onStartSession={onStartSession}
                   onStopSession={onStopSession}
                   onModeChange={onModeChange}
-                  onCheckIn={onCheckIn}
                   onOpenAccounts={onOpenAccounts ? () => {
                     onClose();
                     onOpenAccounts();
