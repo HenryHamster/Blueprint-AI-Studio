@@ -2214,5 +2214,325 @@ class TestPostRetryAfterHeader(unittest.TestCase):
         self.assertEqual(result[0], 200)
 
 
+# ── Docker agent backend (BLUEPRINT_AGENT_IMAGE) ──────────────────────────────
+
+class TestDockerAgentBackend(unittest.TestCase):
+    """Agent tasks routed to the prod agent container image instead of bwrap.
+
+    Everything here mocks ``iso`` (decide_agent_backend / plan_agent_execution /
+    terminate_process_tree) — no real docker/postgres/bwrap is touched. Covers:
+    plan+spawn routing, per-task container tracking, docker-aware teardown, and the
+    relaxed advertisement (claim read-only agent work on docker+image WITHOUT bwrap).
+    """
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    # ---- plan + spawn + container tracking -----------------------------------
+
+    def _spawn(self, *, backend, container_name, agent_image, agent_binary, caps,
+               task_type="research"):
+        active_tasks: dict = {}
+        agent_started_at: dict = {}
+        agent_teardown: dict = {}
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+
+        plan = iso.ExecutionPlan(
+            backend=backend,
+            argv=(["docker", "run", "..."] if backend == iso.BACKEND_DOCKER
+                  else ["bwrap", "node", "..."]),
+            env={"AGENT_SECRET_TOKEN": "s"},
+            container_name=container_name,
+        )
+        decide_mock = MagicMock(return_value=backend)
+        plan_mock = MagicMock(return_value=plan)
+
+        with patch.object(local_runner.iso, "decide_agent_backend", decide_mock), \
+             patch.object(local_runner.iso, "plan_agent_execution", plan_mock), \
+             patch.object(local_runner.subprocess, "Popen", return_value=fake_proc):
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-xyz",
+                task_type=task_type,
+                agent_token="agent-tok",
+                vm_instance_id="runner:local",
+                orchestrator_url="https://api.example.com",
+                workspace="/tmp/ws",
+                caps=caps,
+                agent_binary=agent_binary,
+                agent_image=agent_image,
+                active_tasks=active_tasks,
+                agent_started_at=agent_started_at,
+                agent_teardown=agent_teardown,
+                lock=threading.Lock(),
+            )
+        return {
+            "spawned": spawned, "active": active_tasks, "started": agent_started_at,
+            "teardown": agent_teardown, "decide": decide_mock, "plan": plan_mock,
+            "proc": fake_proc,
+        }
+
+    def test_docker_image_plans_spawns_and_tracks_container(self):
+        r = self._spawn(
+            backend=iso.BACKEND_DOCKER,
+            container_name="bp-agent-abcd1234",
+            agent_image="registry/agent:prod",
+            agent_binary=None,            # a docker box need not carry the host dist
+            caps=_docker_caps(),
+        )
+        self.assertTrue(r["spawned"])
+        self.assertIs(r["active"]["task-xyz"], r["proc"])
+        self.assertIn("task-xyz", r["started"])
+        # container_name tracked alongside the backend for the reaper/shutdown teardown.
+        self.assertEqual(
+            r["teardown"]["task-xyz"], (iso.BACKEND_DOCKER, "bp-agent-abcd1234")
+        )
+        # The claim decision is routed through decide_agent_backend with task_type+image.
+        _, dkw = r["decide"].call_args
+        self.assertEqual(dkw["task_type"], "research")
+        self.assertEqual(dkw["agent_image"], "registry/agent:prod")
+        # The image + task_type are handed to the planner for the docker task.
+        _, pkw = r["plan"].call_args
+        self.assertEqual(pkw["agent_image"], "registry/agent:prod")
+        self.assertEqual(pkw["task_type"], "research")
+        # Injected identity env is passed through unchanged.
+        self.assertEqual(pkw["injected_env"]["AGENT_SECRET_TOKEN"], "agent-tok")
+        self.assertEqual(pkw["injected_env"]["TASK_ID"], "task-xyz")
+
+    def test_real_iso_interface_docker_plan_and_container_name(self):
+        """Integration guard against interface drift: drive _spawn_agent_task with the
+        REAL iso.decide_agent_backend + iso.plan_agent_execution (both pure) — only
+        subprocess.Popen is mocked. A read-only task type on a docker+image box must
+        plan the docker backend and derive container_name = bp-agent-<task_id>."""
+        active_tasks: dict = {}
+        started: dict = {}
+        teardown: dict = {}
+        fake_proc = MagicMock()
+        fake_proc.pid = 999
+        with patch.object(local_runner.subprocess, "Popen", return_value=fake_proc):
+            spawned = local_runner._spawn_agent_task(
+                task_id="abc123def456ghi",  # >12 chars → container name truncates it
+                task_type="research",       # in iso.AGENT_DOCKER_TYPES
+                agent_token="t", vm_instance_id="vm",
+                orchestrator_url="https://api", workspace="/tmp/ws",
+                caps=_docker_caps(),        # docker_usable, no bwrap
+                agent_binary=None,          # host dist absent — image carries the agent
+                agent_image="registry/agent:prod",
+                active_tasks=active_tasks, agent_started_at=started,
+                agent_teardown=teardown, lock=threading.Lock(),
+            )
+        self.assertTrue(spawned)
+        backend, cname = teardown["abc123def456ghi"]
+        self.assertEqual(backend, iso.BACKEND_DOCKER)
+        self.assertEqual(cname, "bp-agent-abc123def456")  # bp-agent-<task_id[:12]>
+
+    def test_no_image_uses_bwrap_and_no_container(self):
+        r = self._spawn(
+            backend=iso.BACKEND_BWRAP,
+            container_name=None,
+            agent_image=None,
+            agent_binary="/agent/dist/index.js",
+            caps=_bwrap_caps(),
+        )
+        self.assertTrue(r["spawned"])
+        self.assertEqual(r["teardown"]["task-xyz"], (iso.BACKEND_BWRAP, None))
+        # No image → the planner is never offered one (bwrap-only, unchanged).
+        _, pkw = r["plan"].call_args
+        self.assertIsNone(pkw["agent_image"])
+
+    def test_declined_task_type_not_spawned(self):
+        """A write task type on a docker-only (read-only image) box declines before
+        planning; nothing is tracked and the caller (which releases the permit) sees
+        False."""
+        active_tasks: dict = {}
+        started: dict = {}
+        teardown: dict = {}
+        with patch.object(local_runner.iso, "plan_agent_execution") as plan_mock, \
+             patch.object(local_runner.iso, "decide_agent_backend",
+                          return_value=iso.DECLINE):
+            spawned = local_runner._spawn_agent_task(
+                task_id="task-w", task_type="feature", agent_token="t",
+                vm_instance_id="vm", orchestrator_url="https://api",
+                workspace="/tmp/ws", caps=_docker_caps(), agent_binary=None,
+                agent_image="registry/agent:prod", active_tasks=active_tasks,
+                agent_started_at=started, agent_teardown=teardown,
+                lock=threading.Lock(),
+            )
+        self.assertFalse(spawned)
+        self.assertEqual(active_tasks, {})
+        self.assertEqual(teardown, {})
+        plan_mock.assert_not_called()
+
+    # ---- docker-aware teardown (reaper deadline path) ------------------------
+
+    def _reap_once_past_deadline(self, teardown_entry):
+        proc = MagicMock()
+        proc.poll.return_value = None  # still running → deadline path (not normal reap)
+        active_tasks = {"t1": proc}
+        agent_started_at = {"t1": time.monotonic() - 100.0}
+        agent_teardown = {"t1": teardown_entry}
+        captured = {}
+
+        def fake_term(p, **kw):
+            captured["proc"] = p
+            captured["kwargs"] = kw
+
+        def stop_sleep(_secs):
+            local_runner._shutdown_event.set()
+
+        with patch.object(local_runner.iso, "terminate_process_tree", fake_term), \
+             patch("time.sleep", stop_sleep):
+            local_runner._reap_loop(
+                active_tasks, threading.Lock(), None,
+                agent_started_at=agent_started_at,
+                agent_max_seconds=10,
+                agent_teardown=agent_teardown,
+            )
+        return captured, active_tasks, agent_teardown, proc
+
+    def test_reaper_docker_teardown_stops_container(self):
+        captured, active, teardown, proc = self._reap_once_past_deadline(
+            (iso.BACKEND_DOCKER, "bp-agent-abcd1234")
+        )
+        self.assertIs(captured["proc"], proc)
+        self.assertEqual(captured["kwargs"]["backend"], iso.BACKEND_DOCKER)
+        self.assertEqual(captured["kwargs"]["container_name"], "bp-agent-abcd1234")
+        self.assertNotIn("t1", active)
+        self.assertNotIn("t1", teardown)
+
+    def test_reaper_bwrap_teardown_has_no_container(self):
+        captured, _active, _teardown, _proc = self._reap_once_past_deadline(
+            (iso.BACKEND_BWRAP, None)
+        )
+        self.assertEqual(captured["kwargs"]["backend"], iso.BACKEND_BWRAP)
+        self.assertIsNone(captured["kwargs"]["container_name"])
+
+    # ---- relaxed advertisement (heartbeat agent_available) -------------------
+
+    def _heartbeat_agent_available(self, *, caps, agent_image):
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        # Host toolchain ABSENT (docker-only box): no agent dist, no node runtime.
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                agent_sandbox_ok=caps.bwrap_ok,
+                caps=caps, agent_image=agent_image,
+            )
+        return posted[0]["agent_available"]
+
+    def test_advertises_agent_on_docker_image_without_bwrap(self):
+        self.assertTrue(
+            self._heartbeat_agent_available(
+                caps=_docker_caps(), agent_image="registry/agent:prod"
+            )
+        )
+
+    def test_no_advertise_agent_on_docker_without_image(self):
+        # Regression guard: docker-usable but no image → NOT claimable (unchanged).
+        self.assertFalse(
+            self._heartbeat_agent_available(caps=_docker_caps(), agent_image=None)
+        )
+
+
+class TestAgentImagePresence(unittest.TestCase):
+    """Fail-closed image check (Fix 3): a docker box with BLUEPRINT_AGENT_IMAGE set
+    but the image ABSENT must NOT advertise the docker agent backend — it would
+    claim-and-crash-loop. ``_agent_image_present`` gates main()'s startup enablement;
+    when it fails, main() sets agent_image=None so the runner falls back to
+    bwrap-or-decline. No real docker is touched (subprocess.run is mocked)."""
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    @staticmethod
+    def _inspect_result(returncode):
+        result = MagicMock()
+        result.returncode = returncode
+        return result
+
+    # ---- the helper itself ---------------------------------------------------
+
+    def test_present_when_inspect_exits_zero(self):
+        with patch.object(
+            local_runner.subprocess, "run",
+            return_value=self._inspect_result(0),
+        ) as run_mock:
+            self.assertTrue(local_runner._agent_image_present("registry/agent:prod"))
+        # It really shells `docker image inspect <image>`.
+        argv = run_mock.call_args[0][0]
+        self.assertEqual(argv, ["docker", "image", "inspect", "registry/agent:prod"])
+
+    def test_absent_when_inspect_exits_nonzero(self):
+        with patch.object(
+            local_runner.subprocess, "run",
+            return_value=self._inspect_result(1),
+        ):
+            self.assertFalse(local_runner._agent_image_present("registry/agent:prod"))
+
+    def test_absent_on_subprocess_error(self):
+        for exc in (
+            OSError("docker not installed"),
+            subprocess.TimeoutExpired(cmd="docker", timeout=15),
+        ):
+            with patch.object(local_runner.subprocess, "run", side_effect=exc):
+                self.assertFalse(
+                    local_runner._agent_image_present("registry/agent:prod")
+                )
+
+    # ---- effect on advertisement (main()'s startup gate) ---------------------
+
+    def _advertised_after_image_gate(self, *, inspect_rc):
+        """Drive the REAL heartbeat advertisement with the effective agent_image
+        main() would compute: present (inspect exit 0) keeps the image, absent
+        disables it (None). Docker-only box (no bwrap), host toolchain absent."""
+        with patch.object(
+            local_runner.subprocess, "run",
+            return_value=self._inspect_result(inspect_rc),
+        ):
+            present = local_runner._agent_image_present("registry/agent:prod")
+        effective_image = "registry/agent:prod" if present else None
+
+        posted = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        with patch.object(local_runner, "_post", fake_post), \
+             patch.object(local_runner, "_locate_agent_binary", return_value=None), \
+             patch.object(local_runner, "_node_runtime_ok", return_value=False):
+            local_runner._heartbeat_loop(
+                "https://api", "tok", {}, threading.Lock(),
+                {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                agent_sandbox_ok=False,  # no bwrap → docker-only
+                caps=_docker_caps(), agent_image=effective_image,
+            )
+        return posted[0]["agent_available"]
+
+    def test_present_image_advertises_docker_agent(self):
+        self.assertTrue(self._advertised_after_image_gate(inspect_rc=0))
+
+    def test_absent_image_disables_and_falls_back(self):
+        # Absent image → agent_image disabled → docker-only box no longer advertises
+        # agent work (falls back to decline, since bwrap is unavailable).
+        self.assertFalse(self._advertised_after_image_gate(inspect_rc=1))
+
+
 if __name__ == "__main__":
     unittest.main()

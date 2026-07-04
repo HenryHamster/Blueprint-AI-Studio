@@ -340,12 +340,83 @@ def detect_capabilities() -> Capabilities:
 
 # ── Decision table (pure, fail-closed) ───────────────────────────────────────
 
+# Read-only agent task types eligible for the prod agent CONTAINER image. This is
+# the "read-only slice": types whose agent runs in read_only mode (they never push
+# a branch/PR) AND whose work is light — no postgres, no pytest, no
+# docker-in-docker — so the slim prod agent image (agent/Dockerfile) satisfies
+# them at exact prod parity (Cloud Run Jobs / GCE VMs run the same image).
+#
+# Reuse note: the backend's authoritative read-only registry is
+# ``app.task_capabilities.READ_ONLY_TASK_TYPES`` (re-exported for Cloud Run Jobs
+# as ``CLOUD_RUN_CANDIDATE_TASK_TYPES``). It is deliberately NOT imported here —
+# runner_isolation is stdlib-only (see the module docstring) and must not pull in
+# the backend package — and it is NOT identical to what belongs here: that set
+# also contains the heavy ``requires_compute`` read-only types (smoketest / perf /
+# verify_tests / compute_experiment), which need pytest / a DB / the compute
+# substrate and therefore MUST NOT be routed to this thin read-only image (cf.
+# agent/Dockerfile header). This frozenset is the hand-maintained read-only slice:
+# the registry's read_only types MINUS those compute-heavy ones (smoketest / perf /
+# verify_tests / compute_experiment). It contains ONLY read_only (agent_mode !=
+# "write") types — never a WRITE/PR type such as ``docs`` (output_kind="pr"), which
+# would push a branch the read-only image cannot safely produce. Keep it in sync
+# with the registry when a new light read-only type is added.
+AGENT_DOCKER_TYPES: frozenset[str] = frozenset(
+    {
+        "strategic_review",
+        "design_doc_update",
+        "research",
+        "web_research",
+        "plan",
+        "design",
+        "memo",
+        "investigate",
+        "debug",
+        "self_audit",
+        "security_audit",
+        "review",
+        "panel_review",
+        "release_audit",
+        "release_audit_challenge",
+        "release_merge_grade",
+        "repo_bootstrap",
+    }
+)
 
-def decide_agent_backend(caps: Capabilities, agent_binary_present: bool) -> str:
-    """Agent tasks run under bwrap or not at all (never GPU, never container).
 
-    Returns ``BACKEND_BWRAP`` or ``DECLINE``.
+def decide_agent_backend(
+    caps: Capabilities,
+    agent_binary_present: bool,
+    *,
+    task_type: str | None = None,
+    agent_image: str | None = None,
+) -> str:
+    """Choose an agent task's isolation backend, fail-closed.
+
+    Backends, in preference order:
+
+      * ``BACKEND_DOCKER`` — an ``agent_image`` is supplied AND docker is usable
+        (``caps.docker_usable`` — the SAME probe the compute path uses) AND the
+        task type is read-only-eligible (``task_type is None`` or in
+        :data:`AGENT_DOCKER_TYPES`). Running the prod agent container is exact
+        prod parity (Cloud Run Jobs / GCE VMs run this same image) and gives the
+        agent a real, rm-able ``/workspace`` layer dir, fixing the bwrap
+        ``rm -rf /workspace`` EBUSY crash. This path does NOT require
+        ``agent_binary_present``: the image ships its own agent build, so a host
+        ``dist/index.js`` is irrelevant to it.
+      * ``BACKEND_BWRAP`` — no eligible docker image, but a built host agent
+        binary AND a rootless bwrap sandbox are available.
+      * ``DECLINE`` — neither boundary can be built.
+
+    CRITICAL invariant: when ``agent_image`` is falsy the result is byte-identical
+    to the historical bwrap-or-decline table below — the docker branch is inert,
+    so there is no behavioral change for callers that do not pass an image.
     """
+    if (
+        agent_image
+        and caps.docker_usable
+        and (task_type is None or task_type in AGENT_DOCKER_TYPES)
+    ):
+        return BACKEND_DOCKER
     if not agent_binary_present:
         return DECLINE
     if caps.bwrap_ok:
@@ -660,7 +731,7 @@ def resolve_tools(names: list[str], source_env: dict[str, str] | None = None) ->
 def build_docker_argv(
     *,
     image: str,
-    command: str,
+    command: str | None,
     container_name: str,
     gpu_indices: list[int] | None,
     binds: list[tuple[str, str]],
@@ -673,6 +744,14 @@ def build_docker_argv(
     """docker/podman run argv. Env VALUES are passed via ``-e KEY`` (read from the
     subprocess env), never inlined as ``KEY=VALUE`` on argv (which /proc/cmdline
     would expose). ``--gpus device=<idx,...>`` scopes to the assigned GPUs only.
+
+    ``command`` semantics:
+      * a string → the image is run with a ``bash -lc <command>`` override
+        (the compute-job path: the image is a generic toolchain, the command is
+        the experiment).
+      * ``None`` → NO command override is appended; the image runs its own
+        ENTRYPOINT/CMD (the agent path: agent/Dockerfile's ``CMD ["npm","start"]``
+        is the whole contract — the agent claims one task and exits).
     """
     argv: list[str] = [runtime, "run", "--rm", "--name", container_name]
     if gpu_indices:
@@ -687,7 +766,9 @@ def build_docker_argv(
         argv += ["-e", key]  # value pulled from the runner's env for this exec
     if cwd:
         argv += ["-w", cwd]
-    argv += [image, "bash", "-lc", command]
+    argv += [image]
+    if command is not None:
+        argv += ["bash", "-lc", command]
     return argv
 
 
@@ -958,20 +1039,85 @@ def plan_agent_execution(
     workspace_host: str,
     injected_env: dict[str, str],
     source_env: dict[str, str],
+    task_type: str | None = None,
+    agent_image: str | None = None,
 ) -> ExecutionPlan:
-    """Build the sandbox plan for an agent task, or DECLINE (fail-closed).
+    """Build the isolation plan for an agent task, or DECLINE (fail-closed).
 
     ``injected_env`` = the runner-set identity vars (AGENT_SECRET_TOKEN,
-    ORCHESTRATOR_URL, TASK_ID, VM_INSTANCE_ID). AGENT_WORKSPACE and HOME are
-    forced to the in-sandbox paths here.
+    ORCHESTRATOR_URL, TASK_ID, VM_INSTANCE_ID).
+
+    When ``agent_image`` is supplied and docker is usable for an eligible
+    ``task_type`` (see :func:`decide_agent_backend` / :data:`AGENT_DOCKER_TYPES`),
+    the plan runs the prod agent CONTAINER (exact Cloud-Run/VM parity): the
+    container owns ``/workspace`` as a writable image layer, keeps its own
+    PATH/HOME/WORKDIR, and runs its own CMD — so nothing is bound from the host
+    and neither the command nor cwd is overridden. Otherwise the historical bwrap
+    plan is built unchanged (AGENT_WORKSPACE and HOME forced to in-sandbox paths).
     """
     present = agent_binary is not None
-    backend = decide_agent_backend(caps, present)
+    backend = decide_agent_backend(
+        caps, present, task_type=task_type, agent_image=agent_image
+    )
     if backend == DECLINE:
         return ExecutionPlan.decline(
             agent_decline_reason(caps, present) or "no agent sandbox"
         )
 
+    # ---- docker (prod agent image; exact Cloud-Run Jobs / GCE VM parity) ------
+    if backend == BACKEND_DOCKER:
+        assert agent_image
+        task_id = injected_env.get("TASK_ID") or "task"
+        container_name = f"bp-agent-{task_id[:12]}"
+        # Forward ONLY the allowlisted provider creds present on the host PLUS the
+        # injected identity vars — never a full environ copy, never the runner
+        # token. The container owns /workspace (a writable image layer dir), its
+        # own PATH/HOME/WORKDIR, and runs its own CMD (npm start → tsx src/index.ts),
+        # so we bind NOTHING from the host (a /workspace bind reintroduces the bwrap
+        # rm -rf EBUSY bug — this is the whole point) and override neither cwd nor
+        # the command.
+        forwarded: dict[str, str] = {}
+        for key in AGENT_ENV_ALLOWLIST:
+            val = source_env.get(key)
+            if val:
+                forwarded[key] = val
+        forwarded.update({k: v for k, v in injected_env.items() if v is not None})
+        for forbidden in FORBIDDEN_ENV_KEYS:
+            forwarded.pop(forbidden, None)
+        argv = build_docker_argv(
+            image=agent_image,
+            command=None,            # run the image's own CMD — do NOT override
+            container_name=container_name,
+            gpu_indices=None,        # agent tasks are never GPU
+            binds=[],                # NO host /workspace bind — the container owns it
+            env_keys=sorted(forwarded),
+            cwd=None,                # honor the image WORKDIR
+            runtime=BACKEND_DOCKER,
+        )
+        # docker CLIENT env: minimal trusted vars to FIND + configure the runtime,
+        # plus the forwarded values so `-e KEY` can read them for this exec. The
+        # host PATH/HOME are here only so the docker binary runs on the host; they
+        # are NOT in ``env_keys`` (no `-e PATH`/`-e HOME`), so the CONTAINER keeps
+        # its own image PATH/HOME. Never the runner token.
+        client_env: dict[str, str] = {}
+        for key in (
+            "PATH", "HOME", "DOCKER_HOST", "DOCKER_CONFIG", "DOCKER_CERT_PATH",
+            "DOCKER_TLS_VERIFY", "XDG_RUNTIME_DIR",
+        ):
+            val = source_env.get(key)
+            if val:
+                client_env[key] = val
+        client_env.update(forwarded)
+        for forbidden in FORBIDDEN_ENV_KEYS:
+            client_env.pop(forbidden, None)
+        return ExecutionPlan(
+            backend=backend,
+            argv=argv,
+            env=client_env,
+            container_name=container_name,
+        )
+
+    # ---- bwrap (host toolchain; unchanged) -----------------------------------
     assert agent_binary is not None and caps.bwrap_path is not None
     agent_real = os.path.realpath(agent_binary)
     # node resolves modules from the agent package root (…/agent) which holds
