@@ -52,7 +52,7 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
-import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
+import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentRunnerOption, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
 import { buildOptimisticStrategicWorkbench, normalizeStrategicInteractionMode, tabForWorkbenchSurface, workbenchSurfaceForTab } from './utils/strategicWorkbenchSession';
@@ -468,6 +468,17 @@ export default function App() {
     ?? (strategicSessionActive ? 'active' : residentStrategicSessionAvailable ? 'ready' : 'off');
   const strategicSessionReason = residentStrategicSessionAvailability?.reason ?? null;
   const strategicWorkbenchState = optimisticStrategicWorkbench ?? strategicReadModelWorkbench;
+  // Multi-device picker options for the resident session (auto-pick + override
+  // dropdown). The selected device is the operator's stored preference, falling
+  // back to the device the live session is pinned to so an active session shows
+  // its actual runner.
+  const residentStrategicSessionRunners =
+    (selectedStrategicReadModel as { resident_session_runners?: StrategicResidentRunnerOption[] | null } | null)
+      ?.resident_session_runners ?? null;
+  const strategicSessionSelectedRunnerId =
+    strategicWorkbenchState?.preferred_runner_id
+    ?? residentStrategicSession?.runner_id
+    ?? null;
   const chatComposerContextDescriptor = useMemo(
     () => buildStrategicContextDescriptor(selectedStrategicReadModel, strategicWorkbenchState),
     [selectedStrategicReadModel, strategicWorkbenchState],
@@ -532,6 +543,13 @@ export default function App() {
     const baseRefs = (strategicWorkbenchStateRef.current ?? strategicReadModelWorkbench)?.selected_refs ?? [];
     persistStrategicWorkbench({ selected_refs: updateRefs(baseRefs) });
   }, [persistStrategicWorkbench, strategicReadModelWorkbench]);
+  // Multi-device override: pick which enrolled runner the resident session pins
+  // to. Persisted as the workbench `preferred_runner_id` — the source the Start
+  // handler already reads — so the next start (or restart after a device goes
+  // offline) uses the chosen device. `null` selects auto-pick.
+  const handleSelectStrategicRunner = useCallback((runnerId: string | null) => {
+    persistStrategicWorkbench({ preferred_runner_id: runnerId });
+  }, [persistStrategicWorkbench]);
   const handleStrategicCheckIn = useCallback(async () => {
     const projectId = s.selectedProjectId;
     if (!projectId || checkingInStrategicSession) return;
@@ -1398,6 +1416,9 @@ export default function App() {
         sessionState={strategicSessionState}
         sessionReason={strategicSessionReason}
         sessionBusy={strategicSessionBusy}
+        sessionRunners={residentStrategicSessionRunners}
+        sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+        onSelectRunner={handleSelectStrategicRunner}
         onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
         onStopSession={handleStopStrategicSession}
         onClose={closeStrategicContextWorkspace}
@@ -1464,6 +1485,9 @@ export default function App() {
                 sessionState={strategicSessionState}
                 sessionReason={strategicSessionReason}
                 sessionBusy={strategicSessionBusy}
+                sessionRunners={residentStrategicSessionRunners}
+                sessionSelectedRunnerId={strategicSessionSelectedRunnerId}
+                onSelectRunner={handleSelectStrategicRunner}
                 onStartSession={residentStrategicSessionAvailable ? handleStartStrategicSession : undefined}
                 onStopSession={handleStopStrategicSession}
                 onModeChange={setStrategicInteractionMode}

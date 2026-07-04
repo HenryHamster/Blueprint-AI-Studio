@@ -739,12 +739,31 @@ export interface StrategicResidentSessionSnapshot {
  * Legible Workday resident-session availability (mirrors
  * `_resident_session_availability` in `strategic_state_read_model.py`).
  * `state` maps to the operator status chip; `reason` is present whenever the
- * session can't run (`sessions_disabled` / `no_runner` / `start_failed: <msg>`).
+ * session can't run (`sessions_disabled` / `no_runner` / `runner_offline` /
+ * `start_failed: <msg>`). `runner_offline` is the mid-session block-on-offline
+ * verdict: the pinned device went offline and the operator must restart to pick
+ * another (no auto-migration).
  */
 export interface StrategicResidentSessionAvailability {
   available: boolean;
-  state: 'dark' | 'ready' | 'active' | 'blocked' | 'error' | string;
+  state: 'off' | 'ready' | 'starting' | 'active' | 'blocked' | 'error' | string;
   reason?: string | null;
+}
+
+/**
+ * One device-picker option for the resident (Workday) session (mirrors an entry
+ * of `build_resident_runner_options` in `strategic_resident_session.py`).
+ * `online` = active + recent heartbeat; `agent_ready` = the agent can run;
+ * `eligible` = online + agent-ready + can handle strategic work (the full
+ * auto-pick gate). The pinned device rides on `resident_session.runner_id`.
+ */
+export interface StrategicResidentRunnerOption {
+  id: string;
+  name: string;
+  hostname?: string | null;
+  online: boolean;
+  agent_ready: boolean;
+  eligible: boolean;
 }
 
 export interface StrategicSessionStartRequest {
@@ -833,6 +852,13 @@ export interface StrategicStateResponse {
    * dark / ready / active / blocked / error instead of relying on a Start click.
    */
   resident_session_availability?: StrategicResidentSessionAvailability | null;
+  /**
+   * Device-picker options for the resident (Workday) session: every enrolled
+   * runner with online / agent-ready / eligible flags so the UI can render the
+   * auto-pick + override dropdown. The currently pinned device is
+   * `resident_session.runner_id`.
+   */
+  resident_session_runners?: StrategicResidentRunnerOption[] | null;
   running_update: {
     excerpt: string | null;
     char_count: number;

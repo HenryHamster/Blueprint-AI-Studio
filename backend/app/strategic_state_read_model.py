@@ -21,6 +21,7 @@ from app.models import (
 from app import strategic_cycle
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
+    RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     STRATEGIC_SESSION_ENABLED_SETTING,
     read_resident_session_blocked_reason,
@@ -544,17 +545,51 @@ def _resident_session_has_begun_streaming(snapshot: Dict[str, Any] | None) -> bo
     return bool(last_op and started and last_op != started)
 
 
+def _resident_selected_runner_offline(
+    snapshot: Dict[str, Any] | None,
+    runner_options: list[Dict[str, Any]] | None,
+) -> bool:
+    """True iff a live session is pinned to a device that is now offline/absent.
+
+    Reads the pinned ``runner_id`` off the session snapshot and checks it against
+    the live runner-picker options: offline iff the device is missing from the set
+    (de-enrolled) OR present but not ``online``. Returns False when the session is
+    unpinned (no ``runner_id``) — an older cloud-fallback session — so only a
+    device-pinned session can flip to the offline block. This is the mid-session
+    half of block-on-offline; Workday does NOT auto-migrate, so the UI prompts the
+    operator to restart and pick another device (operator decision (c)).
+    """
+    if not isinstance(snapshot, dict):
+        return False
+    runner_id = snapshot.get("runner_id")
+    if not isinstance(runner_id, str) or not runner_id.strip():
+        return False
+    runner_id = runner_id.strip()
+    options = runner_options if isinstance(runner_options, list) else []
+    match = next(
+        (
+            option
+            for option in options
+            if isinstance(option, dict) and str(option.get("id")) == runner_id
+        ),
+        None,
+    )
+    return match is None or not bool(match.get("online"))
+
+
 def _resident_session_availability(
     project: Project,
     *,
     eligible_live_runner_count: int | None = None,
+    runner_options: list[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
     """Legible Workday resident-session state + the reason it isn't running.
 
-    Turns three signals — the ``strategic_session_enabled`` flag, the live
-    session blob, and the recorded ``no_runner`` / ``start_failed`` reason (plus
-    the eligible-live-runner count as a live "is a runner attached" hint) — into
-    a single state the operator UI renders without re-deriving backend rules:
+    Turns these signals — the ``strategic_session_enabled`` flag, the live
+    session blob (+ its pinned ``runner_id``), the recorded ``no_runner`` /
+    ``start_failed`` reason, the eligible-live-runner count, and the live
+    runner-picker ``runner_options`` — into a single state the operator UI renders
+    without re-deriving backend rules:
 
     * ``off``      — feature flag off (reason ``sessions_disabled``).
     * ``starting`` — a session blob exists (created + task pinning) but the agent
@@ -563,20 +598,24 @@ def _resident_session_availability(
     * ``active``   — a resident session is live and the agent has begun
       (runner-attached / replying).
     * ``error``    — the last auto-start failed (reason ``start_failed: <msg>``).
-    * ``blocked``  — enabled but can't run: no live local runner
+    * ``blocked``  — enabled but can't run: either the pinned device went offline
+      mid-session (reason ``runner_offline`` — the UI prompts a restart to pick
+      another device, NO auto-migration), or no live local runner exists
       (reason ``no_runner``), whether recorded by the last auto-start or inferred
       from a zero eligible-runner count.
     * ``ready``    — enabled, a live runner is attached, nothing started yet
       (entering Workday auto-starts, so this is transient).
 
-    A recorded ``start_failed`` always wins — a real failure is never masked by a
-    runner count. A recorded ``no_runner``, by contrast, is only authoritative
-    while the live count is still 0/unknown: a POSITIVE
-    ``eligible_live_runner_count`` OVERRIDES a stale ``no_runner`` (recorded when
-    the operator entered Workday with no runner, and never cleared — no mode
-    transition re-runs the auto-start hook when a runner later attaches) and
-    reports ``ready`` instead of a phantom "blocked: no runner" with a runner
-    plainly attached.
+    Block-on-offline takes precedence for a live session: a session pinned to a
+    now-offline device reports ``blocked``/``runner_offline`` even though the blob
+    is still ``active`` (the operator must restart to re-pick). Otherwise a
+    recorded ``start_failed`` always wins — a real failure is never masked by a
+    runner count. A recorded ``no_runner`` is only authoritative while the live
+    count is still 0/unknown: a POSITIVE ``eligible_live_runner_count`` OVERRIDES a
+    stale ``no_runner`` (recorded when the operator entered Workday with no runner,
+    and never cleared — no mode transition re-runs the auto-start hook when a
+    runner later attaches) and reports ``ready`` instead of a phantom "blocked: no
+    runner" with a runner plainly attached.
     """
     enabled = bool(runtime_config.get(STRATEGIC_SESSION_ENABLED_SETTING, False))
     snapshot = resident_session_snapshot(project.vision)
@@ -599,10 +638,20 @@ def _resident_session_availability(
         state = "off"
         reason = "sessions_disabled"
     elif active:
-        # A live session blob: distinguish the transient ``starting`` bring-up
-        # window (task pinning, agent not yet streaming) from a genuinely
-        # ``active`` session where the agent has begun.
-        state = "active" if _resident_session_has_begun_streaming(snapshot) else "starting"
+        # Block-on-offline: a live session pinned to a device that is now offline
+        # (or de-enrolled) flips to ``blocked``/``runner_offline`` — the operator
+        # restarts to pick another device (no auto-migration). Otherwise
+        # distinguish the transient ``starting`` bring-up window (task pinning,
+        # agent not yet streaming) from a genuinely ``active`` session.
+        if _resident_selected_runner_offline(snapshot, runner_options):
+            state = "blocked"
+            reason = RESIDENT_SESSION_REASON_RUNNER_OFFLINE
+        else:
+            state = (
+                "active"
+                if _resident_session_has_begun_streaming(snapshot)
+                else "starting"
+            )
     elif recorded_start_failed:
         # A recorded ``start_failed`` is authoritative and never masked by a live
         # runner count — the last auto-start genuinely errored.

@@ -222,6 +222,9 @@ def test_session_state_helpers():
 async def test_start_helper_adopts_task_and_arms_lease(db_session):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
+    # A live runner is required now: Workday auto-picks an available device and
+    # BLOCKS when none exists (no cloud fallback), so provide one.
+    await _make_live_local_runner(db_session, project)
 
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
@@ -247,6 +250,7 @@ async def test_start_helper_adopts_task_and_arms_lease(db_session):
 async def test_start_is_idempotent(db_session):
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
 
     first = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
@@ -276,6 +280,7 @@ async def test_start_endpoint_starts_when_enabled(
 ):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
 
     res = await client.post(f"/api/admin/projects/{project.id}/strategic-session/start")
     assert res.status_code == 200, res.text
@@ -303,6 +308,7 @@ async def test_start_over_stale_marker_arms_fresh_authoritative_lease(db_session
     competing cycles until the first progress op."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
 
     # Plant a leftover, STALE continuation marker (same operator; last_seen_at
     # well past the TTL) as if a prior session lapsed without a clean release.
@@ -370,6 +376,9 @@ async def test_start_does_not_adopt_in_progress_one_shot(db_session):
     one_shot = await _make_strategic_review_task(
         db_session, project, status=TaskStatus.IN_PROGRESS
     )
+    # A live runner so we exercise the real refuse-on-no-adoptable path (the spawn
+    # guard), not the no-device block that fires earlier when no runner exists.
+    await _make_live_local_runner(db_session, project)
 
     # The refusal path spawns a provisional claim then compensates it on a FRESH,
     # dedicated session (production: ``AsyncSessionLocal``); inject a factory bound
@@ -413,6 +422,9 @@ async def test_start_does_not_adopt_started_provisioning_cycle(db_session):
     started.started_at = _utcnow()
     db_session.add(started)
     await db_session.commit()
+    # A live runner so the refusal is the spawn guard (no adoptable cycle), not the
+    # earlier no-device block.
+    await _make_live_local_runner(db_session, project)
 
     from fastapi import HTTPException
 
@@ -510,89 +522,132 @@ async def test_start_adopt_pins_task_to_runner(db_session):
 
 
 @pytest.mark.asyncio
-async def test_start_adopt_unpinned_when_no_runner_leaves_task_queued(db_session):
-    """ADOPT with NO eligible runner (unpinned cloud fallback): only the resident
-    flags are stamped — the adopted task keeps its QUEUED status + cadence vm id and
-    gains no ``runner_target_id`` (unchanged pre-fix behavior; the runner-pin branch
-    is strictly runner-gated)."""
+async def test_start_blocks_when_no_runner_leaves_task_untouched(db_session):
+    """Multi-device: with NO available runner the start BLOCKS (409) rather than
+    proceeding unpinned to a cloud VM. The adoptable cadence task is left
+    untouched (no resident flags, no claim wedged) so nothing is stranded."""
+    from fastapi import HTTPException
+
     project = await _make_project_with_member(db_session)
-    # No runner registered → auto-selection yields None → unpinned adopt.
+    # No runner registered → auto-pick yields None → BLOCK.
     task = await _make_strategic_review_task(db_session, project, vm="agent-vm-cadence")
 
-    snapshot = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID
-    )
-    assert snapshot["task_id"] == str(task.id)
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session, project, operator_user_id=TEST_USER_ID
+        )
+    assert exc.value.status_code == 409
+    assert "device" in exc.value.detail.lower()
 
-    adopted = await db_session.get(Task, task.id)
-    assert adopted.status == TaskStatus.QUEUED
-    assert adopted.vm_instance_id == "agent-vm-cadence"
-    ctx = adopted.context or {}
-    assert "runner_target_id" not in ctx
-    assert srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY not in ctx
-    # Resident routing flag still stamped even on the unpinned fallback.
-    assert ctx.get("_resident_session") is True
+    # The adoptable cadence task is untouched (never stamped / re-pinned) and no
+    # session claim was written.
+    untouched = await db_session.get(Task, task.id)
+    assert untouched.status == TaskStatus.QUEUED
+    assert untouched.vm_instance_id == "agent-vm-cadence"
+    assert (untouched.context or {}).get("_resident_session") is not True
+    fresh_project = await db_session.get(Project, project.id)
+    assert read_resident_session(fresh_project.vision) is None
 
 
 @pytest.mark.asyncio
 async def test_start_explicit_runner_id_beats_autoselect(db_session):
-    """An explicit ``runner_id`` is honored as-is (auto-selection is only a
-    fallback for the no-runner case)."""
+    """An explicit ``runner_id`` OVERRIDE is honored: it pins to THAT device even
+    when another available runner would auto-pick first (auto-select is only the
+    no-override default)."""
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
-    # A live runner exists, but the caller pins a DIFFERENT explicit id.
-    await _make_live_local_runner(db_session, project)
-
-    explicit = "runner-explicit-123"
-    snap = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID, runner_id=explicit
+    # Two live runners. The most-recently-seen one (auto-pick default) is created
+    # LAST; the caller overrides to the OTHER (older) device explicitly.
+    override_runner = await _make_live_local_runner(
+        db_session, project, last_seen=_utcnow() - timedelta(seconds=30)
     )
-    assert snap["runner_id"] == explicit
+    await _make_live_local_runner(db_session, project)  # newer → auto-pick default
+
+    snap = await start_resident_session(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        runner_id=str(override_runner.id),
+    )
+    assert snap["runner_id"] == str(override_runner.id)
     refreshed = await db_session.get(Task, task.id)
-    assert refreshed.context.get("preferred_runner_target_id") == explicit
+    assert refreshed.context.get("preferred_runner_target_id") == str(
+        override_runner.id
+    )
 
 
 @pytest.mark.asyncio
-async def test_start_proceeds_unpinned_when_no_eligible_runner(db_session):
-    """No runner registered → auto-selection yields None → the session proceeds
-    unpinned (the degraded cloud fallback, unchanged from before)."""
-    project = await _make_project_with_member(db_session)
-    task = await _make_strategic_review_task(db_session, project)
+async def test_start_override_runner_not_found_raises_404(db_session):
+    """An explicit ``runner_id`` that is not a real runner of this project is a
+    hard error (404) — never silently pinned to an unknown device."""
+    from fastapi import HTTPException
 
-    snap = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    # A live runner exists, but the override id is bogus → 404 (no silent fallback
+    # to the live one).
+    await _make_live_local_runner(db_session, project)
+
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id="not-a-real-runner",
+        )
+    assert exc.value.status_code == 404
+    fresh_project = await db_session.get(Project, project.id)
+    assert read_resident_session(fresh_project.vision) is None
+
+
+@pytest.mark.asyncio
+async def test_start_override_offline_runner_blocks_no_fallback(db_session):
+    """Block-on-offline (override): an explicit ``runner_id`` that is OFFLINE
+    blocks (409) with a "restart the session" reason — it does NOT silently fall
+    back to another live device."""
+    from fastapi import HTTPException
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    # The chosen device is offline (stale heartbeat); a DIFFERENT device is live.
+    offline_runner = await _make_live_local_runner(
+        db_session, project, last_seen=_utcnow() - timedelta(hours=1)
     )
-    assert snap["runner_id"] is None
-    refreshed = await db_session.get(Task, task.id)
-    assert (
-        refreshed.context is None
-        or refreshed.context.get(srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
-        is not True
-    )
+    await _make_live_local_runner(db_session, project)  # live, but NOT chosen
+
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            runner_id=str(offline_runner.id),
+        )
+    assert exc.value.status_code == 409
+    assert "restart the session" in exc.value.detail.lower()
+    # No silent fallback: no session pinned to the live device was created.
+    fresh_project = await db_session.get(Project, project.id)
+    assert read_resident_session(fresh_project.vision) is None
 
 
 @pytest.mark.asyncio
 async def test_start_does_not_autoselect_offline_runner(db_session):
     """An OFFLINE (stale ``last_seen_at``) strategic-capable runner is NOT
-    eligible for auto-selection; the session proceeds unpinned rather than
-    pinning to a dead runner."""
+    eligible for auto-pick; with no other available device the start BLOCKS
+    rather than pinning to a dead runner."""
+    from fastapi import HTTPException
+
     project = await _make_project_with_member(db_session)
-    task = await _make_strategic_review_task(db_session, project)
-    # Registered + capable but last heartbeat 1h ago → not live.
+    await _make_strategic_review_task(db_session, project)
+    # Registered + capable but last heartbeat 1h ago → not live → not auto-picked.
     await _make_live_local_runner(
         db_session, project, last_seen=_utcnow() - timedelta(hours=1)
     )
 
-    snap = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID
-    )
-    assert snap["runner_id"] is None
-    refreshed = await db_session.get(Task, task.id)
-    assert (
-        refreshed.context is None
-        or refreshed.context.get(srs.STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY)
-        is not True
-    )
+    with pytest.raises(HTTPException) as exc:
+        await start_resident_session(
+            db_session, project, operator_user_id=TEST_USER_ID
+        )
+    assert exc.value.status_code == 409
 
 
 # ---------------------------------------------------------------------------
@@ -604,6 +659,9 @@ async def test_start_does_not_autoselect_offline_runner(db_session):
 async def test_heartbeat_helper_renews_lease(db_session):
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday auto-picks a device and BLOCKS when
+    # none exists — no cloud fallback), so provide one before starting.
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -633,6 +691,8 @@ async def test_heartbeat_helper_mismatch_rejected(db_session):
 
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -652,6 +712,8 @@ async def test_heartbeat_helper_mismatch_rejected(db_session):
 async def test_heartbeat_helper_reports_stop_requested_without_renewing(db_session):
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -685,11 +747,18 @@ async def test_heartbeat_endpoint_agent_token(
 ):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project, vm="agent-vm-hb")
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
 
-    token = create_agent_token(str(task.id), "agent-vm-hb")
+    # Adoption hard-pins the resident task to the auto-picked runner, so its
+    # vm_instance_id is now ``runner:{id}`` — mint the agent token from the task's
+    # ACTUAL post-adopt vm_instance_id so the heartbeat token matches (the endpoint
+    # rejects a token whose vm_instance_id != task.vm_instance_id).
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.post(
         f"/api/agent/projects/{project.id}/strategic-session/heartbeat",
         headers={"x-agent-token": token},
@@ -718,6 +787,8 @@ async def test_heartbeat_endpoint_rejects_foreign_task_token(
 ):
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project, vm="agent-vm-hb2")
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -748,6 +819,8 @@ async def test_heartbeat_endpoint_rejects_foreign_task_token(
 async def test_stop_helper_drives_task_terminal_and_releases_lease(db_session):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
 
     project = await db_session.get(Project, project.id)
@@ -771,6 +844,8 @@ async def test_stop_helper_drives_task_terminal_and_releases_lease(db_session):
 async def test_stop_endpoint(client: AsyncClient, db_session, enable_strategic_session_flag):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     await client.post(f"/api/admin/projects/{project.id}/strategic-session/start")
 
     res = await client.post(f"/api/admin/projects/{project.id}/strategic-session/stop")
@@ -821,6 +896,8 @@ async def test_heartbeat_stop_race_does_not_rearm_lease(db_session, monkeypatch)
     authority_held=False, and the lease is not renewed."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snapshot = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -923,6 +1000,7 @@ async def test_start_single_task_across_two_starts(db_session):
     task (never spawn a second) and return the same session."""
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
 
     first = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
@@ -1111,6 +1189,9 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     orphaned strategic_review task and clears the provisional claim so no
     untracked task persists and no claim wedges future starts."""
     project = await _make_project_with_member(db_session)  # no live strategic task
+    # A live runner so the start clears the multi-device gate and reaches the
+    # spawn/finalize path this test drives to failure.
+    await _make_live_local_runner(db_session, project)
 
     created: dict = {}
 
@@ -1546,6 +1627,92 @@ def test_resident_session_availability_live_runner_overrides_stale_no_runner(
     assert start_failed_wins["reason"] == "start_failed: boom"
 
 
+def _active_session_vision(runner_id: str | None) -> dict:
+    """An ACTIVE, streaming resident-session blob pinned to *runner_id*."""
+    return {
+        RESIDENT_SESSION_KEY: {
+            "status": "active",
+            "stop_requested": False,
+            "runner_id": runner_id,
+            "started_at": "2026-01-01T00:00:00",
+            "last_progress_at": "2026-01-01T00:05:00",
+        }
+    }
+
+
+def test_resident_session_availability_mid_session_offline_blocks(
+    enable_strategic_session_flag,
+):
+    """Block-on-offline (mid-session): a live session pinned to a device that is
+    now OFFLINE (or de-enrolled) reports ``blocked``/``runner_offline`` — the UI
+    prompts a restart to pick another device, NO auto-migration."""
+    # Pinned device present but offline -> blocked/runner_offline.
+    offline = _resident_session_availability(
+        _project_with_vision(_active_session_vision("r-1")),
+        eligible_live_runner_count=0,
+        runner_options=[{"id": "r-1", "name": "box-1", "online": False}],
+    )
+    assert offline["state"] == "blocked"
+    assert offline["reason"] == srs.RESIDENT_SESSION_REASON_RUNNER_OFFLINE
+
+    # Pinned device de-enrolled (absent from the live options) -> also blocked.
+    missing = _resident_session_availability(
+        _project_with_vision(_active_session_vision("r-gone")),
+        runner_options=[{"id": "r-1", "name": "box-1", "online": True}],
+    )
+    assert missing["state"] == "blocked"
+    assert missing["reason"] == srs.RESIDENT_SESSION_REASON_RUNNER_OFFLINE
+
+    # Pinned device still online -> stays active (no false offline block).
+    online = _resident_session_availability(
+        _project_with_vision(_active_session_vision("r-1")),
+        runner_options=[{"id": "r-1", "name": "box-1", "online": True}],
+    )
+    assert online["state"] == "active"
+    assert online["reason"] is None
+
+    # An UNPINNED (legacy cloud) active session never flips to the offline block.
+    unpinned = _resident_session_availability(
+        _project_with_vision(_active_session_vision(None)),
+        runner_options=[],
+    )
+    assert unpinned["state"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_build_resident_runner_options_flags(db_session):
+    """``build_resident_runner_options`` returns one entry per non-deleted runner
+    with online / agent-ready / eligible flags for the device picker."""
+    project = await _make_project_with_member(db_session)
+    live = await _make_live_local_runner(db_session, project)
+    offline = await _make_live_local_runner(
+        db_session, project, last_seen=_utcnow() - timedelta(hours=1)
+    )
+    agent_down = await _make_live_local_runner(
+        db_session, project, agent_available=False
+    )
+
+    options = await srs.build_resident_runner_options(db_session, project.id)
+    by_id = {o["id"]: o for o in options}
+    assert set(by_id) == {str(live.id), str(offline.id), str(agent_down.id)}
+
+    assert by_id[str(live.id)]["online"] is True
+    assert by_id[str(live.id)]["agent_ready"] is True
+    assert by_id[str(live.id)]["eligible"] is True
+
+    # Offline (stale heartbeat): not online, not eligible.
+    assert by_id[str(offline.id)]["online"] is False
+    assert by_id[str(offline.id)]["eligible"] is False
+
+    # Live but agent unavailable: online yet not agent-ready, so not eligible.
+    assert by_id[str(agent_down.id)]["online"] is True
+    assert by_id[str(agent_down.id)]["agent_ready"] is False
+    assert by_id[str(agent_down.id)]["eligible"] is False
+
+    # Every option carries a display name for the picker.
+    assert all(isinstance(o["name"], str) and o["name"] for o in options)
+
+
 @pytest.mark.asyncio
 async def test_release_start_claim_runs_on_dedicated_session(db_session):
     """Compensation must run on a DEDICATED session opened via the injected
@@ -1668,6 +1835,8 @@ async def test_heartbeat_liveness_only_does_not_extend_lease(db_session):
     and PRESERVES the existing freshness without bumping it."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1716,6 +1885,8 @@ async def test_heartbeat_unattended_cap_ends_session(db_session, monkeypatch):
     forever."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1761,6 +1932,8 @@ async def test_heartbeat_operator_return_before_cap_keeps_session_alive(
     stop-requested — the operator can keep a session alive by interacting."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1814,6 +1987,8 @@ async def test_heartbeat_lease_lapse_stale_ends_session(db_session):
     elapsed-time condition, not a transient non-fresh read."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1858,6 +2033,8 @@ async def test_heartbeat_fresh_session_is_not_stop_requested(db_session):
     so it reads fresh, not lapsed."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1878,6 +2055,8 @@ async def test_heartbeat_active_progress_is_not_stop_requested(db_session):
     never stop-requested."""
     project = await _make_project_with_member(db_session)
     await _make_strategic_review_task(db_session, project)
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )
@@ -1953,6 +2132,8 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
 
     monkeypatch.setattr(srs, "_spawn_resident_strategic_task", fake_spawn)
 
+    # A live runner is required now (Workday blocks when no device is available).
+    await _make_live_local_runner(db_session, project)
     snap = await start_resident_session(
         db_session, project, operator_user_id=TEST_USER_ID
     )

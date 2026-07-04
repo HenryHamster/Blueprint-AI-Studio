@@ -579,4 +579,69 @@ describe('StrategicSessionControl', () => {
       screen.getByRole('status', { name: /resident strategic session: ready/i }),
     ).toBeInTheDocument();
   });
+
+  it('renders the device picker and overrides the runner on selection', async () => {
+    const onSelectRunner = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionState="ready"
+        sessionRunners={[
+          { id: 'r-1', name: 'desk-live', online: true, agent_ready: true, eligible: true },
+          { id: 'r-2', name: 'desk-off', online: false, agent_ready: true, eligible: false },
+        ]}
+        sessionSelectedRunnerId="r-1"
+        onSelectRunner={onSelectRunner}
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+      />,
+    );
+
+    const picker = screen.getByRole('combobox', { name: /workday device/i });
+    expect(picker).toHaveValue('r-1');
+    // The offline device is annotated in the option label.
+    expect(screen.getByRole('option', { name: /desk-off — offline/i })).toBeInTheDocument();
+    // Auto-pick is offered.
+    expect(screen.getByRole('option', { name: /auto \(recommended\)/i })).toBeInTheDocument();
+
+    await user.selectOptions(picker, 'r-2');
+    expect(onSelectRunner).toHaveBeenCalledWith('r-2');
+
+    await user.selectOptions(picker, '');
+    expect(onSelectRunner).toHaveBeenLastCalledWith(null);
+  });
+
+  it('surfaces the restart prompt when the pinned device goes offline mid-session', () => {
+    render(
+      <StrategicSessionControl
+        currentMode="continuous"
+        sessionActive
+        sessionStatus="active"
+        sessionState="blocked"
+        sessionReason="runner_offline"
+        sessionRunners={[
+          { id: 'r-1', name: 'desk-live', online: false, agent_ready: true, eligible: false },
+        ]}
+        sessionSelectedRunnerId="r-1"
+        onSelectRunner={vi.fn()}
+        onModeChange={vi.fn()}
+        onStartSession={vi.fn()}
+        onStopSession={vi.fn()}
+      />,
+    );
+
+    // Named device + explicit restart prompt (no auto-migration).
+    expect(
+      screen.getByText(/device desk-live offline — restart the session to pick another device/i),
+    ).toBeInTheDocument();
+    // Stop stays available so the operator can restart; Start does not show for a
+    // still-"active" blob.
+    expect(
+      screen.getByRole('button', { name: /stop resident strategic session/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /start resident strategic session/i })).toBeNull();
+    // The device dropdown remains so a new device can be chosen for the restart.
+    expect(screen.getByRole('combobox', { name: /workday device/i })).toBeInTheDocument();
+  });
 });
