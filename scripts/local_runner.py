@@ -795,18 +795,30 @@ def _heartbeat_loop(
                 and _locate_agent_binary() is not None
                 and _node_runtime_ok()
             )
-            # LIMITATION (docker-only box): this leg advertises agent_available=True
-            # on docker+image WITHOUT bwrap, but such a box can run ONLY the
-            # read-only slice (iso.AGENT_DOCKER_TYPES). The runner cannot narrow the
-            # advertisement to those types — task_types is operator-configured
-            # server-side and the heartbeat handler preserves it (backend
-            # routers/runner.py) — so the orchestrator can still pin a write/heavy
-            # type here, which decides DECLINE at claim time and strands/loops the
-            # task. The end-to-end fix (orchestrator honoring a runner-advertised
-            # task_types) is a follow-up; today a LOUD startup warning in main()
-            # tells the operator to restrict this runner's enrolled task_types.
+            # A docker-only box (docker+image WITHOUT bwrap) advertises
+            # agent_available=True but can run ONLY the read-only slice
+            # (iso.AGENT_DOCKER_TYPES). It self-restricts by DECLARING that slice in
+            # `supported_agent_task_types` below; the orchestrator intersects that
+            # runner-declared floor with the operator-configured task_types ceiling
+            # (backend orchestrator._runner_handles_task_type), so a write/heavy type
+            # is never pinned here (it would DECLINE at claim time and strand/loop).
+            # The operator `task_types` field is still preserved server-side — this is
+            # a distinct runner capability, not a clobber of operator config.
             docker_agent_ok = caps is not None and _docker_agent_possible(caps, agent_image)
             agent_available = bwrap_agent_ok or docker_agent_ok
+            # Runner-DECLARED agent capability floor. A docker-ONLY box (docker+image
+            # but NO bwrap) can only run the read-only agent slice — the prod agent
+            # image is read-only-parity and write/heavy types would DECLINE at claim
+            # time and strand/loop. Declare exactly that slice so the orchestrator
+            # intersects it with the operator policy and never pins this box a type it
+            # cannot fulfil. When bwrap is available (the full agent slice runs on the
+            # host toolchain) or there is no agent backend at all, declare None → no
+            # runner-side restriction, byte-identical to the prior behavior.
+            supported_agent_task_types = (
+                sorted(iso.AGENT_DOCKER_TYPES)
+                if (docker_agent_ok and not bwrap_agent_ok)
+                else None
+            )
             last_success_at, consecutive_failures = (
                 telemetry.snapshot() if telemetry is not None else (None, 0)
             )
@@ -814,6 +826,7 @@ def _heartbeat_loop(
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
                 "agent_available": agent_available,
+                "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / idle-GPU.
@@ -1767,9 +1780,19 @@ def _preflight(
     # A docker+image box claims (read-only) agent work even without bwrap; the
     # host agent binary is carried by the image, so claimable_classes (which only
     # knows about the bwrap path) under-reports it. Relax it here.
+    bwrap_agent = claimable[iso.CLASS_AGENT]
     docker_agent = _docker_agent_possible(caps, agent_image)
     if docker_agent:
         claimable = {**claimable, iso.CLASS_AGENT: True}
+    # Runner-DECLARED agent capability floor (mirrors the heartbeat loop): a
+    # docker-ONLY box (docker+image, no bwrap agent path) can run only the read-only
+    # agent slice, so it declares that slice for the orchestrator to intersect with
+    # the operator policy. bwrap-capable / no-agent boxes declare None (no restriction).
+    supported_agent_task_types = (
+        sorted(iso.AGENT_DOCKER_TYPES)
+        if (docker_agent and not bwrap_agent)
+        else None
+    )
     agent_reason = iso.agent_decline_reason(caps, agent_binary is not None)
     compute_reason = None
     if not claimable[iso.CLASS_COMPUTE]:
@@ -1790,6 +1813,7 @@ def _preflight(
                 "active_task_ids": [],
                 "active_compute_job_ids": [],
                 "agent_available": claimable[iso.CLASS_AGENT],
+                "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
                 **gpu_caps,
             },

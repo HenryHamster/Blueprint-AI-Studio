@@ -1283,6 +1283,117 @@ class TestGpuDetection(unittest.TestCase):
         with patch.object(local_runner.socket, "gethostname", side_effect=OSError):
             self.assertIsNone(local_runner._hostname())
 
+    def test_docker_only_declares_read_only_agent_slice(self):
+        """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent
+        slice in supported_agent_task_types.
+
+        It still advertises agent_available=True, but self-restricts to the types it
+        can actually run so the orchestrator never pins it a write/heavy agent type
+        (which would DECLINE at claim time and strand/loop the task).
+        """
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    agent_sandbox_ok=False,          # no bwrap
+                    caps=_docker_caps(),             # docker usable, bwrap absent
+                    agent_image="ghcr.io/acme/agent:prod",
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        self.assertTrue(posted_bodies[0]["agent_available"])
+        self.assertEqual(
+            posted_bodies[0]["supported_agent_task_types"],
+            sorted(iso.AGENT_DOCKER_TYPES),
+        )
+
+    def test_bwrap_available_declares_no_agent_restriction(self):
+        """A bwrap agent box (full agent slice on the host toolchain) declares NO
+        supported_agent_task_types restriction (None) — even when an agent image is
+        configured — so the orchestrator applies no runner-side narrowing.
+        """
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    agent_sandbox_ok=True,
+                    caps=_bwrap_caps(),
+                    agent_image="ghcr.io/acme/agent:prod",
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        self.assertTrue(posted_bodies[0]["agent_available"])
+        self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
+
+    def test_bwrap_and_docker_available_declares_no_restriction(self):
+        """bwrap takes precedence: a box that can run the FULL agent slice on the
+        host toolchain declares no restriction even when docker is ALSO usable —
+        the docker-only self-restriction only fires when bwrap is unavailable.
+        """
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        both_caps = iso.Capabilities(
+            bwrap_path="/usr/bin/bwrap",
+            unshare_path="/usr/bin/unshare",
+            userns_ok=True,
+            docker_usable=True,
+        )
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_locate_agent_binary",
+                              return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api", "tok", active_tasks, lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    agent_sandbox_ok=True,
+                    caps=both_caps,
+                    agent_image="ghcr.io/acme/agent:prod",
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        self.assertIsNone(posted_bodies[0]["supported_agent_task_types"])
+
 
 # ── Docker login helper ───────────────────────────────────────────────────────
 
