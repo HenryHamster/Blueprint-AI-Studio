@@ -869,6 +869,95 @@ async def test_start_single_task_across_two_starts(db_session):
     assert len(strategic) == 1
 
 
+@pytest.mark.asyncio
+async def test_start_spawn_path_is_minimal_and_lands_task_id(db_session, monkeypatch):
+    """End-to-end SPAWN path: with no adoptable cadence task, ``start_resident_session``
+    spawns its resident ``strategic_review`` skipping ONLY the slow GitHub-fetching
+    context builders (design-doc grounding, capability backing-path verification,
+    recent-intervention ancestry, branch-verification credential resolution).
+
+    Those builders hold the request's DB connection open long enough for
+    asyncpg/Cloud SQL to idle-close it, so the finalize flush 500s before
+    ``task_id`` lands (~143s). They are tripwires here; the start still returns an
+    ACTIVE session carrying a ``task_id``, the spawned task carries the resident
+    born-context, AND its payload still ships the cheap grounding (directions +
+    the queued open operator message) so the resident agent is not context-blind.
+    """
+    project = await _make_project_with_member(db_session)
+    # Resident sessions run on the self-repo; is_self_repo short-circuits the
+    # bootstrap-pending guard so the real spawn proceeds. Seed one active
+    # direction so the payload's directions grounding is non-empty.
+    project.is_self_repo = True
+    project.directions = [{"id": "d1", "text": "ship it", "status": "active"}]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    runner = await _make_live_local_runner(db_session, project)
+    # An OPEN operator message queued BEFORE the session starts — older than the
+    # runner's ~2min first-poll cursor, so it must ride in the spawn payload or be
+    # lost entirely.
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.QUESTION,
+            content="queued operator question",
+            status="open",
+        )
+    )
+    await db_session.commit()
+    # Deliberately NO adoptable strategic_review task exists → the start SPAWNS.
+
+    import app.strategic_spawning as _sps
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        async def _boom(*args, _n=_name, **kwargs):
+            raise AssertionError(f"resident spawn must not call {_n}")
+
+        monkeypatch.setattr(_sps, _name, _boom)
+
+    snapshot = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # A real task_id landed and the session is active (the bug produced no task_id).
+    assert snapshot["status"] == "active"
+    assert snapshot["stop_requested"] is False
+    assert snapshot["task_id"]
+
+    tasks = (
+        await db_session.execute(select(Task).where(Task.project_id == project.id))
+    ).scalars().all()
+    strategic = [
+        t for t in tasks if (t.first_payload or {}).get("type") == "strategic_review"
+    ]
+    assert len(strategic) == 1
+    spawned = strategic[0]
+    assert str(spawned.id) == snapshot["task_id"]
+    # Born with the resident flags + runner pin (dispatch routes on these).
+    ctx = spawned.context or {}
+    assert ctx.get("_resident_session") is True
+    assert ctx.get("strategic_session_id") == snapshot["session_id"]
+    assert ctx.get("preferred_runner_target_id") == str(runner.id)
+    payload = spawned.first_payload or {}
+    # Cheap grounding shipped: directions + the queued operator message.
+    assert [d["id"] for d in payload.get("directions_summary") or []] == ["d1"]
+    assert "direction_counts" in payload
+    assert any(
+        "queued operator question" in (m.get("content") or "")
+        for m in payload.get("open_messages") or []
+    )
+    # GitHub-derived keys absent (their builders were tripwired).
+    for _heavy in ("recent_interventions", "design_doc", "conversation_thread"):
+        assert _heavy not in payload
+
+
 # ---------------------------------------------------------------------------
 # Finding 3 — spawn/finalize failure compensates (no orphan task, no wedged claim)
 # ---------------------------------------------------------------------------

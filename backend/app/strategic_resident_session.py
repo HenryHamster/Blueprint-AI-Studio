@@ -466,6 +466,17 @@ async def _spawn_resident_strategic_task(
         session,
         preferred_runner_target_id=str(runner_id) if runner_id else None,
         extra_context=_resident_born_context(session_id, runner_id),
+        # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
+        # (design-doc grounding + capability backing-path verification GitHub
+        # content/tree fetches, branch-SHA lookups, recent-intervention ancestry,
+        # drift/version-phase/ci-compliance). This runs inside the operator's
+        # synchronous START request; the heavy build holds the request's DB
+        # connection open long enough for asyncpg/Cloud SQL to idle-close it, so
+        # the finalize flush 500s before ``task_id`` ever lands (~143s). The
+        # resident agent builds its own context on the runner via Claude Code, so
+        # pre-building it at spawn time is unnecessary — the born-context flags +
+        # runner pin still ride in via ``extra_context``.
+        resident_minimal=True,
     )
     return await _find_adoptable_strategic_review_task(session, project.id)
 

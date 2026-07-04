@@ -657,6 +657,156 @@ async def test_spawn_strategic_review_default_extra_context_unchanged(db_session
     assert task.strategic_cycle_id
 
 
+# ── resident_minimal SPAWN path (skips the slow inline GitHub context build) ──
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
+    db_session, mocker
+):
+    """The resident-session SPAWN path (``resident_minimal=True``) skips ONLY the
+    slow GitHub-fetching context builders — not the cheap grounding.
+
+    The four network builders (``ground_design_doc``,
+    ``_verify_capability_backing_paths``, ``_build_recent_interventions``,
+    ``resolve_branch_verification_context``) hold the request's DB connection open
+    long enough for asyncpg/Cloud SQL to idle-close it, so a synchronous resident
+    START 500s at ~143s before ``task_id`` lands. They are TRIPWIRES here (raise if
+    reached). The spawn still succeeds with a payload that INCLUDES the cheap
+    in-memory/DB-only grounding (``vision`` / ``problem_model`` /
+    ``running_update`` / ``directions_summary`` / ``direction_counts`` /
+    ``open_messages``) so the resident agent is not context-blind, while the
+    GitHub-derived keys stay absent.
+    """
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        problem_model={
+            "capabilities": [
+                {"id": "c1", "status": "working", "backing_paths": ["app/foo.py"]}
+            ]
+        },
+        directions=[{"id": "d1", "text": "ship it", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Seed an OPEN operator message so we can prove the resident payload surfaces
+    # it (an operator message older than the runner's ~2min first-poll cursor is
+    # otherwise missed entirely — the exact context-blindness this key fixes).
+    db_session.add(
+        ProjectMessage(
+            project_id=project.id,
+            from_type="user",
+            message_type=MessageType.QUESTION,
+            content="operator question queued before the session started",
+            status="open",
+        )
+    )
+    await db_session.commit()
+
+    # ONLY the four slow, network-I/O builders are tripwires. The cheap DB/
+    # in-memory grounding builders are intentionally NOT tripwired — the resident
+    # payload is expected to run them.
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(
+                side_effect=AssertionError(
+                    f"resident_minimal spawn must not call {_name}"
+                )
+            ),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-resident-min",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+        "preferred_runner_target_id": "runner-xyz",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    assert payload["type"] == "strategic_review"
+    assert payload["research_mode"] == "strategic"
+    assert payload.get("project_name") == project.name
+    assert payload.get("base_branch") == "automain"
+
+    # Cheap grounding is PRESENT so the resident agent boots with context.
+    assert "vision" in payload
+    assert "problem_model" in payload
+    assert payload.get("running_update") == ""
+    assert "direction_counts" in payload
+    assert payload["direction_counts"]["active"] == 1
+    assert [d["id"] for d in payload.get("directions_summary") or []] == ["d1"]
+    # The queued operator message is surfaced (would otherwise be missed).
+    assert any(
+        "operator question queued" in (m.get("content") or "")
+        for m in payload.get("open_messages") or []
+    )
+    # The UNVERIFIED agent-view problem_model carries no backing-path
+    # ``verification`` block — that annotation is exactly the skipped GitHub I/O.
+    _caps = payload["problem_model"].get("capabilities") or []
+    assert all("verification" not in c for c in _caps)
+
+    # The GitHub-derived keys stay ABSENT (their builders were tripwired).
+    for _heavy in ("recent_interventions", "design_doc", "version_phase", "ci_compliance"):
+        assert _heavy not in payload, (
+            f"resident_minimal payload should omit GitHub-derived key {_heavy!r}"
+        )
+
+    # Born-context (resident flags + runner pin) still rode the creating INSERT,
+    # and the strategy-only cycle row was still recorded.
+    ctx = task.context or {}
+    assert ctx.get("_resident_session") is True
+    assert ctx.get("strategic_session_id") == "ss-resident-min"
+    assert ctx.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY) is True
+    assert ctx.get("preferred_runner_target_id") == "runner-xyz"
+    assert ctx.get("strategic_cycle_id") == task.strategic_cycle_id
+    assert task.strategic_cycle_id
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_cadence_still_runs_context_build(db_session):
+    """Regression guard for the resident_minimal refactor: a plain cadence spawn
+    (``resident_minimal`` defaulting False) STILL runs the full context build —
+    the short-circuit is resident-only. The payload carries the assembled
+    ``recent_interventions`` context (produced solely by the inline build) the
+    strategist consumes."""
+    project = _make_project(vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    # The heavy build ran: context the resident_minimal path omits is present.
+    assert "recent_interventions" in payload
+    assert payload["type"] == "strategic_review"
+
+
 @pytest.mark.asyncio
 async def test_drift_snapshot_failure_does_not_expire_caller_instances(
     db_session, mocker

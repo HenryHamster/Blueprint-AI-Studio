@@ -4791,145 +4791,30 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
     return task
 
 
-async def _spawn_strategic_review(
+def _build_direction_stats(
     project: Project,
-    session: AsyncSession,
-    cycle_id: str | None = None,
-    operator_steered: bool = False,
-    steering_excerpt: str | None = None,
-    preferred_runner_target_id: str | None = None,
-    local_runner_context: dict[str, Any] | None = None,
-    extra_context: dict[str, Any] | None = None,
-) -> bool:
-    """Spawn Phase 2 of the strategic cycle: vision + direction review.
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Build the rich per-direction stats list the strategist consumes.
 
-    Called by _handle_design_doc_completion after the design doc is updated.
-    Uses type 'strategic_review' so it doesn't block tactical research.
-    Returns True if a task was created, False if skipped.
-
-    ``extra_context`` (default ``None`` — every cadence caller is unaffected)
-    seeds additional keys into the created task's ``context`` in the SAME
-    INSERT/commit that creates the task, so the committed task is BORN already
-    carrying them (it never exists in a committed state without them). The
-    resident-strategic-session start path uses this to make its spawned
-    ``strategic_review`` claimable ONLY with ``_resident_session`` already set:
-    handler dispatch (one-shot ``handleStrategic`` vs streaming
-    ``handleStrategicResident``) is decided at claim time from the context flag,
-    so a warm local runner that claims the task in the sub-millisecond window
-    before the session blob is finalized still reads the resident flag and routes
-    to the streaming handler — closing the SPAWN-path race a separate post-spawn
-    stamping transaction previously left open. Merged over the context this
-    function derives, so an explicit ``extra_context`` value wins on any key
-    collision (e.g. the local-runner pin), leaving runner-pin semantics identical
-    to stamping it a beat later.
-
-    ``operator_steered`` carries the operator-origin signal forward when this
-    spawn is the Phase 2 tail of an architecture cycle. On that path the
-    pending refresh marker has already been consumed by the autonomous loop's
-    spawn-record (it cleared once for the Phase 1 design_doc spawn), so
-    ``strategic_refresh_origin(project.vision)`` reads ``None`` here and the
-    steering directive would otherwise be dropped (~1/3 of operator wakes land
-    on an architecture cycle). The caller threads the flag through the
-    design_doc task context so the directive still reaches the strategist.
-
-    ``steering_excerpt`` is the operator's message text, threaded forward on the
-    architecture-cycle Phase 2 path (where the marker — and its persisted
-    excerpt — was already consumed at Phase 1 spawn). On the strategy-only path
-    it is ``None`` and the excerpt is read directly from the still-armed marker.
-    Either way it feeds ``_build_operator_steering_directive`` as the durable
-    fallback so the directive survives the operator message aging out of the
-    volatile conversation-thread snapshot.
-
-    ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
-    hint from the preceding architecture phase. Dispatch may honor it only if
-    that runner is still live, eligible, agent-available, and has capacity.
-
-    ``local_runner_context`` carries a hard local-only Strategic intent from
-    the Phase 1 task context. It is captured by the caller before any retry or
-    rollback-prone work so this function does not need to re-read mutable
-    project ORM attributes in the post-build finalize path.
+    Pure over ``project.directions`` (no DB / no network I/O): folds each active/
+    paused/proposed direction's research history + aggregate into lifetime merge,
+    proof, failure, autonomy, cost, and outcome-progress signals. Returns
+    ``(included_directions, direction_stats)`` — the cadence caller reuses
+    ``included_directions`` for its mode-hint lines. Shared verbatim by the
+    cadence ``_spawn_strategic_review`` payload build and the resident-minimal
+    spawn path, so the resident agent boots with the SAME direction grounding
+    (never an empty list) and never re-creates an already-active direction.
     """
-    from app.task_lifecycle import _has_active_strategic_task
-
-    # Guard: no design_doc_update or strategic_review already running
-    if await _has_active_strategic_task(project.id, session):
-        logger.warning(
-            f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}"
-        )
-        return False
-
-    # Guard: defer implementation spawning until repo_bootstrap completes.
-    # If bootstrap_completed_at is unset AND there is a pending bootstrap task,
-    # this project is still being onboarded — skip this cycle. If bootstrap has
-    # FAILED or is otherwise terminal, proceed gracefully (degraded path).
-    if await _bootstrap_pending(project, session):
-        await _maybe_notify_operator_bootstrap_deferred(
-            project,
-            session,
-            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
-        )
-        logger.info(
-            "[STRATEGIC] Deferring strategic review for project %s — "
-            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
-            project.id,
-        )
-        return False
-
-    # Capture project scalars — and, for strategy-only cycles, the baseline
-    # snapshots — NOW, while ``project`` is guaranteed live (it was fresh-read
-    # under the caller's lock). The payload build below takes ~30s and
-    # ``_build_recent_interventions`` COMMITs mid-way; a Cloud SQL connection
-    # drop anywhere in that window invalidates the connection and rolls the
-    # session back, which EXPIRES every ORM instance (expire_on_commit=False
-    # governs commit, not rollback). After that, any synchronous
-    # ``project.<attr>`` read lazy-loads and raises MissingGreenlet in async
-    # context. That is exactly what broke the architecture Phase1->Phase2
-    # handoff (_handle_design_doc_completion -> here): every architecture cycle
-    # stalled and the digest "latest strategic cycle" card went blank. The
-    # previous capture sat AFTER the build, so the capture line itself could
-    # raise; holding the scalars here means the post-build INSERT/finalize path
-    # never touches the expirable instance.
-    strategy_only = cycle_id is None
-    _project_id = project.id
-    _project_name = project.name
-    _base_vision: dict = {}
-    _base_problem_model: dict = {}
-    _base_running_update: str = ""
-    if strategy_only:
-        # Strategy-only cycles (no architecture Phase 1) historically minted no
-        # cycle_id and so were never recorded in StrategicCycle. With
-        # architecture_review_frequency defaulting to every 3rd cycle, ~2/3 of
-        # all strategic cycles were invisible to the digest "latest cycle" card
-        # and to the strategist's own cycle-history context — and the card had
-        # nothing fresh to show whenever the rare (and fragile) architecture
-        # cycle stalled. Mint a cycle id and snapshot the baselines so this
-        # review is recorded and finalized by the normal phase-2 completion
-        # accounting (strategic_completion.mark_phase2_completed), exactly like
-        # an architecture cycle's Phase 2.
-        cycle_id = strategic_cycle.new_cycle_id()
-        _base_vision = dict(project.vision or {})
-        _base_problem_model = dict(project.problem_model or {})
-        _base_running_update = (
-            project.running_update if isinstance(project.running_update, str) else ""
-        )
-    local_runner_intent = dict(local_runner_context or {})
-    if not local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
-        local_runner_intent = await _resolve_local_continuation_runner_intent(
-            session,
-            _project_id,
-            "strategic_review",
-        )
-
-    # Build direction stats with rich data. Include `active` + `paused` +
-    # `proposed`: paused entries are a strong user signal the strategic agent
-    # should respect rather than re-propose; proposed entries exist so the
-    # strategic agent can approve/reject them in the same cycle.
+    # Include `active` + `paused` + `proposed`: paused entries are a strong user
+    # signal the strategic agent should respect rather than re-propose; proposed
+    # entries exist so the strategic agent can approve/reject them in the same
+    # cycle.
     included_directions = [
         d
         for d in (project.directions or [])
         if d.get("status") in ("active", "paused", "proposed")
     ]
-    direction_stats = []
+    direction_stats: list[dict[str, Any]] = []
     for d in included_directions:
         history = d.get("research_history", [])
         agg = d.get("history_aggregate", {})
@@ -5162,6 +5047,431 @@ async def _spawn_strategic_review(
         if _sgm is not None:
             stat_entry["spawn_gate_metrics"] = _sgm
         direction_stats.append(stat_entry)
+    return included_directions, direction_stats
+
+
+def _build_direction_counts(project: Project) -> dict[str, Any]:
+    """Authoritative, trim-proof direction tally for the strategist payload.
+
+    Pure over ``project.directions`` + runtime config (no DB / no network):
+    ``{active, paused, total, max_active, by_system}``. Shared by the cadence
+    payload build and the resident-minimal spawn path so both anchor on the true
+    active set even when ``directions_summary`` is trimmed.
+    """
+    _all_directions = project.directions or []
+    _active_directions_count = sum(
+        1 for d in _all_directions if d.get("status") == "active"
+    )
+    _max_active_directions = _runtime_config.get("max_active_directions", 10)
+    # Authoritative per-system ACTIVE-direction tally, computed from the FULL
+    # direction set before any trimming. Nested under ``direction_counts`` so it
+    # inherits the same ``critical`` trim-proof packing — this lets the agent's
+    # per-system coverage-gap and concentration-risk signals stay truthful even
+    # when ``directions_summary`` is trimmed for budget. Directions with no
+    # ``system_id`` simply do not contribute.
+    _direction_active_by_system: dict[str, int] = {}
+    for _d in _all_directions:
+        if _d.get("status") != "active":
+            continue
+        _sys_id = _d.get("system_id")
+        if not _sys_id:
+            continue
+        _direction_active_by_system[_sys_id] = (
+            _direction_active_by_system.get(_sys_id, 0) + 1
+        )
+    return {
+        "active": _active_directions_count,
+        "paused": sum(1 for d in _all_directions if d.get("status") == "paused"),
+        "total": sum(
+            1
+            for d in _all_directions
+            if d.get("status") in ("active", "paused", "proposed")
+        ),
+        "max_active": _max_active_directions,
+        "by_system": _direction_active_by_system,
+    }
+
+
+async def _finalize_strategic_review_spawn(
+    session: AsyncSession,
+    *,
+    project_id: Any,
+    project_name: str,
+    payload: dict[str, Any],
+    cycle_id: str,
+    strategy_only: bool,
+    base_vision: dict[str, Any],
+    base_problem_model: dict[str, Any],
+    base_running_update: str,
+    local_runner_intent: dict[str, Any],
+    preferred_runner_target_id: str | None,
+    extra_context: dict[str, Any] | None,
+    operator_steered: bool,
+    steering_excerpt: str | None,
+) -> bool:
+    """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
+
+    Re-arms the duplicate-spawn guards, creates the ``strategic_review`` task
+    (born already carrying ``extra_context``), records the StrategicCycle row,
+    commits, and emits the cycle-started event — the short, sub-second
+    transaction both callers finish on. The cadence path reaches here after its
+    ~30s payload build; the resident path reaches here with a minimal payload
+    and no preceding GitHub I/O (see ``_spawn_strategic_review``'s
+    ``resident_minimal`` branch).
+
+    Re-arm the duplicate-spawn guards before the INSERT: the cadence payload
+    build takes ~30s in prod and ``_build_recent_interventions`` COMMITS mid-way
+    (#8842 — releases the read transaction before its GitHub ancestry fan-out).
+    That commit also releases the research-spawn advisory xact-lock taken by the
+    autonomous tick (#8927) and the project-row FOR UPDATE taken by
+    ``_has_active_strategic_task`` at the top of the caller, so everything after
+    it was an unguarded check-then-act window: two orchestrator instances both
+    passed the top guard before either's spawn committed and double-spawned a
+    cycle (2026-06-11, d8f82aa8 / 39eea7b8, 29s apart). Re-take the lock and
+    re-run the active check on the current transaction so check→INSERT→commit
+    shrinks back to milliseconds. Bail rolls back so the session is clean for
+    the caller — the discarded build-state (drift snapshot, version bootstrap)
+    is recomputed by the surviving spawner's cycle.
+    """
+    from app.autonomous_research import _try_research_spawn_advisory_lock
+    from app.task_lifecycle import _has_active_strategic_task
+
+    # ``project_id`` was captured at the caller's function entry (before any
+    # payload build), so the rollback-expiry MissingGreenlet (BUG_REPORT
+    # e530efec) cannot bite this finalize path even when the connection dropped
+    # mid-build.
+    if not await _try_research_spawn_advisory_lock(session, project_id):
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC] Aborting strategic review spawn for project %s — a peer "
+            "instance took the research-spawn lock during the payload build",
+            project_id,
+        )
+        return False
+    if await _has_active_strategic_task(project_id, session):
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC] Aborting strategic review spawn for project %s — a "
+            "strategic task appeared during the payload build",
+            project_id,
+        )
+        return False
+
+    effective_preferred_runner_target_id = (
+        str(preferred_runner_target_id)
+        if preferred_runner_target_id
+        else local_runner_intent.get("preferred_runner_target_id")
+    )
+    task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
+    if local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        task_context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
+        task_context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = local_runner_intent.get(
+            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
+            "workbench_continuous",
+        )
+    if effective_preferred_runner_target_id:
+        task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
+    # Seed any caller-supplied born-context LAST so the task is committed already
+    # carrying it in its first (and only) creating INSERT — no separate follow-up
+    # transaction, no claimable-without-the-flag window. Merged over the derived
+    # context so an explicit caller value wins on collision.
+    if extra_context:
+        task_context.update(extra_context)
+
+    new_task = Task(
+        project_id=project_id,
+        title=f"Strategic review: {project_name}",
+        description="Vision and direction review",
+        payloads=[payload],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.QUEUED,
+        created_by="ORCHESTRATOR",
+        context=task_context,
+        strategic_cycle_id=cycle_id,
+    )
+    session.add(new_task)
+    await session.flush()  # assign new_task.id for the cycle update below
+    history = TaskHistory(
+        task_id=new_task.id,
+        action="SPAWNED",
+        details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
+    )
+    session.add(history)
+    if strategy_only:
+        # Phase-2-only cycle: create the row now (architecture cycles created
+        # theirs at design_doc spawn). ``phase1_*`` stays empty — there is no
+        # architecture phase — and the baselines were snapshotted at function
+        # entry while the instance was live. Created only after the re-armed
+        # spawn guards above passed, so a bail leaves no orphan row.
+        await strategic_cycle.create(
+            session,
+            project_id=project_id,
+            cycle_id=cycle_id,
+            phase1_task_id=None,
+            baseline_vision=base_vision,
+            baseline_problem_model=base_problem_model,
+            baseline_running_update=base_running_update,
+        )
+    # Audit W2: record phase1 completion + phase2 task_id on the cycle row
+    # instead of patching vision._strategic_cycle_history JSONB. For a
+    # strategy-only cycle this flips the just-created row to phase2_running with
+    # phase1_completed_at set (its architecture phase is a no-op).
+    await strategic_cycle.mark_phase1_completed(
+        session,
+        cycle_id,
+        phase2_task_id=new_task.id,
+    )
+    await session.commit()
+    # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
+    from app.strategic_events import emit_strategic_cycle_started
+
+    await emit_strategic_cycle_started(
+        project_id,
+        new_task.id,
+        2,
+        cycle_id=cycle_id,
+        steering_origin=ORIGIN_OPERATOR if operator_steered else None,
+        steering_excerpt=steering_excerpt,
+    )
+    logger.info(
+        f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {project_id}"
+    )
+    return True
+
+
+async def _spawn_strategic_review(
+    project: Project,
+    session: AsyncSession,
+    cycle_id: str | None = None,
+    operator_steered: bool = False,
+    steering_excerpt: str | None = None,
+    preferred_runner_target_id: str | None = None,
+    local_runner_context: dict[str, Any] | None = None,
+    extra_context: dict[str, Any] | None = None,
+    resident_minimal: bool = False,
+) -> bool:
+    """Spawn Phase 2 of the strategic cycle: vision + direction review.
+
+    Called by _handle_design_doc_completion after the design doc is updated.
+    Uses type 'strategic_review' so it doesn't block tactical research.
+    Returns True if a task was created, False if skipped.
+
+    ``resident_minimal`` (default ``False`` — every cadence caller is
+    unaffected) skips ONLY the slow, GitHub-fetching context builders — design-doc
+    grounding + capability backing-path verification (per-file ``contents`` /
+    ``git/trees`` fetches), recent-intervention ancestry, branch-verification
+    credential resolution, and the branch-SHA / version-phase / ci-compliance
+    lookups they feed — because those hold the request's DB connection open long
+    enough for asyncpg/Cloud SQL to idle-close it, so the finalize flush 500s
+    before ``task_id`` ever lands (~143s). It STILL ships the CHEAP grounding
+    (``vision`` / ``problem_model`` [unverified agent-view] / ``running_update`` /
+    ``directions_summary`` / ``direction_counts`` / ``open_messages`` — pure
+    in-memory ORM scalars + DB-only reads, no connection held across any network
+    call) so the resident agent is not context-blind: it must see current
+    directions (so it does not re-create one) and open operator messages (a
+    message older than the runner's ~2-minute first-poll cursor would otherwise
+    surface nowhere). Used only by the resident-session START path
+    (``_spawn_resident_strategic_task``), which runs SYNCHRONOUSLY inside an
+    operator HTTP request; the resident agent builds the REST of its context on
+    the runner via Claude Code. The duplicate-spawn guards, born-context/runner-
+    pin (via ``extra_context``), StrategicCycle recording, and commit are all
+    still applied — only the network-I/O context builders are elided.
+
+    ``extra_context`` (default ``None`` — every cadence caller is unaffected)
+    seeds additional keys into the created task's ``context`` in the SAME
+    INSERT/commit that creates the task, so the committed task is BORN already
+    carrying them (it never exists in a committed state without them). The
+    resident-strategic-session start path uses this to make its spawned
+    ``strategic_review`` claimable ONLY with ``_resident_session`` already set:
+    handler dispatch (one-shot ``handleStrategic`` vs streaming
+    ``handleStrategicResident``) is decided at claim time from the context flag,
+    so a warm local runner that claims the task in the sub-millisecond window
+    before the session blob is finalized still reads the resident flag and routes
+    to the streaming handler — closing the SPAWN-path race a separate post-spawn
+    stamping transaction previously left open. Merged over the context this
+    function derives, so an explicit ``extra_context`` value wins on any key
+    collision (e.g. the local-runner pin), leaving runner-pin semantics identical
+    to stamping it a beat later.
+
+    ``operator_steered`` carries the operator-origin signal forward when this
+    spawn is the Phase 2 tail of an architecture cycle. On that path the
+    pending refresh marker has already been consumed by the autonomous loop's
+    spawn-record (it cleared once for the Phase 1 design_doc spawn), so
+    ``strategic_refresh_origin(project.vision)`` reads ``None`` here and the
+    steering directive would otherwise be dropped (~1/3 of operator wakes land
+    on an architecture cycle). The caller threads the flag through the
+    design_doc task context so the directive still reaches the strategist.
+
+    ``steering_excerpt`` is the operator's message text, threaded forward on the
+    architecture-cycle Phase 2 path (where the marker — and its persisted
+    excerpt — was already consumed at Phase 1 spawn). On the strategy-only path
+    it is ``None`` and the excerpt is read directly from the still-armed marker.
+    Either way it feeds ``_build_operator_steering_directive`` as the durable
+    fallback so the directive survives the operator message aging out of the
+    volatile conversation-thread snapshot.
+
+    ``preferred_runner_target_id`` is a non-authoritative local-runner affinity
+    hint from the preceding architecture phase. Dispatch may honor it only if
+    that runner is still live, eligible, agent-available, and has capacity.
+
+    ``local_runner_context`` carries a hard local-only Strategic intent from
+    the Phase 1 task context. It is captured by the caller before any retry or
+    rollback-prone work so this function does not need to re-read mutable
+    project ORM attributes in the post-build finalize path.
+    """
+    from app.task_lifecycle import _has_active_strategic_task
+
+    # Guard: no design_doc_update or strategic_review already running
+    if await _has_active_strategic_task(project.id, session):
+        logger.warning(
+            f"[STRATEGIC] Skipping strategic review — strategic task already active for {project.id}"
+        )
+        return False
+
+    # Guard: defer implementation spawning until repo_bootstrap completes.
+    # If bootstrap_completed_at is unset AND there is a pending bootstrap task,
+    # this project is still being onboarded — skip this cycle. If bootstrap has
+    # FAILED or is otherwise terminal, proceed gracefully (degraded path).
+    if await _bootstrap_pending(project, session):
+        await _maybe_notify_operator_bootstrap_deferred(
+            project,
+            session,
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+        )
+        logger.info(
+            "[STRATEGIC] Deferring strategic review for project %s — "
+            "repo_bootstrap task is pending (bootstrap_completed_at not set)",
+            project.id,
+        )
+        return False
+
+    # Capture project scalars — and, for strategy-only cycles, the baseline
+    # snapshots — NOW, while ``project`` is guaranteed live (it was fresh-read
+    # under the caller's lock). The payload build below takes ~30s and
+    # ``_build_recent_interventions`` COMMITs mid-way; a Cloud SQL connection
+    # drop anywhere in that window invalidates the connection and rolls the
+    # session back, which EXPIRES every ORM instance (expire_on_commit=False
+    # governs commit, not rollback). After that, any synchronous
+    # ``project.<attr>`` read lazy-loads and raises MissingGreenlet in async
+    # context. That is exactly what broke the architecture Phase1->Phase2
+    # handoff (_handle_design_doc_completion -> here): every architecture cycle
+    # stalled and the digest "latest strategic cycle" card went blank. The
+    # previous capture sat AFTER the build, so the capture line itself could
+    # raise; holding the scalars here means the post-build INSERT/finalize path
+    # never touches the expirable instance.
+    strategy_only = cycle_id is None
+    _project_id = project.id
+    _project_name = project.name
+    _base_vision: dict = {}
+    _base_problem_model: dict = {}
+    _base_running_update: str = ""
+    if strategy_only:
+        # Strategy-only cycles (no architecture Phase 1) historically minted no
+        # cycle_id and so were never recorded in StrategicCycle. With
+        # architecture_review_frequency defaulting to every 3rd cycle, ~2/3 of
+        # all strategic cycles were invisible to the digest "latest cycle" card
+        # and to the strategist's own cycle-history context — and the card had
+        # nothing fresh to show whenever the rare (and fragile) architecture
+        # cycle stalled. Mint a cycle id and snapshot the baselines so this
+        # review is recorded and finalized by the normal phase-2 completion
+        # accounting (strategic_completion.mark_phase2_completed), exactly like
+        # an architecture cycle's Phase 2.
+        cycle_id = strategic_cycle.new_cycle_id()
+        _base_vision = dict(project.vision or {})
+        _base_problem_model = dict(project.problem_model or {})
+        _base_running_update = (
+            project.running_update if isinstance(project.running_update, str) else ""
+        )
+    local_runner_intent = dict(local_runner_context or {})
+    if not local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
+        local_runner_intent = await _resolve_local_continuation_runner_intent(
+            session,
+            _project_id,
+            "strategic_review",
+        )
+
+    if resident_minimal:
+        # A resident strategic session runs SYNCHRONOUSLY inside the operator's
+        # START request and then builds most of its own context on the runner via
+        # Claude Code. So skip ONLY the slow, GitHub-fetching context builders the
+        # cadence path runs below — ``ground_design_doc`` +
+        # ``_verify_capability_backing_paths`` (per-file ``contents``/``git/trees``
+        # fetches), ``_build_recent_interventions`` (ancestry fan-out), and
+        # ``resolve_branch_verification_context`` (credential resolve), plus the
+        # branch-SHA / version-phase / ci-compliance lookups they feed. Those hold
+        # the request's DB connection open long enough for asyncpg/Cloud SQL to
+        # idle-close it, so the finalize flush 500s before ``task_id`` ever lands
+        # (start_project_strategic_resident_session, ~143s).
+        #
+        # STILL include the CHEAP grounding — pure in-memory ORM scalars +
+        # DB-only reads, none of which hold a connection across a network call —
+        # so the resident agent is NOT context-blind at boot: without ``vision`` /
+        # ``problem_model`` / ``running_update`` / ``directions_summary`` /
+        # ``direction_counts`` it would re-derive (and risk re-creating) existing
+        # directions, and without ``open_messages`` an operator message older than
+        # the resident's ~2-minute first-poll cursor would surface NOWHERE (not in
+        # bootstrap, not in the first poll). ``problem_model`` is the UNVERIFIED
+        # agent-view (the backing-path verification is exactly the skipped
+        # GitHub I/O). The transaction stays short: cheap reads only, zero network.
+        review_model = (
+            _runtime_config.get("task_type_models", {}).get("strategic_review")
+            or _runtime_config.get("task_type_models", {}).get("research")
+            or None
+        )
+        review_effort = (
+            _runtime_config.get("task_type_efforts", {}).get("strategic_review")
+            or _runtime_config.get("task_type_efforts", {}).get("research")
+            or None
+        )
+        _res_direction_counts = _build_direction_counts(project)
+        _res_direction_stats = _build_direction_stats(project)[1]
+        _res_open_messages = await _fetch_open_messages(session, project.id)
+        minimal_payload = validate_internal_payload(
+            pack_under_budget(
+                {
+                    "type": "strategic_review",
+                    "research_mode": "strategic",
+                    "project_name": _project_name,
+                    "base_branch": get_project_integration_branch(project),
+                    # Cheap in-memory ORM scalars (no I/O).
+                    "vision": _agent_visible_vision(project.vision),
+                    "problem_model": _agent_view_problem_model(project.problem_model),
+                    "running_update": project.running_update or "",
+                    # Pure-computation direction grounding (no I/O).
+                    "directions_summary": _res_direction_stats,
+                    "direction_counts": _res_direction_counts,
+                    "max_active_directions": _res_direction_counts["max_active"],
+                    # DB-only open-operator-message feed (no network) — the
+                    # load-bearing key: surfaces messages older than the runner's
+                    # first-poll cursor that would otherwise be missed entirely.
+                    "open_messages": _res_open_messages,
+                    **({"model": review_model} if review_model else {}),
+                    **({"effort": review_effort} if review_effort else {}),
+                },
+                _STRATEGIC_REVIEW_SCHEMA,
+            ),
+            "autonomous_research:strategic_review",
+        )
+        return await _finalize_strategic_review_spawn(
+            session,
+            project_id=_project_id,
+            project_name=_project_name,
+            payload=minimal_payload,
+            cycle_id=cycle_id,
+            strategy_only=strategy_only,
+            base_vision=_base_vision,
+            base_problem_model=_base_problem_model,
+            base_running_update=_base_running_update,
+            local_runner_intent=local_runner_intent,
+            preferred_runner_target_id=preferred_runner_target_id,
+            extra_context=extra_context,
+            operator_steered=operator_steered,
+            steering_excerpt=steering_excerpt,
+        )
+
+    # Build direction stats with rich data (pure over ``project.directions``;
+    # shared verbatim with the resident-minimal spawn path via the helper).
+    included_directions, direction_stats = _build_direction_stats(project)
 
     mode_hint_lines = []
     for d in included_directions:
@@ -6600,38 +6910,10 @@ async def _spawn_strategic_review(
     # gap flags can never be starved out by the same byte-budget pressure that
     # trims or drops the per-direction detail list. Shipped as a ``critical``
     # payload key (see _STRATEGIC_REVIEW_SCHEMA) so the packer never reduces them.
-    _all_directions = project.directions or []
-    _active_directions_count = sum(
-        1 for d in _all_directions if d.get("status") == "active"
-    )
-    _max_active_directions = _runtime_config.get("max_active_directions", 10)
-    # Authoritative per-system ACTIVE-direction tally, computed from the FULL
-    # direction set before any trimming. Nested under ``direction_counts`` so it
-    # inherits the same ``critical`` trim-proof packing — this lets the agent's
-    # per-system coverage-gap and concentration-risk signals stay truthful even
-    # when ``directions_summary`` is trimmed for budget. Directions with no
-    # ``system_id`` simply do not contribute.
-    _direction_active_by_system: dict[str, int] = {}
-    for _d in _all_directions:
-        if _d.get("status") != "active":
-            continue
-        _sys_id = _d.get("system_id")
-        if not _sys_id:
-            continue
-        _direction_active_by_system[_sys_id] = (
-            _direction_active_by_system.get(_sys_id, 0) + 1
-        )
-    _direction_counts = {
-        "active": _active_directions_count,
-        "paused": sum(1 for d in _all_directions if d.get("status") == "paused"),
-        "total": sum(
-            1
-            for d in _all_directions
-            if d.get("status") in ("active", "paused", "proposed")
-        ),
-        "max_active": _max_active_directions,
-        "by_system": _direction_active_by_system,
-    }
+    # Shared verbatim with the resident-minimal spawn path via the helper.
+    _direction_counts = _build_direction_counts(project)
+    _active_directions_count = _direction_counts["active"]
+    _max_active_directions = _direction_counts["max_active"]
     # Advisory: when too few directions are active the fleet's per-direction
     # fan-out leaves most VM capacity idle. Surface that cost so the agent can
     # weigh opening more lanes for worthwhile parallel work.
@@ -6974,122 +7256,25 @@ async def _spawn_strategic_review(
     )
     payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
 
-    # Re-arm the duplicate-spawn guards before the INSERT. The payload build
-    # above takes ~30s in prod, and ``_build_recent_interventions`` COMMITS
-    # mid-way (#8842 — releases the read transaction before its GitHub
-    # ancestry fan-out). That commit also releases the research-spawn advisory
-    # xact-lock taken by the autonomous tick (#8927) and the project-row
-    # FOR UPDATE taken by ``_has_active_strategic_task`` at the top of this
-    # function, so everything after it was an unguarded check-then-act window:
-    # two orchestrator instances both passed the top guard before either's
-    # spawn committed and double-spawned a cycle (2026-06-11, d8f82aa8 /
-    # 39eea7b8, 29s apart). Re-take the lock and re-run the active check on
-    # the current transaction so check→INSERT→commit shrinks back to
-    # milliseconds. Bail rolls back so the session is clean for the caller —
-    # the discarded build-state (drift snapshot, version bootstrap) is
-    # recomputed by the surviving spawner's cycle.
-    from app.autonomous_research import _try_research_spawn_advisory_lock
-
-    # ``_project_id`` was captured at function entry (before the payload build),
-    # so the rollback-expiry MissingGreenlet (BUG_REPORT e530efec) cannot bite
-    # this finalize path even when the connection dropped mid-build.
-    if not await _try_research_spawn_advisory_lock(session, _project_id):
-        await session.rollback()
-        logger.warning(
-            "[STRATEGIC] Aborting strategic review spawn for project %s — a peer "
-            "instance took the research-spawn lock during the payload build",
-            _project_id,
-        )
-        return False
-    if await _has_active_strategic_task(_project_id, session):
-        await session.rollback()
-        logger.warning(
-            "[STRATEGIC] Aborting strategic review spawn for project %s — a "
-            "strategic task appeared during the payload build",
-            _project_id,
-        )
-        return False
-
-    effective_preferred_runner_target_id = (
-        str(preferred_runner_target_id)
-        if preferred_runner_target_id
-        else local_runner_intent.get("preferred_runner_target_id")
-    )
-    task_context: dict[str, Any] = {"strategic_cycle_id": cycle_id}
-    if local_runner_intent.get(STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY):
-        task_context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
-        task_context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = local_runner_intent.get(
-            STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
-            "workbench_continuous",
-        )
-    if effective_preferred_runner_target_id:
-        task_context["preferred_runner_target_id"] = effective_preferred_runner_target_id
-    # Seed any caller-supplied born-context LAST so the task is committed already
-    # carrying it in its first (and only) creating INSERT — no separate follow-up
-    # transaction, no claimable-without-the-flag window. Merged over the derived
-    # context so an explicit caller value wins on collision.
-    if extra_context:
-        task_context.update(extra_context)
-
-    new_task = Task(
-        project_id=_project_id,
-        title=f"Strategic review: {_project_name}",
-        description="Vision and direction review",
-        payloads=[payload],
-        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
-        status=TaskStatus.QUEUED,
-        created_by="ORCHESTRATOR",
-        context=task_context,
-        strategic_cycle_id=cycle_id,
-    )
-    session.add(new_task)
-    await session.flush()  # assign new_task.id for the cycle update below
-    history = TaskHistory(
-        task_id=new_task.id,
-        action="SPAWNED",
-        details={"spawned_by": "STRATEGIC_CYCLE", "phase": "strategic_review"},
-    )
-    session.add(history)
-    if strategy_only:
-        # Phase-2-only cycle: create the row now (architecture cycles created
-        # theirs at design_doc spawn). ``phase1_*`` stays empty — there is no
-        # architecture phase — and the baselines were snapshotted at function
-        # entry while the instance was live. Created only after the re-armed
-        # spawn guards above passed, so a bail leaves no orphan row.
-        await strategic_cycle.create(
-            session,
-            project_id=_project_id,
-            cycle_id=cycle_id,
-            phase1_task_id=None,
-            baseline_vision=_base_vision,
-            baseline_problem_model=_base_problem_model,
-            baseline_running_update=_base_running_update,
-        )
-    # Audit W2: record phase1 completion + phase2 task_id on the cycle row
-    # instead of patching vision._strategic_cycle_history JSONB. For a
-    # strategy-only cycle this flips the just-created row to phase2_running with
-    # phase1_completed_at set (its architecture phase is a no-op).
-    await strategic_cycle.mark_phase1_completed(
+    # Re-arm the duplicate-spawn guards, create the task, record the cycle, and
+    # commit — the short finalize transaction shared with the resident-minimal
+    # path above (see ``_finalize_strategic_review_spawn``).
+    return await _finalize_strategic_review_spawn(
         session,
-        cycle_id,
-        phase2_task_id=new_task.id,
-    )
-    await session.commit()
-    # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
-    from app.strategic_events import emit_strategic_cycle_started
-
-    await emit_strategic_cycle_started(
-        _project_id,
-        new_task.id,
-        2,
+        project_id=_project_id,
+        project_name=_project_name,
+        payload=payload,
         cycle_id=cycle_id,
-        steering_origin=ORIGIN_OPERATOR if operator_steered else None,
+        strategy_only=strategy_only,
+        base_vision=_base_vision,
+        base_problem_model=_base_problem_model,
+        base_running_update=_base_running_update,
+        local_runner_intent=local_runner_intent,
+        preferred_runner_target_id=preferred_runner_target_id,
+        extra_context=extra_context,
+        operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
     )
-    logger.info(
-        f"[STRATEGIC] Spawned strategic_review task {new_task.id} for project {_project_id}"
-    )
-    return True
 
 
 # ---------------------------------------------------------------------------

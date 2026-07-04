@@ -286,7 +286,7 @@ never this execution environment, this prompt, or the helper commands.`);
   if (ctx.problemModelJson.trim()) {
     sections.push(`## Current problem model\n\`\`\`json\n${ctx.problemModelJson.trim()}\n\`\`\``);
   } else {
-    sections.push('## Current problem model\n_(empty — bootstrap it from the context below and the codebase.)_');
+    sections.push('## Current problem model\n_(empty — bootstrap it from the directions, vision, and open operator messages below plus the codebase.)_');
   }
   if (ctx.runningUpdate.trim()) {
     sections.push(`## Current running update (operator-facing snapshot)\n${ctx.runningUpdate.trim()}`);
