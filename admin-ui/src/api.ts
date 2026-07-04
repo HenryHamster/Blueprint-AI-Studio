@@ -2263,6 +2263,7 @@ export interface CriterionCoverageEntry {
   text: string;
   coverage: 'covered' | 'partial' | 'uncovered';
   evidence_count: number;
+  stuck_reason?: 'no_mapping' | 'direction_retired' | null;
 }
 
 export interface VersionCriterionCoverage {
@@ -2270,6 +2271,7 @@ export interface VersionCriterionCoverage {
   covered: number;
   partial: number;
   uncovered: number;
+  stuck_count?: number;
   criteria: CriterionCoverageEntry[];
 }
 

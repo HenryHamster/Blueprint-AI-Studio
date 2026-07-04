@@ -11,6 +11,7 @@ import pytest
 
 from app.source_ref_validation import (
     _file_exists_in_repo_branch,
+    _normalize_module_ptr,
     classify_existing_paths,
     classify_paths_tristate,
     detect_absent_symbols,
@@ -169,6 +170,122 @@ async def test_classify_paths_tristate_glob_not_in_missing_bucket_without_snapsh
     assert present == []
     assert missing == []
     assert indeterminate == ["backend/app/routers/*.py"]
+
+
+# ── _normalize_module_ptr ─────────────────────────────────────────────────────
+
+
+def test_normalize_module_ptr_strips_symbol_suffix():
+    assert _normalize_module_ptr("backend/app/models.py:Alert") == "backend/app/models.py"
+
+
+def test_normalize_module_ptr_leaves_line_number_unchanged():
+    assert _normalize_module_ptr("backend/app/models.py:42") == "backend/app/models.py:42"
+
+
+def test_normalize_module_ptr_leaves_bare_path_unchanged():
+    assert _normalize_module_ptr("backend/app/models.py") == "backend/app/models.py"
+
+
+def test_normalize_module_ptr_leaves_directory_unchanged():
+    assert _normalize_module_ptr("backend/app/routers/") == "backend/app/routers/"
+
+
+# ── _path_exists_at_head: directory pointer ───────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_path_exists_at_head_directory_pointer_present(mocker, tmp_path):
+    """Trailing-slash directory pointer returns True when git ls-files has output."""
+    from app.source_ref_validation import _path_exists_at_head
+
+    # Simulate a git repo root so the repo_root guard passes.
+    (tmp_path / ".git").mkdir()
+    mock_proc = mocker.MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = mocker.AsyncMock(
+        return_value=(b"backend/app/models.py\nbackend/app/routers/admin.py\n", b"")
+    )
+    mocker.patch("asyncio.create_subprocess_exec", return_value=mock_proc)
+    result = await _path_exists_at_head("backend/app/", repo_root=str(tmp_path))
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_path_exists_at_head_directory_pointer_absent(mocker, tmp_path):
+    """Trailing-slash directory pointer returns False when git ls-files has no output."""
+    from app.source_ref_validation import _path_exists_at_head
+
+    # Simulate a git repo root where the directory has no tracked files.
+    (tmp_path / ".git").mkdir()
+    mock_proc = mocker.MagicMock()
+    mock_proc.returncode = 0
+    mock_proc.communicate = mocker.AsyncMock(return_value=(b"", b""))
+    mocker.patch("asyncio.create_subprocess_exec", return_value=mock_proc)
+    result = await _path_exists_at_head("backend/app/nonexistent/", repo_root=str(tmp_path))
+    assert result is False
+
+
+# ── _file_exists_in_repo_branch: directory pointer ───────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_directory_pointer_uses_glob(mocker):
+    """A trailing-slash directory pointer uses glob_exists_on_branch instead of path lookup."""
+    glob_calls = []
+
+    async def _glob(path, **kwargs):
+        glob_calls.append(path)
+        return True
+
+    mocker.patch("app.github_repo_snapshot.glob_exists_on_branch", side_effect=_glob)
+    mocker.patch(
+        "app.github_repo_snapshot.path_exists_on_branch", new=mocker.AsyncMock(return_value=False)
+    )
+    result = await _file_exists_in_repo_branch("backend/app/routers/", **_BRANCH_KW)
+    assert result is True
+    assert glob_calls == ["backend/app/routers/*"], (
+        "directory pointer should be checked with a wildcard glob"
+    )
+
+
+@pytest.mark.asyncio
+async def test_file_exists_in_repo_branch_normalizes_symbol_suffix(mocker):
+    """A path:Symbol ref is normalized before the branch existence check."""
+    path_calls = []
+
+    async def _path(path, **kwargs):
+        path_calls.append(path)
+        return True
+
+    mocker.patch("app.github_repo_snapshot.path_exists_on_branch", side_effect=_path)
+    await _file_exists_in_repo_branch("backend/app/models.py:Alert", **_BRANCH_KW)
+    assert path_calls == ["backend/app/models.py"], (
+        "branch check should receive the normalized bare path"
+    )
+
+
+# ── classify_paths_tristate: normalization integration ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_classify_paths_tristate_symbol_suffix_lands_in_present(mocker):
+    """A path:Symbol module pointer is classified as present (not missing) after normalization."""
+    from app.source_ref_validation import _normalize_module_ptr
+
+    async def _exists(path, **kwargs):
+        # _file_exists_at_head normalizes :Symbol refs internally before the git
+        # check; simulate that here so the mock reflects real behavior.
+        norm = _normalize_module_ptr(path)
+        return "/" in norm
+
+    mocker.patch("app.source_ref_validation._file_exists_at_head", side_effect=_exists)
+    present, missing, indeterminate = await classify_paths_tristate(
+        ["backend/app/models.py:Alert"]
+    )
+    assert "backend/app/models.py:Alert" in present
+    assert missing == []
+    assert indeterminate == []
 
 
 # ── summarize_ungrounded_claims (async, verifies symbol definitions) ──────────

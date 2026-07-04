@@ -13192,6 +13192,100 @@ async def test_capability_verification_does_not_mutate_design_doc(db_session, mo
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Module-pointer normalization: path:Symbol and directory/ refs
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_system_verification_path_symbol_pointer_not_flagged_missing(
+    db_session, mocker
+):
+    """A path:Symbol module pointer resolves to the bare file, not flagged missing.
+
+    Before the fix, classify_paths_tristate passed 'models.py:Alert' raw to git,
+    which found nothing → status 'claimed_absent'.  After the fix, the :Symbol
+    suffix is stripped before the existence check, so the underlying file is found
+    and the system is reported 'verified'.
+    """
+    direction = _active_direction("d-pathsym-norm", "Improve symbol system")
+    project = Project(
+        name="PathSymbol Norm",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "systems/alerts": {
+                "status": "mature",
+                "modules": ["backend/app/models.py:Alert"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Return True only for bare file paths (no :Symbol suffix). This discriminates
+    # between the pre-fix call with raw "models.py:Alert" (→ False, missing) and
+    # the post-fix normalized call with "models.py" (→ True, present).
+    async def _exists(path, **kwargs):
+        return ":" not in path and "/" in path
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    sv = payload.get("system_verification")
+    assert sv is not None, "system_verification should be present"
+    assert sv["alerts"]["status"] == "verified", (
+        f"path:Symbol module pointer should resolve to the bare file — got {sv['alerts']}"
+    )
+    assert sv["alerts"]["missing"] == [], (
+        "normalized module pointer should not land in the missing bucket"
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_verification_path_symbol_pointer_not_flagged_missing(
+    db_session, mocker
+):
+    """A path:Symbol module pointer in a capability resolves to the bare file."""
+    direction = _active_direction("d-capsym-norm", "Improve symbol capability")
+    project = Project(
+        name="CapSymbol Norm",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test", "_research_spawn_count": 1},
+        design_doc={
+            "capabilities/auth": {
+                "status": "working",
+                "modules": ["backend/app/auth.py:verify_token"],
+            }
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    async def _exists(path, **kwargs):
+        return ":" not in path and "/" in path
+
+    mocker.patch(
+        "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+
+    payload = await _spawn_and_get_research_payload(project, db_session)
+    cv = payload.get("capability_verification")
+    assert cv is not None, "capability_verification should be present"
+    assert cv["auth"]["status"] == "verified", (
+        f"path:Symbol capability module should resolve to bare file — got {cv['auth']}"
+    )
+    assert cv["auth"]["missing"] == []
+
+
 # ── Undirected (cross-cutting) research spawn guard ──────────────────────────
 
 

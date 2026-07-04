@@ -39,6 +39,40 @@ _TEST_USER_ID = "test-user-123"
 
 
 # ---------------------------------------------------------------------------
+# retired-direction status-set parity
+# ---------------------------------------------------------------------------
+
+
+def test_retired_direction_statuses_parity():
+    """All three copies of RETIRED_DIRECTION_STATUSES must remain in sync.
+
+    RETIRED_DIRECTION_STATUSES exists in three places to avoid import cycles:
+      - research_direction_state.RETIRED_DIRECTION_STATUSES (canonical)
+      - acceptance_criteria._RETIRED_DIRECTION_STATUSES (mirror)
+      - reaper_evaluating_sweeps._RETIRED_DIRECTION_STATUSES (mirror)
+
+    Adding a status to the canonical set and forgetting to update the mirrors
+    silently breaks stuck-criterion classification (in _classify_stuck_reasons)
+    and the reaper's retired-direction sweep guard. This test prevents divergence.
+    """
+    from app import research_direction_state as rds
+    from app import reaper_evaluating_sweeps as res
+
+    canonical = rds.RETIRED_DIRECTION_STATUSES
+    acceptance_mirror = ac._RETIRED_DIRECTION_STATUSES
+    reaper_mirror = res._RETIRED_DIRECTION_STATUSES
+
+    assert canonical == acceptance_mirror, (
+        f"acceptance_criteria._RETIRED_DIRECTION_STATUSES diverged from canonical: "
+        f"canonical={sorted(canonical)}, acceptance={sorted(acceptance_mirror)}"
+    )
+    assert canonical == reaper_mirror, (
+        f"reaper_evaluating_sweeps._RETIRED_DIRECTION_STATUSES diverged from canonical: "
+        f"canonical={sorted(canonical)}, reaper={sorted(reaper_mirror)}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
 

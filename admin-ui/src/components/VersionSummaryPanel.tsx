@@ -136,16 +136,31 @@ function CriterionCoveragePanel({ coverage }: { coverage: VersionCriterionCovera
         <span className="text-ui-sm text-slate-400 font-medium">{coverage.covered}/{coverage.total} covered</span>
         {coverage.partial > 0 && <span className="text-ui-sm text-amber-400">{coverage.partial} partial</span>}
         {coverage.uncovered > 0 && <span className="text-ui-sm text-slate-500">{coverage.uncovered} uncovered</span>}
+        {coverage.stuck_count != null && coverage.stuck_count > 0 && (
+          <span className="text-ui-sm text-red-400" data-testid="stuck-count-badge" title="Uncovered criteria with no active direction mapping — need remapping or operator attestation">
+            {coverage.stuck_count} stuck
+          </span>
+        )}
       </div>
       <ul className="space-y-1">
         {coverage.criteria.map((c) => {
           const badge = COVERAGE_BADGE[c.coverage];
+          const stuckLabel = c.stuck_reason === 'no_mapping'
+            ? 'no direction'
+            : c.stuck_reason === 'direction_retired'
+              ? 'direction retired'
+              : null;
           return (
             <li key={c.criterion_key} className="flex items-start gap-2" data-testid={`criterion-row-${c.criterion_key}`}>
               <span className={`shrink-0 rounded px-1.5 py-0.5 text-ui-sm font-medium ${badge.className}`}>
                 {badge.label}
               </span>
               <span className="text-xs text-slate-300 break-words min-w-0">{c.text}</span>
+              {stuckLabel != null && (
+                <span className="shrink-0 text-ui-sm text-red-400 ml-1" data-testid={`stuck-reason-${c.criterion_key}`} title={`Stuck: ${c.stuck_reason}`}>
+                  {stuckLabel}
+                </span>
+              )}
               {c.evidence_count > 0 && (
                 <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
               )}

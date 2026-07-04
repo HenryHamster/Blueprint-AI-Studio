@@ -7,7 +7,7 @@ import {
   expectNoTextTruncationAt,
   expectMinTouchTargetAt,
 } from '../test/viewport';
-import type { ChangelogEntry } from '../api';
+import type { ChangelogEntry, VersionCriterionCoverage } from '../api';
 
 const SAMPLE_TASKS: ChangelogEntry[] = [
   { task_type: 'create', title: 'Add VersionSummaryPanel component with changelog grouping by task type', pr_number: 10255, pr_url: 'https://github.com/org/repo/pull/10255' },
@@ -359,5 +359,145 @@ describe('VersionSummaryPanel — viewport regression', () => {
       throw new Error('Expected type-section-toggle-create button');
     }
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
+  });
+
+  // ── stuck-criterion diagnosis ───────────────────────────────────────────────
+
+  test('stuck_count badge renders when stuck_count > 0', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 2,
+      covered: 1,
+      partial: 0,
+      uncovered: 1,
+      stuck_count: 1,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+        { criterion_key: 'c2', text: 'Stuck criterion', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="stuck-count-badge"]');
+    if (badge === null) throw new Error('Expected stuck-count-badge when stuck_count > 0');
+    if (!badge.textContent?.includes('1')) throw new Error('Expected stuck count 1 in badge text');
+  });
+
+  test('stuck_count badge is absent when stuck_count is 0', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 1,
+      partial: 0,
+      uncovered: 0,
+      stuck_count: 0,
+      criteria: [
+        { criterion_key: 'c1', text: 'Covered criterion', coverage: 'covered', evidence_count: 1 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="stuck-count-badge"]');
+    if (badge !== null) throw new Error('Expected no stuck-count-badge when stuck_count is 0');
+  });
+
+  test('stuck_count badge is absent when stuck_count is null or omitted', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      criteria: [
+        { criterion_key: 'c1', text: 'Uncovered criterion', coverage: 'uncovered', evidence_count: 0 },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const badge = host.querySelector('[data-testid="stuck-count-badge"]');
+    if (badge !== null) throw new Error('Expected no stuck-count-badge when stuck_count is absent');
+  });
+
+  test('stuck_reason no_mapping renders "no direction" label', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      stuck_count: 1,
+      criteria: [
+        { criterion_key: 'crit-a', text: 'Unmapped criterion', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const label = host.querySelector('[data-testid="stuck-reason-crit-a"]');
+    if (label === null) throw new Error('Expected stuck-reason-crit-a element for no_mapping criterion');
+    if (!label.textContent?.includes('no direction')) {
+      throw new Error(`Expected "no direction" label for no_mapping, got: "${label.textContent}"`);
+    }
+  });
+
+  test('stuck_reason direction_retired renders "direction retired" label', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      stuck_count: 1,
+      criteria: [
+        { criterion_key: 'crit-b', text: 'Retired-direction criterion', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'direction_retired' },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const label = host.querySelector('[data-testid="stuck-reason-crit-b"]');
+    if (label === null) throw new Error('Expected stuck-reason-crit-b element for direction_retired criterion');
+    if (!label.textContent?.includes('direction retired')) {
+      throw new Error(`Expected "direction retired" label for direction_retired, got: "${label.textContent}"`);
+    }
+  });
+
+  test('criterion with null stuck_reason renders no stuck label', async () => {
+    const coverage: VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      criteria: [
+        { criterion_key: 'crit-c', text: 'Plain uncovered criterion', coverage: 'uncovered', evidence_count: 0, stuck_reason: null },
+      ],
+    };
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(<VersionSummaryPanel tasksMerged={SAMPLE_TASKS} criterionCoverage={coverage} />);
+    });
+    const label = host.querySelector('[data-testid="stuck-reason-crit-c"]');
+    if (label !== null) throw new Error('Expected no stuck-reason label when stuck_reason is null');
   });
 });

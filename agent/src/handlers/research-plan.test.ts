@@ -2203,6 +2203,31 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('AC-1: covered');
   });
 
+  it('renders stuck_reason inline for uncovered criteria and omits it for covered/null', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 0,
+        uncovered: 2,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Covered criterion.', coverage: 'covered', evidence_count: 2, stuck_reason: null },
+          { criterion_key: 'AC-2', text: 'No direction mapped yet.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'no_mapping' },
+          { criterion_key: 'AC-3', text: 'All directions retired.', coverage: 'uncovered', evidence_count: 0, stuck_reason: 'direction_retired' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-2: uncovered, evidence=0 [stuck: no_mapping] — No direction mapped yet.');
+    expect(result).toContain('AC-3: uncovered, evidence=0 [stuck: direction_retired] — All directions retired.');
+    // Covered criteria are not rendered; null stuck_reason does not appear
+    expect(result).not.toContain('AC-1: covered');
+    const coveredLine = result.split('\n').find((l) => l.includes('AC-1'));
+    expect(coveredLine).toBeUndefined();
+  });
+
   it('renders counts-only criterion coverage without requiring a criteria list', () => {
     const result = buildVersionPhaseSection({
       version_number: 5,

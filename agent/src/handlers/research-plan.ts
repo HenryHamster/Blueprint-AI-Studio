@@ -782,7 +782,10 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
       const evidenceCount = typeof criterion.evidence_count === 'number'
         ? `, evidence=${criterion.evidence_count}`
         : '';
-      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount} — ${text}`);
+      const stuckReason = typeof criterion.stuck_reason === 'string' && criterion.stuck_reason
+        ? ` [stuck: ${criterion.stuck_reason}]`
+        : '';
+      criteriaLines.push(`  - ${key}: ${criterionCoverage}${evidenceCount}${stuckReason} — ${text}`);
     }
     if (criteriaLines.length > 0) {
       lines.push(`Acceptance criteria needing evidence:`);
