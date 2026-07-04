@@ -4,6 +4,7 @@ import type WebSocket from 'ws';
 import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEFAULT_TOOL_GUIDANCE } from '../prompt.js';
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
+import { agentTokenShellFn } from '../token-file.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -19,13 +20,18 @@ function generateStrategicScript(taskIdRaw: string): string {
 OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|spawn-fix|set-retirement-critiques|set-evidence-progress|set-acceptance-criteria <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
 TASK="${taskId}"
 DATA="$1"
 
 _call() {
-  local attempt=0
+  local attempt=0 saw_auth=0
   while [ $attempt -lt 3 ]; do
+    # Re-read the live token each attempt so a token that rotated between tries
+    # (the agent refreshes at ~45min) is picked up — the resident-session
+    # write-token-expiry fix.
+    _load_agent_token || return 1
     local response
     response=$(printf '{"task_id":"%s","op":"%s","data":%s}' "$TASK" "$1" "$DATA" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
@@ -47,10 +53,18 @@ _call() {
       echo "[CONSTRAINT] $1 rejected (HTTP 409)" >&2
       return 0
     fi
+    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+      saw_auth=1
+      echo "[AUTH] $1 rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+    fi
     attempt=$((attempt + 1))
     [ $attempt -lt 3 ] && echo "[RETRY $attempt/3] $1 failed (HTTP $http_code), retrying in 5s..." >&2 && sleep 5
   done
-  echo "[ERROR] $1 failed after 3 attempts" >&2
+  if [ "$saw_auth" -eq 1 ]; then
+    echo "[ERROR] $1 failed: agent token expired and no refreshed token was available after 3 attempts. The resident session must be restarted (agent JWT TTL is 1h and the agent's proactive refresh appears wedged)." >&2
+  else
+    echo "[ERROR] $1 failed after 3 attempts" >&2
+  fi
   return 1
 }
 
@@ -210,7 +224,8 @@ function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
 KIND="\${1:?Usage: fetch ${verbList} [id]}"
 ID="\${2:-}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
 PROJECT="${projectId}"
 [ -n "$PROJECT" ] || { echo "[ERROR] no project_id available; ./fetch is unavailable in this workspace" >&2; exit 1; }
 
@@ -237,6 +252,18 @@ response=$(curl -sS --max-time 20 --connect-timeout 10 \\
   -w '\\n%{http_code}')
 http_code=$(printf '%s' "$response" | tail -n1)
 body=$(printf '%s' "$response" | head -n -1)
+
+# On 401/403: the spawn-time token may have rotated (resident session token
+# refresh). Re-read the live token and retry ONCE before surfacing the error.
+if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+  _load_agent_token || exit 1
+  response=$(curl -sS --max-time 20 --connect-timeout 10 \\
+    -X GET "$API/api/agent/projects/$PROJECT/$PATH_SUFFIX" \\
+    -H "X-Agent-Token: $TOKEN" \\
+    -w '\\n%{http_code}')
+  http_code=$(printf '%s' "$response" | tail -n1)
+  body=$(printf '%s' "$response" | head -n -1)
+fi
 
 # On 2xx: pass body through as today (success)
 if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then

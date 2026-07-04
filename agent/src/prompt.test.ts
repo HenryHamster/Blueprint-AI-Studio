@@ -70,6 +70,7 @@ import {
   formatSelfReviewCalibrationSection,
   writeMessagesHelper,
   writeDesignDocHelper,
+  writePlaybookHelper,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
   codeChangeGuidanceVariant,
@@ -4795,6 +4796,19 @@ describe('writeDesignDocHelper', () => {
     }
   });
 
+  it('reads the live token file each invocation and retries a write on 401 (resident write-token fix)', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    // Fresh live-token resolution, env fallback, no stale hard-`:?` snapshot.
+    expect(script).toContain('_load_agent_token()');
+    expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+    expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+    // The durable write loop re-reads the token per attempt and treats 401/403 as
+    // a rotated-token retry rather than an immediate non-retryable failure.
+    expect(script).toContain('_load_agent_token || return 1');
+    expect(script).toContain('[ "$http_code" = "401" ] || [ "$http_code" = "403" ]');
+  });
+
   // ── Read-only mode (research / plan workspaces) ──────────────────────────────
   // The research/plan prompt advertises `./design-doc get <key>` (and lists
   // section keys to read), so those workspaces must provision a working get/list
@@ -4858,7 +4872,7 @@ describe('writeMessagesHelper', () => {
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toBeDefined();
     expect(script).toContain('_post_strategic()');
-    expect(script).toContain('if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
+    expect(script).toContain('if ! response=$(printf \'%s\' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
     expect(script).toContain("-w '\\n%{http_code}'");
     expect(script).toContain('printf \'%s\\n\' "$body" >&2');
     expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
@@ -4868,6 +4882,69 @@ describe('writeMessagesHelper', () => {
     const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
     const realOs = await vi.importActual<typeof import('node:os')>('node:os');
     const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+
+  it('reads the live token, captures stdin, retries once on 401, and fails loud (resident write-token fix)', async () => {
+    writeMessagesHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    // Fresh live-token resolution with env fallback (no stale hard-`:?` snapshot).
+    expect(script).toContain('_load_agent_token()');
+    expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+    expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+    // The JSON body is captured from stdin ONCE so the 401 path can re-send it.
+    expect(script).toContain('payload=$(cat)');
+    expect(script).toContain('_load_agent_token || return 1');
+    // 401/403 → re-read the rotated token and retry once...
+    expect(script).toContain('re-reading rotated agent token and retrying once');
+    // ...else fail LOUD ("restart the resident session") rather than silently.
+    expect(script).toContain('restart the resident session');
+
+    // Structural change is still syntactically valid bash.
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/messages_token_smoke_${process.pid}_${Date.now()}.sh`;
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});
+
+// ── writePlaybookHelper (live token resolution) ──────────────────────────────
+describe('writePlaybookHelper live token resolution', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('reads the live token file with an env fallback instead of the stale env snapshot', async () => {
+    writePlaybookHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/playbook'];
+    expect(script).toBeDefined();
+    expect(script).toContain('_load_agent_token()');
+    expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+    expect(script).toContain('TOKEN="${AGENT_API_TOKEN:-}"');
+    expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+    expect(script).toContain('-H "X-Agent-Token: $TOKEN"');
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const tmp = `${realOs.tmpdir().replace(/\\/g, '/')}/playbook_token_smoke_${process.pid}_${Date.now()}.sh`;
     realFs.writeFileSync(tmp, script);
     try {
       realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
