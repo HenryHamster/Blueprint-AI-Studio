@@ -5,6 +5,7 @@ import { WORKSPACE } from './index.js';
 import type { BuildConfig } from './index.js';
 import { isReadOnlyTaskType } from './taskCapabilities.js';
 import { parseBackendTimestamp } from './utils/time.js';
+import { agentTokenShellFn } from './token-file.js';
 
 // ── Re-exports from sub-modules (facade) ────────────────────────────────────
 // The bulky helpers have been split out into prompts/* modules so that small
@@ -606,7 +607,8 @@ OP="\${1:?Usage: playbook get|set|list [key] [content]}"
 KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
 TASK="${taskId}"
 
 if [ "$OP" = "get" ]; then
@@ -654,28 +656,47 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
 
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
 TASK="${taskId}"
 CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
 
+# Capture the JSON body from stdin ONCE so a 401 (rotated resident-session token)
+# can be retried after re-reading the live token — stdin is consumed on the first
+# curl and cannot be re-read.
 _post_strategic() {
-  local response http_code body
-  if ! response=$(curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-    -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
-    --data-binary @- \\
-    -w '\\n%{http_code}'); then
+  local payload response http_code body attempt=0
+  payload=$(cat)
+  while [ $attempt -lt 2 ]; do
+    _load_agent_token || return 1
+    if ! response=$(printf '%s' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
+      --data-binary @- \\
+      -w '\\n%{http_code}'); then
+      return 1
+    fi
+    http_code=$(printf '%s' "$response" | tail -n1)
+    body=$(printf '%s' "$response" | head -n -1)
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '%s' "$body"
+      return 0
+    fi
+    # On 401/403 re-read the rotated token and retry ONCE before failing.
+    if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $attempt -eq 0 ]; then
+      echo "[AUTH] messages $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying once" >&2
+      attempt=$((attempt + 1))
+      continue
+    fi
+    if [ -n "$body" ]; then
+      printf '%s\\n' "$body" >&2
+    fi
+    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+      echo "[ERROR] messages $OP failed: agent token expired — restart the resident session (agent JWT TTL is 1h)." >&2
+    else
+      echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
+    fi
     return 1
-  fi
-  http_code=$(printf '%s' "$response" | tail -n1)
-  body=$(printf '%s' "$response" | head -n -1)
-  if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-    printf '%s' "$body"
-    return 0
-  fi
-  if [ -n "$body" ]; then
-    printf '%s\\n' "$body" >&2
-  fi
-  echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
+  done
   return 1
 }
 
@@ -815,6 +836,9 @@ _post_retry() {
   local body="$1"
   local attempt=0 max=3 delay http_code response dump
   while [ $attempt -lt $max ]; do
+    # Re-read the live token each attempt so a rotated resident-session token is
+    # picked up on the 401 retry below.
+    _load_agent_token || return 1
     dump=$(mktemp)
     response=$(printf '%s' "$body" | \\
       curl -sS --max-time 30 --connect-timeout 10 \\
@@ -837,6 +861,11 @@ _post_retry() {
       [ -z "$delay" ] && delay=$((attempt * 2))
       echo "[RETRY $attempt/$((max - 1))] design-doc $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
       sleep "$delay"
+    elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
+      # Rotated resident-session token — the next loop iteration re-reads the
+      # live token via _load_agent_token before retrying.
+      echo "[AUTH] design-doc $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+      sleep 1
     else
       printf '%s' "$response" | head -n -1 >&2
       echo "[ERROR] design-doc $OP failed (HTTP $http_code, non-retryable)" >&2
@@ -869,11 +898,13 @@ OP="\${1:?Usage: design-doc ${usageLine} <key> [json-value]}"
 KEY="$2"
 VALUE="$3"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
 TASK="${taskId}"
 
 # Fail-fast POST for read operations (list/get): single curl, no retry.
 _post_once() {
+  _load_agent_token || return 1
   curl -f -sS --max-time 30 --connect-timeout 10 \\
     -X POST "$API/api/agent/design-doc" \\
     -H "Content-Type: application/json" \\

@@ -38,6 +38,7 @@ import {
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
+import { ensureAgentTokenFileEnv, writeAgentTokenFile } from './token-file.js';
 import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
@@ -361,7 +362,16 @@ initTokenModule({
   getOrchestratorUrl: () => ORCHESTRATOR_URL,
   getHeaders: () => ({ ...apiHeaders }),
   getToken: () => AGENT_TOKEN,
-  setToken: (newToken: string) => { AGENT_TOKEN = newToken; apiHeaders['X-Agent-Token'] = AGENT_TOKEN; },
+  setToken: (newToken: string) => {
+    AGENT_TOKEN = newToken;
+    apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+    // Mirror the refreshed token to the live token file so the long-lived
+    // resident session's bash helpers (./strategic, ./messages, ...) read the
+    // ROTATED token on their next invocation instead of the stale spawn-time
+    // AGENT_API_TOKEN env snapshot. Best-effort + no-op unless the file is
+    // configured (agent startup); never throws, never logs the token.
+    writeAgentTokenFile(AGENT_TOKEN);
+  },
   log,
 });
 
@@ -1790,6 +1800,9 @@ function activateClaimedRole(
   if (claim.agentToken) {
     AGENT_TOKEN = claim.agentToken;
     apiHeaders['X-Agent-Token'] = AGENT_TOKEN;
+    // Mirror the freshly-claimed token to the live token file so a resident
+    // session provisioned for this role starts with a current token on disk.
+    writeAgentTokenFile(AGENT_TOKEN);
     stopProactiveTokenRefresh();
     scheduleProactiveTokenRefresh(AGENT_TOKEN);
   } else {
@@ -3309,6 +3322,15 @@ export async function main() {
   }
 
   if (!AGENT_TOKEN) throw new Error('AGENT_SECRET_TOKEN is required');
+
+  // Publish the live agent-token file location (once) so the provisioned bash
+  // helper scripts read the ROTATED token on each invocation instead of the
+  // stale spawn-time AGENT_API_TOKEN env snapshot, and mirror the current token
+  // there now. Kept fresh on every claim (activateClaimedRole) and refresh
+  // (setToken). Fixes the resident-session "writes 401 after ~1h" bug while
+  // leaving the 1h security TTL untouched.
+  ensureAgentTokenFileEnv();
+  writeAgentTokenFile(AGENT_TOKEN);
 
   // Distinguish a genuine cold boot from a warm re-target re-exec. The
   // re-target path (performWarmRetarget) restarts the systemd unit after

@@ -17,6 +17,7 @@ import {
   recordLlmTokens, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
+import { AGENT_TOKEN_FILE_ENV, writeAgentTokenFile } from '../token-file.js';
 import {
   parseResidentLine, splitStreamChunk, encodeUserTurn, encodeInterrupt,
   isStrategicMutation, isMessageSend, type ResidentStreamEvent,
@@ -523,6 +524,13 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
   }
   const agentToken = getAgentToken();
   if (agentToken) env.AGENT_API_TOKEN = agentToken;
+  // Propagate the live token-file path so the provisioned bash helpers read the
+  // rotated token FRESH on each invocation (see token-file.ts). The path is
+  // stable; only the file's CONTENTS change on refresh, so passing it once at
+  // spawn is correct even for a long-lived resident subprocess. AGENT_API_TOKEN
+  // above stays as the fallback for the one-shot case / when the file is unset.
+  const tokenFilePath = process.env[AGENT_TOKEN_FILE_ENV];
+  if (tokenFilePath) env[AGENT_TOKEN_FILE_ENV] = tokenFilePath;
   if (LLM_CLI_TRANSLATION?.env) {
     for (const [k, v] of Object.entries(LLM_CLI_TRANSLATION.env)) {
       if (!(k in env)) env[k] = v;
@@ -1895,6 +1903,12 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   // --include-partial-messages / --dangerously-skip-permissions / --model / --effort
   // / --disallowedTools, so we only add the input side.
   const args = [...base.args, '--input-format', 'stream-json'];
+
+  // Guarantee the live token file exists with the CURRENT token before the
+  // long-lived subprocess (and its bash helpers) start reading it. Refreshes
+  // thereafter keep it current via setToken. Best-effort/no-op when the file is
+  // unconfigured or the token is empty (tests).
+  writeAgentTokenFile(getAgentToken());
 
   const child = spawn(base.command, args, {
     cwd: workspace,

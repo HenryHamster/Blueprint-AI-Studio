@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import {
   writeStrategicHelpers,
   writeFetchHelper,
@@ -113,6 +114,58 @@ describe('writeStrategicHelpers', () => {
     expect(content).toContain('playbook');
     expect(content).toContain('gap');
     expect(content).toContain('message');
+  });
+
+  // ── Live token resolution (resident write-token-expiry fix) ─────────────────
+  // The strategic/fetch helpers must read the ROTATED token FRESH on each
+  // invocation (from $AGENT_TOKEN_FILE, kept current by the agent's ~45min
+  // refresh) instead of the stale spawn-time AGENT_API_TOKEN env snapshot; a
+  // long-lived resident session otherwise write-401s once the 1h TTL elapses.
+  describe('live token resolution', () => {
+    it('strategic reads the live token file each invocation with an env fallback', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      expect(s).toContain('_load_agent_token()');
+      expect(s).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+      expect(s).toContain('TOKEN="${AGENT_API_TOKEN:-}"');
+      // The stale hard-`:?` snapshot binding must be gone.
+      expect(s).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+      // Curl still authenticates with the resolved $TOKEN.
+      expect(s).toContain('-H "X-Agent-Token: $TOKEN"');
+      // _call re-reads the token each attempt so a mid-session rotation is used.
+      expect(s).toContain('_load_agent_token || return 1');
+    });
+
+    it('strategic surfaces a loud "restart the session" error when the token is unrecoverably expired', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // 401/403 is treated as an auth failure and retried...
+      expect(s).toContain('[AUTH]');
+      expect(s).toContain('"$http_code" -eq 401');
+      // ...then, if still failing, fails LOUD rather than silently going write-dead.
+      expect(s).toContain('agent token expired');
+      expect(s).toContain('resident session must be restarted');
+    });
+
+    it('fetch reads the live token file and retries once on a 401', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
+      expect(s).toContain('_load_agent_token()');
+      expect(s).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
+      expect(s).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+      // 401/403 → re-read the rotated token and retry the GET once.
+      expect(s).toContain('[ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]');
+      expect(s).toContain('_load_agent_token || exit 1');
+    });
+
+    it('generated strategic + fetch scripts pass `bash -n`', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      for (const name of ['strategic', 'fetch']) {
+        const p = `${testWorkspace}/${name}`;
+        // Throws on a syntax error (non-zero exit) — the assertion is that it does not.
+        expect(() => execFileSync('bash', ['-n', p], { stdio: 'pipe' })).not.toThrow();
+      }
+    });
   });
 
   it('supports fetching a message by short ref via the messages endpoint', () => {
