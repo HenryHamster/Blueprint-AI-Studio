@@ -1,0 +1,20 @@
+{
+  "_note": "Single source of truth for the 14 qualification states produced by release_version.summarize_qualification_state. Consumed by backend, admin-ui, and agent contract tests. Any state add or rename MUST update this file AND all three copies: QUALIFICATION_STATE_VOCAB frozenset in backend/app/release_version.py, QualificationStateValue union in admin-ui/src/api.ts, and QUALIFICATION_STATE_VOCAB export in agent/src/handlers/research-plan.ts.",
+  "schema_version": 1,
+  "states": [
+    "audit_crashed",
+    "deferred_unsynced",
+    "dry_run",
+    "not_promoted",
+    "promoted",
+    "promoted_unconfirmed",
+    "promotion_check_wait",
+    "promotion_confirmation_timed_out",
+    "promotion_deploy_failed",
+    "promotion_failed",
+    "promotion_in_flight",
+    "protection_blocked_review",
+    "qualifying",
+    "required_check_failed"
+  ]
+}

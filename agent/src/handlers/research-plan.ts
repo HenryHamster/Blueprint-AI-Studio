@@ -492,6 +492,27 @@ export function buildUserPausedSection(
 }
 
 const QUALIFICATION_SCORE_KEYS = ['audit', 'test_erosion', 'smoketest'] as const;
+// Canonical vocabulary of all qualification states produced by the backend's
+// summarize_qualification_state. Mirrors QUALIFICATION_STATE_VOCAB in
+// release_version.py and the QualificationStateValue union in admin-ui/src/api.ts.
+// Exported so contract tests can assert it equals the shared fixture at
+// backend/testing/__fixtures__/qualification_state_vocab.json.
+export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
+  'audit_crashed',
+  'deferred_unsynced',
+  'dry_run',
+  'not_promoted',
+  'promoted',
+  'promoted_unconfirmed',
+  'promotion_check_wait',
+  'promotion_confirmation_timed_out',
+  'promotion_deploy_failed',
+  'promotion_failed',
+  'promotion_in_flight',
+  'protection_blocked_review',
+  'qualifying',
+  'required_check_failed',
+]);
 // Derived qualification states that mean an audit / promotion run is actively
 // in flight for the current candidate. When the effective status is any of
 // these, the agent must NOT emit `qualify_request` — a run is already going.

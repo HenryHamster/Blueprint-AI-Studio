@@ -16,8 +16,10 @@ Focus areas:
 from __future__ import annotations
 
 import contextlib
+import json
 import uuid
 from datetime import timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -2062,25 +2064,16 @@ class TestQualificationStateVocab:
         assert all(isinstance(s, str) for s in vocab)
 
     def test_contains_all_14_states(self):
-        expected = frozenset(
-            {
-                "qualifying",
-                "audit_crashed",
-                "promotion_check_wait",
-                "promotion_in_flight",
-                "promotion_failed",
-                "required_check_failed",
-                "protection_blocked_review",
-                "not_promoted",
-                "dry_run",
-                "promoted",
-                "promoted_unconfirmed",
-                "promotion_deploy_failed",
-                "promotion_confirmation_timed_out",
-                "deferred_unsynced",
-            }
+        fixture_path = (
+            Path(__file__).parent / "__fixtures__" / "qualification_state_vocab.json"
         )
-        assert rv.QUALIFICATION_STATE_VOCAB == expected
+        fixture = json.loads(fixture_path.read_text())
+        expected = frozenset(fixture["states"])
+        assert rv.QUALIFICATION_STATE_VOCAB == expected, (
+            f"QUALIFICATION_STATE_VOCAB does not match fixture. "
+            f"Extra in vocab: {rv.QUALIFICATION_STATE_VOCAB - expected}. "
+            f"Missing from vocab: {expected - rv.QUALIFICATION_STATE_VOCAB}."
+        )
 
     def test_promotion_blocking_states_subset_of_vocab(self):
         assert rv.PROMOTION_BLOCKING_STATES <= rv.QUALIFICATION_STATE_VOCAB
