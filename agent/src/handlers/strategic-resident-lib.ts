@@ -63,6 +63,10 @@ export function autonomousActive(autonomousEnabled: boolean, authorityHeld: bool
 
 export interface ResidentConfig {
   idleTickMs: number;
+  /** Inbound operator-message poll cadence (ms). Kept SHORTER than idleTickMs so
+   *  a turn starts promptly after the operator sends — the "faster pickup" knob —
+   *  while heartbeats stay paced at idleTickMs so we don't hammer the backend. */
+  messagePollMs: number;
   turnTimeoutMs: number;
   /** false disables the autonomous self-prompt path (e.g. a read-only monitor mode) */
   autonomousEnabled: boolean;
@@ -78,19 +82,26 @@ function str(v: unknown, fallback = ''): string {
 
 /**
  * Resolve the resident loop's timing knobs from the strategic payload the
- * backend ships (runtime settings surfaced onto the payload). Defaults match the
- * build contract: 5s idle tick, 120s per-turn timeout.
+ * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
+ * (heartbeat) tick, 1.5s inbound-message poll (fast operator pickup), 120s
+ * per-turn timeout.
  */
 export function residentConfig(payload: Record<string, unknown>): ResidentConfig {
   const idleTickSec = num(payload.strategic_session_idle_tick_seconds, 5);
+  const messagePollSec = num(payload.strategic_session_message_poll_seconds, 1.5);
   const turnTimeoutSec = num(payload.strategic_session_turn_timeout_seconds, 120);
   // interaction_mode === 'monitor' (or an explicit flag) makes the session
   // read-only: it still chats + heartbeats but does not autonomously advance.
   const mode = str(payload.interaction_mode).toLowerCase();
   const autonomousEnabled =
     payload.strategic_session_autonomous === false ? false : mode !== 'monitor';
+  const idleTickMs = Math.max(1000, Math.round(idleTickSec * 1000));
   return {
-    idleTickMs: Math.max(1000, Math.round(idleTickSec * 1000)),
+    idleTickMs,
+    // Poll operator messages faster than the heartbeat tick so a turn starts
+    // soon after send, but never below a 750ms floor (don't hammer) and never
+    // slower than the idle tick.
+    messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
   };
@@ -335,10 +346,19 @@ export function resolveTerminalStatus(stopReason: string, exitCode: number | nul
 }
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts
- *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`). */
-export type StreamFrameKind = 'reasoning' | 'action' | 'tool' | 'status' | 'message';
+ *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`). The five activity kinds
+ *  (command / file / read / subagent / tool_result) drive the LIVE, ephemeral
+ *  Workday activity strip; only `message` reaches the durable transcript, and
+ *  only as a ProjectMessage — never via a stream frame. */
+export type StreamFrameKind =
+  | 'reasoning' | 'action' | 'tool' | 'status' | 'message'
+  | 'command' | 'file' | 'read' | 'subagent' | 'tool_result';
 
-interface CoalescedItem { kind: StreamFrameKind; text: string; open: boolean; }
+/** Optional lifecycle status on a frame: `responding` opens an operator turn
+ *  (drives the working indicator), `done` closes it (clears the activity strip). */
+export type StreamFrameStatus = 'responding' | 'done';
+
+interface CoalescedItem { kind: StreamFrameKind; text: string; open: boolean; status?: StreamFrameStatus; }
 
 /**
  * Ordered, coalescing frame buffer shared by ALL live-stream frame kinds (text
@@ -366,12 +386,13 @@ export class FrameCoalescer {
     else this.items.push({ kind: 'message', text, open: true });
   }
 
-  /** Enqueue a discrete tool/status frame, sealing any open text item first so
-   *  it stays ordered BEFORE this frame (and later deltas start a fresh item). */
-  pushFrame(kind: StreamFrameKind, text: string): void {
+  /** Enqueue a discrete tool/status/activity frame, sealing any open text item
+   *  first so it stays ordered BEFORE this frame (and later deltas start a fresh
+   *  item). An optional lifecycle `status` (responding / done) rides the frame. */
+  pushFrame(kind: StreamFrameKind, text: string, status?: StreamFrameStatus): void {
     const tail = this.items.at(-1);
     if (tail && tail.open) tail.open = false;
-    this.items.push({ kind, text, open: false });
+    this.items.push({ kind, text, open: false, status });
   }
 
   /** Seal the trailing open text item so a later delta starts a FRESH frame. A
@@ -388,9 +409,9 @@ export class FrameCoalescer {
   get length(): number { return this.items.length; }
 
   /** Remove and return the next item to emit (front of queue), or null if empty. */
-  next(): { kind: StreamFrameKind; text: string } | null {
+  next(): { kind: StreamFrameKind; text: string; status?: StreamFrameStatus } | null {
     const item = this.items.shift();
-    return item ? { kind: item.kind, text: item.text } : null;
+    return item ? { kind: item.kind, text: item.text, status: item.status } : null;
   }
 
   /** Remove and return ALL queued items in order. NOTE: the boundary flush no

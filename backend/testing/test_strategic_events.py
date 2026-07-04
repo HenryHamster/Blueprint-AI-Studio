@@ -104,6 +104,42 @@ async def test_emit_session_delta_normalizes_unknown_kind_to_status():
 
 
 @pytest.mark.asyncio
+async def test_emit_session_delta_forwards_activity_kinds():
+    """The five live activity kinds (command / file / read / subagent /
+    tool_result) pass through unchanged — the ephemeral Workday activity strip."""
+    for kind in ("command", "file", "read", "subagent", "tool_result"):
+        with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+            await emit_strategic_session_delta(
+                uuid.uuid4(), {"kind": kind, "text": "$ ls", "seq": 1}
+            )
+        assert mock_bcast.await_args.args[2]["kind"] == kind
+
+
+@pytest.mark.asyncio
+async def test_emit_session_delta_forwards_lifecycle_status():
+    """A `responding` / `done` lifecycle status is forwarded; an unknown status
+    is dropped. Status frames may carry empty text (they still emit)."""
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            uuid.uuid4(), {"kind": "status", "text": "", "status": "responding"}
+        )
+    assert mock_bcast.await_args.args[2]["status"] == "responding"
+
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            uuid.uuid4(), {"kind": "status", "text": "", "status": "done"}
+        )
+    assert mock_bcast.await_args.args[2]["status"] == "done"
+
+    # An unknown status is not forwarded (no arbitrary state on the wire).
+    with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
+        await emit_strategic_session_delta(
+            uuid.uuid4(), {"kind": "message", "text": "hi", "status": "bogus"}
+        )
+    assert "status" not in mock_bcast.await_args.args[2]
+
+
+@pytest.mark.asyncio
 async def test_emit_session_delta_sanitizes_secret_in_text():
     with patch.object(se, "broadcast_to_project", new=AsyncMock()) as mock_bcast:
         await emit_strategic_session_delta(

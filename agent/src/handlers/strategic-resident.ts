@@ -21,6 +21,7 @@ import {
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
+  type StreamFrameKind, type StreamFrameStatus,
 } from './strategic-resident-lib.js';
 
 // Coalesce streamed assistant deltas to at most ~10 WebSocket frames/sec so the
@@ -33,8 +34,9 @@ const STREAM_FLUSH_MS = 100;
 const MAX_CONSECUTIVE_STALLS = 3;
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts
- *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`). */
-type SessionDeltaKind = 'reasoning' | 'action' | 'tool' | 'status' | 'message';
+ *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`) — reused from the lib so the
+ *  emit + parse sides can never drift. */
+type SessionDeltaKind = StreamFrameKind;
 
 /**
  * Streams a resident turn's assistant text to the operator as a typed
@@ -70,24 +72,25 @@ export class SessionStreamer {
     private readonly taskId: string,
   ) {}
 
-  private emit(kind: SessionDeltaKind, text: string): void {
+  private emit(kind: SessionDeltaKind, text: string, status?: StreamFrameStatus): void {
     const clean = sanitize(text);
-    if (!clean) return;
-    const frame = {
-      type: 'strategic_session',
-      payload: {
-        session_id: this.sessionId,
-        task_id: this.taskId,
-        seq: this.seq++,
-        kind,
-        text: clean,
-        ts: new Date().toISOString(),
-      },
+    // A lifecycle frame (responding/done) is allowed to carry empty text; every
+    // other frame with no text after sanitizing is dropped.
+    if (!clean && !status) return;
+    const payload: Record<string, unknown> = {
+      session_id: this.sessionId,
+      task_id: this.taskId,
+      seq: this.seq++,
+      kind,
+      text: clean,
+      ts: new Date().toISOString(),
     };
+    if (status) payload.status = status;
+    const frame = { type: 'strategic_session', payload };
     // Prefer the typed frame on a live socket; otherwise keep the delta in the
     // buffered agent-log transcript so a later-attaching viewer still sees it.
     if (!sendWsFrame(this.ws, frame)) {
-      sendLog(this.ws, clean.endsWith('\n') ? clean : `${clean}\n`);
+      if (clean) sendLog(this.ws, clean.endsWith('\n') ? clean : `${clean}\n`);
     }
   }
 
@@ -100,7 +103,7 @@ export class SessionStreamer {
     this.timer = setTimeout(() => {
       this.timer = null;
       const item = this.queue.next();
-      if (item) { this.emit(item.kind, item.text); this.lastEmitAt = Date.now(); }
+      if (item) { this.emit(item.kind, item.text, item.status); this.lastEmitAt = Date.now(); }
       this.scheduleDrain();
     }, wait);
   }
@@ -132,6 +135,32 @@ export class SessionStreamer {
   tool(name: string | undefined, command: string | undefined): void {
     const cmd = command ? ` ${command.slice(0, 160)}` : '';
     this.queue.pushFrame('tool', `[tool: ${name || 'tool'}]${cmd}`);
+    this.scheduleDrain();
+  }
+
+  /**
+   * A LIVE, EPHEMERAL activity one-liner for the operator's Workday activity
+   * strip — a Bash command, file edit, read, spawned sub-agent, or tool result.
+   * Carried on the same rate-limited queue as text so a burst of tool_use blocks
+   * in one assistant message stays under the backend WS-close cap. NEVER
+   * persisted (only the assistant's `./messages send` reply lands in the durable
+   * transcript, as a ProjectMessage).
+   */
+  activity(kind: StreamFrameKind, text: string): void {
+    this.queue.pushFrame(kind, text);
+    this.scheduleDrain();
+  }
+
+  /** Mark the START of an operator turn — drives the UI "Workday's on it" state. */
+  responding(): void {
+    this.queue.pushFrame('status', '[strategic-session] responding', 'responding');
+    this.scheduleDrain();
+  }
+
+  /** Mark the END of an operator turn — clears the UI activity strip. Ordered
+   *  after all of the turn's text/activity frames (the queue drains in order). */
+  done(): void {
+    this.queue.pushFrame('status', '[strategic-session] done', 'done');
     this.scheduleDrain();
   }
 }
@@ -246,9 +275,21 @@ export async function handleStrategicResident(
     model, effort, disallowedTools, workspace: WORKSPACE, turnTimeoutMs: cfg.turnTimeoutMs,
   });
   session.onEvent((ev) => {
-    if (ev.kind === 'text' && ev.text) streamer.delta(ev.text);
-    else if (ev.kind === 'tool') streamer.tool(ev.toolName, ev.text);
-    else if (ev.kind === 'error' && ev.text) streamer.status(`error: ${ev.text}`);
+    if (ev.kind === 'text' && ev.text) {
+      // Assistant reply text — the only content that reaches the durable
+      // transcript (once the agent `./messages send`s it). Streams as `message`.
+      streamer.delta(ev.text);
+    } else if (ev.kind === 'tool' || ev.kind === 'activity') {
+      // A tool call / tool result — a LIVE, ephemeral activity one-liner. Prefer
+      // the parser's compact `{kind,text}`; fall back to a bare tool label.
+      if (ev.activity) {
+        streamer.activity(ev.activity.kind as StreamFrameKind, ev.activity.text);
+      } else if (ev.kind === 'tool') {
+        streamer.tool(ev.toolName, ev.text);
+      }
+    } else if (ev.kind === 'error' && ev.text) {
+      streamer.status(`error: ${ev.text}`);
+    }
   });
 
   let firstTurnSent = false;
@@ -271,8 +312,14 @@ export async function handleStrategicResident(
     const full = firstTurnSent ? text : `${bootstrapPrompt}\n\n---\n\n${text}`;
     firstTurnSent = true;
     statusRef.value = operator ? 'Responding to operator...' : 'Advancing project (autonomous)...';
+    // An operator turn is what the operator is waiting on: bracket it with a
+    // `responding` frame (drives the live working indicator) and a `done` frame
+    // (clears the ephemeral activity strip). Autonomous turns stream activity but
+    // carry no responding/done so they don't flash the operator's working state.
+    if (operator) streamer.responding();
     const r = await session.sendTurn(full);
     streamer.flush();
+    if (operator) streamer.done();
     return r;
   };
 
@@ -365,20 +412,39 @@ export async function handleStrategicResident(
     }
   };
 
+  // Liveness-heartbeat pacing. Operator messages are polled at the fast
+  // cfg.messagePollMs cadence (prompt pickup), but a bare liveness heartbeat
+  // (progress=false) fires only every cfg.idleTickMs so the faster poll does not
+  // hammer the backend. Progress heartbeats (operator interaction / applied op)
+  // are always sent directly and are unaffected by this gate.
+  let lastLivenessHeartbeatAt = 0;
+  const livenessHeartbeatDue = (): boolean =>
+    Date.now() - lastLivenessHeartbeatAt >= cfg.idleTickMs;
+  const livenessHeartbeat = async (): Promise<SessionHeartbeatResponse | null> => {
+    const hb = await heartbeat(false);
+    lastLivenessHeartbeatAt = Date.now();
+    return hb;
+  };
+
   // Poll + heartbeat while an autonomous turn runs; resolves the moment the turn
   // finishes, a stop is requested, or an operator message arrives (→ interrupt).
   // Returns a discriminated outcome so the loop needs no async-mutated flags.
+  // Ticks at the fast message-poll cadence so an operator message pre-empts the
+  // autonomous turn promptly; the liveness heartbeat inside stays paced to
+  // cfg.idleTickMs.
   const watchTurn = async (turnPromise: Promise<ResidentTurnResult>): Promise<WatchOutcome> => {
     const doneSignal: Promise<typeof TURN_DONE> = turnPromise.then(() => TURN_DONE);
     for (;;) {
-      const raced = await Promise.race([doneSignal, sleep(cfg.idleTickMs).then(() => 'tick' as const)]);
+      const raced = await Promise.race([doneSignal, sleep(cfg.messagePollMs).then(() => 'tick' as const)]);
       if (raced === TURN_DONE) return { kind: 'done' };
-      const hb = await heartbeat(false); // liveness only while working
-      if (hb?.stop_requested) return { kind: 'stop' };
-      // Authority lapsed mid-turn (backend unattended cap): suspend the autonomous
-      // path — pre-empt this turn and go passive rather than let it finish
-      // mutating strategic state on a lapsed lease.
-      if (!authorityHeld) return { kind: 'suspend' };
+      if (livenessHeartbeatDue()) {
+        const hb = await livenessHeartbeat(); // liveness only while working
+        if (hb?.stop_requested) return { kind: 'stop' };
+        // Authority lapsed mid-turn (backend unattended cap): suspend the
+        // autonomous path — pre-empt this turn and go passive rather than let it
+        // finish mutating strategic state on a lapsed lease.
+        if (!authorityHeld) return { kind: 'suspend' };
+      }
       const newMsgs = await pollMessages();
       if (newMsgs.length > 0) return { kind: 'message', messages: newMsgs };
     }
@@ -414,9 +480,14 @@ export async function handleStrategicResident(
       // message re-engages) so the NEXT iteration reopens the autonomous path.
       // We never self-prompt or mutate strategic state on a lapsed lease.
       if (!autonomousActive(cfg.autonomousEnabled, authorityHeld)) {
-        const hb = await heartbeat(false);
-        if (hb?.stop_requested) break;
-        await sleep(cfg.idleTickMs);
+        // Poll operator messages at the fast cadence (the fast path at the top of
+        // the loop does the actual pickup); heartbeat only when the paced liveness
+        // interval is due so passive mode doesn't hammer the backend.
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+        }
+        await sleep(cfg.messagePollMs);
         continue;
       }
 
@@ -449,9 +520,11 @@ export async function handleStrategicResident(
         continue;
       }
 
-      // Nothing applied and nothing done → pace so we don't hot-loop the API.
+      // Nothing applied and nothing done → pace so we don't hot-loop the API, but
+      // at the fast message-poll cadence so a just-arrived operator message is
+      // picked up promptly on the next iteration.
       if (!r.appliedStrategicOp && !r.sawToolUse) {
-        await sleep(cfg.idleTickMs);
+        await sleep(cfg.messagePollMs);
       }
     }
   } catch (e) {

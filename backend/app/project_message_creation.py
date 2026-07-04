@@ -130,6 +130,16 @@ async def create_operator_project_message(
     """Create or idempotently return an operator-authored ProjectMessage."""
 
     project_id = project.id
+    # Whether a live resident Workday session owns the project — captured NOW,
+    # while ``project.vision`` is loaded, so the read cannot become a lazy load on
+    # an attribute expired by the message commit below. When active, the standing
+    # agent handles the reply live and cadence steering must not be armed.
+    from app.strategic_resident_session import (
+        read_resident_session,
+        resident_session_is_active,
+    )
+
+    resident_active = resident_session_is_active(read_resident_session(project.vision))
     trimmed_content = content.strip()
     if not trimmed_content:
         raise HTTPException(status_code=400, detail="Content cannot be empty")
@@ -237,11 +247,17 @@ async def create_operator_project_message(
     message_id = msg.id
     message_event = message_event_payload(msg)
 
+    # Gate cadence steering when a live resident Workday session owns the project:
+    # the standing agent handles the operator message directly, so arming the
+    # cadence refresh marker (and firing the steering-acted receipt) would only
+    # spawn a competing writer. ``resident_active`` was captured above, before the
+    # message commit could expire ``project.vision``.
     arming = await maybe_arm_operator_refresh(
         session,
         project_id,
         message_type,
         message_content=trimmed_content,
+        resident_session_active=resident_active,
     )
     if arming == ARMING_STEERING:
         await session.commit()

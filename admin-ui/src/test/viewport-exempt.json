@@ -47,6 +47,7 @@
     "CriterionVerdictBadge": "Compact knowledge-document badge rendered exclusively inside KnowledgeBrowser rows/details; viewport coverage is provided by KnowledgeBrowser.viewport.test.tsx.",
     "StrategicContextDescriptor": "Composer/receipt context chip rendered exclusively inside MessagesComposer and MessageBubble; viewport coverage is provided by MessagesComposer.viewport.test.tsx and MessagesPanel.viewport.test.tsx.",
     "StrategicContextMap": "Context-map visualization rendered inside StrategicContextWorkspace and StrategicContextArtifactSlot; viewport coverage is provided by StrategicContextWorkspace.viewport.test.tsx and StrategicContextRail.viewport.test.tsx.",
-    "StrategicSessionEvents": "Session-event list rendered inside StrategicContextWorkspace and StrategicContextRail; viewport coverage is provided by StrategicContextWorkspace.viewport.test.tsx and StrategicContextRail.viewport.test.tsx."
+    "StrategicSessionEvents": "Session-event list rendered inside StrategicContextWorkspace and StrategicContextRail; viewport coverage is provided by StrategicContextWorkspace.viewport.test.tsx and StrategicContextRail.viewport.test.tsx.",
+    "StrategicLiveTurn": "Live streaming-reply bubble + ephemeral activity strip rendered exclusively at the tail of the chat inside MessagesListView/MessagesPanel; each row truncates and the strip scrolls in its own overflow container, so viewport coverage is provided by MessagesPanel.viewport.test.tsx."
   }
 }

@@ -29,6 +29,13 @@ export interface MessagesListViewProps {
    * duplicates a persisted message.
    */
   streamingBubble?: ReactNode;
+  /**
+   * LIVE, ephemeral activity strip (commands / tools the resident strategist is
+   * running for the in-flight turn). Rendered at the very tail — below the
+   * streaming bubble — while a turn is working, and cleared by the caller when
+   * the turn ends. Never part of the durable transcript.
+   */
+  activityStrip?: ReactNode;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
   blockersRefEl: RefObject<HTMLDivElement | null>;
@@ -95,6 +102,7 @@ export interface MessagesListViewProps {
 export function MessagesListView({
   presentation = 'triage',
   streamingBubble,
+  activityStrip,
   scrollRef,
   blockersRefEl,
   questionsRefEl,
@@ -148,7 +156,7 @@ export function MessagesListView({
         <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[940px] flex-col gap-3">
           {loading ? (
             <p className="py-8 text-center text-xs text-neutral-500">Loading...</p>
-          ) : messages.length === 0 && !streamingBubble ? (
+          ) : messages.length === 0 && !streamingBubble && !activityStrip ? (
             <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
               <MessageSquare className="mb-3 h-8 w-8 opacity-40" />
               <p className="text-sm">No messages yet</p>
@@ -172,6 +180,8 @@ export function MessagesListView({
               )}
               {/* Live streaming preview — always at the tail, below all durable messages. */}
               {streamingBubble}
+              {/* Live, ephemeral activity strip — below the streaming reply. */}
+              {activityStrip}
             </>
           )}
         </div>

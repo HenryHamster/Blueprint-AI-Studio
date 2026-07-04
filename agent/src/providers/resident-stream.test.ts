@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   splitStreamChunk, extractDeltaText, isStrategicMutation, isMessageSend,
   parseResidentLine, encodeUserTurn, encodeInterrupt, extractResultUsage,
+  describeToolUse, describeToolResult,
 } from './resident-stream.js';
 
 describe('splitStreamChunk', () => {
@@ -93,6 +94,49 @@ describe('extractResultUsage', () => {
   });
 });
 
+describe('describeToolUse', () => {
+  it('maps Bash to a $-prefixed command (first line only, capped)', () => {
+    expect(describeToolUse('Bash', { command: 'ls -la' })).toEqual({ kind: 'command', text: '$ ls -la' });
+    expect(describeToolUse('Bash', { command: 'a\nb' })).toEqual({ kind: 'command', text: '$ a' });
+    // Over-long command is truncated with an ellipsis.
+    const long = 'x'.repeat(300);
+    const out = describeToolUse('Bash', { command: long });
+    expect(out?.kind).toBe('command');
+    expect((out?.text.length ?? 0)).toBeLessThanOrEqual(161);
+    expect(out?.text.endsWith('…')).toBe(true);
+  });
+
+  it('drops an empty Bash command (nothing to surface)', () => {
+    expect(describeToolUse('Bash', { command: '   ' })).toBeUndefined();
+    expect(describeToolUse('Bash', {})).toBeUndefined();
+  });
+
+  it('maps Edit/Write/Read/Task to their activity kinds', () => {
+    expect(describeToolUse('Write', { file_path: '/a/b/c.ts' })).toEqual({ kind: 'file', text: 'wrote …/b/c.ts' });
+    expect(describeToolUse('Read', { file_path: 'x.md' })).toEqual({ kind: 'read', text: 'read x.md' });
+    expect(describeToolUse('Task', { subagent_type: 'Plan', description: 'design it' }))
+      .toEqual({ kind: 'subagent', text: 'spawned Plan: design it' });
+  });
+
+  it('falls back to the bare tool name for any other tool', () => {
+    expect(describeToolUse('Grep', { pattern: 'x' })).toEqual({ kind: 'tool', text: 'Grep' });
+  });
+});
+
+describe('describeToolResult', () => {
+  it('summarizes success and error with a ✓/✗ prefix', () => {
+    expect(describeToolResult({ content: 'ok', is_error: false })).toEqual({ kind: 'tool_result', text: '✓ ok' });
+    expect(describeToolResult({ content: 'boom', is_error: true })).toEqual({ kind: 'tool_result', text: '✗ boom' });
+    expect(describeToolResult({ is_error: false })).toEqual({ kind: 'tool_result', text: '✓ done' });
+    expect(describeToolResult({ is_error: true })).toEqual({ kind: 'tool_result', text: '✗ tool error' });
+  });
+
+  it('reads a text block out of an array-content tool_result', () => {
+    const out = describeToolResult({ content: [{ type: 'text', text: 'line1\nline2' }], is_error: false });
+    expect(out.text).toBe('✓ line1');
+  });
+});
+
 describe('parseResidentLine', () => {
   it('classifies a text delta', () => {
     const events = parseResidentLine(JSON.stringify({
@@ -134,6 +178,49 @@ describe('parseResidentLine', () => {
       message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_99', content: 'curl: (7) failed', is_error: true }] },
     }));
     expect(failed[0]).toMatchObject({ kind: 'tool_result', toolUseId: 'toolu_99', isError: true });
+  });
+
+  it('carries a compact activity one-liner on a Bash tool_use', () => {
+    const events = parseResidentLine(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: { command: 'npm test\nsecond line' } }] },
+    }));
+    expect(events[0]).toMatchObject({ kind: 'tool', activityKind: 'command', activityText: '$ npm test' });
+  });
+
+  it('carries a file-edit / read / subagent activity one-liner per tool', () => {
+    const edit = parseResidentLine(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 't2', name: 'Edit', input: { file_path: '/repo/app/main.py' } }] },
+    }));
+    expect(edit[0]).toMatchObject({ activityKind: 'file', activityText: 'edited …/app/main.py' });
+
+    const read = parseResidentLine(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 't3', name: 'Read', input: { file_path: 'README.md' } }] },
+    }));
+    expect(read[0]).toMatchObject({ activityKind: 'read', activityText: 'read README.md' });
+
+    const task = parseResidentLine(JSON.stringify({
+      type: 'assistant',
+      message: { content: [{ type: 'tool_use', id: 't4', name: 'Task', input: { subagent_type: 'Explore', description: 'map the auth flow' } }] },
+    }));
+    expect(task[0]).toMatchObject({ activityKind: 'subagent', activityText: 'spawned Explore: map the auth flow' });
+  });
+
+  it('carries a tool_result summary one-liner (success + error)', () => {
+    const ok = parseResidentLine(JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 't1', content: 'created direction d-1', is_error: false }] },
+    }));
+    expect(ok[0]).toMatchObject({ kind: 'tool_result', activityKind: 'tool_result' });
+    expect(ok[0].activityText).toBe('✓ created direction d-1');
+
+    const bad = parseResidentLine(JSON.stringify({
+      type: 'user',
+      message: { content: [{ type: 'tool_result', tool_use_id: 't9', content: 'curl: (7) failed', is_error: true }] },
+    }));
+    expect(bad[0].activityText).toBe('✗ curl: (7) failed');
   });
 
   it('treats a tool_result-less user line as bare system noise', () => {

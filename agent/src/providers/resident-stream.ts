@@ -26,6 +26,104 @@
 export type ResidentEventKind = 'text' | 'tool' | 'tool_result' | 'result' | 'error' | 'system' | 'other';
 
 /**
+ * The `kind` of a LIVE, EPHEMERAL activity one-liner surfaced to the operator's
+ * Workday activity strip. Mirrors the backend `strategic_session` activity kinds
+ * (strategic_events.py). `command` = a Bash command, `file` = an edit/write,
+ * `read` = a file read, `subagent` = a spawned Task/Agent, `tool_result` = a
+ * tool's outcome, `tool` = any other tool. These NEVER persist — only the
+ * assistant's `./messages send` reply reaches the durable transcript.
+ */
+export type ResidentActivityKind = 'command' | 'file' | 'read' | 'subagent' | 'tool_result' | 'tool';
+
+/** Max chars for an activity one-liner (the backend caps + sanitizes again). */
+const ACTIVITY_TEXT_MAX = 160;
+
+function _firstLine(s: string): string {
+  const nl = s.indexOf('\n');
+  return nl >= 0 ? s.slice(0, nl) : s;
+}
+
+function _cap(s: string): string {
+  return s.length > ACTIVITY_TEXT_MAX ? `${s.slice(0, ACTIVITY_TEXT_MAX - 1)}…` : s;
+}
+
+/** Trim a path to its last two segments (…/dir/file) so the strip stays compact. */
+function _shortPath(p: string): string {
+  const parts = p.split(/[\\/]/).filter(Boolean);
+  return parts.length <= 2 ? p : `…/${parts.slice(-2).join('/')}`;
+}
+
+function _str(v: unknown): string {
+  return typeof v === 'string' ? v : '';
+}
+
+/**
+ * Compact one-liner describing a top-level `tool_use` for the live activity strip
+ * — pure so it is unit-tested in isolation. Maps the common Claude Code tools to
+ * a `{ kind, text }` the operator reads at a glance:
+ *   Bash → `$ <cmd>` (command)   Edit/Write/MultiEdit/NotebookEdit → `edited <file>` (file)
+ *   Read → `read <file>` (read)  Task/Agent → `spawned <type>: <desc>` (subagent)
+ *   anything else → the bare tool name (tool). Returns undefined when there is
+ *   nothing worth surfacing (e.g. an empty Bash command).
+ */
+export function describeToolUse(
+  toolName: string | undefined,
+  input: unknown,
+): { kind: ResidentActivityKind; text: string } | undefined {
+  const name = toolName || '';
+  const obj = input && typeof input === 'object' ? (input as Record<string, unknown>) : {};
+  let out: { kind: ResidentActivityKind; text: string } | undefined;
+  if (name === 'Bash') {
+    const cmd = _str(obj.command).trim();
+    out = cmd ? { kind: 'command', text: `$ ${_firstLine(cmd)}` } : undefined;
+  } else if (name === 'Read') {
+    const f = _str(obj.file_path).trim();
+    out = { kind: 'read', text: f ? `read ${_shortPath(f)}` : 'read' };
+  } else if (name === 'Edit' || name === 'Write' || name === 'MultiEdit' || name === 'NotebookEdit') {
+    const f = _str(obj.file_path || obj.notebook_path).trim();
+    const verb = name === 'Write' ? 'wrote' : 'edited';
+    out = { kind: 'file', text: f ? `${verb} ${_shortPath(f)}` : verb };
+  } else if (name === 'Task' || name === 'Agent') {
+    const type = _str(obj.subagent_type).trim();
+    const desc = _str(obj.description).trim();
+    const label = [type, desc].filter(Boolean).join(': ') || 'sub-agent';
+    out = { kind: 'subagent', text: `spawned ${label}` };
+  } else if (name) {
+    out = { kind: 'tool', text: name };
+  }
+  if (!out) return undefined;
+  return { kind: out.kind, text: _cap(out.text) };
+}
+
+/**
+ * Compact one-liner summarizing a `tool_result` for the live activity strip —
+ * pure so it is unit-tested in isolation. A leading ✓ / ✗ marks success vs a
+ * reported error, with a short first-line preview of the result content when one
+ * is present (kept tight; the backend sanitizes + caps again).
+ */
+export function describeToolResult(
+  block: Record<string, unknown>,
+): { kind: 'tool_result'; text: string } {
+  const isError = block.is_error === true;
+  const content = block.content;
+  let preview = '';
+  if (typeof content === 'string') {
+    preview = content;
+  } else if (Array.isArray(content)) {
+    for (const c of content) {
+      if (c && typeof c === 'object' && (c as Record<string, unknown>).type === 'text') {
+        preview = _str((c as Record<string, unknown>).text);
+        if (preview) break;
+      }
+    }
+  }
+  preview = _firstLine(preview.trim()).slice(0, 100).trim();
+  const mark = isError ? '✗' : '✓';
+  const text = preview ? `${mark} ${preview}` : isError ? '✗ tool error' : '✓ done';
+  return { kind: 'tool_result', text: _cap(text) };
+}
+
+/**
  * Per-turn token usage carried on a top-level `result` event. Mirrors the
  * Anthropic result-usage block the one-shot runner already records
  * (runners.ts): `inputTokens` is the INCLUSIVE sum of the three input classes so
@@ -63,6 +161,10 @@ export interface ResidentStreamEvent {
   nested?: boolean;
   /** token usage parsed from a top-level 'result' event (when the CLI reported it) */
   usage?: ResidentTokenUsage;
+  /** LIVE activity-strip kind for a 'tool' / 'tool_result' event (ephemeral) */
+  activityKind?: ResidentActivityKind;
+  /** LIVE activity-strip one-liner text for a 'tool' / 'tool_result' event */
+  activityText?: string;
 }
 
 /**
@@ -189,13 +291,17 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
         } else if (block.type === 'tool_use') {
           const toolName = typeof block.name === 'string' ? block.name : '';
           const toolUseId = typeof block.id === 'string' && block.id ? block.id : undefined;
-          let command: string | undefined;
           const input = block.input;
+          let command: string | undefined;
           if (toolName === 'Bash' && input && typeof input === 'object') {
             const c = (input as Record<string, unknown>).command;
             if (typeof c === 'string') command = c;
           }
-          events.push({ kind: 'tool', toolName, command, toolUseId, nested, sessionId });
+          const activity = describeToolUse(toolName, input);
+          events.push({
+            kind: 'tool', toolName, command, toolUseId, nested, sessionId,
+            activityKind: activity?.kind, activityText: activity?.text,
+          });
         }
       }
     }
@@ -233,7 +339,11 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
         if (block.type === 'tool_result') {
           const toolUseId = typeof block.tool_use_id === 'string' && block.tool_use_id
             ? block.tool_use_id : undefined;
-          events.push({ kind: 'tool_result', toolUseId, isError: block.is_error === true, nested, sessionId });
+          const activity = describeToolResult(block);
+          events.push({
+            kind: 'tool_result', toolUseId, isError: block.is_error === true, nested, sessionId,
+            activityKind: activity.kind, activityText: activity.text,
+          });
         }
       }
     }

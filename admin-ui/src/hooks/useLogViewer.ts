@@ -60,6 +60,9 @@ export interface StrategicSessionDelta {
   kind?: string;
   text: string;
   ts?: string;
+  /** Optional lifecycle marker: `responding` opens an operator turn (working
+   *  indicator), `done` closes it (clears the ephemeral activity strip). */
+  status?: string;
 }
 
 let _trackLogIdCounter = 0;
@@ -434,7 +437,10 @@ export function useLogViewer({
       // secret-sanitized + length-bounded server-side (strategic_events.py).
       if (msg.event === 'strategic_session') {
         const text = typeof msg.data?.text === 'string' ? msg.data.text : '';
-        if (text) {
+        const status = typeof msg.data?.status === 'string' ? msg.data.status : undefined;
+        // A lifecycle frame (responding/done) may carry empty text but must still
+        // be recorded so the UI can open/close the working state + activity strip.
+        if (text || status) {
           const delta: StrategicSessionDelta = {
             id: ++_sessionDeltaIdCounter,
             session_id: msg.data?.session_id,
@@ -443,6 +449,7 @@ export function useLogViewer({
             kind: msg.data?.kind,
             text,
             ts: msg.data?.ts,
+            status,
           };
           setStrategicSessionTranscript(prev => (
             prev.length >= SESSION_TRANSCRIPT_CAP

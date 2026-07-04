@@ -767,12 +767,26 @@ async def resolve_message(
                     if isinstance(reply_msg.context, dict)
                     else None
                 )
+                # Suppress cadence steering when a live resident Workday session
+                # owns the project — the standing agent replies live, so waking a
+                # competing cadence writer (and posting a steer receipt) is wrong.
+                from app.models import Project as _Project
+                from app.strategic_resident_session import (
+                    read_resident_session,
+                    resident_session_is_active,
+                )
+
+                _reply_project = await session.get(_Project, message_project_uuid)
+                _resident_active = _reply_project is not None and resident_session_is_active(
+                    read_resident_session(_reply_project.vision)
+                )
                 arming = await maybe_arm_operator_refresh(
                     session,
                     message_project_uuid,
                     MessageType(reply_msg.message_type),
                     event_type=str(event_type) if event_type else None,
                     message_content=resolution,
+                    resident_session_active=_resident_active,
                 )
                 if arming == ARMING_STEERING:
                     await session.commit()

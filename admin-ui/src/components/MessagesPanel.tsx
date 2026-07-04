@@ -11,6 +11,13 @@ import { groupRoutineMessages, outcomeBreakdown, isFailingGroup } from './messag
 import { loadLastSeen, saveLastSeen } from './lastSeen';
 import { fetchServerNoisePrefs, saveServerNoisePrefs, fetchServerSavedViews, saveServerSavedViews, fetchServerTempMutes, saveServerTempMutes, fetchServerMuteWindow, saveServerMuteWindow } from './serverSync';
 import type { ProjectMessage } from '../types/messages';
+import {
+  computeStrategicStreamingTurn,
+  computeStrategicSessionActivity,
+  countStrategicReplies,
+  type StrategicLiveActivity,
+} from '../utils/strategicSessionLive';
+import { StrategicStreamingBubble, StrategicActivityStrip } from './StrategicLiveTurn';
 import { SaveViewDialog } from './SaveViewDialog';
 import { useMessageList } from './useMessageList';
 import { MessagesListView } from './MessagesListView';
@@ -398,86 +405,6 @@ function messageListsEqual(a: ProjectMessage[], b: ProjectMessage[]): boolean {
   return a.length === b.length && a.every((message, i) => messagesEqual(message, b[i]));
 }
 
-interface StrategicStreamingTurn {
-  /** Stable React key for the streaming bubble: session id + first visible seq. */
-  key: string;
-  sessionId: string;
-  text: string;
-}
-
-/**
- * Derive the live streaming turn from the resident-session transcript deltas.
- *
- * Dedup / reconciliation key: the newest DURABLE strategic message's `created_at`
- * acts as a high-water mark. Only transcript deltas from the most recent session
- * whose `ts` is strictly newer than that water mark are shown — so the streaming
- * bubble only ever previews content that has NOT yet been persisted. When the
- * durable `from_type=strategic` ProjectMessage for the turn arrives via the
- * conversation refresh, the water mark advances past the turn's deltas, the
- * preview empties, and the durable bubble takes its place — no duplicate. A
- * cadence / non-resident turn streams nothing, so this returns null and only the
- * persisted message renders.
- */
-function computeStrategicStreamingTurn(
-  transcript: StrategicSessionDelta[] | undefined,
-  conversationMessages: ProjectMessage[],
-): StrategicStreamingTurn | null {
-  const deltas = transcript ?? [];
-  if (deltas.length === 0) return null;
-  const latestSessionId = deltas[deltas.length - 1]?.session_id;
-
-  // High-water mark = newest durable strategic reply already in the transcript.
-  let watermark = Number.NEGATIVE_INFINITY;
-  for (const msg of conversationMessages) {
-    const ft = (msg.from_type || '').toLowerCase();
-    if ((ft === 'strategic' || ft === 'strategist') && msg.created_at) {
-      const t = parseTimestamp(msg.created_at).getTime();
-      if (!Number.isNaN(t) && t > watermark) watermark = t;
-    }
-  }
-
-  const visible = deltas.filter(d => {
-    // Restrict to the current (latest) session so a prior session's un-persisted
-    // trailing status lines never linger.
-    if (latestSessionId && d.session_id && d.session_id !== latestSessionId) return false;
-    if (watermark === Number.NEGATIVE_INFINITY) return true;
-    if (!d.ts) return true; // no timestamp → treat as a fresh, unpersisted delta
-    const t = parseTimestamp(d.ts).getTime();
-    return Number.isNaN(t) ? true : t > watermark;
-  });
-  if (visible.length === 0) return null;
-
-  const text = visible.map(d => d.text).filter(Boolean).join('\n').trim();
-  if (!text) return null;
-
-  const firstSeq = visible[0].seq ?? visible[0].id;
-  const sessionId = latestSessionId ?? 'session';
-  return { key: `${sessionId}:${firstSeq}`, sessionId, text };
-}
-
-/** Live "typing"/streaming preview bubble for the resident strategist's in-flight turn. */
-function StrategicStreamingBubble({ text }: { text: string }) {
-  return (
-    <div
-      data-testid="strategic-streaming-bubble"
-      className="group flex scroll-mt-24 justify-start rounded-md"
-    >
-      <div className="flex w-full max-w-[92%] flex-col items-start md:max-w-[76%]">
-        <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
-          <span className="font-medium text-neutral-400">Strategic</span>
-          <span aria-hidden="true">·</span>
-          <span className="inline-flex items-center gap-1">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" aria-hidden="true" />
-            responding…
-          </span>
-        </div>
-        <div className="rounded-md border border-transparent bg-transparent px-0.5 py-0.5">
-          <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-100">{text}</div>
-        </div>
-      </div>
-    </div>
-  );
-}
 
 export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, onClose, addToast, onMessageCountChange, onOpenTask, notifyOnHighSignalMessage, variant, filterChrome, showCloseButton, strategistActive, cycleProgress, lastCycleCompletion, focusComposerSignal, realtimeRefreshSignal, contextPackage, strategicState, strategicWorkbenchState, targetMessage, onTargetMessageHandled, onStrategicStateRefresh, onStrategicInteraction, onOpenStrategicContextWorkspace, onOpenCommandPalette, onOpenStrategicContextCommands, onStrategicRefresh, strategicSessionTranscript }: MessagesPanelProps) {
   const resolvedVariant = variant ?? (onClose ? 'modal' : 'page');
@@ -520,6 +447,20 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   const submittingRef = useRef(false);
   const [replyTo, setReplyTo] = useState<{ id: string; content: string; from: string; message_type: string; status: string } | null>(null);
   const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null);
+  // INSTANT ACK — the operator's just-sent message, rendered optimistically at
+  // the tail of the chat the moment they hit Send (before the POST round-trips),
+  // then dropped once the durable message lands via fetchMessages. Reply-only /
+  // resolve paths do not use it (those messages are the operator's answer to an
+  // existing thread, not a new chat turn).
+  const [optimisticSend, setOptimisticSend] = useState<{
+    key: string; content: string; created_at: string; message_type: string;
+  } | null>(null);
+  // "Workday's on it" working state: set the instant the operator sends, cleared
+  // when a fresh strategist reply lands (count vs baseline — clock-skew-proof), a
+  // `done` lifecycle frame arrives, or a safety timeout. Drives the live activity
+  // strip so there is zero dead time between send and visible progress.
+  const [workingSince, setWorkingSince] = useState<number | null>(null);
+  const strategicReplyBaselineRef = useRef<number>(0);
   // Real arming outcome the server reported for the last send (null before any
   // send, or after the operator changes the message type so the composer reverts
   // to a fresh type-based prediction).
@@ -900,6 +841,73 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     () => (conversationMode ? computeStrategicStreamingTurn(strategicSessionTranscript, conversationMessages) : null),
     [conversationMode, strategicSessionTranscript, conversationMessages],
   );
+  // Live, ephemeral activity feed (commands / tools) for the in-flight turn.
+  const liveActivity = useMemo(
+    () => (conversationMode
+      ? computeStrategicSessionActivity(strategicSessionTranscript, conversationMessages)
+      : { items: [], latestLifecycle: null } as StrategicLiveActivity),
+    [conversationMode, strategicSessionTranscript, conversationMessages],
+  );
+  // The chat is "working on a reply" while a turn is pending (optimistic send not
+  // yet answered) OR the resident agent has streamed a `responding`/activity
+  // frame. The strip clears the instant the turn is done (below).
+  const strategicTurnWorking = conversationMode && (
+    workingSince != null || liveActivity.latestLifecycle === 'responding'
+  ) && liveActivity.latestLifecycle !== 'done';
+  // Render the operator's optimistic bubble until the durable copy lands — dedup
+  // against any already-present user message with the same content so there is
+  // never a duplicate flash between fetchMessages resolving and the clear.
+  const renderedConversationMessages = useMemo(() => {
+    if (!conversationMode || !optimisticSend) return conversationMessages;
+    const alreadyDurable = conversationMessages.some(m => {
+      const ft = (m.from_type || '').toLowerCase();
+      return (ft === 'user' || ft === 'operator') && m.content === optimisticSend.content;
+    });
+    if (alreadyDurable) return conversationMessages;
+    const optimisticMessage = {
+      id: `optimistic:${optimisticSend.key}`,
+      project_id: selectedProjectId ?? '',
+      message_type: optimisticSend.message_type as ProjectMessage['message_type'],
+      from_type: 'user' as ProjectMessage['from_type'],
+      from_task_id: null,
+      content: optimisticSend.content,
+      context: {},
+      status: 'open' as ProjectMessage['status'],
+      resolution: null,
+      resolved_at: null,
+      created_at: optimisticSend.created_at,
+    } satisfies ProjectMessage;
+    return [...conversationMessages, optimisticMessage];
+  }, [conversationMode, optimisticSend, conversationMessages, selectedProjectId]);
+
+  // Clear the working state once a FRESH strategist reply lands (compare reply
+  // COUNT to the baseline captured at send time — robust to client/server clock
+  // skew, unlike a timestamp compare).
+  useEffect(() => {
+    if (workingSince == null) return;
+    if (countStrategicReplies(conversationMessages) > strategicReplyBaselineRef.current) {
+      setWorkingSince(null);
+    }
+  }, [workingSince, conversationMessages]);
+  // A `done` lifecycle frame ends the turn — clear the working state / strip even
+  // before the durable reply is refetched (the streaming bubble keeps the final
+  // reply text until it reconciles).
+  useEffect(() => {
+    if (workingSince == null) return;
+    if (liveActivity.latestLifecycle === 'done') setWorkingSince(null);
+  }, [workingSince, liveActivity.latestLifecycle]);
+  // Safety net: never leave the working state stuck if a turn silently stalls.
+  useEffect(() => {
+    if (workingSince == null) return;
+    const timer = window.setTimeout(() => setWorkingSince(null), 120_000);
+    return () => window.clearTimeout(timer);
+  }, [workingSince]);
+  // Reset instant-ack state on project switch so a prior project's pending turn
+  // never bleeds onto the newly-selected project.
+  useEffect(() => {
+    setOptimisticSend(null);
+    setWorkingSince(null);
+  }, [selectedProjectId]);
   const showStrategicStatusStrip = conversationMode && Boolean(
     strategistActive
       || strategicRefresh
@@ -1453,6 +1461,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       }
       const submittedContent = newContent.trim();
       if (conversationMode) {
+        // INSTANT ACK: optimistically show the operator's message + working state
+        // the moment they Send, before the POST round-trips (zero dead time). The
+        // durable copy lands via fetchMessages below and the optimistic one is
+        // dropped; the working state persists until the strategist replies.
+        setOptimisticSend({
+          key: idempotencyKeyRef.current,
+          content: submittedContent,
+          created_at: new Date().toISOString(),
+          message_type: effectiveNewType,
+        });
+        strategicReplyBaselineRef.current = countStrategicReplies(conversationMessages);
+        setWorkingSince(Date.now());
+        // Clear the composer immediately so the optimistic bubble reads as sent.
+        setNewContent('');
+        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
+        if (textareaRef.current) textareaRef.current.style.height = 'auto';
         const data = await createStrategicSessionMessage(selectedProjectId, {
           message_type: effectiveNewType,
           content: submittedContent,
@@ -1462,11 +1486,8 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         });
         const arming = parseArmingOutcome(data?.arming);
         idempotencyKeyRef.current = null;
-        setNewContent('');
-        clearComposerDraft(auth.currentUser?.email, selectedProjectId);
         setReplyTo(null);
         setLastArming(arming);
-        if (textareaRef.current) textareaRef.current.style.height = 'auto';
         addToast(armingToastCopy(arming), arming === 'not_armed' ? 'info' : 'success');
         let didRefreshStrategicState = false;
         if (arming === 'steering') {
@@ -1487,6 +1508,9 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           didRefreshStrategicState = true;
         }
         await fetchMessages();
+        // Durable operator message is now present — drop the optimistic bubble
+        // (renderedConversationMessages also dedups, so there is no flash).
+        setOptimisticSend(null);
         if (!didRefreshStrategicState) void refreshStrategicState?.();
         recordStrategicInteraction();
         return;
@@ -1547,6 +1571,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       if (!didRefreshStrategicState) void refreshStrategicState?.();
       recordStrategicInteraction();
     } catch {
+      // The send failed — drop the optimistic bubble + working state so the UI
+      // reflects reality (the server idempotency key covers a manual resend).
+      setOptimisticSend(null);
+      setWorkingSince(null);
       addToast('Failed to send message', 'error');
     } finally {
       submittingRef.current = false;
@@ -2039,12 +2067,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       <MessagesListView
         presentation={conversationMode ? 'conversation' : 'triage'}
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} text={streamingTurn.text} /> : null}
+        activityStrip={strategicTurnWorking ? <StrategicActivityStrip items={liveActivity.items} /> : null}
         scrollRef={scrollRef}
         blockersRefEl={blockersRefEl}
         questionsRefEl={questionsRefEl}
         routineRefEl={routineRefEl}
         dividerDismissedRef={dividerDismissedRef}
-        messages={conversationMode ? conversationMessages : messages}
+        messages={conversationMode ? renderedConversationMessages : messages}
         loading={loading}
         dividerTime={dividerTime}
         totalNewCount={totalNewCount}
