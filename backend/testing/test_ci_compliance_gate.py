@@ -304,3 +304,13 @@ async def test_noncompliant_qualify_request_is_blocked_and_spawns_cap_bump(
     assert "python3 backend/testing/check_size_limits.py --fix" in cap_bump_tasks[
         0
     ].first_payload["prompt"]
+
+    # Observability: the CI-compliance block is recorded durably on the version
+    # row (queryable via the strategic payload / version fetch), not just logged.
+    await db_session.refresh(version)
+    assert version.last_qualification is not None
+    blocked_trace = version.last_qualification["qualify_request_blocked"]
+    assert blocked_trace["blocker"] == "ci_compliance"
+    assert blocked_trace["head_sha"] == _HEAD_SHA
+    assert blocked_trace["cap_bump_task"] == str(cap_bump_tasks[0].id)
+    assert "qualify_request_blocked_at" in version.last_qualification

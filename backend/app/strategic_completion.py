@@ -1465,6 +1465,37 @@ async def _apply_qualify_request(
                         getattr(spawned, "id", None),
                         reason,
                     )
+                    # Record the CI-compliance block durably on the version row
+                    # so the resident strategist can see WHY a requested
+                    # qualification never started. This path only spawns a
+                    # cap-bump task + logs today, leaving last_qualification null —
+                    # indistinguishable from "never requested" without log access.
+                    # Merged under a dedicated key (like the qualify_request_error
+                    # trace on the failure path below) so it never overwrites a
+                    # prior verdict's "status" and cannot perturb
+                    # run_qualification's cached-verdict guard.
+                    try:
+                        open_ver.last_qualification = {
+                            **(open_ver.last_qualification or {}),
+                            "qualify_request_blocked": {
+                                "blocker": "ci_compliance",
+                                "violation_count": gate.get("violation_count", 0),
+                                "head_sha": gate.get("head_sha"),
+                                "cap_bump_task": (
+                                    str(spawned.id) if spawned is not None else None
+                                ),
+                            },
+                            "qualify_request_blocked_at": _utcnow().isoformat(),
+                        }
+                        flag_modified(open_ver, "last_qualification")
+                        session.add(open_ver)
+                    except Exception:  # noqa: BLE001 — recording must never block the gate
+                        logger.exception(
+                            "[STRATEGIC] Task %s (%s path): failed to record "
+                            "qualify_request CI-compliance block on ReleaseVersion",
+                            task.id,
+                            path,
+                        )
                     return
             else:
                 logger.info(
