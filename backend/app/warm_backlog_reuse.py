@@ -1200,7 +1200,9 @@ def record_spawn_pin_skipped(reason: str) -> None:
     "caller_suppressed" (suppress_warm_handoff=True),
     "source_cold" (source task has no vm_instance_id),
     "stale_source" (source heartbeat older than WARM_HANDOFF_WINDOW_SECS),
-    "project_paused" (owning project is paused — no new dispatch on any path).
+    "project_paused" (owning project is paused — no new dispatch on any path),
+    "sibling_already_pinned" (an unclaimed QUEUED task is already pinned to
+    the same source VM for this PR — WI-5 anti-re-pin guard).
     """
     _spawn_pin_skipped_events.append((_utcnow(), reason))
 

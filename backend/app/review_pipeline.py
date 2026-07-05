@@ -1634,6 +1634,48 @@ async def _handle_lane_checkpoint_recovery(
     return (recovery_task, True)
 
 
+async def _pinned_unclaimed_sibling_exists(
+    session: AsyncSession,
+    *,
+    project_id,
+    warm_target_vm_id: str,
+    pr_number: int | None,
+) -> bool:
+    """True iff a QUEUED (still-unclaimed) task is already pinned to
+    ``warm_target_vm_id`` for the same PR.
+
+    WI-5 anti-re-pin guard. A source VM serves exactly one task before it is
+    torn down, so once one QUEUED sibling is pinned to it, minting a second
+    pin is dead-on-arrival: the VM's /next-role poll claims the first sibling
+    and the VM is deleted, yet the second pin's fresh 240s deadline keeps the
+    orchestrator skip-provision loop orbiting an already-doomed VM. Each new
+    fix/review row for the same PR minting its own 240s pin is exactly why the
+    handoff deadline appears to "never expire" (new-row churn defeats the
+    per-row deadline bound). Reusing the standing pin lets the existing
+    deadline govern the whole set.
+
+    Mirrors the /next-role claim query's filter shape (agent_warm_continuity):
+    QUEUED + ``context->>'warm_target_vm_id'`` match, narrowed by
+    ``warm_target_pr`` when a PR number is known.
+    """
+    use_jsonb_has_key = resolve_dialect_name(session) == "postgresql"
+    filters = [
+        Task.project_id == project_id,
+        Task.status == TaskStatus.QUEUED,
+    ]
+    if use_jsonb_has_key:
+        filters.append(Task.context.has_key("warm_target_vm_id"))
+    filters.append(
+        Task.context["warm_target_vm_id"].as_string() == str(warm_target_vm_id)
+    )
+    if pr_number is not None:
+        if use_jsonb_has_key:
+            filters.append(Task.context.has_key("warm_target_pr"))
+        filters.append(Task.context["warm_target_pr"].as_string() == str(pr_number))
+    stmt = select(Task.id).where(*filters).limit(1)
+    return (await session.execute(stmt)).first() is not None
+
+
 async def _spawn_pipeline_task(
     source_task: Task,
     task_type: str,
@@ -3930,6 +3972,19 @@ async def _spawn_pipeline_task(
             is_recent_terminal = elapsed <= WARM_HANDOFF_WINDOW_SECS
         if not (is_in_progress or is_recent_terminal):
             record_spawn_pin_skipped("stale_source")
+        elif await _pinned_unclaimed_sibling_exists(
+            session,
+            project_id=source_task.project_id,
+            warm_target_vm_id=source_task.vm_instance_id,
+            pr_number=pr_number,
+        ):
+            # A prior spawn for this same PR already pinned an unclaimed task
+            # to this same source VM. Minting a second 240s pin is redundant
+            # churn — the VM serves one task then tears down, so the standing
+            # pin (and its existing deadline) is the one that governs. Skipping
+            # here stops the new-row pin churn that keeps the orchestrator's
+            # skip-provision loop orbiting a soon-to-be-doomed VM.
+            record_spawn_pin_skipped("sibling_already_pinned")
         else:
             propagated_ctx["warm_target_vm_id"] = source_task.vm_instance_id
             # Stored as int — query side uses .as_string() which on Postgres reads

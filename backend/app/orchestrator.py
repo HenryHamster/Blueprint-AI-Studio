@@ -437,6 +437,40 @@ def _clear_dispatch_prep_failures(task: Task) -> None:
         task.context = ctx
 
 
+def _warm_pin_still_honorable(
+    *,
+    warm_expired: bool,
+    breaker_suppressed: bool,
+    vm_doomed: bool,
+    vm_alive: bool,
+) -> bool:
+    """WI-5: the composed skip-provision honor predicate for a warm-pinned task.
+
+    A warm pin is honored (task left QUEUED for the target VM's /next-role
+    poll, no fresh provision) only when ALL of the following hold:
+
+    - the warm handoff deadline has not passed (``not warm_expired``),
+    - the relevant circuit breaker is not suppressing warm reuse
+      (``not breaker_suppressed``),
+    - the orchestrator has NOT already scheduled the target VM for teardown
+      (``not vm_doomed``) — a torn-down VM's <90s completion heartbeat is a
+      corpse beat, not proof of life, so honoring it busy-loops
+      skip-provision until the liveness window lapses (WI-5 primary fix), and
+    - the target VM is heartbeating within the liveness window (``vm_alive``).
+
+    Pure by construction: callers pass ``is_vm_alive(...)`` and
+    ``is_orchestrator_initiated_delete(...)[0]`` in as plain booleans so this
+    predicate does no ORM/session/clock/registry work and is directly unit
+    testable — the inline dispatch-loop gate has no other extractable seam.
+    """
+    return (
+        (not warm_expired)
+        and (not breaker_suppressed)
+        and (not vm_doomed)
+        and vm_alive
+    )
+
+
 # ---------------------------------------------------------------------------
 # Module-level globals managed by orchestrator_worker
 # ---------------------------------------------------------------------------
@@ -4968,10 +5002,29 @@ async def orchestrator_worker():
                                 _cb_suppressed = (
                                     _shared_state.is_warm_continuity_suppressed()
                                 )
-                            if (
-                                not _warm_expired
-                                and not _cb_suppressed
-                                and _shared_state.is_vm_alive(_warm_target_vm_id)
+                            # Liveness proxy (WI-5): a <90s heartbeat is NOT proof
+                            # of life when the orchestrator has already scheduled
+                            # this VM for teardown. A VM that just finished a task
+                            # still reads "alive" off its completion POST's
+                            # heartbeat while its delete is in flight, so honouring
+                            # the pin loops skip-provision ~30x until the 90s
+                            # window lapses (observed in prod). Treat an
+                            # orchestrator-doomed target as dead so the task falls
+                            # through to cold provision immediately.
+                            # _warm_target_vm_id is a local snapshot (see above) so
+                            # this read is safe even after a session.rollback().
+                            from app.vm_lifecycle import (
+                                is_orchestrator_initiated_delete,
+                            )
+
+                            _vm_doomed, _doom_reason = is_orchestrator_initiated_delete(
+                                _warm_target_vm_id
+                            )
+                            if _warm_pin_still_honorable(
+                                warm_expired=_warm_expired,
+                                breaker_suppressed=_cb_suppressed,
+                                vm_doomed=_vm_doomed,
+                                vm_alive=_shared_state.is_vm_alive(_warm_target_vm_id),
                             ):
                                 # (b) Skip provision: the warm VM is alive and the
                                 # circuit breaker is not tripped. Leave the task
@@ -5010,6 +5063,10 @@ async def orchestrator_worker():
                                 _clear_reason = "circuit_breaker"
                             elif _warm_expired:
                                 _clear_reason = "deadline_expired"
+                            elif _vm_doomed:
+                                # Orchestrator already tore the target VM down; its
+                                # <90s heartbeat is a corpse beat, not liveness.
+                                _clear_reason = "vm_doomed"
                             else:
                                 _clear_reason = "vm_unresponsive"
                             # A pool pin we give up on releases its leased PoolVm row
@@ -5060,9 +5117,16 @@ async def orchestrator_worker():
                                 if (_clear_reason == "circuit_breaker" or _is_pool_pin)
                                 else (_warm_target_vm_id, _clear_reason)
                             )
+                            # Surface the orchestrator's own teardown reason when the
+                            # clear was triggered by a doomed target (WI-5) — otherwise
+                            # the "vm_doomed" reason alone hides WHY the VM was torn down
+                            # (e.g. agent_completion corpse-beat vs an explicit reap).
+                            _doom_detail = (
+                                f" doom_reason={_doom_reason}" if _vm_doomed else ""
+                            )
                             logger.info(
                                 f"[ORCHESTRATOR] Warm-pin cleared for task {task.id}: "
-                                f"target_vm={_warm_target_vm_id} reason={_clear_reason}"
+                                f"target_vm={_warm_target_vm_id} reason={_clear_reason}{_doom_detail}"
                             )
                         else:
                             _pending_warm_pin_clear = None

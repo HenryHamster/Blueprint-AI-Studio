@@ -493,6 +493,338 @@ async def test_warm_vm_next_role_skips_when_heartbeat_missing(
         _shared_state.vm_last_heartbeat.update(prior_heartbeat)
 
 
+# ---------------------------------------------------------------------------
+# WI-5: doomed-VM liveness proxy + anti-re-pin guard
+# ---------------------------------------------------------------------------
+
+
+def test_wi5_warm_pin_still_honorable_gates_on_each_term():
+    """WI-5 regression guard: the extracted skip-provision honor predicate
+    (``_warm_pin_still_honorable``) must FAIL the pin if any of its four terms
+    is unfavorable — most importantly a DOOMED VM even with a live heartbeat.
+
+    This is the guard the adversarial review found missing: the old
+    ``test_wi5_doomed_source_vm_fails_skip_provision_liveness_gate`` rebuilt the
+    composed predicate inline in the test body, so it stayed green even if
+    ``and not _vm_doomed`` were deleted from the real orchestrator gate. This
+    asserts against the REAL helper the dispatch loop calls, so dropping the
+    ``not vm_doomed`` term flips the doomed-but-live case to True and fails
+    this test.
+    """
+    from app.orchestrator import _warm_pin_still_honorable
+
+    # Honorable: fresh deadline, breaker clear, not doomed, heartbeat live.
+    assert (
+        _warm_pin_still_honorable(
+            warm_expired=False,
+            breaker_suppressed=False,
+            vm_doomed=False,
+            vm_alive=True,
+        )
+        is True
+    )
+
+    # Doomed VM with a LIVE heartbeat (the corpse-beat case) must NOT be
+    # honored. THIS is the assertion that fails if ``not vm_doomed`` is dropped
+    # from the helper — a doomed target would then read as honorable.
+    assert (
+        _warm_pin_still_honorable(
+            warm_expired=False,
+            breaker_suppressed=False,
+            vm_doomed=True,
+            vm_alive=True,
+        )
+        is False
+    )
+
+    # Each remaining unfavorable term independently fails the pin.
+    assert (
+        _warm_pin_still_honorable(
+            warm_expired=True,
+            breaker_suppressed=False,
+            vm_doomed=False,
+            vm_alive=True,
+        )
+        is False
+    )
+    assert (
+        _warm_pin_still_honorable(
+            warm_expired=False,
+            breaker_suppressed=True,
+            vm_doomed=False,
+            vm_alive=True,
+        )
+        is False
+    )
+    assert (
+        _warm_pin_still_honorable(
+            warm_expired=False,
+            breaker_suppressed=False,
+            vm_doomed=False,
+            vm_alive=False,
+        )
+        is False
+    )
+
+
+def test_wi5_doomed_source_vm_fails_skip_provision_liveness_gate():
+    """WI-5 Part 1: a torn-down source VM whose completion heartbeat is still
+    <90s old must NOT keep a warm-pinned task QUEUED.
+
+    ``is_vm_alive`` is a pure heartbeat proxy, so a VM that just completed a
+    task still reads "alive" off its completion POST's beat while its
+    orchestrator-initiated delete is in flight (the corpse beat). The
+    orchestrator skip-provision gate ANDs in
+    ``not is_orchestrator_initiated_delete(vm)[0]`` (orchestrator.py, Phase-2c
+    branch), so a doomed target falls through to cold provision immediately
+    instead of busy-looping ~30x until the 90s window lapses.
+
+    Drives the REAL composed predicate the dispatch loop evaluates
+    (``_warm_pin_still_honorable``) with the two live liveness sources so the
+    two proxies are shown to disagree precisely in the corpse-beat window AND
+    the gate resolves against the shipping helper (not a re-derived copy).
+    """
+    import time
+
+    import app.shared_state as _ss
+    import app.vm_lifecycle as _vml
+    from app.orchestrator import _warm_pin_still_honorable
+
+    vm_id = "agent-vm-wi5-doomed-001"
+    prior_hb = dict(_ss.vm_last_heartbeat)
+    prior_doomed = _vml._orchestrator_deleted_vms.get(vm_id)
+    try:
+        # Fresh completion heartbeat: the pure heartbeat proxy says "alive".
+        _ss.record_vm_heartbeat(vm_id)
+        assert _ss.is_vm_alive(vm_id) is True
+
+        # Before teardown: not doomed → the composed gate honors the pin
+        # (skip-provision, task stays QUEUED for /next-role pickup).
+        doomed, _ = _vml.is_orchestrator_initiated_delete(vm_id)
+        assert doomed is False
+        assert (
+            _warm_pin_still_honorable(
+                warm_expired=False,
+                breaker_suppressed=False,
+                vm_doomed=doomed,
+                vm_alive=_ss.is_vm_alive(vm_id),
+            )
+            is True
+        )
+
+        # The orchestrator tears the VM down. fire_and_forget_vm_delete stamps
+        # the doomed marker synchronously (vm_lifecycle.py) before any await;
+        # write it directly here to avoid scheduling a real GCP delete.
+        _vml._orchestrator_deleted_vms[vm_id] = (time.time(), "agent_completion")
+
+        doomed, reason = _vml.is_orchestrator_initiated_delete(vm_id)
+        assert doomed is True and reason == "agent_completion"
+
+        # The heartbeat is STILL fresh (corpse beat) — the pure proxy is fooled —
+        # yet the REAL composed gate now correctly falls through to cold provision.
+        assert _ss.is_vm_alive(vm_id) is True
+        assert (
+            _warm_pin_still_honorable(
+                warm_expired=False,
+                breaker_suppressed=False,
+                vm_doomed=doomed,
+                vm_alive=_ss.is_vm_alive(vm_id),
+            )
+            is False
+        )
+    finally:
+        _ss.vm_last_heartbeat.clear()
+        _ss.vm_last_heartbeat.update(prior_hb)
+        _vml._orchestrator_deleted_vms.pop(vm_id, None)
+        if prior_doomed is not None:
+            _vml._orchestrator_deleted_vms[vm_id] = prior_doomed
+
+
+@pytest.mark.asyncio
+async def test_wi5_pinned_unclaimed_sibling_exists_query(db_session):
+    """WI-5 Part 2 (unit): the anti-re-pin guard query recognises exactly a
+    QUEUED (still-unclaimed) task pinned to the same source VM for the same PR,
+    and nothing else (different VM, different PR, different project, or an
+    already-claimed / IN_PROGRESS sibling)."""
+    from app.review_pipeline import _pinned_unclaimed_sibling_exists
+
+    project = Project(name="WI5 sibling-query", user_id="test-user-123")
+    other_project = Project(name="WI5 sibling-query other", user_id="test-user-123")
+    db_session.add_all([project, other_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(other_project)
+
+    vm_id = "agent-vm-wi5-sibling"
+    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    pinned = Task(
+        project_id=project.id,
+        title="Standing warm pin",
+        payloads=[{"type": "fix", "pr_number": 8100, "branch": "feat/x"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+        context={
+            "warm_target_vm_id": vm_id,
+            "warm_target_pr": "8100",
+            "warm_handoff_deadline": deadline,
+        },
+    )
+    db_session.add(pinned)
+    await db_session.commit()
+    await db_session.refresh(pinned)
+
+    # Exact match: same project, same VM, same PR, still QUEUED → sibling exists.
+    assert (
+        await _pinned_unclaimed_sibling_exists(
+            db_session, project_id=project.id, warm_target_vm_id=vm_id, pr_number=8100
+        )
+        is True
+    )
+    # Different target VM → no sibling.
+    assert (
+        await _pinned_unclaimed_sibling_exists(
+            db_session,
+            project_id=project.id,
+            warm_target_vm_id="agent-vm-elsewhere",
+            pr_number=8100,
+        )
+        is False
+    )
+    # Different PR → no sibling (distinct PR handoffs don't collide).
+    assert (
+        await _pinned_unclaimed_sibling_exists(
+            db_session, project_id=project.id, warm_target_vm_id=vm_id, pr_number=9999
+        )
+        is False
+    )
+    # Different project → no sibling.
+    assert (
+        await _pinned_unclaimed_sibling_exists(
+            db_session,
+            project_id=other_project.id,
+            warm_target_vm_id=vm_id,
+            pr_number=8100,
+        )
+        is False
+    )
+
+    # Once the pin is CLAIMED (leaves QUEUED), it is no longer an unclaimed
+    # sibling — a fresh pin for a genuinely new follow-on is then allowed.
+    pinned.status = TaskStatus.IN_PROGRESS
+    db_session.add(pinned)
+    await db_session.commit()
+    assert (
+        await _pinned_unclaimed_sibling_exists(
+            db_session, project_id=project.id, warm_target_vm_id=vm_id, pr_number=8100
+        )
+        is False
+    )
+
+
+@pytest.mark.asyncio
+async def test_wi5_spawn_refuses_pin_when_sibling_already_pinned(db_session, mocker):
+    """WI-5 Part 2 (integration): _spawn_pipeline_task refuses to mint a fresh
+    warm pin when an unclaimed sibling is already pinned to the same source VM
+    for the same PR — the new-row pin churn that made the handoff deadline
+    appear to "never expire" is suppressed with reason ``sibling_already_pinned``.
+    """
+    import app.shared_state as _shared_state
+    from app.shared_state import runtime_config as _runtime_config
+    from app.warm_backlog_reuse import get_spawn_pin_funnel_snapshot
+
+    mocker.patch(
+        "app.review_pipeline.broadcast_to_project", new_callable=mocker.AsyncMock
+    )
+
+    prior_warm_continuity = _runtime_config.get("warm_continuity_enabled")
+    prior_heartbeat = dict(_shared_state.vm_last_heartbeat)
+    try:
+        _runtime_config["warm_continuity_enabled"] = True
+
+        project = Project(name="WI5 anti-re-pin", user_id="test-user-123")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        source_vm_id = "agent-vm-wi5-repin"
+        source_task = Task(
+            project_id=project.id,
+            title="Create task that opened PR #8200",
+            payloads=[
+                {
+                    "type": "create",
+                    "pr_number": 8200,
+                    "branch": "feat/wi5-repin",
+                    "base_branch": "main",
+                    "prompt": "implement X",
+                }
+            ],
+            vm_instance_id=source_vm_id,
+            status=TaskStatus.IN_PROGRESS,
+            context={"scope": "small", "review_loop": {"iteration": 0}},
+        )
+        # A prior spawn already minted the standing pin: a QUEUED task pinned to
+        # the same source VM for the same PR. Put it on a DIFFERENT chain so the
+        # (chain-scoped) same-type dedup guard ignores it and control reaches the
+        # warm-pin decision block where the anti-re-pin guard runs.
+        deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+        standing_pin = Task(
+            project_id=project.id,
+            title="Standing warm pin for PR #8200",
+            payloads=[
+                {
+                    "type": "review",
+                    "pr_number": 8200,
+                    "branch": "feat/wi5-repin",
+                    "original_task_id": str(uuid.uuid4()),
+                }
+            ],
+            vm_instance_id=None,
+            status=TaskStatus.QUEUED,
+            context={
+                "warm_target_vm_id": source_vm_id,
+                "warm_target_pr": "8200",
+                "warm_handoff_deadline": deadline,
+            },
+        )
+        db_session.add_all([source_task, standing_pin])
+        await db_session.commit()
+        await db_session.refresh(source_task)
+        await db_session.refresh(standing_pin)
+
+        before = get_spawn_pin_funnel_snapshot()["skipped_by_reason"].get(
+            "sibling_already_pinned", 0
+        )
+
+        spawned, was_created = await _spawn_pipeline_task(
+            source_task,
+            "review",
+            db_session,
+            pr_number=8200,
+            branch="feat/wi5-repin",
+            base_branch="main",
+        )
+        assert was_created is True and spawned is not None
+
+        # The pin was REFUSED: no warm_target_vm_id on the new row (it will cold
+        # provision instead of orbiting the doomed source VM).
+        ctx = spawned.context or {}
+        assert ctx.get("warm_target_vm_id") is None
+
+        # And the refusal is attributed to the anti-re-pin guard in the funnel.
+        after = get_spawn_pin_funnel_snapshot()["skipped_by_reason"].get(
+            "sibling_already_pinned", 0
+        )
+        assert after == before + 1
+    finally:
+        if prior_warm_continuity is None:
+            _runtime_config.pop("warm_continuity_enabled", None)
+        else:
+            _runtime_config["warm_continuity_enabled"] = prior_warm_continuity
+        _shared_state.vm_last_heartbeat.clear()
+        _shared_state.vm_last_heartbeat.update(prior_heartbeat)
+
+
 @pytest.mark.asyncio
 async def test_warm_vm_next_role_chain_continuity_blocked_when_paused(
     client: AsyncClient, db_session, mocker
