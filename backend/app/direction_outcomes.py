@@ -1098,7 +1098,10 @@ async def _update_direction_research_outcomes(
     # smearing sibling merges, costs, and counts across unrelated directions. Legacy
     # single-direction cycles (no child has direction_id set) keep all children so
     # existing history entries are unaffected.
-    if any((ct.context or {}).get("direction_id") for ct in child_tasks_rows):
+    has_tagged_children = any(
+        (ct.context or {}).get("direction_id") for ct in child_tasks_rows
+    )
+    if has_tagged_children:
         child_tasks_rows = [
             ct
             for ct in child_tasks_rows
@@ -1386,18 +1389,34 @@ async def _update_direction_research_outcomes(
     entry["preventive_context_tasks_failed"] = sum(
         1 for ct in _prev_rows if _counts_as_failure(ct)
     )
-    challenged_children = [
-        ct
-        for ct in child_tasks_rows
-        if (ct.context or {}).get("research_spawn_gate_challenged") is True
-        and (ct.context or {}).get("direction_id") == direction_id
-    ]
-    unchallenged_children = [
-        ct
-        for ct in child_tasks_rows
-        if not (ct.context or {}).get("research_spawn_gate_challenged")
-        and (ct.context or {}).get("direction_id") == direction_id
-    ]
+    # Spawn-gate metrics: filter by direction_id only if children are tagged
+    # (new multi-direction mode). In legacy mode (untagged children), all
+    # children in child_tasks_rows already match this direction, so skip the
+    # redundant filter that would exclude all untagged children.
+    if has_tagged_children:
+        challenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if (ct.context or {}).get("research_spawn_gate_challenged") is True
+            and (ct.context or {}).get("direction_id") == direction_id
+        ]
+        unchallenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if not (ct.context or {}).get("research_spawn_gate_challenged")
+            and (ct.context or {}).get("direction_id") == direction_id
+        ]
+    else:
+        challenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if (ct.context or {}).get("research_spawn_gate_challenged") is True
+        ]
+        unchallenged_children = [
+            ct
+            for ct in child_tasks_rows
+            if not (ct.context or {}).get("research_spawn_gate_challenged")
+        ]
     challenged_spawned = len(challenged_children)
     unchallenged_spawned = len(unchallenged_children)
     challenged_merged = sum(1 for ct in challenged_children if is_merged_completion(ct))

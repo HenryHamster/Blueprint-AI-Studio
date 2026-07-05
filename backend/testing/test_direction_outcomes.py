@@ -7124,6 +7124,101 @@ async def test_multi_direction_cycle_legacy_fallback(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_spawn_gate_metrics_preserved_for_untagged_cycles(
+    db_session: AsyncSession,
+):
+    """Spawn-gate challenged/unchallenged metrics are preserved for legacy untagged cycles.
+
+    When children carry no direction_id context key (legacy cycles), the direction-scoped
+    filtering keeps all children in child_tasks_rows. The spawn-gate metrics computation
+    must NOT apply a redundant direction_id filter that would exclude all untagged children
+    and zero out the challenged_spawned/merged and unchallenged_spawned/merged counts.
+    This is the critical fix for the bug where retroactive recomputes overwrote
+    previously-correct spawn-gate values with zeros.
+    """
+    direction_id = "d-sg-legacy"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    research_task.context = {
+        "research_spawn_gate_challenged_count": 3,
+        "research_spawn_gate_refuted_count": 1,
+        "research_spawn_gate_survived_count": 2,
+    }
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # Legacy children: NO direction_id in context, but DO carry spawn-gate challenge info
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-merged",
+        context={
+            "research_spawn_gate_challenged": True,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-not-merged",
+        context={
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-merged",
+        context={
+            "research_spawn_gate_challenged": False,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Parent metrics must be preserved
+    assert entry["research_spawn_gate_challenged_count"] == 3
+    assert entry["research_spawn_gate_refuted_count"] == 1
+    assert entry["research_spawn_gate_survived_count"] == 2
+
+    # The critical fix: spawn-gate sub-metrics must NOT be zero for untagged cycles
+    # With the bug, both would be 0 (empty lists) because the filter
+    # (ct.context or {}).get("direction_id") == direction_id would fail for all untagged children.
+    # With the fix, they correctly reflect all children that passed/failed the challenge filter.
+    assert entry["research_spawn_gate_challenged_spawned"] == 2
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 0.5
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1
+    assert entry["research_spawn_gate_unchallenged_merged"] == 1
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_skips_ineligible_task_types(db_session: AsyncSession):
     """scope_breakdown excludes web_research, design, and compute_experiment children.
 
