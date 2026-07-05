@@ -17978,3 +17978,85 @@ def test_droppable_section_degrades_not_drops_under_budget(section):
     )
     # The retained value is strictly smaller than the original.
     assert _ser_size(packed[section]) < _ser_size(fixtures[section])
+
+
+# ── Reconciliation sections fixture contract ──────────────────────────────────
+
+
+class TestReconciliationSectionsContract:
+    """Pin the list-class keys of cycle_start_reconciliation to a fixture so
+    that adding a backend key without updating the agent renderer fails CI.
+
+    The fixture (backend/testing/__fixtures__/reconciliation_sections.json) is
+    the single source of truth.  These tests verify the backend side; the agent
+    side is covered in agent/src/handlers/strategic-sections.test.ts.
+    """
+
+    def _load_fixture(self) -> dict:
+        from pathlib import Path
+
+        fixture_path = (
+            Path(__file__).parent / "__fixtures__" / "reconciliation_sections.json"
+        )
+        with open(fixture_path) as f:
+            return json.load(f)
+
+    def _minimal_recon_output(self) -> dict:
+        """Return a non-None _build_cycle_start_reconciliation result."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        # An active direction with no gap_id is always ungrounded → non-empty
+        # conflict list → function returns a dict (not None).
+        direction_stats = [
+            {"id": "d-contract-test", "status": "active", "text": "contract test"}
+        ]
+        out = _build_cycle_start_reconciliation(direction_stats, {}, {})
+        assert out is not None, (
+            "_build_cycle_start_reconciliation returned None for minimal data — "
+            "the early-return guard may have changed; update this helper."
+        )
+        return out
+
+    def test_fixture_schema_version_and_list_keys(self):
+        fixture = self._load_fixture()
+        assert fixture["schema_version"] == 1
+        assert isinstance(fixture["list_keys"], list)
+        assert len(fixture["list_keys"]) > 0
+
+    def test_backend_output_contains_all_fixture_list_keys(self):
+        """Every fixture key must appear as a list in the backend output.
+
+        Fails when the fixture adds a key that _build_cycle_start_reconciliation
+        does not yet emit — update the backend function or remove the key.
+        """
+        fixture = self._load_fixture()
+        expected_keys = set(fixture["list_keys"])
+        out = self._minimal_recon_output()
+
+        actual_list_keys = {k for k, v in out.items() if isinstance(v, list)}
+        missing = expected_keys - actual_list_keys
+        assert not missing, (
+            f"Keys in reconciliation_sections fixture but absent from "
+            f"_build_cycle_start_reconciliation output: {sorted(missing)}. "
+            f"Add them to the backend function or remove them from the fixture."
+        )
+
+    def test_fixture_covers_all_backend_list_keys(self):
+        """Every list key the backend emits must be declared in the fixture.
+
+        Fails when _build_cycle_start_reconciliation adds a new list key without
+        updating backend/testing/__fixtures__/reconciliation_sections.json — the
+        CI guard that catches the compute-but-never-render drift class.
+        """
+        fixture = self._load_fixture()
+        expected_keys = set(fixture["list_keys"])
+        out = self._minimal_recon_output()
+
+        actual_list_keys = {k for k, v in out.items() if isinstance(v, list)}
+        extra = actual_list_keys - expected_keys
+        assert not extra, (
+            f"_build_cycle_start_reconciliation emits list keys not declared in "
+            f"the reconciliation_sections fixture: {sorted(extra)}. "
+            f"Add them to backend/testing/__fixtures__/reconciliation_sections.json "
+            f"AND add a renderer in agent/src/handlers/strategic-sections.ts."
+        )

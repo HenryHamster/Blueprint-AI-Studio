@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   fmtScalar,
   buildSystemMaturitySection,
@@ -2240,5 +2243,119 @@ describe('buildCompletionDebtSection', () => {
   it('includes advisory footer', () => {
     const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', description: 'x', age_days: 0 }], total_open: 1 });
     expect(result).toContain('Address open completion debt');
+  });
+});
+
+// ── Reconciliation sections fixture contract (agent render coverage) ──────────
+
+const RECON_FIXTURE_RELATIVE = 'backend/testing/__fixtures__/reconciliation_sections.json';
+
+function loadReconSectionsFixture(): { schema_version: number; list_keys: string[] } {
+  const candidates = [
+    import.meta.url.startsWith('file:')
+      ? resolve(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', RECON_FIXTURE_RELATIVE)
+      : null,
+    resolve(process.cwd(), '..', RECON_FIXTURE_RELATIVE),
+    resolve(process.cwd(), RECON_FIXTURE_RELATIVE),
+  ].filter((p): p is string => Boolean(p));
+  const fixturePath = candidates.find(c => existsSync(c));
+  if (!fixturePath) {
+    throw new Error(`Missing reconciliation_sections fixture. Checked: ${candidates.join(', ')}`);
+  }
+  return JSON.parse(readFileSync(fixturePath, 'utf-8')) as { schema_version: number; list_keys: string[] };
+}
+
+// A recognisable marker embedded in each minimal item so we can assert the
+// renderer actually outputs it (rather than silently ignoring the key).
+const CANARY = 'recon-contract-canary-marker';
+
+// One minimal item per fixture list key, structured so the renderer's
+// conditional guard fires and the CANARY string appears in the output.
+const MINIMAL_ITEMS: Partial<Record<string, unknown[]>> = {
+  capability_contradictions: [
+    { name: CANARY, stored_status: 'working', effective_status: 'absent', missing: [] },
+  ],
+  orphaned_gaps: [
+    { gap_id: 'g-1', name: CANARY, priority: 'high' },
+  ],
+  staffed_but_deferred: [
+    { name: CANARY, priority: 'high', gap_id: 'g-1', status: 'active' },
+  ],
+  ungrounded_directions: [
+    { direction_id: 'd-1', text: CANARY, reason: 'no_gap' },
+  ],
+  stale_active_moves: [
+    { gap_name: CANARY, gap_id: 'g-1', stale_direction_ids: ['d-stale'] },
+  ],
+  direction_pipeline: [
+    { direction_id: 'd-1', text: CANARY, state: 'research_waiting_on_action', findings: 1 },
+  ],
+  merge_accounting: [
+    {
+      direction_id: 'd-1',
+      direction_text: CANARY,
+      not_landed: 1,
+      landed: 0,
+      unverifiable: 0,
+      not_landed_titles: ['pr-ghost'],
+    },
+  ],
+  pending_in_open_rollup: [
+    {
+      direction_id: 'd-1',
+      direction_text: CANARY,
+      pending_in_open_rollup: 1,
+      pending_in_open_rollup_titles: ['pr-pending'],
+    },
+  ],
+  phantom_direction_refs: [
+    { direction_id: CANARY, cited_in: 'intent' },
+  ],
+  qualification_prose_drift: [
+    { stale_sha: 'deadbeef', active_candidate_sha: '11223344', cited_in: CANARY },
+  ],
+  qualification_surface_conflicts: [
+    { conflict_type: 'canary_type', description: CANARY },
+  ],
+};
+
+describe('reconciliation_sections fixture contract (agent render coverage)', () => {
+  it('fixture has schema_version 1 and a non-empty list_keys array', () => {
+    const fixture = loadReconSectionsFixture();
+    expect(fixture.schema_version).toBe(1);
+    expect(Array.isArray(fixture.list_keys)).toBe(true);
+    expect(fixture.list_keys.length).toBeGreaterThan(0);
+  });
+
+  it('MINIMAL_ITEMS covers every fixture list key', () => {
+    const fixture = loadReconSectionsFixture();
+    const uncovered = fixture.list_keys.filter(k => !(k in MINIMAL_ITEMS));
+    expect(
+      uncovered,
+      `Test gap: add a MINIMAL_ITEMS entry for each new fixture key so the render check can run: ${uncovered.join(', ')}`,
+    ).toEqual([]);
+  });
+
+  it('buildCycleStartReconciliationSection renders every fixture list key when populated', () => {
+    const fixture = loadReconSectionsFixture();
+    const missingRenderers: string[] = [];
+
+    for (const key of fixture.list_keys) {
+      const items = MINIMAL_ITEMS[key];
+      if (!items) continue; // covered by the previous test
+      const recon: Record<string, unknown> = { [key]: items, counts: {} };
+      const output = buildCycleStartReconciliationSection(recon);
+      if (!output.includes(CANARY)) {
+        missingRenderers.push(key);
+      }
+    }
+
+    expect(
+      missingRenderers,
+      `These list keys are declared in the reconciliation_sections fixture but ` +
+      `buildCycleStartReconciliationSection does not render them. ` +
+      `Add a renderer in agent/src/handlers/strategic-sections.ts: ` +
+      missingRenderers.join(', '),
+    ).toEqual([]);
   });
 });
