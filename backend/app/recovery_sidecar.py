@@ -9,9 +9,11 @@ resolving unchanged.
 """
 
 import logging
+import uuid
 
 from sqlalchemy import func
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app import services
@@ -30,6 +32,82 @@ _AWAITING_SIDECAR_KEYS = (
 )
 _SIDECAR_VERDICT_APPLICATION_PENDING_KEY = "sidecar_verdict_application_pending"
 _SIDECAR_SWEEP_MAX_PER_CYCLE = 50
+
+
+async def _clear_stranded_pending_marker(
+    session, *, source_id: str, sidecar_id: str
+) -> bool:
+    """Authoritatively clear a source's application-pending marker after resolution.
+
+    Called after ``trigger_stranded_sidecar_resolution`` returns *without
+    raising*. When the resolver terminally concludes "nothing left to apply" —
+    the second-opinion challenge was already resolved / this is a replayed
+    terminal status, or the resolver's own view of the source (derived from the
+    sidecar's SOURCE_KEY) diverged from the sweep-selected one — it returns
+    normally but does NOT clear the durable
+    ``_SIDECAR_VERDICT_APPLICATION_PENDING_KEY`` marker on THIS (sweep-selected)
+    source.  Without this the sweep re-selects, re-logs
+    (``… has unapplied side-car verdict … — retrying application``), and
+    re-counts the same ~handful of sources on every ~2-min cycle forever — the
+    dominant orchestrator log-volume wedge.
+
+    Re-reads the row FRESH by its plain-string id rather than trusting the
+    sweep's in-memory ``source``: the resolver ran on this same session and has
+    committed (and, on its best-effort sub-op paths, may have rolled back), and
+    ``session.rollback()`` expires every ORM instance even under
+    ``expire_on_commit=False`` — a stale ``source.context`` read would fire a
+    sync expired-load inside the async session and raise MissingGreenlet.
+
+    Only clears when the marker still references the SAME sidecar we just
+    processed; a marker that now points at a freshly-spawned challenger is a
+    legitimately-pending application and is left untouched.  Never raises — a
+    cleanup failure self-heals on the next sweep.
+
+    Returns True iff a stale marker was cleared.
+    """
+    try:
+        source_uuid = uuid.UUID(source_id)
+    except (ValueError, TypeError):
+        return False
+    try:
+        refreshed = (
+            (
+                await session.execute(
+                    select(Task)
+                    .options(load_only(Task.id, Task.context, raiseload=True))
+                    .where(Task.id == source_uuid)
+                    .with_for_update()
+                )
+            )
+            .scalars()
+            .first()
+        )
+        if refreshed is None:
+            return False
+        ctx = dict(refreshed.context or {})
+        marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
+        if not isinstance(marker, dict) or marker.get("sidecar_task_id") != sidecar_id:
+            return False
+        ctx.pop(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY, None)
+        refreshed.context = ctx
+        flag_modified(refreshed, "context")
+        session.add(refreshed)
+        await session.commit()
+        return True
+    except Exception:
+        logger.debug(
+            "[SIDECAR-RECOVERY] pending-marker cleanup failed for source %s",
+            source_id,
+            exc_info=True,
+        )
+        try:
+            await session.rollback()
+        except Exception:
+            logger.debug(
+                "[SIDECAR-RECOVERY] pending-marker cleanup rollback failed",
+                exc_info=True,
+            )
+        return False
 
 
 async def _sweep_stranded_sidecar_sources() -> None:
@@ -189,6 +267,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 }
 
             retried = 0
+            cleared = 0
             for source in terminal_sources:
                 ctx = source.context or {}
                 marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
@@ -241,10 +320,31 @@ async def _sweep_stranded_sidecar_sources() -> None:
                             "[SIDECAR-RECOVERY] post-failure rollback failed",
                             exc_info=True,
                         )
+                    # Resolver raised — the verdict is genuinely unapplied; keep
+                    # the marker so a later sweep retries. Do NOT clear here.
+                    continue
+                # Resolver returned WITHOUT raising: it either applied the verdict
+                # (and cleared the marker itself) or terminally concluded there is
+                # nothing left to apply (already-resolved / replayed-terminal /
+                # source diverged) and left the marker set. Authoritatively clear
+                # the sweep-selected source's marker in the latter case so it is
+                # never re-stranded and re-logged forever.
+                if await _clear_stranded_pending_marker(
+                    session,
+                    source_id=_source_id_str,
+                    sidecar_id=_sidecar_id_str,
+                ):
+                    cleared += 1
             if retried:
                 logger.info(
                     "[SIDECAR-RECOVERY] Retried %d unapplied side-car verdict(s)",
                     retried,
+                )
+            if cleared:
+                logger.info(
+                    "[SIDECAR-RECOVERY] Cleared %d stale application-pending "
+                    "marker(s) the resolver left set on already-resolved sources",
+                    cleared,
                 )
     except Exception:
         logger.exception("[SIDECAR-RECOVERY] Stranded-sidecar sweep failed")
