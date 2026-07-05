@@ -897,6 +897,33 @@ export async function apiRequest(
         await new Promise(r => setTimeout(r, delayMs));
         continue;
       }
+      // 503 (or a 403 carrying a Retry-After): temporary upstream unavailability
+      // — e.g. the create-PR endpoint refusing with 503 + Retry-After while the
+      // shared GitHub install-token quota is drained (it cannot confirm no
+      // duplicate PR). Back off honoring Retry-After when present, else
+      // exponential, capped like the 429 path. A 403 is retried here ONLY when
+      // it carries a Retry-After, so genuine auth/permission 403s (no such
+      // header) still fail fast via the 4xx bail-out below.
+      //
+      // Note: this path clamps Retry-After to API_RETRY_BACKOFF_MAX_MS (30s),
+      // intentionally TIGHTER than the backend's advertised ceiling (up to 120s)
+      // and the ./pr shell loop's 120s honor cap. This is a Node fetch retry with
+      // a bounded per-request budget (not the synchronous ./pr step), so a short
+      // cap keeps it responsive and simply re-polls sooner; the backend still
+      // won't create until the quota returns, so an earlier retry is harmless.
+      const retryAfterHeader = res.headers?.get('Retry-After') ?? null;
+      if (res.status === 503 || (res.status === 403 && retryAfterHeader !== null)) {
+        if (attempt === retries - 1) {
+          throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
+        }
+        const retryAfterSec = retryAfterHeader !== null ? parseInt(retryAfterHeader, 10) : NaN;
+        const delayMs = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.max(1000, Math.min(retryAfterSec * 1000, API_RETRY_BACKOFF_MAX_MS))
+          : Math.min(1000 * Math.pow(2, attempt) + Math.random() * 1000, API_RETRY_BACKOFF_MAX_MS);
+        log(`${method} ${path} got ${res.status} (temporary/upstream-unavailable), retrying in ${delayMs}ms`);
+        await new Promise(r => setTimeout(r, delayMs));
+        continue;
+      }
       // Other 4xx errors are not transient — fail immediately
       if (res.status < 500) {
         throw new Error(`${method} ${path} failed (${res.status}): ${text}`);

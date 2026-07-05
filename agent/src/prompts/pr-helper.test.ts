@@ -425,6 +425,81 @@ esac
     expect(result.stderr).not.toContain('Suspicious shell-artifact file(s)');
     expect(result.stdout).toContain('mergeable=false, mergeable_state=dirty');
   });
+
+  it('retries PR creation on a 503 and honors Retry-After, then succeeds', async () => {
+    const script = writeScript({
+      taskId: 'task-retry-1',
+      workBranch: 'blueprint/task-retry-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    // Cross-process handoff files live at absolute /tmp paths (survive the temp
+    // dir cleanup). Start clean so the attempt counter is authoritative.
+    realFs.rmSync('/tmp/pr_attempts_task-retry-1', { force: true });
+    realFs.rmSync('/tmp/pr_url_task-retry-1', { force: true });
+
+    const result = await runScript(script, ['open', '--title', 'title', '--body', 'body'], (dir, rfs) => {
+      const bin = `${dir}/bin`;
+      rfs.mkdirSync(bin, { recursive: true });
+      rfs.writeFileSync(`${dir}/check`, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/git`, `#!/bin/sh
+case "$*" in
+  *"rev-parse --verify origin/main"*) exit 0 ;;
+  *"diff --name-only origin/main...HEAD"*) exit 0 ;;
+  *"diff --name-only --cached"*) exit 0 ;;
+  *"diff --name-only"*) exit 0 ;;
+  *"ls-files --others --exclude-standard"*) exit 0 ;;
+  *"status --porcelain"*) printf '%s\\n' '?? src/normal.txt'; exit 0 ;;
+  *"rev-list --count origin/main..HEAD"*) printf '1\\n'; exit 0 ;;
+  *"remote set-url origin"*) exit 0 ;;
+  *"push --force-with-lease origin blueprint/task-retry-1"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      // curl mock: return 503 + Retry-After on the FIRST create POST, then 201.
+      // A per-task counter file (absolute /tmp path) tracks attempts across the
+      // fresh process spawned for each curl call.
+      rfs.writeFileSync(`${bin}/curl`, `#!/bin/sh
+ARGS="$*"
+OUT=""
+DUMP=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -o) OUT="$2"; shift 2 ;;
+    -D) DUMP="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+case "$ARGS" in
+  *"/api/agent/github/token?task_id=task-retry-1"*) printf '{"data":{"token":"token-abc"}}'; exit 0 ;;
+  *"/api/agent/github/pull-requests"*)
+    N=$(cat /tmp/pr_attempts_task-retry-1 2>/dev/null || echo 0)
+    N=$((N + 1)); echo "$N" > /tmp/pr_attempts_task-retry-1
+    if [ "$N" -lt 2 ]; then
+      [ -n "$DUMP" ] && printf 'HTTP/1.1 503 Service Unavailable\\r\\nRetry-After: 1\\r\\n\\r\\n' > "$DUMP"
+      [ -n "$OUT" ] && printf '{"error":{"code":503}}' > "$OUT"
+      printf '503'; exit 0
+    fi
+    [ -n "$OUT" ] && printf '{"data":{"html_url":"https://github.com/acme/repo/pull/7"}}' > "$OUT"
+    printf '201'; exit 0 ;;
+  *"/pulls/7"*) printf '{"mergeable":true,"mergeable_state":"clean"}'; exit 0 ;;
+  *) exit 0 ;;
+esac
+`, { mode: 0o755 });
+      rfs.writeFileSync(`${bin}/jq`, '#!/bin/sh\ncase "$*" in\n  *".data.token"*) printf \'token-abc\\n\' ;;\n  *".data.html_url"*) printf \'https://github.com/acme/repo/pull/7\\n\' ;;\n  *".mergeable_state"*) printf \'clean\\n\' ;;\n  *".mergeable // \\"null\\""*) printf \'true\\n\' ;;\n  *) printf \'{}\\n\' ;;\nesac\n', { mode: 0o755 });
+    });
+
+    expect(result.status).toBe(0);
+    // Exactly two POSTs: the 503 (retried) and the 201 (success).
+    expect(realFs.readFileSync('/tmp/pr_attempts_task-retry-1', 'utf8').trim()).toBe('2');
+    expect(realFs.readFileSync('/tmp/pr_url_task-retry-1', 'utf8').trim()).toBe('https://github.com/acme/repo/pull/7');
+    realFs.rmSync('/tmp/pr_attempts_task-retry-1', { force: true });
+    realFs.rmSync('/tmp/pr_url_task-retry-1', { force: true });
+  });
 });
 
 // Static content checks (no bash execution — these run on every platform,
@@ -485,5 +560,31 @@ describe('writePrHelper — generated script content', () => {
       "sed '/<!-- blueprint:screenshots -->/,/<!-- \\/blueprint:screenshots -->/d'",
     );
     expect(script).toContain('BODY=$(printf \'%s\\n\\n%s\' "$BODY" "$SHOTS_SECTION")');
+  });
+
+  // Assert the generated ./pr script emits the fail-closed-aware create-PR
+  // backoff — honoring Retry-After, exponential backoff with a cap, 503 treated
+  // as retryable, and the old tight linear loop removed.
+  it('emits Retry-After-aware, capped exponential create-PR backoff (503 retryable)', () => {
+    writePrHelper({
+      taskId: 'task-backoff-1',
+      workBranch: 'blueprint/task-backoff-1',
+      baseBranch: 'main',
+      owner: 'acme',
+      repo: 'repo',
+      testsOnMainBranch: false,
+    });
+    const s = capturedScripts['/tmp/workspace/pr'];
+    expect(s).toBeDefined();
+    // Dumps response headers so a server Retry-After can be read.
+    expect(s).toContain('-D "$PR_HDR_FILE"');
+    expect(s).toContain("grep -i '^Retry-After:'");
+    // Exponential backoff (5,10,20,40s), capped at 120s.
+    expect(s).toContain('BACKOFF=$((5 * (1 << (attempt - 1))))');
+    expect(s).toContain('[ "$BACKOFF" -gt 120 ] && BACKOFF=120');
+    // 503 (and any 5xx) plus 429/000/401/403 are retryable; other 4xx are not.
+    expect(s).toContain('401|403|429|000|5[0-9][0-9]');
+    // The old tight linear backoff (~3-9s) is gone.
+    expect(s).not.toContain('BACKOFF=$((attempt * 3))');
   });
 });

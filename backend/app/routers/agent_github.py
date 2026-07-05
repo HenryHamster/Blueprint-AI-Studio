@@ -328,6 +328,12 @@ async def agent_github_create_pr(
             await session.delete(existing_artifact)
             await session.flush()
 
+    # create_pull_request is FAIL-CLOSED under GitHub rate-limit exhaustion: when
+    # it cannot confirm whether an open PR already exists, it raises
+    # HTTPException(503, headers={"Retry-After": ...}) instead of POSTing (which
+    # would create a duplicate PR once the quota window resets). That 503 +
+    # Retry-After propagates through the app HTTPException handler unchanged, so
+    # the agent's create-PR backoff loop respects it rather than seeing a 500.
     result = await create_pull_request(
         token=gh_token,
         owner=owner,

@@ -6780,6 +6780,73 @@ describe('apiRequest body-read timeout', () => {
   });
 });
 
+describe('apiRequest 503 / Retry-After backoff (create-PR fail-closed contract)', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('retries a 503 honoring Retry-After, then returns the success body', async () => {
+    vi.useFakeTimers();
+    let calls = 0;
+    const fetchMock = makeFetchMock().mockImplementation(() => {
+      calls += 1;
+      if (calls === 1) {
+        // The backend returns 503 + Retry-After when it refuses to create a PR
+        // because it cannot confirm no-duplicate while the GitHub quota is drained.
+        // Retry-After is 10s — deliberately LARGER than the exponential fallback
+        // (< 2s on the first retry) so the two-phase advance below can prove the
+        // header is honored rather than the exponential window.
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          text: () => Promise.resolve('{"error":{"message":"rate-limited"}}'),
+          json: () => Promise.resolve({}),
+          headers: { get: (h: string) => (h === 'Retry-After' ? '10' : null) },
+        });
+      }
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        json: () => Promise.resolve({ status: 'success', data: { html_url: 'u' } }),
+        text: () => Promise.resolve(''),
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    // timeout=30s so the per-attempt abort timer never fires during the 10s wait.
+    const p = apiPost('/api/agent/github/pull-requests', {}, 3, 30_000);
+    // After 2.1s the retry must NOT have fired: the exponential fallback would
+    // have (< 2s), so a still-pending retry proves the 10s Retry-After is honored.
+    await vi.advanceTimersByTimeAsync(2_100);
+    expect(calls).toBe(1);
+    // Advance past the 10s Retry-After — now the retry fires and succeeds.
+    await vi.advanceTimersByTimeAsync(8_000);
+    await expect(p).resolves.toEqual({ status: 'success', data: { html_url: 'u' } });
+    expect(calls).toBe(2);
+  });
+
+  it('does NOT retry a 403 without a Retry-After header (fails fast)', async () => {
+    let calls = 0;
+    const fetchMock = makeFetchMock().mockImplementation(() => {
+      calls += 1;
+      return Promise.resolve({
+        ok: false,
+        status: 403,
+        text: () => Promise.resolve('Forbidden'),
+        json: () => Promise.resolve({}),
+        headers: { get: () => null },
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      apiPost('/api/agent/github/pull-requests', {}, 3, 5_000),
+    ).rejects.toThrow(/failed \(403\)/);
+    expect(calls).toBe(1);
+  });
+});
+
 describe('agent runtime fingerprint heartbeats', () => {
   let fetchMock: FetchMock;
   const runtimeFingerprint = 'a'.repeat(64);

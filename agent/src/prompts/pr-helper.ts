@@ -428,32 +428,54 @@ PR_PAYLOAD=$(jq -n --arg tid "$TASK" --arg owner "${cfg.owner}" --arg repo "${cf
   '{task_id: $tid, owner: $owner, repo: $repo, title: $title, head: $head, base: $base, body: $body}')
 PR_RESP=""
 PR_OK=0
+PR_HDR_FILE=/tmp/pr_create_hdrs_${cfg.taskId}
 for attempt in 1 2 3 4 5; do
-  PR_HTTP=$(printf '%s' "$PR_PAYLOAD" | curl -sS -o /tmp/pr_create_resp_${cfg.taskId} -w '%{http_code}' --max-time 90 \\
+  : > "$PR_HDR_FILE"
+  PR_HTTP=$(printf '%s' "$PR_PAYLOAD" | curl -sS -o /tmp/pr_create_resp_${cfg.taskId} -D "$PR_HDR_FILE" -w '%{http_code}' --max-time 90 \\
     -X POST "$API/api/agent/github/pull-requests" \\
     -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-) || PR_HTTP="000"
   if [ "$PR_HTTP" = "200" ] || [ "$PR_HTTP" = "201" ] || [ "$PR_HTTP" = "202" ]; then
     PR_RESP=$(cat /tmp/pr_create_resp_${cfg.taskId})
     PR_OK=1; break
   fi
-  if [ "$PR_HTTP" = "401" ] || [ "$PR_HTTP" = "403" ]; then
-    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — re-reading token and retrying..." >&2
-    _load_agent_token 2>/dev/null || true
-    sleep 2; continue
+  # Classify the status. RETRYABLE: 401/403 (maybe a stale agent token), 429
+  # (rate limited), 5xx (incl. 503 = the backend refusing to create because it
+  # could not confirm no-duplicate while the GitHub quota is drained), and 000
+  # (curl transport/timeout). Anything else (400/404/409/422 ...) is permanent.
+  case "$PR_HTTP" in
+    401|403|429|000|5[0-9][0-9]) : ;;
+    *)
+      echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP (permanent failure):" >&2
+      cat /tmp/pr_create_resp_${cfg.taskId} >&2
+      rm -f /tmp/pr_create_resp_${cfg.taskId} "$PR_HDR_FILE"
+      exit 1 ;;
+  esac
+  # A 401/403 can be a stale agent token — re-read it before backing off.
+  case "$PR_HTTP" in
+    401|403) _load_agent_token 2>/dev/null || true ;;
+  esac
+  if [ "$attempt" -ge 5 ]; then
+    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — no attempts left" >&2
+    cat /tmp/pr_create_resp_${cfg.taskId} >&2
+    break
   fi
-  if [ "$PR_HTTP" = "429" ] || [ "\${PR_HTTP:0:1}" = "5" ] || [ "$PR_HTTP" = "000" ]; then
-    BACKOFF=$((attempt * 3))
-    echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — retrying in \${BACKOFF}s..." >&2
-    sleep "$BACKOFF"; continue
+  # Backoff: honor a server-sent Retry-After (seconds) when present — the backend
+  # returns 503 + Retry-After while the GitHub quota is drained. Cap it so a long
+  # reset window (up to ~1h) never blocks the VM past its reaper heartbeat budget.
+  # Otherwise exponential backoff (5,10,20,40s) — never the old tight ~3-9s loop.
+  RETRY_AFTER=$(grep -i '^Retry-After:' "$PR_HDR_FILE" 2>/dev/null | tail -1 | tr -cd '0-9')
+  if [ -n "$RETRY_AFTER" ] && [ "$RETRY_AFTER" -gt 0 ] 2>/dev/null; then
+    BACKOFF="$RETRY_AFTER"
+  else
+    BACKOFF=$((5 * (1 << (attempt - 1))))
   fi
-  echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP (permanent failure):" >&2
-  cat /tmp/pr_create_resp_${cfg.taskId} >&2
-  rm -f /tmp/pr_create_resp_${cfg.taskId}
-  exit 1
+  [ "$BACKOFF" -gt 120 ] && BACKOFF=120
+  echo "[pr] PR creation attempt $attempt got HTTP=$PR_HTTP — retrying in \${BACKOFF}s..." >&2
+  sleep "$BACKOFF"
 done
-rm -f /tmp/pr_create_resp_${cfg.taskId}
+rm -f /tmp/pr_create_resp_${cfg.taskId} "$PR_HDR_FILE"
 if [ "$PR_OK" = "0" ]; then
-  echo "[pr] PR creation failed after 5 retries — orchestrator unreachable" >&2
+  echo "[pr] PR creation failed after 5 retries — orchestrator/GitHub quota unavailable" >&2
   exit 1
 fi
 PR_URL=$(printf '%s' "$PR_RESP" | jq -r '.data.html_url // empty')

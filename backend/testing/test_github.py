@@ -4025,9 +4025,16 @@ async def test_create_pull_request_posts_when_no_existing_pr(mocker):
 
 
 @pytest.mark.asyncio
-async def test_create_pull_request_precheck_error_falls_through_to_post(mocker):
-    """A failing pre-check lookup must NOT block creation — it falls through to
-    the POST (best-effort idempotency)."""
+async def test_create_pull_request_precheck_error_refuses_post(mocker):
+    """FAIL-CLOSED (WI-3): a failing pre-check lookup is UNCERTAIN, not
+    "no existing PR". create_pull_request must REFUSE to POST (a POST here could
+    duplicate an existing PR once a drained GitHub quota resets) and raise a
+    retryable HTTP 503 + Retry-After instead of falling through to the POST.
+
+    This replaces the removed fail-open fall-through behavior; the fail-closed
+    contract is also covered end-to-end in
+    testing/test_github_pulls.py::test_create_pr_refuses_when_lookup_raises.
+    """
     from app.github import create_pull_request
 
     calls = []
@@ -4036,16 +4043,19 @@ async def test_create_pull_request_precheck_error_falls_through_to_post(mocker):
         calls.append(method)
         if method == "GET":
             raise RuntimeError("transient lookup failure")
-        return MockResponse(201, {"number": 555})
+        return MockResponse(201, {"number": 555})  # POST must never run
 
     mocker.patch("app.github._github_request", side_effect=fake_request)
 
-    result = await create_pull_request(
-        "tok", "owner", "repo", title="t", head="feature", base="main"
-    )
+    with pytest.raises(HTTPException) as exc_info:
+        await create_pull_request(
+            "tok", "owner", "repo", title="t", head="feature", base="main"
+        )
 
-    assert result["number"] == 555
-    assert calls == ["GET", "POST"]
+    assert exc_info.value.status_code == 503
+    assert (exc_info.value.headers or {}).get("Retry-After")
+    # Refused BEFORE any POST — only the pre-check GET happened.
+    assert calls == ["GET"]
 
 
 @pytest.mark.asyncio
