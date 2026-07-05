@@ -4831,3 +4831,248 @@ def test_apply_agent_update_gap_deletion_blocked_does_not_block_write():
     assert "g-protected" in diff["gaps_deletion_blocked"]
     surviving = [g["id"] for g in new_raw["gaps"]]
     assert "g-protected" in surviving
+
+
+# ---------------------------------------------------------------------------
+# Round-trip: operator intent.purpose preserved on both write paths
+#
+# Criterion c-8cdb5049: source=null corrupted shape full round-trip
+# Criterion c-543d4959: placeholder auto-restore from operator-owned user_purpose
+#
+# Both apply_agent_update (agent write path) and apply_user_intent_patch (user
+# write path) must handle corrupted shapes correctly. The existing tests for
+# apply_agent_update without baseline_raw are at lines 1575-1630; the tests
+# below extend coverage to (a) the 3-way-merge code path (baseline_raw
+# provided) and (b) the apply_user_intent_patch write path.
+# ---------------------------------------------------------------------------
+
+
+# --- apply_user_intent_patch path ---
+
+
+def test_apply_user_intent_patch_source_null_shape_restamps_source_and_user_purpose():
+    """c-8cdb5049 / apply_user_intent_patch path: when the current model holds the
+    corrupted shape (purpose="", source=null, user_purpose populated) and the
+    operator re-patches with a real intent, the write path correctly stamps
+    source=user_message and user_purpose — healing the corruption."""
+    corrupted = {
+        "revision": 5,
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    model = apply_user_intent_patch(
+        corrupted,
+        {"intent": {"purpose": "Make Blueprint handle any project well.", "current_focus": "v22"}},
+        "2026-07-05T00:00:00",
+    )
+    assert model.intent.purpose == "Make Blueprint handle any project well."
+    assert model.intent.source is not None
+    assert model.intent.source.type == "user_message"
+    assert model.intent.user_purpose == "Make Blueprint handle any project well.", (
+        "user_purpose must mirror the operator-set purpose after intent patch"
+    )
+    assert model.revision == 6
+    assert model.last_updated_by == "user"
+
+
+def test_apply_user_intent_patch_placeholder_shape_stamps_user_purpose():
+    """c-543d4959 / apply_user_intent_patch path: when the current model holds a
+    placeholder purpose and the operator re-patches, the user_purpose is set to
+    the real purpose so future agent cycles can self-heal from it."""
+    for placeholder in ("...", "<from analysis>", "<placeholder>", ""):
+        corrupted = {
+            "revision": 2,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        model = apply_user_intent_patch(
+            corrupted,
+            {"intent": {"purpose": "Real operator purpose.", "current_focus": ""}},
+            "2026-07-05T00:00:00",
+        )
+        assert model.intent.purpose == "Real operator purpose.", (
+            f"placeholder {placeholder!r} not replaced"
+        )
+        assert model.intent.source is not None
+        assert model.intent.source.type == "user_message"
+        assert model.intent.user_purpose == "Real operator purpose.", (
+            f"user_purpose not set after replacing placeholder {placeholder!r}"
+        )
+
+
+def test_apply_user_intent_patch_context_only_preserves_user_purpose_on_corrupted_model():
+    """c-8cdb5049 / apply_user_intent_patch path: a context-only patch on a
+    source=null, blank-purpose corrupted model carries user_purpose forward so a
+    subsequent apply_agent_update can heal from it — full round-trip."""
+    corrupted = {
+        "revision": 5,
+        "intent": {
+            "purpose": "",
+            "source": None,
+            "user_purpose": "Operator real purpose.",
+        },
+    }
+    # User only patches context (no intent in patch).
+    patched = apply_user_intent_patch(
+        corrupted,
+        {"context": {"project_type": "startup"}},
+        "2026-07-05T00:00:00",
+    )
+    # user_purpose must survive the context-only patch.
+    assert patched.intent.user_purpose == "Operator real purpose.", (
+        "user_purpose must be preserved on a non-intent patch over a corrupted model"
+    )
+    assert patched.context.project_type == "startup"
+    assert patched.intent.purpose == ""  # still blank — user did not fix it
+
+    # apply_agent_update then heals from user_purpose regardless of source=null.
+    new_raw, _ = apply_agent_update(
+        patched.model_dump(),
+        {"intent": {"purpose": "", "current_focus": "new focus"}},
+        "2026-07-05T01:00:00",
+    )
+    assert new_raw["intent"]["purpose"] == "Operator real purpose.", (
+        "intent.purpose must be restored from user_purpose after context-only "
+        "apply_user_intent_patch preserves user_purpose across the corrupted model"
+    )
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    assert new_raw["intent"]["current_focus"] == "new focus"
+
+
+# --- apply_agent_update path WITH baseline_raw (3-way merge code path) ---
+
+
+def test_apply_agent_update_heals_source_null_on_3way_merge_path():
+    """c-8cdb5049 / apply_agent_update with baseline_raw: source=null + blank
+    purpose + user_purpose populated — the user_purpose fallback in
+    _preserve_operator_intent fires on the 3-way-merge code path just as it does
+    on the legacy path (baseline_raw=None)."""
+    current = {
+        "revision": 3,
+        "last_updated_by": "agent",
+        "intent": {
+            "purpose": "",
+            "current_focus": "some focus",
+            "source": None,
+            "user_purpose": "Make Blueprint handle any project well.",
+        },
+    }
+    baseline = {
+        "revision": 2,
+        "intent": {
+            "purpose": "Make Blueprint handle any project well.",
+            "source": {"type": "user_message", "message_id": "m-seed"},
+        },
+    }
+    proposed = {"intent": {"purpose": "", "current_focus": "next focus"}}
+    new_raw, _ = apply_agent_update(
+        current, proposed, "2026-07-05T00:00:00", baseline_raw=baseline
+    )
+    assert new_raw["intent"]["purpose"] == "Make Blueprint handle any project well.", (
+        "intent.purpose must be restored from user_purpose even on the 3-way-merge path"
+    )
+    assert new_raw["intent"]["source"]["type"] == "user_message"
+    # agent-owned current_focus still advances
+    assert new_raw["intent"]["current_focus"] == "next focus"
+    assert new_raw["intent"]["user_purpose"] == "Make Blueprint handle any project well."
+
+
+def test_apply_agent_update_heals_placeholder_on_3way_merge_path():
+    """c-543d4959 / apply_agent_update with baseline_raw: placeholder purpose +
+    user_purpose — the user_purpose fallback fires on the 3-way-merge path."""
+    for placeholder in ("...", "<from analysis>", ""):
+        current = {
+            "revision": 1,
+            "intent": {
+                "purpose": placeholder,
+                "source": None,
+                "user_purpose": "Real operator purpose.",
+            },
+        }
+        baseline = {
+            "revision": 0,
+            "intent": {
+                "purpose": "Real operator purpose.",
+                "source": {"type": "user_message"},
+            },
+        }
+        proposed = {"intent": {"purpose": placeholder, "current_focus": "next"}}
+        new_raw, _ = apply_agent_update(
+            current, proposed, "2026-07-05T00:00:00", baseline_raw=baseline
+        )
+        assert new_raw["intent"]["purpose"] == "Real operator purpose.", (
+            f"placeholder {placeholder!r} not healed from user_purpose on 3-way-merge path"
+        )
+        assert new_raw["intent"]["source"]["type"] == "user_message"
+        assert new_raw["intent"]["user_purpose"] == "Real operator purpose."
+
+
+def test_full_round_trip_both_write_paths_source_null_and_placeholder():
+    """c-8cdb5049 + c-543d4959: full round-trip exercising both write paths.
+
+    1. apply_user_intent_patch seeds purpose + user_purpose (user write path).
+    2. Agent cycle corrupts: source=null, purpose blanked to placeholder.
+    3. apply_user_intent_patch context-only patch preserves user_purpose
+       (user write path — no intent in patch).
+    4. apply_agent_update heals from user_purpose (agent write path, with
+       baseline_raw to exercise the 3-way-merge code path).
+    """
+    # Step 1: operator seeds purpose via the user write path.
+    seeded = apply_user_intent_patch(
+        None,
+        {"intent": {"purpose": "Operator steering purpose.", "current_focus": ""}},
+        "2026-07-05T00:00:00",
+    )
+    assert seeded.intent.purpose == "Operator steering purpose."
+    assert seeded.intent.user_purpose == "Operator steering purpose."
+    assert seeded.intent.source is not None
+    assert seeded.intent.source.type == "user_message"
+
+    # Step 2: agent cycle drops provenance and then something blanks purpose.
+    cycle1, _ = apply_agent_update(
+        seeded.model_dump(),
+        {"intent": {"purpose": "Agent derived purpose.", "current_focus": "phase 1"}},
+        "2026-07-05T01:00:00",
+        baseline_raw=None,  # legacy path drops source
+    )
+    # Corrupt: simulate purpose being overwritten with a placeholder.
+    corrupted = dict(cycle1)
+    corrupted["intent"] = dict(cycle1["intent"])
+    corrupted["intent"]["purpose"] = "..."
+    corrupted["intent"]["source"] = None
+    assert corrupted["intent"]["user_purpose"] == "Operator steering purpose."
+
+    # Step 3: operator issues a context-only patch (user write path, no intent).
+    after_context_patch = apply_user_intent_patch(
+        corrupted,
+        {"context": {"project_type": "product"}},
+        "2026-07-05T02:00:00",
+    )
+    # user_purpose is preserved across the non-intent patch.
+    assert after_context_patch.intent.user_purpose == "Operator steering purpose.", (
+        "user_purpose must survive a context-only apply_user_intent_patch call"
+    )
+    assert after_context_patch.intent.purpose == "...", "placeholder still present"
+
+    # Step 4: agent cycle heals from user_purpose (3-way-merge path).
+    baseline = {"revision": cycle1["revision"], "intent": {"purpose": "Agent derived purpose."}}
+    final, _ = apply_agent_update(
+        after_context_patch.model_dump(),
+        {"intent": {"purpose": "...", "current_focus": "phase 2"}},
+        "2026-07-05T03:00:00",
+        baseline_raw=baseline,
+    )
+    assert final["intent"]["purpose"] == "Operator steering purpose.", (
+        "intent.purpose must be healed from user_purpose after the full round-trip "
+        "through both write paths"
+    )
+    assert final["intent"]["source"]["type"] == "user_message"
+    assert final["intent"]["user_purpose"] == "Operator steering purpose."
+    assert final["intent"]["current_focus"] == "phase 2"
