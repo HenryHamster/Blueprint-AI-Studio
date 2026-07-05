@@ -400,14 +400,17 @@ def record_completion_debt(
         ).scalar_one_or_none()
         if existing_open is not None:
             return False
-        # Check for a resolved/dismissed row to reopen (dedupe_key is globally
-        # unique, so INSERT would violate the constraint if such a row exists).
+        # Check for a resolved row to reopen. DISMISSED rows must NOT be
+        # reopened — the operator's dismissal reason and timestamp are permanent
+        # against startup seeding and recurring obligation re-records.
         existing_any = session.execute(
             select(CompletionDebtEntry).where(
                 CompletionDebtEntry.dedupe_key == dedupe_key
             )
         ).scalar_one_or_none()
         if existing_any is not None:
+            if existing_any.status == STATUS_DISMISSED:
+                return False
             try:
                 with session.begin_nested():
                     existing_any.status = STATUS_OPEN
@@ -475,8 +478,9 @@ async def arecord_completion_debt(
         ).scalar_one_or_none()
         if existing_open is not None:
             return False
-        # Check for a resolved/dismissed row to reopen (dedupe_key is globally
-        # unique, so INSERT would violate the constraint if such a row exists).
+        # Check for a resolved row to reopen. DISMISSED rows must NOT be
+        # reopened — the operator's dismissal reason and timestamp are permanent
+        # against startup seeding and recurring obligation re-records.
         existing_any = (
             await session.execute(
                 select(CompletionDebtEntry).where(
@@ -485,6 +489,8 @@ async def arecord_completion_debt(
             )
         ).scalar_one_or_none()
         if existing_any is not None:
+            if existing_any.status == STATUS_DISMISSED:
+                return False
             try:
                 async with session.begin_nested():
                     existing_any.status = STATUS_OPEN

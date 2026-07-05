@@ -555,6 +555,103 @@ def test_resolved_debt_can_be_reopened(sync_session):
     assert _count(sync_session, dedupe_key=key) == 1, "still a single row (reopened)"
 
 
+def test_dismissed_debt_is_not_reopened_by_recorder(sync_session):
+    """A dismissed debt must NOT be reopened by a re-record — dismissal is permanent."""
+    key = "unit:dismissed-no-reopen"
+    cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T"
+    )
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+    ).scalar_one()
+    row.status = cd.STATUS_DISMISSED
+    row.resolution_reason = "operator:not-applicable"
+    sync_session.flush()
+
+    result = cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T (retry)"
+    )
+    sync_session.commit()
+
+    assert result is False, "re-recording a dismissed debt must return False"
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+    ).scalar_one()
+    assert row.status == cd.STATUS_DISMISSED, "status must remain dismissed"
+    assert row.resolution_reason == "operator:not-applicable", (
+        "dismissal reason must not be cleared"
+    )
+    assert _count(sync_session, dedupe_key=key) == 1, "must still be a single row"
+
+
+@pytest.mark.asyncio
+async def test_async_dismissed_debt_is_not_reopened(db_session):
+    """Async recorder must also leave DISMISSED rows untouched."""
+    key = "unit:async-dismissed-no-reopen"
+    await cd.arecord_completion_debt(
+        db_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T"
+    )
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    row.status = cd.STATUS_DISMISSED
+    row.resolution_reason = "operator:dismissed"
+    await db_session.flush()
+
+    result = await cd.arecord_completion_debt(
+        db_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T (retry)"
+    )
+    await db_session.commit()
+
+    assert result is False, "async re-record of a dismissed debt must return False"
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_DISMISSED
+    assert row.resolution_reason == "operator:dismissed"
+
+
+def test_dismissed_debt_not_reopened_by_seed(sync_session):
+    """Startup seed must not resurrect a dismissed global seed/dormant-knob row."""
+    # Seed once to create the inventory rows.
+    created = cd.seed_completion_debt_inventory(sync_session)
+    sync_session.commit()
+    assert created > 0
+
+    # Dismiss one of the seeded dormant-knob rows.
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(
+            CompletionDebtEntry.kind == cd.KIND_DORMANT_KNOB
+        )
+    ).scalars().first()
+    assert row is not None, "at least one dormant-knob row must exist after seed"
+    dismissed_key = row.dedupe_key
+    row.status = cd.STATUS_DISMISSED
+    row.resolution_reason = "operator:not-applicable"
+    sync_session.flush()
+    sync_session.commit()
+
+    # Re-seed (simulates a restart).
+    cd.seed_completion_debt_inventory(sync_session)
+    sync_session.commit()
+
+    # The dismissed row must still be dismissed.
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(
+            CompletionDebtEntry.dedupe_key == dismissed_key
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_DISMISSED, (
+        "restart seed must not resurrect a dismissed debt row"
+    )
+    assert row.resolution_reason == "operator:not-applicable"
+    assert _count(sync_session, dedupe_key=dismissed_key) == 1
+
+
 def test_open_debt_still_idempotent_after_reopen_fix(sync_session):
     """An already-open debt must still be a no-op (unchanged behavior)."""
     key = "unit:still-idempotent"
@@ -634,3 +731,66 @@ def test_dormant_knob_registry_covers_all_dormant_defaults():
             assert (
                 knob_key in registered_knobs
             ), f"Dormant flag '{knob_key}' (value=False) not in registry"
+
+
+def test_completion_debt_weight_mode_seeds_dormant_debt(monkeypatch):
+    """The new completion_debt_weight_mode knob (default 'observe') is a real
+    runtime_config key, so iter_dormant_knob_debts now emits its dormant-knob row.
+
+    Regression guard for Defect 2: before the knob became a real default key,
+    runtime_config.get(key, "") yielded "" (not in {off, observe}) and the row
+    was silently skipped — so the graduation gate seeded no obligation.
+    """
+    # The shipped default must be a member of the dormant set so the row seeds.
+    assert str(runtime_config.get("completion_debt_weight_mode")).lower() == "observe"
+
+    debts = iter_dormant_knob_debts()
+    by_key = {d["dedupe_key"]: d for d in debts}
+    assert "dormant_knob:completion_debt_weight_mode" in by_key, (
+        "completion_debt_weight_mode in observe mode must seed its dormant-knob debt"
+    )
+    entry = by_key["dormant_knob:completion_debt_weight_mode"]
+    assert entry["kind"] == "dormant_knob"
+    assert entry["detail"] == {"knob": "completion_debt_weight_mode", "value": "observe"}
+
+    # When graduated to enforce, the knob leaves the dormant set → no seed row.
+    monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "enforce")
+    enforced_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
+    assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_weight_mode_graduation_resolves_debt(db_session):
+    """Graduating completion_debt_weight_mode to 'enforce' via _apply_settings
+    resolves its standing dormant-knob completion-debt row."""
+    from app.routers.admin_settings import _apply_settings
+
+    seeded = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key="dormant_knob:completion_debt_weight_mode",
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Completion-debt pressure signal observe-mode",
+        project_id=None,
+    )
+    await db_session.commit()
+    assert seeded is True
+
+    _rc: dict = {"completion_debt_weight_mode": "observe"}
+    await _apply_settings(
+        {"completion_debt_weight_mode": "enforce"}, db_session, _rc
+    )
+    assert _rc["completion_debt_weight_mode"] == "enforce"
+    db_session.expire_all()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == "dormant_knob:completion_debt_weight_mode"
+            )
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED, (
+        "graduating completion_debt_weight_mode to 'enforce' must resolve its "
+        "completion-debt entry"
+    )

@@ -712,6 +712,148 @@ class TestComputeCompositeDebtPressure:
 
 
 # ===========================================================================
+# completion_debt_weight_mode — the graduation gate that makes the debt-pressure
+# blend reachable end-to-end (Defect 1 + Defect 2).
+# ===========================================================================
+
+
+class TestCompletionDebtWeightModeGate:
+    """The completion_debt weight is READ + PRESERVED through resolution and the
+    completion_debt_weight_mode knob gates whether it reaches compute_composite."""
+
+    @staticmethod
+    def _seed_runtime_config(mocker, *, weights, mode):
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": weights,
+                "completion_debt_weight_mode": mode,
+            },
+            clear=False,
+        )
+
+    def test_completion_debt_weight_mode_enforce_reachable(self, mocker):
+        """NAMED ACCEPTANCE TEST — end-to-end enforce reachability.
+
+        With completion_debt_weight_mode='enforce' AND a completion_debt weight
+        configured in runtime_config, the resolved policy MUST carry a nonzero
+        completion_debt weight (Defect 1: the tier no longer strips it) and the
+        enforce blend in compute_composite MUST actually be reached — confidence
+        under enforce differs from confidence under observe for the same debt
+        pressure (Defect 2: the mode gate arms the blend)."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.2,
+        }
+        # --- enforce: the configured completion_debt weight survives resolution
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        enforce_policy = rq._load_policy()
+        assert enforce_policy["weights"].get("completion_debt") == pytest.approx(0.2), (
+            "enforce mode must preserve the configured completion_debt weight so "
+            "the compute_composite blend is reachable"
+        )
+        enforce_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=enforce_policy,
+            debt_pressure_score=0.0,  # maximum open debt
+        )
+        # existing_confidence = 1.0; blended = 0.8 * 1.0 + 0.2 * 0.0 = 0.8
+        assert enforce_result["confidence"] == pytest.approx(0.8)
+
+        # --- observe: the SAME configured weight is forced to 0.0 (dropped)
+        self._seed_runtime_config(mocker, weights=weights, mode="observe")
+        observe_policy = rq._load_policy()
+        assert "completion_debt" not in observe_policy["weights"], (
+            "observe mode must force the effective completion_debt weight to 0.0"
+        )
+        observe_result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=observe_policy,
+            debt_pressure_score=0.0,
+        )
+        assert observe_result["confidence"] == pytest.approx(1.0)
+
+        # Graduation actually changed the composite.
+        assert enforce_result["confidence"] != pytest.approx(
+            observe_result["confidence"]
+        )
+
+    def test_observe_and_off_force_effective_weight_zero(self, mocker):
+        """observe/off both force the effective completion_debt weight to 0.0
+        even when a nonzero weight is configured (behaviour-preserving)."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.5,
+        }
+        for mode in ("observe", "off"):
+            self._seed_runtime_config(mocker, weights=weights, mode=mode)
+            policy = rq._load_policy()
+            assert "completion_debt" not in policy["weights"], (
+                f"mode={mode} must drop the completion_debt blend factor"
+            )
+
+    def test_enforce_with_unset_weight_falls_back_to_default(self, mocker):
+        """Graduating to enforce with NO completion_debt weight configured falls
+        back to the module default so graduation still changes the composite."""
+        weights = {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        policy = rq._load_policy()
+        assert policy["weights"]["completion_debt"] == pytest.approx(
+            rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+        )
+        assert rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT > 0.0
+
+    def test_enforce_weight_clamped_to_max(self, mocker):
+        """A configured completion_debt weight above the cap is clamped."""
+        weights = {
+            "audit": 0.40,
+            "test_erosion": 0.30,
+            "smoketest": 0.30,
+            "completion_debt": 0.9,
+        }
+        self._seed_runtime_config(mocker, weights=weights, mode="enforce")
+        policy = rq._load_policy()
+        assert policy["weights"]["completion_debt"] == pytest.approx(
+            rq.MAX_COMPLETION_DEBT_WEIGHT
+        )
+
+    def test_legacy_three_key_weights_still_resolve(self, mocker):
+        """Backward compatibility: a legacy 3-key promotion_weights (no
+        completion_debt) resolves exactly as before, with an effective
+        completion_debt weight of 0.0 (key absent) under the default observe
+        mode."""
+        weights = {"audit": 0.40, "test_erosion": 0.30, "smoketest": 0.30}
+        mocker.patch.dict(
+            rq._runtime_config,
+            {
+                "promotion_threshold": 0.90,
+                "promotion_weights": weights,
+                # No completion_debt_weight_mode set → default observe applies.
+                "completion_debt_weight_mode": "observe",
+            },
+            clear=False,
+        )
+        policy = rq._load_policy()
+        assert policy["weights"] == {
+            "audit": pytest.approx(0.40),
+            "test_erosion": pytest.approx(0.30),
+            "smoketest": pytest.approx(0.30),
+        }
+        assert policy["threshold"] == pytest.approx(0.90)
+
+
+# ===========================================================================
 # _load_policy — read promotion_policy.yaml, fall back on failure
 # ===========================================================================
 

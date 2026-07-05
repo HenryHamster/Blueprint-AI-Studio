@@ -38,6 +38,43 @@ _DEFAULT_POLICY: dict[str, Any] = {
 # A linear decay: 0 items → 1.0; _DEBT_PRESSURE_CEIL items → 0.0.
 _DEBT_PRESSURE_CEIL = 20
 
+# Hard cap on the completion_debt blend factor.  completion_debt is a SEPARATE
+# blend weight, NOT part of the audit + test_erosion + smoketest core-weight sum
+# (see ``compute_composite``): the existing sub-scores are scaled by
+# ``(1 - w_debt)`` and the debt term is added, so the total stays in [0, 1].
+# Bounded at 0.5 so the debt signal can never dominate the quality sub-scores.
+MAX_COMPLETION_DEBT_WEIGHT = 0.5
+
+# Default completion_debt blend weight applied when the operator graduates
+# ``completion_debt_weight_mode`` to "enforce" but left the weight unset/zero —
+# so graduation actually changes the composite instead of being a no-op.
+DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT = 0.15
+
+
+def coerce_completion_debt_weight(weights_raw: Any) -> float:
+    """Read the OPTIONAL ``completion_debt`` blend weight from a weights mapping.
+
+    Returns ``0.0`` when the key is absent or unparseable — this is what keeps a
+    legacy three-key ``{audit, test_erosion, smoketest}`` policy fully backward
+    compatible (an effective completion_debt weight of 0.0 = the shipped observe
+    behaviour).  A present numeric value is clamped to
+    ``[0.0, MAX_COMPLETION_DEBT_WEIGHT]``.  Pure — no I/O, no runtime_config.
+    """
+    if not isinstance(weights_raw, dict):
+        return 0.0
+    raw = weights_raw.get("completion_debt")
+    if raw is None or isinstance(raw, bool):
+        return 0.0
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if v < 0.0:
+        return 0.0
+    if v > MAX_COMPLETION_DEBT_WEIGHT:
+        return MAX_COMPLETION_DEBT_WEIGHT
+    return v
+
 
 def _clamp01(value: float) -> float:
     """Clamp a numeric sub-score into [0.0, 1.0]."""

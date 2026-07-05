@@ -151,6 +151,24 @@ runtime_config: Dict = {
     "structural_health_audit_fat_row_bytes": int(
         os.getenv("STRUCTURAL_HEALTH_AUDIT_FAT_ROW_BYTES", "1048576")
     ),
+    # --- Completion-debt pressure signal graduation gate ---
+    # Operator-facing graduation knob for blending the qualification debt-pressure
+    # signal into the promotion composite (release_qualifier._load_policy →
+    # compute_composite).  Mirrors evergreen_fill_mode / structural_health_audit_mode.
+    #   off      — never blend; the completion_debt weight is forced to 0.0.
+    #   observe  — (default) the debt-pressure score is recorded in sub_scores but
+    #              the effective completion_debt weight is 0.0 (never blended).
+    #   enforce  — the configured completion_debt weight is applied (falling back
+    #              to a sensible nonzero default when the operator left it unset),
+    #              so open completion debt actually erodes promotion confidence.
+    # Default "observe" is a member of _DORMANT_KNOB_VALUES, so this knob seeds its
+    # own dormant_knob completion-debt row via iter_dormant_knob_debts.
+    "completion_debt_weight_mode": os.getenv(
+        "COMPLETION_DEBT_WEIGHT_MODE", "observe"
+    ).lower()
+    if os.getenv("COMPLETION_DEBT_WEIGHT_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
     # Co-change auto-decomposition: split a medium research finding's files into
     # independent co-change/dir clusters and spawn one small sub-finding per
     # cluster (research_completion -> cochange_decomposition.py). Default OFF:
@@ -1215,6 +1233,15 @@ def _read_promotion_policy_file() -> dict | None:
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+        # Optional completion_debt blend factor — SEPARATE from the three-core
+        # weights that must sum to ~1.0 (mirrors release_qualifier resolution).
+        # Read + preserve it (default 0.0, clamped to [0, 0.5]) so a YAML rubric
+        # that documents a completion_debt weight seeds it into runtime_config.
+        from app.release_scoring import coerce_completion_debt_weight
+
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
         result: dict = {"weights": weights, "threshold": threshold}
         if "merge_grade_block_threshold" in parsed:
             try:
@@ -1632,6 +1659,12 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     )
                     if raw_mode in ("off", "observe", "enforce"):
                         _set("structural_health_audit_mode", raw_mode)
+                if "completion_debt_weight_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["completion_debt_weight_mode"] or "").strip().lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("completion_debt_weight_mode", raw_mode)
                 if "structural_health_audit_interval_minutes" in config_json:
                     try:
                         _set(

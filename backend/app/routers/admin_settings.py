@@ -108,6 +108,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "structural_health_audit_mode",
         "structural_health_audit_interval_minutes",
         "structural_health_audit_fat_row_bytes",
+        "completion_debt_weight_mode",
         "category_routing",
         "ci_backstop_timeout_minutes",
         "cochange_decomposition_enabled",
@@ -384,6 +385,9 @@ async def get_settings(
         ),
         "structural_health_audit_fat_row_bytes": int(
             _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
+        ),
+        "completion_debt_weight_mode": str(
+            _runtime_config.get("completion_debt_weight_mode", "observe")
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -969,6 +973,18 @@ async def _apply_settings(
         _runtime_config["structural_health_audit_mode"] = val
         if val == "enforce":
             _debt_keys_to_resolve.append("dormant_knob:structural_health_audit_mode")
+    if "completion_debt_weight_mode" in payload:
+        val = str(payload["completion_debt_weight_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="completion_debt_weight_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["completion_debt_weight_mode"] = val
+        # Graduating the debt-pressure signal to enforce resolves its standing
+        # dormant-knob completion-debt row (mirrors evergreen_fill_mode).
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:completion_debt_weight_mode")
     if "structural_health_audit_interval_minutes" in payload:
         try:
             val = int(payload["structural_health_audit_interval_minutes"])
@@ -1121,12 +1137,18 @@ async def _apply_settings(
                 status_code=400, detail="promotion_weights must be a dict"
             )
         _PROMOTION_WEIGHT_KEYS = ("audit", "test_erosion", "smoketest")
-        if set(val.keys()) != set(_PROMOTION_WEIGHT_KEYS):
+        # ``completion_debt`` is an OPTIONAL, SEPARATE blend factor (NOT part of
+        # the three-core-weight sum) — accept it but require the three core keys.
+        _allowed_weight_keys = set(_PROMOTION_WEIGHT_KEYS) | {"completion_debt"}
+        missing_core = set(_PROMOTION_WEIGHT_KEYS) - set(val.keys())
+        extra_keys = set(val.keys()) - _allowed_weight_keys
+        if missing_core or extra_keys:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "promotion_weights must have exactly the keys "
-                    f"{sorted(_PROMOTION_WEIGHT_KEYS)}"
+                    "promotion_weights must have the keys "
+                    f"{sorted(_PROMOTION_WEIGHT_KEYS)} "
+                    "and may optionally include 'completion_debt'"
                 ),
             )
         cleaned_weights: Dict[str, float] = {}
@@ -1148,16 +1170,33 @@ async def _apply_settings(
         # saturates confidence (gate effectively disabled) or makes it
         # unreachable (gate stuck closed). Reject a mis-weighted set rather than
         # silently honour it — same invariant release_qualifier._load_policy
-        # enforces on the YAML file.
+        # enforces on the YAML file.  Only the THREE CORE weights participate in
+        # this sum; completion_debt is validated separately below.
         weight_sum = sum(cleaned_weights.values())
         if abs(weight_sum - 1.0) > 0.01:
             raise HTTPException(
                 status_code=400,
                 detail=(f"promotion_weights must sum to ~1.0 (got {weight_sum:.4f})"),
             )
-        _runtime_config["promotion_weights"] = {
+        stored_weights = {
             wk: round(cleaned_weights[wk], 4) for wk in _PROMOTION_WEIGHT_KEYS
         }
+        # Optional completion_debt blend factor: a number in [0.0, 0.5].
+        if "completion_debt" in val:
+            try:
+                cd_weight = float(val["completion_debt"])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="promotion_weights[completion_debt] must be a number",
+                )
+            if not (0.0 <= cd_weight <= 0.5):
+                raise HTTPException(
+                    status_code=400,
+                    detail="promotion_weights[completion_debt] must be between 0.0 and 0.5",
+                )
+            stored_weights["completion_debt"] = round(cd_weight, 4)
+        _runtime_config["promotion_weights"] = stored_weights
     if "merge_grade_block_threshold" in payload:
         try:
             val = float(payload["merge_grade_block_threshold"])
@@ -3290,6 +3329,11 @@ async def _apply_settings(
                     ),
                     "structural_health_audit_fat_row_bytes": int(
                         _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
+                    ),
+                    # Persist the completion-debt weight-mode graduation knob so an
+                    # operator's enforce graduation survives a Cloud Run restart.
+                    "completion_debt_weight_mode": str(
+                        _runtime_config.get("completion_debt_weight_mode", "observe")
                     ),
                     # Persist the Cloud Run task-type allowlist so an operator
                     # configuration survives a Cloud Run restart. runtime_config_state.

@@ -179,7 +179,10 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
+    DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
+    MAX_COMPLETION_DEBT_WEIGHT,
     _clamp01,  # noqa: F401
+    coerce_completion_debt_weight,
     _compute_audit_reconciliation,
     _compute_audit_challenge_synthesis,  # noqa: F401 — re-exported for callers/tests
     _compute_challenge_synthesis_from_binding_verdicts,
@@ -406,6 +409,13 @@ def _policy_from_runtime_config() -> dict[str, Any] | None:
             raise ValueError(
                 f"runtime_config promotion_weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+        # completion_debt is an OPTIONAL, SEPARATE blend factor — NOT part of the
+        # three-core-weight sum above.  Read + preserve it (default 0.0, clamped
+        # to [0, 0.5]) so the mode gate in _resolve_policy_with_provenance can
+        # turn the debt-pressure signal on; absent => 0.0 = the legacy behaviour.
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
             _v = _runtime_config.get(_k)
@@ -466,6 +476,11 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
                 raise ValueError(
                     f"build_config promotion_weights sum to {wsum:.4f}, expected ~1.0"
                 )
+            # Optional per-project completion_debt blend factor (separate from the
+            # three-core-weight sum; default 0.0, clamped to [0, 0.5]).
+            _cd = coerce_completion_debt_weight(weights_raw)
+            if _cd > 0.0:
+                weights["completion_debt"] = _cd
             if weights["audit"] < _MIN_AUDIT_WEIGHT:
                 raise ValueError(
                     f"build_config promotion_weights audit={weights['audit']:.3f} "
@@ -503,6 +518,63 @@ def _policy_from_build_config(project: "Project | None") -> dict[str, Any] | Non
         return None
 
 
+# The operator-facing graduation gate for the completion-debt pressure signal.
+# ``completion_debt_weight_mode`` is a real runtime_config key (default
+# "observe"); only "enforce" lets the configured completion_debt weight reach
+# the composite blend.
+_COMPLETION_DEBT_WEIGHT_MODES: frozenset[str] = frozenset({"off", "observe", "enforce"})
+
+
+def _resolve_completion_debt_weight_mode() -> str:
+    """Return the live ``completion_debt_weight_mode`` (default "observe").
+
+    Any unrecognised / unset value degrades to the safe "observe" default so a
+    malformed knob can never silently arm the enforce blend.
+    """
+    mode = str(_runtime_config.get("completion_debt_weight_mode", "observe")).strip().lower()
+    return mode if mode in _COMPLETION_DEBT_WEIGHT_MODES else "observe"
+
+
+def _apply_completion_debt_weight_mode(policy: dict[str, Any]) -> dict[str, Any]:
+    """Mode-gate a resolved policy's ``weights["completion_debt"]`` blend factor.
+
+    Centralises Defect 2's graduation gate so ``compute_composite`` stays pure:
+    the returned policy already carries the *effective* completion_debt weight.
+
+      * "observe" / "off"  → the effective weight is forced to 0.0 and the key is
+        DROPPED, so ``weights`` is the legacy three-key shape and the debt-
+        pressure score is recorded in sub_scores but never blended (the shipped
+        observe behaviour, backward compatible).
+      * "enforce"          → the configured completion_debt weight is applied; if
+        the operator graduated but left it unset/zero, fall back to
+        ``DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT`` so graduation actually changes
+        the composite.  The effective weight is clamped to
+        ``[0, MAX_COMPLETION_DEBT_WEIGHT]``.
+
+    Returns a shallow copy with a fresh ``weights`` dict — the caller's input is
+    never mutated.
+    """
+    weights = dict(policy.get("weights") or {})
+    configured = coerce_completion_debt_weight(weights)
+    mode = _resolve_completion_debt_weight_mode()
+    if mode == "enforce":
+        effective = (
+            configured
+            if configured > 0.0
+            else DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+        )
+        effective = max(0.0, min(effective, MAX_COMPLETION_DEBT_WEIGHT))
+    else:
+        effective = 0.0
+    if effective > 0.0:
+        weights["completion_debt"] = effective
+    else:
+        weights.pop("completion_debt", None)
+    gated = dict(policy)
+    gated["weights"] = weights
+    return gated
+
+
 def _resolve_policy_with_provenance(
     project: "Project | None" = None,
 ) -> tuple[dict[str, Any], str, str | None]:
@@ -512,6 +584,11 @@ def _resolve_policy_with_provenance(
     shape. This helper layers operator-visible provenance on top so callers can tell
     whether the active rubric came from the project's build_config, runtime config,
     the YAML file, or the hardcoded defaults after a YAML failure.
+
+    The final step mode-gates ``weights["completion_debt"]`` via
+    ``_apply_completion_debt_weight_mode`` so every consumer (the qualifier and
+    the admin provenance surface) sees the same effective, graduation-gated blend
+    factor.
     """
     fleet_policy, fleet_source, fleet_error = _resolve_fleet_policy_with_provenance()
     overrides = _policy_from_build_config(project)
@@ -523,8 +600,8 @@ def _resolve_policy_with_provenance(
         merged = dict(fleet_policy)
         merged["weights"] = overrides["weights"]
         merged["threshold"] = overrides["threshold"]
-        return merged, "build_config", fleet_error
-    return fleet_policy, fleet_source, fleet_error
+        return _apply_completion_debt_weight_mode(merged), "build_config", fleet_error
+    return _apply_completion_debt_weight_mode(fleet_policy), fleet_source, fleet_error
 
 
 def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | None]:
@@ -568,6 +645,12 @@ def _resolve_fleet_policy_with_provenance() -> tuple[dict[str, Any], str, str | 
             raise ValueError(
                 f"promotion_policy.yaml weights sum to {weight_sum:.4f}, expected ~1.0"
             )
+
+        # Optional completion_debt blend factor from the on-disk rubric (separate
+        # from the three-core-weight sum; default 0.0, clamped to [0, 0.5]).
+        _cd = coerce_completion_debt_weight(weights_raw)
+        if _cd > 0.0:
+            weights["completion_debt"] = _cd
 
         result: dict[str, Any] = {"weights": weights, "threshold": threshold}
         for _k in ("merge_grade_block_threshold",):
@@ -616,7 +699,11 @@ def _load_policy(project: "Project | None" = None) -> dict[str, Any]:
 
     The returned dict always has the shape
     ``{"weights": {"audit": float, "test_erosion": float, "smoketest": float},
-       "threshold": float}`` with every value coerced to float.
+       "threshold": float}`` with every value coerced to float.  An OPTIONAL
+    ``weights["completion_debt"]`` blend factor is present only when the operator
+    has graduated ``completion_debt_weight_mode`` to "enforce" (mode-gated in
+    ``_resolve_policy_with_provenance``); in observe/off mode the key is absent
+    and the three-core-weight shape is preserved unchanged.
     """
     policy, _, _ = _resolve_policy_with_provenance(project)
     return policy
