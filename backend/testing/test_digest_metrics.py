@@ -7226,3 +7226,62 @@ def test_digest_payload_keys_have_named_consumer():
         "admin-ui component reads it (not just a pending/retired annotation): "
         f"{consumerless}"
     )
+
+def test_multi_attempt_task_counts_once_in_cost_breakdown():
+    """A multi-attempt task contributes task_count=1, priced_task_count=1,
+    and merge_rate=1.0 even when it has two banked attempt-rows, not two."""
+    from app.llm_cost_attribution import compute_llm_cost_breakdown
+    from app.models import TaskStatus, bank_task_current_attempt
+
+    now = _utcnow()
+
+    # Build a task with one banked attempt and one live attempt (both on the
+    # same anthropic/claude-sonnet-4-6 model — a priced combo).
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+        api_call_summary={
+            "llm_call_count": 3,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+        },
+        vm_provisioned_at=now,
+        vm_spot=True,
+    )
+    # Bank the first attempt into attempt_history so the task has two rows.
+    bank_task_current_attempt(task, stopped_at=now)
+
+    # Set up a second live attempt.
+    task.api_call_summary = {
+        "llm_call_count": 2,
+        "total_input_tokens": 250,
+        "total_output_tokens": 150,
+    }
+    task.vm_provisioned_at = now
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+
+    # One task → task_count=1 (not 2 attempt-rows).
+    assert totals["task_count"] == 1, (
+        f"task_count should be 1 (one task), got {totals['task_count']}"
+    )
+    # One priced task → priced_task_count=1 (not 2 attempt-rows).
+    assert totals["priced_task_count"] == 1, (
+        f"priced_task_count should be 1 (one task), got {totals['priced_task_count']}"
+    )
+    assert totals["unpriced_task_count"] == 0
+
+    # One merged task → merge_rate=1.0 (not 0.5 as if task_count were 2).
+    assert totals["merged_count"] == 1
+    assert totals["merge_rate"] == 1.0, (
+        f"merge_rate should be 1.0 (1 merged / 1 task), got {totals['merge_rate']}"
+    )
+
+    # Model bucket should also count the task once.
+    by_model = {(r["provider"], r["model"]): r for r in breakdown["by_model"]}
+    row = by_model[("anthropic", "claude-sonnet-4-6")]
+    assert row["task_count"] == 1
+    assert row["merge_rate"] == 1.0

@@ -1800,9 +1800,9 @@ async def test_compute_llm_cost_breakdown_credits_each_attempt_model(db_session)
     assert openai_row["cost_per_merge"] == round(openai_row["total_cost_usd"] / 1, 6)
 
     totals = breakdown["totals"]
-    assert totals["task_count"] == 2  # two attempt-rows
+    assert totals["task_count"] == 1  # one task (not two attempt-rows)
     assert totals["merged_count"] == 1  # one merged TASK, not double-credited
-    assert totals["merge_rate"] == round(1 / 2, 4)
+    assert totals["merge_rate"] == 1.0
 
 
 @pytest.mark.asyncio
@@ -1857,17 +1857,17 @@ async def test_compute_llm_cost_breakdown_merge_counts_multi_attempt_task_once(
     row = {(e["provider"], e["model"]): e for e in breakdown["by_model"]}[
         ("anthropic", "claude-sonnet-4-6")
     ]
-    # Two attempt-rows in one bucket, but a single merged task.
-    assert row["task_count"] == 2
+    # Two attempt-rows in one bucket, but a single task and a single merged task.
+    assert row["task_count"] == 1
     assert row["merged_count"] == 1
-    assert row["merge_rate"] == round(1 / 2, 4)
+    assert row["merge_rate"] == 1.0
     # cost_per_merge divides total bucket cost by the merge COUNT (1), not the
     # attempt count (2): the per-attempt accumulation would halve this figure.
     assert row["cost_per_merge"] == round(row["total_cost_usd"] / 1, 6)
 
     totals = breakdown["totals"]
     assert totals["merged_count"] == 1
-    assert totals["merge_rate"] == round(1 / 2, 4)
+    assert totals["merge_rate"] == 1.0
 
 
 @pytest.mark.asyncio

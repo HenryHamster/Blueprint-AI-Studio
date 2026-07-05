@@ -116,6 +116,7 @@ def test_registry_contains_initial_checks():
         "landed_vs_reported_merges",
         "playbook_confirmation_integrity",
         "noncode_outcome_window_accounting",
+        "direction_acceptance_metric_invariant",
     } <= names
 
 
@@ -276,6 +277,106 @@ async def test_playbook_does_not_mutate_source_counter(db):
     await db.refresh(project)
     assert project.design_doc["playbook/x"]["confirmed_count"] == 7
     assert project.design_doc["playbook/x"]["reference_count"] == 1
+
+
+# --- Check: direction_acceptance_metric_invariant ---------------------------
+
+
+@pytest.mark.asyncio
+async def test_direction_acceptance_metric_check_flags_violating_entry(db):
+    """A research_history entry where proven > declared must be flagged.
+
+    This exercises the real acceptance_metric_invariant_violations path via the
+    registered sweep check — not a mock — so the test validates that the check
+    is wired up and running against live data correctly.
+    """
+    project = await _project(db)
+    # Build a violating entry: proven=3 exceeds declared=2 (invariant: proven ≤ declared).
+    violating_entry = {
+        "task_id": "aaaaaaaa-0000-0000-0000-000000000001",
+        "prs_merged": 5,
+        "verified_prs_merged": 4,
+        "acceptance_proven_merged": 3,   # violates: proven (3) > declared (2)
+        "acceptance_declared_merged": 2,
+        "acceptance_merged_write_total": 4,
+        "acceptance_declaration_coverage": 0.5,  # 2/4
+    }
+    project.directions = [
+        {
+            "id": "d-test-001",
+            "research_history": [violating_entry],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_direction_acceptance_metric_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    f = flagged[0]
+    assert f.check == "direction_acceptance_metric_invariant"
+    assert f.delta >= 1  # at least one invariant violated
+    assert "proven" in f.detail  # the violation message names the field
+
+
+@pytest.mark.asyncio
+async def test_direction_acceptance_metric_check_ok_when_consistent(db):
+    project = await _project(db)
+    good_entry = {
+        "task_id": "aaaaaaaa-0000-0000-0000-000000000002",
+        "prs_merged": 5,
+        "verified_prs_merged": 4,
+        "acceptance_proven_merged": 2,
+        "acceptance_declared_merged": 3,
+        "acceptance_merged_write_total": 4,
+        "acceptance_declaration_coverage": 0.75,  # 3/4
+    }
+    project.directions = [{"id": "d-test-002", "research_history": [good_entry]}]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_acceptance_metric_invariant(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_direction_acceptance_metric_check_skips_legacy_entries(db):
+    """Entries without any acceptance fields (pre-acceptance-layer) must be skipped."""
+    project = await _project(db)
+    legacy_entry = {
+        "task_id": "aaaaaaaa-0000-0000-0000-000000000003",
+        "prs_merged": 3,
+    }
+    project.directions = [{"id": "d-legacy", "research_history": [legacy_entry]}]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_acceptance_metric_invariant(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
 
 
 # --- Check: noncode_outcome_window_accounting -------------------------------

@@ -4638,6 +4638,36 @@ def test_resurrect_strips_churn_retirement_recommendation():
     )
 
 
+def test_resurrection_notes_capped_and_idempotent():
+    """resurrect_direction keeps only the newest resurrection notes and ignores retries."""
+    from app.direction_lifecycle import resurrect_direction
+
+    notes = [
+        {"at": f"2026-01-01T00:00:{i:02d}", "actor": "operator", "action": "resurrected"}
+        for i in range(50)
+    ]
+    d = {
+        "id": "d-resurrect-notes",
+        "status": "completed",
+        "auto_completed": True,
+        "completed_at": "2026-01-01T00:00:00",
+        "resurrection_notes": notes,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    resurrect_direction(d, now_iso="2026-02-01T00:00:00", actor="operator", rationale="retry")
+    first_pass = list(d["resurrection_notes"])
+    assert len(first_pass) == 50
+    assert first_pass[0]["at"] == "2026-01-01T00:00:01"
+    assert first_pass[-1]["at"] == "2026-02-01T00:00:00"
+
+    resurrect_direction(d, now_iso="2026-03-01T00:00:00", actor="operator", rationale="retry")
+    assert d["resurrection_notes"] == first_pass
+
+
 def test_keep_decision_reactivates_and_resets_churn_ladder():
     """apply_churn_retirement_keep reactivates a held-paused direction, clears the
     recommendation + manual-hold residue, and resets the churn ladder to 0."""

@@ -664,6 +664,132 @@ async def check_playbook_confirmation_integrity(
 
 
 @register_check(
+    "direction_acceptance_metric_invariant",
+    "Scan research_history entries across directions and flag any that violate the "
+    "semantic invariants between acceptance-evidence metrics (proven ≤ declared ≤ "
+    "merged-write, proven ≤ verified ≤ prs_merged, coverage identity).",
+)
+async def check_direction_acceptance_metric_invariant(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: the semantic ordering invariants in
+    :func:`app.direction_outcomes.acceptance_metric_invariant_violations` must hold
+    for every research_history entry. A violation means a metric counter was written
+    inconsistently — proven exceeding declared, verified exceeding raw merged, etc.
+    Flag-only: the check never mutates the entry it audits.
+
+    Bounded to ``max_projects`` projects; skips directions without research_history
+    and entries without any acceptance-evidence fields (legacy rows).
+    """
+    from app.direction_outcomes import acceptance_metric_invariant_violations
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.directions).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="direction_acceptance_metric_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for project_id, directions in projects:
+        pid = str(project_id)
+        for direction in directions or []:
+            history = direction.get("research_history") or []
+            for entry in history:
+                # Skip legacy entries with no acceptance fields — they were written
+                # before the acceptance-evidence layer existed and the guard
+                # function itself handles them safely, but emitting OK for every
+                # legacy entry inflates noise without value.
+                has_acceptance_fields = any(
+                    k in entry
+                    for k in (
+                        "acceptance_proven_merged",
+                        "acceptance_declared_merged",
+                        "acceptance_merged_write_total",
+                        "verified_prs_merged",
+                    )
+                )
+                if not has_acceptance_fields:
+                    continue
+                any_checked = True
+                violations = acceptance_metric_invariant_violations(entry)
+                if violations:
+                    direction_id = direction.get("id", "unknown")
+                    cycle_id = entry.get("task_id", "unknown")
+                    results.append(
+                        CheckResult(
+                            check="direction_acceptance_metric_invariant",
+                            status=CheckStatus.FLAGGED,
+                            self_reported=int(entry.get("acceptance_proven_merged") or 0),
+                            ground_truth=0,
+                            delta=len(violations),
+                            severity="warn",
+                            subject=pid,
+                            detail=(
+                                f"direction {direction_id} cycle {cycle_id}: "
+                                + "; ".join(violations[:3])
+                            ),
+                        )
+                    )
+
+    if not any_checked:
+        return [
+            CheckResult(
+                check="direction_acceptance_metric_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no research_history entries with acceptance fields found",
+            )
+        ]
+
+    # Only emit OK results per-project when no flagged results exist for that project.
+    flagged_pids = {r.subject for r in results if r.flagged}
+    seen_ok: set[str] = set()
+    for project_id, directions in projects:
+        pid = str(project_id)
+        if pid in flagged_pids or pid in seen_ok:
+            continue
+        # Check if this project had any entries audited.
+        for direction in directions or []:
+            history = direction.get("research_history") or []
+            for entry in history:
+                if any(
+                    k in entry
+                    for k in (
+                        "acceptance_proven_merged",
+                        "acceptance_declared_merged",
+                        "acceptance_merged_write_total",
+                        "verified_prs_merged",
+                    )
+                ):
+                    seen_ok.add(pid)
+                    results.append(
+                        CheckResult(
+                            check="direction_acceptance_metric_invariant",
+                            status=CheckStatus.OK,
+                            delta=0,
+                            subject=pid,
+                            detail="all audited acceptance-metric entries consistent",
+                        )
+                    )
+                    break
+            if pid in seen_ok:
+                break
+
+    return results
+
+
+@register_check(
     "noncode_outcome_window_accounting",
     "Recompute non-code terminal-outcome window membership by terminal time vs "
     "the naive created-at method and flag mis-windowed tasks.",

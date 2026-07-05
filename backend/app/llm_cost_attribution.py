@@ -335,14 +335,16 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
         merged = is_merged_completion(t)
         verified = is_verified_merge(t)
         is_fallback = _task_ran_on_fallback(t)
-        # Tokens/cost/task_count accumulate per attempt-row (automain
-        # convention), but a task's merge is a single TASK-level outcome: it
-        # must be credited at most ONCE per distinct bucket it touched, never
-        # once per attempt-row. Collect the distinct buckets this task
-        # contributed a row to, then credit the merge after the attempt loop.
+        # Tokens/cost accumulate per attempt-row, but task_count and merge
+        # outcomes are TASK-level: each must be credited at most ONCE per
+        # distinct bucket the task touched, never once per attempt-row.
+        # Collect the distinct buckets this task contributed a row to, then
+        # credit task_count and merge outcomes after the attempt loop.
         task_model_keys: set[tuple[str, str]] = set()
         task_provider_keys: set[str] = set()
         task_contributed = False
+        task_had_priced = False
+        task_had_unpriced = False
         for (
             provider,
             model,
@@ -373,7 +375,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     output_rate,
                 )
                 priced_combos.add(key)
-                priced_task_count += 1
+                task_had_priced = True
                 # Track approximate-priced combos (proxy rate, not exactly published).
                 if key in LLM_APPROXIMATE_PRICED:
                     combo = f"{provider}:{model}"
@@ -384,7 +386,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                         approximate_priced_combos.append(combo)
             else:
                 cost = 0.0
-                unpriced_task_count += 1
+                task_had_unpriced = True
                 unpriced_providers.add(provider)
                 combo = f"{provider}:{model}"
                 if (
@@ -407,7 +409,6 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             mb["cache_read_input_tokens"] += cr
             mb["output_tokens"] += int(output_tokens)
             mb["llm_call_count"] += call_count
-            mb["task_count"] += 1
             mb["cost_usd"] += cost
 
             pb = provider_buckets[provider]
@@ -416,7 +417,6 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             pb["cache_read_input_tokens"] += cr
             pb["output_tokens"] += int(output_tokens)
             pb["llm_call_count"] += call_count
-            pb["task_count"] += 1
             pb["cost_usd"] += cost
 
             total_input += int(input_tokens)
@@ -424,15 +424,27 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
             total_cache_read += cr
             total_output += int(output_tokens)
             total_cost += cost
-            total_task_count += 1
 
             task_model_keys.add(key)
             task_provider_keys.add(provider)
             task_contributed = True
 
-        # Credit the task's merge once per distinct bucket it touched, and once
-        # to the grand total — so multi-attempt and multi-model merged tasks
-        # never inflate merged_count beyond the actual merged-task count.
+        # Credit task_count, merge outcomes, and priced/unpriced counts once
+        # per distinct bucket the task touched — never once per attempt-row —
+        # so multi-attempt tasks don't inflate task_count or deflate merge_rate.
+        if task_contributed:
+            for key in task_model_keys:
+                model_buckets[key]["task_count"] += 1
+            for provider in task_provider_keys:
+                provider_buckets[provider]["task_count"] += 1
+            total_task_count += 1
+            # A task that had at least one priced attempt counts as priced;
+            # only tasks with zero priced attempts count as unpriced.
+            if task_had_priced:
+                priced_task_count += 1
+            elif task_had_unpriced:
+                unpriced_task_count += 1
+
         if merged and task_contributed:
             for key in task_model_keys:
                 model_buckets[key]["merged_count"] += 1

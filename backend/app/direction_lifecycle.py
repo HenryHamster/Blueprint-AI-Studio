@@ -231,6 +231,7 @@ _TERMINAL_RESIDUE_KEYS = (
 # Cap on the audit-note rationale so a resurrected direction can't bloat the
 # directions JSONB with an unbounded operator string.
 _RESURRECTION_RATIONALE_MAX = 512
+_RESURRECTION_NOTES_MAX = 50
 
 
 def resurrect_direction(
@@ -270,6 +271,16 @@ def resurrect_direction(
     Returns the same ``direction`` object (mutated in place) for convenience.
     """
     now = now_iso or _utcnow().isoformat()
+    notes = direction.get("resurrection_notes")
+    if direction.get("status") == "active" and isinstance(notes, list):
+        last_note = notes[-1] if notes else None
+        if (
+            isinstance(last_note, dict)
+            and last_note.get("action") == "resurrected"
+            and last_note.get("actor") == (actor or "operator")[:64]
+            and last_note.get("rationale") == (str(rationale)[:_RESURRECTION_RATIONALE_MAX] if rationale else None)
+        ):
+            return direction
 
     direction["status"] = "active"
 
@@ -302,7 +313,7 @@ def resurrect_direction(
     if not isinstance(notes, list):
         notes = []
     notes.append(note)
-    direction["resurrection_notes"] = notes
+    direction["resurrection_notes"] = notes[-_RESURRECTION_NOTES_MAX:]
 
     return direction
 
