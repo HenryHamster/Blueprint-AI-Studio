@@ -114,6 +114,7 @@ async def compute_system_state(
     from app.time_utils import _utcnow
     from app import release_version as rv
     from app.release_artifacts import version_serving_summary as _version_serving_summary
+    from app.qualification_state_resolver import resolve_effective_qualification_state
 
     now = _utcnow()
 
@@ -210,11 +211,12 @@ async def compute_system_state(
             # Pass the AGGREGATE serving status — never the raw scalar.
             # summarize_qualification_state uses aggregate_serving_status when
             # artifact_evidence is provided, so the read path stays consistent.
-            qual_state = rv.summarize_qualification_state(
-                version.last_qualification,
-                aggregate_serving_status=aggregate_serving_status,
-                aggregate_deploy_failure_reason=aggregate_reason,
-                artifact_evidence=evidence_list,
+            # Routed through the shared resolver so every read surface layers the
+            # same enrichments in the same order.
+            qual_state, _ = resolve_effective_qualification_state(
+                version,
+                project,
+                serving=(agg_dict, evidence_list),
             )
 
             merged_count = await rv.count_merged_since(

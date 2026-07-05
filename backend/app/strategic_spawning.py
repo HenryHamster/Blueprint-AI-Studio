@@ -331,20 +331,20 @@ def _merge_finding_challenge_summary(target: dict[str, Any], source: Any) -> Non
 
 
 def _strategic_recent_version_entry(version, project=None) -> dict[str, Any]:
-    from app.release_version import summarize_qualification_state as _summarize
+    from app.qualification_state_resolver import (
+        resolve_effective_qualification_state,
+    )
 
     aggregate, artifacts = _version_serving_summary(version, project)
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate, artifacts)
+    )
     return {
         "version_number": version.version_number,
         "status": version.status,
         "phase": version.phase,
         "last_qualification": version.last_qualification,
-        "qualification_state": _summarize(
-            version.last_qualification,
-            aggregate_serving_status=aggregate["serving_status"],
-            aggregate_deploy_failure_reason=aggregate["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "serving_status": aggregate["serving_status"],
         "served_sha": (version.served_sha or "")[:12] or None,
         "deploy_failure_reason": aggregate["reason_code"],
@@ -1914,7 +1914,7 @@ def _build_cycle_start_reconciliation(
             candidate_status = vpb_last_qual.get("status")
             if (
                 is_stale
-                and candidate_status in ("pending", "promotion_failed")
+                and candidate_status == "promotion_failed"
             ):
                 qualification_surface_conflicts.append(
                     {
@@ -2006,7 +2006,11 @@ def _build_cycle_start_reconciliation(
             qual_status = vpb_last_qual.get("status")
             # If promotion_readiness says not ready but status is
             # "promotion_failed", the surfaces contradict.
-            if ready_state is False and qual_status == "promotion_failed":
+            if (
+                ready_state is False
+                and qual_status == "promotion_failed"
+                and vpb_promotion_ready.get("is_current_readiness") is not False
+            ):
                 qualification_surface_conflicts.append(
                     {
                         "conflict_type": "promotion_readiness_unready",

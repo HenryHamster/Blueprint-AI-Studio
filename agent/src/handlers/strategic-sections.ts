@@ -288,6 +288,21 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  const qualSurfaceConflicts = Array.isArray(recon.qualification_surface_conflicts)
+    ? recon.qualification_surface_conflicts as Array<Record<string, unknown>> : [];
+  if (qualSurfaceConflicts.length > 0) {
+    const qualConflictsTotal = countOr(counts.qualification_surface_conflicts, qualSurfaceConflicts.length);
+    lines.push(`\n### Qualification surface conflicts — coherence disagreements (${qualConflictsTotal})`);
+    lines.push('The backend detected disagreements between qualification surfaces (candidate currency, qualification state, criterion coverage, promotion readiness). Each entry names a specific cross-surface contradiction. Resolve the conflict before advancing the qualification.');
+    for (const c of qualSurfaceConflicts) {
+      lines.push(`- [${strVal(c.conflict_type, '?')}] ${strVal(c.description, '?')}`);
+    }
+    const overflow = qualConflictsTotal - qualSurfaceConflicts.length;
+    if (overflow > 0) {
+      lines.push(`- +${overflow} more not shown`);
+    }
+  }
+
   // Per-direction research pipeline: where is each active direction stuck/moving.
   const waiting = pipeline.filter(p => strVal(p.state as string) === 'research_waiting_on_action');
   const inProgress = pipeline.filter(p => strVal(p.state as string) === 'tasks_in_progress');

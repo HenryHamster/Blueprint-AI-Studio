@@ -2048,6 +2048,64 @@ def test_qual_state_unknown_status_passes_through():
     assert state["state"] == "some_new_status"
 
 
+def test_qual_state_error_no_credentials_is_in_vocab():
+    """status='error' with error='no_credentials' returns state='error' ∈ vocab."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "no_credentials"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    assert state["error"] == "no_credentials"
+    # Summary must mention credentials / config problem, not a passing audit.
+    assert "credentials" in state["summary"].lower() or "config" in state["summary"].lower()
+
+
+def test_qual_state_error_forwards_sub_reason_and_detail():
+    """status='error' forwards the error sub-reason and detail into the returned dict."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "sha_error", "detail": "ref not found"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["error"] == "sha_error"
+    assert state["detail"] == "ref not found"
+    assert "ref not found" in state["summary"]
+
+
+def test_qual_state_error_spawn_failed_is_in_vocab():
+    """status='error' with error='spawn_failed' returns state='error' ∈ vocab."""
+    state = rv.summarize_qualification_state(
+        {"status": "error", "error": "spawn_failed"}
+    )
+    assert state is not None
+    assert state["state"] == "error"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+
+
+def test_qual_state_infra_failure_is_in_vocab():
+    """status='infra_failure' returns state='infra_failure' ∈ vocab."""
+    state = rv.summarize_qualification_state({"status": "infra_failure"})
+    assert state is not None
+    assert state["state"] == "infra_failure"
+    assert state["state"] in rv.QUALIFICATION_STATE_VOCAB
+    # Summary must make clear this is non-conclusive and re-qualify is needed.
+    lowered = state["summary"].lower()
+    assert "non-conclusive" in lowered or "conclusive" in lowered
+    assert "re-qualify" in lowered
+
+
+def test_qual_state_infra_failure_forwards_detail():
+    """status='infra_failure' forwards detail into the returned dict and summary."""
+    state = rv.summarize_qualification_state(
+        {"status": "infra_failure", "detail": "executor OOM"}
+    )
+    assert state is not None
+    assert state["state"] == "infra_failure"
+    assert state["detail"] == "executor OOM"
+    assert "executor OOM" in state["summary"]
+
+
 # ===========================================================================
 # TestQualificationStateVocab — pin QUALIFICATION_STATE_VOCAB contract
 # ===========================================================================
@@ -2063,7 +2121,7 @@ class TestQualificationStateVocab:
         assert vocab, "vocab must not be empty"
         assert all(isinstance(s, str) for s in vocab)
 
-    def test_contains_all_14_states(self):
+    def test_contains_all_16_states(self):
         fixture_path = (
             Path(__file__).parent / "__fixtures__" / "qualification_state_vocab.json"
         )
@@ -2133,6 +2191,16 @@ class TestQualificationStateVocab:
             ),
             # deferred_unsynced
             ({"status": "deferred_unsynced"}, {}),
+            # error — no_credentials sub-reason
+            ({"status": "error", "error": "no_credentials"}, {}),
+            # error — sha_error sub-reason
+            ({"status": "error", "error": "sha_error"}, {}),
+            # error — spawn_failed sub-reason
+            ({"status": "error", "error": "spawn_failed"}, {}),
+            # error — unknown sub-reason (generic fallback)
+            ({"status": "error", "error": "unknown_reason"}, {}),
+            # infra_failure
+            ({"status": "infra_failure"}, {}),
         ],
     )
     def test_returned_state_is_in_vocab(self, verdict, kwargs):

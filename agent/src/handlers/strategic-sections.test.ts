@@ -642,6 +642,60 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).not.toContain('Merge-accounting drift');
     expect(result).not.toContain('NOT landed');
   });
+
+  it('renders qualification_surface_conflicts entries with conflict_type and description', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [
+        { conflict_type: 'status_state_mismatch', description: "last_qualification.status='pending' but qualification_state.state='not_started' (states do not align for this status)." },
+        { conflict_type: 'criterion_coverage_vs_confidence', description: 'Confidence 85.00% meets threshold 80.00%, but only 2/5 criteria are covered.' },
+      ],
+      counts: { qualification_surface_conflicts: 2 },
+    });
+    expect(result).toContain('Qualification surface conflicts — coherence disagreements (2)');
+    expect(result).toContain("[status_state_mismatch] last_qualification.status='pending' but qualification_state.state='not_started' (states do not align for this status).");
+    expect(result).toContain('[criterion_coverage_vs_confidence] Confidence 85.00% meets threshold 80.00%, but only 2/5 criteria are covered.');
+  });
+
+  it('omits the qualification_surface_conflicts section when the array is empty or absent', () => {
+    const withEmpty = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [],
+      counts: { qualification_surface_conflicts: 0 },
+    });
+    expect(withEmpty).not.toContain('Qualification surface conflicts');
+
+    const withAbsent = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      counts: {},
+    });
+    expect(withAbsent).not.toContain('Qualification surface conflicts');
+  });
+
+  it('shows +N more tail when counts.qualification_surface_conflicts exceeds shown entries', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      qualification_surface_conflicts: [
+        { conflict_type: 'stale_candidate_with_pending_status', description: 'Candidate currency says the pinned SHA is stale/behind HEAD, but last_qualification.status is pending.' },
+      ],
+      counts: { qualification_surface_conflicts: 4 },
+    });
+    expect(result).toContain('Qualification surface conflicts — coherence disagreements (4)');
+    expect(result).toContain('[stale_candidate_with_pending_status]');
+    expect(result).toContain('- +3 more not shown');
+  });
 });
 
 describe('buildPruneCandidatesSection', () => {

@@ -28,6 +28,7 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.release_artifacts import version_serving_summary as _version_serving_summary
+from app.qualification_state_resolver import resolve_effective_qualification_state
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
 from app import compute as _compute
@@ -222,6 +223,9 @@ async def _serialize_version_history_entry(
     )
 
     aggregate, artifacts = _version_serving_summary(version, project)
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate, artifacts)
+    )
 
     # Enrich each history entry with the same server-computed highlights and
     # merged counts the per-version summary endpoint produces, bounded by the
@@ -281,14 +285,7 @@ async def _serialize_version_history_entry(
         "aggregate_deploy_failure_reason": aggregate["reason_code"],
         "artifacts": artifacts,
         "serving": _compose_serving_block(aggregate, artifacts, version),
-        "qualification_state": _release_version.summarize_qualification_state(
-            version.last_qualification,
-            version.serving_status,
-            version.deploy_failure_reason,
-            aggregate_serving_status=aggregate["serving_status"],
-            aggregate_deploy_failure_reason=aggregate["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "abandoned_at": (
             (version.last_qualification or {}).get("abandoned_at")
             if version.status == "abandoned"
@@ -626,14 +623,11 @@ async def get_version_lifecycle(
             # so a crashed audit (terminal-failed, no report) reconciles to
             # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
             # badge and the audit-findings section then agree by construction.
-            qual_state = _release_version.summarize_qualification_state(
-                qual,
-                open_row.serving_status,
-                open_row.deploy_failure_reason,
+            qual_state, _ = resolve_effective_qualification_state(
+                open_row,
+                project_row,
                 audit_child=latest_audit,
-                aggregate_serving_status=aggregate_serving["serving_status"],
-                aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-                artifact_evidence=artifact_evidence,
+                serving=(aggregate_serving, artifact_evidence),
             )
 
             # Fetch live current_focus from the project's problem_model
@@ -1338,13 +1332,8 @@ async def get_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state = _release_version.summarize_qualification_state(
-        version.last_qualification,
-        version.serving_status,
-        version.deploy_failure_reason,
-        aggregate_serving_status=aggregate_serving["serving_status"],
-        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-        artifact_evidence=artifacts,
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate_serving, artifacts)
     )
 
     highlights = _release_version.build_version_highlights(
@@ -1701,13 +1690,8 @@ async def get_release_version_summary(
 
     aggregate_serving, artifacts = _version_serving_summary(version, project)
 
-    qualification_state = _release_version.summarize_qualification_state(
-        version.last_qualification,
-        version.serving_status,
-        version.deploy_failure_reason,
-        aggregate_serving_status=aggregate_serving["serving_status"],
-        aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-        artifact_evidence=artifacts,
+    qualification_state, _ = resolve_effective_qualification_state(
+        version, project, serving=(aggregate_serving, artifacts)
     )
 
     # Derive highlights from the data above — no extra I/O. Shared helper so the

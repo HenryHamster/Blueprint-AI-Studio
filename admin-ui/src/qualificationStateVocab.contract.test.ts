@@ -33,6 +33,8 @@ const ALL_QUAL_STATE_VALUES: QualificationStateValue[] = [
   'audit_crashed',
   'deferred_unsynced',
   'dry_run',
+  'error',
+  'infra_failure',
   'not_promoted',
   'promoted',
   'promoted_unconfirmed',

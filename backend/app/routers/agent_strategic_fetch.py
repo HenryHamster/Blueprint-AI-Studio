@@ -32,6 +32,7 @@ from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledg
 from app.message_convergence import get_message_link, resolve_message_ref
 from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task
 from app.project_message_projection import agent_fetch_message_dict
+from app.qualification_state_resolver import apply_verdict_substitution
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
 from app.source_ref_validation import (
@@ -154,18 +155,13 @@ def _compose_serving_block(
     }
 
 
-_FINALIZED_TERMINAL_STATUSES = frozenset(
-    {"promoted", "not_promoted", "dry_run", "promotion_failed"}
-)
-
-
 def _compact_version_lifecycle(
     version: ReleaseVersion,
     project: Project,
     *,
     latest_verdict: "QualificationVerdict | None" = None,
 ) -> dict[str, Any]:
-    from app import release_version as _release_version
+    from app.qualification_state_resolver import resolve_effective_qualification_state
     from app.release_artifacts import version_serving_summary
 
     aggregate_serving, artifacts = version_serving_summary(version, project)
@@ -175,24 +171,15 @@ def _compact_version_lifecycle(
         else {}
     )
 
-    # Detect pending/verdict disagreement: last_qualification is in a transient
-    # promotion_pending state but the verdict row already has a finalized outcome.
-    verdict_disagreement: dict[str, Any] | None = None
-    effective_qual = qual
-    if (
-        latest_verdict is not None
-        and qual.get("status") == "pending"
-        and isinstance(qual.get("promotion_pending"), dict)
-        and latest_verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
-    ):
-        verdict_disagreement = {
-            "last_qualification_status": "pending",
-            "verdict_terminal_status": latest_verdict.terminal_status,
-        }
-        # Use the finalized verdict status so summarize_qualification_state sees
-        # the resolved outcome instead of the transient promotion_in_flight state.
-        effective_qual = {**qual, "status": latest_verdict.terminal_status}
-        effective_qual.pop("promotion_pending", None)
+    # Derive the effective qualification_state through the shared resolver so the
+    # finalized-verdict substitution (transient promotion_pending superseded by a
+    # finalized verdict row) is applied identically across every read surface.
+    qualification_state, verdict_disagreement = resolve_effective_qualification_state(
+        version,
+        project,
+        latest_verdict=latest_verdict,
+        serving=(aggregate_serving, artifacts),
+    )
 
     out = {
         "id": str(version.id),
@@ -209,14 +196,7 @@ def _compact_version_lifecycle(
         "qualification_attempts": version.qualification_attempts,
         "active_candidate_sha": qual.get("candidate_sha"),
         "last_qualification": _compact_last_qualification(qual),
-        "qualification_state": _release_version.summarize_qualification_state(
-            effective_qual,
-            version.serving_status,
-            version.deploy_failure_reason,
-            aggregate_serving_status=aggregate_serving["serving_status"],
-            aggregate_deploy_failure_reason=aggregate_serving["reason_code"],
-            artifact_evidence=artifacts,
-        ),
+        "qualification_state": qualification_state,
         "serving_status": version.serving_status,
         "served_sha": version.served_sha,
         "served_at": _iso(version.served_at),
@@ -642,19 +622,16 @@ async def agent_fetch_qualification(
         # agent sees the resolved disposition instead of the stale pending.
         lq = open_row.last_qualification or {}
         lq_status = lq.get("status")
-        lq_has_promotion_pending = isinstance(lq.get("promotion_pending"), dict)
-        verdict_is_finalized = verdict.terminal_status in _FINALIZED_TERMINAL_STATUSES
 
-        source_disagreement: dict[str, Any] | None = None
-        if lq_status == "pending" and lq_has_promotion_pending and verdict_is_finalized:
+        # Detect (and record) the transient pending vs finalized-verdict
+        # disagreement through the shared resolver primitive so the agent fetch
+        # verb and the version-phase surface classify this window identically.
+        _, source_disagreement = apply_verdict_substitution(lq, verdict)
+        if source_disagreement is not None:
             resolved_status = verdict.terminal_status
             resolved_finalized_at = (
                 verdict.finalized_at.isoformat() if verdict.finalized_at else None
             )
-            source_disagreement = {
-                "last_qualification_status": lq_status,
-                "verdict_terminal_status": verdict.terminal_status,
-            }
         else:
             resolved_status = lq_status or verdict.terminal_status
             resolved_finalized_at = lq.get("finalized_at") or (

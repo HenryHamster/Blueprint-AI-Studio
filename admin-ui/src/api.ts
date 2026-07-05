@@ -2217,7 +2217,9 @@ export type QualificationStateValue =
   | 'promoted_unconfirmed'
   | 'promotion_deploy_failed'
   | 'promotion_confirmation_timed_out'
-  | 'deferred_unsynced';
+  | 'deferred_unsynced'
+  | 'error'
+  | 'infra_failure';
 
 export interface QualificationState {
   state: QualificationStateValue;

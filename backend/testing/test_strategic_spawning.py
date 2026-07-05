@@ -12766,6 +12766,9 @@ class TestBuildCycleStartReconciliation:
         assert out["counts"]["qualification_prose_drift"] == 0
 
     def test_qualification_surface_conflicts_stale_candidate_with_pending_status(self):
+        # A stale candidate with status="pending" (active qualification in flight)
+        # should NOT raise a conflict — integration-branch drift during active
+        # qualification is expected, not a surface disagreement.
         from app.strategic_spawning import _build_cycle_start_reconciliation
 
         direction_stats = [
@@ -12799,7 +12802,47 @@ class TestBuildCycleStartReconciliation:
         )
         assert out is not None
         conflicts = out["qualification_surface_conflicts"]
-        assert len(conflicts) >= 1
+        stale_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "stale_candidate_with_pending_status"
+        ]
+        # pending + stale is normal during active qualification; NOT a conflict
+        assert len(stale_conflicts) == 0
+
+    def test_qualification_surface_conflicts_stale_candidate_with_promotion_failed(self):
+        # A stale candidate with status="promotion_failed" IS a genuine conflict
+        # — the version should have advanced its candidate after failure.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "stale",
+                "resolved": True,
+                "current": False,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "9998887776665554443",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
         stale_conflicts = [
             c
             for c in conflicts
@@ -12807,7 +12850,7 @@ class TestBuildCycleStartReconciliation:
         ]
         assert len(stale_conflicts) == 1
         assert "stale" in stale_conflicts[0]["description"].lower()
-        assert "pending" in stale_conflicts[0]["description"].lower()
+        assert "promotion_failed" in stale_conflicts[0]["description"]
 
     def test_qualification_surface_conflicts_status_state_mismatch(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
@@ -12932,8 +12975,7 @@ class TestBuildCycleStartReconciliation:
     def test_qualification_surface_conflicts_promotion_readiness_unready(self):
         # promotion_readiness.ready=False while last_qualification.status=
         # "promotion_failed" should produce a promotion_readiness_unready
-        # conflict. ("passed" is not a real last_qualification.status value —
-        # the persisted vocabulary is pending/promotion_failed/promoted/etc.)
+        # conflict when is_current_readiness=True (pre-go-live calibration mode).
         from app.strategic_spawning import _build_cycle_start_reconciliation
 
         direction_stats = [
@@ -12965,6 +13007,9 @@ class TestBuildCycleStartReconciliation:
             },
             "promotion_readiness": {
                 "ready": False,
+                # is_current_readiness=True: pre-go-live calibration regime
+                # where ready=False reflects actual track-record failure.
+                "is_current_readiness": True,
             },
         }
         out = _build_cycle_start_reconciliation(
@@ -12983,6 +13028,60 @@ class TestBuildCycleStartReconciliation:
         assert len(pr_conflicts) == 1
         assert "not ready" in pr_conflicts[0]["description"].lower()
         assert "promotion_failed" in pr_conflicts[0]["description"]
+
+    def test_promotion_readiness_unready_suppressed_in_live_regime(self):
+        # When is_current_readiness=False (live regime), promotion_readiness
+        # forced ready=False by _annotate_regime is a regime relabel, not a
+        # genuine track-record failure — the conflict must NOT be raised.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": False,
+                # is_current_readiness=False: live regime, ready=False is a
+                # regime relabel by _annotate_regime, not a real conflict.
+                "is_current_readiness": False,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        pr_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "promotion_readiness_unready"
+        ]
+        # Live-regime forced ready=False must not surface as a conflict
+        assert len(pr_conflicts) == 0
 
     def test_qualification_surface_conflicts_absent_without_version_phase_block(self):
         # When version_phase_block is None (no LTS split), the check simply

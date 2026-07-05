@@ -3737,6 +3737,95 @@ async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_
 
 
 # ---------------------------------------------------------------------------
+# Shared effective-qualification-state resolver primitives
+#
+# The agent fetch verb (agent_fetch_qualification) and the version-phase surface
+# (_compact_version_lifecycle) both delegate their pending-vs-finalized-verdict
+# reconciliation to app.qualification_state_resolver.apply_verdict_substitution,
+# so the endpoint tests above exercise this production code end-to-end. These
+# unit tests pin the shared primitive's contract directly.
+# ---------------------------------------------------------------------------
+
+
+def _fake_verdict(terminal_status):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(terminal_status=terminal_status)
+
+
+def test_apply_verdict_substitution_finalized_verdict_supersedes_pending():
+    """A finalized verdict supersedes a transient pending+promotion_pending record."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = {
+        "status": "pending",
+        "candidate_sha": "a" * 40,
+        "promotion_pending": {"pr_number": 42},
+    }
+    effective, disagreement = apply_verdict_substitution(
+        qual, _fake_verdict("promoted")
+    )
+
+    # Effective record adopts the verdict's finalized status and drops the
+    # transient promotion_pending sub-key so the classifier sees the resolution.
+    assert effective["status"] == "promoted"
+    assert "promotion_pending" not in effective
+    assert effective["candidate_sha"] == "a" * 40
+    # The original dict is not mutated in place.
+    assert qual["status"] == "pending"
+    assert "promotion_pending" in qual
+    # Disagreement records both sides for surfacing.
+    assert disagreement == {
+        "last_qualification_status": "pending",
+        "verdict_terminal_status": "promoted",
+    }
+
+
+def test_apply_verdict_substitution_non_finalized_verdict_is_noop():
+    """A non-finalized verdict terminal_status leaves the pending record untouched."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = {"status": "pending", "promotion_pending": {"pr_number": 7}}
+    # ``pending`` is not in FINALIZED_TERMINAL_STATUSES.
+    effective, disagreement = apply_verdict_substitution(qual, _fake_verdict("pending"))
+
+    assert effective is qual
+    assert disagreement is None
+
+
+def test_apply_verdict_substitution_requires_promotion_pending():
+    """Without a promotion_pending sub-key the substitution does not fire."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = {"status": "pending"}
+    effective, disagreement = apply_verdict_substitution(qual, _fake_verdict("promoted"))
+
+    assert effective is qual
+    assert disagreement is None
+
+
+def test_apply_verdict_substitution_no_verdict_or_non_pending_status():
+    """No verdict, or a non-pending status, is a no-op regardless of the verdict."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    pending = {"status": "pending", "promotion_pending": {"pr_number": 1}}
+    # No verdict at all.
+    effective, disagreement = apply_verdict_substitution(pending, None)
+    assert effective is pending and disagreement is None
+
+    # Already-terminal status is never overwritten even when a verdict exists.
+    promoted = {"status": "promoted", "promotion_pending": {"pr_number": 2}}
+    effective, disagreement = apply_verdict_substitution(
+        promoted, _fake_verdict("not_promoted")
+    )
+    assert effective is promoted and disagreement is None
+
+    # None / non-dict input degrades to an empty dict without raising.
+    effective, disagreement = apply_verdict_substitution(None, _fake_verdict("promoted"))
+    assert effective == {} and disagreement is None
+
+
+# ---------------------------------------------------------------------------
 # compute-sweeps recovery endpoints + sweep_id filter on knowledge-documents
 # ---------------------------------------------------------------------------
 

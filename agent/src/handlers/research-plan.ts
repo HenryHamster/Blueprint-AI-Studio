@@ -514,6 +514,8 @@ export const QUALIFICATION_STATE_VOCAB: ReadonlySet<string> = new Set([
   'audit_crashed',
   'deferred_unsynced',
   'dry_run',
+  'error',
+  'infra_failure',
   'not_promoted',
   'promoted',
   'promoted_unconfirmed',

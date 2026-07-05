@@ -321,6 +321,12 @@ export const QUAL_STATE_STYLE: Record<QualificationStateValue, string> = {
   promotion_confirmation_timed_out: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   not_promoted: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
   deferred_unsynced: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
+  // Qualification failed to start/complete due to a setup or operational error
+  // (no_credentials, sha_error, spawn_failed) — loud red, config/human action needed.
+  error: 'bg-red-500/10 border-red-500/30 text-red-400',
+  // Audit infra failed mid-execution, no conclusive verdict — amber/caution to
+  // distinguish from a setup error; re-qualify is the path forward.
+  infra_failure: 'bg-amber-500/10 border-amber-500/30 text-amber-400',
 };
 
 type PromotionFreshnessContext = {

@@ -111,6 +111,8 @@ QUALIFICATION_STATE_VOCAB: frozenset[str] = frozenset(
         "promotion_deploy_failed",
         "promotion_confirmation_timed_out",
         "deferred_unsynced",
+        "error",
+        "infra_failure",
     }
 )
 
@@ -1017,6 +1019,58 @@ def summarize_qualification_state(
                 "fall-through qualifies anyway if the back-merge stalls)."
             ),
         }
+    if status == "error":
+        error_sub = lq.get("error")
+        detail = lq.get("detail")
+        if error_sub == "no_credentials":
+            sub_summary = (
+                "Qualification FAILED to start: no credentials are configured. "
+                "This is a configuration/human problem — fix the credentials, "
+                "then re-qualify."
+            )
+        elif error_sub == "sha_error":
+            sub_summary = (
+                "Qualification FAILED: the candidate SHA could not be resolved. "
+                "Re-qualify on a fresh candidate."
+            )
+        elif error_sub == "spawn_failed":
+            sub_summary = (
+                "Qualification FAILED to start: the audit/smoketest spawn failed. "
+                "This is an operational problem — re-qualify to retry."
+            )
+        else:
+            sub_summary = (
+                "Qualification FAILED due to a setup or operational error"
+                + (f" ({error_sub})" if error_sub else "")
+                + ". This is NON-conclusive (no verdict). Re-qualify to retry."
+            )
+        if detail:
+            sub_summary += f" Detail: {detail}."
+        return {
+            "state": "error",
+            "summary": sub_summary,
+            "error": error_sub,
+            "detail": detail,
+        }
+    if status == "infra_failure":
+        detail = lq.get("detail")
+        return {
+            "state": "infra_failure",
+            "summary": (
+                "Qualification audit INFRA FAILED mid-execution — the "
+                "infrastructure could not produce a conclusive verdict. "
+                "This is NON-conclusive (no score, no promotion decision). "
+                "Re-qualify to get a fresh verdict."
+                + (f" Detail: {detail}." if detail else "")
+            ),
+            "detail": detail,
+        }
+    logger.warning(
+        "[RELEASE_VERSION] summarize_qualification_state: unrecognized status %r; "
+        "passing through as-is — update QUALIFICATION_STATE_VOCAB if this is a new "
+        "producer status",
+        status,
+    )
     return {"state": status, "summary": f"Qualification status: {status}."}
 
 
