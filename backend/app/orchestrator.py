@@ -3079,6 +3079,46 @@ async def _persist_requeue_dep_remap(task: Task, deps_remapped: dict[str, str]) 
     return True
 
 
+def _select_cycle_sleep(
+    *,
+    consecutive_errors: int,
+    consecutive_monitoring_errors: int,
+    cycle_dispatched: int,
+    error_backoff: float,
+    monitoring_backoff: float,
+    fast_interval: float = 0.5,
+    idle_interval: float = 5.0,
+) -> float:
+    """Pick the post-cycle sleep duration for the orchestrator main loop.
+
+    The fast path (``fast_interval``) is gated on ACTUAL dispatch progress this
+    cycle (``cycle_dispatched > 0``), NOT on queue-presence. Tasks can sit
+    QUEUED-but-undispatchable for many cycles — warm-pin skip-provision,
+    strategic-local-runner hold, project resource/spend defer, no-credentials,
+    backlog-reuse first-refusal — without ever incrementing ``cycle_dispatched``.
+    Gating the fast path on ``queued_tasks`` being non-empty (the old behavior)
+    made the loop spin at 2 Hz whenever any such held task existed, re-running the
+    whole dispatch + review/PR + monitoring pass to no effect (~10x load
+    amplifier, WI-4).
+
+    ``cycle_dispatched`` increments only where a task actually moves OUT of
+    QUEUED, so if a task were genuinely dispatchable the loop would have
+    dispatched it and bumped the counter. ``cycle_dispatched == 0`` therefore
+    provably means nothing was dispatchable this cycle — back off to
+    ``idle_interval``. The extra idle wait only delays noticing external state
+    changes (a slot freeing, an account recovering, a runner registering), all
+    second-to-minute-scale; CI polling is already 30s-gated + webhook-driven, and
+    per-cycle health checks still run at the 5s idle cadence when slots are full.
+    """
+    if consecutive_errors > 0:
+        return error_backoff
+    if consecutive_monitoring_errors > 0:
+        return monitoring_backoff
+    if cycle_dispatched > 0:
+        return fast_interval
+    return idle_interval
+
+
 async def orchestrator_worker():
     """
     Background worker that polls for QUEUED tasks and provisions VMs.
@@ -3163,6 +3203,13 @@ async def orchestrator_worker():
         _last_local_runner_hold_sweep
     while True:
         queued_tasks = []
+        # Reset at the very top of the loop body (before the try) so a stale
+        # count from a prior cycle can never leak into the end-of-cycle sleep
+        # decision (_select_cycle_sleep). The authoritative per-cycle reset still
+        # lives with its sibling counters inside the dispatch block below; this
+        # is defensive belt-and-suspenders in case any early-exit path reaches
+        # the sleep decision without having entered that block.
+        _cycle_dispatched = 0
         session = None  # defined before try so except handler can reference it
         try:
             _orchestrator_cycle_started = _utcnow()
@@ -9061,20 +9108,31 @@ async def orchestrator_worker():
                 exc_info=True,
             )
 
-        # Sleep based on whether we found tasks
+        # Sleep based on whether the cycle made real dispatch progress.
+        # Fast path is gated on _cycle_dispatched (a task actually left QUEUED),
+        # NOT on queued_tasks being non-empty — a held/deferred but undispatchable
+        # task kept the queue non-empty and spun the loop at 2 Hz (WI-4). See
+        # _select_cycle_sleep for the full rationale.
         try:
-            if _orchestrator_consecutive_errors > 0:
-                backoff = exponential_backoff(_orchestrator_consecutive_errors)
-                await asyncio.sleep(backoff)
-            elif _orchestrator_consecutive_monitoring_errors > 0:
-                monitoring_backoff = exponential_backoff(
-                    _orchestrator_consecutive_monitoring_errors
+            _cycle_error_backoff = (
+                exponential_backoff(_orchestrator_consecutive_errors)
+                if _orchestrator_consecutive_errors > 0
+                else 0.0
+            )
+            _cycle_monitoring_backoff = (
+                exponential_backoff(_orchestrator_consecutive_monitoring_errors)
+                if _orchestrator_consecutive_monitoring_errors > 0
+                else 0.0
+            )
+            await asyncio.sleep(
+                _select_cycle_sleep(
+                    consecutive_errors=_orchestrator_consecutive_errors,
+                    consecutive_monitoring_errors=_orchestrator_consecutive_monitoring_errors,
+                    cycle_dispatched=_cycle_dispatched,
+                    error_backoff=_cycle_error_backoff,
+                    monitoring_backoff=_cycle_monitoring_backoff,
                 )
-                await asyncio.sleep(monitoring_backoff)
-            elif queued_tasks:
-                await asyncio.sleep(0.5)
-            else:
-                await asyncio.sleep(5)
+            )
             # Check autonomous research every cycle — interval gate inside handles throttling.
             # Spawns only when VM slots are available (not tied to queue being empty).
             await _bounded_leader_step(

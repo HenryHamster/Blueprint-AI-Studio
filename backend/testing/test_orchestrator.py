@@ -75,6 +75,74 @@ def test_resolved_red_ci_status_handoff_falls_back_to_check_names():
     assert result["failed_logs"] == "CI checks failed: CI / Backend, CI / Frontend"
 
 
+# ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
+
+
+def test_select_cycle_sleep_backs_off_when_nothing_dispatched():
+    """A cycle whose only queued tasks are held/deferred dispatches nothing
+    (_cycle_dispatched == 0) ⇒ the loop takes the slow 5s idle path, NOT the
+    2 Hz fast path. This is the WI-4 fix: queue-presence alone no longer spins."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=0,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 5.0
+
+
+def test_select_cycle_sleep_fast_path_when_dispatch_made_progress():
+    """A cycle that actually moved a task out of QUEUED (_cycle_dispatched > 0)
+    grabs the next batch on the 0.5s fast path."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=3,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 0.5
+
+
+def test_select_cycle_sleep_error_backoff_wins_over_dispatch():
+    """Consecutive cycle errors take the error backoff even if the cycle also
+    dispatched — the error path has highest precedence."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=2,
+        consecutive_monitoring_errors=0,
+        cycle_dispatched=5,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 99.0
+
+
+def test_select_cycle_sleep_monitoring_backoff_wins_over_dispatch():
+    """Monitoring errors (no cycle errors) take the monitoring backoff even if
+    the cycle dispatched work."""
+    from app.orchestrator import _select_cycle_sleep
+
+    sleep = _select_cycle_sleep(
+        consecutive_errors=0,
+        consecutive_monitoring_errors=1,
+        cycle_dispatched=5,
+        error_backoff=99.0,
+        monitoring_backoff=88.0,
+    )
+
+    assert sleep == 88.0
+
+
 # ── Helper: redirect AsyncSessionLocal to the test database ─────────────────
 
 
