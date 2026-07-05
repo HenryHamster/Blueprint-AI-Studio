@@ -948,7 +948,7 @@ def test_open_debt_still_idempotent_after_reopen_fix(sync_session):
 
 @pytest.mark.asyncio
 async def test_knob_graduation_resolves_dormant_debt(db_session):
-    """Patching a dormant knob to 'enforce' via _apply_settings resolves its debt."""
+    """Patching a dormant knob to 'enforce' and back re-resolves and reopens its debt."""
     from app.routers.admin_settings import _apply_settings
 
     # Seed the dormant-knob debt row for evergreen_fill_mode.
@@ -979,6 +979,114 @@ async def test_knob_graduation_resolves_dormant_debt(db_session):
     assert row.status == cd.STATUS_RESOLVED, (
         "graduating evergreen_fill_mode to 'enforce' must resolve its completion-debt entry"
     )
+
+    await _apply_settings({"evergreen_fill_mode": "observe"}, db_session, _rc)
+    db_session.expire_all()
+
+    reopened_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == "dormant_knob:evergreen_fill_mode"
+            )
+        )
+    ).scalar_one()
+    assert reopened_row.status == cd.STATUS_OPEN, (
+        "demoting evergreen_fill_mode back to 'observe' must reopen its completion-debt entry"
+    )
+
+
+@pytest.mark.asyncio
+async def test_dormant_knob_reconciliation_recovers_env_graduation_and_demotion(
+    db_session, monkeypatch
+):
+    """Startup-style reconciliation must resolve stale rows and reopen them."""
+    from app.completion_debt import areconcile_dormant_knob_debts
+
+    key = "dormant_knob:safeguard_challenge_gate_mode"
+    seeded = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=key,
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Safeguard challenge gate is observe-only",
+        project_id=None,
+    )
+    await db_session.commit()
+    assert seeded is True
+
+    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "enforce")
+    stats = await areconcile_dormant_knob_debts(db_session)
+    await db_session.commit()
+    db_session.expire_all()
+
+    resolved_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert resolved_row.status == cd.STATUS_RESOLVED
+    assert stats["resolved"] >= 1
+
+    monkeypatch.setitem(runtime_config, "safeguard_challenge_gate_mode", "observe")
+    stats = await areconcile_dormant_knob_debts(db_session)
+    await db_session.commit()
+    db_session.expire_all()
+
+    reopened_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert reopened_row.status == cd.STATUS_OPEN
+    assert stats["opened"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_dormant_knob_reconciliation_leaves_manual_debts_open(db_session):
+    """Reconciliation must not resolve dormant_knob rows it does not own.
+
+    A dormant_knob obligation recorded outside the runtime-config registry
+    (manual/strategist/admin flows: non-registry dedupe key, different source)
+    has no corresponding knob in ``iter_dormant_knob_debts`` — it must survive
+    reconciliation untouched, not be swept as ``graduated:runtime-config``.
+    """
+    from app.completion_debt import areconcile_dormant_knob_debts
+
+    key = "dormant_knob:manual:external-integration-followup"
+    seeded = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=key,
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Manually tracked dormant integration",
+        project_id=None,
+        source="admin_agent_ops",
+    )
+    await db_session.commit()
+    assert seeded is True
+
+    await areconcile_dormant_knob_debts(db_session)
+    await db_session.commit()
+    db_session.expire_all()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_OPEN, (
+        "manual dormant_knob debt must not be resolved by registry reconciliation"
+    )
+
+    # And the same holds for the PATCH-settings path (explicit runtime_config).
+    await areconcile_dormant_knob_debts(db_session, dict(runtime_config))
+    await db_session.commit()
+    db_session.expire_all()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_OPEN
 
 
 # ── Dormant-knob registry completeness ───────────────────────────────────
@@ -1035,6 +1143,55 @@ def test_completion_debt_weight_mode_seeds_dormant_debt(monkeypatch):
     monkeypatch.setitem(runtime_config, "completion_debt_weight_mode", "enforce")
     enforced_keys = {d["dedupe_key"] for d in iter_dormant_knob_debts()}
     assert "dormant_knob:completion_debt_weight_mode" not in enforced_keys
+
+
+@pytest.mark.asyncio
+async def test_autonomous_spawn_budget_mode_seeds_and_graduates_dormant_debt(db_session):
+    """autonomous_spawn_budget_mode in observe mode must seed and then resolve
+    its dormant-knob debt when graduated to enforce."""
+    from app.routers.admin_settings import _apply_settings
+
+    assert str(runtime_config.get("autonomous_spawn_budget_mode")).lower() == "observe"
+
+    debts = iter_dormant_knob_debts()
+    by_key = {d["dedupe_key"]: d for d in debts}
+    assert "dormant_knob:autonomous_spawn_budget_mode" in by_key, (
+        "autonomous_spawn_budget_mode in observe mode must seed its dormant-knob debt"
+    )
+    entry = by_key["dormant_knob:autonomous_spawn_budget_mode"]
+    assert entry["kind"] == "dormant_knob"
+    assert entry["detail"] == {
+        "knob": "autonomous_spawn_budget_mode",
+        "value": "observe",
+    }
+
+    seeded = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key="dormant_knob:autonomous_spawn_budget_mode",
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Autonomous spawn-budget mode observe-only pending dedicated rollout",
+        project_id=None,
+    )
+    await db_session.commit()
+    assert seeded is True
+
+    _rc: dict = {"autonomous_spawn_budget_mode": "observe"}
+    await _apply_settings({"autonomous_spawn_budget_mode": "enforce"}, db_session, _rc)
+    assert _rc["autonomous_spawn_budget_mode"] == "enforce"
+    db_session.expire_all()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key
+                == "dormant_knob:autonomous_spawn_budget_mode"
+            )
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED, (
+        "graduating autonomous_spawn_budget_mode to 'enforce' must resolve its "
+        "completion-debt entry"
+    )
 
 
 @pytest.mark.asyncio

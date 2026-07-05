@@ -1196,6 +1196,9 @@ _DORMANT_MODE_KNOBS = {
     "metrics_integrity_sweep_mode": (
         "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
     ),
+    "autonomous_spawn_budget_mode": (
+        "Autonomous spawn-budget mode observe-only pending dedicated rollout"
+    ),
     "safeguard_challenge_gate_mode": (
         "Safeguard challenge gate in observe-only shadow mode"
     ),

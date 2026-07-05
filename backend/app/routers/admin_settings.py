@@ -919,6 +919,10 @@ async def _apply_settings(
             )
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if _runtime_config["autonomous_spawn_budget_mode"] == "enforce":
+            _debt_keys_to_resolve.append(
+                "dormant_knob:autonomous_spawn_budget_mode"
+            )
     if "max_global_autonomous_initiative_tasks_per_hour" in payload:
         try:
             _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = (
@@ -3020,6 +3024,12 @@ async def _apply_settings(
 
         for _dk in _debt_keys_to_resolve:
             await aresolve_completion_debt(session, _dk, reason="graduated:enforce")
+
+    # Best-effort: reconcile the full dormant-knob registry against the new
+    # runtime config so demotions back to observe/off reopen immediately.
+    from app.completion_debt import areconcile_dormant_knob_debts
+
+    await areconcile_dormant_knob_debts(session, _runtime_config)
 
     # Detect a genuine warm_pool_enabled True→False transition. Computed here —
     # after all config changes but before the DB persist block — so the flag is

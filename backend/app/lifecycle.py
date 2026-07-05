@@ -214,6 +214,32 @@ async def _seed_completion_debt_inventory():
         )
 
 
+async def _reconcile_dormant_knob_debts():
+    """Reconcile dormant-knob debts against the current runtime config.
+
+    Best-effort and idempotent: a reconciliation failure must never abort
+    startup, and repeated startup calls should converge to the same ledger
+    state even when knobs graduate outside the PATCH handler.
+    """
+    try:
+        from app.completion_debt import areconcile_dormant_knob_debts
+
+        async with AsyncSessionLocal() as seed_session:
+            stats = await areconcile_dormant_knob_debts(seed_session)
+            await seed_session.commit()
+        if stats["opened"] or stats["resolved"]:
+            logger.info(
+                "[STARTUP] Reconciled dormant-knob debts (opened=%d resolved=%d)",
+                stats["opened"],
+                stats["resolved"],
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] dormant-knob debt reconciliation failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _seed_completion_debt_design_doc():
     """Seed the completion-debt design-doc section for all projects.
 
@@ -490,6 +516,10 @@ async def lifespan(app):
     # Seed the completion-debt ledger from the standing HEAD dormant-state
     # inventory (idempotent: dedupe_key upserts, so restarts never duplicate).
     await _seed_completion_debt_inventory()
+
+    # Reconcile dormant-knob debt rows against the current runtime config so
+    # env-var/redeploy graduations and live demotions converge immediately.
+    await _reconcile_dormant_knob_debts()
 
     # Seed the completion-debt design-doc section for all projects (idempotent:
     # absent sections are seeded, existing sections only refresh code fields).

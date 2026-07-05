@@ -9105,6 +9105,44 @@ class TestEvergreenFillSettingsPersist:
         )
 
     @pytest.mark.asyncio
+    async def test_autonomous_spawn_budget_mode_graduation_resolves_debt_via_settings(
+        self, client: AsyncClient, db_session
+    ):
+        """PATCH /api/admin/settings resolves the seeded dormant debt when the
+        spawn-budget mode graduates to enforce."""
+        from app.models import CompletionDebtEntry, DeploymentState
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        seeded = CompletionDebtEntry(
+            project_id=None,
+            dedupe_key="dormant_knob:autonomous_spawn_budget_mode",
+            kind="dormant_knob",
+            title="Autonomous spawn-budget mode observe-only pending dedicated rollout",
+        )
+        db_session.add(seeded)
+        await db_session.commit()
+        await db_session.refresh(seeded)
+
+        original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+        try:
+            resp = await client.patch(
+                "/api/admin/settings",
+                json={"autonomous_spawn_budget_mode": "enforce"},
+            )
+            assert resp.status_code == 200, resp.text
+            assert resp.json()["autonomous_spawn_budget_mode"] == "enforce"
+
+            await db_session.refresh(seeded)
+            assert seeded.status == "resolved"
+            assert seeded.resolution_reason == "graduated:enforce"
+        finally:
+            _shared_state.runtime_config["autonomous_spawn_budget_mode"] = (
+                original_mode
+            )
+
+    @pytest.mark.asyncio
     async def test_autonomous_spawn_budget_settings_validate_categories(
         self, client: AsyncClient
     ):

@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
@@ -856,6 +856,99 @@ async def aseed_completion_debt_inventory(session: Any) -> int:
         if await arecord_completion_debt(session, **item):
             created += 1
     return created
+
+
+async def areconcile_dormant_knob_debts(
+    session: Any, runtime_config: Mapping[str, Any] | None = None
+) -> dict[str, int]:
+    """Best-effort reconcile dormant-knob debt rows against runtime config.
+
+    Current dormant knobs are (re)opened if needed. Dormant-knob rows whose
+    key is no longer dormant are resolved in place so startup and live settings
+    changes converge immediately instead of waiting for a later seed pass.
+    """
+    stats = {"opened": 0, "resolved": 0}
+    if session is None:
+        return stats
+    try:
+        from app.models import CompletionDebtEntry
+        from app.runtime_config_state import (
+            _DORMANT_KNOB_VALUES,
+            _DORMANT_MODE_KNOBS,
+            _DORMANT_OFF_FLAGS,
+        )
+
+        # Dedupe keys the knob registry owns. Stale resolution below must only
+        # touch these (or rows the registry itself wrote) — dormant_knob debts
+        # recorded through other flows (strategist/admin, project-scoped) are
+        # NOT ours to resolve just because no current knob produces their key.
+        registry_keys = {
+            f"dormant_knob:{key}"
+            for key in (*_DORMANT_MODE_KNOBS, *_DORMANT_OFF_FLAGS)
+        }
+
+        if runtime_config is None:
+            from app.runtime_config_state import iter_dormant_knob_debts
+
+            dormant_by_key = {
+                item["dedupe_key"]: item for item in iter_dormant_knob_debts()
+            }
+        else:
+            dormant_by_key = {}
+            for key, title in _DORMANT_MODE_KNOBS.items():
+                value = str(runtime_config.get(key, "")).lower()
+                if value in _DORMANT_KNOB_VALUES:
+                    dormant_by_key[f"dormant_knob:{key}"] = {
+                        "dedupe_key": f"dormant_knob:{key}",
+                        "kind": KIND_DORMANT_KNOB,
+                        "title": title,
+                        "project_id": None,
+                        "source": "runtime_config_state",
+                        "detail": {"knob": key, "value": value},
+                    }
+            for key, title in _DORMANT_OFF_FLAGS.items():
+                if not runtime_config.get(key, False):
+                    dormant_by_key[f"dormant_knob:{key}"] = {
+                        "dedupe_key": f"dormant_knob:{key}",
+                        "kind": KIND_DORMANT_KNOB,
+                        "title": title,
+                        "project_id": None,
+                        "source": "runtime_config_state",
+                        "detail": {"knob": key, "value": bool(runtime_config.get(key))},
+                    }
+
+        for item in dormant_by_key.values():
+            if await arecord_completion_debt(session, **item):
+                stats["opened"] += 1
+
+        stale_rows = (
+            await session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.kind == KIND_DORMANT_KNOB,
+                    CompletionDebtEntry.status == STATUS_OPEN,
+                )
+            )
+        ).scalars().all()
+        for entry in stale_rows:
+            if entry.dedupe_key in dormant_by_key:
+                continue
+            registry_owned = (
+                entry.dedupe_key in registry_keys
+                or entry.source == "runtime_config_state"
+            )
+            if not registry_owned:
+                continue
+            if await aresolve_completion_debt(
+                session, entry.dedupe_key, reason="graduated:runtime-config"
+            ):
+                stats["resolved"] += 1
+        return stats
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to reconcile dormant knob debts",
+            exc_info=True,
+        )
+        return stats
 
 
 def _build_completion_debt_design_doc_section() -> dict:
