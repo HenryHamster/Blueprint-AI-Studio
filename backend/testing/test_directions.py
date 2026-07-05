@@ -8889,6 +8889,98 @@ async def test_strategic_cycle_endpoint_defaults_to_main(
         assert t.first_payload.get("base_branch") == "main"
 
 
+@pytest.mark.asyncio
+async def test_manual_strategic_cycle_ignores_exhausted_initiative_budget(
+    client: AsyncClient, db_session
+):
+    """The operator /strategic-cycle path should not inherit the autonomous initiative cap."""
+    project = await _make_strategic_project(db_session, "manual strategic budget")
+    project.build_config = {"bootstrap_completed_at": "2026-01-01T00:00:00"}
+    await db_session.commit()
+
+    budget_source = Project(name="budget source", user_id="test-user-123")
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    original_mode = _runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _runtime_config["max_global_autonomous_tasks_per_hour"]
+    _runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-cycle",
+            params={"phase": "design_doc"},
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        _runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        _runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_manual_strategic_review_ignores_exhausted_global_budget(
+    client: AsyncClient, db_session
+):
+    """The operator /strategic-cycle strategic_review path should ignore the autonomous backstop."""
+    project = await _make_strategic_project(db_session, "manual strategic review budget")
+    project.build_config = {"bootstrap_completed_at": "2026-01-01T00:00:00"}
+    await db_session.commit()
+
+    budget_source = Project(name="budget source global", user_id="test-user-123")
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    original_mode = _runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _runtime_config["max_global_autonomous_tasks_per_hour"]
+    _runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 500
+    _runtime_config["max_global_autonomous_tasks_per_hour"] = 1
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/strategic-cycle",
+            params={"phase": "strategic_review"},
+        )
+        assert resp.status_code == 200, resp.text
+    finally:
+        _runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        _runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
 def test_no_hardcoded_main_base_branch_in_directions_router():
     """Static guard: spawn payloads in routers/directions.py must never
     hardcode {"base_branch": "main"} — they must route through

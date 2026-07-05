@@ -14,6 +14,12 @@ import asyncio
 import logging
 from typing import Any, Dict
 
+from app.task_capabilities import (
+    ALL_TASK_TYPES,
+    AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES,
+    AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES,
+)
+
 logger = logging.getLogger(__name__)
 
 # Lock for multi-key runtime config updates (prevents reading partial state between two assignments)
@@ -92,7 +98,16 @@ runtime_config: Dict = {
         os.getenv("RETRY_AFTER_RESET_ALERT_THRESHOLD", "8")
     ),
     "max_autonomous_tasks_per_hour": 12,
-    "max_global_autonomous_tasks_per_hour": 50,  # Cross-project cap (default 10x per-project)
+    "max_global_autonomous_tasks_per_hour": 500,  # Cross-project backstop ceiling
+    # Observe-only replacement accounting for the global autonomous spawn guard.
+    # Enforcement stays on the initiative budget until the dedicated rollout
+    # switches the gate over.
+    "autonomous_spawn_budget_mode": "observe",
+    "max_global_autonomous_initiative_tasks_per_hour": 50,
+    "autonomous_spawn_budget_categories": {
+        "initiative": sorted(AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES),
+        "servicing": sorted(AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES),
+    },
     "autonomous_research_interval_minutes": 30,
     # --- Utilization-triggered evergreen backlog auto-fill (d-2877ddc7) ---
     # Phase-0, defaulted OFF. When idle (low utilization) or all active
@@ -1551,6 +1566,60 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                 ):
                     if key in config_json:
                         _set(key, config_json[key])
+                if "autonomous_spawn_budget_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["autonomous_spawn_budget_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in {"off", "observe", "enforce"}:
+                        _set("autonomous_spawn_budget_mode", raw_mode)
+                if "max_global_autonomous_initiative_tasks_per_hour" in config_json:
+                    try:
+                        raw_cap = int(
+                            config_json[
+                                "max_global_autonomous_initiative_tasks_per_hour"
+                            ]
+                        )
+                    except (TypeError, ValueError):
+                        raw_cap = -1
+                    if 0 <= raw_cap <= 500:
+                        _set("max_global_autonomous_initiative_tasks_per_hour", raw_cap)
+                if "autonomous_spawn_budget_categories" in config_json:
+                    raw_categories = config_json["autonomous_spawn_budget_categories"]
+                    if isinstance(raw_categories, dict):
+                        normalized_categories: dict[str, list[str]] = {}
+                        valid_categories = all(
+                            str(key) in {"initiative", "servicing"}
+                            for key in raw_categories
+                        )
+                        for category_key, default_types in (
+                            ("initiative", AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES),
+                            ("servicing", AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES),
+                        ):
+                            if not valid_categories:
+                                break
+                            raw_types = raw_categories.get(category_key, default_types)
+                            if isinstance(raw_types, str):
+                                raw_types = raw_types.split(",")
+                            if not isinstance(raw_types, (list, tuple, set)):
+                                valid_categories = False
+                                break
+                            normalized_types = sorted(
+                                {str(t).strip() for t in raw_types if str(t).strip()}
+                            )
+                            if any(t not in ALL_TASK_TYPES for t in normalized_types):
+                                valid_categories = False
+                                break
+                            normalized_categories[category_key] = normalized_types
+                        overlap = set(
+                            normalized_categories.get("initiative", [])
+                        ) & set(normalized_categories.get("servicing", []))
+                        if valid_categories and not overlap:
+                            _set(
+                                "autonomous_spawn_budget_categories",
+                                normalized_categories,
+                            )
                 if "strategic_research_frequency" in config_json:
                     _set(
                         "strategic_research_frequency",

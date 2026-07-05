@@ -2302,6 +2302,134 @@ async def test_spawn_strategic_review_skips_when_strategic_task_active(
 
 
 @pytest.mark.asyncio
+async def test_spawn_design_doc_update_respects_initiative_budget(
+    db_session, mocker
+):
+    """Design-doc spawns stop when the initiative budget is exhausted in enforce mode."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = _make_project(
+        vision={"purpose": "test purpose"},
+        build_config={"bootstrap_completed_at": "2026-01-01T00:00:00"},
+    )
+    budget_source = _make_project(vision={"purpose": "budget source"})
+    db_session.add_all([project, budget_source])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(budget_source)
+
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        spawned = await _spawn_design_doc_update(
+            project,
+            db_session,
+            apply_spawn_budget_guard=True,
+        )
+
+        assert spawned is False
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert result.scalars().all() == []
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_respects_global_backstop(db_session, mocker):
+    """Strategic review spawns stop when the global autonomous backstop is exhausted."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-sr-budget",
+                "status": "active",
+                "text": "Budget-sensitive direction",
+                "priority": "medium",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    budget_source = _make_project(vision={"purpose": "budget source"})
+    db_session.add_all([project, budget_source])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(budget_source)
+    await _seed_legacy_cycles(db_session, project)
+
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 500
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 1
+    try:
+        spawned = await _spawn_strategic_review(
+            project,
+            db_session,
+            apply_spawn_budget_guard=True,
+        )
+
+        assert spawned is False
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert result.scalars().all() == []
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
 async def test_spawn_design_doc_update_proceeds_when_no_active_strategic(db_session):
     """_spawn_design_doc_update returns True and creates a task when no strategic task is active."""
     project = _make_project(vision={"purpose": "test purpose"})

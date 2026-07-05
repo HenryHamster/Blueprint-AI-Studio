@@ -59,6 +59,10 @@ from app.release_artifacts import (
     summarize_required_artifact_gap,
     version_serving_summary as _version_serving_summary,
 )
+from app.autonomous_spawn_budget import (
+    build_autonomous_spawn_budget_guard,
+    compute_autonomous_spawn_budget_snapshot,
+)
 from app.release_version import QUALIFICATION_STATE_VOCAB
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
@@ -112,6 +116,8 @@ from app.workbench_state import (
 )
 
 logger = logging.getLogger(__name__)
+
+STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY = "strategic_cycle_manual"
 
 _CHALLENGE_BOUNDARY_BUCKETS = (
     CHALLENGE_BOUNDARY_REPRODUCE_ABSENT,
@@ -5011,7 +5017,37 @@ async def _maybe_notify_operator_bootstrap_deferred(
     await _maybe_notify_operator_refresh_deferred(project, session, reason)
 
 
-async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> bool:
+async def _strategic_spawn_budget_guard(
+    session: AsyncSession, spawn_category: str
+) -> dict[str, Any] | None:
+    """Return the autonomous budget guard for a strategic spawn, if any."""
+    try:
+        snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session, runtime_config=_runtime_config
+        )
+        logger.info(
+            "[AUTONOMOUS] Spawn budget snapshot: %s",
+            snapshot.as_log_fields(),
+        )
+    except Exception as exc:  # noqa: BLE001 - fail open if the snapshot cannot be read
+        logger.warning(
+            "[AUTONOMOUS] Spawn budget calculation failed open: %s",
+            exc,
+        )
+        return None
+    return build_autonomous_spawn_budget_guard(
+        snapshot=snapshot,
+        spawn_category=spawn_category,
+        enforce_initiative=snapshot.mode == "enforce",
+    )
+
+
+async def _spawn_design_doc_update(
+    project: Project,
+    session: AsyncSession,
+    *,
+    apply_spawn_budget_guard: bool = False,
+) -> bool:
     """Spawn a design doc update task (Phase 1 of strategic cycle).
 
     This runs as a separate task type so it doesn't block tactical research.
@@ -5040,6 +5076,12 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
             project.id,
         )
         return False
+
+    if apply_spawn_budget_guard:
+        budget_guard = await _strategic_spawn_budget_guard(session, "initiative")
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return False
 
     doc_model = (
         _runtime_config.get("task_type_models", {}).get("design_doc_update")
@@ -5163,6 +5205,10 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
         "design_doc_update",
     )
     task_context: dict = {"strategic_cycle_id": cycle_id, **local_runner_intent}
+    if not apply_spawn_budget_guard:
+        # Manual / operator-triggered cycles should not inherit the autonomous
+        # budget backstop when Phase 1 completes.
+        task_context[STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY] = True
     if operator_steered:
         task_context["operator_steered"] = True
         # Persist the operator steering excerpt alongside the flag: the marker is
@@ -6197,6 +6243,8 @@ async def _spawn_strategic_review(
     extra_context: dict[str, Any] | None = None,
     resident_minimal: bool = False,
     runner_pin_id: str | None = None,
+    *,
+    apply_spawn_budget_guard: bool = False,
 ) -> bool:
     """Spawn Phase 2 of the strategic cycle: vision + direction review.
 
@@ -6302,6 +6350,12 @@ async def _spawn_strategic_review(
             project.id,
         )
         return False
+
+    if apply_spawn_budget_guard:
+        budget_guard = await _strategic_spawn_budget_guard(session, "initiative")
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return False
 
     # Capture project scalars — and, for strategy-only cycles, the baseline
     # snapshots — NOW, while ``project`` is guaranteed live (it was fresh-read

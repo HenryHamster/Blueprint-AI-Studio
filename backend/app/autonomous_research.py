@@ -76,6 +76,12 @@ from app.resource_envelope import (
     resolve_project_spend_warning_fraction,
     resolve_project_spend_window_days,
 )
+from app.autonomous_spawn_budget import (
+    build_autonomous_spawn_budget_guard,
+    classify_autonomous_spawn_budget_category,
+    compute_autonomous_spawn_budget_snapshot,
+    autonomous_spawn_budget_config_from_runtime,
+)
 
 logger = logging.getLogger(__name__)
 _spawn_locks: dict[str, asyncio.Lock] = {}
@@ -1265,6 +1271,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 if await _spawn_strategic_review(
                     project,
                     session,
+                    apply_spawn_budget_guard=True,
                     cycle_id=pending_sr.get("cycle_id"),
                     operator_steered=bool(pending_sr.get("operator_steered")),
                     steering_excerpt=pending_sr.get("steering_excerpt"),
@@ -1516,7 +1523,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # Full pipeline: Phase 1 (architecture) → Phase 2 (strategic) via completion handler
                 from app.strategic_spawning import _spawn_design_doc_update
 
-                spawned = await _spawn_design_doc_update(project, session)
+                spawned = await _spawn_design_doc_update(
+                    project,
+                    session,
+                    apply_spawn_budget_guard=True,
+                )
                 if spawned:
                     logger.info(
                         f"[AUTONOMOUS] Spawned design doc update (strategic cycle #{strategic_cycle_count}, "
@@ -1526,7 +1537,11 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 # Strategy-only: skip architecture, go straight to strategic review
                 from app.strategic_spawning import _spawn_strategic_review
 
-                spawned = await _spawn_strategic_review(project, session)
+                spawned = await _spawn_strategic_review(
+                    project,
+                    session,
+                    apply_spawn_budget_guard=True,
+                )
                 if spawned:
                     logger.info(
                         f"[AUTONOMOUS] Spawned strategic review without architecture "
@@ -1718,25 +1733,51 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
     chosen_directions = chosen_directions[:remaining_slots]
     # Guard: global rate limit across ALL projects
     one_hour_ago = _utcnow() - timedelta(hours=1)
-    global_max = _runtime_config.get(
-        "max_global_autonomous_tasks_per_hour",
-        _runtime_config["max_autonomous_tasks_per_hour"] * 10,
-    )
-    global_recent = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.created_by == "ORCHESTRATOR",
-                Task.created_at >= one_hour_ago,
-            )
+    budget_snapshot = None
+    try:
+        budget_snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session,
+            runtime_config=_runtime_config,
+            now=one_hour_ago + timedelta(hours=1),
         )
-    ).scalar() or 0
-    if global_recent >= global_max:
+        logger.info(
+            "[AUTONOMOUS] Spawn budget snapshot: %s",
+            budget_snapshot.as_log_fields(),
+        )
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+            "[AUTONOMOUS] Spawn budget calculation failed open: %s",
+            exc,
         )
-        return
+    if budget_snapshot is not None:
+        budget_guard = build_autonomous_spawn_budget_guard(
+            snapshot=budget_snapshot,
+            spawn_category="initiative",
+            enforce_initiative=budget_snapshot.mode == "enforce",
+        )
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return
+    else:
+        global_max = _runtime_config.get(
+            "max_global_autonomous_tasks_per_hour",
+            _runtime_config["max_autonomous_tasks_per_hour"] * 10,
+        )
+        global_recent = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= one_hour_ago,
+                )
+            )
+        ).scalar() or 0
+        if global_recent >= global_max:
+            logger.warning(
+                f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+            )
+            return
     # Guard: per-project rate limit for research spawns
     recent_research_count = (
         await session.execute(
@@ -2673,25 +2714,55 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
     # Guard: global rate limit across ALL projects
     one_hour_ago = _utcnow() - timedelta(hours=1)
-    global_max = _runtime_config.get(
-        "max_global_autonomous_tasks_per_hour",
-        _runtime_config["max_autonomous_tasks_per_hour"] * 10,
-    )
-    global_recent = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.created_by == "ORCHESTRATOR",
-                Task.created_at >= one_hour_ago,
-            )
+    budget_snapshot = None
+    try:
+        budget_snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session,
+            runtime_config=_runtime_config,
+            now=one_hour_ago + timedelta(hours=1),
         )
-    ).scalar() or 0
-    if global_recent >= global_max:
+        logger.info(
+            "[AUTONOMOUS] Spawn budget snapshot: %s",
+            budget_snapshot.as_log_fields(),
+        )
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
-            f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+            "[AUTONOMOUS] Spawn budget calculation failed open: %s",
+            exc,
         )
-        return
+    if budget_snapshot is not None:
+        budget_config = autonomous_spawn_budget_config_from_runtime(_runtime_config)
+        budget_guard = build_autonomous_spawn_budget_guard(
+            snapshot=budget_snapshot,
+            spawn_category=classify_autonomous_spawn_budget_category(
+                task_type=task_type,
+                config=budget_config,
+            ),
+            enforce_initiative=budget_snapshot.mode == "enforce",
+        )
+        if budget_guard is not None:
+            logger.warning("[AUTONOMOUS] Spawn budget block: %s", budget_guard)
+            return
+    else:
+        global_max = _runtime_config.get(
+            "max_global_autonomous_tasks_per_hour",
+            _runtime_config["max_autonomous_tasks_per_hour"] * 10,
+        )
+        global_recent = (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(
+                    Task.created_by == "ORCHESTRATOR",
+                    Task.created_at >= one_hour_ago,
+                )
+            )
+        ).scalar() or 0
+        if global_recent >= global_max:
+            logger.warning(
+                f"[AUTONOMOUS] Global rate limit reached: {global_recent}/{global_max} tasks/hour"
+            )
+            return
     # Guard: per-project rate limit
     recent_auto = (
         await session.execute(

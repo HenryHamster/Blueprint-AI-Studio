@@ -4512,6 +4512,9 @@ async def _handle_design_doc_completion(
     """
     # Deferred imports to avoid circular dependency
     from app.strategic_spawning import _spawn_strategic_review  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
+    )
     from app.alert_dispatch import _create_strategic_alert  # noqa: PLC0415
     from app.task_locking import lock_project_for_strategic_transition  # noqa: PLC0415
     from app.strategic_events import emit_strategic_cycle_completed  # noqa: PLC0415
@@ -4620,6 +4623,9 @@ async def _handle_design_doc_completion(
     # Do this BEFORE committing task status so a failed spawn doesn't leave
     # the task as COMPLETED with no Phase 2 follow-up.
     cycle_id = phase1_cycle_id
+    apply_spawn_budget_guard = not bool(
+        (task.context or {}).get(STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY)
+    )
     # Architecture-cycle operator steering: the pending refresh marker was
     # consumed when Phase 1 (this design_doc task) was spawned, so it no longer
     # reads as operator-origin in vision. The flag was stamped on the task
@@ -4644,6 +4650,7 @@ async def _handle_design_doc_completion(
         spawned = await _spawn_strategic_review(
             project,
             session,
+            apply_spawn_budget_guard=apply_spawn_budget_guard,
             cycle_id=cycle_id,
             operator_steered=operator_steered,
             steering_excerpt=steering_excerpt,

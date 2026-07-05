@@ -48,6 +48,12 @@ from app.task_capabilities import (
     RESERVABLE_TASK_TYPES,
     task_capability_contract,
 )
+from app.autonomous_spawn_budget import (
+    default_autonomous_spawn_budget_categories,
+    normalize_autonomous_initiative_cap,
+    normalize_autonomous_spawn_budget_categories,
+    normalize_autonomous_spawn_budget_mode,
+)
 
 _VALID_PROVIDER_SELECTION_MODES = frozenset({"balanced", "preferred", "exclusive"})
 
@@ -98,6 +104,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "autonomous_direction_cooldown_minutes",
         "autonomous_periodic_tasks",
         "autonomous_research_interval_minutes",
+        "autonomous_spawn_budget_categories",
+        "autonomous_spawn_budget_mode",
         "cloud_run_task_type_allowlist",
         "evergreen_fill_mode",
         "evergreen_fill_interval_minutes",
@@ -136,6 +144,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "max_concurrent_tasks_by_project",
         "max_concurrent_vms",
         "max_global_autonomous_tasks_per_hour",
+        "max_global_autonomous_initiative_tasks_per_hour",
         "max_parallel_research_per_project",
         "max_pipeline_slots",
         "max_provision_retries",
@@ -360,7 +369,17 @@ async def get_settings(
             "max_autonomous_tasks_per_hour"
         ],
         "max_global_autonomous_tasks_per_hour": _runtime_config.get(
-            "max_global_autonomous_tasks_per_hour", 50
+            "max_global_autonomous_tasks_per_hour", 500
+        ),
+        "autonomous_spawn_budget_mode": str(
+            _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+        ),
+        "max_global_autonomous_initiative_tasks_per_hour": int(
+            _runtime_config.get("max_global_autonomous_initiative_tasks_per_hour", 50)
+        ),
+        "autonomous_spawn_budget_categories": _runtime_config.get(
+            "autonomous_spawn_budget_categories",
+            default_autonomous_spawn_budget_categories(),
         ),
         "autonomous_research_interval_minutes": _runtime_config.get(
             "autonomous_research_interval_minutes", 30
@@ -891,6 +910,33 @@ async def _apply_settings(
                 detail="max_global_autonomous_tasks_per_hour must be between 1 and 500",
             )
         _runtime_config["max_global_autonomous_tasks_per_hour"] = val
+    if "autonomous_spawn_budget_mode" in payload:
+        try:
+            _runtime_config["autonomous_spawn_budget_mode"] = (
+                normalize_autonomous_spawn_budget_mode(
+                    payload["autonomous_spawn_budget_mode"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "max_global_autonomous_initiative_tasks_per_hour" in payload:
+        try:
+            _runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = (
+                normalize_autonomous_initiative_cap(
+                    payload["max_global_autonomous_initiative_tasks_per_hour"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if "autonomous_spawn_budget_categories" in payload:
+        try:
+            _runtime_config["autonomous_spawn_budget_categories"] = (
+                normalize_autonomous_spawn_budget_categories(
+                    payload["autonomous_spawn_budget_categories"]
+                )
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     if "autonomous_research_interval_minutes" in payload:
         try:
             val = int(payload["autonomous_research_interval_minutes"])
@@ -3099,6 +3145,18 @@ async def _apply_settings(
                     ),
                     "autonomous_periodic_tasks": _runtime_config.get(
                         "autonomous_periodic_tasks", {}
+                    ),
+                    "autonomous_spawn_budget_mode": str(
+                        _runtime_config.get("autonomous_spawn_budget_mode", "observe")
+                    ),
+                    "max_global_autonomous_initiative_tasks_per_hour": int(
+                        _runtime_config.get(
+                            "max_global_autonomous_initiative_tasks_per_hour", 50
+                        )
+                    ),
+                    "autonomous_spawn_budget_categories": _runtime_config.get(
+                        "autonomous_spawn_budget_categories",
+                        default_autonomous_spawn_budget_categories(),
                     ),
                     "health_check_urls": _runtime_config.get("health_check_urls", []),
                     "strategic_research_frequency": _runtime_config.get(

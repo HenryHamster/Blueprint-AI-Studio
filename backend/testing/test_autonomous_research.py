@@ -32,7 +32,11 @@ from app.models import (
     Task,
     TaskStatus,
 )
-from app.autonomous_research import _spawn_research_task
+from app.autonomous_research import _spawn_periodic_task, _spawn_research_task
+from app.autonomous_spawn_budget import (
+    classify_autonomous_spawn_budget_category,
+    compute_autonomous_spawn_budget_snapshot,
+)
 from app.research_completion import _handle_research_completion
 from app.direction_outcomes import _update_direction_research_outcomes
 from app.max_plan_pool import _max_plan_pools, _account_by_id
@@ -3135,6 +3139,351 @@ async def test_spawn_skipped_at_global_rate_limit(db_session):
         )
     finally:
         _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original
+
+
+@pytest.mark.asyncio
+async def test_autonomous_budget_classifies_downstream_churn_out_of_initiative_count(
+    db_session,
+):
+    """Downstream servicing tasks do not consume initiative budget headroom."""
+    project = Project(
+        name="Autonomous Budget Classification",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-budget01")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    parent_research = Task(
+        project_id=project.id,
+        title="Research: initiative",
+        payloads=[{"type": "research", "directions": [], "base_branch": "main"}],
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        created_at=now - timedelta(minutes=15),
+    )
+    db_session.add(parent_research)
+    await db_session.flush()
+
+    rows = [
+        Task(
+            project_id=project.id,
+            title="Create: initiative",
+            payloads=[{"type": "create", "prompt": "build the feature"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=10),
+        ),
+        Task(
+            project_id=project.id,
+            title="Review: servicing",
+            payloads=[{"type": "review", "pr_number": 101, "branch": "feature/a"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=9),
+        ),
+        Task(
+            project_id=project.id,
+            title="Fix: servicing",
+            payloads=[{"type": "fix", "pr_number": 101, "branch": "feature/a"}],
+            context={"review_loop": {"pr_number": 101, "branch": "feature/a"}},
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=8),
+        ),
+        Task(
+            project_id=project.id,
+            title="Perf: servicing",
+            payloads=[{"type": "perf", "prompt": "profile PR churn"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            depends_on=[str(parent_research.id)],
+            created_at=now - timedelta(minutes=7),
+        ),
+        Task(
+            project_id=project.id,
+            title="Panel Review: servicing",
+            payloads=[{"type": "panel_review", "pr_number": 101}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent_research.id,
+            created_at=now - timedelta(minutes=6),
+        ),
+        Task(
+            project_id=project.id,
+            title="Unknown: backstop",
+            payloads=[{"type": "new_future_type"}],
+            status=TaskStatus.QUEUED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        ),
+        Task(
+            project_id=project.id,
+            title="Old review outside window",
+            payloads=[{"type": "review", "pr_number": 44}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(hours=2),
+        ),
+        Task(
+            project_id=project.id,
+            title="User task ignored",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.QUEUED,
+            created_by="USER",
+            created_at=now - timedelta(minutes=4),
+        ),
+    ]
+    db_session.add_all(rows)
+    await db_session.commit()
+
+    snapshot = await compute_autonomous_spawn_budget_snapshot(
+        db_session,
+        runtime_config={
+            **_shared_state.runtime_config,
+            "max_global_autonomous_initiative_tasks_per_hour": 3,
+        },
+        now=now,
+    )
+
+    assert snapshot.initiative_count == 2
+    assert snapshot.servicing_count == 4
+    assert snapshot.other_count == 1
+    assert snapshot.initiative_headroom == 1
+    assert snapshot.task_type_counts["initiative"] == {"create": 1, "research": 1}
+    assert snapshot.task_type_counts["servicing"] == {
+        "fix": 1,
+        "panel_review": 1,
+        "perf": 1,
+        "review": 1,
+    }
+    assert snapshot.task_type_counts["other"] == {"new_future_type": 1}
+
+
+def test_autonomous_spawn_budget_classifies_initiative_with_parent_lineage_as_servicing():
+    assert (
+        classify_autonomous_spawn_budget_category(
+            task_type="create",
+            parent_task_id=object(),
+            payload={},
+            context={},
+        )
+        == "servicing"
+    )
+    assert (
+        classify_autonomous_spawn_budget_category(
+            task_type="research",
+            depends_on=["parent-task-id"],
+            payload={},
+            context={},
+        )
+        == "servicing"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_blocks_in_enforce_mode_when_initiative_budget_exhausted(
+    db_session,
+):
+    """Enforce mode blocks new initiative spawns once the initiative budget is spent."""
+    project = Project(
+        name="Initiative Budget Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-enforce")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Budget Source",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-source")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Research budget source",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_observe_mode_allows_initiative_over_budget(
+    db_session,
+):
+    """Observe mode keeps the initiative snapshot visible without blocking the spawn."""
+    project = Project(
+        name="Initiative Budget Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-observe")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Budget Source Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-init-budget-source-observe")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Research budget source observe",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        spawned_tasks = result.scalars().all()
+        assert len(spawned_tasks) == 1
+        assert spawned_tasks[0].first_payload["type"] == "research"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+
+
+@pytest.mark.asyncio
+async def test_spawn_periodic_task_enforce_mode_uses_runtime_categories(
+    db_session,
+):
+    """Periodic enforcement blocks when runtime categories place the task in initiative."""
+    project = Project(
+        name="Periodic Budget Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-enforce")],
+        vision={"purpose": "test"},
+    )
+    source_project = Project(
+        name="Periodic Budget Source",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-source")],
+        vision={"purpose": "test"},
+    )
+    db_session.add_all([project, source_project])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(source_project)
+
+    now = datetime.now(timezone.utc)
+    db_session.add(
+        Task(
+            project_id=source_project.id,
+            title="Review budget source",
+            payloads=[{"type": "review"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=now - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = _shared_state.runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"]
+    original_categories = _shared_state.runtime_config.get(
+        "autonomous_spawn_budget_categories"
+    )
+    original_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 500
+    _shared_state.runtime_config["autonomous_spawn_budget_categories"] = {
+        "initiative": ["review"],
+        "servicing": ["qa", "deps", "security_audit"],
+    }
+    _shared_state.runtime_config["autonomous_periodic_tasks"] = {
+        **(original_periodic or {}),
+        "review": {"enabled": True, "interval_hours": 1},
+    }
+    try:
+        await _spawn_periodic_task(project, "review", db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = original_initiative
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
+        _shared_state.runtime_config["autonomous_spawn_budget_categories"] = (
+            original_categories
+        )
+        _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
 
 
 # ─────────────────────────────────────────────────────────────────────────────

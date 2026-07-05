@@ -1065,24 +1065,51 @@ async def test_start_spawn_path_is_minimal_and_lands_task_id(db_session, monkeyp
         )
     )
     await db_session.commit()
+    budget_source = Project(name="resident budget source", user_id=TEST_USER_ID)
+    db_session.add(budget_source)
+    await db_session.commit()
+    db_session.add(
+        Task(
+            project_id=budget_source.id,
+            title="Budget source task",
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            created_at=_utcnow() - timedelta(minutes=5),
+        )
+    )
+    await db_session.commit()
+    original_mode = runtime_config["autonomous_spawn_budget_mode"]
+    original_initiative = runtime_config[
+        "max_global_autonomous_initiative_tasks_per_hour"
+    ]
+    original_global = runtime_config["max_global_autonomous_tasks_per_hour"]
+    runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = 1
+    runtime_config["max_global_autonomous_tasks_per_hour"] = 500
     # Deliberately NO adoptable strategic_review task exists → the start SPAWNS.
 
-    import app.strategic_spawning as _sps
+    try:
+        import app.strategic_spawning as _sps
 
-    for _name in (
-        "resolve_branch_verification_context",
-        "_verify_capability_backing_paths",
-        "_build_recent_interventions",
-        "ground_design_doc",
-    ):
-        async def _boom(*args, _n=_name, **kwargs):
-            raise AssertionError(f"resident spawn must not call {_n}")
+        for _name in (
+            "resolve_branch_verification_context",
+            "_verify_capability_backing_paths",
+            "_build_recent_interventions",
+            "ground_design_doc",
+        ):
+            async def _boom(*args, _n=_name, **kwargs):
+                raise AssertionError(f"resident spawn must not call {_n}")
 
-        monkeypatch.setattr(_sps, _name, _boom)
+            monkeypatch.setattr(_sps, _name, _boom)
 
-    snapshot = await start_resident_session(
-        db_session, project, operator_user_id=TEST_USER_ID
-    )
+        snapshot = await start_resident_session(
+            db_session, project, operator_user_id=TEST_USER_ID
+        )
+    finally:
+        runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        runtime_config["max_global_autonomous_initiative_tasks_per_hour"] = original_initiative
+        runtime_config["max_global_autonomous_tasks_per_hour"] = original_global
 
     # A real task_id landed and the session is active (the bug produced no task_id).
     assert snapshot["status"] == "active"

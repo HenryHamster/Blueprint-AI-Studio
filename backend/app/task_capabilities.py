@@ -913,6 +913,40 @@ STRATEGIC_TASK_TYPES: frozenset[str] = frozenset(
     for capability in TASK_CAPABILITIES
     if capability.completion_needs_locked_project
 )
+# Default autonomous spawn-budget categories. Runtime config may override these
+# sets, but defaults stay registry-owned so new task types are classified from
+# the same catalog that defines their capabilities.
+AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        TaskType.create.value,
+        TaskType.research.value,
+        TaskType.plan.value,
+        TaskType.web_research.value,
+        TaskType.design.value,
+        TaskType.compute_experiment.value,
+        *STRATEGIC_TASK_TYPES,
+    }
+)
+AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
+    {
+        TaskType.review.value,
+        TaskType.panel_review.value,
+        TaskType.fix.value,
+        TaskType.perf.value,
+        TaskType.verify_tests.value,
+        TaskType.debug.value,
+        TaskType.qa.value,
+        TaskType.deps.value,
+        TaskType.docs.value,
+        TaskType.refactor.value,
+        TaskType.migrate.value,
+        TaskType.security_audit.value,
+        TaskType.smoketest.value,
+        TaskType.release_audit.value,
+        TaskType.release_audit_challenge.value,
+        TaskType.release_merge_grade.value,
+    }
+)
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
 # ("phase1"/"phase2"), derived from the registry. Non-strategic types are
 # absent. Resolved via ``strategic_phase_for`` at the failure/backstop sites.

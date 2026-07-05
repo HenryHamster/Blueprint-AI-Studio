@@ -4602,7 +4602,11 @@ async def _maybe_trigger_strategic_after_qualification(
             # Lazy import — release_qualifier <-> strategic_spawning is circular.
             from app.strategic_spawning import _spawn_strategic_review
 
-            spawned = await _spawn_strategic_review(project, session)
+            spawned = await _spawn_strategic_review(
+                project,
+                session,
+                apply_spawn_budget_guard=True,
+            )
             if spawned:
                 await session.commit()
                 logger.info(

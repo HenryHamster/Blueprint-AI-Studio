@@ -70,6 +70,7 @@ from app.strategic_spawning import (
     _build_previous_decision_outcomes,
     _build_past_retirement_critiques,
     _spawn_strategic_review,
+    STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY,
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
@@ -14088,6 +14089,51 @@ class TestDesignDocCompletionStrategistEvent:
         await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
 
         emit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_manual_design_doc_cycle_skips_autonomous_budget_guard(
+        self, strat_fail_db, mocker
+    ):
+        from unittest.mock import AsyncMock
+        from app.task_completion import _handle_design_doc_completion
+        from app.strategic_spawning import _spawn_design_doc_update
+
+        project = Project(
+            name="P",
+            user_id="u1",
+            vision={"purpose": "test"},
+            design_doc={"overview": {"body": "x"}, "_meta": {"revision": 1}},
+        )
+        strat_fail_db.add(project)
+        await strat_fail_db.commit()
+        await strat_fail_db.refresh(project)
+
+        assert await _spawn_design_doc_update(project, strat_fail_db) is True
+        task = (
+            (
+                await strat_fail_db.execute(
+                    select(Task).where(Task.project_id == project.id)
+                )
+            )
+            .scalars()
+            .all()[0]
+        )
+        assert (task.context or {}).get(STRATEGIC_CYCLE_MANUAL_CONTEXT_KEY) is True
+        task.status = TaskStatus.COMPLETED
+        strat_fail_db.add(task)
+        await strat_fail_db.commit()
+
+        spawn = AsyncMock(return_value=True)
+        mocker.patch("app.strategic_spawning._spawn_strategic_review", new=spawn)
+        mocker.patch(
+            "app.strategic_events.emit_strategic_cycle_completed",
+            new=AsyncMock(),
+        )
+
+        await _handle_design_doc_completion(task, "", strat_fail_db, project=project)
+
+        assert spawn.await_count == 1
+        assert spawn.await_args.kwargs["apply_spawn_budget_guard"] is False
 
     @pytest.mark.asyncio
     async def test_deferred_path_survives_task_and_project_expiry(

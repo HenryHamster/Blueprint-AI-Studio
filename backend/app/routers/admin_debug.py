@@ -610,6 +610,10 @@ async def get_autonomy_debug(
     """Return a detailed snapshot of why autonomy is or isn't spawning for a project."""
     from app.shared_state import runtime_config as _runtime_config, get_circuit_breaker
     from app.max_plan_pool import _max_plan_pools, _account_available_for_model
+    from app.autonomous_spawn_budget import (
+        build_autonomous_spawn_budget_guard,
+        compute_autonomous_spawn_budget_snapshot,
+    )
     import app.shared_state as _shared_state_mod
 
     project = await _get_user_project(project_id, current_user["user_id"], session)
@@ -638,6 +642,14 @@ async def get_autonomy_debug(
             {
                 "guard": "autonomous_disabled",
                 "reason": "project.autonomous_enabled is False",
+            }
+        )
+
+    if project.paused:
+        blocking_guards.append(
+            {
+                "guard": "project_paused",
+                "reason": "project.paused is True",
             }
         )
 
@@ -837,6 +849,28 @@ async def get_autonomy_debug(
             }
         )
 
+    budget_snapshot = None
+    try:
+        budget_snapshot = await compute_autonomous_spawn_budget_snapshot(
+            session,
+            runtime_config=_runtime_config,
+            now=now,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[AUTONOMY-DEBUG] spawn budget snapshot failed open for project %s",
+            project_id,
+            exc_info=True,
+        )
+    if budget_snapshot is not None:
+        budget_guard = build_autonomous_spawn_budget_guard(
+            snapshot=budget_snapshot,
+            spawn_category="initiative",
+            enforce_initiative=budget_snapshot.mode == "enforce",
+        )
+        if budget_guard is not None:
+            blocking_guards.append(budget_guard)
+
     # Guard 6a: pipeline_paused — admin-paused or auto-paused deployments halt dispatch,
     # which means _check_idle_research silently skips spawning.
     deploy_state = await session.get(DeploymentState, 1)
@@ -914,6 +948,9 @@ async def get_autonomy_debug(
             "tasks_this_hour": tasks_this_hour,
             "max_per_hour": max_per_hour,
         },
+        "global_rate_limit": budget_snapshot.as_log_fields()
+        if budget_snapshot is not None
+        else None,
         "directions": directions_info,
         "next_check_at": next_check_at,
         "strategic_cycle_history": await _get_cycle_history_for_debug(

@@ -938,7 +938,7 @@ async def check_evergreen_fill() -> None:
     max_active = int(_runtime_config.get("evergreen_fill_max_active", 1))
     daily_cap = int(_runtime_config.get("evergreen_fill_daily_cap", 3))
     max_global_per_hour = int(
-        _runtime_config.get("max_global_autonomous_tasks_per_hour", 50)
+        _runtime_config.get("max_global_autonomous_tasks_per_hour", 500)
     )
 
     try:

@@ -3138,10 +3138,11 @@ class TestAutonomousMode:
 
         project = await _make_project(db_session, name="Auto Project")
 
-        # Seed a non-research orchestrator task to confirm all ORCHESTRATOR tasks count.
+        # Seed a downstream servicing orchestrator task to confirm the
+        # health view separates churn from initiative spawns.
         non_research_task = Task(
             project_id=project.id,
-            payloads=[{"type": "plan"}],
+            payloads=[{"type": "review", "pr_number": 1}],
             status=TaskStatus.COMPLETED,
             created_by="ORCHESTRATOR",
             created_at=_utcnow() - timedelta(minutes=30),
@@ -3160,14 +3161,57 @@ class TestAutonomousMode:
         # no failures, rate_limit mirrors global config, source is fleet_default.
         assert entry["autonomous_enabled"] is True
         assert entry["consecutive_failures"] == 0
-        # The non-research ORCHESTRATOR task counts toward the hour budget.
+        # Total churn is still visible, but it is separated from initiative.
         assert entry["tasks_spawned_last_hour"] == 1
+        assert entry["initiative_tasks_spawned_last_hour"] == 0
+        assert entry["servicing_tasks_spawned_last_hour"] == 1
+        assert entry["research_create_tasks_spawned_last_hour"] == 0
+        assert entry["last_research_at"] is None
         assert entry["rate_limit"] == runtime_config["max_autonomous_tasks_per_hour"]
         assert (
             entry["fleet_default_rate_limit"]
             == runtime_config["max_autonomous_tasks_per_hour"]
         )
         assert entry["rate_limit_source"] == "fleet_default"
+        assert "global_rate_limit" in data
+        assert data["global_rate_limit"]["global_headroom"] >= 0
+
+    @pytest.mark.asyncio
+    async def test_get_autonomous_status_uses_runtime_categories(
+        self, client: AsyncClient, db_session
+    ):
+        """Custom autonomous spawn categories stay aligned with the status split."""
+        from app.shared_state import runtime_config
+        from datetime import timedelta
+        from app.models import _utcnow
+
+        project = await _make_project(db_session, name="Categorized Auto Project")
+        original_categories = runtime_config.get("autonomous_spawn_budget_categories")
+        runtime_config["autonomous_spawn_budget_categories"] = {
+            "initiative": ["review"],
+            "servicing": ["qa", "deps", "security_audit"],
+        }
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "review"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=_utcnow() - timedelta(minutes=30),
+            )
+        )
+        await db_session.commit()
+        try:
+            resp = await client.get("/api/admin/autonomous-status")
+            assert resp.status_code == 200
+            data = resp.json()
+            entry = next(p for p in data["projects"] if p["project_id"] == str(project.id))
+            assert entry["tasks_spawned_last_hour"] == 1
+            assert entry["initiative_tasks_spawned_last_hour"] == 1
+            assert entry["servicing_tasks_spawned_last_hour"] == 0
+            assert entry["other_tasks_spawned_last_hour"] == 0
+        finally:
+            runtime_config["autonomous_spawn_budget_categories"] = original_categories
 
     @pytest.mark.asyncio
     async def test_get_autonomous_status_project_override(
@@ -3483,6 +3527,48 @@ class TestAutonomyDebug:
             f"Expected 2 research tasks this hour, got {tasks_this_hour}. "
             "Non-research and out-of-window tasks must be excluded."
         )
+
+    @pytest.mark.asyncio
+    async def test_autonomy_debug_reports_global_backstop_and_project_pause(
+        self, client: AsyncClient, db_session
+    ):
+        """The debug endpoint mirrors the global backstop and Project.paused guard."""
+        import app.shared_state as _shared_state
+
+        project = await _make_project(db_session, name="AutonomyDebug Pause")
+        project.paused = True
+        await db_session.commit()
+        db_session.add(
+            Task(
+                project_id=project.id,
+                payloads=[{"type": "review", "pr_number": 77}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=_utcnow() - timedelta(minutes=10),
+            )
+        )
+        await db_session.commit()
+
+        original_global = _shared_state.runtime_config[
+            "max_global_autonomous_tasks_per_hour"
+        ]
+        _shared_state.runtime_config["max_global_autonomous_tasks_per_hour"] = 1
+        try:
+            resp = await client.get(f"/api/admin/projects/{project.id}/autonomy-debug")
+        finally:
+            _shared_state.runtime_config[
+                "max_global_autonomous_tasks_per_hour"
+            ] = original_global
+
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        guards = {guard["guard"]: guard for guard in data["blocking_guards"]}
+        assert "project_paused" in guards
+        assert "global_rate_limit_exceeded" in guards
+        assert guards["global_rate_limit_exceeded"]["current"] == 1
+        assert guards["global_rate_limit_exceeded"]["limit"] == 1
+        assert data["global_rate_limit"]["global_cap"] == 1
+        assert data["global_rate_limit"]["global_headroom"] == 0
 
 
 class TestTaskTypeCostAdherence:
@@ -8948,6 +9034,102 @@ class TestEvergreenFillSettingsPersist:
         await sync_runtime_config_from_state(state)
         # Junk value is ignored — original default survives
         assert _shared_state.runtime_config["evergreen_fill_mode"] == "off"
+
+    @pytest.mark.asyncio
+    async def test_autonomous_spawn_budget_settings_persist_and_restore(
+        self, client: AsyncClient, db_session
+    ):
+        """Initiative budget settings persist to runtime_config_json and sync back."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        payload = {
+            "autonomous_spawn_budget_mode": "observe",
+            "max_global_autonomous_initiative_tasks_per_hour": 7,
+            "autonomous_spawn_budget_categories": {
+                "initiative": ["research", "create", "strategic_review"],
+                "servicing": ["review", "fix", "perf", "panel_review"],
+            },
+        }
+        expected_categories = {
+            "initiative": ["create", "research", "strategic_review"],
+            "servicing": ["fix", "panel_review", "perf", "review"],
+        }
+        resp = await client.patch("/api/admin/settings", json=payload)
+        assert resp.status_code == 200, resp.text
+
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["autonomous_spawn_budget_mode"] == "observe"
+        assert body["max_global_autonomous_initiative_tasks_per_hour"] == 7
+        assert body["autonomous_spawn_budget_categories"] == expected_categories
+
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["autonomous_spawn_budget_mode"] == "observe"
+        assert (
+            row.runtime_config_json["max_global_autonomous_initiative_tasks_per_hour"]
+            == 7
+        )
+        assert row.runtime_config_json["autonomous_spawn_budget_categories"] == (
+            expected_categories
+        )
+
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "off"
+        _shared_state.runtime_config[
+            "max_global_autonomous_initiative_tasks_per_hour"
+        ] = 1
+        _shared_state.runtime_config["autonomous_spawn_budget_categories"] = {
+            "initiative": ["research"],
+            "servicing": ["review"],
+        }
+
+        changed = await sync_runtime_config_from_state(row)
+
+        assert "autonomous_spawn_budget_mode" in changed
+        assert "max_global_autonomous_initiative_tasks_per_hour" in changed
+        assert "autonomous_spawn_budget_categories" in changed
+        assert _shared_state.runtime_config["autonomous_spawn_budget_mode"] == "observe"
+        assert (
+            _shared_state.runtime_config[
+                "max_global_autonomous_initiative_tasks_per_hour"
+            ]
+            == 7
+        )
+        assert _shared_state.runtime_config["autonomous_spawn_budget_categories"] == (
+            expected_categories
+        )
+
+    @pytest.mark.asyncio
+    async def test_autonomous_spawn_budget_settings_validate_categories(
+        self, client: AsyncClient
+    ):
+        overlap = await client.patch(
+            "/api/admin/settings",
+            json={
+                "autonomous_spawn_budget_categories": {
+                    "initiative": ["research", "review"],
+                    "servicing": ["review"],
+                }
+            },
+        )
+        assert overlap.status_code == 400
+        assert "overlap" in overlap.text
+
+        unknown_type = await client.patch(
+            "/api/admin/settings",
+            json={
+                "autonomous_spawn_budget_categories": {
+                    "initiative": ["research", "not_a_task_type"],
+                }
+            },
+        )
+        assert unknown_type.status_code == 400
+        assert "unknown task type" in unknown_type.text
 
     @pytest.mark.asyncio
     async def test_structural_health_audit_mode_persists_across_sync(
