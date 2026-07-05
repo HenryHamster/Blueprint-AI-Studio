@@ -4389,7 +4389,11 @@ async def _handle_strategic_completion(
         try:
             from pydantic import ValidationError as _PmValidationError
 
-            from app.problem_model import apply_agent_update
+            from app.problem_model import (
+                active_direction_gap_ids as _active_direction_gap_ids,
+                apply_agent_update,
+                normalize_active_moves_writeback as _normalize_active_moves_writeback,
+            )
 
             # Resolve the cycle's baseline problem model (snapshot at spawn) for
             # the 3-way operator-wins merge, mirroring the vision baseline
@@ -4415,12 +4419,14 @@ async def _handle_strategic_completion(
                         if snap:
                             pm_baseline = snap
 
+            _protected_gap_ids = _active_direction_gap_ids(project.directions)
             try:
                 new_pm_raw, pm_diff = apply_agent_update(
                     current_raw=project.problem_model,
                     proposed_raw=new_problem_model,
                     now_iso=_utcnow().isoformat(),
                     baseline_raw=pm_baseline,
+                    protected_gap_ids=_protected_gap_ids,
                 )
             except _PmValidationError as pm_err:
                 logger.warning(
@@ -4430,6 +4436,29 @@ async def _handle_strategic_completion(
             else:
                 project.problem_model = new_pm_raw
                 flag_modified(project, "problem_model")
+                # Surface blocked gap deletions (active direction still references).
+                _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+                if _blocked_dels:
+                    logger.warning(
+                        f"[STRATEGIC] Task {task.id}: gap deletion(s) blocked — "
+                        f"still referenced by active direction(s): {_blocked_dels}"
+                    )
+                # Normalize stale active_moves via shared helper so both write
+                # paths (op-endpoint + log-parse fallback) stay converged.
+                _active_dir_ids = {
+                    str(d.get("id"))
+                    for d in (project.directions or [])
+                    if d.get("status") == "active"
+                }
+                new_pm_raw, _norm = _normalize_active_moves_writeback(
+                    new_pm_raw, _active_dir_ids, _utcnow().isoformat()
+                )
+                if _norm:
+                    logger.info(
+                        f"[STRATEGIC] Task {task.id}: auto-normalized active_moves: {_norm}"
+                    )
+                    project.problem_model = new_pm_raw
+                    flag_modified(project, "problem_model")
                 logger.info(
                     f"[STRATEGIC] Updated problem_model for project {project.id} "
                     f"to revision {new_pm_raw.get('revision')} ({pm_diff or 'no diff'})"

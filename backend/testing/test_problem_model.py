@@ -33,6 +33,7 @@ from app.problem_model import (
     ProjectContext,
     SelfReflectionEntry,
     Source,
+    active_direction_gap_ids,
     append_revision_log,
     append_self_reflection,
     apply_agent_update,
@@ -43,6 +44,7 @@ from app.problem_model import (
     compute_model_size_signal,
     gc_problem_model,
     is_empty,
+    normalize_active_moves_writeback,
     normalize_gap_active_moves,
     parse_problem_model,
     reconcile_gap_staffing,
@@ -4673,3 +4675,159 @@ def test_normalize_gap_active_moves_no_duplicate_past_moves():
     model = ProblemModel(gaps=[gap])
     normalize_gap_active_moves(model, set(), _NORM_NOW)
     assert model.gaps[0].past_moves.count("d-1") == 1
+
+
+# ---------------------------------------------------------------------------
+# normalize_active_moves_writeback (shared helper)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_active_moves_writeback_no_corrections_unchanged():
+    """Returns raw dict unchanged and empty corrections when all moves are active."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-active"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, corrections = normalize_active_moves_writeback(raw, {"d-active"}, _NORM_NOW)
+    assert corrections == []
+    assert updated_raw == raw
+
+
+def test_normalize_active_moves_writeback_records_revision_log():
+    """When corrections occur, a revision-log entry is written into the returned raw dict."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-paused"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, corrections = normalize_active_moves_writeback(raw, set(), _NORM_NOW)
+    assert len(corrections) >= 1
+    log = updated_raw.get("revision_log") or []
+    assert any(
+        isinstance(e, dict) and "active_moves_normalized" in e.get("changes", {})
+        for e in log
+    ), "expected revision_log entry for active_moves normalization"
+
+
+def test_normalize_active_moves_writeback_prunes_stale():
+    """Stale active_moves ID ends up in past_moves in the returned raw dict."""
+    gap = Gap(id="g-1", name="x", active_moves=["d-paused", "d-active"])
+    pm = ProblemModel(gaps=[gap])
+    raw = pm.model_dump()
+    updated_raw, _ = normalize_active_moves_writeback(raw, {"d-active"}, _NORM_NOW)
+    g = updated_raw["gaps"][0]
+    assert "d-paused" not in g["active_moves"]
+    assert "d-paused" in g["past_moves"]
+
+
+# ---------------------------------------------------------------------------
+# active_direction_gap_ids
+# ---------------------------------------------------------------------------
+
+
+def test_active_direction_gap_ids_returns_active_only():
+    dirs = [
+        {"id": "d-1", "status": "active", "gap_id": "g-1"},
+        {"id": "d-2", "status": "paused", "gap_id": "g-2"},
+        {"id": "d-3", "status": "active", "gap_id": "g-3"},
+    ]
+    assert active_direction_gap_ids(dirs) == {"g-1", "g-3"}
+
+
+def test_active_direction_gap_ids_skips_missing_gap_id():
+    dirs = [{"id": "d-1", "status": "active"}]
+    assert active_direction_gap_ids(dirs) == set()
+
+
+def test_active_direction_gap_ids_empty_input():
+    assert active_direction_gap_ids([]) == set()
+    assert active_direction_gap_ids(None) == set()
+
+
+# ---------------------------------------------------------------------------
+# apply_agent_update with protected_gap_ids (Residual 2 guard)
+# ---------------------------------------------------------------------------
+
+
+def test_apply_agent_update_gap_deletion_orphan_guard():
+    """A _deletions.gaps entry that orphans an active direction is blocked.
+
+    The gap must survive (not be deleted), and diff['gaps_deletion_blocked']
+    must list the blocked id.  This is the named acceptance-criterion test.
+    """
+    current = {
+        "revision": 1,
+        "gaps": [
+            {"id": "g-protected", "name": "live gap", "status": "active"},
+            {"id": "g-safe", "name": "safe gap", "status": "active"},
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {"id": "g-protected", "name": "live gap", "status": "active"},
+            {"id": "g-safe", "name": "safe gap", "status": "active"},
+        ],
+        "_deletions": {"gaps": ["g-protected", "g-safe"]},
+    }
+    # g-protected is still the gap_id of an active direction.
+    protected = {"g-protected"}
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids=protected
+    )
+    assert "g-protected" in diff.get("gaps_deletion_blocked", [])
+    assert "g-safe" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-protected" in surviving_ids, "protected gap must not be deleted"
+    assert "g-safe" not in surviving_ids, "unprotected gap should be deleted"
+
+
+def test_apply_agent_update_gap_deletion_no_protected_ids_deletes_all():
+    """Without protected_gap_ids, all requested deletions proceed as before."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+        "_deletions": {"gaps": ["g-1"]},
+    }
+    new_raw, diff = apply_agent_update(current, proposed, _NORM_NOW)
+    assert "g-1" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-1" not in surviving_ids
+
+
+def test_apply_agent_update_gap_deletion_protected_empty_set_deletes_all():
+    """An empty protected set allows all deletions (no false blocks)."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+    }
+    proposed = {
+        "gaps": [{"id": "g-1", "name": "x", "status": "active"}],
+        "_deletions": {"gaps": ["g-1"]},
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids=set()
+    )
+    assert "g-1" in diff.get("gaps_deleted", [])
+    surviving_ids = [g["id"] for g in new_raw.get("gaps", [])]
+    assert "g-1" not in surviving_ids
+
+
+def test_apply_agent_update_gap_deletion_blocked_does_not_block_write():
+    """The write succeeds even when a gap deletion is blocked (non-fatal)."""
+    current = {
+        "revision": 1,
+        "gaps": [{"id": "g-protected", "name": "y", "status": "active"}],
+        "intent": {"purpose": "test", "current_focus": ""},
+    }
+    proposed = {
+        "gaps": [{"id": "g-protected", "name": "y updated", "status": "active"}],
+        "_deletions": {"gaps": ["g-protected"]},
+        "intent": {"purpose": "test updated", "current_focus": ""},
+    }
+    new_raw, diff = apply_agent_update(
+        current, proposed, _NORM_NOW, protected_gap_ids={"g-protected"}
+    )
+    assert new_raw["revision"] == 2
+    assert "g-protected" in diff["gaps_deletion_blocked"]
+    surviving = [g["id"] for g in new_raw["gaps"]]
+    assert "g-protected" in surviving

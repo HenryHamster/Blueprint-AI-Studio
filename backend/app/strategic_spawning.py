@@ -3538,6 +3538,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # experiments that would fall back to billable cloud GPU (or be held
     # indefinitely when require_local_runner is set).
     "local_runner_status": {"priority": "medium", "exempt": True},
+    # Persisted integrity-conflict trend over the last 10 completed cycles.
+    # Three scalars (stamped_cycles, consecutive_clean_cycles) + last_counts
+    # dict. Low priority, exempt: absent until the first stamped cycle lands and
+    # tiny once present. Drives the '2 consecutive clean cycles' retirement
+    # condition for the direction-gap referential-integrity work. Fetchable on
+    # demand via ./fetch integrity-conflict-trend.
+    "integrity_conflict_trend": {"priority": "low", "exempt": True},
 }
 
 
@@ -7123,6 +7130,22 @@ async def _spawn_strategic_review(
                     )
     except Exception:
         logger.exception("[STRATEGIC] held-directions block build failed; continuing")
+    # Integrity-conflict trend — persisted per-cycle counts for the four
+    # referential-integrity classes (orphaned_gaps, ungrounded_directions,
+    # stale_active_moves, staffed_but_deferred) over the last 10 completed
+    # cycles. Compact dict of three scalars + last_counts; low priority. Best-
+    # effort: absent when no stamped cycles exist yet or the query fails.
+    _integrity_trend: dict | None = None
+    try:
+        from app import strategic_cycle as _sc_trend  # noqa: PLC0415
+
+        _trend_result = await _sc_trend.recent_integrity_conflict_trend(
+            session, project.id, limit=10
+        )
+        if _trend_result.get("stamped_cycles", 0) > 0:
+            _integrity_trend = _trend_result
+    except Exception:
+        logger.exception("[STRATEGIC] integrity_conflict_trend fetch failed; continuing")
     # Post-promotion handoff — when a fresh version has just opened, it was
     # opened by the PROMOTION of the prior version: open_version() is only ever
     # called from _record_promotion_success and the v1 bootstrap, so a version
@@ -8165,6 +8188,11 @@ async def _spawn_strategic_review(
                 else {}
             ),
             **(
+                {"integrity_conflict_trend": _integrity_trend}
+                if _integrity_trend
+                else {}
+            ),
+            **(
                 {"held_directions": _held_directions_block}
                 if _held_directions_block
                 else {}
@@ -8203,6 +8231,7 @@ async def _spawn_strategic_review(
         "orphaned_gaps": int(_recon_counts.get("orphaned_gaps") or 0),
         "ungrounded_directions": int(_recon_counts.get("ungrounded_directions") or 0),
         "stale_active_moves": int(_recon_counts.get("stale_active_moves") or 0),
+        "staffed_but_deferred": int(_recon_counts.get("staffed_but_deferred") or 0),
     }
 
     # Re-arm the duplicate-spawn guards, create the task, record the cycle, and

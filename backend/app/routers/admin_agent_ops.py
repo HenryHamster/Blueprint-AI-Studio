@@ -2949,7 +2949,12 @@ async def strategic_operation(
         from pydantic import ValidationError as _PmValidationError
 
         from app import strategic_cycle as _strategic_cycle
-        from app.problem_model import apply_agent_update, operator_owned_subset
+        from app.problem_model import (
+            active_direction_gap_ids as _active_direction_gap_ids,
+            apply_agent_update,
+            normalize_active_moves_writeback as _normalize_active_moves_writeback,
+            operator_owned_subset,
+        )
         from app.strategic_completion import (
             NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
             NEW_VERSION_GOAL_CONTEXT_KEY,
@@ -3018,12 +3023,14 @@ async def strategic_operation(
                     snap = _strategic_cycle.baseline_problem_model(pm_cycle_row)
                     if snap:
                         baseline_pm = snap
+        _protected_gap_ids = _active_direction_gap_ids(project.directions)
         try:
             new_pm_raw, pm_diff = apply_agent_update(
                 current_raw=project.problem_model,
                 proposed_raw=pm_data,
                 now_iso=_utcnow().isoformat(),
                 baseline_raw=baseline_pm,
+                protected_gap_ids=_protected_gap_ids,
             )
         except _PmValidationError as ve:
             raise HTTPException(
@@ -3031,27 +3038,25 @@ async def strategic_operation(
             ) from None
         project.problem_model = new_pm_raw
         flag_modified(project, "problem_model")
-        # Normalize stale active_moves: if the agent's proposed model lists a
-        # paused/expired direction in a gap's active_moves, prune it to past_moves
-        # and (if the gap is now unstaffed) auto-defer. Corrections surface as
-        # response warnings and are recorded in the revision log.
-        from app.problem_model import (  # noqa: PLC0415
-            append_revision_log as _append_revision_log,
-            normalize_gap_active_moves as _normalize_gap_active_moves,
-            parse_problem_model as _parse_problem_model,
-        )
+        # Surface blocked gap deletions (active direction still references the gap).
+        _blocked_dels = pm_diff.get("gaps_deletion_blocked") or []
+        for _bid in _blocked_dels:
+            warnings.append(
+                f"gap deletion blocked: {_bid} is still referenced by an active direction"
+            )
+        # Normalize stale active_moves via the shared helper so both write paths
+        # (op-endpoint + log-parse fallback) stay converged.
         _active_dir_ids = {
             str(d.get("id"))
             for d in (project.directions or [])
             if d.get("status") == "active"
         }
-        _pm_obj = _parse_problem_model(new_pm_raw)
-        _norm = _normalize_gap_active_moves(_pm_obj, _active_dir_ids, _utcnow().isoformat())
+        new_pm_raw, _norm = _normalize_active_moves_writeback(
+            new_pm_raw, _active_dir_ids, _utcnow().isoformat()
+        )
         if _norm:
             for _c in _norm:
                 warnings.append(f"active_moves normalized: {_c}")
-            _append_revision_log(_pm_obj, "auto-normalized stale active_moves", {"active_moves_normalized": _norm})
-            new_pm_raw = _pm_obj.model_dump()
             project.problem_model = new_pm_raw
         # Carry proof records and adoption verdicts onto survivor keys when a
         # capability consolidation occurred in this write.

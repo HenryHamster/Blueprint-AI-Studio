@@ -816,7 +816,7 @@ async def test_record_integrity_conflict_counts_stamps_metadata(db_session):
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    counts = {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0}
+    counts = {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0, "staffed_but_deferred": 3}
     strategic_cycle.record_integrity_conflict_counts(cycle, counts)
     db_session.add(cycle)
     await db_session.commit()
@@ -824,7 +824,7 @@ async def test_record_integrity_conflict_counts_stamps_metadata(db_session):
     fetched = await strategic_cycle.get(db_session, cycle.id)
     assert fetched is not None
     stored = fetched.cycle_metadata.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS)
-    assert stored == {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0}
+    assert stored == {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0, "staffed_but_deferred": 3}
 
 
 @pytest.mark.asyncio
@@ -834,7 +834,7 @@ async def test_record_integrity_conflict_counts_zeros_are_explicit(db_session):
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0}
     strategic_cycle.record_integrity_conflict_counts(cycle, counts)
     db_session.add(cycle)
     await db_session.commit()
@@ -846,6 +846,7 @@ async def test_record_integrity_conflict_counts_zeros_are_explicit(db_session):
     assert stored["orphaned_gaps"] == 0
     assert stored["ungrounded_directions"] == 0
     assert stored["stale_active_moves"] == 0
+    assert stored["staffed_but_deferred"] == 0
 
 
 @pytest.mark.asyncio
@@ -865,14 +866,14 @@ async def test_recent_integrity_conflict_trend_consecutive_clean(db_session):
         return c
 
     # Oldest cycle has conflicts, two newer ones are clean.
-    await _make_completed_cycle({"orphaned_gaps": 3, "ungrounded_directions": 1, "stale_active_moves": 0})
-    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
-    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
+    await _make_completed_cycle({"orphaned_gaps": 3, "ungrounded_directions": 1, "stale_active_moves": 0, "staffed_but_deferred": 0})
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0})
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0})
 
     trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
     assert trend["stamped_cycles"] == 3
     assert trend["consecutive_clean_cycles"] == 2
-    assert trend["last_counts"] == {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+    assert trend["last_counts"] == {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0}
 
 
 @pytest.mark.asyncio
@@ -892,8 +893,8 @@ async def test_recent_integrity_conflict_trend_dirty_resets_count(db_session):
         return c
 
     # Most-recent cycle has conflicts — streak is zero even though prior was clean.
-    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
-    await _make_completed_cycle({"orphaned_gaps": 1, "ungrounded_directions": 0, "stale_active_moves": 0})
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0})
+    await _make_completed_cycle({"orphaned_gaps": 1, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0})
 
     trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
     assert trend["stamped_cycles"] == 2
@@ -927,7 +928,7 @@ async def test_to_legacy_dict_includes_integrity_conflict_counts(db_session):
     cycle = await strategic_cycle.create(db_session, project_id=project.id)
     await db_session.commit()
 
-    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0, "staffed_but_deferred": 0}
     strategic_cycle.record_integrity_conflict_counts(cycle, counts)
     db_session.add(cycle)
     await db_session.commit()
@@ -935,3 +936,84 @@ async def test_to_legacy_dict_includes_integrity_conflict_counts(db_session):
     legacy = strategic_cycle._to_legacy_dict(cycle)
     assert CYCLE_META_INTEGRITY_CONFLICT_COUNTS in legacy
     assert legacy[CYCLE_META_INTEGRITY_CONFLICT_COUNTS] == counts
+
+
+@pytest.mark.asyncio
+async def test_integrity_conflict_trend_includes_staffed_but_deferred(db_session):
+    """staffed_but_deferred is persisted and factored into the trend's clean/dirty determination."""
+    project = await _make_project(db_session)
+
+    async def _make_completed_cycle(counts):
+        c = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        strategic_cycle.record_integrity_conflict_counts(c, counts)
+        db_session.add(c)
+        await strategic_cycle.mark_phase1_completed(db_session, c.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase2_completed(db_session, c.id)
+        await db_session.commit()
+        return c
+
+    # Cycle 1: all clean including staffed_but_deferred
+    await _make_completed_cycle({
+        "orphaned_gaps": 0,
+        "ungrounded_directions": 0,
+        "stale_active_moves": 0,
+        "staffed_but_deferred": 0,
+    })
+    # Cycle 2 (most recent): staffed_but_deferred is nonzero — should break clean streak
+    await _make_completed_cycle({
+        "orphaned_gaps": 0,
+        "ungrounded_directions": 0,
+        "stale_active_moves": 0,
+        "staffed_but_deferred": 2,
+    })
+
+    trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
+    assert trend["stamped_cycles"] == 2
+    # Most-recent cycle has staffed_but_deferred=2 — streak must be 0
+    assert trend["consecutive_clean_cycles"] == 0
+    last = trend["last_counts"]
+    assert last is not None
+    assert last["staffed_but_deferred"] == 2
+    # All four classes present in last_counts
+    assert "orphaned_gaps" in last
+    assert "ungrounded_directions" in last
+    assert "stale_active_moves" in last
+
+
+@pytest.mark.asyncio
+async def test_recent_integrity_conflict_trend_legacy_stamp_breaks_streak(db_session):
+    """Legacy stamps (without staffed_but_deferred key) break the clean streak."""
+    project = await _make_project(db_session)
+
+    # Create a completed cycle with only the three legacy keys (simulates a
+    # pre-staffed_but_deferred stamp written before this feature landed).
+    c = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    # Manually write a legacy-format stamp (three keys only)
+    from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS  # noqa: PLC0415
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified  # noqa: PLC0415
+    new_meta = dict(c.cycle_metadata or {})
+    new_meta[CYCLE_META_INTEGRITY_CONFLICT_COUNTS] = {
+        "orphaned_gaps": 0,
+        "ungrounded_directions": 0,
+        "stale_active_moves": 0,
+        # intentionally NO "staffed_but_deferred"
+    }
+    c.cycle_metadata = new_meta
+    _flag_modified(c, "cycle_metadata")
+    db_session.add(c)
+    await strategic_cycle.mark_phase1_completed(db_session, c.id)
+    await db_session.commit()
+    await strategic_cycle.mark_phase2_completed(db_session, c.id)
+    await db_session.commit()
+
+    trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
+    # Cycle is stamped so stamped_cycles == 1
+    assert trend["stamped_cycles"] == 1
+    # Legacy stamp breaks the streak (staffed_but_deferred class unknown)
+    assert trend["consecutive_clean_cycles"] == 0
+    # last_counts exists but does NOT include staffed_but_deferred
+    assert trend["last_counts"] is not None
+    assert "staffed_but_deferred" not in trend["last_counts"]

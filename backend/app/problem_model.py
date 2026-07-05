@@ -2128,12 +2128,56 @@ def _apply_compactions(
     return events
 
 
+def active_direction_gap_ids(directions: list[dict] | None) -> set[str]:
+    """Return the set of gap_ids referenced by active directions.
+
+    Used to compute the protected set before calling
+    :func:`apply_agent_update` so a gap deletion that would orphan an active
+    direction can be surfaced rather than silently applied.
+    """
+    result: set[str] = set()
+    for d in directions or []:
+        if d.get("status") == "active":
+            gid = d.get("gap_id")
+            if gid:
+                result.add(str(gid))
+    return result
+
+
+def normalize_active_moves_writeback(
+    new_pm_raw: dict,
+    active_dir_ids: set[str],
+    now_iso: str,
+) -> tuple[dict, list[str]]:
+    """Normalize gap active_moves and record corrections in the revision log.
+
+    Shared helper invoked by both the op-endpoint (``set_problem_model``) and
+    the log-parse fallback in ``strategic_completion`` so the two write paths
+    cannot diverge on active-moves normalization.
+
+    Returns ``(updated_raw, corrections)`` where ``corrections`` is the list of
+    change messages from :func:`normalize_gap_active_moves`.  When empty the
+    raw dict is returned unchanged and no revision-log entry is written.
+    """
+    pm_obj = parse_problem_model(new_pm_raw)
+    corrections = normalize_gap_active_moves(pm_obj, active_dir_ids, now_iso)
+    if corrections:
+        append_revision_log(
+            pm_obj,
+            "auto-normalized stale active_moves",
+            {"active_moves_normalized": corrections},
+        )
+        new_pm_raw = pm_obj.model_dump()
+    return new_pm_raw, corrections
+
+
 def apply_agent_update(
     current_raw: dict | None,
     proposed_raw: dict,
     now_iso: str,
     *,
     baseline_raw: dict | None = None,
+    protected_gap_ids: set[str] | None = None,
 ) -> tuple[dict, dict]:
     """Apply an agent-proposed problem_model update to the current state.
 
@@ -2202,6 +2246,19 @@ def apply_agent_update(
     # part of the durable model (extra="forbid" would reject it).
     proposed_raw = dict(proposed_raw)
     deletions = proposed_raw.pop("_deletions", None)
+    # Filter protected gap_ids from deletions BEFORE the merge pass so gaps
+    # still referenced by active directions are preserved, not silently wiped.
+    # Non-destructive: blocked ids are surfaced in the diff; the write proceeds.
+    _blocked_gap_deletions: list[str] = []
+    if protected_gap_ids and isinstance(deletions, dict):
+        _raw_gap_dels = _as_str_list(deletions, "gaps")
+        if _raw_gap_dels:
+            _blocked_gap_deletions = [g for g in _raw_gap_dels if g in protected_gap_ids]
+            if _blocked_gap_deletions:
+                deletions = {
+                    **deletions,
+                    "gaps": [g for g in _raw_gap_dels if g not in protected_gap_ids],
+                }
     # Per-gap history compaction directive: ``{gap_id: {history?: ISO,
     # past_moves?: ISO}}``.  Lifted out like _deletions so ProblemModel
     # (extra="forbid") does not reject it.
@@ -2286,6 +2343,9 @@ def apply_agent_update(
         removed = sorted(_as_str_list(deletions, del_key))
         if removed:
             diff[diff_key] = removed
+    # Surface blocked gap deletions (already filtered before merge above).
+    if _blocked_gap_deletions:
+        diff["gaps_deletion_blocked"] = sorted(_blocked_gap_deletions)
 
     # Record compaction events in the diff for observability.
     if compaction_events:

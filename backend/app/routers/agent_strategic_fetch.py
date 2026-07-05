@@ -1104,6 +1104,8 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "prediction_calibration_factor": None,
     "prediction_calibration_note": None,
     "system_maturity": None,
+    # Low — dedicated fetch verb; tiny persisted trend across recent cycles
+    "integrity_conflict_trend": "integrity-conflict-trend",
 }
 
 _SECTIONS_NEEDING_CYCLE_HISTORY: frozenset[str] = frozenset({
@@ -1177,6 +1179,30 @@ async def agent_fetch_payload_section(
             data = _build_outcome_evaluation(project, cycle_history)
 
     return {"status": "success", "data": data}
+
+
+@router.get("/projects/{project_id}/integrity-conflict-trend")
+@limiter.limit("60/minute")
+async def agent_fetch_integrity_conflict_trend(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return the persisted integrity-conflict trend for the project.
+
+    Queries the last 10 completed strategic cycles for their stamped
+    integrity-conflict counts (orphaned_gaps, ungrounded_directions,
+    stale_active_moves, staffed_but_deferred) and returns the trend summary:
+    stamped_cycles, consecutive_clean_cycles, and last_counts.  Used by the
+    strategist to verify the '2 consecutive clean cycles' retirement condition
+    for the direction-gap referential-integrity direction."""
+    project = await _resolve_agent_project(project_id, token, session)
+    from app import strategic_cycle as _sc  # noqa: PLC0415
+
+    _ = project  # resolve auth; project_id is passed directly to the query
+    trend = await _sc.recent_integrity_conflict_trend(session, project_id, limit=10)
+    return {"status": "success", "data": trend}
 
 
 @router.get("/projects/{project_id}/completion-debt")
