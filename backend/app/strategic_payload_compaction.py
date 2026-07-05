@@ -15,6 +15,7 @@ _VERSION_PHASE_RECENT_VERSIONS_FLOOR_CAP = 2
 _VERSION_PHASE_TEXT_CAP = 500
 _VERSION_PHASE_TEXT_FLOOR_CAP = 240
 _VERSION_PHASE_CRITERIA_CAP = 20
+_VERSION_PHASE_CRITERIA_FLOOR_CAP = 10
 _DIRECTION_SUMMARY_TEXT_CAP = 260
 _DIRECTION_SUMMARY_LONG_TEXT_CAP = 420
 _DIRECTION_SUMMARY_LIST_CAP = 3
@@ -418,11 +419,44 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
         for key in ("total", "covered", "partial", "uncovered", "stuck_count"):
             if key in coverage:
                 compact_coverage[key] = coverage[key]
-        if not floor:
-            # Normal path: include per-criterion list capped to bounded length.
-            criteria = coverage.get("criteria")
-            if isinstance(criteria, list):
+        criteria = coverage.get("criteria")
+        if isinstance(criteria, list):
+            if not floor:
+                # Normal path: include per-criterion list capped to bounded length.
                 compact_coverage["criteria"] = criteria[:_VERSION_PHASE_CRITERIA_CAP]
+            else:
+                # Floor path: include a tightly capped, priority-sorted subset so
+                # the strategist knows WHICH criteria need attention without a fetch.
+                # Priority order: stuck first, then uncovered, then partial.
+                # Keep only load-bearing identity/state fields.
+                def _criterion_sort_key(c: dict) -> int:
+                    if not isinstance(c, dict):
+                        return 3
+                    if c.get("stuck_reason") is not None:
+                        return 0
+                    cov = c.get("coverage")
+                    if cov == "uncovered":
+                        return 1
+                    if cov == "partial":
+                        return 2
+                    return 3
+
+                sorted_criteria = sorted(criteria, key=_criterion_sort_key)
+                floor_criteria = []
+                for c in sorted_criteria[:_VERSION_PHASE_CRITERIA_FLOOR_CAP]:
+                    if not isinstance(c, dict):
+                        continue
+                    entry: dict[str, Any] = {}
+                    for fkey in ("criterion_key", "coverage", "stuck_reason"):
+                        if fkey in c:
+                            entry[fkey] = c[fkey]
+                    text = _bounded_text(c.get("text"), _VERSION_PHASE_TEXT_FLOOR_CAP)
+                    if text:
+                        entry["text"] = text
+                    if entry:
+                        floor_criteria.append(entry)
+                if floor_criteria:
+                    compact_coverage["criteria"] = floor_criteria
         if compact_coverage:
             out["criterion_coverage"] = compact_coverage
     for key in (

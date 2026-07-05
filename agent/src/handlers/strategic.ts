@@ -516,6 +516,26 @@ export async function handleStrategic(
     // wholesale; both forms land in payload._packer_meta. Render them so the
     // agent knows what's available-but-not-shipped and can call ./fetch.
     const packerMeta = payload._packer_meta as Record<string, unknown> | undefined;
+    // Maps each strategic payload key to the ./fetch command that recovers it.
+    const PAYLOAD_KEY_FETCH_VERB: Record<string, string> = {
+      'problem_model':              './fetch problem-model',
+      'directions_summary':         './fetch direction',
+      'staged_directions':          './fetch direction',
+      'open_messages':              './fetch message',
+      'playbook_summary':           './fetch playbook <key>',
+      'playbook_keys_index':        './fetch playbook <key>',
+      'knowledge_index':            './fetch knowledge',
+      'version_phase':              './fetch version-phase',
+      'design_doc':                 './fetch section <key>',
+      'capability_trial_verdicts':  './fetch capability-trials',
+      'compute_experiment_sweeps':  './fetch compute-sweeps',
+      'efficiency_snapshot':        './fetch efficiency-snapshot',
+      'ci_compliance':              './fetch ci-compliance',
+      'retirement_deferrals':       './fetch direction',
+      'past_retirement_critiques':  './fetch direction',
+      'retired_directions_summary': './fetch direction',
+      'previous_decision_outcomes': './fetch direction',
+    };
     const renderPackerMeta = (meta: Record<string, unknown> | undefined): string => {
       if (!meta) return '';
       const trimmed = Array.isArray(meta.trimmed) ? meta.trimmed as Array<Record<string, unknown>> : [];
@@ -538,6 +558,8 @@ export async function handleStrategic(
           } else {
             lines.push(`  - ${k}: shipped in ${kind} form${bytesOrig}${recovery}`);
           }
+          const fetchHint = PAYLOAD_KEY_FETCH_VERB[k];
+          if (fetchHint) lines.push(`    → ${fetchHint}`);
         }
       }
       if (dropped.length > 0) {
@@ -551,11 +573,6 @@ export async function handleStrategic(
           lines.push(`  - ${k}${bytes}: ${reason}${recovery}`);
         }
       }
-      lines.push(
-        '',
-        'To pull full detail when you need it:',
-        ...renderStrategicFetchVerbHelpLines().map(line => `  - ${line}`),
-      );
       return lines.join('\n');
     };
     const packerMetaSection = renderPackerMeta(packerMeta);

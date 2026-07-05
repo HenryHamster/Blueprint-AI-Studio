@@ -3607,6 +3607,14 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         isinstance(e, dict) and "problem_model" in str(e.get("key", "")).lower()
         for e in (dropped + trimmed)
     )
+    open_messages_dropped: bool = any(
+        isinstance(e, dict) and str(e.get("key", "")) == "open_messages"
+        for e in dropped
+    )
+    version_phase_dropped: bool = any(
+        isinstance(e, dict) and str(e.get("key", "")) == "version_phase"
+        for e in dropped
+    )
     # High/critical-tier sections that dropped wholesale under budget pressure —
     # the packer stamps each drop entry with its schema tier. A non-empty list
     # means the strategist ran on a degraded payload; empty means clean.
@@ -3647,6 +3655,8 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         "model_size_status": model_size_status,
         "directions_dropped_count": directions_dropped_count,
         "problem_model_truncated": problem_model_truncated,
+        "open_messages_dropped": open_messages_dropped,
+        "version_phase_dropped": version_phase_dropped,
         "high_tier_dropped": high_tier_dropped,
         "gap_memory_trimmed_count": gap_memory_trimmed_count,
         "gap_memory_hidden_entries": gap_memory_hidden_entries,

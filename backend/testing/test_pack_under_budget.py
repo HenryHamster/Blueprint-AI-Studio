@@ -1429,6 +1429,180 @@ def test_core_sections_survive_realistic_worst_case():
     assert out["_packer_meta"]["budget_used"] <= budget
 
 
+def test_version_phase_floor_keeps_per_criterion_state():
+    """When version_phase ships in floored form, criterion_coverage includes a
+    per-criterion list so the strategist can see WHICH criteria are uncovered or
+    stuck without a fetch round-trip.
+
+    The floor path must:
+    - Preserve aggregate counts (total, covered, partial, uncovered, stuck_count).
+    - Include a per-criterion list capped to _VERSION_PHASE_CRITERIA_FLOOR_CAP.
+    - Prioritize stuck criteria first, then uncovered, then partial.
+    - Emit only load-bearing fields (criterion_key, text, coverage, stuck_reason).
+    - Omit covered criteria when the cap forces a choice.
+    """
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    # Build a version_phase with a rich criterion_coverage list: a mix of
+    # stuck, uncovered, partial, and covered criteria so we can verify that
+    # the floor prioritizes correctly.
+    criteria = []
+    # 3 stuck (uncovered with stuck_reason)
+    for i in range(3):
+        criteria.append({
+            "criterion_key": f"c-stuck-{i:02d}",
+            "text": f"Stuck criterion {i}: needs direction remapping. " + ("s" * 180),
+            "coverage": "uncovered",
+            "status": "active",
+            "evidence_count": 0,
+            "stuck_reason": "no_mapping",
+        })
+    # 5 uncovered (no stuck_reason)
+    for i in range(5):
+        criteria.append({
+            "criterion_key": f"c-uncov-{i:02d}",
+            "text": f"Uncovered criterion {i}: no evidence yet. " + ("u" * 180),
+            "coverage": "uncovered",
+            "status": "active",
+            "evidence_count": 0,
+            "stuck_reason": None,
+        })
+    # 4 partial
+    for i in range(4):
+        criteria.append({
+            "criterion_key": f"c-partial-{i:02d}",
+            "text": f"Partial criterion {i}: some evidence gathered. " + ("p" * 180),
+            "coverage": "partial",
+            "status": "active",
+            "evidence_count": 1,
+            "stuck_reason": None,
+        })
+    # 38 covered (should be lowest priority; dropped when cap forces a choice)
+    for i in range(38):
+        criteria.append({
+            "criterion_key": f"c-covered-{i:02d}",
+            "text": f"Covered criterion {i}: fully evidenced. " + ("v" * 180),
+            "coverage": "covered",
+            "status": "active",
+            "evidence_count": 3,
+            "stuck_reason": None,
+        })
+
+    version_phase = {
+        "version_number": 22,
+        "phase": "build",
+        "goal": "Ship the core-floor guarantee. " + ("g" * 4000),
+        "phase_reasoning": "r" * 4000,
+        "criterion_coverage": {
+            "total": 50,
+            "covered": 38,
+            "partial": 4,
+            "uncovered": 8,
+            "stuck_count": 3,
+            "criteria": criteria,
+        },
+        "recent_versions": [
+            {
+                "version_number": 22 - i,
+                "status": "promoted",
+                "last_qualification": {"status": "not_promoted", "detail": "z" * 1000},
+            }
+            for i in range(10)
+        ],
+    }
+
+    # Build a payload large enough to force the packer to floor version_phase.
+    big_pm = {
+        "gaps": [
+            {
+                "id": f"g-{i:03d}",
+                "name": f"Gap {i}",
+                "priority": "high",
+                "status": "active",
+                "opened": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z",
+                "evidence": "e" * 900,
+                "description": "d" * 600,
+            }
+            for i in range(60)
+        ],
+    }
+    problem_model = _agent_view_problem_model(big_pm)
+    directions_summary = [
+        {
+            "id": f"d-{i:03d}",
+            "priority": "high",
+            "status": "active",
+            "text": "t" * 1500,
+        }
+        for i in range(20)
+    ]
+    open_messages = [
+        {"id": f"m-{i:03d}", "type": "NOTE", "content": "c" * 800}
+        for i in range(30)
+    ]
+
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "Test floor criterion state."},
+        "problem_model": problem_model,
+        "directions_summary": directions_summary,
+        "open_messages": open_messages,
+        "version_phase": version_phase,
+    }
+
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=120 * 1024)
+
+    # version_phase must be present (core floor guarantee).
+    assert "version_phase" in out, "version_phase was dropped wholesale"
+    trimmed_keys = {t["key"] for t in out["_packer_meta"]["trimmed"]}
+    assert "version_phase" in trimmed_keys, (
+        "version_phase should be in floored/trimmed form given the budget pressure"
+    )
+
+    vp_out = out["version_phase"]
+    cc = vp_out.get("criterion_coverage")
+    assert cc is not None, "criterion_coverage was dropped from floored version_phase"
+
+    # Aggregate counts preserved.
+    assert cc.get("total") == 50
+    assert cc.get("stuck_count") == 3
+
+    # Per-criterion list present in floored form.
+    floor_criteria = cc.get("criteria")
+    assert floor_criteria is not None, (
+        "floor path must include per-criterion list — "
+        "strategist cannot see which criteria are stuck/uncovered without it"
+    )
+    assert len(floor_criteria) > 0, "floor criteria list must not be empty"
+
+    # All 3 stuck criteria must appear (they rank highest).
+    floor_keys = {c["criterion_key"] for c in floor_criteria if isinstance(c, dict)}
+    for i in range(3):
+        assert f"c-stuck-{i:02d}" in floor_keys, (
+            f"stuck criterion c-stuck-{i:02d} missing from floor list"
+        )
+
+    # Each criterion entry carries the load-bearing fields.
+    for entry in floor_criteria:
+        assert isinstance(entry, dict)
+        assert "criterion_key" in entry, "floor entry missing criterion_key"
+        assert "coverage" in entry, "floor entry missing coverage"
+        # text may be absent only if the original had no text
+        # stuck_reason present (even if None)
+        assert "stuck_reason" in entry, "floor entry missing stuck_reason"
+
+    # Covered criteria are the lowest priority — with 3+5+4=12 higher-priority
+    # entries and a cap of 10, covered entries should not appear.
+    covered_in_floor = [c for c in floor_criteria if c.get("coverage") == "covered"]
+    assert not covered_in_floor, (
+        "covered criteria should not appear in the floor list when "
+        "stuck+uncovered+partial entries fill the cap"
+    )
+
+
 def test_trim_and_drop_records_include_byte_counts_and_fetch_verb():
     """Trimmed and dropped entries carry byte counts and fetch_verb where declared.
 

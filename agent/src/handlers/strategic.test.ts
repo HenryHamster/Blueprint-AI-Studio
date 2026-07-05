@@ -800,28 +800,29 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).toContain('./fetch version-phase');
   });
 
-  it('packer-meta recovery block advertises all strategic fetch verbs including previously-omitted ones', async () => {
+  it('per-key fetch hints appear for dropped and trimmed entries with byte sizes', async () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',
       _packer_meta: {
-        dropped: [{ key: 'efficiency_snapshot', reason: 'budget' }],
-        trimmed: [],
+        dropped: [{ key: 'open_messages', reason: 'budget exhausted', bytes: 20480, fetch_verb: 'message' }],
+        trimmed: [{ key: 'directions_summary', kind: 'list_trimmed', shown: 5, total: 20, bytes_original: 10240, bytes_trimmed: 2048 }],
       },
     };
     const statusRef = { value: '' };
-    await handleStrategic('task-full-verbs', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+    await handleStrategic('task-per-key-hints', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
 
     const section = String(capturedThinkerParams?.packerMetaSection);
-    // Previously present
-    expect(section).toContain('./fetch problem-model');
-    expect(section).toContain('./fetch version-phase');
-    // Previously missing — must now appear
-    expect(section).toContain('./fetch efficiency-snapshot');
-    expect(section).toContain('./fetch ci-compliance');
-    expect(section).toContain('./fetch qualification');
-    expect(section).toContain('./fetch compute-sweeps');
-    expect(section).toContain('./fetch vm-cost');
-    expect(section).toContain('./fetch knowledge');
+    // Per-key hint for dropped open_messages → message verb (via fetch_verb field)
+    expect(section).toContain('./fetch message');
+    // Per-key hint for trimmed directions_summary → direction verb (via PAYLOAD_KEY_FETCH_VERB)
+    expect(section).toContain('./fetch direction');
+    // Byte size info appears for both entries
+    expect(section).toContain('20480');   // bytes for open_messages
+    expect(section).toContain('10240');   // bytes_original for directions_summary
+    expect(section).toContain('2048');    // bytes_trimmed for directions_summary
+    // Unrelated verbs are not shown (no generic trailing list)
+    expect(section).not.toContain('./fetch gap');
+    expect(section).not.toContain('./fetch playbook');
   });
 
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {

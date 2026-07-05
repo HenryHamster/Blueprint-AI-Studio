@@ -16361,6 +16361,92 @@ def test_compute_model_gc_telemetry_gap_memory_absent():
     assert result["gap_memory_hidden_entries"] == 0
 
 
+def test_cycle_telemetry_records_core_section_survival():
+    """open_messages_dropped and version_phase_dropped reflect core-section drops.
+
+    When open_messages appears in packer dropped list, open_messages_dropped is True.
+    When version_phase appears in packer dropped list, version_phase_dropped is True.
+    When neither core section was dropped, both flags are False.
+    """
+    base_project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+
+    # Both core sections dropped
+    task_both_dropped = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 119000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "open_messages", "reason": "exceeds remaining budget"},
+                        {"key": "version_phase", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_both = _compute_model_gc_telemetry(base_project, task_both_dropped)
+    assert result_both["open_messages_dropped"] is True
+    assert result_both["version_phase_dropped"] is True
+
+    # Only open_messages dropped
+    task_open_only = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 110000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "open_messages", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_open_only = _compute_model_gc_telemetry(base_project, task_open_only)
+    assert result_open_only["open_messages_dropped"] is True
+    assert result_open_only["version_phase_dropped"] is False
+
+    # Neither core section dropped — survival case
+    task_survived = Task(
+        project_id=base_project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 80000,
+                    "trimmed": [],
+                    "dropped": [
+                        {"key": "knowledge_index", "reason": "exceeds remaining budget"},
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+    result_survived = _compute_model_gc_telemetry(base_project, task_survived)
+    assert result_survived["open_messages_dropped"] is False
+    assert result_survived["version_phase_dropped"] is False
+
+
 # ── QUESTION answer threading tests ──────────────────────────────────────────
 
 
