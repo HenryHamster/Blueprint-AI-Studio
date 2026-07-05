@@ -2413,6 +2413,25 @@ async def strategic_operation(
                 status_code=400, detail=f"Unknown direction_id: {direction_id}"
             )
 
+        # Optional explicit criterion_ids — validated against active keys at
+        # task-creation time (same as direction-row inheritance below). Allows
+        # direction-free proving spawns to link their merge evidence to coverage
+        # criteria without requiring a direction assignment.
+        raw_explicit_criterion_ids = data.get("criterion_ids")
+        explicit_criterion_ids: list[str] = []
+        if raw_explicit_criterion_ids is not None:
+            if not isinstance(raw_explicit_criterion_ids, list):
+                raise HTTPException(
+                    status_code=400, detail="criterion_ids must be a list of strings"
+                )
+            for _cid in raw_explicit_criterion_ids:
+                if not isinstance(_cid, str) or not _cid.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="criterion_ids entries must be non-empty strings",
+                    )
+            explicit_criterion_ids = [str(k).strip() for k in raw_explicit_criterion_ids[:50]]
+
         # Build payload — use the same validator the research/plan spawners use
         # so the new task is indistinguishable from normal autonomous spawns
         # except for the context flags.
@@ -2424,6 +2443,25 @@ async def strategic_operation(
         }
         if direction_id:
             spawn_payload["direction_id"] = direction_id
+
+        # Forward an acceptance_evidence declaration from the strategist into the
+        # task payload so direction-free proving spawns can declare a named_test
+        # and have their merge credited as proven acceptance evidence.
+        raw_acceptance_evidence = data.get("acceptance_evidence")
+        if raw_acceptance_evidence is not None:
+            if isinstance(raw_acceptance_evidence, dict):
+                from app.payload_schemas import AcceptanceEvidence as _AcceptanceEvidence
+                try:
+                    _AcceptanceEvidence.model_validate(raw_acceptance_evidence)
+                    spawn_payload["acceptance_evidence"] = raw_acceptance_evidence
+                except Exception:  # noqa: BLE001
+                    warnings.append(
+                        "acceptance_evidence declaration is malformed and was ignored"
+                    )
+            else:
+                warnings.append(
+                    "acceptance_evidence must be a dict; ignored"
+                )
 
         # compute_experiment requires a validated launch contract with spend-gate.
         spawn_requires_approval: bool | None = None
@@ -2635,26 +2673,34 @@ async def strategic_operation(
         if direction_id:
             new_task_ctx["direction_id"] = direction_id
 
-        # Resolve criterion_keys from the direction row so they propagate to the
-        # spawned task's criterion_ids field.
+        # Resolve criterion_keys from two sources: the direction row (when
+        # direction_id is set) and any explicit criterion_ids the strategist
+        # passed. Both are merged and filtered to active keys on the open
+        # version so stale/retracted criteria never propagate to new tasks.
         _task_criterion_ids: list[str] = []
+        _keys_to_filter: list[str] = list(explicit_criterion_ids)
         if direction_id:
             from app.directions_repo import get_direction_row as _get_direction_row
-            from app.release_version import current_open_version as _current_open_version
 
             _dir_row = await _get_direction_row(session, project.id, direction_id)
             if _dir_row is not None and _dir_row.criterion_keys:
-                from app.acceptance_criteria import (
-                    filter_active_criterion_keys as _filter_active_crit,
+                # Merge: explicit keys first, then direction-derived; deduplicate.
+                _keys_to_filter = list(
+                    dict.fromkeys(_keys_to_filter + list(_dir_row.criterion_keys))
                 )
-                _open_version = await _current_open_version(session, project.id)
-                if _open_version is not None:
-                    _task_criterion_ids = await _filter_active_crit(
-                        session,
-                        project.id,
-                        list(_dir_row.criterion_keys),
-                        release_version_id=_open_version.id,
-                    )
+        if _keys_to_filter:
+            from app.acceptance_criteria import (
+                filter_active_criterion_keys as _filter_active_crit,
+            )
+            from app.release_version import current_open_version as _current_open_version
+
+            _open_version = await _current_open_version(session, project.id)
+            _task_criterion_ids = await _filter_active_crit(
+                session,
+                project.id,
+                _keys_to_filter,
+                release_version_id=_open_version.id if _open_version is not None else None,
+            )
 
         new_task = Task(
             project_id=project.id,

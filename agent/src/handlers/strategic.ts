@@ -1039,6 +1039,20 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # the others.  "declared_metric" (required with arms) is the exact metric key each
 # arm writes to $BLUEPRINT_RESULT_FILE.
 ./strategic spawn-task '{"type": "compute_experiment", "title": "...", "hypothesis": "<arm A outperforms arm B on the declared metric>", "arms": [{"name": "a", "command": "<command for arm a>"}, {"name": "b", "command": "<command for arm b>"}], "declared_metric": "<metric_key>", "spend_cap_usd": 5.00, "deadline_seconds": 3600, "direction_id": "d-xxx"}'
+# Optional fields on any spawn-task call:
+#   criterion_ids — list of criterion keys (from acceptance criteria) to link this
+#     task's merge evidence to coverage. When direction_id is also set, these are
+#     MERGED with the direction's criterion_keys (both filtered to active keys).
+#     Use this for direction-free proving spawns that should count toward coverage.
+#   acceptance_evidence — declare HOW the spawned task proves its claim; the named_test
+#     kind is the strongest signal: when the declared test runs green, the merge is
+#     credited as proven and contributes to acceptance_declaration_coverage.
+#     Without this field, a proven merge still records evidence but is not pinned to
+#     a specific test, so the coverage credit is weaker.
+# Direction-free proving spawn that contributes to criterion coverage:
+./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "criterion_ids": ["c-key-1", "c-key-2"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}}'
+# Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
+./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually

@@ -21584,6 +21584,360 @@ class TestStrategistSpawnableRegistry:
                 )
 
 
+class TestStrategistSpawnCriterionIds:
+    """Guard: spawn_task accepts explicit criterion_ids and acceptance_evidence.
+
+    Explicit criterion_ids must be validated against active criteria (inactive
+    keys silently dropped, exactly like direction-row inheritance).  An
+    acceptance_evidence dict is forwarded into the task payload unchanged when
+    well-formed, and rejected with a warning when malformed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_explicit_criterion_ids_stored_on_spawned_task(
+        self, client: AsyncClient, db_session
+    ):
+        """criterion_ids passed to spawn_task land on the new task after
+        filtering to active keys only (inactive / unknown keys are dropped)."""
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import VersionAcceptanceCriterion
+
+        project = Project(name="ExplicitCriterionIdSpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        # Seed one active and one inactive criterion for the open version.
+        rv = await _make_open_version(db_session, project.id)
+
+        active_key = f"c-active-{_uuid.uuid4().hex[:8]}"
+        inactive_key = f"c-inactive-{_uuid.uuid4().hex[:8]}"
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=active_key,
+                status="active",
+                text="Active criterion",
+            )
+        )
+        db_session.add(
+            VersionAcceptanceCriterion(
+                project_id=project.id,
+                release_version_id=rv.id,
+                criterion_key=inactive_key,
+                status="retracted",
+                text="Inactive criterion",
+            )
+        )
+        await db_session.commit()
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for criterion spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-crit-spawn-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-crit-spawn-test",
+            task_type="strategic_review",
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Investigate criterion coverage gap",
+                    "prompt": "Research the coverage gap for the active criterion",
+                    # Active key should survive; inactive should be dropped.
+                    "criterion_ids": [active_key, inactive_key],
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "spawn_task"
+
+        child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
+        assert child is not None
+        # Only the active key survives the filter.
+        assert child.criterion_ids == [active_key], (
+            f"expected [{active_key!r}], got {child.criterion_ids!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_criterion_ids_merged_with_direction_keys(
+        self, client: AsyncClient, db_session
+    ):
+        """When both direction_id and explicit criterion_ids are supplied, the
+        spawned task receives the union of both sources (filtered to active)."""
+        import uuid as _uuid
+        from app.auth import create_agent_token
+        from app.models import Direction, VersionAcceptanceCriterion
+
+        project = Project(name="MergedCriterionSpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        rv = await _make_open_version(db_session, project.id)
+
+        dir_key = f"c-dir-{_uuid.uuid4().hex[:8]}"
+        explicit_key = f"c-explicit-{_uuid.uuid4().hex[:8]}"
+        for key in (dir_key, explicit_key):
+            db_session.add(
+                VersionAcceptanceCriterion(
+                    project_id=project.id,
+                    release_version_id=rv.id,
+                    criterion_key=key,
+                    status="active",
+                    text=f"Criterion {key}",
+                )
+            )
+        await db_session.commit()
+
+        direction_id_str = f"d-{_uuid.uuid4().hex[:8]}"
+        direction = Direction(
+            project_id=project.id,
+            direction_key=direction_id_str,
+            status="active",
+            text="Direction with criterion",
+            data={"id": direction_id_str, "status": "active", "text": "Direction with criterion"},
+            criterion_keys=[dir_key],
+        )
+        db_session.add(direction)
+        await db_session.commit()
+
+        # Project.directions must include the direction dict for the id-check in the handler.
+        project.directions = [
+            {"id": direction_id_str, "status": "active", "text": "Direction with criterion"}
+        ]
+        from sqlalchemy.orm.attributes import flag_modified
+
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for merged criterion spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-merged-crit-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-merged-crit-test",
+            task_type="strategic_review",
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with merged criteria",
+                    "prompt": "Investigate both criterion areas",
+                    "direction_id": direction_id_str,
+                    "criterion_ids": [explicit_key],
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
+        assert child is not None
+        # Both the explicit key and the direction-derived key must be present.
+        assert set(child.criterion_ids) == {dir_key, explicit_key}, (
+            f"expected both keys, got {child.criterion_ids!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_acceptance_evidence_forwarded_to_task_payload(
+        self, client: AsyncClient, db_session
+    ):
+        """A well-formed acceptance_evidence dict is forwarded into the spawned
+        task's payload verbatim."""
+        import uuid as _uuid
+        from app.auth import create_agent_token
+
+        project = Project(name="AcceptanceEvidenceSpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for acceptance evidence spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-ae-spawn-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-ae-spawn-test",
+            task_type="strategic_review",
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with acceptance evidence",
+                    "prompt": "Investigate criterion coverage",
+                    "acceptance_evidence": {
+                        "kind": "named_test",
+                        "test_path": "testing/test_acceptance_criteria.py",
+                        "test_id": "test_coverage_gate",
+                    },
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
+        assert child is not None
+        payload = child.first_payload
+        assert "acceptance_evidence" in payload, (
+            "acceptance_evidence must be forwarded into task payload"
+        )
+        ae = payload["acceptance_evidence"]
+        assert ae["kind"] == "named_test"
+        assert ae["test_path"] == "testing/test_acceptance_criteria.py"
+        assert ae["test_id"] == "test_coverage_gate"
+
+    @pytest.mark.asyncio
+    async def test_malformed_acceptance_evidence_silently_warned(
+        self, client: AsyncClient, db_session
+    ):
+        """A malformed acceptance_evidence is dropped with a warning (not a 400)
+        so the spawn still succeeds — the declaration is advisory, not gate-blocking."""
+        import uuid as _uuid
+        from app.auth import create_agent_token
+
+        project = Project(name="MalformedAESpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for malformed AE spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-bad-ae-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-bad-ae-test",
+            task_type="strategic_review",
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with bad acceptance evidence",
+                    "prompt": "Investigate coverage",
+                    # Missing required fields — kind=named_test but no test_path.
+                    "acceptance_evidence": {"kind": "named_test"},
+                },
+            },
+        )
+        # Should succeed (not a 400) — bad AE is a warning, not a hard failure.
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+
+        child = await db_session.get(Task, _uuid.UUID(body["task_id"]))
+        assert child is not None
+        payload = child.first_payload
+        # Malformed AE must not land in the payload.
+        assert "acceptance_evidence" not in payload
+
+    @pytest.mark.asyncio
+    async def test_criterion_ids_non_list_rejected(
+        self, client: AsyncClient, db_session
+    ):
+        """criterion_ids must be a list; a non-list value returns 400."""
+        from app.auth import create_agent_token
+
+        project = Project(name="BadCriterionIdSpawn", user_id="test-user")
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        strategic_task = Task(
+            project_id=project.id,
+            title="Strategic review for bad criterion spawn",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id="agent-vm-bad-crit-test",
+        )
+        db_session.add(strategic_task)
+        await db_session.commit()
+        await db_session.refresh(strategic_task)
+
+        token = create_agent_token(
+            str(strategic_task.id),
+            "agent-vm-bad-crit-test",
+            task_type="strategic_review",
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(strategic_task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Research with bad criterion_ids type",
+                    "prompt": "Investigate coverage",
+                    "criterion_ids": "not-a-list",
+                },
+            },
+        )
+        assert resp.status_code == 400
+        assert "criterion_ids" in resp.json().get("error", {}).get("message", "")
+
+
 @pytest.mark.asyncio
 async def test_qa_task_receives_rejection_patterns(client: AsyncClient, db_session):
     """A qa task's claim ships project_context.rejection_patterns.
