@@ -2029,6 +2029,7 @@ export default function App() {
           projects={s.projects}
           selectedProjectId={s.selectedProjectId}
           fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
+          live={s.wsConnected}
         />
       )}
 

@@ -1015,4 +1015,115 @@ describe('FleetRunnersPanel — behavioral', () => {
     const el = await mount();
     expect(el.textContent).toContain('Unauthorized');
   });
+
+  // ── live prop / 30s poll gating ──────────────────────────────────────────────
+
+  test('test_live_stream_suppresses_blind_30s_poll: when live=true, setInterval is not called with 30000', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-live" live={true} />);
+      });
+      await act(async () => {});
+
+      // The 30s blind-poll interval must not be registered when live=true
+      expect(intervals).not.toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('when live=false, setInterval is called with 30000 (poll runs)', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-poll" live={false} />);
+      });
+      await act(async () => {});
+
+      expect(intervals).toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('when live is absent (default), setInterval fires with 30000 (backward-compat)', async () => {
+    const intervals: number[] = [];
+    const origSetInterval = globalThis.setInterval;
+    const spy = vi.spyOn(globalThis, 'setInterval').mockImplementation((fn, delay, ...args) => {
+      if (typeof delay === 'number') intervals.push(delay);
+      return origSetInterval(fn, delay, ...args);
+    });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-default" />);
+      });
+      await act(async () => {});
+
+      expect(intervals).toContain(30000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  test('enrollment fast-poll (3s) still fires when live=true and enroll dialog is open', async () => {
+    // Reset mock so runner-new is NOT in the list (a prior test's mockResolvedValue
+    // would otherwise include it as 'connected', making enrolledConnected=true which
+    // short-circuits the fast-poll useEffect).
+    vi.mocked(listFleetRunners).mockResolvedValue(SAMPLE_RUNNERS);
+
+    // Use fake timers only for setInterval/clearInterval so React's scheduler
+    // (which uses MessageChannel/setTimeout) keeps working normally.
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval'] });
+    try {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      const r = createRoot(host);
+      root = r;
+      await act(async () => {
+        r.render(<FleetRunnersPanel projectId="proj-enroll-live" live={true} />);
+      });
+      await act(async () => {});
+
+      const enrollBtn = [...(host as HTMLDivElement).querySelectorAll('button')].find(b => b.textContent?.includes('Enroll runner'));
+      await act(async () => { (enrollBtn as HTMLButtonElement).click(); });
+      await act(async () => {});
+
+      // Verify the dialog opened and the runner has not yet connected
+      expect((host as HTMLDivElement).textContent).toContain('Waiting for your runner to connect');
+
+      const callsBeforeAdvance = vi.mocked(listFleetRunners).mock.calls.length;
+
+      // Advance 3s: the enrollment fast-poll (gated on pendingToken, NOT on live)
+      // must still fire when live=true — assert an extra load() call occurs.
+      await act(async () => { vi.advanceTimersByTime(3000); });
+      await act(async () => {});
+
+      expect(vi.mocked(listFleetRunners).mock.calls.length).toBeGreaterThan(callsBeforeAdvance);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

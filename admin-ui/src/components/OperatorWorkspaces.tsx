@@ -608,6 +608,7 @@ export function RuntimeWorkspace({
                   projectId={selectedProjectId}
                   requireLocalRunner={settingsRouterProps.resourceEnvelopeData?.require_local_runner ?? false}
                   refreshSignal={fleetRunnersRefreshSignal}
+                  live={wsConnected}
                 />
               ) : (
                 <div className="py-10 text-center text-xs text-neutral-500">

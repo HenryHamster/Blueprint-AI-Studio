@@ -418,13 +418,17 @@ interface Props {
   projectId: string;
   requireLocalRunner?: boolean;
   refreshSignal?: number;
+  /** When true (WS stream connected), suppress the 30s blind poll — rely on
+   *  refreshSignal and post-mutation loads instead. Absent or false keeps the
+   *  poll running as a safety-net (WS down / prop not yet plumbed). */
+  live?: boolean;
 }
 
 function tokenExpiryFromRegisterResult(result: FleetRunnerRegistrationResult): string | null {
   return result.token_expires_at ?? result.expires_at ?? result.expiresAt ?? null;
 }
 
-export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal }: Props) {
+export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refreshSignal, live }: Props) {
   const [runners, setRunners] = useState<FleetRunner[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -461,9 +465,10 @@ export function FleetRunnersPanel({ projectId, requireLocalRunner = false, refre
   useEffect(() => { if (refreshSignal !== undefined) load(); }, [load, refreshSignal]);
 
   useEffect(() => {
+    if (live === true) return;
     const interval = setInterval(load, 30000);
     return () => clearInterval(interval);
-  }, [load]);
+  }, [load, live]);
 
   // While the enroll dialog is open, resolve the just-enrolled runner from the
   // list so the dialog can show live "waiting… / connected" feedback. Poll faster
