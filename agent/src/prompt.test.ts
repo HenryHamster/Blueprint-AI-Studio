@@ -4971,6 +4971,191 @@ describe('writeMessagesHelper', () => {
   });
 });
 
+// ── writeMessagesHelper stdin-based send (quote-safety) ──────────────────────
+describe('writeMessagesHelper stdin-based send', () => {
+  let capturedScripts: Record<string, string> = {};
+
+  beforeEach(() => {
+    capturedScripts = {};
+    vi.mocked(fs.writeFileSync).mockImplementation((...args: unknown[]) => {
+      const [path, content] = args as [string, string];
+      capturedScripts[path] = content;
+    });
+  });
+
+  it('reads content from stdin instead of $2, and MSG_TYPE from $2 instead of $3', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toBeDefined();
+    // Content comes from stdin, not a positional argument
+    expect(script).toContain('CONTENT=$(cat)');
+    expect(script).not.toContain("CONTENT=\"${2:?");
+    // MSG_TYPE is now $2, not $3
+    expect(script).toContain('MSG_TYPE="${2:-NOTE}"');
+    expect(script).not.toContain('MSG_TYPE="${3:-NOTE}"');
+  });
+
+  it('fails loud with a clear error when stdin is empty', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toContain('[ERROR] send: no content on stdin');
+    expect(script).toContain("printf '%s' 'msg' | ./messages send [TYPE]");
+  });
+
+  it('captures jq-built payload into PAYLOAD variable and fails loud on jq errors', () => {
+    writeMessagesHelper('task-stdin-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    expect(script).toContain('PAYLOAD=$(jq -n');
+    expect(script).toContain('[ERROR] send: failed to serialize message payload');
+    // Sends the PAYLOAD (not raw jq pipe) to _post_strategic
+    expect(script).toContain('printf \'%s\' "$PAYLOAD" | _post_strategic');
+  });
+
+  it('sends content with single quotes end-to-end via stdin', async () => {
+    writeMessagesHelper('task-q-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    // Write the messages script
+    const scriptPath = realPath.join(tmpDir, `messages_quote_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    // Mock curl: captures --data-binary stdin, writes to a file, exits 0 with 200
+    const captureFile = realPath.join(tmpDir, `messages_captured_${process.pid}.json`);
+    const mockCurlDir = realPath.join(tmpDir, `messages_mockbin_${process.pid}`);
+    realFs.mkdirSync(mockCurlDir, { recursive: true });
+    const mockCurlPath = realPath.join(mockCurlDir, 'curl');
+    realFs.writeFileSync(mockCurlPath, [
+      '#!/bin/bash',
+      `CAPTURE_FILE="${captureFile}"`,
+      '# Read piped stdin (--data-binary @-) and capture it',
+      'cat > "$CAPTURE_FILE"',
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    const mockJqDir = realPath.join(tmpDir, `messages_mockjq_${process.pid}`);
+    realFs.mkdirSync(mockJqDir, { recursive: true });
+    const mockJqPath = realPath.join(mockJqDir, 'jq');
+    realFs.writeFileSync(mockJqPath, [
+      '#!/bin/bash',
+      '# Passthrough to real jq',
+      'exec /usr/bin/jq "$@"',
+    ].join('\n'), { mode: 0o755 });
+    const contentWithQuote = "Everything's fine and \"quoted\"";
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'NOTE'], {
+        input: contentWithQuote,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${mockCurlDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as { data: { content: string; type: string } };
+      expect(parsed.data.content).toBe(contentWithQuote);
+      expect(parsed.data.type).toBe('NOTE');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockJqPath); realFs.rmdirSync(mockJqDir); } catch { /* ignore */ }
+    }
+  });
+
+  it('sends content with newlines end-to-end via stdin', async () => {
+    writeMessagesHelper('task-nl-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_nl_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    const captureFile = realPath.join(tmpDir, `messages_captured_nl_${process.pid}.json`);
+    const mockCurlDir = realPath.join(tmpDir, `messages_mockbin_nl_${process.pid}`);
+    realFs.mkdirSync(mockCurlDir, { recursive: true });
+    const mockCurlPath = realPath.join(mockCurlDir, 'curl');
+    realFs.writeFileSync(mockCurlPath, [
+      '#!/bin/bash',
+      `CAPTURE_FILE="${captureFile}"`,
+      'cat > "$CAPTURE_FILE"',
+      "echo '{\"status\":\"ok\"}'",
+      'echo "200"',
+    ].join('\n'), { mode: 0o755 });
+    const contentWithNewlines = 'Line one\nLine two has an apostrophe\'s content\nLine three: "quoted"';
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'BUG_REPORT'], {
+        input: contentWithNewlines,
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          ORCHESTRATOR_URL: 'http://mock',
+          AGENT_API_TOKEN: 'tok',
+          PATH: `${mockCurlDir}:${process.env.PATH}`,
+        },
+        timeout: 5000,
+      });
+      expect(result.status).toBe(0);
+      const captured = realFs.readFileSync(captureFile, 'utf8').trim();
+      const parsed = JSON.parse(captured) as { data: { content: string; type: string } };
+      expect(parsed.data.content).toBe(contentWithNewlines);
+      expect(parsed.data.type).toBe('BUG_REPORT');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+      try { realFs.unlinkSync(captureFile); } catch { /* ignore */ }
+      try { realFs.unlinkSync(mockCurlPath); realFs.rmdirSync(mockCurlDir); } catch { /* ignore */ }
+    }
+  });
+
+  it('fails loud (non-zero exit + stderr message) when stdin is empty', async () => {
+    writeMessagesHelper('task-empty-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmpDir = realOs.tmpdir();
+    const scriptPath = realPath.join(tmpDir, `messages_empty_test_${process.pid}.sh`);
+    realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
+    try {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'NOTE'], {
+        input: '',
+        encoding: 'utf8',
+        env: { ...process.env, ORCHESTRATOR_URL: 'http://mock', AGENT_API_TOKEN: 'tok' },
+        timeout: 5000,
+      });
+      expect(result.status).not.toBe(0);
+      expect(result.stderr).toContain('[ERROR] send: no content on stdin');
+    } finally {
+      try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
+    }
+  });
+
+  it('generated script passes bash -n syntax check', async () => {
+    writeMessagesHelper('task-syntax-test');
+    const script = capturedScripts['/tmp/workspace/messages'];
+    const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const realCp = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    const realOs = await vi.importActual<typeof import('node:os')>('node:os');
+    const realPath = await vi.importActual<typeof import('node:path')>('node:path');
+    const tmp = realPath.join(realOs.tmpdir(), `messages_stdin_syntax_${process.pid}.sh`);
+    realFs.writeFileSync(tmp, script);
+    try {
+      realCp.execFileSync('bash', ['-n', tmp], { stdio: 'pipe' });
+    } finally {
+      try { realFs.unlinkSync(tmp); } catch { /* ignore */ }
+    }
+  });
+});
+
 // ── writePlaybookHelper (live token resolution) ──────────────────────────────
 describe('writePlaybookHelper live token resolution', () => {
   let capturedScripts: Record<string, string> = {};

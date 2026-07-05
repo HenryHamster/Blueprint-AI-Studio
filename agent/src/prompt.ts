@@ -733,6 +733,7 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
 #                                                  #   message UUID, as shown in the admin UI)
 #                                                  #   or a full UUID — the backend resolves it,
 #                                                  #   so no need to recover the full UUID.
+# Note: send reads content from stdin so apostrophes, quotes, and newlines are safe.
 
 OP="\${1:?Usage: messages send|resolve ...}"
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
@@ -750,9 +751,11 @@ if [ "$OP" = "send" ]; then
   fi
   [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
   IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
-  jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
-    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}' | \\
-    _post_with_retry "$API/api/agent/strategic" "messages $OP"
+  PAYLOAD=$(jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
+    '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}') || {
+    echo "[ERROR] send: failed to serialize message payload" >&2; exit 1
+  }
+  printf '%s' "$PAYLOAD" | _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"

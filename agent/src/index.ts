@@ -911,7 +911,7 @@ export async function apiRequest(
       // a bounded per-request budget (not the synchronous ./pr step), so a short
       // cap keeps it responsive and simply re-polls sooner; the backend still
       // won't create until the quota returns, so an earlier retry is harmless.
-      const retryAfterHeader = res.headers?.get('Retry-After') ?? null;
+      const retryAfterHeader = res.headers.get('Retry-After') ?? null;
       if (res.status === 503 || (res.status === 403 && retryAfterHeader !== null)) {
         if (attempt === retries - 1) {
           throw new Error(`${method} ${path} failed (${res.status}): ${text}`);
