@@ -8,6 +8,7 @@ import { DirectionsPanel } from './DirectionsPanel';
 import { ComputeJobsPanel } from './ComputeJobsPanel';
 import { DashboardHome } from './DashboardHome';
 import { ConsoleHome } from './ConsoleHome';
+import { CompletionDebtPanel } from './CompletionDebtPanel';
 import { FleetRunnersPanel } from './FleetRunnersPanel';
 import { RuntimeAccountsPanel } from './RuntimeAccountsPanel';
 import { SettingsSectionRouter, type SettingsSectionRouterProps } from './SettingsSectionRouter';
@@ -461,6 +462,7 @@ interface RuntimeWorkspaceProps {
   onNavigateToKnowledge: (documentId: string) => void;
   onRestartOrchestrator: () => Promise<void>;
   fleetRunnersRefreshSignal?: number;
+  addToast: (message: string, type: 'success' | 'error' | 'info') => void;
 }
 
 export function RuntimeWorkspace({
@@ -496,6 +498,7 @@ export function RuntimeWorkspace({
   onNavigateToKnowledge,
   onRestartOrchestrator,
   fleetRunnersRefreshSignal,
+  addToast,
 }: RuntimeWorkspaceProps) {
   const runtimeSettingsSections = visibleRuntimeSettingsSections(userRole);
   const activeRuntimeItem = resolveRuntimeItem(runtimeSection);
@@ -579,6 +582,12 @@ export function RuntimeWorkspace({
             onOpenFleet={onOpenFleet}
             onCreateTask={onCreateTask}
           />
+          {selectedProjectId && (
+            <CompletionDebtPanel
+              projectId={selectedProjectId}
+              addToast={addToast}
+            />
+          )}
         </div>
       ) : runtimeSection === 'devices' ? (
         <div className="mx-auto flex max-w-7xl flex-col gap-3">

@@ -64,6 +64,7 @@ import {
   buildDirHealthSummary,
   buildSweepComparisonSection,
   buildCiComplianceSection,
+  buildCompletionDebtSection,
   buildPayloadStalenessSection,
 } from './strategic-sections.js';
 
@@ -322,6 +323,7 @@ export async function handleStrategic(
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
+    const completionDebtSection = buildCompletionDebtSection(payload.open_completion_debt);
 
     const outcomeEval = payload.outcome_evaluation as Record<string, unknown> | undefined;
     const outcomeSection = buildOutcomeSection(outcomeEval);
@@ -545,6 +547,7 @@ export async function handleStrategic(
       'compute_experiment_sweeps':  './fetch compute-sweeps',
       'efficiency_snapshot':        './fetch efficiency-snapshot',
       'ci_compliance':              './fetch ci-compliance',
+      'open_completion_debt':       './fetch completion-debt',
       // sections-type keys: served by /api/agent/projects/{id}/sections/{name}.
       // retirement_deferrals is intentionally omitted: it has no recovery path
       // (SECTION_FETCH_INVENTORY maps it to None), so advertising any fetch
@@ -740,6 +743,7 @@ prompts, schemas, tools, or orchestration.` : '';
       memoCitationsSection: buildMemoCitationsSection(payload.memo_citations),
       efficiencySnapshotSection,
       ciComplianceSection,
+      completionDebtSection,
       // Shared capability vocabulary + uniform provides_capability / prerequisite
       // declaration guidance, so the strategist draws cross-lane capability refs
       // from the same registry namespace every other task type uses.

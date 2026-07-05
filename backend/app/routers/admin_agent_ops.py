@@ -1652,6 +1652,32 @@ async def strategic_operation(
             flag_modified(task, "context")
             session.add(task)
             await session.commit()
+            # Completion-debt ledger: a deferred retirement is a residual
+            # obligation (the retire is owed once the gate clears). Best-effort,
+            # deduped per (project, direction) so repeated deferrals keep a
+            # single open row and never break the strategic operation.
+            try:
+                from app.completion_debt import (
+                    arecord_completion_debt,
+                    KIND_RETIREMENT_RESIDUAL,
+                )
+
+                await arecord_completion_debt(
+                    session,
+                    dedupe_key=f"retirement_residual:{project.id}:{dir_id}:deferred",
+                    kind=KIND_RETIREMENT_RESIDUAL,
+                    title=f"Retirement deferred for direction {dir_id}: {gate_reason}",
+                    project_id=project.id,
+                    source="admin_agent_ops",
+                    detail={"direction_id": str(dir_id), "kind": "deferred"},
+                )
+                await session.commit()
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "[STRATEGIC API] completion-debt record failed for deferred "
+                    "retirement of direction %s (non-fatal)",
+                    dir_id,
+                )
             await _emit_updated(
                 STRATEGIC_KIND_DIRECTIONS,
                 changed_direction_ids=[dir_id],
@@ -4258,3 +4284,103 @@ async def admin_declare_capability_verdict(
         "cap_name": cap_name,
         "verdict": body.verdict,
     }
+
+
+# ── Completion-debt endpoints ──────────────────────────────────────────────────
+
+
+@router.get("/api/admin/projects/{project_id}/completion-debts")
+@limiter.limit("60/minute")
+async def admin_list_completion_debts(
+    request: Request,
+    project_id: uuid.UUID,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """List completion-debt entries for a project with optional filters."""
+    from app.completion_debt import debt_to_dict, list_completion_debts
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    valid_statuses = {"open", "dismissed", "resolved"}
+    if status is not None and status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"status must be one of {sorted(valid_statuses)}")
+
+    entries = await list_completion_debts(
+        session,
+        project_id=project_id,
+        status=status,
+        kind=kind,
+        limit=min(limit, 200),
+        offset=offset,
+    )
+    return {"entries": [debt_to_dict(e) for e in entries], "count": len(entries)}
+
+
+class _DismissDebtRequest(BaseModel):
+    reason: str
+
+
+@router.post("/api/admin/projects/{project_id}/completion-debts/{debt_id}/dismiss")
+@limiter.limit("30/minute")
+async def admin_dismiss_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    debt_id: uuid.UUID,
+    body: _DismissDebtRequest,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Dismiss a completion-debt entry with a reason."""
+    from app.completion_debt import debt_to_dict, dismiss_debt
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    reason = body.reason.strip() if isinstance(body.reason, str) else ""
+    if not reason:
+        raise HTTPException(status_code=400, detail="reason must be a non-empty string")
+
+    try:
+        entry = await dismiss_debt(session, debt_id, project_id=project_id, reason=reason)
+    except ValueError as exc:
+        if "not_found" in str(exc):
+            raise HTTPException(status_code=404, detail="Completion debt entry not found") from exc
+        raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+    await session.commit()
+    return {"status": "ok", "entry": debt_to_dict(entry)}
+
+
+@router.post("/api/admin/projects/{project_id}/completion-debts/{debt_id}/resolve")
+@limiter.limit("30/minute")
+async def admin_resolve_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    debt_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(require_admin),
+):
+    """Mark a completion-debt entry as resolved."""
+    from app.completion_debt import debt_to_dict, resolve_debt
+
+    project = await session.get(Project, project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        entry = await resolve_debt(session, debt_id, project_id=project_id)
+    except ValueError as exc:
+        if "not_found" in str(exc):
+            raise HTTPException(status_code=404, detail="Completion debt entry not found") from exc
+        raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+    await session.commit()
+    return {"status": "ok", "entry": debt_to_dict(entry)}

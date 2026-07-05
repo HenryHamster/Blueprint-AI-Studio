@@ -1073,6 +1073,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "capability_trial_verdicts": "capability-trials",
     "efficiency_snapshot": "efficiency-snapshot",
     "ci_compliance": "ci-compliance",
+    "open_completion_debt": "completion-debt",
     # Low — generic section endpoint (project-data-based, no complex async)
     "self_reflection_log": "sections",
     "anomaly_summary": "sections",
@@ -1176,6 +1177,38 @@ async def agent_fetch_payload_section(
             data = _build_outcome_evaluation(project, cycle_history)
 
     return {"status": "success", "data": data}
+
+
+@router.get("/projects/{project_id}/completion-debt")
+@limiter.limit("60/minute")
+async def agent_fetch_completion_debt(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return open completion-debt entries for the project.
+
+    Recovery path when ``open_completion_debt`` was dropped from the strategic
+    payload under budget pressure. Returns the bounded list of open debt entries
+    (kind, description, created_at, age_days) from the completion-debt ledger.
+
+    Returns ``{"status": "success", "data": [], "source": "not_available"}`` when
+    the completion-debt module has not yet been deployed (ledger table absent).
+    Cross-project access returns 404.
+    """
+    await _resolve_agent_project(project_id, token, session)
+    try:
+        from importlib import import_module
+
+        _completion_debt = import_module("app.completion_debt")
+        entries = await _completion_debt.get_open_completion_debt(session, project_id)
+        return {"status": "success", "data": entries}
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] completion_debt unavailable for project %s", project_id
+        )
+        return {"status": "success", "data": [], "source": "not_available"}
 
 
 @router.get("/projects/{project_id}/gaps/{gap_id}")

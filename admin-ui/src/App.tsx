@@ -1648,6 +1648,7 @@ export default function App() {
             onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}
             onRestartOrchestrator={s.handleRestartOrchestrator}
             fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
+            addToast={s.addToast}
           />
         </ErrorBoundary>
       ) : (

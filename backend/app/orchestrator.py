@@ -8754,7 +8754,7 @@ async def orchestrator_worker():
                                 if ci_task.project_id
                                 else None
                             )
-                            ci_resolution.record_no_ci_gate_runtime(
+                            await ci_resolution.arecord_no_ci_gate_runtime(
                                 session,
                                 _rt_proj,
                                 executed_real_tests=(

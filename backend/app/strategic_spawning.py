@@ -3515,6 +3515,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # signal that degrades before load-bearing state. Dropped whole under budget;
     # full detail fetchable via ./fetch ci-compliance.
     "ci_compliance": {"priority": "low", "exempt": True},
+    # Open completion-debt ledger: durable unfinished-work obligations from
+    # default-OFF feature merges, observe-mode knobs, and retirement residuals.
+    # Medium priority, exempt: bounded by the ledger query cap at build time.
+    # Fetchable via ./fetch completion-debt when dropped under budget pressure.
+    "open_completion_debt": {"priority": "medium", "exempt": True},
     # Held-directions block: directions that have hit the consecutive-failure
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
@@ -7963,6 +7968,16 @@ async def _spawn_strategic_review(
                 )
     except Exception:
         logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
+    _open_completion_debt_block: list[dict[str, Any]] | None = None
+    try:
+        from importlib import import_module
+
+        _completion_debt = import_module("app.completion_debt")
+        _open_completion_debt_block = await _completion_debt.get_open_completion_debt(
+            session, project.id
+        )
+    except Exception:
+        logger.exception("[STRATEGIC] open_completion_debt signal build failed; continuing")
     _active_direction_ids = [
         d.get("id")
         for d in (project.directions or [])
@@ -8114,6 +8129,11 @@ async def _spawn_strategic_review(
             **({"version_phase": _version_phase_block} if _version_phase_block else {}),
             **({"payload_staleness": _payload_staleness} if _payload_staleness else {}),
             **({"ci_compliance": _ci_compliance_block} if _ci_compliance_block else {}),
+            **(
+                {"open_completion_debt": _open_completion_debt_block}
+                if _open_completion_debt_block
+                else {}
+            ),
             **(
                 {"deployment_state": _deployment_state_block}
                 if _deployment_state_block

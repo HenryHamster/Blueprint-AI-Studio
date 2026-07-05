@@ -4485,3 +4485,67 @@ export async function triggerTaskRollup(
   }
   return res.json();
 }
+
+export interface CompletionDebtEntry {
+  id: string;
+  project_id: string;
+  kind: string;
+  title: string;
+  detail: string | null;
+  status: 'open' | 'dismissed' | 'resolved';
+  dismiss_reason: string | null;
+  created_at: string;
+  dismissed_at: string | null;
+  resolved_at: string | null;
+}
+
+/** List completion-debt entries for a project. */
+export async function fetchCompletionDebts(
+  projectId: string,
+  filters?: { status?: string; kind?: string },
+): Promise<{ entries: CompletionDebtEntry[]; count: number }> {
+  const params = new URLSearchParams();
+  if (filters?.status) params.set('status', filters.status);
+  if (filters?.kind) params.set('kind', filters.kind);
+  const qs = params.toString();
+  const url = `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts${qs ? `?${qs}` : ''}`;
+  const res = await apiFetch(url);
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to fetch completion debts: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Dismiss a completion-debt entry with a reason. */
+export async function dismissCompletionDebt(
+  projectId: string,
+  debtId: string,
+  reason: string,
+): Promise<{ status: string; entry: CompletionDebtEntry }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts/${encodeURIComponent(debtId)}/dismiss`,
+    { method: 'POST', body: JSON.stringify({ reason }), headers: { 'Content-Type': 'application/json' } },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to dismiss completion debt: ${res.status}`);
+  }
+  return res.json();
+}
+
+/** Resolve a completion-debt entry (mark work complete). */
+export async function resolveCompletionDebt(
+  projectId: string,
+  debtId: string,
+): Promise<{ status: string; entry: CompletionDebtEntry }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/completion-debts/${encodeURIComponent(debtId)}/resolve`,
+    { method: 'POST' },
+  );
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.detail || `Failed to resolve completion debt: ${res.status}`);
+  }
+  return res.json();
+}

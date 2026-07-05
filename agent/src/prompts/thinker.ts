@@ -110,6 +110,7 @@ function buildStrategicFingerprintPrompt(
     memoCitationsSection: p.memoCitationsSection ? '<memo-citations>' : '',
     efficiencySnapshotSection: p.efficiencySnapshotSection ? '<efficiency-snapshot>' : '',
     ciComplianceSection: p.ciComplianceSection ? '<ci-compliance>' : '',
+    completionDebtSection: p.completionDebtSection ? '<completion-debt>' : '',
     availableCapabilitiesSection: p.availableCapabilitiesSection ? '<available-capabilities>' : '',
     sweepComparisonSection: p.sweepComparisonSection ? '<sweep-comparison>' : '',
     localRunnerSection: p.localRunnerSection ? '<local-runner>' : '',
@@ -219,6 +220,13 @@ export interface ThinkerPromptParams {
    */
   ciComplianceSection?: string;
   /**
+   * Open completion-debt obligations from the ledger: unfinished work from
+   * merged default-OFF features, observe-mode knobs, or retired directions.
+   * Built from the strategic payload's `open_completion_debt` field. Optional
+   * so existing constructions/tests that omit it still compile; '' renders nothing.
+   */
+  completionDebtSection?: string;
+  /**
    * Shared capability vocabulary section (canonical registry names + statuses)
    * plus the uniform provides_capability / prerequisite declaration guidance.
    * Built from the strategic payload's `available_capabilities` field. Optional
@@ -314,7 +322,7 @@ ${p.dirHealthSummary}
 ${p.stagedDirectionsSection ? `\n${p.stagedDirectionsSection}\n` : ''}${p.userPausedSection}${p.rejectedProposalsSection}${p.operatorOverridesSection}
 ## Portfolio Composition
 ${p.portfolioCompositionText}
-${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
+${p.availableCapabilitiesSection ? `\n${p.availableCapabilitiesSection}` : ''}${p.modelHealthSection}${p.pruneCandidatesSection ? `\n${p.pruneCandidatesSection}\n` : ''}${p.systemMaturitySection}${p.driftSection}${p.heldDirectionsSection ? `\n${p.heldDirectionsSection}` : ''}${p.efficiencySnapshotSection}${p.ciComplianceSection ? `\n${p.ciComplianceSection}` : ''}${p.completionDebtSection ? `\n${p.completionDebtSection}` : ''}${p.sweepComparisonSection ? `\n${p.sweepComparisonSection}` : ''}${p.localRunnerSection ? `\n${p.localRunnerSection}\n` : ''}
 ${p.recentWorkSection}${p.questionSection}${p.feedbackSection}${p.threadSection}${p.versionPhaseSection}${p.memoCitationsSection}
 # Your job
 

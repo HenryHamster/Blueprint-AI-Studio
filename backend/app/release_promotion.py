@@ -376,6 +376,11 @@ async def _record_qualification_verdict(
         if "smoketest_enabled" in base_record:
             sub_scores = dict(sub_scores)
             sub_scores["smoketest_enabled"] = base_record["smoketest_enabled"]
+        # Embed completion-debt snapshot so the immutable verdict row carries the
+        # open-debt state observed at finalization time.
+        if "completion_debt" in base_record:
+            sub_scores = dict(sub_scores)
+            sub_scores["completion_debt"] = base_record["completion_debt"]
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")

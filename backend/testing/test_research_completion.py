@@ -9092,6 +9092,16 @@ class TestIsHighStakesFinding:
             self._f(scope="large", actionability_grade="LOW")
         )
 
+    def test_capability_foundation_or_prerequisite_is_not_high_stakes(self):
+        foundation = self._f(risk="high", provides_capability="payment-core")
+        _annotate_capability_declarations([foundation], [])
+        assert not _is_high_stakes_finding(foundation)
+
+        prerequisite = self._f(risk="high")
+        prerequisite["prerequisite"] = {"kind": "capability", "ref": "payment-core"}
+        _annotate_capability_declarations([prerequisite], [])
+        assert not _is_high_stakes_finding(prerequisite)
+
     def test_non_dict_is_not_high_stakes(self):
         assert not _is_high_stakes_finding("not a dict")
         assert not _is_high_stakes_finding(None)
@@ -12206,6 +12216,52 @@ async def test_adversarial_gate_uses_bounded_valid_manifest_for_long_findings(
     assert source_hashes == grader_hashes, (
         "Source and grader _adversarial_challenged_hashes must be identical"
     )
+
+
+@_pytest.mark.asyncio
+async def test_capability_foundation_finding_bypasses_adversarial_gate(
+    db_session, mocker
+):
+    """Capability-providing findings should spawn directly instead of parking."""
+    from test_autonomous_research import _make_finding, _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-capability-adv01"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.task_evaluators.spawn_forward_quality_grader",
+        new=AsyncMock(return_value=None),
+    )
+
+    finding = _make_finding(
+        title="Declare payment-core capability", direction_id=direction["id"]
+    )
+    finding["risk"] = "high"
+    finding["provides_capability"] = "payment-core"
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    ctx = task.context or {}
+    assert not ctx.get("awaiting_adversarial_grader")
+    assert "_adversarial_challenged_hashes" not in ctx
+    assert (task.plan_output or [{}])[0].get("_provides_capability") == "payment-core"
+
+    all_tasks = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.project_id == _project.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    graders = [t for t in all_tasks if (t.context or {}).get("adversarial_grader")]
+    assert len(graders) == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────

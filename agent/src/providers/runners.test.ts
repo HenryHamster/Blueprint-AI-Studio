@@ -83,6 +83,7 @@ import {
 import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
+import { expectCalledWith } from '../utils/typed-mock-call.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -542,7 +543,7 @@ describe('drainJsonChunks — recordLlmTokens nested guard', () => {
     ]);
     await runProviderAgent('prompt', null, { value: '' });
     expect(vi.mocked(recordLlmTokens)).toHaveBeenCalledOnce();
-    expect(vi.mocked(recordLlmTokens)).toHaveBeenCalledWith(115, 50, 10, 5);
+    expectCalledWith(recordLlmTokens, 115, 50, 10, 5);
   });
 
   it('does NOT call recordLlmTokens for a nested result event (parent_tool_use_id set)', async () => {
@@ -576,7 +577,7 @@ describe('drainJsonChunks — tool-result byte accounting (user events)', () => 
     ]);
     await runProviderAgent('prompt', null, { value: '' });
     expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledOnce();
-    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledWith(expectedBytes);
+    expectCalledWith(recordToolResultBytes, expectedBytes);
   });
 
   it('does NOT call recordToolResultBytes for a nested user event (parent_tool_use_id set)', async () => {
@@ -609,6 +610,6 @@ describe('drainJsonChunks — tool-result byte accounting (user events)', () => 
     ]);
     await runProviderAgent('prompt', null, { value: '' });
     expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledOnce();
-    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledWith(expectedBytes);
+    expectCalledWith(recordToolResultBytes, expectedBytes);
   });
 });

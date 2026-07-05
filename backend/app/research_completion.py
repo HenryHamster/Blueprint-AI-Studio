@@ -1196,6 +1196,20 @@ def _is_high_stakes_finding(finding: Dict[str, Any]) -> bool:
         return False
     if finding.get("actionability_grade") == "LOW":
         return False
+    # Capability-foundation work is structurally non-adversarial: a finding that
+    # declares it provides a capability, or one that depends on a capability,
+    # should flow through the normal capability resolver instead of getting
+    # parked in the refute-first spawn gate.
+    if finding.get("_provides_capability") or finding.get("provides_capability"):
+        return False
+    _capability_prereq = finding.get("_prerequisite") or normalize_prerequisite(
+        finding.get("prerequisite") or finding.get("requires")
+    )
+    if (
+        isinstance(_capability_prereq, dict)
+        and _capability_prereq.get("kind") == "capability"
+    ):
+        return False
 
     # Large blast radius: large scope
     if str(finding.get("scope") or "").lower() == "large":

@@ -191,6 +191,29 @@ async def _seed_initial_admin():
                 )
 
 
+async def _seed_completion_debt_inventory():
+    """Seed the completion-debt ledger from the HEAD dormant-state inventory.
+
+    Best-effort and idempotent (dedupe_key upserts): a seed failure must never
+    abort startup, and repeated restarts never create duplicate rows.
+    """
+    try:
+        from app.completion_debt import aseed_completion_debt_inventory
+
+        async with AsyncSessionLocal() as seed_session:
+            created = await aseed_completion_debt_inventory(seed_session)
+            await seed_session.commit()
+        if created:
+            logger.info(
+                "[STARTUP] Seeded %d completion-debt inventory row(s)", created
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] completion-debt inventory seed failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _leader_lock_keepalive_tick(leader_conn) -> str:
     """Run one leader-lock keepalive iteration and report the outcome.
 
@@ -422,6 +445,10 @@ async def lifespan(app):
 
     # Check deployment state (detect new deploy, rollback, or normal restart)
     await _init_deployment_state()
+
+    # Seed the completion-debt ledger from the standing HEAD dormant-state
+    # inventory (idempotent: dedupe_key upserts, so restarts never duplicate).
+    await _seed_completion_debt_inventory()
 
     # Log the resolved deploy-level identity so operators can confirm that
     # deploy-level serving confirmation (backend_revision, agent_image) is

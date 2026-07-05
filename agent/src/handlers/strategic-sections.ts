@@ -1276,6 +1276,21 @@ export function buildCiComplianceSection(ciCompliance: unknown): string {
   return lines.join('\n');
 }
 
+export function buildCompletionDebtSection(debt: unknown): string {
+  if (!Array.isArray(debt) || debt.length === 0) return '';
+  const entries = debt as Array<Record<string, unknown>>;
+  const lines: string[] = ['\n## Open Completion Debt'];
+  lines.push(`${entries.length} open obligation(s) — unfinished work from merged features, knob activations, or retired directions:`);
+  for (const e of entries) {
+    const kind = strVal(e.kind, 'unknown');
+    const desc = strVal(e.description, '(no description)');
+    const ageDays = typeof e.age_days === 'number' ? ` (${e.age_days}d old)` : '';
+    lines.push(`  - [${kind}] ${desc}${ageDays}`);
+  }
+  lines.push('\n_Address open completion debt before adding new obligations in the same area._');
+  return lines.join('\n');
+}
+
 export function buildDirHealthSummary(
   directionsSummary: Array<Record<string, unknown>>,
   maxActiveDirections: number,

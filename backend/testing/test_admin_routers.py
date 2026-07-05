@@ -24840,6 +24840,204 @@ async def test_create_direction_retired_match_does_not_block(
     assert body["retired_grounding"]["classification"] == "landed"
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Completion-debt admin endpoints
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestCompletionDebtAdmin:
+    """Tests for GET /completion-debts, POST /dismiss, and POST /resolve."""
+
+    @pytest.mark.asyncio
+    async def test_completion_debt_list_and_dismiss(
+        self, client: AsyncClient, db_session
+    ):
+        """List returns entries, status filter works, dismiss sets status and reason."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+
+        entry1 = CompletionDebtEntry(
+            project_id=project.id,
+            kind="knob_merge",
+            title="Enable auto-fill mode",
+            detail="Knob merged but enforcement not wired",
+        )
+        entry2 = CompletionDebtEntry(
+            project_id=project.id,
+            kind="capability_trial",
+            title="No-CI gate active but unresolved",
+        )
+        db_session.add(entry1)
+        db_session.add(entry2)
+        await db_session.commit()
+        await db_session.refresh(entry1)
+        await db_session.refresh(entry2)
+
+        # List all open entries
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?status=open"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert data["count"] == 2
+        ids = {e["id"] for e in data["entries"]}
+        assert str(entry1.id) in ids
+        assert str(entry2.id) in ids
+
+        # Dismiss one entry
+        dismiss_resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{entry1.id}/dismiss",
+            json={"reason": "Deferred to Q3"},
+        )
+        assert dismiss_resp.status_code == 200, dismiss_resp.text
+        dismissed = dismiss_resp.json()
+        assert dismissed["status"] == "ok"
+        assert dismissed["entry"]["status"] == "dismissed"
+        assert dismissed["entry"]["dismiss_reason"] == "Deferred to Q3"
+        assert dismissed["entry"]["dismissed_at"] is not None
+
+        # List open only — should now be 1
+        resp2 = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?status=open"
+        )
+        assert resp2.status_code == 200
+        assert resp2.json()["count"] == 1
+        assert resp2.json()["entries"][0]["id"] == str(entry2.id)
+
+        # List dismissed — should be 1
+        resp3 = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?status=dismissed"
+        )
+        assert resp3.status_code == 200
+        assert resp3.json()["count"] == 1
+        assert resp3.json()["entries"][0]["id"] == str(entry1.id)
+
+    @pytest.mark.asyncio
+    async def test_completion_debt_list_kind_filter(
+        self, client: AsyncClient, db_session
+    ):
+        """Kind filter returns only matching entries."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+
+        db_session.add(CompletionDebtEntry(project_id=project.id, kind="knob_merge", title="A"))
+        db_session.add(CompletionDebtEntry(project_id=project.id, kind="retirement_residual", title="B"))
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?kind=knob_merge"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 1
+        assert data["entries"][0]["kind"] == "knob_merge"
+
+    @pytest.mark.asyncio
+    async def test_completion_debt_resolve(self, client: AsyncClient, db_session):
+        """Resolve endpoint marks entry resolved."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(project_id=project.id, kind="knob_merge", title="Wire enforce")
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{entry.id}/resolve"
+        )
+        assert resp.status_code == 200, resp.text
+        result = resp.json()
+        assert result["entry"]["status"] == "resolved"
+        assert result["entry"]["resolved_at"] is not None
+
+    @pytest.mark.asyncio
+    async def test_dismiss_unknown_id_returns_404(self, client: AsyncClient, db_session):
+        """Dismissing a nonexistent debt entry returns 404."""
+        project = await _make_project(db_session)
+        fake_id = "00000000-0000-0000-0000-000000000099"
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{fake_id}/dismiss",
+            json={"reason": "doesn't matter"},
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_dismiss_already_dismissed_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Dismissing an already-dismissed entry returns 409."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id,
+            kind="knob_merge",
+            title="Already done",
+            status="dismissed",
+            dismiss_reason="Old reason",
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{entry.id}/dismiss",
+            json={"reason": "New reason"},
+        )
+        assert resp.status_code == 409
+
+    @pytest.mark.asyncio
+    async def test_dismiss_empty_reason_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Dismiss with empty reason returns 400."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(project_id=project.id, kind="knob_merge", title="X")
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{entry.id}/dismiss",
+            json={"reason": ""},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_non_admin_returns_403(self, override_get_session, db_session):
+        """Non-admin gets 403 on list endpoint."""
+        from fastapi import HTTPException
+
+        async def reject_admin():
+            raise HTTPException(status_code=403, detail="Admin privileges required")
+
+        app.dependency_overrides[require_admin] = reject_admin
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as ac:
+                fake_id = "00000000-0000-0000-0000-000000000001"
+                resp = await ac.get(f"/api/admin/projects/{fake_id}/completion-debts")
+            assert resp.status_code == 403
+        finally:
+            app.dependency_overrides.pop(require_admin, None)
+
+    @pytest.mark.asyncio
+    async def test_list_returns_empty_by_default(self, client: AsyncClient, db_session):
+        """Listing debts for a project with no entries returns empty list."""
+        project = await _make_project(db_session)
+        resp = await client.get(f"/api/admin/projects/{project.id}/completion-debts")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["count"] == 0
+        assert data["entries"] == []
+
+
 @pytest.mark.asyncio
 async def test_direction_created_during_gated_op_survives_commit(
     client: AsyncClient, db_session, mocker

@@ -328,6 +328,108 @@ def record_no_ci_gate_runtime(
             pass
         if db_session is not None:
             db_session.add(project)
+            # Completion-debt ledger: a fall-open to an UNVERIFIED merge is a
+            # standing obligation (the no-CI gate owes an enforce decision).
+            # Best-effort and deduped per project so repeated fall-opens keep a
+            # SINGLE open row. Sync callers/tests use the plain recorder; the
+            # live async merge path uses the async recorder below.
+            if unverified_reason:
+                try:
+                    from app.completion_debt import (
+                        record_completion_debt,
+                        KIND_NO_CI_GATE,
+                    )
+
+                    _pid = getattr(project, "id", None)
+                    record_completion_debt(
+                        db_session,
+                        dedupe_key=f"no_ci_gate:{_pid}",
+                        kind=KIND_NO_CI_GATE,
+                        title="No-CI merge gate fell open to an UNVERIFIED merge",
+                        project_id=_pid,
+                        source="ci_resolution",
+                        detail={"last_unverified_reason": str(unverified_reason)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[CI_RESOLUTION] failed to record no-CI gate runtime readiness",
+            exc_info=True,
+        )
+
+
+async def arecord_no_ci_gate_runtime(
+    db_session,
+    project,
+    *,
+    executed_real_tests: bool,
+    unverified_reason: str | None,
+    when,
+) -> None:
+    """Async analogue of :func:`record_no_ci_gate_runtime`.
+
+    The orchestrator's live merge path already runs on ``AsyncSession``; this
+    variant keeps the runtime ledger write effective there instead of relying on
+    the sync recorder's async-session no-op.
+    """
+    try:
+        when_iso = when.isoformat() if hasattr(when, "isoformat") else str(when)
+        runtime: dict[str, Any] = dict(
+            getattr(project, "merge_gate_runtime", None) or {}
+        )
+        runtime["last_run_at"] = when_iso
+        runtime["executed_real_tests"] = bool(executed_real_tests)
+        if unverified_reason:
+            runtime["last_unverified_at"] = when_iso
+            runtime["last_unverified_reason"] = str(unverified_reason)
+        outcomes = list(runtime.get("recent_outcomes") or [])
+        outcomes.append(
+            {
+                "at": when_iso,
+                "verified": bool(executed_real_tests),
+                "reason": str(unverified_reason) if unverified_reason else None,
+            }
+        )
+        runtime["recent_outcomes"] = outcomes[-_RECENT_OUTCOMES_CAP:]
+
+        if unverified_reason:
+            prior_counts = runtime.get("unverified_reason_counts")
+            counts: dict[str, int] = (
+                dict(prior_counts) if isinstance(prior_counts, dict) else {}
+            )
+            key = str(unverified_reason)
+            counts[key] = int(counts.get(key, 0) or 0) + 1
+            runtime["unverified_reason_counts"] = counts
+
+        project.merge_gate_runtime = runtime
+        try:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            flag_modified(project, "merge_gate_runtime")
+        except Exception:  # noqa: BLE001
+            pass
+        if db_session is not None:
+            db_session.add(project)
+            if unverified_reason:
+                try:
+                    from app.completion_debt import (
+                        arecord_completion_debt,
+                        KIND_NO_CI_GATE,
+                    )
+
+                    _pid = getattr(project, "id", None)
+                    await arecord_completion_debt(
+                        db_session,
+                        dedupe_key=f"no_ci_gate:{_pid}",
+                        kind=KIND_NO_CI_GATE,
+                        title="No-CI merge gate fell open to an UNVERIFIED merge",
+                        project_id=_pid,
+                        source="ci_resolution",
+                        detail={"last_unverified_reason": str(unverified_reason)},
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception:  # noqa: BLE001
         logger.warning(
             "[CI_RESOLUTION] failed to record no-CI gate runtime readiness",

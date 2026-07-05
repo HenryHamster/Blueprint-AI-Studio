@@ -4221,6 +4221,97 @@ class CriterionEvidence(SQLModel, table=True):
     )
 
 
+class CompletionDebtEntry(SQLModel, table=True):
+    """A durable record of merged-but-unfinished work — "completion debt".
+
+    An entry is opened whenever the system lands something in an incomplete,
+    dormant, or observe-only state that still owes follow-through:
+      * a feature/knob merged default-off or in observe mode (``dormant_knob``);
+      * a capability running in observe/trial mode with no decided enforce
+        verdict (``capability_trial``);
+      * a no-CI merge gate that fell open to an UNVERIFIED merge (``no_ci_gate``);
+      * a strategic retirement that left a residual handoff/deferral behind
+        (``retirement_residual``);
+      * a standing backlog item seeded from the HEAD dormant-state inventory
+        (``seed_inventory``).
+
+    Entries are IDEMPOTENT on ``dedupe_key`` (globally unique): repeated recorder
+    or seed invocations upsert the same logical obligation rather than creating a
+    duplicate row.  Recording is best-effort at every write site — a ledger
+    failure must never break the merge, verdict-persist, or retirement path that
+    created the debt.
+    """
+
+    __tablename__ = "completiondebtentry"
+    __table_args__ = (
+        UniqueConstraint("dedupe_key", name="uq_completiondebt_dedupe_key"),
+        Index("ix_completiondebt_status", "status"),
+        Index("ix_completiondebt_kind_status", "kind", "status"),
+        Index("ix_completiondebt_project", "project_id"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    # Nullable: deployment-global debt (dormant runtime knobs, adversarial /
+    # retirement observe-watch state) has no owning project.
+    project_id: uuid.UUID | None = Field(
+        default=None,
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=True,
+        ),
+    )
+
+    # Debt family, e.g. 'dormant_knob' | 'capability_trial' | 'no_ci_gate' |
+    # 'retirement_residual' | 'seed_inventory'.
+    kind: str = Field(sa_column=Column(String(64), nullable=False))
+
+    # Stable, globally-unique idempotency key for this obligation.
+    dedupe_key: str = Field(
+        default_factory=lambda: f"manual:{uuid.uuid4()}",
+        sa_column=Column(String(255), nullable=False),
+    )
+
+    # Lifecycle: 'open' | 'resolved' | 'dismissed'.
+    status: str = Field(
+        default="open",
+        sa_column=Column(String(32), nullable=False, server_default="open"),
+    )
+
+    # Short human-readable summary of the outstanding obligation.
+    title: str = Field(sa_column=Column(Text, nullable=False))
+
+    # Writer family / call site that opened the entry (audit provenance).
+    source: str | None = Field(
+        default=None,
+        sa_column=Column(String(64), nullable=True),
+    )
+
+    # Bounded arbitrary metadata (JSONB) — capped by the recorder.
+    detail: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    created_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    updated_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+    resolved_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
+    resolution_reason: str | None = Field(
+        default=None,
+        sa_column=Column(Text, nullable=True),
+    )
+
+
 class ReleaseDeployArtifact(SQLModel, table=True):
     """Per-artifact serving confirmation record for a promoted release version."""
 

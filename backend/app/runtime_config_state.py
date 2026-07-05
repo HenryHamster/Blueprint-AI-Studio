@@ -1072,6 +1072,77 @@ runtime_config: Dict = {
     "direction_gap_respawn_cooldown_days": 14,
 }
 
+
+# Completion-debt seed: runtime-config knobs whose current default/observe value
+# means an obligation is standing open (a feature ships dark, or a capability is
+# measured-but-not-enforced). ``iter_dormant_knob_debts`` converts these into
+# ``dormant_knob`` completion-debt seed rows.  Kept as literal kind/source
+# strings (mirroring ``app.completion_debt``) so this module stays free of any
+# import edge onto the ledger.
+_DORMANT_KNOB_VALUES = frozenset({"off", "observe"})
+_DORMANT_MODE_KNOBS = {
+    "evergreen_fill_mode": (
+        "Evergreen auto-fill capability enabled but not enforcing (off/observe)"
+    ),
+    "strategic_retirement_challenge_gate_mode": (
+        "Adversarial retirement challenge running in observe-only watch"
+    ),
+    "structural_health_audit_mode": (
+        "Structural-health audit measuring but not enrolling findings"
+    ),
+    "safeguard_challenge_gate_mode": (
+        "Safeguard challenge gate in observe-only shadow mode"
+    ),
+    "direction_gap_respawn_block_mode": (
+        "Direction-gap respawn block in observe-only mode"
+    ),
+}
+# Master feature flags that ship OFF still owe an enablement decision.
+_DORMANT_OFF_FLAGS = {
+    "strategic_session_enabled": (
+        "Resident strategic session runtime shipped disabled (default-off)"
+    ),
+}
+
+
+def iter_dormant_knob_debts() -> list[dict]:
+    """Enumerate runtime-config knobs currently in a dormant/default-off/observe
+    state as completion-debt seed rows.
+
+    Each returned dict is a kwargs bundle for
+    ``app.completion_debt.record_completion_debt`` (stable ``dedupe_key``, the
+    ``dormant_knob`` kind, a human ``title``, and bounded ``detail`` capturing
+    the knob's current value). Deployment-global — no ``project_id``.
+    """
+    debts: list[dict] = []
+    for key, title in _DORMANT_MODE_KNOBS.items():
+        value = str(runtime_config.get(key, "")).lower()
+        if value in _DORMANT_KNOB_VALUES:
+            debts.append(
+                {
+                    "dedupe_key": f"dormant_knob:{key}",
+                    "kind": "dormant_knob",
+                    "title": title,
+                    "project_id": None,
+                    "source": "runtime_config_state",
+                    "detail": {"knob": key, "value": value},
+                }
+            )
+    for key, title in _DORMANT_OFF_FLAGS.items():
+        if not runtime_config.get(key, False):
+            debts.append(
+                {
+                    "dedupe_key": f"dormant_knob:{key}",
+                    "kind": "dormant_knob",
+                    "title": title,
+                    "project_id": None,
+                    "source": "runtime_config_state",
+                    "detail": {"knob": key, "value": bool(runtime_config.get(key))},
+                }
+            )
+    return debts
+
+
 # Promotion-policy key set — the rubric controls that live in runtime_config.
 # Used both by the seed below and by _apply_settings validation.
 PROMOTION_POLICY_KEYS = ("promotion_threshold", "promotion_weights")

@@ -3896,6 +3896,22 @@ async def _finalize_qualification(
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
 
+    # --- Completion-debt snapshot (additive, informational, best-effort) ------
+    # Reports open ledger debt at qualification time. Never a blocker — purely
+    # advisory context for the operator and strategist.  Best-effort: if the
+    # completion_debt module is not yet landed or raises, finalize continues
+    # with completion_debt=None in the record.
+    _completion_debt: dict[str, Any] | None = None
+    try:
+        from importlib import import_module  # noqa: PLC0415
+
+        _cd_mod = import_module("app.completion_debt")
+        _completion_debt = await _cd_mod.get_open_completion_debt(
+            session, version.project_id
+        )
+    except Exception:
+        pass
+
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {
         "candidate_sha": candidate_sha,
@@ -3969,6 +3985,9 @@ async def _finalize_qualification(
         # version.goal is set. None when no goal is configured or the audit
         # predates this field.
         "goal_alignment": (audit_report or {}).get("goal_alignment"),
+        # Open completion-debt snapshot at qualification time (additive, informational).
+        # None when the ledger module is not yet available or returned no data.
+        "completion_debt": _completion_debt,
     }
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when

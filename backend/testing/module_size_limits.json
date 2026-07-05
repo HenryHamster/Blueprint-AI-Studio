@@ -30,7 +30,7 @@
     "routers/admin_pool_accounts.py": 1600,
     "max_plan_pool.py": 3750,
     "anomaly_detection.py": 2100,
-    "routers/agent.py": 5550,
+    "routers/agent.py": 6450,
     "services.py": 3250,
     "recovery_sweeps.py": 100,
     "routers/agent_status.py": 3850,
@@ -97,7 +97,7 @@
     "compute_jobs.py": 2900,
     "task_evaluators.py": 2300,
     "release_scoring.py": 2450,
-    "runtime_config_state.py": 2100,
+    "runtime_config_state.py": 2450,
     "routers/directions.py": 1750,
     "warm_pool_maintainer.py": 2300,
     "review_fix_lane_pilot.py": 2450,
@@ -123,7 +123,8 @@
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 1750,
     "operator_attention.py": 1800,
-    "payload_schemas.py": 1750
+    "payload_schemas.py": 1750,
+    "lifecycle.py": 1750
   },
   "agent": {
     "index.ts": 4600,

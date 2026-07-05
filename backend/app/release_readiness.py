@@ -370,6 +370,9 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         "merge_grade_coverage": qual.get("merge_grade_coverage"),
         "merge_grade_biggest_gap": qual.get("merge_grade_biggest_gap"),
         "merge_grade": qual.get("merge_grade"),
+        # Open completion-debt snapshot at qualification time (additive; None when
+        # the ledger was unavailable or no debt was open).
+        "completion_debt": qual.get("completion_debt"),
     }
 
 
@@ -467,6 +470,9 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         "goal_alignment": verdict.goal_alignment,
         # Blind merge-grade cert (additive; None on legacy rows predating migration 0327).
         "blind_merge_grade": verdict.blind_merge_grade,
+        # Open completion-debt snapshot embedded in sub_scores at verdict-recording time.
+        # None on legacy rows or when the ledger was unavailable at finalization.
+        "completion_debt": _sub(verdict, "completion_debt"),
     }
 
 

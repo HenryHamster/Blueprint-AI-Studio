@@ -2003,6 +2003,34 @@ async def _spawn_retirement_memos(
             memo_task.status = TaskStatus.FAILED
             raise
         spawned += 1
+        # Completion-debt ledger: a retirement leaves a residual handoff (the
+        # memo captures rationale, but downstream follow-through is owed).
+        # Best-effort, deduped per (project, direction) so the row is unique.
+        try:
+            from app.completion_debt import (
+                arecord_completion_debt,
+                KIND_RETIREMENT_RESIDUAL,
+            )
+
+            await arecord_completion_debt(
+                session,
+                dedupe_key=f"retirement_residual:{project.id}:{did}",
+                kind=KIND_RETIREMENT_RESIDUAL,
+                title=f"Retirement residual handoff for direction {did}: {topic[:120]}",
+                project_id=project.id,
+                source="strategic_completion",
+                detail={
+                    "direction_id": str(did),
+                    "memo_task_id": str(memo_task.id),
+                    "kind": "retired",
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "[STRATEGIC] completion-debt record failed for retired "
+                "direction %s (non-fatal)",
+                did,
+            )
         logger.info(
             "[STRATEGIC] Spawned retirement memo task %s for direction %s (synthesized=%s)",
             memo_task.id,

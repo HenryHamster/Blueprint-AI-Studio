@@ -29764,3 +29764,143 @@ class TestComputeGoalCoverageDrift:
             merges_since_grade=0,
         )
         assert result["signal"] == "drifting"
+
+
+# ===========================================================================
+# Completion-debt block in qualification verdicts
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_qualification_verdict_includes_completion_debt_block(
+    db_session, mocker
+):
+    """Completion-debt snapshot flows through finalize → last_qualification and verdict row.
+
+    When completion_debt.get_open_completion_debt returns a non-empty snapshot,
+    the finalized last_qualification carries a `completion_debt` key with the
+    correct shape, and the persisted QualificationVerdict row's sub_scores embed
+    the same snapshot.  The debt block is purely informational and must not
+    change the blocker or confidence.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    _debt_snapshot = {
+        "open_count": 3,
+        "per_kind": {"evergreen_fill": 2, "observe_mode": 1},
+        "oldest_age_days": 14,
+    }
+
+    # Mock the completion_debt module so finalize picks up the snapshot even
+    # though the real module is not yet landed.
+    _mock_cd = MagicMock()
+    _mock_cd.get_open_completion_debt = AsyncMock(return_value=_debt_snapshot)
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Status must still be dry_run — debt block is informational, not a blocker.
+    assert result["status"] == "dry_run", f"unexpected status: {result['status']}"
+    assert result.get("blocker") is None, f"unexpected blocker: {result.get('blocker')}"
+
+    # last_qualification carries the snapshot.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual.get("completion_debt") == _debt_snapshot, (
+        f"completion_debt missing or wrong in last_qualification: {qual.get('completion_debt')}"
+    )
+
+    # QualificationVerdict row's sub_scores embed the same snapshot.
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.release_version_id == version.id
+    )
+    rows = (await db_session.execute(stmt)).scalars().all()
+    assert rows, "no QualificationVerdict row recorded"
+    verdict_row = rows[-1]
+    assert isinstance(verdict_row.sub_scores, dict), "sub_scores is not a dict"
+    assert verdict_row.sub_scores.get("completion_debt") == _debt_snapshot, (
+        f"completion_debt missing or wrong in verdict sub_scores: "
+        f"{verdict_row.sub_scores.get('completion_debt')}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_qualification_verdict_completion_debt_absent_when_module_missing(
+    db_session, mocker
+):
+    """When completion_debt module is unavailable, finalize succeeds and omits the block.
+
+    The best-effort try/except in _finalize_qualification must swallow any
+    import or runtime error from the completion_debt module so that the
+    qualification verdict is still written.
+    """
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.85,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-b", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Simulate a missing module by making the import raise ImportError.
+    _mock_cd = MagicMock()
+    _mock_cd.get_open_completion_debt = AsyncMock(side_effect=ImportError("not landed"))
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    # Finalize must still succeed (best-effort — never fatal).
+    assert result["status"] in ("dry_run", "not_promoted", "promoted"), (
+        f"unexpected status: {result['status']}"
+    )
+
+    # completion_debt key should be None (not set) in last_qualification.
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual.get("completion_debt") is None, (
+        f"expected completion_debt=None, got {qual.get('completion_debt')}"
+    )

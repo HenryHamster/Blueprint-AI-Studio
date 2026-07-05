@@ -4076,6 +4076,55 @@ async def test_fetch_ci_compliance_rejects_cross_project(
 
 
 # ---------------------------------------------------------------------------
+# completion-debt endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_completion_debt_returns_not_available_without_module(
+    client: AsyncClient, db_session
+):
+    """GET /api/agent/projects/{id}/completion-debt returns not_available when
+    the completion_debt module is not yet deployed (common before ledger lands)."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-cdebtnav")
+    token = create_agent_token(str(task.id), "agent-vm-cdebtnav")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/completion-debt",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    # Module not deployed yet → not_available fallback or empty list
+    assert isinstance(body["data"], list)
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_completion_debt_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Agent token for project A cannot fetch completion-debt for project B (404)."""
+    project_a = Project(name="CDA", user_id="u-cda")
+    project_b = Project(name="CDB", user_id="u-cdb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-cdxp")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-cdxp")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/completion-debt",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
 # criterion_coverage in version-phase endpoint
 # ---------------------------------------------------------------------------
 

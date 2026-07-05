@@ -1,0 +1,556 @@
+"""Completion-debt ledger — make merged-but-unfinished work first-class.
+
+The ledger records obligations created when the system lands something in a
+dormant / default-off / observe-only / residual state that still owes
+follow-through:
+
+  * ``dormant_knob``        — a runtime/config knob shipped default-off or in
+                              observe mode (enumerated from ``runtime_config``);
+  * ``capability_trial``    — a capability running in observe/trial mode with no
+                              decided (adopt/reject) enforce verdict;
+  * ``no_ci_gate``          — a no-CI merge gate that fell open to an UNVERIFIED
+                              merge;
+  * ``retirement_residual`` — a strategic retirement/deferral that left a
+                              residual handoff behind;
+  * ``seed_inventory``      — a standing backlog item seeded once from the HEAD
+                              dormant-state inventory.
+
+Every entry is IDEMPOTENT on ``dedupe_key`` (globally unique): repeated recorder
+or seed invocations upsert the same logical obligation rather than duplicating a
+row.  Recording is BEST-EFFORT at every write site — the recorders never raise
+and use a SAVEPOINT so a ledger failure rolls back only the debt insert, never
+the caller's transaction.  A ledger failure must never break the merge,
+capability-verdict, or strategic-retirement path that created the debt.
+
+Most live write paths run on ``AsyncSession`` (the ``a*`` coroutine variants);
+sync ``Session`` callers (and unit tests) use the plain variants.  A sync
+recorder handed an ``AsyncSession`` cleanly no-ops (returns ``False``) rather
+than issuing sync I/O against an async engine — such call sites rely on the
+async recorders or the startup seed instead.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, Iterable
+
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
+
+from app.time_utils import _utcnow
+
+logger = logging.getLogger(__name__)
+
+# --- Debt kinds ---
+KIND_DORMANT_KNOB = "dormant_knob"
+KIND_CAPABILITY_TRIAL = "capability_trial"
+KIND_NO_CI_GATE = "no_ci_gate"
+KIND_RETIREMENT_RESIDUAL = "retirement_residual"
+KIND_SEED_INVENTORY = "seed_inventory"
+
+# --- Statuses ---
+STATUS_OPEN = "open"
+STATUS_RESOLVED = "resolved"
+STATUS_DISMISSED = "dismissed"
+
+# Bound the serialized JSONB metadata so the column cannot grow unbounded.
+_MAX_DETAIL_BYTES = 4000
+_MAX_TITLE_LEN = 500
+_OPEN_COMPLETION_DEBT_LIMIT = 10
+
+
+def _is_async_session(session: Any) -> bool:
+    """True for an ``AsyncSession`` (which exposes ``.sync_session``).
+
+    A plain sync ``Session`` has no ``sync_session`` attribute, so this cleanly
+    distinguishes the two without importing the async class.
+    """
+    return hasattr(session, "sync_session")
+
+
+def _bound_title(title: Any) -> str:
+    text = str(title or "").strip() or "(unspecified completion debt)"
+    return text[:_MAX_TITLE_LEN]
+
+
+def _bound_detail(detail: Any) -> dict | None:
+    """Return a size-bounded, JSON-serializable metadata dict (or ``None``)."""
+    if detail is None:
+        return None
+    if not isinstance(detail, dict):
+        detail = {"value": str(detail)}
+    try:
+        encoded = json.dumps(detail, default=str)
+    except Exception:  # noqa: BLE001
+        return {"_note": "detail-unserializable"}
+    if len(encoded) <= _MAX_DETAIL_BYTES:
+        return dict(detail)
+    return {
+        "_truncated": True,
+        "_original_bytes": len(encoded),
+        "preview": encoded[:_MAX_DETAIL_BYTES],
+    }
+
+
+def _new_entry(
+    *,
+    dedupe_key: str,
+    kind: str,
+    title: str,
+    project_id: Any,
+    source: str | None,
+    detail: Any,
+):
+    """Build an unsaved ``CompletionDebtEntry`` (imported lazily to avoid a
+    models import cycle at module load)."""
+    from app.models import CompletionDebtEntry
+
+    return CompletionDebtEntry(
+        project_id=project_id,
+        kind=str(kind),
+        dedupe_key=str(dedupe_key),
+        status=STATUS_OPEN,
+        title=_bound_title(title),
+        source=(str(source) if source else None),
+        detail=_bound_detail(detail),
+    )
+
+
+def _detail_to_text(detail: Any) -> str | None:
+    if detail is None:
+        return None
+    if isinstance(detail, dict):
+        for key in ("description", "summary", "backlog_item", "value"):
+            value = detail.get(key)
+            if value not in (None, ""):
+                return str(value)
+        try:
+            return json.dumps(detail, sort_keys=True, default=str)
+        except Exception:  # noqa: BLE001
+            return str(detail)
+    return str(detail)
+
+
+def _serialize_debt(entry) -> dict[str, Any]:
+    created_at = entry.created_at.isoformat() if entry.created_at else None
+    resolved_at = entry.resolved_at.isoformat() if entry.resolved_at else None
+    dismissed_at = resolved_at if entry.status == STATUS_DISMISSED else None
+    return {
+        "id": str(entry.id),
+        "project_id": str(entry.project_id) if entry.project_id is not None else None,
+        "kind": entry.kind,
+        "title": entry.title,
+        "detail": _detail_to_text(entry.detail),
+        "status": entry.status,
+        "dismiss_reason": (
+            entry.resolution_reason if entry.status == STATUS_DISMISSED else None
+        ),
+        "created_at": created_at,
+        "dismissed_at": dismissed_at,
+        "resolved_at": resolved_at,
+    }
+
+
+async def _query_completion_debts(
+    session: Any,
+    *,
+    project_id: Any,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    newest_first: bool = True,
+) -> list[Any]:
+    from app.models import CompletionDebtEntry
+    from sqlalchemy import or_
+
+    if project_id is not None:
+        # Include both project-scoped rows and deployment-global rows (project_id
+        # IS NULL — e.g. seed inventory and dormant runtime knobs that have no
+        # owning project).
+        q = select(CompletionDebtEntry).where(
+            or_(
+                CompletionDebtEntry.project_id == project_id,
+                CompletionDebtEntry.project_id.is_(None),
+            )
+        )
+    else:
+        q = select(CompletionDebtEntry).where(
+            CompletionDebtEntry.project_id.is_(None)
+        )
+    if status is not None:
+        q = q.where(CompletionDebtEntry.status == status)
+    if kind is not None:
+        q = q.where(CompletionDebtEntry.kind == kind)
+    if newest_first:
+        q = q.order_by(
+            CompletionDebtEntry.created_at.desc(),
+            CompletionDebtEntry.id.desc(),
+        )
+    else:
+        q = q.order_by(
+            CompletionDebtEntry.created_at.asc(),
+            CompletionDebtEntry.id.asc(),
+        )
+    q = q.offset(max(0, int(offset))).limit(max(0, min(int(limit), 200)))
+    result = await session.execute(q)
+    return list(result.scalars().all())
+
+
+async def list_completion_debts(
+    session: Any,
+    *,
+    project_id: Any,
+    status: str | None = None,
+    kind: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> list[Any]:
+    """Return completion-debt rows for a project, newest first."""
+    return await _query_completion_debts(
+        session,
+        project_id=project_id,
+        status=status,
+        kind=kind,
+        limit=limit,
+        offset=offset,
+        newest_first=True,
+    )
+
+
+async def dismiss_debt(
+    session: Any,
+    debt_id: Any,
+    *,
+    project_id: Any,
+    reason: str,
+):
+    from app.models import CompletionDebtEntry
+
+    entry = await session.get(CompletionDebtEntry, debt_id)
+    if entry is None or entry.project_id != project_id:
+        raise ValueError("not_found")
+    if entry.status != STATUS_OPEN:
+        raise ValueError("not_open")
+    reason_text = str(reason).strip()
+    if not reason_text:
+        raise ValueError("invalid_reason")
+    async with session.begin_nested():
+        entry.status = STATUS_DISMISSED
+        entry.resolution_reason = reason_text[:_MAX_TITLE_LEN]
+        entry.resolved_at = _utcnow()
+        entry.updated_at = _utcnow()
+        session.add(entry)
+        await session.flush()
+    return entry
+
+
+async def resolve_debt(
+    session: Any,
+    debt_id: Any,
+    *,
+    project_id: Any,
+):
+    from app.models import CompletionDebtEntry
+
+    entry = await session.get(CompletionDebtEntry, debt_id)
+    if entry is None or entry.project_id != project_id:
+        raise ValueError("not_found")
+    if entry.status != STATUS_OPEN:
+        raise ValueError("not_open")
+    async with session.begin_nested():
+        entry.status = STATUS_RESOLVED
+        entry.resolution_reason = None
+        entry.resolved_at = _utcnow()
+        entry.updated_at = _utcnow()
+        session.add(entry)
+        await session.flush()
+    return entry
+
+
+def debt_to_dict(entry) -> dict[str, Any]:
+    return _serialize_debt(entry)
+
+
+async def get_open_completion_debt(session: Any, project_id: Any) -> list[dict[str, Any]]:
+    """Return a bounded, project-scoped open-debt snapshot for strategist use."""
+    entries = await _query_completion_debts(
+        session,
+        project_id=project_id,
+        status=STATUS_OPEN,
+        limit=_OPEN_COMPLETION_DEBT_LIMIT,
+        offset=0,
+        newest_first=False,
+    )
+    now = _utcnow()
+    snapshot: list[dict[str, Any]] = []
+    for entry in entries:
+        created_at = entry.created_at
+        snapshot.append(
+            {
+                "id": str(entry.id),
+                "kind": entry.kind,
+                "title": entry.title,
+                "description": _detail_to_text(entry.detail) or entry.title,
+                "created_at": created_at.isoformat() if created_at else None,
+                "age_days": (
+                    max(0, (now - created_at).days) if created_at is not None else None
+                ),
+            }
+        )
+    return snapshot
+
+
+# ── Recorders ────────────────────────────────────────────────────────────────
+
+
+def record_completion_debt(
+    session: Any,
+    *,
+    dedupe_key: str,
+    kind: str,
+    title: str,
+    project_id: Any = None,
+    source: str | None = None,
+    detail: Any = None,
+) -> bool:
+    """Best-effort idempotent open of a completion-debt entry (SYNC session).
+
+    Returns ``True`` iff a NEW open row was created, ``False`` if an entry with
+    the same ``dedupe_key`` already existed, the session is async, or recording
+    failed.  Never raises.
+    """
+    if not dedupe_key or session is None:
+        return False
+    if _is_async_session(session):
+        # Called from a sync code path that was, in production, handed an async
+        # session (e.g. the no-CI gate runtime recorder). Sync I/O against an
+        # async engine would raise; defer to the async recorders / startup seed.
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        existing = session.execute(
+            select(CompletionDebtEntry.id).where(
+                CompletionDebtEntry.dedupe_key == dedupe_key
+            )
+        ).first()
+        if existing is not None:
+            return False
+        entry = _new_entry(
+            dedupe_key=dedupe_key,
+            kind=kind,
+            title=title,
+            project_id=project_id,
+            source=source,
+            detail=detail,
+        )
+        try:
+            with session.begin_nested():
+                session.add(entry)
+                session.flush()
+        except IntegrityError:
+            # A concurrent writer inserted the same dedupe_key first — the
+            # "one open row per obligation" invariant still holds.
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to record debt (kind=%s key=%s)",
+            kind,
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
+async def arecord_completion_debt(
+    session: Any,
+    *,
+    dedupe_key: str,
+    kind: str,
+    title: str,
+    project_id: Any = None,
+    source: str | None = None,
+    detail: Any = None,
+) -> bool:
+    """Best-effort idempotent open of a completion-debt entry (ASYNC session).
+
+    Async analogue of :func:`record_completion_debt`; never raises.
+    """
+    if not dedupe_key or session is None:
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        existing = (
+            await session.execute(
+                select(CompletionDebtEntry.id).where(
+                    CompletionDebtEntry.dedupe_key == dedupe_key
+                )
+            )
+        ).first()
+        if existing is not None:
+            return False
+        entry = _new_entry(
+            dedupe_key=dedupe_key,
+            kind=kind,
+            title=title,
+            project_id=project_id,
+            source=source,
+            detail=detail,
+        )
+        try:
+            async with session.begin_nested():
+                session.add(entry)
+                await session.flush()
+        except IntegrityError:
+            return False
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to record debt (kind=%s key=%s)",
+            kind,
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
+# ── Resolvers ────────────────────────────────────────────────────────────────
+
+
+def _apply_resolution(entry, reason: str | None) -> None:
+    entry.status = STATUS_RESOLVED
+    entry.resolved_at = _utcnow()
+    entry.updated_at = _utcnow()
+    if reason:
+        entry.resolution_reason = str(reason)[:_MAX_TITLE_LEN]
+
+
+async def aresolve_completion_debt(
+    session: Any,
+    dedupe_key: str,
+    *,
+    reason: str | None = None,
+) -> bool:
+    """Best-effort resolve of an OPEN debt entry (ASYNC session).
+
+    Returns ``True`` iff an open row was found and flipped to resolved. Never
+    raises. A missing or already-resolved entry is a no-op.
+    """
+    if not dedupe_key or session is None:
+        return False
+    try:
+        from app.models import CompletionDebtEntry
+
+        entry = (
+            await session.execute(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.dedupe_key == dedupe_key,
+                    CompletionDebtEntry.status == STATUS_OPEN,
+                )
+            )
+        ).scalar_one_or_none()
+        if entry is None:
+            return False
+        # Flush the resolution inside a SAVEPOINT so it is visible to later
+        # queries in this session regardless of the session's autoflush setting,
+        # and so a failure rolls back only this update (never the caller's txn).
+        async with session.begin_nested():
+            _apply_resolution(entry, reason)
+            session.add(entry)
+            await session.flush()
+        return True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to resolve debt (key=%s)",
+            dedupe_key,
+            exc_info=True,
+        )
+        return False
+
+
+# ── Seed inventory ───────────────────────────────────────────────────────────
+
+
+def _standing_inventory_debts() -> list[dict]:
+    """Static, deployment-global backlog items present on HEAD that are not
+    already enumerable from runtime-config knobs."""
+    return [
+        {
+            "dedupe_key": "seed:no_ci_gate_live_trial",
+            "kind": KIND_NO_CI_GATE,
+            "title": (
+                "No-CI merge gate live-trial: the gate may fall open to "
+                "UNVERIFIED merges until an enforce policy is proven"
+            ),
+            "project_id": None,
+            "source": KIND_SEED_INVENTORY,
+            "detail": {"backlog_item": "no_ci_gate_live_trial"},
+        },
+        {
+            "dedupe_key": "seed:capability_trial_rail",
+            "kind": KIND_CAPABILITY_TRIAL,
+            "title": (
+                "Capability-trial/adoption rail: observe-mode capabilities "
+                "lacking a decided enforce verdict"
+            ),
+            "project_id": None,
+            "source": KIND_SEED_INVENTORY,
+            "detail": {"backlog_item": "capability_trial_adoption"},
+        },
+        {
+            "dedupe_key": "seed:adversarial_observe_watch",
+            "kind": KIND_RETIREMENT_RESIDUAL,
+            "title": (
+                "Adversarial / retirement observe-watch rail: challenges are "
+                "recorded but never enforced pending graduation"
+            ),
+            "project_id": None,
+            "source": KIND_SEED_INVENTORY,
+            "detail": {"backlog_item": "adversarial_observe_watch"},
+        },
+    ]
+
+
+def _iter_seed_debts() -> Iterable[dict]:
+    """All seed rows: the static standing inventory plus the currently-dormant
+    runtime-config knobs enumerated by ``runtime_config_state``."""
+    yield from _standing_inventory_debts()
+    try:
+        from app.runtime_config_state import iter_dormant_knob_debts
+
+        yield from iter_dormant_knob_debts()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to enumerate dormant knob debts for seed",
+            exc_info=True,
+        )
+
+
+def seed_completion_debt_inventory(session: Any) -> int:
+    """Seed the ledger from the HEAD dormant-state inventory (SYNC session).
+
+    Idempotent: each item upserts on its stable ``dedupe_key`` so repeated
+    startup/test calls never duplicate rows. Returns the count of NEW rows
+    created this call.
+    """
+    created = 0
+    for item in _iter_seed_debts():
+        if record_completion_debt(session, **item):
+            created += 1
+    return created
+
+
+async def aseed_completion_debt_inventory(session: Any) -> int:
+    """Seed the ledger from the HEAD dormant-state inventory (ASYNC session).
+
+    Async analogue of :func:`seed_completion_debt_inventory`.
+    """
+    created = 0
+    for item in _iter_seed_debts():
+        if await arecord_completion_debt(session, **item):
+            created += 1
+    return created
