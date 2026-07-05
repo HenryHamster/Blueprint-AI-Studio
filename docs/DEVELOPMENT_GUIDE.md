@@ -25,6 +25,10 @@ cp .env.example .env
 npm install
 cd backend && pip install -r requirements.txt && cd ..
 cd agent && npm install && cd ..
+
+# (Optional but recommended) Install blueprint and blueprint-runner as bare commands.
+# Creates symlinks in ~/.local/bin so you can type 'blueprint status' instead of './blueprint status'.
+bash scripts/install-cli.sh
 ```
 
 ### 2. Starting Services
