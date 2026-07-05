@@ -889,6 +889,18 @@ async def _hold_strategic_local_runner_task(
     if task.latest_status_message != reason:
         task.latest_status_message = reason
         changed = True
+
+    # Identity/status snapshot taken BEFORE the commit/rollback below. The
+    # no-change branch calls ``session.rollback()``, which expires every
+    # session-bound ORM instance even under ``expire_on_commit=False`` (that
+    # setting governs commit, not rollback). A subsequent attribute read on
+    # ``task`` (e.g. ``task.id`` in the trailing log line) would then fire a
+    # sync lazy-load — ``_load_expired`` → asyncpg ping → ``await_only`` with
+    # no active greenlet — and raise MissingGreenlet, deterministically
+    # quarantining the held task. Reading into locals first avoids the reload.
+    task_id_str = str(task.id)
+    project_id_str = str(task.project_id)
+    task_status = task.status
     if changed:
         task.context = ctx
         session.add(task)
@@ -897,26 +909,26 @@ async def _hold_strategic_local_runner_task(
             from app.broadcast import broadcast_to_project
 
             await broadcast_to_project(
-                str(task.project_id),
+                project_id_str,
                 "task_updated",
                 {
-                    "task_id": str(task.id),
-                    "status": task.status,
-                    "message": task.latest_status_message,
+                    "task_id": task_id_str,
+                    "status": task_status,
+                    "message": reason,
                 },
             )
         except Exception:
             logger.exception(
                 "[RUNNERS] task_updated broadcast failed for held Strategic "
                 "local-runner task %s",
-                task.id,
+                task_id_str,
             )
     else:
         await session.rollback()
     logger.info(
         "[RUNNERS] Holding Strategic task %s: continuous local mode requires "
         "a live Strategic-capable runner (reason=%s)",
-        task.id,
+        task_id_str,
         intent_reason,
     )
     return True

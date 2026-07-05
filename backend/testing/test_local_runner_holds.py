@@ -402,3 +402,51 @@ class TestPinClearsStaleHoldStamp:
         assert task.status == TaskStatus.PROVISIONING
         assert task.context.get("runner_target_id") == str(runner.id)
         assert "awaiting_local_runner_since" not in task.context
+
+
+class TestHoldStrategicLocalRunnerTask:
+    @pytest.mark.asyncio
+    async def test_repeated_hold_no_change_does_not_crash(self, db_session):
+        """A held Strategic task with no live local runner is re-evaluated every
+        orchestrator cycle. The first cycle stamps the hold (commit path); every
+        cycle after makes no change and takes the ``session.rollback()`` branch.
+
+        Rollback expires every session-bound ORM instance (even under
+        ``expire_on_commit=False`` — that setting governs commit, not rollback),
+        so any ``task.<attr>`` read after it fires a lazy-load. Under asyncpg
+        that reload happens outside a greenlet and raises ``MissingGreenlet``,
+        which quarantined the real task 8c37771e after 3 cycles. The hold must
+        snapshot identity before the rollback and never touch the ORM instance
+        after. This guards the branch and its idempotency; the exact greenlet
+        crash is asyncpg-pool-specific and is documented by the production
+        traceback rather than reproduced here."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.QUEUED,
+            context={
+                STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+                STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+        # Cycle 1: stamps the hold + status message -> changed -> commit path.
+        first = await orch._hold_strategic_local_runner_task(db_session, task)
+        assert first is True
+
+        # Reload as the orchestrator does each cycle (fresh, attributes loaded).
+        await db_session.refresh(task)
+
+        # Cycle 2: nothing changes -> rollback branch. Pre-fix this raised
+        # MissingGreenlet on the expired ``task.id`` read; it must not now.
+        second = await orch._hold_strategic_local_runner_task(db_session, task)
+        assert second is True
+
+        await db_session.refresh(task)
+        assert task.status == TaskStatus.QUEUED
+        assert (
+            task.context or {}
+        ).get(STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY) is not None
