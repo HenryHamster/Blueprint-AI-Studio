@@ -366,23 +366,59 @@ async def record_task_merge_evidence(
 ) -> int:
     """Record task_merge evidence for each criterion a task carries, when proven.
 
-    No-op when ``task.criterion_ids`` is empty or the task's acceptance verdict
-    is absent or not ``proven=True``.  When it does write, it stamps a
-    proof-backed ``task_merge`` row (``detail["proven"] = True``) per criterion,
-    plus a companion ``reachability`` row.  Coverage flips to ``covered`` on
-    either signal alone — a proven ``task_merge`` row is itself sufficient;
-    the companion ``reachability`` row is recorded for audit completeness.
+    No-op when both ``task.criterion_ids`` and the task's associated Direction's
+    ``criterion_keys`` are empty, or the task's acceptance verdict is absent or
+    not ``proven=True``.  When it does write, it stamps a proof-backed
+    ``task_merge`` row (``detail["proven"] = True``) per criterion, plus a
+    companion ``reachability`` row.  Coverage flips to ``covered`` on either
+    signal alone — a proven ``task_merge`` row is itself sufficient; the
+    companion ``reachability`` row is recorded for audit completeness.
+
+    Direction criterion_keys are fetched via the ``direction_id`` stored in
+    ``task.context`` at merge time, so criteria mapped to a direction *after*
+    the task was spawned are also captured.  This fetch is best-effort: if the
+    Direction row is missing or the query fails, only ``task.criterion_ids`` is
+    used.
+
     Best-effort: errors are logged and not re-raised so a failure here never
     blocks merge finalization.
 
     Returns the number of evidence rows recorded.
     """
     criterion_ids: list[str] = list(getattr(task, "criterion_ids", None) or [])
+
+    # Best-effort: also pick up any criteria mapped to the direction at merge
+    # time.  Tasks inherit criterion_ids at spawn time; a later mapping update
+    # would otherwise be silently missed.
+    task_context: dict = getattr(task, "context", None) or {}
+    direction_id_key: str | None = task_context.get("direction_id")
+    if direction_id_key:
+        try:
+            direction_row = await session.scalar(
+                select(Direction).where(
+                    Direction.project_id == project_id,
+                    Direction.direction_key == direction_id_key,
+                )
+            )
+            if direction_row is not None and direction_row.criterion_keys:
+                merged_keys = list(
+                    dict.fromkeys(criterion_ids + list(direction_row.criterion_keys))
+                )
+                criterion_ids = merged_keys
+        except Exception:
+            logger.warning(
+                "record_task_merge_evidence: failed to fetch direction %s "
+                "for task %s; using task.criterion_ids only",
+                direction_id_key,
+                getattr(task, "id", None),
+                exc_info=True,
+            )
+
     if not criterion_ids:
         return 0
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
 
-    verdict = (getattr(task, "context", None) or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+    verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not acceptance_is_proven(verdict):
         return 0
     try:

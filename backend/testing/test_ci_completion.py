@@ -1991,12 +1991,14 @@ async def test_criterion_evidence_persisted_via_attempt_merge_proven_verdict_cov
         created_by="strategist",
     )
 
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
     # Create the original task (what carries the criterion)
     orig_task = Task(
         project_id=project.id,
         title="Original task with criterion",
         payloads=[{"type": "research", "prompt": "test"}],
-        context={},
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
         criterion_ids=[criterion.criterion_key],  # Task carries the criterion
         vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
         status=TaskStatus.EVALUATING,
@@ -5018,12 +5020,14 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
         created_by="strategist",
     )
 
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
     # Create the original (implementation) task with criterion_ids set
     orig_task = Task(
         project_id=project.id,
         title="Implement feature",
         payloads=[{"type": "create", "prompt": "build the feature", "base_branch": "main"}],
-        context={"direction_id": "d-ce-test"},
+        context={"direction_id": "d-ce-test", CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True}},
         status=TaskStatus.EVALUATING,
         vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
         criterion_ids=[criterion.criterion_key],
@@ -5062,11 +5066,103 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
     assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
     assert task_merge_ev[0].source_id == str(orig_task.id)
     # Evidence must include proven=True so the criterion coverage transitions to 'covered'
-    assert task_merge_ev[0].detail == {"pr": 99, "proven": True}, (
+    assert task_merge_ev[0].detail == {"proven": True}, (
         "task_merge evidence must have proven=True to satisfy criterion coverage"
     )
     # Verify coverage is 'covered' due to the proven evidence
     coverage = ac.compute_criterion_coverage(evidence)
     assert coverage == "covered", (
         f"Coverage should be 'covered' with proven task_merge evidence, got '{coverage}'"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_merge_unproven_verdict_records_no_proven_evidence(
+    db_session, mocker
+):
+    """Direct CI merge WITHOUT a proven code-acceptance verdict records NO evidence.
+
+    When orig_task.context lacks a proven verdict (or the verdict is absent),
+    record_task_merge_evidence must not write any CriterionEvidence rows.
+    This is the acceptance-gate regression guard: bare merge badges must NOT
+    fabricate 'covered' status for criteria that have not been genuinely proven.
+    """
+    from app import acceptance_criteria as ac
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch("app.ci_completion.asyncio.sleep", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True, "sha": "abc123noproven"},
+    )
+    mocker.patch(
+        "app.rollup_pr_verification.verify_rollup_merge_landed",
+        new=AsyncMock(return_value="indeterminate"),
+    )
+
+    project = Project(name="Unproven verdict merge test", user_id="test-user-upv")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Must be covered only by proven merge",
+        created_by="strategist",
+    )
+
+    # orig_task has NO code-acceptance verdict — simulates an unproven merge
+    orig_task = Task(
+        project_id=project.id,
+        title="Unproven feature task",
+        payloads=[{"type": "create", "prompt": "build it", "base_branch": "main"}],
+        context={"direction_id": "d-upv-test"},  # no CODE_ACCEPTANCE_VERDICT_KEY
+        status=TaskStatus.EVALUATING,
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        criterion_ids=[criterion.criterion_key],
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    ci_task = _make_task(
+        db_session,
+        project,
+        pr_number=77,
+        ci_loop_extra={
+            "original_task_id": str(orig_task.id),
+            "base_branch": "main",
+        },
+    )
+    await db_session.commit()
+    await db_session.refresh(ci_task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        ci_task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True, "merge should have succeeded"
+
+    # Verify that NO evidence rows were written — unproven verdict must be gated out
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_ev) == 0, (
+        "No task_merge evidence should be recorded when the code-acceptance verdict "
+        f"is absent or unproven; got {task_merge_ev}"
+    )
+
+    # Coverage must remain uncovered — no fabricated proven evidence
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "uncovered", (
+        f"Coverage must stay 'uncovered' when verdict is absent, got '{coverage}'"
     )

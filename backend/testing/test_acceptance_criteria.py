@@ -1222,6 +1222,78 @@ async def test_refresh_after_merge_scopes_to_open_version_and_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_session):
+    """record_task_merge_evidence picks up criteria mapped to the direction after task spawn.
+
+    Simulates the race: a task is spawned with criterion_ids=[], then a criterion
+    is mapped to the direction before the task's PR merges.  The merge-time call to
+    record_task_merge_evidence must find the criterion via Direction.criterion_keys
+    and record proven evidence for it.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LateDirectionMapping")
+    version = await _make_version(db_session, project)
+
+    # Criterion authored after task was spawned (task carries no criterion_ids yet)
+    late_criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Late-mapped criterion",
+        created_by="strategist",
+    )
+
+    # Direction with the late criterion already linked (simulates post-spawn mapping)
+    direction_row = Direction(
+        project_id=project.id,
+        direction_key="d-latemap1",
+        data={"id": "d-latemap1", "text": "Late mapping direction", "status": "active"},
+        status="active",
+        criterion_keys=[late_criterion.criterion_key],
+    )
+    db_session.add(direction_row)
+    await db_session.commit()
+
+    # Task spawned before the criterion was mapped — criterion_ids is empty
+    task = Task(
+        project_id=project.id,
+        title="Late mapping task",
+        payloads=[{"type": "create", "prompt": "implement late mapped"}],
+        context={
+            "direction_id": "d-latemap1",
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge",
+            },
+        },
+        criterion_ids=[],  # empty at spawn time — the whole point of this test
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert recorded == 1, (
+        "Expected one criterion recorded via late direction mapping; "
+        f"got {recorded}"
+    )
+
+    evidence = await ac.get_evidence_for_criterion(db_session, late_criterion.id)
+    assert len(evidence) == 2
+    assert {e.source_kind for e in evidence} == {"task_merge", "reachability"}
+    assert all(e.detail == {"proven": True} for e in evidence)
+    assert {e.source_id for e in evidence} == {str(task.id)}
+
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "covered"
+
+
+@pytest.mark.asyncio
 async def test_coverage_summary_partial_only(db_session):
     """A version with only non-covered evidence totals as partial."""
     project = await _make_project(db_session, "PartialOnly")

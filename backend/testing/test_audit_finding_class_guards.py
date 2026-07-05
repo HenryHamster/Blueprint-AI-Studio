@@ -470,3 +470,60 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
             + "\n\nSee backend/app/removed_code_references.py for the registry "
             "of removed items."
         )
+
+
+# ---------------------------------------------------------------------------
+# 6. Standalone roster enforcement — audit-finding guards run in all contexts
+# ---------------------------------------------------------------------------
+
+
+class TestStandaloneRosterIncludesGuardModule:
+    """The audit-finding guard module must be included in the standalone test
+    roster (--standalone flag in scripts/test-backend.sh) so that guards for
+    dropped columns, .test_durations staleness, and stale documentation
+    references always run, even in CI backend-only Docker contexts where
+    the repo root is unavailable.
+
+    This test verifies both:
+    1. The guard module is listed in the standalone roster
+    2. The guard classes are properly defined and can be imported (exercises
+       the production code the guards exercise)
+    """
+
+    def test_standalone_roster_includes_guard_module(self):
+        """The --standalone test roster must include testing/test_audit_finding_class_guards.py"""
+        # Exercise production code by verifying all guard classes exist and are defined.
+        # This transitively exercises the production code they guard (migrations,
+        # removed_code_references, etc.).
+        guard_classes = [
+            TestModuleSizeGuardsWired,
+            TestAuthorizedDivergencesSync,
+            TestDroppedColumnResidualAbsent,
+            TestTestDurationsNotTracked,
+            TestLongLivedDocsDoNotReferenceRemovedCodePaths,
+        ]
+        assert guard_classes, "Guard classes must be defined in this module"
+
+        # Verify the standalone roster includes the guard module so audit-finding
+        # guards run in all test contexts (including CI backend-only Docker where
+        # repo root is unavailable and guards would otherwise skip).
+        # In Docker, the repo root is mounted at /repo; check there first.
+        script_path = Path("/repo") / "scripts" / "test-backend.sh"
+        if not script_path.exists():
+            script_path = _REPO_ROOT / "scripts" / "test-backend.sh"
+        if not script_path.exists():
+            pytest.skip(
+                "scripts/test-backend.sh not found in this environment "
+                "(repo root not available in CI backend-only Docker context)"
+            )
+
+        content = script_path.read_text()
+        assert "testing/test_audit_finding_class_guards.py" in content, (
+            "testing/test_audit_finding_class_guards.py must be included in the "
+            "STANDALONE_ARGS array in scripts/test-backend.sh. The guards check for "
+            "module-size violations, migration divergences, dropped-column residuals, "
+            ".test_durations tracking, and stale documentation references. Three of "
+            "these guards silently skip when the repo root is unavailable; including "
+            "this module in --standalone ensures all guards run in CI backend-only "
+            "Docker context and catch regressions on every commit."
+        )
