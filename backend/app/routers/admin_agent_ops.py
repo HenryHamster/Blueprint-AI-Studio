@@ -3479,6 +3479,17 @@ async def strategic_operation(
 
         # Active-only count minus what we just retracted in this call
         existing_active_count = await _count_active_criteria(session, open_version.id)
+        # Snapshot active criterion keys from DB to use for stale-key scrubbing
+        # when merging criterion_key into dir_row.criterion_keys.  Keys created
+        # in this call are tracked separately so multi-item loops don't lose
+        # each other's newly written keys before they flush to DB.
+        from app.direction_referential_guard import (
+            load_version_criterion_key_sets as _load_crit_key_sets,
+        )
+        _db_active_crit_keys, _ = await _load_crit_key_sets(
+            session, project.id, open_version.id
+        )
+        _call_crit_keys: set[str] = set()
         new_added_count = 0
         skipped_over_cap = 0
         processed: list[dict] = []
@@ -3508,13 +3519,23 @@ async def strategic_operation(
                 new_added_count += 1
                 is_new = True
 
+            # Track keys added in this call so later iterations can preserve
+            # them even before they flush to DB.
+            _call_crit_keys.add(criterion_key)
+
             mapped_keys: list[str] = []
             for dk in direction_keys_input:
                 dir_row = await _get_direction_row(session, project.id, dk)
                 if dir_row is None:
                     warnings.append(f"Unknown direction_key: {dk}")
                     continue
-                merged = list(set(dir_row.criterion_keys or []) | {criterion_key})
+                # Scrub stale (inactive/old-version) keys from the existing set,
+                # keeping only keys that are active in this version or were
+                # added during this call (not yet flushed to DB).
+                _valid_keys = _db_active_crit_keys | _call_crit_keys
+                merged = list(
+                    (_valid_keys & set(dir_row.criterion_keys or [])) | {criterion_key}
+                )
                 dir_row.criterion_keys = merged
                 session.add(dir_row)
                 mapped_keys.append(dk)

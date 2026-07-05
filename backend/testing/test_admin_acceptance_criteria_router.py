@@ -436,6 +436,61 @@ async def test_link_direction_400_rejects_closed_version_criterion_key(
     )
 
 
+@pytest.mark.asyncio
+async def test_link_direction_400_rejects_inactive_criterion_key(
+    client: AsyncClient, db_session
+):
+    """A retracted criterion key in the open version is rejected with structured 400.
+
+    Even when the key exists in the open version, an inactive (retracted or
+    superseded) criterion must not be linked to a direction — the guard returns
+    a structured error with error='criterion_key_invalid' and
+    classification='inactive' so callers can distinguish inactive from unknown.
+    """
+    from app.models import VersionAcceptanceCriterion
+    from sqlmodel import select as _select
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    direction = await _make_direction(db_session, project)
+
+    # Create a criterion and retract it in the open version.
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract",
+    )
+    row = (
+        await db_session.execute(
+            _select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.id == criterion.id
+            )
+        )
+    ).scalar_one()
+    row.status = "retracted"
+    db_session.add(row)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/link-direction",
+        json={
+            "direction_key": direction.direction_key,
+            "criterion_keys": [criterion.criterion_key],
+        },
+    )
+    assert resp.status_code == 400, (
+        "retracted criterion key must be rejected with 400; "
+        f"got {resp.status_code}: {resp.text}"
+    )
+    # FastAPI wraps dict details under {"error": {"code": ..., "message": {...}}}.
+    body = resp.json()
+    detail = body.get("error", {}).get("message", body)
+    assert detail.get("error") == "criterion_key_invalid"
+    assert detail.get("classification") == "inactive"
+    assert criterion.criterion_key in detail.get("keys", [])
+
+
 # ---------------------------------------------------------------------------
 # Supersession-target validation via the strategic agent op
 # ---------------------------------------------------------------------------

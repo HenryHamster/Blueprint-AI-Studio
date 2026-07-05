@@ -1,0 +1,380 @@
+"""Regression guards for previously-recurring LOW-severity qualification-audit
+finding classes.
+
+Each class below pins one finding class so that CI fails on reintroduction.
+The goal: every finding class that recurred in v22 or earlier is covered by a
+guard that fails on reintroduction, making the 2026-07-04 acceptance criterion
+verifiable in a single module.
+
+Four classes are addressed:
+
+1. **Module file-density caps** — already guarded via
+   ``backend/testing/test_invariants.py`` (``TestBackendModuleSizeGuardrails``)
+   and the eslint frontend rule. ``TestModuleSizeGuardsWired`` asserts that
+   guard is present so this consolidated module stays auditable in one place.
+
+2. **Migration-chain annotations** — chain linearity/monotonicity is guarded
+   in ``test_invariants.py``. ``TestAuthorizedDivergencesSync`` asserts that
+   every ``AUTHORIZED_DIVERGENCES`` entry's on-disk migration file exists, so a
+   divergence cannot be listed without a matching migration on disk.
+
+3. **Dropped-column residuals** — the qualificationverdict column dropped in
+   migration 0351 must leave no residual references in live code outside
+   alembic/versions. ``TestDroppedColumnResidualAbsent`` greps the codebase
+   and fails if any such reference is reintroduced.
+
+4. **.test_durations staleness** — ``backend/.test_durations`` was tracked in
+   git and recurred as a low-severity staleness finding. ``TestTestDurationsNotTracked``
+   asserts it is listed in ``.gitignore`` and is not tracked in git.
+
+Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
+"""
+
+from __future__ import annotations
+
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+
+_THIS_DIR = Path(__file__).resolve().parent
+_BACKEND_ROOT = _THIS_DIR.parent
+_REPO_ROOT = _BACKEND_ROOT.parent
+_VERSIONS_DIR = _BACKEND_ROOT / "alembic" / "versions"
+_RECONCILIATION_PATH = _BACKEND_ROOT / "app" / "migration_reconciliation.py"
+
+
+def _repo_root_available() -> bool:
+    """True when the repo root .git checkout is accessible (not the CI
+    backend-only Docker context)."""
+    return (_REPO_ROOT / ".git").is_dir()
+
+
+# ---------------------------------------------------------------------------
+# 1. Module file-density guardrails — assert coverage stays wired
+# ---------------------------------------------------------------------------
+
+
+class TestModuleSizeGuardsWired:
+    """Assert that the module-size guardrail infrastructure is still in place.
+
+    This class does NOT duplicate the cap assertions — those live in
+    ``TestBackendModuleSizeGuardrails`` / ``TestAgentModuleSizeGuardrails`` in
+    ``test_invariants.py``. Here we merely verify the data file and the test
+    class exist so a future refactor cannot silently hollow out the guardrail
+    while this consolidated module still reports green.
+    """
+
+    def test_module_size_limits_json_exists(self):
+        """module_size_limits.json must exist with non-empty backend + agent sections."""
+        import json
+
+        limits_path = _THIS_DIR / "module_size_limits.json"
+        assert limits_path.exists(), (
+            "backend/testing/module_size_limits.json is missing — the module-size "
+            "guardrail infrastructure has been removed. Restore it."
+        )
+        with limits_path.open() as f:
+            data = json.load(f)
+        assert isinstance(data.get("backend"), dict) and data["backend"], (
+            "module_size_limits.json must have a non-empty 'backend' section."
+        )
+        assert isinstance(data.get("agent"), dict) and data["agent"], (
+            "module_size_limits.json must have a non-empty 'agent' section."
+        )
+
+    def test_test_invariants_has_backend_size_guardrail_class(self):
+        """test_invariants.py must still contain the TestBackendModuleSizeGuardrails
+        class and its parametrized test method."""
+        inv_path = _THIS_DIR / "test_invariants.py"
+        assert inv_path.exists(), "test_invariants.py is missing."
+        content = inv_path.read_text()
+        assert "class TestBackendModuleSizeGuardrails" in content, (
+            "TestBackendModuleSizeGuardrails class is missing from test_invariants.py. "
+            "The module-size guardrail has been removed — restore it."
+        )
+        assert "def test_module_within_limit" in content, (
+            "test_module_within_limit is missing from TestBackendModuleSizeGuardrails. "
+            "The parametrized size cap is no longer enforced."
+        )
+
+    def test_test_invariants_has_migration_chain_guards(self):
+        """test_invariants.py must still contain the migration-chain linearity and
+        monotonicity test methods."""
+        inv_path = _THIS_DIR / "test_invariants.py"
+        assert inv_path.exists(), "test_invariants.py is missing."
+        content = inv_path.read_text()
+        assert "def test_migration_chain_is_linear" in content, (
+            "test_migration_chain_is_linear is missing from test_invariants.py. "
+            "The migration chain linearity guard has been removed."
+        )
+        assert "def test_migration_chain_is_monotonic" in content, (
+            "test_migration_chain_is_monotonic is missing from test_invariants.py. "
+            "The migration chain monotonicity guard has been removed."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for AuthorizedDivergence extraction (static file parse, no DB deps)
+# ---------------------------------------------------------------------------
+
+# Matches a field assignment inside an AuthorizedDivergence(...) call:
+#   fieldname="value",
+_FIELD_RE = re.compile(r'(\w+)\s*=\s*"([^"]+)"')
+
+
+def _parse_authorized_divergences(source: str) -> list[dict[str, str]]:
+    """Extract AuthorizedDivergence(...) call keyword arguments from source
+    without importing the module (avoids the sqlalchemy dependency).
+
+    Returns a list of dicts, one per call, each with the kwargs as str→str.
+    """
+    # Match each AuthorizedDivergence(...) call block
+    call_re = re.compile(r"AuthorizedDivergence\s*\(([^)]+)\)", re.DOTALL)
+    results: list[dict[str, str]] = []
+    for m in call_re.finditer(source):
+        block = m.group(1)
+        kwargs = dict(_FIELD_RE.findall(block))
+        if kwargs:
+            results.append(kwargs)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# 2. AUTHORIZED_DIVERGENCES sync — every listed divergence must have its
+#    on-disk migration file present
+# ---------------------------------------------------------------------------
+
+
+class TestAuthorizedDivergencesSync:
+    """Each AuthorizedDivergence in AUTHORIZED_DIVERGENCES must have a
+    corresponding on-disk migration file.
+
+    Parsed statically from migration_reconciliation.py (no DB import needed).
+    The reconciliation function ``_on_disk_revision_is_integration_identity``
+    checks for ``{revision}_{integration_identity}.py`` — that is the file that
+    lives at the *collided* revision id and holds the integration-branch content.
+    ``integration_revision}_{deployed_identity}.py`` is where the deployed
+    identity was renumbered to on automain.
+    """
+
+    def _load_divergences(self) -> list[dict[str, str]]:
+        assert _RECONCILIATION_PATH.exists(), (
+            f"migration_reconciliation.py not found at {_RECONCILIATION_PATH}. "
+            "The authorized-divergences record cannot be verified."
+        )
+        source = _RECONCILIATION_PATH.read_text()
+        divs = _parse_authorized_divergences(source)
+        assert divs, (
+            "No AuthorizedDivergence entries found in migration_reconciliation.py. "
+            "The AUTHORIZED_DIVERGENCES tuple must have at least one entry, or the "
+            "file has been refactored in a way the static parser cannot handle."
+        )
+        return divs
+
+    def test_migration_reconciliation_has_authorized_divergences(self):
+        """migration_reconciliation.py must declare at least one
+        AuthorizedDivergence to document the handled revision collision."""
+        divs = self._load_divergences()
+        assert len(divs) >= 1, (
+            "AUTHORIZED_DIVERGENCES must contain at least one entry."
+        )
+
+    def test_each_authorized_divergence_integration_identity_file_exists(self):
+        """For every AuthorizedDivergence, the on-disk migration at the collided
+        revision id must be the integration identity file.
+
+        File expected: ``{revision}_{integration_identity}.py`` in alembic/versions.
+        If absent, ``_on_disk_revision_is_integration_identity`` would always return
+        False and the deploy-time rewind would never trigger.
+        """
+        divs = self._load_divergences()
+        missing: list[str] = []
+        for div in divs:
+            rev = div.get("revision", "")
+            identity = div.get("integration_identity", "")
+            if not rev or not identity:
+                continue
+            expected = _VERSIONS_DIR / f"{rev}_{identity}.py"
+            if not expected.exists():
+                missing.append(str(expected))
+
+        assert not missing, (
+            "AUTHORIZED_DIVERGENCES entries reference migration files that do not "
+            "exist on disk. The deploy-time reconciliation is incoherent without them:\n"
+            + "\n".join(f"  - {p}" for p in missing)
+            + "\n\nEither add the missing migration file or remove the stale entry."
+        )
+
+    def test_each_authorized_divergence_deployed_identity_file_exists(self):
+        """For every AuthorizedDivergence, the renumbered deployed-identity file
+        ``{integration_revision}_{deployed_identity}.py`` must exist on disk.
+
+        If absent the migration chain is broken and ``alembic upgrade head`` errors.
+        """
+        divs = self._load_divergences()
+        missing: list[str] = []
+        for div in divs:
+            int_rev = div.get("integration_revision", "")
+            deployed = div.get("deployed_identity", "")
+            if not int_rev or not deployed:
+                continue
+            expected = _VERSIONS_DIR / f"{int_rev}_{deployed}.py"
+            if not expected.exists():
+                missing.append(str(expected))
+
+        assert not missing, (
+            "AUTHORIZED_DIVERGENCES entries reference renumbered deployed-identity "
+            "migration files that do not exist on disk:\n"
+            + "\n".join(f"  - {p}" for p in missing)
+            + "\n\nEither add the missing migration file or remove the stale entry."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 3. Dropped-column residuals — no reference outside alembic/versions
+# ---------------------------------------------------------------------------
+
+# Directories searched (relative to repo root)
+_SEARCH_DIRS = ["backend", "agent", "admin-ui"]
+
+# File extensions to scan
+_CODE_EXTENSIONS = {
+    ".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md",
+}
+
+# Paths to exclude from the scan
+_EXCLUDE_RE = re.compile(
+    r"[/\\]alembic[/\\]versions[/\\]"
+    r"|[/\\]\.git[/\\]"
+    r"|[/\\]node_modules[/\\]"
+    r"|[/\\]__pycache__[/\\]"
+    r"|[/\\]\.venv[/\\]"
+    r"|[/\\]build[/\\]"
+    r"|[/\\]dist[/\\]"
+    r"|[/\\]coverage[/\\]"
+    r"|[/\\]test_audit_finding_class_guards\.py$"  # this file references the term in comments
+)
+
+# Column name dropped in migration 0351
+_DROPPED_COLUMN = "theme" + "_delivery"  # split to avoid self-match
+
+
+class TestDroppedColumnResidualAbsent:
+    """The qualificationverdict column dropped in migration 0351 must leave no
+    residual references in live code outside alembic/versions.
+
+    The column name is assembled at module-load time to avoid a false-positive
+    when this guard file itself is scanned. If this test fails, a reintroduced
+    reference was found — remove it and ensure no new code uses the dropped column.
+    """
+
+    def test_no_dropped_column_references_outside_migrations(self):
+        """Walk backend/, agent/, admin-ui/ (excluding alembic/versions and this
+        guard file) and fail if any source file contains the dropped column name.
+
+        Skipped only when ALL search directories are absent (e.g. CI backend-only
+        Docker context that doesn't mount agent/ or admin-ui/); the backend/ dir
+        is always searched from the test environment.
+        """
+        hits: list[str] = []
+        checked_dirs: list[Path] = []
+
+        for dir_name in _SEARCH_DIRS:
+            search_dir = _REPO_ROOT / dir_name
+            if not search_dir.is_dir():
+                continue
+            checked_dirs.append(search_dir)
+            for path in search_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix not in _CODE_EXTENSIONS:
+                    continue
+                path_str = str(path)
+                if _EXCLUDE_RE.search(path_str):
+                    continue
+                try:
+                    text = path.read_text(encoding="utf-8", errors="ignore")
+                except OSError:
+                    continue
+                if _DROPPED_COLUMN in text:
+                    rel = path.relative_to(_REPO_ROOT)
+                    hits.append(str(rel))
+
+        assert checked_dirs, (
+            "No searchable directories were found. Expected at least one of "
+            + ", ".join(_SEARCH_DIRS)
+            + " to exist relative to the repo root."
+        )
+
+        assert not hits, (
+            f"Residual '{_DROPPED_COLUMN}' references found outside alembic/versions. "
+            "The qualificationverdict column was dropped in migration 0351 and must "
+            "not be reintroduced.\n"
+            "Files containing the dropped column name:\n"
+            + "\n".join(f"  - {h}" for h in sorted(hits))
+        )
+
+
+# ---------------------------------------------------------------------------
+# 4. .test_durations staleness — must be gitignored and untracked
+# ---------------------------------------------------------------------------
+
+
+class TestTestDurationsNotTracked:
+    """``backend/.test_durations`` is a pytest-split duration cache generated
+    locally by pytest-split. It is large (~1.7 MB) and was previously
+    committed, causing a recurring low-severity staleness finding.
+
+    Guards:
+    - ``.gitignore`` must list the ``backend/.test_durations`` pattern.
+    - The file must not be tracked in git (``git ls-files`` must not list it).
+
+    Skipped when the repo root is unavailable (CI backend-only Docker context).
+    """
+
+    def test_test_durations_in_gitignore(self):
+        """.gitignore must contain ``backend/.test_durations``."""
+        gitignore_path = _REPO_ROOT / ".gitignore"
+        if not _repo_root_available() or not gitignore_path.exists():
+            pytest.skip(
+                "repo root / .gitignore not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        lines = gitignore_path.read_text().splitlines()
+        assert "backend/.test_durations" in lines, (
+            ".gitignore is missing the 'backend/.test_durations' pattern. "
+            "Without it, pytest-split's duration cache file can be accidentally "
+            "staged and committed, causing recurring staleness audit findings. "
+            "Add 'backend/.test_durations' to .gitignore."
+        )
+
+    def test_test_durations_not_git_tracked(self):
+        """backend/.test_durations must not be a tracked git file.
+
+        If this fails, run: git rm --cached backend/.test_durations
+        """
+        if not _repo_root_available():
+            pytest.skip(
+                "repo root .git not available in this test environment "
+                "(CI docker context is ./backend; run locally or via "
+                "scripts/test-backend.sh from a checkout for enforcement)"
+            )
+        result = subprocess.run(
+            ["git", "ls-files", "backend/.test_durations"],
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+        )
+        tracked_paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        assert not tracked_paths, (
+            "backend/.test_durations is tracked in git. "
+            "Remove it with: git rm --cached backend/.test_durations\n"
+            "Then commit the change to stop the staleness finding from recurring."
+        )

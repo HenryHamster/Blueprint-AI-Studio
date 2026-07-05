@@ -171,22 +171,41 @@ async def link_criteria_to_direction(
     # De-duplicate while preserving order.
     deduped_keys = list(dict.fromkeys(body.criterion_keys))
 
-    # Validate that all supplied keys exist in the current open version.
-    # criterion_key is unique only within release_version_id, so we must scope
-    # the lookup to open_version.id to reject stale keys from closed versions.
+    # Validate all supplied keys against the version's active/inactive sets in
+    # one query (guard mirrors check_gap_id_write in problem_model.py).
     if deduped_keys:
-        existing = await ac.get_criteria_by_keys(
-            session,
-            project_id,
-            deduped_keys,
-            release_version_id=open_version.id,
+        from app.direction_referential_guard import (
+            classify_criterion_key,
+            load_version_criterion_key_sets,
         )
-        existing_keys = {r.criterion_key for r in existing}
-        unknown = [k for k in deduped_keys if k not in existing_keys]
+
+        active_keys, inactive_keys = await load_version_criterion_key_sets(
+            session, project_id, open_version.id
+        )
+        unknown = [
+            k
+            for k in deduped_keys
+            if classify_criterion_key(k, active_keys, inactive_keys) == "dangling"
+        ]
         if unknown:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown criterion keys for this version: {unknown}",
+            )
+        inactive = [
+            k
+            for k in deduped_keys
+            if classify_criterion_key(k, active_keys, inactive_keys) == "inactive"
+        ]
+        if inactive:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": "criterion_key_invalid",
+                    "classification": "inactive",
+                    "keys": inactive,
+                    "active_criterion_keys": sorted(active_keys),
+                },
             )
 
     row = (

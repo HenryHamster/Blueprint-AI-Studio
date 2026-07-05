@@ -2573,3 +2573,50 @@ async def test_record_task_merge_evidence_skips_inactive_criteria(db_session):
 
     retracted_evidence = await ac.get_evidence_for_criterion(db_session, retracted_c.id)
     assert retracted_evidence == [], "Retracted criterion must not receive new evidence"
+
+
+# ---------------------------------------------------------------------------
+# test_criterion_link_invalid_rejected_at_write
+# ---------------------------------------------------------------------------
+
+
+def test_criterion_link_invalid_rejected_at_write():
+    """Write-time guard rejects dangling and inactive criterion keys at link time.
+
+    Exercises the pure classifier and check helper in direction_referential_guard,
+    which back every write surface that updates Direction.criterion_keys.
+    """
+    from app.direction_referential_guard import (
+        check_criterion_key_write,
+        classify_criterion_key,
+    )
+
+    active = frozenset(["c-alpha", "c-beta"])
+    inactive = frozenset(["c-retracted", "c-superseded"])
+
+    # Valid key — no rejection.
+    cls, active_list = check_criterion_key_write("c-alpha", active, inactive)
+    assert cls is None
+    assert active_list == []
+
+    # Dangling key (not in version at all) — rejected, active keys surfaced.
+    cls, active_list = check_criterion_key_write("c-unknown", active, inactive)
+    assert cls == "dangling"
+    assert set(active_list) == {"c-alpha", "c-beta"}
+
+    # Inactive key (retracted/superseded in open version) — rejected, active keys surfaced.
+    cls, active_list = check_criterion_key_write("c-retracted", active, inactive)
+    assert cls == "inactive"
+    assert set(active_list) == {"c-alpha", "c-beta"}
+
+    # Empty key treated as no-op (caller skips empty writes).
+    cls, active_list = check_criterion_key_write("", active, inactive)
+    assert cls is None
+    assert active_list == []
+
+    # classify_criterion_key returns correct classification for each case.
+    assert classify_criterion_key("c-alpha", active, inactive) == "valid"
+    assert classify_criterion_key("c-retracted", active, inactive) == "inactive"
+    assert classify_criterion_key("c-superseded", active, inactive) == "inactive"
+    assert classify_criterion_key("c-missing", active, inactive) == "dangling"
+    assert classify_criterion_key("", active, inactive) == "dangling"
