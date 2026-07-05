@@ -4771,10 +4771,12 @@ describe('writeDesignDocHelper', () => {
   it('makes set/delete durable: a retry loop honoring Retry-After on 429/5xx', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];
-    // Bounded retry loop wired to the write ops.
-    expect(script).toContain('_post_retry()');
-    expect(script).toContain('max=3');
-    expect(script).toContain('_post_retry "$(printf');
+    // Shared bounded retry function wired to the write ops (max=4, 5s/15s/30s backoff).
+    expect(script).toContain('_post_with_retry()');
+    expect(script).toContain('max=4');
+    // set and delete pipe through the shared retry wrapper.
+    expect(script).toContain('| \\\n    _post_with_retry "$API/api/agent/design-doc" "design-doc set"');
+    expect(script).toContain('| \\\n    _post_with_retry "$API/api/agent/design-doc" "design-doc delete"');
     // Retries on contention (429) and transient server errors (5xx).
     expect(script).toContain('"$http_code" = "429"');
     expect(script).toContain('"$http_code" -ge 500');
@@ -4816,10 +4818,11 @@ describe('writeDesignDocHelper', () => {
     expect(script).toContain('_load_agent_token()');
     expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
-    // The durable write loop re-reads the token per attempt and treats 401/403 as
+    // The shared retry wrapper re-reads the token per attempt and treats 401/403 as
     // a rotated-token retry rather than an immediate non-retryable failure.
     expect(script).toContain('_load_agent_token || return 1');
-    expect(script).toContain('[ "$http_code" = "401" ] || [ "$http_code" = "403" ]');
+    // The shared function uses -eq for numeric comparison (not string "= \"401\"").
+    expect(script).toContain('[ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]');
   });
 
   // ── Read-only mode (research / plan workspaces) ──────────────────────────────
@@ -4844,7 +4847,7 @@ describe('writeDesignDocHelper', () => {
       const script = capturedScripts['/tmp/workspace/design-doc'];
       expect(script).toContain('read-only in this workspace');
       // No durable write path is emitted at all.
-      expect(script).not.toContain('_post_retry');
+      expect(script).not.toContain('_post_with_retry');
       expect(script).not.toContain('"op":"set"');
       expect(script).not.toContain('"op":"delete"');
     });
@@ -4885,11 +4888,13 @@ describe('writeMessagesHelper', () => {
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toBeDefined();
     expect(script).toContain('./messages send --stdin [type]');
-    expect(script).toContain('_post_strategic()');
-    expect(script).toContain('if ! response=$(printf \'%s\' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
+    // Uses the shared _post_with_retry function (not a private _post_strategic).
+    expect(script).toContain('_post_with_retry()');
+    // POSTs to the strategic endpoint via the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/strategic" "messages $OP"');
     expect(script).toContain("-w '\\n%{http_code}'");
     expect(script).toContain('printf \'%s\\n\' "$body" >&2');
-    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+    expect(script).toContain('[ERROR] $op_label failed');
     expect(script).not.toContain('curl -f -sS');
 
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -4904,7 +4909,7 @@ describe('writeMessagesHelper', () => {
     }
   });
 
-  it('reads the live token, captures stdin, retries once on 401, and fails loud (resident write-token fix)', async () => {
+  it('reads the live token, captures stdin, retries on 401, and fails loud (resident write-token fix)', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
     // Fresh live-token resolution with env fallback (no stale hard-`:?` snapshot).
@@ -4912,13 +4917,13 @@ describe('writeMessagesHelper', () => {
     expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
     expect(script).toContain('CONTENT="$(cat)"');
-    // The JSON body is captured from stdin ONCE so the 401 path can re-send it.
+    // The JSON body is captured from stdin ONCE via payload=$(cat) in _post_with_retry.
     expect(script).toContain('payload=$(cat)');
     expect(script).toContain('_load_agent_token || return 1');
-    // 401/403 → re-read the rotated token and retry once...
-    expect(script).toContain('re-reading rotated agent token and retrying once');
-    // ...else fail LOUD ("restart the resident session") rather than silently.
-    expect(script).toContain('restart the resident session');
+    // 401/403 → re-read the rotated token and retry via the shared wrapper.
+    expect(script).toContain('re-reading rotated agent token and retrying');
+    // ...else fail LOUD ("restart the session") rather than silently.
+    expect(script).toContain('restart the session');
 
     // Structural change is still syntactically valid bash.
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -4936,7 +4941,7 @@ describe('writeMessagesHelper', () => {
   it('retries up to 3 times on 429/5xx, honors Retry-After, then fails loud', async () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
-    // Bounded retry loop with max=4 (3 retry slots + the initial attempt).
+    // Shared bounded retry wrapper: max=4 (3 retry slots + the initial attempt).
     expect(script).toContain('max=4');
     expect(script).toContain('while [ $attempt -lt $max ]');
     // Header capture for Retry-After extraction.
@@ -4949,8 +4954,8 @@ describe('writeMessagesHelper', () => {
     // Progress message so the agent can see retry activity.
     expect(script).toContain('[RETRY');
     expect(script).toContain('retrying in');
-    // After all retries exhausted, surfaces a real error rather than silently returning 1.
-    expect(script).toContain('[ERROR] messages $OP failed (HTTP $http_code)');
+    // After all retries exhausted, surfaces a real error via the shared wrapper.
+    expect(script).toContain('[ERROR] $op_label failed after $max attempts');
 
     // Generated script must be syntactically valid bash.
     const realFs = await vi.importActual<typeof import('node:fs')>('node:fs');

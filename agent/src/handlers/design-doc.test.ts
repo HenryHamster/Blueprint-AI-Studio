@@ -88,7 +88,7 @@ describe('handleDesignDocUpdate', () => {
     expect(content.startsWith('#!/bin/bash')).toBe(true);
     expect(content).toContain('design-doc get|set|delete|list');
     // set/delete are durable under 429/5xx contention via a bounded retry loop.
-    expect(content).toContain('_post_retry');
+    expect(content).toContain('_post_with_retry');
     expect(content).toContain('"$http_code" = "429"');
     expect(helperCall[2]).toEqual({ mode: 0o755 });
   });

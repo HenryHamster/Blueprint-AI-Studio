@@ -16,8 +16,8 @@ import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
   recordLlmTokens, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
-import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
-import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV } from '../token-file.js';
+import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
+import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -793,9 +793,10 @@ if [ -z "$CONTENT" ]; then
 fi
 
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
-TOKEN="\${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"
 TASK="\${TASK_ID:?TASK_ID not set}"
-CURL_OPTS="-f -sS --max-time 15 --connect-timeout 10"
+${agentTokenShellFn()}
+_load_agent_token || exit 1
+${retryPostShellFn()}
 
 # Build JSON with printf to avoid shell expansion issues
 JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\":\\"$(echo "$CONTENT" | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')\\""
@@ -803,12 +804,10 @@ JSON="{\\"task_id\\":\\"$TASK\\",\\"annotation_type\\":\\"$TYPE\\",\\"content\\"
 [ -n "$SEVERITY" ] && JSON="\${JSON},\\"severity\\":\\"$SEVERITY\\""
 JSON="\${JSON}}"
 
-printf '%s' "$JSON" | \\
-  curl $CURL_OPTS -X POST "$API/api/agent/annotate" \\
-    -H "Content-Type: application/json" \\
-    -H "X-Agent-Token: $TOKEN" \\
-    --data-binary @-
+printf '%s' "$JSON" | _post_with_retry "$API/api/agent/annotate" "note $TYPE"
+rc=$?
 echo ""
+exit $rc
 `;
     fs.writeFileSync(`${workspace}/note`, noteScript, { mode: 0o755 });
     try {

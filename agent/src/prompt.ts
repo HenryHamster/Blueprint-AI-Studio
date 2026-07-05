@@ -620,6 +620,64 @@ export function shellEscapeDoubleQuoted(value: string): string {
   return value.replace(/[\\"`$]/g, '\\$&');
 }
 
+// Returns the shared bash _post_with_retry function embedded by all write-capable
+// helper scripts (messages send/resolve, playbook set, design-doc set/delete, note).
+// Provides bounded retry on 429/5xx: 4 max attempts, 5s/15s/30s backoff, Retry-After
+// honored, token re-read each attempt. Requires _load_agent_token (from agentTokenShellFn()).
+// Usage in bash: echo "$JSON" | _post_with_retry <url> <op-label>
+export function retryPostShellFn(): string {
+  return `
+_post_with_retry() {
+  local url="$1" op_label="$2"
+  local payload attempt=0 max=4 delay http_code body response dump saw_auth=0
+  payload=$(cat)
+  while [ $attempt -lt $max ]; do
+    _load_agent_token || return 1
+    dump=$(mktemp)
+    response=$(printf '%s' "$payload" | curl -sS --max-time 30 --connect-timeout 10 \\
+      -X POST "$url" \\
+      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
+      --data-binary @- \\
+      -D "$dump" \\
+      -w '\\n%{http_code}')
+    http_code=$(printf '%s' "$response" | tail -n1)
+    body=$(printf '%s' "$response" | head -n -1)
+    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
+    rm -f "$dump"
+    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+      printf '%s' "$body"
+      return 0
+    fi
+    attempt=$((attempt + 1))
+    if [ $attempt -ge $max ]; then break; fi
+    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+      if [ -z "$delay" ]; then
+        if [ $attempt -eq 1 ]; then delay=5
+        elif [ $attempt -eq 2 ]; then delay=15
+        else delay=30; fi
+      fi
+      echo "[RETRY $attempt/$((max - 1))] $op_label failed (HTTP $http_code), retrying in \${delay}s..." >&2
+      sleep "$delay"
+    elif [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
+      saw_auth=1
+      echo "[AUTH] $op_label rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
+      sleep 1
+    else
+      if [ -n "$body" ]; then printf '%s\\n' "$body" >&2; fi
+      echo "[ERROR] $op_label failed (HTTP $http_code, non-retryable)" >&2
+      return 1
+    fi
+  done
+  if [ "$saw_auth" -eq 1 ] && { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; }; then
+    echo "[ERROR] $op_label failed: agent token expired — restart the session." >&2
+  else
+    if [ -n "$body" ]; then printf '%s\\n' "$body" >&2; fi
+    echo "[ERROR] $op_label failed after $max attempts (HTTP $http_code)" >&2
+  fi
+  return 1
+}`;
+}
+
 export function writePlaybookHelper(taskIdRaw: string, workspace: string = WORKSPACE): void {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
   const helperScript = `#!/bin/bash
@@ -630,7 +688,7 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
-
+${retryPostShellFn()}
 if [ "$OP" = "get" ]; then
   printf '{"task_id":"%s","op":"get"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -645,8 +703,7 @@ elif [ "$OP" = "set" ]; then
     '{task_id: $tid, op: "set", key: $k, value: $v}
        + (if $br == "" then {} else {branch: $br} end)
        + (if $sha == "" then {} else {head_sha: $sha} end)' | \\
-    curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" --data-binary @-
+    _post_with_retry "$API/api/agent/playbook" "playbook set"
 elif [ "$OP" = "list" ]; then
   printf '{"task_id":"%s","op":"list"}' "$TASK" | \\
     curl -f -sS --max-time 30 -X POST "$API/api/agent/playbook" \\
@@ -655,7 +712,9 @@ else
   echo "Error: unsupported playbook operation: $OP" >&2
   exit 1
 fi
+rc=$?
 echo ""
+exit $rc
 `;
   fs.writeFileSync(`${workspace}/playbook`, helperScript, { mode: 0o755 });
   excludeAgentHelpers();
@@ -680,65 +739,7 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
 _load_agent_token || exit 1
 TASK="${taskId}"
-CURL_OPTS="-sS --max-time 30 --connect-timeout 10"
-
-# Capture the JSON body from stdin ONCE so a 401 (rotated resident-session token)
-# can be retried after re-reading the live token — stdin is consumed on the first
-# curl and cannot be re-read. 429 (lock contention) and 5xx (transient) are also
-# retried up to max-1 times, honoring Retry-After when present.
-_post_strategic() {
-  local payload response http_code body attempt=0 max=4 delay dump
-  payload=$(cat)
-  while [ $attempt -lt $max ]; do
-    _load_agent_token || return 1
-    dump=$(mktemp)
-    if ! response=$(printf '%s' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic" \\
-      -H "Content-Type: application/json" -H "X-Agent-Token: $TOKEN" \\
-      --data-binary @- \\
-      -D "$dump" \\
-      -w '\\n%{http_code}'); then
-      rm -f "$dump"
-      return 1
-    fi
-    http_code=$(printf '%s' "$response" | tail -n1)
-    body=$(printf '%s' "$response" | head -n -1)
-    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
-    rm -f "$dump"
-    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-      printf '%s' "$body"
-      return 0
-    fi
-    # On 401/403 re-read the rotated token and retry ONCE before failing.
-    if { [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; } && [ $attempt -eq 0 ]; then
-      echo "[AUTH] messages $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying once" >&2
-      attempt=$((attempt + 1))
-      continue
-    fi
-    attempt=$((attempt + 1))
-    if [ $attempt -ge $max ]; then break; fi
-    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
-      [ -z "$delay" ] && delay=$((attempt * 2))
-      echo "[RETRY $attempt/$((max - 1))] messages $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
-      sleep "$delay"
-      continue
-    fi
-    if [ -n "$body" ]; then
-      printf '%s\\n' "$body" >&2
-    fi
-    if [ "$http_code" -eq 401 ] || [ "$http_code" -eq 403 ]; then
-      echo "[ERROR] messages $OP failed: agent token expired — restart the resident session (agent JWT TTL is 1h)." >&2
-    else
-      echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
-    fi
-    return 1
-  done
-  if [ -n "$body" ]; then
-    printf '%s\\n' "$body" >&2
-  fi
-  echo "[ERROR] messages $OP failed (HTTP $http_code)" >&2
-  return 1
-}
-
+${retryPostShellFn()}
 if [ "$OP" = "send" ]; then
   if [ "\${2:-}" = "--stdin" ]; then
     MSG_TYPE="\${3:-NOTE}"
@@ -751,13 +752,13 @@ if [ "$OP" = "send" ]; then
   IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
   jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
     '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}' | \\
-    _post_strategic
+    _post_with_retry "$API/api/agent/strategic" "messages $OP"
 elif [ "$OP" = "resolve" ]; then
   MSG_ID="\${2:?resolve requires <message-id>}"
   RESOLUTION="\${3:-Addressed}"
   jq -n --arg tid "$TASK" --arg mid "$MSG_ID" --arg r "$RESOLUTION" \\
     '{task_id: $tid, op: "resolve_message", data: {message_id: $mid, resolution: $r}}' | \\
-    _post_strategic
+    _post_with_retry "$API/api/agent/strategic" "messages $OP"
 else
   echo "Unknown op: $OP. Use send or resolve." >&2; exit 1
 fi
@@ -873,66 +874,24 @@ export function writeDesignDocHelper(
 #   ./design-doc list                     — list all section keys`;
   const usageLine = readOnly ? 'get|list' : 'get|set|delete|list';
 
-  // Durable POST for write operations (set/delete). Retries up to 3 times on
-  // 429 (lock contention / rate limit) and 5xx (transient), honoring the
-  // Retry-After header when present and falling back to linear backoff.
-  // Non-retryable responses (other 4xx) surface immediately.
-  const retryFn = readOnly ? '' : `
-_post_retry() {
-  local body="$1"
-  local attempt=0 max=3 delay http_code response dump
-  while [ $attempt -lt $max ]; do
-    # Re-read the live token each attempt so a rotated resident-session token is
-    # picked up on the 401 retry below.
-    _load_agent_token || return 1
-    dump=$(mktemp)
-    response=$(printf '%s' "$body" | \\
-      curl -sS --max-time 30 --connect-timeout 10 \\
-        -X POST "$API/api/agent/design-doc" \\
-        -H "Content-Type: application/json" \\
-        -H "X-Agent-Token: $TOKEN" \\
-        --data-binary @- \\
-        -D "$dump" \\
-        -w '\\n%{http_code}')
-    http_code=$(printf '%s' "$response" | tail -n1)
-    delay=$(grep -i '^retry-after:' "$dump" 2>/dev/null | tail -n1 | tr -dc '0-9')
-    rm -f "$dump"
-    if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
-      printf '%s' "$response" | head -n -1
-      return 0
-    fi
-    attempt=$((attempt + 1))
-    if [ $attempt -ge $max ]; then break; fi
-    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
-      [ -z "$delay" ] && delay=$((attempt * 2))
-      echo "[RETRY $attempt/$((max - 1))] design-doc $OP failed (HTTP $http_code), retrying in \${delay}s..." >&2
-      sleep "$delay"
-    elif [ "$http_code" = "401" ] || [ "$http_code" = "403" ]; then
-      # Rotated resident-session token — the next loop iteration re-reads the
-      # live token via _load_agent_token before retrying.
-      echo "[AUTH] design-doc $OP rejected (HTTP $http_code) — re-reading rotated agent token and retrying" >&2
-      sleep 1
-    else
-      printf '%s' "$response" | head -n -1 >&2
-      echo "[ERROR] design-doc $OP failed (HTTP $http_code, non-retryable)" >&2
-      return 1
-    fi
-  done
-  echo "[ERROR] design-doc $OP failed after $max attempts" >&2
-  return 1
-}
-`;
+  // Durable POST for write operations (set/delete). Routes through the shared
+  // _post_with_retry wrapper (4 attempts, 5s/15s/30s backoff, Retry-After honored)
+  // so 429 (lock contention) and 5xx (transient) are never silently dropped.
+  // Non-retryable 4xx responses surface immediately.
+  const retryFn = readOnly ? '' : retryPostShellFn();
   const writeBranches = readOnly ? `elif [ "$OP" = "set" ] || [ "$OP" = "delete" ]; then
   echo "Error: ./design-doc is read-only in this workspace ($OP not permitted)." >&2; exit 1` : `elif [ "$OP" = "set" ]; then
   if [ -z "$KEY" ] || [ -z "$VALUE" ]; then
     echo "Error: set requires <key> and <json-value>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE")"
+  printf '{"task_id":"%s","op":"set","key":"%s","value":%s}' "$TASK" "$KEY" "$VALUE" | \\
+    _post_with_retry "$API/api/agent/design-doc" "design-doc set"
 elif [ "$OP" = "delete" ]; then
   if [ -z "$KEY" ]; then
     echo "Error: delete requires <key>" >&2; exit 1
   fi
-  _post_retry "$(printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY")"`;
+  printf '{"task_id":"%s","op":"delete","key":"%s"}' "$TASK" "$KEY" | \\
+    _post_with_retry "$API/api/agent/design-doc" "design-doc delete"`;
   const unknownUsage = readOnly ? 'Use get or list.' : 'Use get, set, delete, or list.';
   const helperScript = `#!/bin/bash
 # Design doc wiki tool — updates pages incrementally via API

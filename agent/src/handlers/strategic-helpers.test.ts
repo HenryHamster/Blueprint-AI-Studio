@@ -19,7 +19,12 @@ import {
   STRATEGIC_CHALLENGE_VERSION,
   portfolioOperationFingerprint,
 } from './strategic-helpers.js';
-import { VmConfigMissingError } from '../providers/runners.js';
+import { VmConfigMissingError, provisionAmbientHelpers } from '../providers/runners.js';
+import {
+  writePlaybookHelper,
+  writeMessagesHelper,
+  writeDesignDocHelper,
+} from '../prompt.js';
 
 // Use the OS temp dir (not a hardcoded /tmp) so this suite runs on Windows too.
 const testWorkspace = path.join(os.tmpdir(), 'test-strategic-helpers-workspace');
@@ -1140,5 +1145,150 @@ describe('buildStrategicChallengeExecutorSection (retirement gate)', () => {
     });
     expect(section).toContain('approving NOTHING');
     expect(section).toContain('(none — no retirement was approved this cycle)');
+  });
+});
+
+// ── Shared _post_with_retry function across all write helpers ─────────────────
+// These tests verify that the bounded 429/5xx retry logic with Retry-After
+// honoring is present in ALL generated write-capable helper scripts.
+describe('shared _post_with_retry retry logic across all write helpers', () => {
+  const ws = path.join(os.tmpdir(), 'test-shared-retry-workspace');
+
+  beforeEach(() => {
+    if (!fs.existsSync(ws)) fs.mkdirSync(ws, { recursive: true });
+  });
+  afterEach(() => {
+    if (fs.existsSync(ws)) {
+      try { fs.rmSync(ws, { recursive: true }); } catch { /* ignore */ }
+    }
+  });
+
+  // Helper: verify the _post_with_retry function is present in a script and has
+  // the correct retry structure: 429, 5xx, Retry-After, max=4, 5s/15s/30s backoff.
+  function assertRetryPresent(script: string, label: string): void {
+    // Shared function signature
+    expect(script, `${label}: missing _post_with_retry function`).toContain('_post_with_retry()');
+    // max=4 attempts (3 retry slots + initial)
+    expect(script, `${label}: expected max=4`).toContain('max=4');
+    // Retry on 429 (lock contention) and 5xx (transient)
+    expect(script, `${label}: missing 429 retry`).toContain('"$http_code" = "429"');
+    expect(script, `${label}: missing 5xx retry`).toContain('"$http_code" -ge 500');
+    // Retry-After header honored
+    expect(script, `${label}: missing dump file for Retry-After`).toContain('-D "$dump"');
+    expect(script, `${label}: missing retry-after header parse`).toContain("grep -i '^retry-after:'");
+    expect(script, `${label}: missing sleep "$delay"`).toContain('sleep "$delay"');
+    // Backoff schedule: 5s/15s/30s (not attempt*2)
+    expect(script, `${label}: missing 5s backoff`).toContain('delay=5');
+    expect(script, `${label}: missing 15s backoff`).toContain('delay=15');
+    expect(script, `${label}: missing 30s backoff`).toContain('delay=30');
+    // Auth retry: re-reads token on 401/403
+    expect(script, `${label}: missing auth retry`).toContain('_load_agent_token || return 1');
+    // Passes bash -n syntax check
+    const tmpFile = path.join(os.tmpdir(), `retry_check_${Date.now()}.sh`);
+    fs.writeFileSync(tmpFile, script);
+    try {
+      expect(() => execFileSync('bash', ['-n', tmpFile], { stdio: 'pipe' }), `${label}: bash -n failed`).not.toThrow();
+    } finally {
+      try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    }
+  }
+
+  it('./messages send/resolve use _post_with_retry (not a bare curl)', () => {
+    writeMessagesHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    assertRetryPresent(script, 'messages');
+    // Both send and resolve route through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/strategic" "messages $OP"');
+    // No bare curl with -f (fail-fast) in the write path.
+    expect(script).not.toContain('curl -f');
+  });
+
+  it('./playbook set uses _post_with_retry (not a bare curl)', () => {
+    writePlaybookHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/playbook`, 'utf-8');
+    assertRetryPresent(script, 'playbook');
+    // The set write op routes through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/playbook" "playbook set"');
+    // Read ops (get/list) remain fail-fast (no retry wrapper).
+    expect(script).toContain('curl -f -sS');
+  });
+
+  it('./design-doc set/delete use _post_with_retry (not a bare curl)', () => {
+    writeDesignDocHelper('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    assertRetryPresent(script, 'design-doc');
+    // set and delete route through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/design-doc" "design-doc set"');
+    expect(script).toContain('_post_with_retry "$API/api/agent/design-doc" "design-doc delete"');
+    // Read ops (get/list) remain fail-fast via _post_once.
+    expect(script).toContain('_post_once()');
+  });
+
+  it('./note uses _post_with_retry (not a bare curl)', () => {
+    provisionAmbientHelpers('t-retry', ws);
+    const script = fs.readFileSync(`${ws}/note`, 'utf-8');
+    assertRetryPresent(script, 'note');
+    // The annotation POST routes through the shared retry wrapper.
+    expect(script).toContain('_post_with_retry "$API/api/agent/annotate" "note $TYPE"');
+    // No bare curl with -f in the write path.
+    expect(script).not.toContain('curl -f');
+  });
+
+  it('429 without Retry-After uses the 5s/15s/30s schedule (not attempt*2)', () => {
+    // The previous backoff was attempt*2 (2s, 4s, 6s). The new schedule is 5s/15s/30s.
+    // Verify that ALL write helpers use the new schedule and none use attempt*2.
+    writeMessagesHelper('t-backoff', ws);
+    const messages = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    expect(messages).not.toContain('delay=$((attempt * 2))');
+    expect(messages).toContain('delay=5');
+    expect(messages).toContain('delay=15');
+    expect(messages).toContain('delay=30');
+
+    writePlaybookHelper('t-backoff', ws);
+    const playbook = fs.readFileSync(`${ws}/playbook`, 'utf-8');
+    expect(playbook).not.toContain('delay=$((attempt * 2))');
+    expect(playbook).toContain('delay=5');
+    expect(playbook).toContain('delay=15');
+    expect(playbook).toContain('delay=30');
+
+    writeDesignDocHelper('t-backoff', ws);
+    const designDoc = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    expect(designDoc).not.toContain('delay=$((attempt * 2))');
+    expect(designDoc).toContain('delay=5');
+    expect(designDoc).toContain('delay=15');
+    expect(designDoc).toContain('delay=30');
+
+    provisionAmbientHelpers('t-backoff', ws);
+    const note = fs.readFileSync(`${ws}/note`, 'utf-8');
+    expect(note).not.toContain('delay=$((attempt * 2))');
+    expect(note).toContain('delay=5');
+    expect(note).toContain('delay=15');
+    expect(note).toContain('delay=30');
+  });
+
+  it('429 with Retry-After: the header value takes priority over the default backoff', () => {
+    // Every write helper must honor a Retry-After header by reading the dump file
+    // and using it as the sleep duration, overriding the default 5s/15s/30s schedule.
+    writeMessagesHelper('t-retry-after', ws);
+    const script = fs.readFileSync(`${ws}/messages`, 'utf-8');
+    // Header is captured to a dump file each attempt.
+    expect(script).toContain('dump=$(mktemp)');
+    expect(script).toContain('-D "$dump"');
+    // Retry-After is extracted from the dump (case-insensitive).
+    expect(script).toContain("grep -i '^retry-after:'");
+    // If delay is non-empty (from Retry-After), it skips the default schedule.
+    expect(script).toContain('if [ -z "$delay" ]');
+    // Sleep uses the extracted/computed delay.
+    expect(script).toContain('sleep "$delay"');
+  });
+
+  it('read-only design-doc workspace does not get the retry function', () => {
+    writeDesignDocHelper('t-ro', ws, { readOnly: true });
+    const script = fs.readFileSync(`${ws}/design-doc`, 'utf-8');
+    // Read-only mode must NOT include the write retry path.
+    expect(script).not.toContain('_post_with_retry');
+    expect(script).not.toContain('delay=5');
+    // But it still has the fail-fast read helper.
+    expect(script).toContain('_post_once()');
   });
 });
