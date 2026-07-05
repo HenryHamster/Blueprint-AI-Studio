@@ -5210,6 +5210,199 @@ describe('MessagesPanel send arming receipt', () => {
   });
 });
 
+// ── Auto-scroll behavior ───────────────────────────────────────────────────────
+// Verifies the two scroll-to-bottom cases that the operator complained were
+// unreliable: (1) operator's own just-sent message always scrolls, (2) incoming
+// messages scroll when near bottom but not when far away.
+
+describe('MessagesPanel auto-scroll', () => {
+  let root: Root | null = null;
+  let host: HTMLDivElement | null = null;
+
+  beforeEach(() => { localStorage.clear(); });
+
+  afterEach(() => {
+    const r = root;
+    if (r) act(() => r.unmount());
+    root = null;
+    host?.remove();
+    host = null;
+    vi.clearAllMocks();
+  });
+
+  function _setupStrategicSendMock(): void {
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-session\/messages$/.test(urlStr) && method === 'POST') {
+        return new Response(JSON.stringify({ arming: 'steering' }), { status: 200 });
+      }
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: [] },
+          recent_outputs: [],
+          session: {},
+          status: 'unavailable',
+          location: 'unavailable',
+          status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+  }
+
+  async function renderConversationPanel(): Promise<HTMLDivElement> {
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    _setupStrategicSendMock();
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel
+          selectedProjectId="proj-1"
+          onClose={() => {}}
+          addToast={() => {}}
+          onMessageCountChange={() => {}}
+          filterChrome="minimal"
+        />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    return host as HTMLDivElement;
+  }
+
+  test('operator own message always scrolls to bottom regardless of scroll position', async () => {
+    const scrollTo = vi.fn();
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    HTMLElement.prototype.scrollTo = scrollTo;
+
+    try {
+      const el = await renderConversationPanel();
+
+      // Simulate user being far from the bottom (scrollHeight >> scrollTop + clientHeight).
+      const scrollContainer = el.querySelector('[class*="overflow-y-auto"]') as HTMLElement;
+      expect(scrollContainer).toBeTruthy();
+      Object.defineProperty(scrollContainer, 'scrollHeight', { configurable: true, get: () => 2000 });
+      Object.defineProperty(scrollContainer, 'scrollTop', { configurable: true, get: () => 0 });
+      Object.defineProperty(scrollContainer, 'clientHeight', { configurable: true, get: () => 400 });
+
+      scrollTo.mockClear();
+
+      // Type and send a message in conversation mode
+      const textarea = el.querySelector('textarea') as HTMLTextAreaElement;
+      expect(textarea).toBeTruthy();
+      const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')!.set!;
+      await act(async () => {
+        nativeSetter.call(textarea, 'My new message');
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      const sendBtn = el.querySelector('button[aria-label="Send message"]') as HTMLButtonElement;
+      expect(sendBtn).toBeTruthy();
+      await act(async () => { sendBtn.click(); });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 0)); });
+
+      // scrollTo must have been called (optimistic send always scrolls)
+      expect(scrollTo).toHaveBeenCalled();
+      const lastCall = scrollTo.mock.calls.at(-1);
+      expect(lastCall?.[0]).toMatchObject({ top: expect.any(Number) });
+    } finally {
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+    }
+  });
+
+  test('incoming message does not scroll when user is far from bottom', async () => {
+    let messageQueue = [[] as ReturnType<typeof makeMsg>[], [] as ReturnType<typeof makeMsg>[]];
+    (apiFetch as ReturnType<typeof vi.fn>).mockImplementation(async (url: unknown, init?: unknown) => {
+      const urlStr = String(url);
+      const method = (init as RequestInit | undefined)?.method ?? 'GET';
+      if (urlStr.includes('/api/admin/messages/last-seen') && method !== 'PUT') {
+        return new Response(JSON.stringify({ last_seen_at: null }), { status: 200 });
+      }
+      if (/\/api\/admin\/projects\/[^/]+\/strategic-session(?:\?|$)/.test(urlStr) && method === 'GET') {
+        const batch = messageQueue.shift() ?? [];
+        return new Response(JSON.stringify({
+          conversation: { limit: 20, has_more: false, order: 'oldest_first', items: batch },
+          recent_outputs: [], session: {}, status: 'unavailable', location: 'unavailable', status_reason: 'no_runner',
+        }), { status: 200 });
+      }
+      if (method === 'GET' && (
+        urlStr.includes('/api/admin/messages/noise-prefs') ||
+        urlStr.includes('/api/admin/messages/saved-views') ||
+        urlStr.includes('/api/admin/messages/temp-mutes') ||
+        urlStr.includes('/api/admin/messages/mute-window')
+      )) {
+        return new Response('', { status: 404 });
+      }
+      return new Response(JSON.stringify({}), { status: 200 });
+    });
+    // Second fetch returns one new agent message
+    messageQueue = [
+      [],
+      [makeMsg({ id: 'agent-reply', from_type: 'agent', message_type: 'NOTE', content: 'Agent reply' })],
+    ];
+
+    _suppressSinceLastVisit('test-user@example.com', 'proj-1');
+    host = document.createElement('div');
+    document.body.appendChild(host);
+    const r = createRoot(host);
+    root = r;
+    await act(async () => {
+      r.render(
+        <MessagesPanel selectedProjectId="proj-1" onClose={() => {}} addToast={() => {}} onMessageCountChange={() => {}} filterChrome="minimal" />,
+      );
+    });
+    await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+    const el = host as HTMLDivElement;
+
+    const scrollContainer = el.querySelector('[class*="overflow-y-auto"]') as HTMLElement;
+    expect(scrollContainer).toBeTruthy();
+    // Far from bottom: gap = 2000 - 0 - 400 = 1600 px >> 200 px threshold
+    Object.defineProperty(scrollContainer, 'scrollHeight', { configurable: true, get: () => 2000 });
+    Object.defineProperty(scrollContainer, 'scrollTop', { configurable: true, get: () => 0 });
+    Object.defineProperty(scrollContainer, 'clientHeight', { configurable: true, get: () => 400 });
+
+    const scrollTo = vi.fn();
+    const originalScrollTo = HTMLElement.prototype.scrollTo;
+    HTMLElement.prototype.scrollTo = scrollTo;
+
+    try {
+      scrollTo.mockClear();
+      // Trigger a re-render that delivers the new agent message (simulate polling)
+      await act(async () => {
+        r.render(
+          <MessagesPanel
+            selectedProjectId="proj-1"
+            onClose={() => {}}
+            addToast={() => {}}
+            onMessageCountChange={() => {}}
+            filterChrome="minimal"
+            realtimeRefreshSignal={Date.now()}
+          />,
+        );
+      });
+      await act(async () => { await new Promise<void>(res => setTimeout(res, 50)); });
+
+      // No scroll — user was far from bottom
+      expect(scrollTo).not.toHaveBeenCalled();
+    } finally {
+      HTMLElement.prototype.scrollTo = originalScrollTo;
+    }
+  });
+});
+
 // ── Feedback → direction conversion idempotency ───────────────────────────────
 // The operator can convert a FEEDBACK message into a steering direction. A
 // retried (or batch-replayed) conversion of the SAME message must reuse one

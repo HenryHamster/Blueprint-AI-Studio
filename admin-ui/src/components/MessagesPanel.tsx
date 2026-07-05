@@ -1333,12 +1333,16 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     void fetchMessages();
   }, [fetchMessages, realtimeRefreshSignal]);
 
-  // Auto-scroll to bottom only on initial load or when user sends a new message
-  // (new message = count increased AND user is near the bottom)
+  // Auto-scroll to bottom on initial load, when the operator sends their own
+  // message (optimistic send), or when a new message arrives while near bottom.
+  // Uses renderedConversationMessages (includes the optimistic bubble) so the
+  // operator's own just-sent message fires the scroll before the server round-trip.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
-    const currentCount = conversationMode ? conversationMessages.length : highSignalOpen.length + routineOpen.length + visibleResolved.length;
+    const currentCount = conversationMode
+      ? renderedConversationMessages.length
+      : highSignalOpen.length + routineOpen.length + visibleResolved.length;
     if (conversationMode && targetMessageId) {
       prevMessageCountRef.current = currentCount;
       return;
@@ -1348,15 +1352,18 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       // First load — jump to bottom instantly
       requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'instant' }));
     } else if (currentCount > prevMessageCountRef.current) {
-      // New message arrived — only scroll if user is already near bottom
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
+      // Operator's own just-sent message (optimistic bubble) — always scroll.
+      // For incoming messages use a generous threshold (200 px) to absorb mobile
+      // viewport shifts from the on-screen keyboard opening/closing.
+      const alwaysScroll = conversationMode && optimisticSend != null;
+      const nearBottom = alwaysScroll || el.scrollHeight - el.scrollTop - el.clientHeight < 200;
       if (nearBottom) {
         requestAnimationFrame(() => el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' }));
       }
     }
     // Don't scroll at all on polling refresh with same count — preserves position
     prevMessageCountRef.current = currentCount;
-  }, [conversationMode, conversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved]);
+  }, [conversationMode, renderedConversationMessages.length, highSignalOpen, routineOpen, targetMessageId, visibleResolved, optimisticSend]);
 
   // Keep the chat pinned to the live streaming preview as it grows — but only
   // when the operator is already near the bottom, so a deliberate scroll-up to
