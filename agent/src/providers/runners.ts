@@ -1287,7 +1287,7 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
               lastResultText = (obj as { result?: string }).result ?? '';
               sendLog(ws, `\n--- Result ---\n${lastResultText}\n`);
               const usage = (obj as { result?: string; usage?: Record<string, unknown> }).usage;
-              if (usage && typeof usage === 'object') {
+              if (!isNested && usage && typeof usage === 'object') {
                 const cacheCreationTokens = Number(usage.cache_creation_input_tokens ?? 0);
                 const cacheReadTokens = Number(usage.cache_read_input_tokens ?? 0);
                 const inputTokens = Number(usage.input_tokens ?? 0) + cacheCreationTokens + cacheReadTokens;

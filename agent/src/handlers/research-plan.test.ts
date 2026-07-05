@@ -119,6 +119,7 @@ const {
     'recordInitialOAuthAuthHash',
     'recordLlmCallStart',
     'recordLlmTokens',
+    'recordNumTurns',
     'recordToolUse',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
@@ -4283,5 +4284,56 @@ describe('normalizePlanSubtaskTypes', () => {
     expect(normalizePlanSubtaskTypes(noOp)).toBe(noOp);
     const weird = JSON.stringify({ findings: [] });
     expect(normalizePlanSubtaskTypes(weird)).toBe(weird);
+  });
+});
+
+// ── Byte-budget ratchet — plan and research prompts ─────────────────────────
+// These tests assert that the static template size of the plan and research
+// prompts stays within a known ceiling. With all dynamic sections mocked to
+// empty strings, any silent regrowth of the static template causes a failure.
+// To raise the ceiling intentionally, bump the constant below and document why.
+//
+// Ceilings are set at measured-size + ~20% headroom. A future PR that exceeds
+// the ceiling MUST bump the constant — silent growth is the bug we are catching.
+//
+// PLAN_PROMPT_BYTE_CEILING: measured 16 298 bytes on first landing; set to
+// 19 600 (≈20% headroom) so minor wording tweaks are absorbed without noise.
+//
+// RESEARCH_PROMPT_BYTE_CEILING: measured 25 505 bytes on first landing; set
+// to 31 000 (≈21% headroom) for the same reason.
+const PLAN_PROMPT_BYTE_CEILING = 19_600;
+const RESEARCH_PROMPT_BYTE_CEILING = 31_000;
+
+describe('research/plan prompt byte-budget ratchet', () => {
+  const RB_TASK_ID = 'rb-task-001';
+  const RB_GH_TOKEN = 'gh-token';
+  const RB_OWNER = 'owner';
+  const RB_REPO = 'repo';
+  const RB_WS = null;
+  const RB_STATUS_REF = () => ({ value: '' });
+  const RB_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const RB_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('plan prompt static bytes stay within ratchet ceiling', async () => {
+    await handlePlan(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+    expect(bytes, `plan prompt grew to ${bytes} bytes (ceiling: ${PLAN_PROMPT_BYTE_CEILING}). Bump PLAN_PROMPT_BYTE_CEILING in research-plan.test.ts if this is intentional.`).toBeLessThan(PLAN_PROMPT_BYTE_CEILING);
+  });
+
+  it('research prompt static bytes stay within ratchet ceiling', async () => {
+    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const bytes = Buffer.byteLength(prompt, 'utf8');
+    expect(bytes, `research prompt grew to ${bytes} bytes (ceiling: ${RESEARCH_PROMPT_BYTE_CEILING}). Bump RESEARCH_PROMPT_BYTE_CEILING in research-plan.test.ts if this is intentional.`).toBeLessThan(RESEARCH_PROMPT_BYTE_CEILING);
   });
 });

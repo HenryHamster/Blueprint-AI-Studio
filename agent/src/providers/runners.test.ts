@@ -78,6 +78,7 @@ import {
   getLastProviderRunErrorReport,
   _setLastProviderRunErrorReportForTesting,
 } from './runners.js';
+import { recordLlmTokens } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 
@@ -520,5 +521,38 @@ describe('providerAutoInjectsClaudeMd', () => {
   it('returns false for zai', async () => {
     const { providerAutoInjectsClaudeMd } = await import('./runners.js');
     expect(providerAutoInjectsClaudeMd('zai')).toBe(false);
+  });
+});
+
+describe('drainJsonChunks — recordLlmTokens nested guard', () => {
+  beforeEach(() => {
+    vi.mocked(recordLlmTokens).mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('calls recordLlmTokens for a top-level result event (no parent_tool_use_id)', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'result',
+        result: 'done',
+        usage: { input_tokens: 100, output_tokens: 50, cache_creation_input_tokens: 10, cache_read_input_tokens: 5 },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordLlmTokens)).toHaveBeenCalledOnce();
+    expect(vi.mocked(recordLlmTokens)).toHaveBeenCalledWith(115, 50, 10, 5);
+  });
+
+  it('does NOT call recordLlmTokens for a nested result event (parent_tool_use_id set)', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'result',
+        parent_tool_use_id: 'parent-id-1',
+        result: 'sub-agent done',
+        usage: { input_tokens: 100, output_tokens: 50 },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordLlmTokens)).not.toHaveBeenCalled();
   });
 });
