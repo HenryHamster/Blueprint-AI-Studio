@@ -24,11 +24,14 @@ fetch surface it sits beside (``agent_strategic_fetch.py``): the same
 ``_resolve_agent_project`` cross-project 404 semantics and the same 60/min rate
 limit. Mutations stay on the ``/api/agent/strategic`` POST surface.
 
-Registered under the same ``/api/agent`` prefix in ``app.main`` so the route
-path is byte-identical to what the agent poll helper expects. This is the
-cursor-poll LIST — distinct from the existing
-``GET /projects/{project_id}/messages/{ref}`` single-message resolver in
-``agent_strategic_fetch.py`` (different path: the ``/{ref}`` segment).
+Registered under the same ``/api/agent`` prefix in ``app.main`` and OWNS the
+bare ``GET /projects/{project_id}/messages`` path the agent poll helper expects.
+Two sibling routes in ``agent_strategic_fetch.py`` deliberately live on DISTINCT
+paths so nothing shadows this poll: the ``/messages/{ref}`` single-message
+resolver and the ``/messages/open`` compact recovery listing. (Historical note:
+the recovery listing briefly collided on bare ``/messages`` and, being included
+first in ``app.main``, silently shadowed this poll — resolved 2026-07-05 by
+moving the listing to ``/messages/open``.)
 """
 
 import logging

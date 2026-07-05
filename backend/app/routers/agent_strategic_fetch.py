@@ -279,7 +279,7 @@ async def agent_fetch_directions_list(
     return {"status": "success", "data": directions}
 
 
-@router.get("/projects/{project_id}/messages")
+@router.get("/projects/{project_id}/messages/open")
 @limiter.limit("60/minute")
 async def agent_fetch_open_messages_list(
     request: Request,
@@ -291,7 +291,14 @@ async def agent_fetch_open_messages_list(
     excerpt, status). Used as a recovery path when open_messages was dropped
     entirely under budget pressure so no message refs were shipped — the agent
     can call this with no id to see what messages exist, then pull a full
-    message with ``./fetch message <ref>``."""
+    message with ``./fetch message <ref>``.
+
+    Path is the ``/messages/open`` sub-collection, NOT bare ``/messages`` — the
+    latter is owned by the resident agent's cursor-poll list in
+    ``agent_strategic_messages.py`` (``{messages, server_time}``). Keeping this on
+    a distinct literal path avoids the route collision where this listing (being
+    included first in ``app.main``) silently shadowed that poll. Registered before
+    the ``/messages/{ref}`` resolver below so the literal ``open`` segment wins."""
     await _resolve_agent_project(project_id, token, session)
     rows = (
         (

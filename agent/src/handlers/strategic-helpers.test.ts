@@ -242,14 +242,15 @@ describe('writeStrategicHelpers', () => {
     const content = fs.readFileSync(`${testWorkspace}/fetch`, 'utf-8');
     // The new subcommand maps `fetch message [ref]` to the read-only lookup
     // endpoint that resolves a short ref or full UUID backend-side. When no ref
-    // is supplied it lists open messages (compact); ${ID:+/$ID} appends only when
-    // a ref is provided.
-    expect(content).toContain('message)    PATH_SUFFIX="messages${ID:+/$ID}"');
+    // is supplied it lists open messages (compact) via /messages/open;
+    // messages/${ID:-open} substitutes the ref when one is provided.
+    expect(content).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
     expect(content).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     // Reuses the existing X-Agent-Token GET path — no new auth/curl block.
     expect(content).toContain('-H "X-Agent-Token: $TOKEN"');
     // Both direction and message are excluded from the id-required guard: they
-    // support a no-id compact-listing mode (${ID:+/$ID} path suffix).
+    // support a no-id compact-listing mode (direction via ${ID:+/$ID};
+    // message via messages/${ID:-open}).
     expect(content).toContain('[ "$KIND" != "direction" ]');
     expect(content).toContain('[ "$KIND" != "message" ]');
     // The id-required guard still fires for verbs that do require an id.
@@ -464,7 +465,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     // Spot-check the load-bearing usage + case lines the strategic suite pins.
     expect(viaWriter).toContain('fetch problem-model|direction|playbook|gap|message|section|knowledge|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks [id]');
     expect(viaWriter).toContain('problem-model) PATH_SUFFIX="problem-model"');
-    expect(viaWriter).toContain('message)    PATH_SUFFIX="messages${ID:+/$ID}"');
+    expect(viaWriter).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
     expect(viaWriter).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(viaWriter).toContain('compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"');
     expect(viaWriter).toContain('version-phase) PATH_SUFFIX="version-phase"');
@@ -480,7 +481,7 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
     expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
     // Non-granted verbs have NO resolving branch (check both old and new literal forms).
     expect(content).not.toContain('PATH_SUFFIX="playbook/$ID"');
-    expect(content).not.toContain('PATH_SUFFIX="messages${ID:+/$ID}"');
+    expect(content).not.toContain('PATH_SUFFIX="messages/${ID:-open}"');
     expect(content).not.toContain('PATH_SUFFIX="design-doc/$ID"');
     // Usage line lists only the granted subset (canonical order; qualification last).
     expect(content).toContain('Usage: fetch problem-model|direction|gap|knowledge|qualification [id]');
@@ -509,12 +510,13 @@ describe('writeFetchHelper (verb-subset read-only fetch)', () => {
   it('different subsets bake different verb vocabularies (design-doc subset)', () => {
     writeFetchHelper('t', 'proj-3', testWorkspace, { verbs: DESIGN_DOC_FETCH_VERBS });
     const content = readFetch();
-    // direction and message use ${ID:+/$ID}: compact listing when called without an id.
+    // direction uses ${ID:+/$ID}; message uses messages/${ID:-open}: both give a
+    // compact listing when called without an id.
     expect(content).toContain('direction)  PATH_SUFFIX="directions${ID:+/$ID}"');
     expect(content).toContain('section)    PATH_SUFFIX="design-doc/$ID"');
     expect(content).toContain('playbook)   PATH_SUFFIX="playbook/$ID"');
     expect(content).toContain('gap)        PATH_SUFFIX="gaps/$ID"');
-    expect(content).toContain('message)    PATH_SUFFIX="messages${ID:+/$ID}"');
+    expect(content).toContain('message)    PATH_SUFFIX="messages/${ID:-open}"');
     expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
     // problem-model and qualification are rejected here because they are not part of the design-doc subset.
     expect(content).toContain('problem-model|compute-sweeps|qualification|version-phase|vm-cost|efficiency-snapshot|ci-compliance|capability-trials|sections|task|tasks) echo "Error: ./fetch \'$KIND\' is not permitted in this workspace (allowed: direction|playbook|gap|message|section|knowledge)."');

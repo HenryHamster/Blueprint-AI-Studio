@@ -104,13 +104,13 @@ describe('handleDesignDocUpdate', () => {
     if (!fetchCall) throw new Error('fetch helper script was not written');
     const content = fetchCall[1] as string;
     expect(content).toContain('Usage: fetch direction|playbook|gap|message|section|knowledge [id]');
-    expect(content).toContain('messages/$ID');
+    expect(content).toContain('messages/${ID:-open}');
     expect(content).toContain('design-doc/$ID');
 
     const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
     expect(prompt).toContain('MID-RUN FETCH (./fetch)');
     expect(prompt).toContain('`./fetch section <key>`');
-    expect(prompt).toContain('`./fetch message <ref>`');
+    expect(prompt).toContain('`./fetch message [ref]`');
   });
 
   it('reports COMPLETED when runClaudeCode exits 0 and project has design_doc pages', async () => {

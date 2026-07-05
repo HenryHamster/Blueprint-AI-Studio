@@ -2766,7 +2766,7 @@ async def test_open_messages_list_mode(
     )
     token = create_agent_token(str(task.id), task.vm_instance_id)
     res = await client.get(
-        f"/api/agent/projects/{project.id}/messages",
+        f"/api/agent/projects/{project.id}/messages/open",
         headers={"x-agent-token": token},
     )
     assert res.status_code == 200, res.text
