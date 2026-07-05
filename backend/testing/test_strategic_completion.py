@@ -1172,6 +1172,7 @@ class TestRecordRetiredDirectionMemory:
             "id": "d-abc",
             "text": "model gc garbage collection optimize performance",
             "gap_id": "g-model-gc",
+            "research_history": [{"prs_merged": 1}],
         }
         record_retired_direction_memory(vision, d, reason="strategic_retire")
         entries = vision["_recently_retired_directions"]
@@ -1183,6 +1184,10 @@ class TestRecordRetiredDirectionMemory:
         assert "model" in entry["text_tokens"]
         assert "gc" in entry["text_tokens"]
         assert "retired_at" in entry
+        assert entry["retired_outcome"] == {
+            "classification": "landed",
+            "metrics": {"cycles": 1, "prs_merged": 1},
+        }
 
     def test_records_entry_without_gap_id(self):
         vision: dict = {}
@@ -1191,6 +1196,17 @@ class TestRecordRetiredDirectionMemory:
         entry = vision["_recently_retired_directions"][0]
         assert "gap_id" not in entry
         assert entry["reason"] == "auto_completed"
+        assert entry["retired_outcome"]["classification"] == "success_evidence_met"
+
+    def test_records_abandoned_outcome_when_no_success_or_merge_signal(self):
+        vision: dict = {}
+        d = {"id": "d-stop", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["retired_outcome"] == {
+            "classification": "abandoned",
+            "metrics": {"cycles": 0, "prs_merged": 0},
+        }
 
     def test_fifo_eviction_at_cap(self):
         from app.strategic_completion import _RETIRED_MEMORY_CAP
@@ -1225,7 +1241,9 @@ class TestRecordRetiredDirectionMemory:
         vision: dict = {}
         d = {"id": "d-1", "text": "cache layer optimization database"}
         record_retired_direction_memory(vision, d, reason="strategic_retire")
-        assert "outcome" not in vision["_recently_retired_directions"][0]
+        entry = vision["_recently_retired_directions"][0]
+        assert "outcome" not in entry
+        assert "retired_outcome" in entry
 
     def test_records_bounded_outcome_when_provided(self):
         from app.strategic_completion import _RETIRED_OUTCOME_CHAR_CAP
@@ -1246,7 +1264,9 @@ class TestRecordRetiredDirectionMemory:
         record_retired_direction_memory(
             vision, d, reason="strategic_superseded", outcome="   "
         )
-        assert "outcome" not in vision["_recently_retired_directions"][0]
+        entry = vision["_recently_retired_directions"][0]
+        assert "outcome" not in entry
+        assert "retired_outcome" in entry
 
     def test_superseded_outcome_carries_successor_pointer(self):
         vision: dict = {}
@@ -1346,6 +1366,26 @@ class TestCheckGapRespawnBlock:
         )
         # cooldown_days=0 means cutoff = now, so even a 0-day-old entry is outside window
         assert reason is None
+
+
+def test_retired_grounding_classifier_handles_legacy_memory_entry():
+    from app.direction_referential_guard import build_retired_direction_grounding
+
+    grounding = build_retired_direction_grounding(
+        {
+            "id": "d-legacy",
+            "reason": "strategic_retire",
+            "cycles": 4,
+            "prs_merged": 0,
+        }
+    )
+
+    assert grounding == {
+        "direction_id": "d-legacy",
+        "classification": "abandoned",
+        "metrics": {"prs_merged": 0, "cycles": 4},
+        "reason": "strategic_retire",
+    }
 
 
 def test_strategic_refresh_rejects_same_gap_duplicate_direction():
@@ -4044,6 +4084,274 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
     assert verdict is not None
     assert verdict["status"] == "validated"
     assert verdict["live_direction_ids"] == ["d-grounded"]
+
+
+@pytest.mark.asyncio
+async def test_create_direction_attaches_landed_retired_outcome(db_session, mocker):
+    """Fallback create ops matching landed retired work carry prior outcome context."""
+    import json
+    from unittest.mock import AsyncMock
+    from app import strategic_cycle
+    from app.models import KnowledgeDocument, SourceKind
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.strategic_completion._runtime_config",
+        {"direction_gap_respawn_block_mode": "observe"},
+    )
+
+    retired_memory = [
+        {
+            "id": "d-landed",
+            "text_tokens": ["gpu", "runner", "lane", "verification"],
+            "retired_at": _utcnow().isoformat(),
+            "reason": "success_evidence_met",
+            "outcome": {
+                "classification": "landed",
+                "metrics": {"prs_merged": 2, "cycles": 3},
+            },
+        }
+    ]
+    project = Project(
+        name="RetiredOutcomeCreate",
+        user_id="u-retired-outcome",
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": retired_memory,
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "prompt": "retirement memo"}],
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+    memo = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+        title="Direction retired: GPU runner lane",
+        summary="GPU runner lane shipped and verified on automain.",
+        body="Retirement memo body",
+        topic="direction-retirement",
+        direction_id="d-landed",
+        tags=["direction-retirement"],
+    )
+    db_session.add(memo)
+    await db_session.commit()
+    await db_session.refresh(memo)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "_recently_retired_directions": retired_memory,
+            },
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Rebuild GPU runner lane verification coverage",
+                    "priority": "medium",
+                    "success_evidence": "Fresh verification is present",
+                    "retirement_condition": "Verification remains green",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "GPU runner lane" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    grounding = (created[0].get("context") or {}).get("retired_direction_grounding")
+    assert grounding == {
+        "direction_id": "d-landed",
+        "classification": "landed",
+        "metrics": {"prs_merged": 2, "cycles": 3},
+        "reason": "success_evidence_met",
+        "retirement_memo": {
+            "knowledge_doc_id": str(memo.id),
+            "summary": "GPU runner lane shipped and verified on automain.",
+        },
+    }
+    notes = [n.get("text", "") for n in created[0].get("notes", [])]
+    assert any("prior_outcome=landed" in n and "landed work" in n for n in notes)
+
+    await db_session.refresh(cycle)
+    meta = cycle.cycle_metadata or {}
+    created_id = created[0]["id"]
+    assert meta["created_retired_grounding"][created_id]["classification"] == "landed"
+
+
+@pytest.mark.asyncio
+async def test_create_direction_attaches_abandoned_retired_outcome(db_session, mocker):
+    """Fallback create ops matching non-landed retired work are marked abandoned."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch.dict(
+        "app.strategic_completion._runtime_config",
+        {"direction_gap_respawn_block_mode": "observe"},
+    )
+
+    retired_memory = [
+        {
+            "id": "d-abandoned",
+            "text_tokens": ["cache", "warming", "scheduler", "latency"],
+            "retired_at": _utcnow().isoformat(),
+            "reason": "strategic_retire",
+            "outcome": {
+                "classification": "abandoned",
+                "metrics": {"prs_merged": 0, "cycles": 5},
+            },
+        }
+    ]
+    project = Project(
+        name="AbandonedRetiredOutcomeCreate",
+        user_id="u-abandoned-outcome",
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": retired_memory,
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {
+                "purpose": "test",
+                "revision": 2,
+                "_recently_retired_directions": retired_memory,
+            },
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Retry cache warming scheduler latency improvements",
+                    "priority": "medium",
+                    "success_evidence": "Latency improves",
+                    "retirement_condition": "Scheduler stabilizes",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "cache warming" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    grounding = (created[0].get("context") or {}).get("retired_direction_grounding")
+    assert grounding["classification"] == "abandoned"
+    assert grounding["metrics"] == {"prs_merged": 0, "cycles": 5}
+    notes = [n.get("text", "") for n in created[0].get("notes", [])]
+    assert any("prior_outcome=abandoned" in n for n in notes)
+    assert not any("landed work" in n for n in notes)
+
+
+@pytest.mark.asyncio
+async def test_create_direction_without_retired_match_has_no_grounding(
+    db_session, mocker
+):
+    """Clean fallback creates remain unchanged when retired memory does not match."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NoRetiredOutcomeCreate",
+        user_id="u-no-retired-outcome",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "create_direction",
+                    "text": "Open a new retrieval evaluation lane",
+                    "priority": "medium",
+                    "success_evidence": "Evaluation lane reports results",
+                    "retirement_condition": "Retriever quality is measured",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    created = [
+        d for d in (project.directions or []) if "retrieval evaluation" in d.get("text", "")
+    ]
+    assert len(created) == 1
+    assert "retired_direction_grounding" not in (created[0].get("context") or {})
+    assert all(
+        "Grounding: matches retired direction" not in n.get("text", "")
+        for n in created[0].get("notes", [])
+    )
 
 
 @pytest.mark.asyncio

@@ -181,9 +181,11 @@ def _build_retired_directions_summary(
     # the live list. The lifecycle pass removes terminal directions from
     # project.directions, so directions retired a cycle ago are invisible to the
     # loop above. vision['_recently_retired_directions'] survives pruning and
-    # stores compact entries (id, text_tokens, retired_at, reason, gap_id).
-    # Adding them here ensures the agent sees cross-cycle retirements and can
-    # avoid re-proposing work for the same gaps.
+    # stores compact entries (id, text_tokens, retired_at, reason, gap_id,
+    # cycles, prs_merged). Adding them here ensures the agent sees cross-cycle
+    # retirements and can avoid re-proposing work for the same gaps. The outcome
+    # metrics (cycles, prs_merged) surface the actual result so re-proposals of
+    # landed or known-dead work can be detected.
     vision = project.vision or {}
     recently_retired_memory = vision.get("_recently_retired_directions") or []
     if recently_retired_memory and len(results) < max_count:
@@ -202,8 +204,8 @@ def _build_retired_directions_summary(
                 "id": entry_id,
                 "text": text[:200],
                 "status": "retired",
-                "cycles": 0,
-                "prs_merged": 0,
+                "cycles": mem_entry.get("cycles", 0),
+                "prs_merged": mem_entry.get("prs_merged", 0),
             }
             if mem_entry.get("reason"):
                 mem_result["retirement_reason"] = str(mem_entry["reason"])[:200]

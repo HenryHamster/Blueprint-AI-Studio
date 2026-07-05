@@ -27,7 +27,9 @@ from app.capability_trial_verdict import (
     carry_adoption_verdicts_for_consolidation,
     record_trial_verdict,
 )
+from app.direction_referential_guard import build_retired_direction_grounding
 from app.database import get_session
+from app.knowledge_query import fetch_retirement_memo
 from app.strategic_events import (
     STRATEGIC_KIND_DIRECTIONS,
     STRATEGIC_KIND_PROBLEM_MODEL,
@@ -71,6 +73,7 @@ from app.strategic_completion import (
     record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     challenge_approves_retirement,
+    find_gap_respawn_match,
     spawn_budget_status,
     spawn_title_is_redundant,
     strategic_retirement_challenge_gate_mode,
@@ -903,6 +906,52 @@ async def strategic_operation(
                 matched.get("status"),
                 project.id,
             )
+        retired_memory = list((project.vision or {}).get("_recently_retired_directions") or [])
+        retired_grounding: dict[str, Any] | None = None
+        _ret_match_raw = find_gap_respawn_match(
+            text,
+            str(data.get("gap_id") or "") or None,
+            retired_memory,
+            cooldown_days=90,
+        )
+        if _ret_match_raw is not None:
+            retired_match, retired_match_kind = _ret_match_raw
+            retirement_memo = None
+            retired_direction_id = str(retired_match.get("id") or "")
+            if retired_direction_id:
+                try:
+                    retirement_memo = await fetch_retirement_memo(
+                        session,
+                        project.id,
+                        retired_direction_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "[STRATEGIC] API path: failed to fetch retirement memo for recently-retired "
+                        "direction %s on project %s",
+                        retired_direction_id,
+                        project.id,
+                        exc_info=True,
+                    )
+            retired_grounding = build_retired_direction_grounding(
+                retired_match,
+                retirement_memo,
+            )
+            logger.info(
+                "[STRATEGIC] API path: direction '%s' matches recently-retired '%s' "
+                "(prior_outcome=%s, match=%s, memo=%s) — creating anyway (advisory; agent-owned set); "
+                "project=%s",
+                text[:60],
+                (retired_match.get("text") or retired_direction_id)[:60],
+                retired_grounding.get("classification"),
+                retired_match_kind,
+                (
+                    retired_grounding.get("retirement_memo", {}).get("knowledge_doc_id")
+                    if isinstance(retired_grounding.get("retirement_memo"), dict)
+                    else "none"
+                ),
+                project.id,
+            )
         success_evidence = str(data.get("success_evidence", "")).strip()
         retirement_condition = str(data.get("retirement_condition", "")).strip()
         if not success_evidence or not retirement_condition:
@@ -1134,6 +1183,8 @@ async def strategic_operation(
             "direction_id": new_dir["id"],
             "grounding_verdict": new_dir.get("context", {}).get("grounding_verdict"),
         }
+        if retired_grounding:
+            resp_body["retired_grounding"] = retired_grounding
         if staged_create:
             resp_body["staged_for_version"] = staged_for_version
         return _resp(resp_body)

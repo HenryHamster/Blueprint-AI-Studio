@@ -3481,3 +3481,29 @@ def test_retired_directions_summary_memory_respects_window():
     )
     result = _build_retired_directions_summary(project)
     assert result == []
+
+
+def test_retired_directions_summary_memory_surfaces_outcome():
+    """Memory-augmented entries surface cycles and prs_merged outcome metrics."""
+    project = _make_project(
+        directions=[],  # direction pruned from live list
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-pruned-with-merges",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                    "cycles": 5,
+                    "prs_merged": 3,
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["id"] == "d-pruned-with-merges"
+    assert entry["cycles"] == 5
+    assert entry["prs_merged"] == 3
+    assert entry["status"] == "retired"

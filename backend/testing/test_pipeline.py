@@ -1654,6 +1654,15 @@ def _patch_common_rollup_mocks(mocker):
             "empty_diff": False,
         },
     )
+    # The rollup auto-merge path now runs a module size-cap preflight that
+    # fetches the caps JSON and changed-file contents at the staging branch.
+    # Default to "ok" so the guard is a no-op; tests exercising breach cases
+    # override this.
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
 
 
 @pytest.mark.asyncio

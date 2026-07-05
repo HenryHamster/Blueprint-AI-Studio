@@ -108,6 +108,11 @@ _ROLLUP_PR_CREATE_CLAIM_TTL_S = 300
 # fix path rather than loop on a non-mechanical block.
 _ALEMBIC_AUTORECONCILE_CAP = 2
 
+# Bounded auto-bump attempts per rollup PR for assembled-tree module size
+# breaches. Two bumps covers the rare case where CI re-runs before the bump
+# commit propagates; beyond that we require manual approval rather than loop.
+_SIZE_CAP_AUTOBUMP_CAP = 2
+
 
 async def _attempt_alembic_autoreconcile(
     parent: Task,
@@ -2977,6 +2982,35 @@ async def _check_and_trigger_rollup(
                         promotion_target=promotion_target,
                     )
 
+                    # Check assembled-tree module size caps before auto-merge.
+                    # Two child PRs can each add lines to a capped file and pass
+                    # CI in isolation; the combined rollup may breach the cap.
+                    # Auto-bumps and commits the updated JSON so the next CI run
+                    # passes. Runs in this unlocked window (GitHub I/O).
+                    #
+                    # Pre-check the auto-bump budget BEFORE calling preflight so
+                    # that we never commit a cap bump when the budget is already
+                    # exhausted. preflight_rollup_size_caps returns "hold" when
+                    # commit_bump=False and a breach is detected, avoiding the
+                    # spurious commit that would otherwise happen before the
+                    # budget check in the "bumped" branch below.
+                    from app.rollup_size_preflight import preflight_rollup_size_caps
+                    _sb_pr_pre = parent_ctx.get("_size_cap_autobump_pr")
+                    _sb_count_pre = (
+                        int(parent_ctx.get("_size_cap_autobump_count", 0))
+                        if _sb_pr_pre == rollup_pr_number
+                        else 0
+                    )
+                    size_cap_status, size_cap_reason = await preflight_rollup_size_caps(
+                        gh_token,
+                        owner,
+                        repo,
+                        rollup_pr_number,
+                        staging_branch,
+                        project_id=str(project_id_local) if project_id_local else None,
+                        commit_bump=_sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP,
+                    )
+
                     # Re-acquire to apply mutations / dispatch alerts.
                     parent = await _relock_parent(
                         session,
@@ -3235,6 +3269,72 @@ async def _check_and_trigger_rollup(
                         logger.warning(
                             f"[ROLLUP] PR #{rollup_pr_number} blocked — invalid Alembic "
                             f"chain ({alembic_reason}) — held for approval, spawned re-chain fix"
+                        )
+                        return
+
+                    # Module size-cap preflight guard (parent is locked here).
+                    if size_cap_status == "defer":
+                        logger.info(
+                            f"[ROLLUP] Deferring auto-merge for PR #{rollup_pr_number} — "
+                            f"could not validate module size caps: {size_cap_reason}"
+                        )
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — size-cap check failed, "
+                            f"retrying next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        return
+                    if size_cap_status == "hold":
+                        _gates_on = _runtime_config.get("require_approval_gates", True)
+                        if _gates_on:
+                            parent.requires_approval = True
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} held — size-cap: "
+                            f"{size_cap_reason}"
+                        )[:500]
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                        }
+                        session.add(parent)
+                        await _dispatch_rollup_approval_alert(
+                            parent,
+                            session,
+                            f"Rollup PR #{rollup_pr_number} held — module size-cap: "
+                            f"{size_cap_reason}",
+                            pr_number=rollup_pr_number,
+                        )
+                        await session.commit()
+                        logger.warning(
+                            f"[ROLLUP] PR #{rollup_pr_number} held — size-cap "
+                            f"({size_cap_reason})"
+                        )
+                        return
+                    if size_cap_status == "bumped":
+                        # Cap was auto-bumped and committed to the staging branch.
+                        # Defer one sweep so CI re-runs with the updated JSON.
+                        # Budget was already pre-checked before calling preflight
+                        # (commit_bump=False when exhausted → "hold" instead of
+                        # "bumped"), so _sb_count_pre < _SIZE_CAP_AUTOBUMP_CAP here.
+                        parent.context = {
+                            **parent_ctx,
+                            "rollup_pr_url": rollup_pr_url,
+                            "rollup_pr_number": rollup_pr_number,
+                            "_size_cap_autobump_pr": rollup_pr_number,
+                            "_size_cap_autobump_count": _sb_count_pre + 1,
+                        }
+                        parent.latest_status_message = (
+                            f"Rollup PR #{rollup_pr_number} — auto-bumped module size "
+                            f"caps: {size_cap_reason}; re-validating next cycle"
+                        )[:500]
+                        session.add(parent)
+                        await session.commit()
+                        logger.info(
+                            f"[ROLLUP] PR #{rollup_pr_number} size-cap auto-bump "
+                            f"committed (attempt {_sb_count_pre + 1}/{_SIZE_CAP_AUTOBUMP_CAP}): "
+                            f"{size_cap_reason}"
                         )
                         return
 

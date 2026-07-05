@@ -111,6 +111,11 @@ def _mock_automerge_deps(mocker, *, pr_files, merge_merged=True):
         new_callable=AsyncMock,
         return_value=(MagicMock(id="fix-task-id"), True),
     )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
     return mock_merge, mock_spawn
 
 
@@ -185,6 +190,72 @@ async def test_rollup_guard_block_skips_auto_merge(cleanup_db, mocker):
     await cleanup_db.refresh(parent)
     assert parent.requires_approval is True
     assert "alembic" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_size_cap_breach_auto_bumped_defers(cleanup_db, mocker):
+    """Size-cap preflight returns 'bumped' → merge NOT called, autobump counter stamped."""
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+    )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("bumped", "models.py: 500 -> 750"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_with_pr(cleanup_db, project.id)
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_merge.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is False
+    assert parent.context.get("_size_cap_autobump_count") == 1
+    assert "auto-bumped" in (parent.latest_status_message or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_rollup_size_cap_breach_hold_when_cap_exhausted(cleanup_db, mocker):
+    """Size-cap autobump counter already at cap → merge NOT called, requires_approval set."""
+    mock_merge, _mock_spawn = _mock_automerge_deps(
+        mocker,
+        pr_files=_files("backend/app/models.py"),
+    )
+    mock_preflight = mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("hold", "auto-bump budget exhausted; breach: models.py: 500 -> 750"),
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    # Seed the parent context so the autobump counter is already at the cap (2).
+    # _make_rollup_parent_with_pr uses rollup_pr_number=4242.
+    parent = await _make_rollup_parent_with_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"_size_cap_autobump_count": 2, "_size_cap_autobump_pr": 4242},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    # Budget exhausted → preflight called with commit_bump=False
+    mock_preflight.assert_awaited_once()
+    _, preflight_kwargs = mock_preflight.call_args
+    assert preflight_kwargs.get("commit_bump") is False
+
+    mock_merge.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.requires_approval is True
+    assert "size" in (parent.latest_status_message or "").lower()
 
 
 @pytest.mark.asyncio

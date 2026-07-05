@@ -24,6 +24,10 @@ from app.direction_metrics import (
     proof_weighted_merged,
 )
 from app.direction_outcomes import credit_gate_merged_count, verified_merged_count
+from app.direction_referential_guard import (
+    build_retired_direction_grounding,
+    classify_retired_direction_outcome,
+)
 from app.direction_grounding import validate_create_direction_grounding
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
@@ -3111,6 +3115,16 @@ _RETIRED_TEXT_TOKEN_CAP = 20
 _RETIRED_OUTCOME_CHAR_CAP = 200
 
 
+def _retired_direction_outcome_metrics(direction: dict) -> dict[str, int]:
+    history = direction.get("research_history") or []
+    agg = direction.get("history_aggregate") or {}
+    total_cycles = len(history) + int(agg.get("total_cycles") or 0)
+    total_merged = sum(int(h.get("prs_merged", 0) or 0) for h in history) + int(
+        agg.get("total_prs_merged") or 0
+    )
+    return {"cycles": total_cycles, "prs_merged": total_merged}
+
+
 def record_retired_direction_memory(
     vision: dict,
     direction: dict,
@@ -3134,11 +3148,26 @@ def record_retired_direction_memory(
     tokens = list(
         set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     )[:_RETIRED_TEXT_TOKEN_CAP]
+
+    metrics = _retired_direction_outcome_metrics(direction)
+    classification = classify_retired_direction_outcome(
+        reason,
+        prs_merged=metrics["prs_merged"],
+    )
+
     entry: dict = {
         "id": direction.get("id", ""),
         "text_tokens": tokens,
         "retired_at": _utcnow().isoformat(),
         "reason": reason,
+        # Preserve legacy top-level metrics for older readers while placing the
+        # classified outcome in one compact object for new grounding consumers.
+        "cycles": metrics["cycles"],
+        "prs_merged": metrics["prs_merged"],
+        "retired_outcome": {
+            "classification": classification,
+            "metrics": metrics,
+        },
     }
     gap_id = direction.get("gap_id")
     if gap_id:
@@ -3164,23 +3193,95 @@ def _check_gap_respawn_block(
     Gate 2: text-token overlap >=4 (same threshold as _is_direction_duplicate).
     Returns None when no block applies.
     """
+    match = find_gap_respawn_match(
+        text,
+        new_gap_id,
+        retired_memory,
+        cooldown_days,
+    )
+    if match is None:
+        return None
+    mem_entry, match_kind = match
+    annotation = build_retired_direction_grounding(mem_entry)
+    return _format_retired_grounding_reason(
+        mem_entry,
+        match_kind=match_kind,
+        new_gap_id=new_gap_id,
+        grounding=annotation,
+    )
+
+
+def find_gap_respawn_match(
+    text: str,
+    new_gap_id: str | None,
+    retired_memory: list,
+    cooldown_days: float,
+) -> tuple[dict, str] | None:
     cooldown_cutoff = (_utcnow() - timedelta(days=cooldown_days)).isoformat()
     new_text_tokens = set(text.lower().split()) - _DIRECTION_DEDUP_STOPWORDS
     for mem_entry in retired_memory:
+        if not isinstance(mem_entry, dict):
+            continue
         if mem_entry.get("retired_at", "") < cooldown_cutoff:
             continue
         if new_gap_id and mem_entry.get("gap_id") == new_gap_id:
-            return (
-                f"gap {new_gap_id} was recently staffed by retired direction "
-                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
-            )
+            return mem_entry, "gap"
         mem_tokens = set(mem_entry.get("text_tokens") or [])
         if len(new_text_tokens & mem_tokens) >= 4:
-            return (
-                f"text overlaps recently-retired direction "
-                f"{mem_entry.get('id')} ({mem_entry.get('reason')})"
-            )
+            return mem_entry, "text"
     return None
+
+
+def _format_retired_grounding_reason(
+    mem_entry: dict,
+    *,
+    match_kind: str,
+    new_gap_id: str | None,
+    grounding: dict | None,
+) -> str:
+    direction_id = mem_entry.get("id")
+    reason = mem_entry.get("reason")
+    if match_kind == "gap":
+        prefix = (
+            f"gap {new_gap_id} was recently staffed by retired direction "
+            f"{direction_id}"
+        )
+    else:
+        prefix = f"text overlaps recently-retired direction {direction_id}"
+
+    classification = (grounding or {}).get("classification")
+    metrics = (grounding or {}).get("metrics") or {}
+    if classification in {"landed", "success_evidence_met"}:
+        outcome_label = (
+            "landed work"
+            if classification == "landed"
+            else "met success evidence"
+        )
+        return (
+            f"{prefix} whose prior outcome was {outcome_label} "
+            f"(prs_merged={metrics.get('prs_merged', 0)}, "
+            f"cycles={metrics.get('cycles', 0)}; {reason})"
+        )
+    return f"{prefix} ({reason})"
+
+
+def _retired_grounding_note(grounding: dict, block_reason: str) -> str:
+    classification = grounding.get("classification") or "unknown"
+    metrics = grounding.get("metrics") or {}
+    direction_id = grounding.get("direction_id") or "unknown"
+    note = (
+        "Grounding: matches retired direction "
+        f"{direction_id}; prior_outcome={classification}; "
+        f"prs_merged={metrics.get('prs_merged', 0)}, "
+        f"cycles={metrics.get('cycles', 0)}. {block_reason}"
+    )
+    memo = grounding.get("retirement_memo")
+    if isinstance(memo, dict) and memo.get("knowledge_doc_id"):
+        note += (
+            f" Retirement memo {memo.get('knowledge_doc_id')}: "
+            f"{str(memo.get('summary') or '')[:160]}"
+        )
+    return note
 
 
 async def _check_direction_starvation(
@@ -4359,6 +4460,7 @@ async def _handle_strategic_completion(
     created_ids_fb: list = []
     retired_ids_fb: list = []
     created_rationales_fb: Dict[str, str] = {}
+    created_retired_grounding_fb: dict[str, dict] = {}
     _pending_retire_memory: list = []
     # Rejected-proposal tombstones to persist into vision["rejected_proposals"]
     # after the op loop, via with_vision_locked() — same deferred-batch +
@@ -4457,12 +4559,46 @@ async def _handle_strategic_completion(
                 _retired_memory = list(
                     (project.vision or {}).get("_recently_retired_directions") or []
                 )
-                _gap_block_reason = _check_gap_respawn_block(
+                _retired_grounding: dict | None = None
+                _gap_block_reason = None
+                _gap_match = find_gap_respawn_match(
                     text,
                     op_entry.get("gap_id"),
                     _retired_memory,
                     _gap_respawn_cooldown_days,
                 )
+                if _gap_match is not None:
+                    _matched_retired_entry, _gap_match_kind = _gap_match
+                    _retirement_memo = None
+                    _retired_direction_id = str(
+                        _matched_retired_entry.get("id") or ""
+                    )
+                    if _retired_direction_id:
+                        try:
+                            from app.knowledge_query import fetch_retirement_memo
+
+                            _retirement_memo = await fetch_retirement_memo(
+                                session,
+                                project.id,
+                                _retired_direction_id,
+                            )
+                        except Exception:  # noqa: BLE001
+                            logger.warning(
+                                "[STRATEGIC] Task %s: failed to fetch retirement memo for %s",
+                                task.id,
+                                _retired_direction_id,
+                                exc_info=True,
+                            )
+                    _retired_grounding = build_retired_direction_grounding(
+                        _matched_retired_entry,
+                        _retirement_memo,
+                    )
+                    _gap_block_reason = _format_retired_grounding_reason(
+                        _matched_retired_entry,
+                        match_kind=_gap_match_kind,
+                        new_gap_id=op_entry.get("gap_id"),
+                        grounding=_retired_grounding,
+                    )
                 if _gap_block_reason:
                     logger.warning(
                         "[STRATEGIC] Task %s: create_direction '%s' blocked by recently-retired "
@@ -4520,6 +4656,19 @@ async def _handle_strategic_completion(
                         ]
                         if matched
                         else []
+                    )
+                    + (
+                        [
+                            {
+                                "text": _retired_grounding_note(
+                                    _retired_grounding,
+                                    _gap_block_reason or "",
+                                ),
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        ]
+                        if _retired_grounding
+                        else []
                     ),
                     "research_history": [],
                     "context": {
@@ -4527,6 +4676,10 @@ async def _handle_strategic_completion(
                         "retirement_condition": retirement_condition[:_DIR_FIELD_MAX],
                     },
                 }
+                if _retired_grounding:
+                    new_dir["context"]["retired_direction_grounding"] = (
+                        _retired_grounding
+                    )
                 impl_constraints = str(
                     op_entry.get("implementation_constraints", "")
                 ).strip()
@@ -4634,6 +4787,8 @@ async def _handle_strategic_completion(
                     created_rationales_fb[new_dir["id"]] = rationale[
                         :_RATIONALE_PERSIST_MAX
                     ]
+                if _retired_grounding:
+                    created_retired_grounding_fb[new_dir["id"]] = _retired_grounding
                 logger.info(
                     f"[STRATEGIC] Created direction '{text[:60]}' for project {project.id}"
                 )
@@ -5355,6 +5510,10 @@ async def _handle_strategic_completion(
                     project, retired_ids_fb
                 ),
             }
+            if created_retired_grounding_fb:
+                _fb_extra["created_retired_grounding"] = dict(
+                    created_retired_grounding_fb
+                )
             _fb_critiques = parsed.get("retired_direction_critiques")
             if _fb_critiques is not None:
                 _fb_extra["retirement_critiques"] = _fb_critiques

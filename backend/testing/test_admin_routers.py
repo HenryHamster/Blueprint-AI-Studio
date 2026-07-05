@@ -8,6 +8,7 @@ Tests for admin routers:
 """
 
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -19197,6 +19198,180 @@ async def test_update_direction_revival_attaches_prior_outcome(client: AsyncClie
 
 
 @pytest.mark.asyncio
+async def test_create_direction_endpoint_surfaces_prior_retired_outcome(
+    client: AsyncClient, db_session, caplog
+):
+    from app import strategic_cycle
+    from app.auth import create_agent_token
+    from app.models import KnowledgeDocument, SourceKind
+
+    retired_memory = [
+        {
+            "id": "d-landed",
+            "text_tokens": ["gpu", "runner", "lane", "verification"],
+            "retired_at": _utcnow().isoformat(),
+            "reason": "success_evidence_met",
+            "outcome": {
+                "classification": "landed",
+                "metrics": {"prs_merged": 2, "cycles": 3},
+            },
+        }
+    ]
+    project = Project(
+        name="Retired Grounding",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": retired_memory,
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+
+    source_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "memo", "prompt": "retirement memo"}],
+        context={},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(source_task)
+
+    memo = KnowledgeDocument(
+        project_id=project.id,
+        source_task_id=source_task.id,
+        source_kind=SourceKind.DIRECTION_RETIREMENT.value,
+        title="Direction retired: GPU runner lane",
+        summary="GPU runner lane shipped and verified on automain.",
+        body="Retirement memo body",
+        topic="direction-retirement",
+        direction_id="d-landed",
+        tags=["direction-retirement"],
+    )
+    db_session.add(memo)
+    await db_session.commit()
+    await db_session.refresh(memo)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-retired-grounding",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-retired-grounding", task_type="strategic_review"
+    )
+    with caplog.at_level(logging.INFO, logger="app.routers.admin_agent_ops"):
+        resp = await client.post(
+            "/api/agent/strategic",
+            json={
+                "task_id": str(task.id),
+                "op": "create_direction",
+                "data": {
+                    "text": "GPU runner lane verification with stable release gates",
+                    "priority": "medium",
+                    "rationale": "recreate the retired lane with updated constraints",
+                    "success_evidence": "Verification is present",
+                    "retirement_condition": "No open GPU runner incidents",
+                },
+            },
+            headers={"x-agent-token": token},
+        )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "create_direction"
+    assert body["direction_id"]
+    assert body["retired_grounding"] == {
+        "direction_id": "d-landed",
+        "classification": "landed",
+        "metrics": {"prs_merged": 2, "cycles": 3},
+        "reason": "success_evidence_met",
+        "retirement_memo": {
+            "knowledge_doc_id": str(memo.id),
+            "summary": "GPU runner lane shipped and verified on automain.",
+        },
+    }
+    assert any(
+        "matches recently-retired" in record.message
+        and "prior_outcome=landed" in record.message
+        and str(memo.id) in record.message
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_direction_endpoint_without_retired_match_has_unchanged_shape(
+    client: AsyncClient, db_session
+):
+    from app.auth import create_agent_token
+    from app import strategic_cycle
+
+    project = Project(
+        name="No Retired Grounding",
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-no-retired-grounding",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-no-retired-grounding", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Launch a new telemetry lane",
+                "priority": "high",
+                "rationale": "expand instrumentation coverage",
+                "success_evidence": "Telemetry is visible",
+                "retirement_condition": "Telemetry remains stable",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "retired_grounding" not in body
+    assert set(body) == {"status", "op", "direction_id"}
+
+
+@pytest.mark.asyncio
 async def test_strategic_create_message_rejects_oversized_context(
     client: AsyncClient, db_session
 ):
@@ -24176,3 +24351,242 @@ class TestTaskPayloadSecretRedaction:
         assert payload["base_branch"] == "main"
         assert "SUPER-SECRET-REGISTRY-PW" not in resp.text
         assert "hf_SECRET_ENV_TOKEN" not in resp.text
+
+
+# ---------------------------------------------------------------------------
+# create_direction: retired-outcome grounding surfaced in response
+# ---------------------------------------------------------------------------
+
+def _make_retired_memory_entry(
+    direction_id: str,
+    text_tokens: list,
+    *,
+    classification: str = "success_evidence_met",
+    prs_merged: int = 3,
+    cycles: int = 4,
+) -> dict:
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return {
+        "id": direction_id,
+        "text_tokens": text_tokens,
+        "reason": "Success evidence met: webhook reliability confirmed",
+        "retired_at": (now - datetime.timedelta(days=10)).isoformat(),
+        "outcome": {"classification": classification},
+        "metrics": {"prs_merged": prs_merged, "cycles": cycles},
+    }
+
+
+async def _make_strategic_task_for_project(db_session, project):
+    from app import strategic_cycle
+    from app.models import Task, TaskStatus
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-retired-grounding-test",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_create_direction_endpoint_surfaces_prior_retired_outcome_with_mocked_memo(
+    client: AsyncClient, db_session, mocker
+):
+    """Creating a direction whose text overlaps a recently-retired direction
+    returns 200 (not blocked) AND includes retired_grounding in the response."""
+    from app.auth import create_agent_token
+
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock())
+    # Retired memory entry whose text_tokens overlap the new direction text
+    retired_entry = _make_retired_memory_entry(
+        "d-retired001",
+        ["stabilize", "billing", "webhooks", "reliability"],
+        classification="success_evidence_met",
+        prs_merged=3,
+    )
+    project = Project(
+        name="Retired Grounding Test",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": [retired_entry],
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_strategic_task_for_project(db_session, project)
+    token = create_agent_token(
+        str(task.id), "vm-retired-grounding-test", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # Mock fetch_retirement_memo to avoid DB knowledge-doc dependency
+    mocker.patch(
+        "app.knowledge_query.fetch_retirement_memo",
+        new=AsyncMock(return_value=None),
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Stabilize billing webhooks for reliability",
+                "priority": "high",
+                "success_evidence": "Webhook retries are verified end-to-end",
+                "retirement_condition": "No open webhook incidents for 30 days",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    # Direction was created
+    assert body["status"] == "ok"
+    assert body["op"] == "create_direction"
+    assert "direction_id" in body
+    # Prior-outcome grounding is attached
+    assert "retired_grounding" in body, f"Expected retired_grounding in response; got: {body}"
+    grounding = body["retired_grounding"]
+    assert grounding["direction_id"] == "d-retired001"
+    assert grounding["classification"] == "success_evidence_met"
+    assert grounding["metrics"]["prs_merged"] == 3
+
+
+@pytest.mark.asyncio
+async def test_create_direction_no_retired_match_omits_grounding_field(
+    client: AsyncClient, db_session, mocker
+):
+    """Creating a direction with no retired-memory match returns the
+    unchanged response shape — no retired_grounding field."""
+    from app.auth import create_agent_token
+
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock())
+    # Retired entry with disjoint text_tokens so no match
+    retired_entry = _make_retired_memory_entry(
+        "d-retired002",
+        ["totally", "unrelated", "archived", "initiative"],
+        classification="abandoned",
+    )
+    project = Project(
+        name="No Retired Match Test",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": [retired_entry],
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_strategic_task_for_project(db_session, project)
+    token = create_agent_token(
+        str(task.id), "vm-retired-grounding-test", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Ship new onboarding experience for first-time users",
+                "priority": "medium",
+                "success_evidence": "Funnel conversion measured and improved",
+                "retirement_condition": "Onboarding KPIs stable for 2 weeks",
+            },
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "create_direction"
+    assert "direction_id" in body
+    # No match → no retired_grounding field
+    assert "retired_grounding" not in body, f"Unexpected retired_grounding: {body}"
+
+
+@pytest.mark.asyncio
+async def test_create_direction_retired_match_does_not_block(
+    client: AsyncClient, db_session, mocker
+):
+    """Advisory grounding must never hard-block the create — direction is
+    created successfully even with a landed retired match."""
+    from app.auth import create_agent_token
+
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock())
+    # Strong overlap with a landed direction
+    retired_entry = _make_retired_memory_entry(
+        "d-retired003",
+        ["improve", "test", "coverage", "backend", "unit"],
+        classification="landed",
+        prs_merged=5,
+    )
+    project = Project(
+        name="No Block Test",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": [retired_entry],
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_strategic_task_for_project(db_session, project)
+    token = create_agent_token(
+        str(task.id), "vm-retired-grounding-test", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    mocker.patch(
+        "app.knowledge_query.fetch_retirement_memo",
+        new=AsyncMock(return_value=None),
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Improve test coverage for backend unit tests",
+                "priority": "low",
+                "success_evidence": "Coverage above 80%",
+                "retirement_condition": "Coverage threshold met",
+            },
+        },
+        headers=headers,
+    )
+    # Must succeed, not be blocked
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert "direction_id" in body
+    # Grounding attached (landed match)
+    assert "retired_grounding" in body
+    assert body["retired_grounding"]["classification"] == "landed"

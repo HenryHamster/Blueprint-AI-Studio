@@ -670,6 +670,40 @@ async def fetch_direction_knowledge_index(
     return by_dir
 
 
+async def fetch_retirement_memo(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_id: str,
+    *,
+    summary_chars: int = _KNOWLEDGE_INDEX_SUMMARY_CHARS,
+) -> dict[str, str] | None:
+    """Return the latest retirement memo knowledge row for a direction.
+
+    Retirement memos are best-effort: dedup windows and sparse retire context
+    mean a matching row may not exist, so callers should treat ``None`` as a
+    normal absence rather than a grounding failure.
+    """
+    if not direction_id:
+        return None
+    stmt = (
+        select(KnowledgeDocument)
+        .where(
+            KnowledgeDocument.project_id == project_id,
+            KnowledgeDocument.direction_id == direction_id,
+            KnowledgeDocument.source_kind == SourceKind.DIRECTION_RETIREMENT.value,
+        )
+        .order_by(KnowledgeDocument.created_at.desc())
+        .limit(1)
+    )
+    doc = (await session.execute(stmt)).scalars().first()
+    if doc is None:
+        return None
+    return {
+        "id": str(doc.id),
+        "summary": (doc.summary or "")[:summary_chars],
+    }
+
+
 async def get_knowledge_document(
     session: AsyncSession,
     project_id: uuid.UUID,
