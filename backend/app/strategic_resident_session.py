@@ -1298,6 +1298,15 @@ async def start_resident_session(
             )
             await session.commit()
     except Exception:
+        # Snapshot the project id into a plain local BEFORE the rollback below.
+        # ``session.rollback()`` expires EVERY ORM attribute on ``project`` (this
+        # happens even under ``expire_on_commit=False``), so a later ``project.id``
+        # read would trigger a sync lazy-load in async context and raise
+        # ``MissingGreenlet`` — masking the real failure and leaking a half-
+        # compensated start. Every post-rollback use below reads this snapshot,
+        # never the (now-expired) ORM attribute. (``session_id`` and
+        # ``spawned_task_id`` are already plain locals captured before the rollback.)
+        project_id = project.id
         # Log the ORIGINAL failure (with traceback) FIRST, before any
         # compensation — so the true cause is visible next time even if the
         # caller session is poisoned and its own rollback trips over the dead
@@ -1308,7 +1317,7 @@ async def start_resident_session(
         logger.exception(
             "[RESIDENT_SESSION] start failed for project %s (session %s); "
             "compensating on a fresh session",
-            project.id,
+            project_id,
             session_id,
         )
         # Best-effort caller-session rollback so its connection is returned
@@ -1321,11 +1330,11 @@ async def start_resident_session(
             logger.warning(
                 "[RESIDENT_SESSION] caller-session rollback failed during start "
                 "compensation for project %s (continuing on a fresh session)",
-                project.id,
+                project_id,
                 exc_info=True,
             )
         await _release_start_claim(
-            project.id, session_id, spawned_task_id, session_factory=session_factory
+            project_id, session_id, spawned_task_id, session_factory=session_factory
         )
         raise
 
@@ -1493,6 +1502,14 @@ async def sync_resident_session_for_interaction_mode(
 
     factory = session_factory or AsyncSessionLocal
 
+    # Snapshot the project id into a plain local BEFORE the rollback below. The
+    # rollback intentionally expires the caller's cached ORM ``project`` (so the
+    # endpoint's trailing read reloads the freshly-committed state), but that also
+    # means any ``project.id`` read AFTER it would trigger a sync lazy-load in
+    # async context → ``MissingGreenlet``. Every post-rollback use in this function
+    # reads this plain snapshot, never the (now-expired) ORM attribute.
+    project_id = project.id
+
     # Release the caller session's transaction / expire its cached ``project`` so
     # (a) the shared single-connection test pool is free for the dedicated session
     # below, and (b) the endpoint's trailing read reloads the freshly-committed
@@ -1505,14 +1522,14 @@ async def sync_resident_session_for_interaction_mode(
         logger.warning(
             "[RESIDENT_SESSION] caller-session rollback before sync failed for "
             "project %s (continuing on a dedicated session)",
-            project.id,
+            project_id,
             exc_info=True,
         )
 
     try:
         if entered:
             return await _auto_start_on_workday_entry(
-                project.id,
+                project_id,
                 operator_user_id=operator_user_id,
                 session_factory=factory,
             )
@@ -1521,7 +1538,7 @@ async def sync_resident_session_for_interaction_mode(
         # clear any recorded reason, on a dedicated session.
         try:
             async with factory() as fresh:
-                fresh_project = await fresh.get(Project, project.id)
+                fresh_project = await fresh.get(Project, project_id)
                 if fresh_project is not None:
                     await stop_resident_session(
                         fresh, fresh_project, operator_user_id=operator_user_id
@@ -1529,11 +1546,11 @@ async def sync_resident_session_for_interaction_mode(
         except Exception:
             logger.warning(
                 "[RESIDENT_SESSION] auto-stop on Workday exit failed for project %s",
-                project.id,
+                project_id,
                 exc_info=True,
             )
         await _record_blocked_reason_isolated(
-            project.id, None, session_factory=factory
+            project_id, None, session_factory=factory
         )
         return None
     except Exception:
@@ -1542,7 +1559,7 @@ async def sync_resident_session_for_interaction_mode(
         logger.warning(
             "[RESIDENT_SESSION] sync for interaction_mode change failed for "
             "project %s",
-            project.id,
+            project_id,
             exc_info=True,
         )
         return None

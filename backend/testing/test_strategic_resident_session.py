@@ -1242,6 +1242,82 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
     assert read_resident_session(vision) is None
 
 
+@pytest.mark.asyncio
+async def test_start_compensation_receives_plain_snapshotted_project_id(
+    db_session, monkeypatch
+):
+    """WI-7: start-failure compensation must receive a PLAIN id value snapshotted
+    before ``session.rollback()`` — it must never re-read the (post-rollback)
+    ``project.id`` ORM attribute.
+
+    The ``except`` block's ``session.rollback()`` expires ``project``'s ORM
+    attributes; under asyncpg a subsequent ``project.id`` read emits a sync
+    lazy-load in an async context → ``MissingGreenlet`` (the ~1-2/hr prod wedge).
+    A full fault repro is impractical on the SQLite harness (it retains the PK
+    through the rollback and services any re-load on the single shared connection
+    instead of raising), so this test locks the observable contract the fix
+    guarantees: compensation (``_release_start_claim``) is handed the correct,
+    concrete ``uuid.UUID`` and runs to completion (claim cleared). The sibling
+    ``test_sync_resident_snapshots_project_id_before_rollback`` is the true
+    fault-injecting guard for the same snapshot-before-rollback discipline.
+    """
+    project = await _make_project_with_member(db_session)  # no live strategic task
+    await _make_live_local_runner(db_session, project)
+    # Snapshot the expected id while ``project`` is still loaded (before the run).
+    expected_id = project.id
+
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
+        t = Task(
+            project_id=proj.id,
+            title="spawned resident",
+            payloads=[{"type": "strategic_review"}],
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="agent-vm-spawned",
+            created_by="ORCHESTRATOR",
+        )
+        session.add(t)
+        await session.commit()
+        await session.refresh(t)
+        return t
+
+    async def boom(*args, **kwargs):
+        raise RuntimeError("finalize boom")
+
+    monkeypatch.setattr(srs, "_spawn_resident_strategic_task", fake_spawn)
+    monkeypatch.setattr(srs, "persist_strategic_workbench_update", boom)
+
+    captured: dict = {}
+    real_release = srs._release_start_claim
+
+    async def spy_release(
+        project_id, session_id, spawned_task_id, *, session_factory=None
+    ):
+        captured["project_id"] = project_id
+        return await real_release(
+            project_id, session_id, spawned_task_id, session_factory=session_factory
+        )
+
+    monkeypatch.setattr(srs, "_release_start_claim", spy_release)
+
+    factory = _dedicated_session_factory(db_session)
+    with pytest.raises(RuntimeError):
+        await start_resident_session(
+            db_session,
+            project,
+            operator_user_id=TEST_USER_ID,
+            session_factory=factory,
+        )
+
+    # Compensation ran and received the pre-rollback SNAPSHOT of the id: correct
+    # value, concrete uuid.UUID (same plain type — not a coroutine/deferred).
+    assert captured, "compensation (_release_start_claim) was never invoked"
+    assert captured["project_id"] == expected_id
+    assert type(captured["project_id"]) is type(expected_id)
+    # Claim actually cleared → compensation completed (not aborted mid-way).
+    vision = await _fresh_vision(factory, project.id)
+    assert read_resident_session(vision) is None
+
+
 # ---------------------------------------------------------------------------
 # Workday is the on-switch: auto start/stop the resident session on an
 # interaction_mode change (sync_resident_session_for_interaction_mode).
@@ -1277,6 +1353,91 @@ async def test_sync_auto_starts_on_enter_continuous(
     assert resident_session_is_active(read_resident_session(vision))
     # No blocked-reason recorded when the auto-start succeeds.
     assert read_resident_session_blocked_reason(vision) is None
+
+
+@pytest.mark.asyncio
+async def test_sync_resident_snapshots_project_id_before_rollback(
+    db_session, enable_strategic_session_flag, monkeypatch
+):
+    """WI-7 regression (true fault-injecting guard): the interaction-mode sync
+    snapshots ``project.id`` BEFORE its up-front ``session.rollback()`` and never
+    re-reads the (post-rollback) ORM attribute.
+
+    ``sync_resident_session_for_interaction_mode`` only ever reads ``project.id``
+    (it never ``refresh``-es or ``add``-s the instance), so this passes a proxy
+    whose ``.id`` starts delegating to the real id and, once the rollback fires,
+    raises ``MissingGreenlet`` — exactly what asyncpg does when the code lazy-reads
+    an expired attribute after a rollback in an async context. This faithfully
+    reproduces the prod fault the SQLite harness cannot (it retains the PK and
+    services re-loads silently).
+
+    With the fix (id snapshotted before the rollback) the sync passes the plain
+    snapshot to ``_auto_start_on_workday_entry`` and succeeds → active snapshot.
+    On the PRE-FIX code the post-rollback ``project.id`` read raises inside the
+    ``try`` and the whole sync is swallowed to ``None`` (a silently wedged auto-
+    start) — so this assertion fails, catching the regression.
+    """
+    from sqlalchemy.exc import MissingGreenlet
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+
+    class _ProjectIdPoisonAfterRollback:
+        """Delegates ``.id`` to the real project until the caller rolls back;
+        after that a ``.id`` read raises ``MissingGreenlet`` (mimics asyncpg's
+        post-rollback expired-attribute lazy-load in an async context)."""
+
+        def __init__(self, real_id):
+            self._real_id = real_id
+            self._rolled_back = False
+
+        @property
+        def id(self):
+            if self._rolled_back:
+                raise MissingGreenlet(
+                    "simulated post-rollback lazy-load of an expired attribute"
+                )
+            return self._real_id
+
+    proxy = _ProjectIdPoisonAfterRollback(project.id)
+
+    real_rollback = db_session.rollback
+
+    async def rollback_then_poison(*args, **kwargs):
+        await real_rollback(*args, **kwargs)
+        proxy._rolled_back = True
+
+    monkeypatch.setattr(db_session, "rollback", rollback_then_poison)
+
+    captured: dict = {}
+    real_auto_start = srs._auto_start_on_workday_entry
+
+    async def spy_auto_start(project_id, *, operator_user_id, session_factory):
+        captured["project_id"] = project_id
+        return await real_auto_start(
+            project_id,
+            operator_user_id=operator_user_id,
+            session_factory=session_factory,
+        )
+
+    monkeypatch.setattr(srs, "_auto_start_on_workday_entry", spy_auto_start)
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        proxy,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+
+    # Fix present: the pre-rollback snapshot let the auto-start run to success.
+    assert snapshot is not None and snapshot["status"] == "active"
+    assert captured, "auto-start hand-off was never reached (post-rollback read?)"
+    assert captured["project_id"] == proxy._real_id
+    assert type(captured["project_id"]) is type(proxy._real_id)
 
 
 @pytest.mark.asyncio
