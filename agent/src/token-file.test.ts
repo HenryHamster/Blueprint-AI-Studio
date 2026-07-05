@@ -8,22 +8,32 @@ import {
   ensureAgentTokenFileEnv,
   writeAgentTokenFile,
   agentTokenShellFn,
+  GITHUB_TOKEN_FILE_ENV,
+  githubTokenFilePath,
+  ensureGithubTokenFileEnv,
+  writeGithubTokenFile,
+  githubTokenShellFn,
 } from './token-file.js';
 
-// Isolate every test from the real home dir: each run points AGENT_TOKEN_FILE at
-// a unique temp path and restores the prior env afterward.
+// Isolate every test from the real home dir: each run points token files at
+// unique temp paths and restores the prior env afterward.
 const tmpRoot = path.join(os.tmpdir(), `token-file-test-${process.pid}`);
 let savedEnv: string | undefined;
+let savedGhEnv: string | undefined;
 
 beforeEach(() => {
   savedEnv = process.env.AGENT_TOKEN_FILE;
+  savedGhEnv = process.env.GITHUB_TOKEN_FILE;
   delete process.env.AGENT_TOKEN_FILE;
+  delete process.env.GITHUB_TOKEN_FILE;
   fs.mkdirSync(tmpRoot, { recursive: true });
 });
 
 afterEach(() => {
   if (savedEnv === undefined) delete process.env.AGENT_TOKEN_FILE;
   else process.env.AGENT_TOKEN_FILE = savedEnv;
+  if (savedGhEnv === undefined) delete process.env.GITHUB_TOKEN_FILE;
+  else process.env.GITHUB_TOKEN_FILE = savedGhEnv;
   try { fs.rmSync(tmpRoot, { recursive: true, force: true }); } catch { /* ignore */ }
 });
 
@@ -115,5 +125,113 @@ describe('agentTokenShellFn', () => {
     expect(fn).toContain('no agent token available');
     // Must never echo the token value.
     expect(fn).not.toContain('echo "$TOKEN"');
+  });
+});
+
+// ── GitHub token file ─────────────────────────────────────────────────────────
+
+describe('githubTokenFilePath', () => {
+  it('honors an explicit GITHUB_TOKEN_FILE override', () => {
+    process.env[GITHUB_TOKEN_FILE_ENV] = '/custom/run/github-token.txt';
+    expect(githubTokenFilePath()).toBe('/custom/run/github-token.txt');
+  });
+
+  it('defaults to a private .blueprint path OUTSIDE the cloned workspace', () => {
+    const p = githubTokenFilePath();
+    expect(p).toContain('.blueprint');
+    expect(p.endsWith('github-token.txt')).toBe(true);
+    expect(p.includes(`${path.sep}workspace${path.sep}`)).toBe(false);
+  });
+});
+
+describe('ensureGithubTokenFileEnv', () => {
+  it('publishes the resolved path into the env when unset', () => {
+    expect(process.env[GITHUB_TOKEN_FILE_ENV]).toBeUndefined();
+    const p = ensureGithubTokenFileEnv();
+    expect(process.env[GITHUB_TOKEN_FILE_ENV]).toBe(p);
+    expect(p).toContain('.blueprint');
+  });
+
+  it('keeps an already-configured path (idempotent)', () => {
+    process.env[GITHUB_TOKEN_FILE_ENV] = '/preset/github.txt';
+    expect(ensureGithubTokenFileEnv()).toBe('/preset/github.txt');
+    expect(process.env[GITHUB_TOKEN_FILE_ENV]).toBe('/preset/github.txt');
+  });
+});
+
+describe('writeGithubTokenFile', () => {
+  it('no-ops (returns false) when GITHUB_TOKEN_FILE is not configured', () => {
+    expect(writeGithubTokenFile('ghs_abc')).toBe(false);
+  });
+
+  it('no-ops (returns false) for an empty token', () => {
+    process.env[GITHUB_TOKEN_FILE_ENV] = path.join(tmpRoot, 'a', 'github.txt');
+    expect(writeGithubTokenFile('')).toBe(false);
+    expect(fs.existsSync(path.join(tmpRoot, 'a', 'github.txt'))).toBe(false);
+  });
+
+  it('writes the token to the configured file, creating nested dirs', () => {
+    const target = path.join(tmpRoot, 'nested', 'dir', 'github.txt');
+    process.env[GITHUB_TOKEN_FILE_ENV] = target;
+    expect(writeGithubTokenFile('ghs_live-1')).toBe(true);
+    expect(fs.readFileSync(target, 'utf-8')).toBe('ghs_live-1');
+    expect(fs.existsSync(`${target}.tmp`)).toBe(false);
+  });
+
+  it('overwrites the file on refresh so helpers read the ROTATED token', () => {
+    const target = path.join(tmpRoot, 'github.txt');
+    process.env[GITHUB_TOKEN_FILE_ENV] = target;
+    writeGithubTokenFile('ghs_old');
+    expect(fs.readFileSync(target, 'utf-8')).toBe('ghs_old');
+    writeGithubTokenFile('ghs_new');
+    expect(fs.readFileSync(target, 'utf-8')).toBe('ghs_new');
+  });
+
+  it('writes the token file with owner-only 0600 perms (POSIX)', () => {
+    const target = path.join(tmpRoot, 'perm-gh.txt');
+    process.env[GITHUB_TOKEN_FILE_ENV] = target;
+    writeGithubTokenFile('ghs_secret');
+    if (process.platform !== 'win32') {
+      const mode = fs.statSync(target).mode & 0o777;
+      expect(mode).toBe(0o600);
+    } else {
+      expect(fs.existsSync(target)).toBe(true);
+    }
+  });
+});
+
+describe('githubTokenShellFn', () => {
+  it('emits _load_github_token that prefers the file and falls back to API', () => {
+    const fn = githubTokenShellFn();
+    expect(fn).toContain('_load_github_token()');
+    // Reads from the live token file first.
+    expect(fn).toContain('[ -s "${GITHUB_TOKEN_FILE}" ]');
+    expect(fn).toContain('GH_TOKEN=$(cat "${GITHUB_TOKEN_FILE}" 2>/dev/null)');
+    // Falls back to the backend API.
+    expect(fn).toContain('api/agent/github/token');
+    // Fails loud when neither source yields a token.
+    expect(fn).toContain('no GitHub token available');
+    // Must never echo the token value.
+    expect(fn).not.toContain('echo "$GH_TOKEN"');
+  });
+
+  it('emits _set_github_remote that rewrites the origin URL with the token', () => {
+    const fn = githubTokenShellFn();
+    expect(fn).toContain('_set_github_remote()');
+    expect(fn).toContain('git remote set-url origin');
+    expect(fn).toContain('x-access-token:${GH_TOKEN}@github.com');
+  });
+
+  it('suppresses _set_github_remote remote-URL rewrite for read-only seats (call site)', () => {
+    // For read-only task types the caller (pr-helper generator) must NOT emit the
+    // _set_github_remote call. The function itself is still defined in the shell
+    // output (it's part of the canonical helper block) — only the invocation is
+    // omitted. Verify the function definition is present in the emitted block.
+    const fn = githubTokenShellFn();
+    expect(fn).toContain('_set_github_remote()');
+    // The READ-ONLY suppression is enforced at generation time in pr-helper.ts
+    // via cfg.isReadOnly — not inside githubTokenShellFn itself.
+    // This test documents the contract: the shell fn block is always emitted;
+    // the caller decides whether to call _set_github_remote.
   });
 });

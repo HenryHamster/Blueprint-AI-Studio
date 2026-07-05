@@ -1,5 +1,10 @@
-import { describe, it, expect } from 'vitest';
-import { computeRefreshDelayMs, isBootstrapToken } from './agent-token.js';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  computeRefreshDelayMs, isBootstrapToken,
+  initTokenModule,
+  scheduleGithubTokenRefresh, stopGithubTokenRefresh,
+} from './agent-token.js';
+import * as agentTokenModule from './agent-token.js';
 import {
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
@@ -96,5 +101,60 @@ describe('isBootstrapToken', () => {
     const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
     const token = `${header}.${payload}.sig`;
     expect(isBootstrapToken(token, now)).toBe(false);
+  });
+});
+
+// ── scheduleGithubTokenRefresh / stopGithubTokenRefresh ───────────────────────
+
+describe('scheduleGithubTokenRefresh / stopGithubTokenRefresh lifecycle', () => {
+  // These tests verify the timer start/stop contract without actually firing the
+  // 45-min timer. We use vitest fake timers to stay fast and deterministic.
+  beforeEach(() => {
+    vi.useFakeTimers();
+    // initTokenModule must be called before schedule* functions.
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopGithubTokenRefresh();
+  });
+  afterEach(() => {
+    stopGithubTokenRefresh();
+    vi.useRealTimers();
+  });
+
+  it('scheduleGithubTokenRefresh sets a timer that stopGithubTokenRefresh clears', () => {
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+    scheduleGithubTokenRefresh('task-1', '/tmp/ws', 'owner', 'repo', false);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+    stopGithubTokenRefresh();
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+  });
+
+  it('calling scheduleGithubTokenRefresh twice replaces the previous timer (no orphan)', () => {
+    scheduleGithubTokenRefresh('task-1', '/tmp/ws', 'owner', 'repo', false);
+    const first = agentTokenModule.githubTokenRefreshTimer;
+    scheduleGithubTokenRefresh('task-2', '/tmp/ws', 'owner', 'repo', false);
+    const second = agentTokenModule.githubTokenRefreshTimer;
+    // The second call must replace the first — no orphaned timers.
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+  });
+
+  it('stopGithubTokenRefresh is a no-op when no timer is running', () => {
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+    expect(() => { stopGithubTokenRefresh(); }).not.toThrow();
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+  });
+
+  it('scheduleGithubTokenRefresh works for both read-only and non-read-only tasks', () => {
+    scheduleGithubTokenRefresh('task-ro', '/tmp/ws', 'owner', 'repo', true);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+    stopGithubTokenRefresh();
+    scheduleGithubTokenRefresh('task-rw', '/tmp/ws', 'owner', 'repo', false);
+    expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
   });
 });

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { WORKSPACE } from '../index.js';
-import { agentTokenShellFn } from '../token-file.js';
+import { agentTokenShellFn, githubTokenShellFn } from '../token-file.js';
 import { validateCfgShellSafety, type CodeChangeHelperConfig } from './code-change-helpers.js';
 
 // Load the canonical sr-pr-section.js renderer from disk and base64-encode
@@ -55,6 +55,7 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
   const _SR_SECTION_SCRIPT_B64 = loadSrSectionScriptB64();
   const _SCREENSHOTS_SECTION_SCRIPT_B64 = loadScreenshotsSectionScriptB64();
   const agentTokenFn = agentTokenShellFn();
+  const githubTokenFn = githubTokenShellFn();
   const script = `#!/bin/bash
 # ./pr open --title "..." --body "..."  — ship the diff via PR
 #
@@ -67,6 +68,7 @@ export function writePrHelper(cfg: CodeChangeHelperConfig): void {
 
 set -uo pipefail
 ${agentTokenFn}
+${githubTokenFn}
 WORKSPACE="\${WORKSPACE:-${WORKSPACE}}"
 cd "$WORKSPACE" || { echo "Error: cannot cd to $WORKSPACE" >&2; exit 2; }
 
@@ -338,21 +340,13 @@ API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 _load_agent_token
 TASK="${cfg.taskId}"
 
-# 3. Refresh GitHub token + remote URL right before push. The clone-time token
-#    is per-task ephemeral and may be near expiry by the time Claude ships.
-TOKEN_RESP=$(curl -f -sS --max-time 30 \\
-  -H "X-Agent-Token: $TOKEN" \\
-  "$API/api/agent/github/token?task_id=$TASK") || {
-  echo "[pr] Failed to fetch fresh GitHub token from orchestrator" >&2
-  exit 1
-}
-GH_PUSH_TOKEN=$(printf '%s' "$TOKEN_RESP" | jq -r '.data.token // empty')
-if [ -z "$GH_PUSH_TOKEN" ]; then
-  echo "[pr] orchestrator returned no token: $TOKEN_RESP" >&2
-  exit 1
-fi
-git remote set-url origin "https://x-access-token:$GH_PUSH_TOKEN@github.com/${cfg.owner}/${cfg.repo}.git"
-unset GH_PUSH_TOKEN  # only needed for the remote URL above
+# 3. Refresh GitHub token + remote URL right before push. _load_github_token
+#    prefers the live token file (kept fresh by the Node agent at ~45min
+#    intervals) and falls back to the backend API. _set_github_remote rewrites
+#    the origin URL so git push uses the rotated token instead of the stale
+#    clone-time one.
+_load_github_token || { echo "[pr] Failed to load GitHub token" >&2; exit 1; }
+_set_github_remote "${cfg.owner}" "${cfg.repo}"
 
 # 4. Push (with retry — concurrent-push handling)
 PUSH_OK=0

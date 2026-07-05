@@ -8,6 +8,7 @@ import { getLastWorkspacePrepOutcome, resetWorkspacePrepOutcome } from './worksp
 import { handlers, resolveHandler } from './handlers/index.js';
 import {
   loadTaskCapabilityContract,
+  isReadOnlyTaskType,
   type TaskCapabilityContract,
 } from './taskCapabilities.js';
 import { extractJsonObject, extractJsonArray, JsonExtractionError } from './json-extract.js';
@@ -36,9 +37,10 @@ import {
 import {
   initTokenModule, tryRefreshToken,
   scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
+  scheduleGithubTokenRefresh, stopGithubTokenRefresh,
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
-import { ensureAgentTokenFileEnv, writeAgentTokenFile } from './token-file.js';
+import { ensureAgentTokenFileEnv, writeAgentTokenFile, ensureGithubTokenFileEnv, writeGithubTokenFile } from './token-file.js';
 import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
@@ -2324,6 +2326,7 @@ function startHeartbeat(taskId: string, getMessage: () => string) {
 function stopHeartbeat() {
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
   stopProactiveTokenRefresh();
+  stopGithubTokenRefresh();
   // Reset mutex so warm-VM continuity (one agent process, multiple sequential
   // tasks) starts the next task with a clean in-flight state. Without this,
   // a stuck heartbeat at role-end would leave the flag true and the new
@@ -3789,6 +3792,14 @@ async function runRoleOnce(opts: RunRoleOnceOptions): Promise<RunRoleOnceResult>
     // permissions to a read-only task.
     statusRef.value = 'Loading task-capability contract...';
     await ensureTaskCapabilityContractLoaded();
+
+    // Seed the GitHub token file immediately so bash helpers can use it from
+    // the first invocation. Then schedule proactive refreshes every 45 min
+    // (the GitHub installation token TTL is 60 min; the backend cache is 50 min,
+    // so force_refresh=false hits the cache at zero GitHub API cost).
+    ensureGithubTokenFileEnv();
+    writeGithubTokenFile(ghToken);
+    scheduleGithubTokenRefresh(taskId, WORKSPACE, owner, repo, isReadOnlyTaskType(taskType));
 
     // Dispatch to handler — contract-driven (registry-driven task types).
     //

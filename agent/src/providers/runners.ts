@@ -17,7 +17,7 @@ import {
   recordLlmTokens, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
-import { AGENT_TOKEN_FILE_ENV } from '../token-file.js';
+import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV } from '../token-file.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
@@ -531,6 +531,8 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
   // above stays as the fallback for the one-shot case / when the file is unset.
   const tokenFilePath = process.env[AGENT_TOKEN_FILE_ENV];
   if (tokenFilePath) env[AGENT_TOKEN_FILE_ENV] = tokenFilePath;
+  const ghTokenFilePath = process.env[GITHUB_TOKEN_FILE_ENV];
+  if (ghTokenFilePath) env[GITHUB_TOKEN_FILE_ENV] = ghTokenFilePath;
   if (LLM_CLI_TRANSLATION?.env) {
     for (const [k, v] of Object.entries(LLM_CLI_TRANSLATION.env)) {
       if (!(k in env)) env[k] = v;

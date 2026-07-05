@@ -99,6 +99,103 @@ export function writeAgentTokenFile(token: string): boolean {
 }
 
 /**
+ * Env var carrying the ABSOLUTE path of the live GitHub token file.
+ */
+export const GITHUB_TOKEN_FILE_ENV = 'GITHUB_TOKEN_FILE';
+
+/**
+ * Resolve the intended absolute path of the live GitHub token file. Honors an
+ * explicit `GITHUB_TOKEN_FILE` override; otherwise a private per-agent path under
+ * the agent user's home, deliberately NOT under the cloned workspace.
+ */
+export function githubTokenFilePath(): string {
+  const override = process.env[GITHUB_TOKEN_FILE_ENV];
+  if (override && override.trim()) return override.trim();
+  const base = os.homedir() || os.tmpdir();
+  return path.join(base, '.blueprint', 'github-token.txt');
+}
+
+/**
+ * Publish the GitHub token-file location into `process.env[GITHUB_TOKEN_FILE_ENV]`
+ * (once) so it is propagated to child helper scripts. Idempotent. Returns the
+ * resolved path. Called once at role start — NOT at module load.
+ */
+export function ensureGithubTokenFileEnv(): string {
+  const existing = process.env[GITHUB_TOKEN_FILE_ENV];
+  if (existing && existing.trim()) return existing.trim();
+  const resolved = githubTokenFilePath();
+  process.env[GITHUB_TOKEN_FILE_ENV] = resolved;
+  return resolved;
+}
+
+/**
+ * Mirror the current GitHub installation token to the configured token file
+ * (dir 0700, file 0600, written atomically via temp-file + rename).
+ *
+ * No-op unless `GITHUB_TOKEN_FILE` is configured and the token is non-empty.
+ * Best-effort: never throws, never logs the token value. Returns true only when
+ * the file was actually written.
+ */
+export function writeGithubTokenFile(token: string): boolean {
+  const configured = process.env[GITHUB_TOKEN_FILE_ENV];
+  if (!configured || !configured.trim() || !token) return false;
+  const target = configured.trim();
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true, mode: 0o700 });
+    const tmp = `${target}.tmp`;
+    fs.writeFileSync(tmp, token, { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tmp, target);
+    try { fs.chmodSync(target, 0o600); } catch { /* best effort */ }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Bash functions, emitted into helper scripts that need a fresh GitHub
+ * installation token before a git push or GitHub API call.
+ *
+ * `_load_github_token()` resolves the token into `$GH_TOKEN`: prefers the live
+ * token file (`$GITHUB_TOKEN_FILE`, kept fresh by the Node agent at spawn and on
+ * every ~45min refresh), falls back to the backend API endpoint, and returns
+ * non-zero with a clear error when neither source yields a token.
+ *
+ * `_set_github_remote()` rewrites the git origin URL with the fresh token.
+ * Usage: _set_github_remote <owner> <repo>  (call after _load_github_token)
+ *
+ * Returned as an array of single-quoted lines joined with newlines so no bash
+ * `$`/`${...}` needs escaping through a TypeScript template literal.
+ */
+export function githubTokenShellFn(): string {
+  return [
+    '# Resolve a fresh GitHub installation token into $GH_TOKEN, preferring the',
+    '# live token file (kept fresh by the Node agent at spawn + ~45min refresh) and',
+    '# falling back to the backend API. Re-callable to re-read a rotated token.',
+    '_load_github_token() {',
+    '  GH_TOKEN=""',
+    '  if [ -n "${GITHUB_TOKEN_FILE:-}" ] && [ -s "${GITHUB_TOKEN_FILE}" ]; then',
+    '    GH_TOKEN=$(cat "${GITHUB_TOKEN_FILE}" 2>/dev/null)',
+    '  fi',
+    '  if [ -z "$GH_TOKEN" ] && [ -n "${ORCHESTRATOR_URL:-}" ] && [ -n "${TASK_ID:-}" ] && [ -n "${TOKEN:-}" ]; then',
+    '    _GT_RESP=$(curl -f -sS --max-time 30 -H "X-Agent-Token: $TOKEN" "${ORCHESTRATOR_URL}/api/agent/github/token?task_id=${TASK_ID}" 2>/dev/null) || _GT_RESP=""',
+    '    GH_TOKEN=$(printf "%s" "$_GT_RESP" | jq -r ".data.token // empty" 2>/dev/null || true)',
+    '  fi',
+    '  if [ -z "$GH_TOKEN" ]; then',
+    '    echo "[ERROR] no GitHub token available (GITHUB_TOKEN_FILE empty and backend API fallback failed)" >&2',
+    '    return 1',
+    '  fi',
+    '  return 0',
+    '}',
+    '# Rewrite the git origin remote URL with the fresh GitHub token.',
+    '# Must call _load_github_token first. Usage: _set_github_remote <owner> <repo>',
+    '_set_github_remote() {',
+    '  git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/$1/$2.git"',
+    '}',
+  ].join('\n');
+}
+
+/**
  * Bash function, emitted verbatim into every provisioned helper that
  * authenticates to the orchestrator, that resolves the agent token into `$TOKEN`.
  *
