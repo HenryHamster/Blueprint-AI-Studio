@@ -207,6 +207,13 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "review_fix_lane_pilot_enabled",
         "direction_gap_respawn_block_mode",
         "direction_gap_respawn_cooldown_days",
+        # Direction guardrail knobs (churn/lifetime pause thresholds + review ladder)
+        "direction_churn_window_cycles",
+        "direction_churn_non_merge_threshold",
+        "direction_churn_min_merge_rate",
+        "direction_lifetime_non_merge_threshold",
+        "direction_lifetime_min_merge_rate",
+        "direction_review_recommendation_threshold",
     }
 )
 
@@ -694,6 +701,25 @@ async def get_settings(
         ),
         "direction_gap_respawn_cooldown_days": float(
             _runtime_config.get("direction_gap_respawn_cooldown_days", 14) or 14
+        ),
+        # Direction guardrail knobs
+        "direction_churn_window_cycles": int(
+            _runtime_config.get("direction_churn_window_cycles", 5)
+        ),
+        "direction_churn_non_merge_threshold": int(
+            _runtime_config.get("direction_churn_non_merge_threshold", 15)
+        ),
+        "direction_churn_min_merge_rate": float(
+            _runtime_config.get("direction_churn_min_merge_rate", 0.10)
+        ),
+        "direction_lifetime_non_merge_threshold": int(
+            _runtime_config.get("direction_lifetime_non_merge_threshold", 150)
+        ),
+        "direction_lifetime_min_merge_rate": float(
+            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10)
+        ),
+        "direction_review_recommendation_threshold": int(
+            _runtime_config.get("direction_review_recommendation_threshold", 2)
         ),
     }
 
@@ -1824,6 +1850,90 @@ async def _apply_settings(
                 detail="direction_gap_respawn_cooldown_days must be between 1 and 365",
             )
         _runtime_config["direction_gap_respawn_cooldown_days"] = fval
+    if "direction_churn_window_cycles" in payload:
+        try:
+            val = int(payload["direction_churn_window_cycles"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_window_cycles must be an integer",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_window_cycles must be between 1 and 100",
+            )
+        _runtime_config["direction_churn_window_cycles"] = val
+    if "direction_churn_non_merge_threshold" in payload:
+        try:
+            val = int(payload["direction_churn_non_merge_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_non_merge_threshold must be an integer",
+            )
+        if not (1 <= val <= 10000):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_non_merge_threshold must be between 1 and 10000",
+            )
+        _runtime_config["direction_churn_non_merge_threshold"] = val
+    if "direction_churn_min_merge_rate" in payload:
+        try:
+            fval = float(payload["direction_churn_min_merge_rate"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_min_merge_rate must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_churn_min_merge_rate must be between 0.0 and 1.0",
+            )
+        _runtime_config["direction_churn_min_merge_rate"] = fval
+    if "direction_lifetime_non_merge_threshold" in payload:
+        try:
+            val = int(payload["direction_lifetime_non_merge_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_non_merge_threshold must be an integer",
+            )
+        if not (1 <= val <= 100000):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_non_merge_threshold must be between 1 and 100000",
+            )
+        _runtime_config["direction_lifetime_non_merge_threshold"] = val
+    if "direction_lifetime_min_merge_rate" in payload:
+        try:
+            fval = float(payload["direction_lifetime_min_merge_rate"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_min_merge_rate must be a number",
+            )
+        if not (0.0 <= fval <= 1.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_lifetime_min_merge_rate must be between 0.0 and 1.0",
+            )
+        _runtime_config["direction_lifetime_min_merge_rate"] = fval
+    if "direction_review_recommendation_threshold" in payload:
+        try:
+            val = int(payload["direction_review_recommendation_threshold"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_review_recommendation_threshold must be an integer",
+            )
+        if not (1 <= val <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_review_recommendation_threshold must be between 1 and 100",
+            )
+        _runtime_config["direction_review_recommendation_threshold"] = val
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -3211,6 +3321,28 @@ async def _apply_settings(
                     "direction_gap_respawn_cooldown_days": float(
                         _runtime_config.get("direction_gap_respawn_cooldown_days", 14)
                         or 14
+                    ),
+                    "direction_churn_window_cycles": int(
+                        _runtime_config.get("direction_churn_window_cycles", 5)
+                    ),
+                    "direction_churn_non_merge_threshold": int(
+                        _runtime_config.get("direction_churn_non_merge_threshold", 15)
+                    ),
+                    "direction_churn_min_merge_rate": float(
+                        _runtime_config.get("direction_churn_min_merge_rate", 0.10)
+                    ),
+                    "direction_lifetime_non_merge_threshold": int(
+                        _runtime_config.get(
+                            "direction_lifetime_non_merge_threshold", 150
+                        )
+                    ),
+                    "direction_lifetime_min_merge_rate": float(
+                        _runtime_config.get("direction_lifetime_min_merge_rate", 0.10)
+                    ),
+                    "direction_review_recommendation_threshold": int(
+                        _runtime_config.get(
+                            "direction_review_recommendation_threshold", 2
+                        )
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

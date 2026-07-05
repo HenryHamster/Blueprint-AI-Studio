@@ -65,6 +65,13 @@ export function useSettings(addToast: AddToast) {
   const [evaluatingPipelineTimeoutMinutes, setEvaluatingPipelineTimeoutMinutes] = useState(120);
   const [evaluatingFailHours, setEvaluatingFailHours] = useState(48);
   const [ciBackstopTimeoutMinutes, setCiBackstopTimeoutMinutes] = useState(60);
+  // Direction guardrail knobs
+  const [directionChurnWindowCycles, setDirectionChurnWindowCycles] = useState(5);
+  const [directionChurnNonMergeThreshold, setDirectionChurnNonMergeThreshold] = useState(15);
+  const [directionChurnMinMergeRate, setDirectionChurnMinMergeRate] = useState(0.10);
+  const [directionLifetimeNonMergeThreshold, setDirectionLifetimeNonMergeThreshold] = useState(150);
+  const [directionLifetimeMinMergeRate, setDirectionLifetimeMinMergeRate] = useState(0.10);
+  const [directionReviewRecommendationThreshold, setDirectionReviewRecommendationThreshold] = useState(2);
 
   // ── Handlers ────────────────────────────────────────────────────────────
 
@@ -121,6 +128,12 @@ export function useSettings(addToast: AddToast) {
         setEvaluatingPipelineTimeoutMinutes(data.evaluating_pipeline_timeout_minutes ?? 120);
         setEvaluatingFailHours(data.evaluating_fail_hours ?? 48);
         setCiBackstopTimeoutMinutes(data.ci_backstop_timeout_minutes ?? 60);
+        setDirectionChurnWindowCycles(data.direction_churn_window_cycles ?? 5);
+        setDirectionChurnNonMergeThreshold(data.direction_churn_non_merge_threshold ?? 15);
+        setDirectionChurnMinMergeRate(data.direction_churn_min_merge_rate ?? 0.10);
+        setDirectionLifetimeNonMergeThreshold(data.direction_lifetime_non_merge_threshold ?? 150);
+        setDirectionLifetimeMinMergeRate(data.direction_lifetime_min_merge_rate ?? 0.10);
+        setDirectionReviewRecommendationThreshold(data.direction_review_recommendation_threshold ?? 2);
         if (data.notification_config) {
           setNotificationConfig({
             webhook_url: data.notification_config.webhook_url ?? '',
@@ -801,6 +814,78 @@ export function useSettings(addToast: AddToast) {
     }
   };
 
+  const updateDirectionChurnWindowCycles = async (value: number) => {
+    const v = Math.max(1, Math.min(100, Math.round(value)));
+    const prev = directionChurnWindowCycles;
+    setDirectionChurnWindowCycles(v);
+    try {
+      await patchSettings({ direction_churn_window_cycles: v });
+    } catch {
+      setDirectionChurnWindowCycles(prev);
+      addToast('Failed to update churn window cycles', 'error');
+    }
+  };
+
+  const updateDirectionChurnNonMergeThreshold = async (value: number) => {
+    const v = Math.max(1, Math.min(10000, Math.round(value)));
+    const prev = directionChurnNonMergeThreshold;
+    setDirectionChurnNonMergeThreshold(v);
+    try {
+      await patchSettings({ direction_churn_non_merge_threshold: v });
+    } catch {
+      setDirectionChurnNonMergeThreshold(prev);
+      addToast('Failed to update churn non-merge threshold', 'error');
+    }
+  };
+
+  const updateDirectionChurnMinMergeRate = async (value: number) => {
+    const v = Math.max(0, Math.min(1, value));
+    const prev = directionChurnMinMergeRate;
+    setDirectionChurnMinMergeRate(v);
+    try {
+      await patchSettings({ direction_churn_min_merge_rate: v });
+    } catch {
+      setDirectionChurnMinMergeRate(prev);
+      addToast('Failed to update churn min merge rate', 'error');
+    }
+  };
+
+  const updateDirectionLifetimeNonMergeThreshold = async (value: number) => {
+    const v = Math.max(1, Math.min(100000, Math.round(value)));
+    const prev = directionLifetimeNonMergeThreshold;
+    setDirectionLifetimeNonMergeThreshold(v);
+    try {
+      await patchSettings({ direction_lifetime_non_merge_threshold: v });
+    } catch {
+      setDirectionLifetimeNonMergeThreshold(prev);
+      addToast('Failed to update lifetime non-merge threshold', 'error');
+    }
+  };
+
+  const updateDirectionLifetimeMinMergeRate = async (value: number) => {
+    const v = Math.max(0, Math.min(1, value));
+    const prev = directionLifetimeMinMergeRate;
+    setDirectionLifetimeMinMergeRate(v);
+    try {
+      await patchSettings({ direction_lifetime_min_merge_rate: v });
+    } catch {
+      setDirectionLifetimeMinMergeRate(prev);
+      addToast('Failed to update lifetime min merge rate', 'error');
+    }
+  };
+
+  const updateDirectionReviewRecommendationThreshold = async (value: number) => {
+    const v = Math.max(1, Math.min(100, Math.round(value)));
+    const prev = directionReviewRecommendationThreshold;
+    setDirectionReviewRecommendationThreshold(v);
+    try {
+      await patchSettings({ direction_review_recommendation_threshold: v });
+    } catch {
+      setDirectionReviewRecommendationThreshold(prev);
+      addToast('Failed to update review recommendation threshold', 'error');
+    }
+  };
+
   const updateNotificationConfig = async (config: Partial<NotificationConfig>) => {
     const prev = notificationConfig;
     const next = { ...notificationConfig, ...config };
@@ -835,6 +920,9 @@ export function useSettings(addToast: AddToast) {
     notificationConfig, dailyCostCeilingUsd,
     maxGlobalAutonomousTasksPerHour, maxPipelineSlots, reservedSlotsForTypes,
     evaluatingPipelineTimeoutMinutes, evaluatingFailHours, ciBackstopTimeoutMinutes,
+    directionChurnWindowCycles, directionChurnNonMergeThreshold, directionChurnMinMergeRate,
+    directionLifetimeNonMergeThreshold, directionLifetimeMinMergeRate,
+    directionReviewRecommendationThreshold,
     providerTierModelMap, taskTypeModelPreferences,
     taskTypeCategories, categoryRouting, taskTypeRouting,
     providerSettingsByEffort,
@@ -867,6 +955,9 @@ export function useSettings(addToast: AddToast) {
     updateNotificationConfig, updateDailyCostCeiling,
     updateMaxGlobalAutonomousRate, updateMaxPipelineSlots, updateReservedSlotsForTypes,
     updateEvaluatingPipelineTimeout, updateEvaluatingFailHours, updateCiBackstopTimeout,
+    updateDirectionChurnWindowCycles, updateDirectionChurnNonMergeThreshold,
+    updateDirectionChurnMinMergeRate, updateDirectionLifetimeNonMergeThreshold,
+    updateDirectionLifetimeMinMergeRate, updateDirectionReviewRecommendationThreshold,
     updateBuildConfig,
   };
 }

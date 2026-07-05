@@ -72,6 +72,18 @@ const baseProps = {
   anyAutonomousEnabled: true,
   onPauseAllAutonomous: vi.fn(),
   onRestartOrchestrator: vi.fn().mockResolvedValue(undefined),
+  directionChurnWindowCycles: 5,
+  onUpdateDirectionChurnWindowCycles: vi.fn(),
+  directionChurnNonMergeThreshold: 15,
+  onUpdateDirectionChurnNonMergeThreshold: vi.fn(),
+  directionChurnMinMergeRate: 0.10,
+  onUpdateDirectionChurnMinMergeRate: vi.fn(),
+  directionLifetimeNonMergeThreshold: 150,
+  onUpdateDirectionLifetimeNonMergeThreshold: vi.fn(),
+  directionLifetimeMinMergeRate: 0.10,
+  onUpdateDirectionLifetimeMinMergeRate: vi.fn(),
+  directionReviewRecommendationThreshold: 2,
+  onUpdateDirectionReviewRecommendationThreshold: vi.fn(),
 };
 
 describe('SettingsOrchestratorSection', () => {
@@ -199,5 +211,32 @@ describe('SettingsOrchestratorSection', () => {
     render(<SettingsOrchestratorSection {...baseProps} onRestartOrchestrator={onRestartOrchestrator} />);
     fireEvent.click(screen.getByText('Restart Orchestrator'));
     expect(onRestartOrchestrator).not.toHaveBeenCalled();
+  });
+
+  it('renders Direction Guardrails section with correct default values', () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    expect(screen.getByTestId('direction-guardrails-section')).toBeTruthy();
+    expect((screen.getByTestId('direction-churn-window-cycles') as HTMLInputElement).value).toBe('5');
+    expect((screen.getByTestId('direction-churn-non-merge-threshold') as HTMLInputElement).value).toBe('15');
+    expect((screen.getByTestId('direction-lifetime-non-merge-threshold') as HTMLInputElement).value).toBe('150');
+    expect((screen.getByTestId('direction-review-recommendation-threshold') as HTMLInputElement).value).toBe('2');
+  });
+
+  it('calls onUpdateDirectionChurnWindowCycles on valid blur', () => {
+    const onUpdate = vi.fn();
+    render(<SettingsOrchestratorSection {...baseProps} onUpdateDirectionChurnWindowCycles={onUpdate} />);
+    const input = screen.getByTestId('direction-churn-window-cycles');
+    fireEvent.change(input, { target: { value: '8' } });
+    fireEvent.blur(input);
+    expect(onUpdate).toHaveBeenCalledWith(8);
+  });
+
+  it('calls onUpdateDirectionReviewRecommendationThreshold on valid blur', () => {
+    const onUpdate = vi.fn();
+    render(<SettingsOrchestratorSection {...baseProps} onUpdateDirectionReviewRecommendationThreshold={onUpdate} />);
+    const input = screen.getByTestId('direction-review-recommendation-threshold');
+    fireEvent.change(input, { target: { value: '5' } });
+    fireEvent.blur(input);
+    expect(onUpdate).toHaveBeenCalledWith(5);
   });
 });

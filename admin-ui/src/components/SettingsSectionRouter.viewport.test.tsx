@@ -108,6 +108,18 @@ function makeProps(activeSection: SectionId): SettingsSectionRouterProps {
     anyAutonomousEnabled: false,
     onPauseAllAutonomous: async () => {},
     onRestartOrchestrator: async () => {},
+    directionChurnWindowCycles: 5,
+    onUpdateDirectionChurnWindowCycles: () => {},
+    directionChurnNonMergeThreshold: 15,
+    onUpdateDirectionChurnNonMergeThreshold: () => {},
+    directionChurnMinMergeRate: 0.10,
+    onUpdateDirectionChurnMinMergeRate: () => {},
+    directionLifetimeNonMergeThreshold: 150,
+    onUpdateDirectionLifetimeNonMergeThreshold: () => {},
+    directionLifetimeMinMergeRate: 0.10,
+    onUpdateDirectionLifetimeMinMergeRate: () => {},
+    directionReviewRecommendationThreshold: 2,
+    onUpdateDirectionReviewRecommendationThreshold: () => {},
 
     // Accounts
     githubAccount: null,

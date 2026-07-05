@@ -510,6 +510,12 @@ runtime_config: Dict = {
     # (order-of-hundreds) so healthy high-throughput directions are never paused.
     "direction_lifetime_non_merge_threshold": 150,
     "direction_lifetime_min_merge_rate": 0.10,
+    # Churn-family pause-ladder threshold: how many churn-family auto-pause cycles
+    # must accumulate before a flagged, strategist-reviewable retirement
+    # RECOMMENDATION is recorded (non-terminal — the direction stays paused, no
+    # auto-retire). Replaces the hardcoded _MAX_CHURN_PAUSE_CYCLES=2 constant in
+    # direction_lifecycle.py so operators can tune the ladder without a redeploy.
+    "direction_review_recommendation_threshold": 2,
     # Outcome-progress (scaffolding) detector — ADVISORY, never auto-pauses.
     # Surfaces long-running directions that keep merging PRs at a healthy rate but
     # never advance their stated success_evidence (the "outcome-less scaffolding"
@@ -1568,6 +1574,31 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             _set("direction_gap_respawn_cooldown_days", _cooldown)
                     except (TypeError, ValueError):
                         pass
+                for _guardrail_int_key in (
+                    "direction_churn_window_cycles",
+                    "direction_churn_non_merge_threshold",
+                    "direction_lifetime_non_merge_threshold",
+                    "direction_review_recommendation_threshold",
+                ):
+                    if _guardrail_int_key in config_json:
+                        try:
+                            _set(
+                                _guardrail_int_key,
+                                int(config_json[_guardrail_int_key]),
+                            )
+                        except (TypeError, ValueError):
+                            pass
+                for _guardrail_float_key in (
+                    "direction_churn_min_merge_rate",
+                    "direction_lifetime_min_merge_rate",
+                ):
+                    if _guardrail_float_key in config_json:
+                        try:
+                            _fval = float(config_json[_guardrail_float_key])
+                            if 0.0 <= _fval <= 1.0:
+                                _set(_guardrail_float_key, _fval)
+                        except (TypeError, ValueError):
+                            pass
                 if "evergreen_fill_mode" in config_json:
                     raw_mode = (
                         str(config_json["evergreen_fill_mode"] or "").strip().lower()

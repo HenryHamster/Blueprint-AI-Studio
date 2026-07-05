@@ -37,6 +37,7 @@ from app.strategic_completion import (
     _extract_rationale_from_notes,
     _compute_churn_metrics,
     _compute_lifetime_burn_metrics,
+    _direction_non_merge_pause,
     _direction_still_productive,
     _recent_merges_mostly_unproven,
     _already_built_signature,
@@ -339,10 +340,13 @@ class TestCheckDirectionHealth:
     # --- Rule 2: Zero-merge ---
 
     def test_zero_merge_5_cycles_all_finished_returns_message(self):
-        # All cycles: 0 PRs merged, last cycle fully finished
+        # All cycles: 0 PRs merged, last cycle fully finished. tasks_failed=1 means
+        # all 5 cycles would also match Rule 4 ("Recent stall:") — but the non-merge
+        # proxy is evaluated FIRST so this direction is classified as "Unproductive:"
+        # (reversible/non-terminal) not "Recent stall:" (terminal code_failure ladder).
         d = _direction(
             research_history=_history(
-                5, prs_merged=0, tasks_created=2, tasks_completed=1, tasks_failed=1
+                5, prs_merged=0, tasks_created=2, tasks_completed=2, tasks_failed=1
             ),
         )
         result = _check_direction_health(d)
@@ -559,6 +563,16 @@ class TestCheckDirectionHealth:
         assert result is not None
         assert "Churn guardrail" in result
 
+    def test_rule5_config_zero_merge_rate_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_churn_min_merge_rate": 0.0},
+            clear=False,
+        )
+        d = _direction(research_history=_history(5, tasks_created=25, tasks_completed=20, tasks_failed=0, prs_merged=1))
+        assert _compute_churn_metrics(d)["merge_rate"] < 0.10
+        assert _check_direction_health(d) is None
+
     def test_rule5_config_window_honored(self, mocker):
         # window=3 focuses on last 3 bad cycles, ignoring earlier good ones that
         # would raise the merge rate high enough to suppress the rule
@@ -675,6 +689,34 @@ class TestCheckDirectionHealth:
         assert result is not None
         assert "Lifetime burn backstop" in result
 
+    def test_rule6_config_zero_merge_rate_honored(self, mocker):
+        mocker.patch.dict(
+            "app.strategic_completion._runtime_config",
+            {"direction_lifetime_min_merge_rate": 0.0},
+            clear=False,
+        )
+        d = _direction(
+            research_history=[
+                {
+                    "tasks_created": 5,
+                    "tasks_completed": 4,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                }
+                for _ in range(5)
+            ],
+            history_aggregate={
+                "total_tasks_completed": 145,
+                "total_tasks_failed": 0,
+                "total_tasks_failed_infra": 0,
+                "total_prs_merged": 0,
+                "total_cycles": 30,
+            },
+        )
+        assert _compute_lifetime_burn_metrics(d)["lifetime_merge_rate"] < 0.10
+        assert _check_direction_health(d) is None
+
     def test_rule6_message_includes_machine_readable_counts(self):
         # lifetime_non_merge_finished=160, lifetime_merged=0, rate=0%
         d = _direction(
@@ -712,6 +754,81 @@ class TestCheckDirectionHealth:
         assert reason is not None
         assert "Lifetime burn backstop" in reason
         assert _is_code_failure_pause_reason(reason) is False
+
+    # --- Consolidation: single non-merge-rate proxy governs the pause ---
+
+    def test_consolidated_pause_uses_single_non_merge_proxy(self):
+        """The merge-rate pause decision flows through ONE proxy driven by the
+        proof-weighted merge verdict — not the former separate zero-merge / churn /
+        lifetime rules.
+
+        Two directions with the SAME finished-work shape and real (verified) merge
+        outcomes differ only in the merge-test *verdict*: one ships merely-delivered
+        UNDECLARED merges (proof-weighted rate below the floor), the other ships
+        machine-PROVEN merges (adequate rate). The single proxy pauses the first and
+        spares the second, and ``_check_direction_health`` returns exactly what
+        ``_direction_non_merge_pause`` returns — proving the consolidation.
+        """
+        # Real verified merge each cycle, but UNDECLARED ("merely delivered"):
+        # proof weight 0.4 → windowed proof-weighted merge rate ≈ 8% (< 10% floor).
+        unproven = _direction(
+            research_history=[
+                {
+                    "tasks_created": 6,
+                    "tasks_completed": 5,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "acceptance_merged_write_total": 1,
+                    "acceptance_declared_merged": 0,
+                    "acceptance_proven_merged": 0,
+                }
+                for _ in range(5)
+            ]
+        )
+        # The proxy signal itself: high unmerged volume AND a sub-floor merge rate.
+        metrics = _compute_churn_metrics(unproven)
+        assert metrics is not None
+        assert metrics["non_merge_finished"] >= 15
+        assert metrics["merge_rate"] < 0.10
+
+        proxy_reason = _direction_non_merge_pause(unproven)
+        assert proxy_reason is not None
+        assert proxy_reason.startswith("Churn guardrail:")
+        # The single proxy — not saturation or a code-failure guard — is the cause.
+        assert not proxy_reason.startswith(
+            ("Saturated:", "High code failure rate:", "Recent stall:")
+        )
+        assert _is_code_failure_pause_reason(proxy_reason) is False
+        # _check_direction_health delegates the merge-rate decision to the one proxy.
+        assert _check_direction_health(unproven) == proxy_reason
+
+        # Same finished-work shape, but PROVEN merges (full credit) → the SAME proxy
+        # reads an adequate merge rate and does NOT pause, even with high unmerged
+        # volume. It is the proof-weighted rate, not raw non-merge volume, that decides.
+        proven = _direction(
+            research_history=[
+                {
+                    "tasks_created": 8,
+                    "tasks_completed": 7,
+                    "tasks_failed": 0,
+                    "tasks_failed_infra": 0,
+                    "prs_merged": 2,
+                    "verified_prs_merged": 2,
+                    "acceptance_merged_write_total": 2,
+                    "acceptance_declared_merged": 2,
+                    "acceptance_proven_merged": 2,
+                }
+                for _ in range(5)
+            ]
+        )
+        proven_metrics = _compute_churn_metrics(proven)
+        assert proven_metrics is not None
+        assert proven_metrics["non_merge_finished"] >= 15
+        assert proven_metrics["merge_rate"] >= 0.10
+        assert _direction_non_merge_pause(proven) is None
+        assert _check_direction_health(proven) is None
 
 
 # ── _compute_churn_metrics ────────────────────────────────────────────────────

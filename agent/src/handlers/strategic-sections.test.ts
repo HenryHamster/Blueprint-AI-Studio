@@ -1395,6 +1395,43 @@ describe('buildDirSummaryText', () => {
     expect(result).not.toContain('[SCAFFOLDING]');
   });
 
+  it('renders CHURN-RETIRE-RECOMMENDED marker and evidence when recommended', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-churn-rec',
+      text: 'churn direction recommended for retirement',
+      status: 'paused',
+      priority: 'medium',
+      total_cycles: 6,
+      auto_paused: true,
+      paused_reason: 'Unproductive: 0 PRs merged',
+      churn_retirement_recommended: true,
+      churn_retirement_evidence: {
+        churn_family_pause_count: 2,
+        threshold: 2,
+        merge_rate: 0,
+        summary: 'Paused 2x for churn with no escape; retirement recommended.',
+      },
+    }]);
+    expect(result).toContain('[CHURN-RETIRE-RECOMMENDED]');
+    expect(result).toContain('CHURN-RETIREMENT-RECOMMENDED');
+    expect(result).toContain('will NOT auto-retire');
+    expect(result).toContain('2x churn');
+  });
+
+  it('omits CHURN-RETIRE marker when churn_retirement_recommended is false or absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-churn-rec',
+      text: 'ordinary paused direction',
+      status: 'paused',
+      priority: 'medium',
+      total_cycles: 3,
+      auto_paused: true,
+      paused_reason: 'Unproductive: 0 PRs merged',
+      churn_retirement_recommended: false,
+    }]);
+    expect(result).not.toContain('CHURN-RETIRE');
+  });
+
   it('renders retired_direction_grounding when present on an active direction', () => {
     const result = buildDirSummaryText([{
       id: 'd-grounding',

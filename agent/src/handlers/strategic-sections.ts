@@ -1227,11 +1227,21 @@ export function buildDirSummaryText(
     }
 
     const scaffoldingNote = d.outcome_scaffolding_flagged === true ? ' [SCAFFOLDING]' : '';
+    const churnRetireNote = d.churn_retirement_recommended === true ? ' [CHURN-RETIRE-RECOMMENDED]' : '';
+
+    let churnRetireSection = '';
+    if (d.churn_retirement_recommended === true) {
+      const ev = d.churn_retirement_evidence as Record<string, unknown> | undefined;
+      const detail = ev && typeof ev === 'object'
+        ? ` (${fmtScalar(ev.churn_family_pause_count)}x churn/unproductive/saturated paused, merge_rate=${fmtScalar(ev.merge_rate, 'n/a')})`
+        : '';
+      churnRetireSection = `\n   ⚠ CHURN-RETIREMENT-RECOMMENDED${detail}: this direction has repeatedly churn-paused with no escape and now stays PAUSED pending your explicit decision. It will NOT auto-retire — either retire it via the retirement path or give it a concrete new approach.`;
+    }
 
     const groundingText = formatRetiredDirectionGrounding(d.retired_direction_grounding);
     const groundingSection = groundingText ? `\n   ${groundingText}` : '';
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${groundingSection}`;
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}${churnRetireNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${churnRetireSection}${groundingSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer

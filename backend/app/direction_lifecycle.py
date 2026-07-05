@@ -26,11 +26,14 @@ logger = logging.getLogger(__name__)
 
 _MAX_AUTO_PAUSE_CYCLES = 3
 
-# Zombie-direction auto-retire ladder (4th ladder, ref knowledge bf6d8788). A
-# direction the health guardrail keeps churn/unproductive/saturated-pausing
-# (Rules 1, 2, 5) accumulates churn_family_pause_count; once it has been paused
-# this many times for a churn-family reason it is auto-retired, freeing the slot
-# without strategist intervention.
+# Zombie-direction churn ladder (4th ladder, ref knowledge bf6d8788; redesign
+# d-73f03cc0). A direction the health guardrail keeps churn/unproductive/
+# saturated-pausing (Rules 1, 2, 5) accumulates churn_family_pause_count; once it
+# has been paused this many times for a churn-family reason it crosses the
+# retirement threshold. This NO LONGER auto-retires the direction — it records a
+# flagged, strategist-reviewable retirement RECOMMENDATION and keeps the
+# direction paused/non-terminal. Terminal retirement requires an explicit
+# strategist/operator retire action.
 _MAX_CHURN_PAUSE_CYCLES = 2
 
 # Lifetime-burn auto-retire ladder (5th ladder). A direction that repeatedly
@@ -510,6 +513,39 @@ async def _directed_research_recently_completed(
     return any(_derive_completed_at(task) >= cutoff for task in completed)
 
 
+def _build_churn_retirement_evidence(
+    churn_count: int,
+    threshold: int,
+    pause_reason: str | None,
+    metrics: dict | None,
+) -> dict:
+    """Bounded structured evidence for a churn-family retirement recommendation.
+
+    Recorded on the direction (``churn_retirement_evidence``) when the zombie
+    churn ladder crosses the configured recommendation threshold. Kept flat and
+    small so it survives strategic-payload compaction and is cheap to render.
+    ``metrics`` is the ``_compute_churn_metrics`` result (or None when history is
+    insufficient).
+    """
+    evidence: dict = {
+        "churn_family_pause_count": int(churn_count),
+        "threshold": int(threshold),
+        "last_pause_reason": (pause_reason or "")[:200],
+        "summary": (
+            f"Paused {churn_count}x for churn/unproductive/saturated with no "
+            f"escape; retirement recommended — requires an explicit "
+            f"strategist/operator retire action (no longer auto-retired)."
+        ),
+    }
+    if metrics:
+        # Flat scalars only (merge_rate/non_merge_finished/window_cycles) so the
+        # scalar-mapping compactor keeps them.
+        for key in ("merge_rate", "non_merge_finished", "window_cycles"):
+            if metrics.get(key) is not None:
+                evidence[key] = metrics[key]
+    return evidence
+
+
 def _record_auto_retired_memory(
     pending_retired_memory: list[tuple[dict, str]], d: dict, reason: str
 ) -> None:
@@ -963,6 +999,8 @@ async def _process_direction_lifecycle_locked(
             continue
         if d.get("remediation_monitor_started_at"):
             continue
+        if d.get("churn_retirement_recommended"):
+            continue
         # Skip TTL clear for lifetime-burn pauses — they require manual operator
         # intervention and should not auto-expire.
         if (d.get("paused_reason") or "").startswith("Lifetime burn backstop:"):
@@ -1006,7 +1044,9 @@ async def _process_direction_lifecycle_locked(
         hours = (_utcnow() - paused_dt).total_seconds() / 3600
         if hours < recovery_hours:
             continue
-        if not d.get("needs_manual_intervention"):
+        if not d.get("needs_manual_intervention") and not d.get(
+            "churn_retirement_recommended"
+        ):
             prior_status = d.get("status")
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
@@ -1532,27 +1572,46 @@ async def _process_direction_lifecycle_locked(
                 logger.warning(
                     f"[NOTIFY] Failed to post direction pause notification: {_notify_exc}"
                 )
-            # Zombie auto-retire ladder (4th ladder, ref bf6d8788): a direction
-            # that has now been churn/unproductive/saturated-paused >= the
-            # threshold has never escaped the recycling-zombie loop — no findings,
-            # no merged PRs, no in-flight tasks (the churn-family rules imply low
-            # throughput). Retire it terminally so the strategic agent can reuse
-            # the slot. Fires on the SAME pause event, before the code-failure
-            # ladder check below.
+            # Zombie churn-family retirement RECOMMENDATION (4th ladder, ref
+            # bf6d8788; churn-guardrail redesign d-73f03cc0). A direction that has
+            # now been churn/unproductive/saturated-paused >= the threshold has
+            # never escaped the recycling-zombie loop. Historically this ladder
+            # silently auto-executed a terminal completed/auto_completed state,
+            # freeing the slot with zero review. That auto-retire is replaced with
+            # a flagged, strategist-reviewable recommendation: the direction stays
+            # PAUSED and NON-TERMINAL, its staffing (gap) and memory state are
+            # preserved, bounded structured evidence is recorded, and terminal
+            # retirement now requires an explicit strategist/operator retire action
+            # through the existing retirement paths. Fires once (the flag gates
+            # re-firing); the auto-pause notification/evidence above are untouched.
             churn_count = d.get("churn_family_pause_count", 0)
-            if churn_count >= _MAX_CHURN_PAUSE_CYCLES:
-                d["status"] = "completed"
-                d["auto_completed"] = True
-                d["auto_completed_reason"] = (
-                    f"Auto-retired: zombie direction paused {churn_count} times for "
-                    f"churn/unproductive/saturated with no findings or merged PRs. "
-                    f"Slot freed for new directions."
+            _churn_recommend_threshold = int(
+                _runtime_config.get("direction_review_recommendation_threshold", _MAX_CHURN_PAUSE_CYCLES)
+            )
+            if churn_count >= _churn_recommend_threshold and not d.get(
+                "churn_retirement_recommended"
+            ):
+                churn_metrics = _compute_churn_metrics(d)
+                d["churn_retirement_recommended"] = True
+                d["churn_retirement_recommended_at"] = _utcnow().isoformat()
+                d["churn_retirement_evidence"] = _build_churn_retirement_evidence(
+                    churn_count,
+                    _churn_recommend_threshold,
+                    pause_reason,
+                    churn_metrics,
                 )
-                d["completed_at"] = _utcnow().isoformat()
-                logger.info(
-                    f"[AUTONOMOUS] Auto-retired zombie direction {did} after "
-                    f"{churn_count} churn-family auto-pause cycles: "
-                    f"{d.get('text', '')[:60]}"
+                # Flag for manual intervention so operator-facing surfaces treat it
+                # like the lifetime-burn recommendation (a retire/reset decision is
+                # owed), without touching the auto-recovery/reactivation-grace path
+                # owned by the separate paused-to-active task.
+                if not d.get("needs_manual_intervention"):
+                    d["needs_manual_intervention"] = True
+                    d["needs_manual_intervention_at"] = _utcnow().isoformat()
+                logger.warning(
+                    f"[AUTONOMOUS] Direction {did} recommended for churn retirement "
+                    f"after {churn_count} churn-family auto-pause cycles — kept paused "
+                    f"and non-terminal pending explicit strategist/operator retire "
+                    f"action: {d.get('text', '')[:60]}"
                 )
                 from app.models import Alert, AlertSeverity
 
@@ -1560,11 +1619,13 @@ async def _process_direction_lifecycle_locked(
                     Alert(
                         project_id=project.id,
                         severity=AlertSeverity.INFO,
-                        title="Direction auto-retired (zombie)",
+                        title="Direction churn-retirement recommended",
                         message=(
-                            f"Direction '{d.get('text', '')[:80]}' was auto-retired after "
-                            f"{churn_count} churn/unproductive/saturated auto-pause cycles. "
-                            f"Slot freed for strategic agent to create a replacement."
+                            f"Direction '{d.get('text', '')[:80]}' has been "
+                            f"{churn_count}x churn/unproductive/saturated auto-paused "
+                            f"and is recommended for retirement. It stays paused "
+                            f"pending a strategist/operator retire decision — it is "
+                            f"no longer auto-retired."
                         ),
                     )
                 )
@@ -1577,25 +1638,21 @@ async def _process_direction_lifecycle_locked(
                         session,
                         project.id,
                         direction_text=d.get("text", ""),
-                        milestone="auto-retired-zombie",
-                        reason=d["auto_completed_reason"],
+                        milestone="churn-retirement-recommended",
+                        reason=d["churn_retirement_evidence"]["summary"],
                         direction_id=did,
+                        evidence=d["churn_retirement_evidence"],
                     )
                 except Exception as _notify_exc:
                     logger.warning(
-                        f"[NOTIFY] Failed to post zombie retire milestone for {did}: "
-                        f"{_notify_exc}"
+                        f"[NOTIFY] Failed to post churn-retirement recommendation for "
+                        f"{did}: {_notify_exc}"
                     )
-                # Gap reconciliation (Direction C, ref 626ec3f5): free the gap
-                # this direction was staffing so it can be re-staffed. Unified
-                # onto the authoritative id-match helper so a missing/stale
-                # gap_id no longer hides a staffing entry. Fail-open.
-                _reconcile_retired_gap(did)
-                _record_auto_retired_memory(
-                    pending_retired_memory, d, "auto_retired_zombie"
-                )
                 directions_modified = True
-                continue  # terminal — skip active_directions.append
+                # NON-TERMINAL: staffing (gap) and retired-memory state are
+                # deliberately preserved — no _reconcile_retired_gap, no
+                # _record_auto_retired_memory, no `continue`. Fall through to the
+                # paused-direction handling so the direction remains paused.
             # Lifetime-burn auto-retire ladder (5th ladder): a direction that has
             # repeatedly tripped the lifetime burn backstop is structurally stuck —
             # the cumulative non-merge ratio will not improve without a history reset.

@@ -51,6 +51,19 @@ interface SettingsOrchestratorSectionProps {
   onPauseAllAutonomous: () => Promise<void>;
   onRestartOrchestrator: () => Promise<void>;
   selectedProjectId?: string | null;
+  // Direction guardrail knobs
+  directionChurnWindowCycles: number;
+  onUpdateDirectionChurnWindowCycles: (value: number) => void;
+  directionChurnNonMergeThreshold: number;
+  onUpdateDirectionChurnNonMergeThreshold: (value: number) => void;
+  directionChurnMinMergeRate: number;
+  onUpdateDirectionChurnMinMergeRate: (value: number) => void;
+  directionLifetimeNonMergeThreshold: number;
+  onUpdateDirectionLifetimeNonMergeThreshold: (value: number) => void;
+  directionLifetimeMinMergeRate: number;
+  onUpdateDirectionLifetimeMinMergeRate: (value: number) => void;
+  directionReviewRecommendationThreshold: number;
+  onUpdateDirectionReviewRecommendationThreshold: (value: number) => void;
 }
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
@@ -104,6 +117,18 @@ export function SettingsOrchestratorSection({
   onPauseAllAutonomous,
   onRestartOrchestrator,
   selectedProjectId = null,
+  directionChurnWindowCycles,
+  onUpdateDirectionChurnWindowCycles,
+  directionChurnNonMergeThreshold,
+  onUpdateDirectionChurnNonMergeThreshold,
+  directionChurnMinMergeRate,
+  onUpdateDirectionChurnMinMergeRate,
+  directionLifetimeNonMergeThreshold,
+  onUpdateDirectionLifetimeNonMergeThreshold,
+  directionLifetimeMinMergeRate,
+  onUpdateDirectionLifetimeMinMergeRate,
+  directionReviewRecommendationThreshold,
+  onUpdateDirectionReviewRecommendationThreshold,
 }: SettingsOrchestratorSectionProps) {
   // Reservable task types derive from the published capability contract so a
   // newly registered reservable type gets a control here automatically.
@@ -125,6 +150,13 @@ export function SettingsOrchestratorSection({
   const [autonomousResearchIntervalInputVal, setAutonomousResearchIntervalInputVal] = useState(String(autonomousResearchIntervalMinutes));
   const [directionCooldownInputVal, setDirectionCooldownInputVal] = useState(String(directionCooldownMinutes));
   const [strategicResearchFreqInputVal, setStrategicResearchFreqInputVal] = useState(String(strategicResearchFrequency));
+  // Direction guardrail input vals
+  const [churnWindowInputVal, setChurnWindowInputVal] = useState(String(directionChurnWindowCycles));
+  const [churnNonMergeThresholdInputVal, setChurnNonMergeThresholdInputVal] = useState(String(directionChurnNonMergeThreshold));
+  const [churnMinMergeRateInputVal, setChurnMinMergeRateInputVal] = useState(String(directionChurnMinMergeRate));
+  const [lifetimeNonMergeThresholdInputVal, setLifetimeNonMergeThresholdInputVal] = useState(String(directionLifetimeNonMergeThreshold));
+  const [lifetimeMinMergeRateInputVal, setLifetimeMinMergeRateInputVal] = useState(String(directionLifetimeMinMergeRate));
+  const [reviewRecommendThresholdInputVal, setReviewRecommendThresholdInputVal] = useState(String(directionReviewRecommendationThreshold));
   const [restarting, setRestarting] = useState(false);
   const [restartStatus, setRestartStatus] = useState<'idle' | 'success' | 'error'>('idle');
 
@@ -228,6 +260,12 @@ export function SettingsOrchestratorSection({
   useEffect(() => { setAutonomousResearchIntervalInputVal(String(autonomousResearchIntervalMinutes)); }, [autonomousResearchIntervalMinutes]);
   useEffect(() => { setDirectionCooldownInputVal(String(directionCooldownMinutes)); }, [directionCooldownMinutes]);
   useEffect(() => { setStrategicResearchFreqInputVal(String(strategicResearchFrequency)); }, [strategicResearchFrequency]);
+  useEffect(() => { setChurnWindowInputVal(String(directionChurnWindowCycles)); }, [directionChurnWindowCycles]);
+  useEffect(() => { setChurnNonMergeThresholdInputVal(String(directionChurnNonMergeThreshold)); }, [directionChurnNonMergeThreshold]);
+  useEffect(() => { setChurnMinMergeRateInputVal(String(directionChurnMinMergeRate)); }, [directionChurnMinMergeRate]);
+  useEffect(() => { setLifetimeNonMergeThresholdInputVal(String(directionLifetimeNonMergeThreshold)); }, [directionLifetimeNonMergeThreshold]);
+  useEffect(() => { setLifetimeMinMergeRateInputVal(String(directionLifetimeMinMergeRate)); }, [directionLifetimeMinMergeRate]);
+  useEffect(() => { setReviewRecommendThresholdInputVal(String(directionReviewRecommendationThreshold)); }, [directionReviewRecommendationThreshold]);
 
   const reserved = (t: string) => reservedSlotsForTypes[t] ?? 0;
   const setReserved = (t: string, value: number) =>
@@ -508,6 +546,102 @@ export function SettingsOrchestratorSection({
         >
           Pause All Autonomous
         </button>
+      </div>
+
+      {/* Direction Guardrails */}
+      <div data-testid="direction-guardrails-section">
+        <h3 className="text-xs font-semibold text-neutral-300 uppercase tracking-wider mb-3">Direction Guardrails</h3>
+        <p className="text-xs text-neutral-500 mb-3">
+          Thresholds for the churn and lifetime-burn pause guardrails. A direction accumulating non-merging tasks beyond these thresholds is paused; after the review-recommendation threshold is crossed, a flagged retirement recommendation is recorded for operator review.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Churn Window (cycles)</label>
+            <input
+              data-testid="direction-churn-window-cycles"
+              type="number"
+              min={1}
+              max={100}
+              value={churnWindowInputVal}
+              onChange={e => setChurnWindowInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(churnWindowInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionChurnWindowCycles(n); else setChurnWindowInputVal(String(directionChurnWindowCycles)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(churnWindowInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionChurnWindowCycles(n); else setChurnWindowInputVal(String(directionChurnWindowCycles)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Churn Non-Merge Threshold</label>
+            <input
+              data-testid="direction-churn-non-merge-threshold"
+              type="number"
+              min={1}
+              max={10000}
+              value={churnNonMergeThresholdInputVal}
+              onChange={e => setChurnNonMergeThresholdInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(churnNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 10000) onUpdateDirectionChurnNonMergeThreshold(n); else setChurnNonMergeThresholdInputVal(String(directionChurnNonMergeThreshold)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(churnNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 10000) onUpdateDirectionChurnNonMergeThreshold(n); else setChurnNonMergeThresholdInputVal(String(directionChurnNonMergeThreshold)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Churn Min Merge Rate (0–1)</label>
+            <input
+              data-testid="direction-churn-min-merge-rate"
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              value={churnMinMergeRateInputVal}
+              onChange={e => setChurnMinMergeRateInputVal(e.target.value)}
+              onBlur={() => { const n = parseFloat(churnMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionChurnMinMergeRate(n); else setChurnMinMergeRateInputVal(String(directionChurnMinMergeRate)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseFloat(churnMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionChurnMinMergeRate(n); else setChurnMinMergeRateInputVal(String(directionChurnMinMergeRate)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Lifetime Non-Merge Threshold</label>
+            <input
+              data-testid="direction-lifetime-non-merge-threshold"
+              type="number"
+              min={1}
+              max={100000}
+              value={lifetimeNonMergeThresholdInputVal}
+              onChange={e => setLifetimeNonMergeThresholdInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(lifetimeNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100000) onUpdateDirectionLifetimeNonMergeThreshold(n); else setLifetimeNonMergeThresholdInputVal(String(directionLifetimeNonMergeThreshold)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(lifetimeNonMergeThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100000) onUpdateDirectionLifetimeNonMergeThreshold(n); else setLifetimeNonMergeThresholdInputVal(String(directionLifetimeNonMergeThreshold)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Lifetime Min Merge Rate (0–1)</label>
+            <input
+              data-testid="direction-lifetime-min-merge-rate"
+              type="number"
+              min={0}
+              max={1}
+              step={0.01}
+              value={lifetimeMinMergeRateInputVal}
+              onChange={e => setLifetimeMinMergeRateInputVal(e.target.value)}
+              onBlur={() => { const n = parseFloat(lifetimeMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionLifetimeMinMergeRate(n); else setLifetimeMinMergeRateInputVal(String(directionLifetimeMinMergeRate)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseFloat(lifetimeMinMergeRateInputVal); if (!isNaN(n) && n >= 0 && n <= 1) onUpdateDirectionLifetimeMinMergeRate(n); else setLifetimeMinMergeRateInputVal(String(directionLifetimeMinMergeRate)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+          <div>
+            <label className="block text-xs font-medium text-neutral-400 mb-1.5">Review Recommend Threshold</label>
+            <input
+              data-testid="direction-review-recommendation-threshold"
+              type="number"
+              min={1}
+              max={100}
+              value={reviewRecommendThresholdInputVal}
+              onChange={e => setReviewRecommendThresholdInputVal(e.target.value)}
+              onBlur={() => { const n = parseInt(reviewRecommendThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionReviewRecommendationThreshold(n); else setReviewRecommendThresholdInputVal(String(directionReviewRecommendationThreshold)); }}
+              onKeyDown={e => { if (e.key === 'Enter') { const n = parseInt(reviewRecommendThresholdInputVal); if (!isNaN(n) && n >= 1 && n <= 100) onUpdateDirectionReviewRecommendationThreshold(n); else setReviewRecommendThresholdInputVal(String(directionReviewRecommendationThreshold)); } }}
+              className="w-full bg-neutral-950 border border-neutral-700 text-neutral-100 rounded-lg px-3 py-2 text-sm font-mono focus:outline-none focus:ring-1 focus:ring-neutral-600"
+            />
+          </div>
+        </div>
       </div>
 
       {/* Evergreen Fill */}

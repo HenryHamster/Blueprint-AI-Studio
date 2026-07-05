@@ -9214,6 +9214,122 @@ class TestDirectionGapRespawnSettings:
         assert _shared_state.runtime_config["direction_gap_respawn_block_mode"] == "observe"
 
 
+class TestDirectionGuardrailSettings:
+    """direction_churn_*, direction_lifetime_*, and direction_review_recommendation_threshold
+    are registered in the settings allowlist, exposed by GET /settings with
+    correct defaults, validated on PATCH, and persisted + restored via
+    sync_runtime_config_from_state."""
+
+    @pytest.mark.asyncio
+    async def test_direction_guardrail_settings_appear_in_get_with_defaults(
+        self, client: AsyncClient
+    ):
+        """GET /settings includes all 6 guardrail keys with expected defaults."""
+        body = (await client.get("/api/admin/settings")).json()
+        assert body.get("direction_churn_window_cycles") == 5
+        assert body.get("direction_churn_non_merge_threshold") == 15
+        assert abs(body.get("direction_churn_min_merge_rate", -1) - 0.10) < 1e-9
+        assert body.get("direction_lifetime_non_merge_threshold") == 150
+        assert abs(body.get("direction_lifetime_min_merge_rate", -1) - 0.10) < 1e-9
+        assert body.get("direction_review_recommendation_threshold") == 2
+
+    @pytest.mark.asyncio
+    async def test_direction_guardrail_settings_round_trip_and_persist(
+        self, client: AsyncClient, db_session
+    ):
+        """Valid guardrail values round-trip through PATCH→GET and persist to
+        runtime_config_json so they survive a restart (sync_runtime_config_from_state)."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "direction_churn_window_cycles": 8,
+                "direction_churn_non_merge_threshold": 20,
+                "direction_churn_min_merge_rate": 0.15,
+                "direction_lifetime_non_merge_threshold": 200,
+                "direction_lifetime_min_merge_rate": 0.20,
+                "direction_review_recommendation_threshold": 3,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_churn_window_cycles"] == 8
+        assert body["direction_churn_non_merge_threshold"] == 20
+        assert abs(body["direction_churn_min_merge_rate"] - 0.15) < 1e-9
+        assert body["direction_lifetime_non_merge_threshold"] == 200
+        assert abs(body["direction_lifetime_min_merge_rate"] - 0.20) < 1e-9
+        assert body["direction_review_recommendation_threshold"] == 3
+
+        # Values are persisted to runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None and row.runtime_config_json is not None
+        rcj = row.runtime_config_json
+        assert rcj["direction_churn_window_cycles"] == 8
+        assert rcj["direction_churn_non_merge_threshold"] == 20
+        assert abs(rcj["direction_churn_min_merge_rate"] - 0.15) < 1e-9
+        assert rcj["direction_lifetime_non_merge_threshold"] == 200
+        assert abs(rcj["direction_lifetime_min_merge_rate"] - 0.20) < 1e-9
+        assert rcj["direction_review_recommendation_threshold"] == 3
+
+        # Simulate restart: reset in-memory values to defaults
+        _shared_state.runtime_config["direction_churn_window_cycles"] = 5
+        _shared_state.runtime_config["direction_churn_non_merge_threshold"] = 15
+        _shared_state.runtime_config["direction_churn_min_merge_rate"] = 0.10
+        _shared_state.runtime_config["direction_lifetime_non_merge_threshold"] = 150
+        _shared_state.runtime_config["direction_lifetime_min_merge_rate"] = 0.10
+        _shared_state.runtime_config["direction_review_recommendation_threshold"] = 2
+
+        await sync_runtime_config_from_state(row)
+
+        # Persisted values are restored after sync
+        assert _shared_state.runtime_config["direction_churn_window_cycles"] == 8
+        assert _shared_state.runtime_config["direction_churn_non_merge_threshold"] == 20
+        assert abs(_shared_state.runtime_config["direction_churn_min_merge_rate"] - 0.15) < 1e-9
+        assert _shared_state.runtime_config["direction_lifetime_non_merge_threshold"] == 200
+        assert abs(_shared_state.runtime_config["direction_lifetime_min_merge_rate"] - 0.20) < 1e-9
+        assert _shared_state.runtime_config["direction_review_recommendation_threshold"] == 3
+
+    @pytest.mark.asyncio
+    async def test_direction_guardrail_out_of_range_rejected(self, client: AsyncClient):
+        """Out-of-range values are rejected with HTTP 400."""
+        cases = [
+            {"direction_churn_window_cycles": 0},
+            {"direction_churn_window_cycles": 101},
+            {"direction_churn_non_merge_threshold": 0},
+            {"direction_churn_non_merge_threshold": 10001},
+            {"direction_churn_min_merge_rate": -0.1},
+            {"direction_churn_min_merge_rate": 1.1},
+            {"direction_lifetime_non_merge_threshold": 0},
+            {"direction_lifetime_non_merge_threshold": 100001},
+            {"direction_lifetime_min_merge_rate": -0.1},
+            {"direction_lifetime_min_merge_rate": 1.1},
+            {"direction_review_recommendation_threshold": 0},
+            {"direction_review_recommendation_threshold": 101},
+        ]
+        for payload in cases:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 400, f"Expected 400 for {payload}, got {resp.status_code}"
+
+    @pytest.mark.asyncio
+    async def test_direction_guardrail_wrong_type_rejected(self, client: AsyncClient):
+        """Non-numeric values are rejected with HTTP 400."""
+        cases = [
+            {"direction_churn_window_cycles": "five"},
+            {"direction_churn_min_merge_rate": "high"},
+            {"direction_review_recommendation_threshold": None},
+        ]
+        for payload in cases:
+            resp = await client.patch("/api/admin/settings", json=payload)
+            assert resp.status_code == 400, f"Expected 400 for {payload}, got {resp.status_code}"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # dispatch_external_notification — webhook dispatch logic
 # ═══════════════════════════════════════════════════════════════════════════════

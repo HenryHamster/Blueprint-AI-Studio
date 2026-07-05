@@ -829,6 +829,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "confirmed_finding_count",
         "confirmed_finding_trend",
         "outcome_scaffolding_flagged",
+        "churn_retirement_recommended",
     ):
         _put_present(out, stat, key)
     for key in (
@@ -849,6 +850,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "recent_findings_grade_distribution",
         "recent_findings_verification_basis",
         "recent_findings_challenge_summary",
+        "churn_retirement_evidence",
     ):
         compact = _compact_scalar_mapping(stat.get(key), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
         if compact:

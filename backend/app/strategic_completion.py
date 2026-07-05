@@ -2352,73 +2352,186 @@ def _already_built_signature(direction: dict) -> dict | None:
     return None
 
 
-def _check_direction_health(direction: dict) -> str | None:
-    """Return a pause reason if this direction should be auto-paused, else None."""
+def _direction_non_merge_pause(direction: dict) -> str | None:
+    """Single consolidated non-merge-rate pause proxy — the mechanical trigger.
+
+    Churn-guardrail redesign: the three former independent merge-rate rules
+    (zero-merge, churn guardrail, lifetime burn backstop) are collapsed here into
+    ONE proxy driven by a single signal — finished tasks that did not merge, versus
+    the proof-weighted merge rate — evaluated at two horizons that share that same
+    signal shape:
+
+      1. Rolling window (via ``_compute_churn_metrics``) — the primary, responsive
+         trigger. Two folded-in cases of the one signal:
+           * FOLDED zero-merge: ``0`` proof-weighted merges landed over >=5 settled
+             cycles with real (non-no-op, non-infra) unmerged work — the degenerate
+             rate==0 tail of the proxy. Reason kept as ``Unproductive:`` for the
+             downstream zombie-ladder / already-built classification.
+           * FOLDED churn: unmerged volume is absolutely high AND the proof-weighted
+             merge rate is very low. Reason ``Churn guardrail:``.
+      2. Lifetime (via ``_compute_lifetime_burn_metrics``) — a slow-burn backstop for
+         directions that stay under the window volume every window yet accumulate.
+         Reason ``Lifetime burn backstop:``.
+
+    Every branch reads the same non-merge definition (completed-minus-no-op plus
+    non-infra code failures, minus proof-weighted merges) so infra-failure exclusion
+    and already-built no-op suppression are preserved. Reason prefixes are unchanged
+    so the lifecycle's evidence capture, zombie/lifetime ladders and already-built
+    routing keep working. No terminal retirement happens here — only a reversible
+    pause reason is returned. Callers gate this on ``not in_grace and not
+    still_productive`` (grace + productivity/proof shields).
+    """
     history = direction.get("research_history") or []
 
-    # Grace period: a just-recovered direction skips history-based rules (1, 2, 5, 6)
-    # until at least one new research cycle is appended after recovery. This prevents
-    # the frozen research_history that originally triggered the pause from immediately
-    # re-triggering it on the very next lifecycle tick. Code-failure rules (3, 4) are
-    # always evaluated so auto-retirement is never weakened by the grace period.
+    # --- Folded zero-merge tail (was Rule 2): proof-weighted merge rate == 0 ---
+    # 5+ cycles, no verified merges anywhere, most recent cycle settled (no tasks
+    # in flight), and real unmerged work finished. This is the low-volume end of the
+    # same non-merge proxy: a direction shipping literally nothing over five cycles.
+    if len(history) >= 5:
+        total_merged = sum(verified_merged_count(entry) for entry in history)
+        if total_merged == 0:
+            non_merge_real = sum(
+                max(0, entry.get("tasks_completed", 0))
+                - entry.get("tasks_completed_no_pr", 0)
+                + max(
+                    0,
+                    entry.get("tasks_failed", 0) - entry.get("tasks_failed_infra", 0),
+                )
+                for entry in history
+            )
+            last = history[-1]
+            created = last.get("tasks_created", 0)
+            finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
+            if (created == 0 or finished >= created) and non_merge_real > 0:
+                total_created = sum(entry.get("tasks_created", 0) for entry in history)
+                return (
+                    f"Unproductive: 0 PRs merged from {len(history)} research cycles "
+                    f"({total_created} tasks created)"
+                )
+
+    # --- Rolling-window churn (was Rule 5): high unmerged volume at a low rate ---
+    churn_threshold = int(
+        _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
+    )
+    churn_min_merge_rate_config = _runtime_config.get(
+        "direction_churn_min_merge_rate", 0.10
+    )
+    churn_min_merge_rate = float(
+        0.10 if churn_min_merge_rate_config is None else churn_min_merge_rate_config
+    )
+    if churn_threshold > 0:
+        metrics = _compute_churn_metrics(direction)
+        if (
+            metrics
+            and metrics["non_merge_finished"] >= churn_threshold
+            and metrics["merge_rate"] < churn_min_merge_rate
+        ):
+            return (
+                f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
+                f"without merging, {metrics['merged']} merged in last "
+                f"{metrics['window_cycles']} cycles "
+                f"(merge rate {metrics['merge_rate']:.0%})"
+            )
+
+    # --- Lifetime cumulative burn backstop (was Rule 6): same signal, whole life ---
+    lifetime_threshold = int(
+        _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
+    )
+    lifetime_min_merge_rate_config = _runtime_config.get(
+        "direction_lifetime_min_merge_rate", 0.10
+    )
+    lifetime_min_merge_rate = float(
+        0.10
+        if lifetime_min_merge_rate_config is None
+        else lifetime_min_merge_rate_config
+    )
+    if lifetime_threshold > 0:
+        lm = _compute_lifetime_burn_metrics(direction)
+        if (
+            lm
+            and lm["lifetime_non_merge_finished"] >= lifetime_threshold
+            and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
+        ):
+            return (
+                f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
+                f"finished without merging lifetime, {lm['lifetime_merged']} merged "
+                f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
+            )
+
+    return None
+
+
+def _check_direction_health(direction: dict) -> str | None:
+    """Return a pause reason if this direction should be auto-paused, else None.
+
+    Consolidation (churn-guardrail redesign). The former six independent
+    history-based pause rules are reduced to ONE mechanical non-merge-rate proxy
+    (:func:`_direction_non_merge_pause`) plus two guards that the code shows are a
+    genuinely different — and safer to keep separate — kind of signal:
+
+      * FOLDED into the single proxy: zero-merge (Rule 2), churn (Rule 5) and
+        lifetime burn (Rule 6). All three are one signal — unmerged finished work
+        versus the proof-weighted merge rate — at the rate==0 tail, the rolling
+        window, and the lifetime horizon respectively.
+      * RETAINED as a separate mechanical guard — code-failure (Rules 3 & 4). This
+        is a CRASH signal, not a merge-RATE one: it must stay classifiable
+        (``_is_code_failure_pause_reason`` routes it to an investigate task and its
+        own retire ladder) and it is deliberately UNGATED — a crashing direction
+        pauses no matter how productive its last cycle looked and even inside the
+        grace period.
+      * DROPPED as a standalone rule but preserved in spirit — saturation (Rule 1).
+        A saturated direction produces no actionable work at all (it may finish
+        nothing), so a non-merge-RATE proxy that needs finished work cannot see it;
+        it is kept as a small research-productivity guard rather than force-fitted
+        into the proxy.
+
+    Preserved semantics: grace period (the proxy + saturation skip until a new
+    post-recovery cycle appends; code-failure always evaluated), the still-productive
+    shield with proof-aware forfeit (:func:`_direction_still_productive` /
+    :func:`_recent_merges_mostly_unproven`), and infra-failure exclusion. No terminal
+    retirement happens here.
+    """
+    history = direction.get("research_history") or []
+
+    # Grace period: a just-recovered direction skips the history-based non-merge
+    # proxy and the saturation guard until at least one new research cycle is
+    # appended after recovery, so the frozen research_history that triggered the
+    # original pause cannot immediately re-trigger it. The code-failure guard below
+    # is always evaluated so auto-retirement is never weakened by the grace period.
     recovered_at = direction.get("auto_recovered_at")
     in_grace = recovered_at is not None and not any(
         (e.get("timestamp") or "") > recovered_at for e in history
     )
 
-    # Fix #1 gate for the cumulative merge-rate family (Rules 2, 5, 6 only): a
-    # direction that is still demonstrably productive must not be pause-retired by a
-    # zero-merge / churn / lifetime-burn signal. Code-failure rules (3, 4) below are
-    # deliberately left UNGATED — a crashing direction pauses no matter how productive
-    # its last cycle looked. The shield is also FORFEIT when the direction's recent
-    # merges are essentially all undeclared/unproven (_recent_merges_mostly_unproven):
-    # "productive" must mean proven work, not a pile of merely-delivered merges, so
-    # such a direction no longer out-protects one shipping proven work.
+    # Productivity/proof shield for the non-merge proxy only: a direction that is
+    # still demonstrably productive must not be pause-retired by a merge-rate signal.
+    # The code-failure guard is deliberately left UNGATED. The shield is FORFEIT when
+    # the direction's recent merges are essentially all undeclared/unproven
+    # (_recent_merges_mostly_unproven): "productive" must mean proven work.
     still_productive = _direction_still_productive(
         direction
     ) and not _recent_merges_mostly_unproven(direction)
 
-    if not in_grace:
-        # Rule 1: Persistent saturation — possibly_saturated AND last 5+ cycles all produced ≤1 task
-        if direction.get("possibly_saturated") and len(history) >= 5:
-            recent5 = history[-5:]
-            if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
-                return (
-                    "Saturated: last 5 research cycles produced no actionable findings"
-                )
+    # Saturation guard (retained): research produced no actionable findings.
+    if not in_grace and direction.get("possibly_saturated") and len(history) >= 5:
+        recent5 = history[-5:]
+        if all(entry.get("tasks_created", 0) <= 1 for entry in recent5):
+            return "Saturated: last 5 research cycles produced no actionable findings"
 
-        # Rule 2: Zero merge rate — 5+ cycles with 0 PRs merged total, and the most
-        # recent cycle has no tasks still in-flight (tasks_created == tasks_completed + tasks_failed).
-        # Skipped when the direction is still productive (Fix #1). Also skipped when the
-        # only thing that "finished" was correct no-op "already-built" completions
-        # (Fix #2 inline math): subtract tasks_completed_no_pr (and infra failures) from
-        # the lifetime non-merge volume — if nothing real finished unmerged, 0 PRs merged
-        # is "nothing to merge", not unproductiveness.
-        if len(history) >= 5 and not still_productive:
-            total_merged = sum(verified_merged_count(entry) for entry in history)
-            if total_merged == 0:
-                non_merge_real = sum(
-                    max(0, entry.get("tasks_completed", 0))
-                    - entry.get("tasks_completed_no_pr", 0)
-                    + max(
-                        0,
-                        entry.get("tasks_failed", 0)
-                        - entry.get("tasks_failed_infra", 0),
-                    )
-                    for entry in history
-                )
-                last = history[-1]
-                created = last.get("tasks_created", 0)
-                finished = last.get("tasks_completed", 0) + last.get("tasks_failed", 0)
-                if (created == 0 or finished >= created) and non_merge_real > 0:
-                    total_created = sum(
-                        entry.get("tasks_created", 0) for entry in history
-                    )
-                    return f"Unproductive: 0 PRs merged from {len(history)} research cycles ({total_created} tasks created)"
+    # Single consolidated non-merge-rate proxy (folds zero-merge + churn + lifetime).
+    # Evaluated BEFORE the code-failure guards so that a zero-merge, non-productive
+    # direction is always classified as 'Unproductive:' (reversible, non-terminal)
+    # rather than 'Recent stall:' (code_failure_pause_count, terminal at 3 strikes).
+    # The code-failure guards below then only fire on directions that passed the
+    # non-merge proxy (in_grace, still_productive, or no non-merge trigger).
+    if not in_grace and not still_productive:
+        proxy_reason = _direction_non_merge_pause(direction)
+        if proxy_reason:
+            return proxy_reason
 
-    # Rule 3: High CODE failure rate — last 3 cycles have >70% tasks failed
-    # for direction-attributable reasons (not infra failures like rate limits,
-    # provision failures, or timeouts which are uncorrelated with direction quality).
+    # Code-failure guard (retained, UNGATED): a crash signal that routes to an
+    # investigate task. Rule 3 — >70% of spawned tasks failed for CODE reasons over
+    # the last 3 cycles (infra failures excluded, uncorrelated with direction quality).
     if len(history) >= 3:
         recent3 = history[-3:]
         total_created_3 = sum(entry.get("tasks_created", 0) for entry in recent3)
@@ -2428,11 +2541,9 @@ def _check_direction_health(direction: dict) -> str | None:
         if total_created_3 > 0 and code_failed_3 / total_created_3 > 0.7:
             return f"High code failure rate: >70% of spawned tasks failed for code reasons in last 3 cycles ({code_failed_3}/{total_created_3}, {infra_failed_3} infra failures excluded)"
 
-    # Rule 4: Recent cycle stall — last 3 cycles all either failed as research
-    # tasks (crash/timeout/provision) or produced children with ≥1 CODE failed
-    # and zero merges. Pauses faster than Rule 2's 5-cycle threshold. Infra
-    # failures are excluded from the child-failed check for the same reason
-    # as Rule 3: they're uncorrelated with direction quality.
+    # Rule 4 — recent stall: last 3 cycles all either failed as research tasks
+    # (crash/timeout/provision) or produced children with >=1 CODE failure and zero
+    # merges. Infra failures are excluded for the same reason as Rule 3.
     if len(history) >= 3:
         recent3 = history[-3:]
 
@@ -2448,58 +2559,6 @@ def _check_direction_health(direction: dict) -> str | None:
             return (
                 "Recent stall: last 3 research cycles all failed or produced no merges"
             )
-
-    if not in_grace and not still_productive:
-        # Rules 5 & 6 are gated on the same Fix #1 productivity check as Rule 2: a
-        # still-productive direction is never churn/burn-paused.
-        #
-        # Rule 5: High non-merge churn — rolling window of finished tasks that did not merge.
-        # Only fires when non-merging volume is both absolutely high AND merge rate is very low,
-        # to avoid pausing productive high-throughput directions that simply have many tasks.
-        # research/investigate children are excluded conservatively by the default threshold.
-        churn_threshold = int(
-            _runtime_config.get("direction_churn_non_merge_threshold", 15) or 15
-        )
-        churn_min_merge_rate = float(
-            _runtime_config.get("direction_churn_min_merge_rate", 0.10) or 0.10
-        )
-        if churn_threshold > 0:
-            metrics = _compute_churn_metrics(direction)
-            if (
-                metrics
-                and metrics["non_merge_finished"] >= churn_threshold
-                and metrics["merge_rate"] < churn_min_merge_rate
-            ):
-                return (
-                    f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "
-                    f"without merging, {metrics['merged']} merged in last "
-                    f"{metrics['window_cycles']} cycles "
-                    f"(merge rate {metrics['merge_rate']:.0%})"
-                )
-
-        # Rule 6: Lifetime cumulative burn backstop — catches slow-burn directions that stay
-        # just under the rolling-window threshold every window but accumulate hundreds of
-        # non-merging tasks over their lifetime. High threshold prevents pausing productive
-        # high-throughput directions. This pause requires manual operator intervention (retire
-        # vs. reset) because the lifetime metric will not drop on its own after auto-recovery.
-        lifetime_threshold = int(
-            _runtime_config.get("direction_lifetime_non_merge_threshold", 150) or 150
-        )
-        lifetime_min_merge_rate = float(
-            _runtime_config.get("direction_lifetime_min_merge_rate", 0.10) or 0.10
-        )
-        if lifetime_threshold > 0:
-            lm = _compute_lifetime_burn_metrics(direction)
-            if (
-                lm
-                and lm["lifetime_non_merge_finished"] >= lifetime_threshold
-                and lm["lifetime_merge_rate"] < lifetime_min_merge_rate
-            ):
-                return (
-                    f"Lifetime burn backstop: {lm['lifetime_non_merge_finished']} tasks "
-                    f"finished without merging lifetime, {lm['lifetime_merged']} merged "
-                    f"(lifetime merge rate {lm['lifetime_merge_rate']:.0%})"
-                )
 
     return None
 

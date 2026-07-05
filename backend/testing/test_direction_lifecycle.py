@@ -1124,9 +1124,9 @@ async def test_process_lifecycle_productive_direction_still_pauses_on_code_failu
     history = [
         {
             "timestamp": (now - timedelta(days=i)).isoformat(),
-            "tasks_created": 10,
-            "tasks_completed": 1,
-            "tasks_failed": 9,
+            "tasks_created": 3,
+            "tasks_completed": 0,
+            "tasks_failed": 3,
             "tasks_failed_infra": 0,
             "prs_merged": 0,
         }
@@ -2404,11 +2404,16 @@ def _unproductive_history(now: datetime, cycles: int = 5) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_auto_retire_stale_churn_paused_direction(db_session, mocker):
+async def test_zombie_churn_threshold_recommends_retirement_without_completion(
+    db_session, mocker
+):
     """Acceptance selector: a churn/unproductive direction already paused once
-    (churn_family_pause_count=1) that re-trips a churn-family pause is terminally
-    auto-retired on the same lifecycle tick, and its gap is reconciled — while a
-    still-productive direction under the same count is left untouched."""
+    (churn_family_pause_count=1) that re-trips a churn-family pause crosses the
+    zombie threshold — but is NO LONGER terminally auto-retired. Instead it stays
+    PAUSED and non-terminal, carries a strategist-reviewable retirement
+    recommendation with bounded evidence, preserves its gap staffing, and writes
+    no retired-memory. A still-productive direction under the same count is
+    untouched."""
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
         new_callable=AsyncMock,
@@ -2472,24 +2477,56 @@ async def test_auto_retire_stale_churn_paused_direction(db_session, mocker):
 
     by_id = {d["id"]: d for d in project.directions}
     z = by_id["d-zombie"]
-    assert z["status"] == "completed", "zombie direction should be auto-retired"
-    assert z.get("auto_completed") is True
-    assert "zombie" in (z.get("auto_completed_reason") or "").lower()
-    assert z.get("completed_at") is not None
+    # NON-TERMINAL: crossing the churn threshold must NOT complete/auto_complete.
+    assert z["status"] == "paused", (
+        "zombie direction must stay paused (non-terminal), not be auto-retired"
+    )
+    assert z.get("auto_completed") is not True
+    assert z.get("completed_at") is None
     assert z.get("churn_family_pause_count") == 2, (
-        "churn_family_pause_count should increment on the retiring pause event"
+        "churn_family_pause_count should increment on the threshold-crossing pause"
+    )
+    # A reviewable retirement recommendation is recorded with bounded evidence.
+    assert z.get("churn_retirement_recommended") is True, (
+        "crossing the threshold must flag a reviewable retirement recommendation"
+    )
+    assert z.get("churn_retirement_recommended_at")
+    ev = z.get("churn_retirement_evidence") or {}
+    assert ev.get("churn_family_pause_count") == 2
+    assert ev.get("threshold") == 2
+    assert isinstance(ev.get("summary"), str) and ev["summary"]
+    # Flagged for an operator/strategist decision, but not terminally retired.
+    assert z.get("needs_manual_intervention") is True
+    # Staffing link PRESERVED on the direction: gap_id stays intact so the
+    # direction re-staffs its gap on reactivation (terminal retire dropped the row).
+    assert z.get("gap_id") == "g-zombie"
+
+    # Memory state PRESERVED: no retired-memory entry written (the terminal retire
+    # path recorded one; a recommendation must not).
+    retired_memory = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-zombie" for m in retired_memory), (
+        "a recommendation must not write retired-direction memory"
     )
 
-    # Gap reconciled: direction pruned from active_moves, recorded in past_moves.
-    gap = project.problem_model["gaps"][0]
-    assert "d-zombie" not in gap["active_moves"]
-    assert "d-zombie" in gap["past_moves"]
+    # NON-TERMINAL: the direction survives the next prune tick (a completed
+    # direction would be removed), so it stays available to reactivate/retire.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=1)
+    )
+    await db_session.refresh(project)
+    surviving = {d["id"]: d for d in project.directions}
+    assert "d-zombie" in surviving, (
+        "a recommended-but-not-retired direction must survive the prune tick"
+    )
+    assert surviving["d-zombie"]["status"] == "paused"
+    assert surviving["d-zombie"].get("churn_retirement_recommended") is True
 
-    h = by_id["d-healthy"]
+    h = surviving["d-healthy"]
     assert h["status"] != "completed", (
-        "a still-productive direction must not be auto-retired by the zombie ladder"
+        "a still-productive direction must not be flagged by the zombie ladder"
     )
     assert not h.get("auto_completed")
+    assert not h.get("churn_retirement_recommended")
 
 
 async def _make_gap_project(db_session, direction: dict, problem_model: dict) -> Project:
@@ -2527,9 +2564,9 @@ async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
     history = [
         {
             "timestamp": (now - timedelta(days=i)).isoformat(),
-            "tasks_created": 10,
-            "tasks_completed": 1,
-            "tasks_failed": 9,
+            "tasks_created": 3,
+            "tasks_completed": 0,
+            "tasks_failed": 3,
             "tasks_failed_infra": 0,
             "prs_merged": 0,
         }
@@ -2665,10 +2702,11 @@ async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_zombie_retire_reconciles_gap_with_stale_gap_id(db_session, mocker):
-    """Authoritative id-match: even when the direction's gap_id hint is missing
-    or stale, the zombie retire still prunes the direction out of any gap whose
-    active_moves lists its id — closing the latent gap_id-gated no-op hole."""
+async def test_churn_recommendation_preserves_gap_staffing(db_session, mocker):
+    """The churn-threshold recommendation is non-terminal, so it must PRESERVE the
+    direction's gap staffing — the direction stays in the gap's active_moves and
+    is not archived into past_moves (unlike the terminal code-failure/lifetime-burn
+    retire ladders, which still reconcile the gap)."""
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
         new_callable=AsyncMock,
@@ -2684,7 +2722,6 @@ async def test_zombie_retire_reconciles_gap_with_stale_gap_id(db_session, mocker
         "added_at": "2026-01-01T00:00:00",
         "research_history": _unproductive_history(now),
         "churn_family_pause_count": 1,
-        # No gap_id at all — the old gap_id-gated reconcile would have been a no-op.
     }
     problem_model = {
         "gaps": [
@@ -2705,13 +2742,14 @@ async def test_zombie_retire_reconciles_gap_with_stale_gap_id(db_session, mocker
     await db_session.refresh(project)
 
     d = project.directions[0]
-    assert d["status"] == "completed", "zombie direction should be auto-retired"
+    assert d["status"] == "paused", "churn threshold recommends, does not retire"
+    assert d.get("churn_retirement_recommended") is True
 
     gap = project.problem_model["gaps"][0]
-    assert "d-zombie-stale" not in gap["active_moves"], (
-        "id-match must prune the direction even with no gap_id hint"
+    assert "d-zombie-stale" in gap["active_moves"], (
+        "staffing must be preserved — the direction stays in active_moves"
     )
-    assert "d-zombie-stale" in gap["past_moves"]
+    assert "d-zombie-stale" not in gap["past_moves"]
 
 
 @pytest.mark.asyncio
@@ -2775,12 +2813,14 @@ async def test_code_failure_pause_does_not_increment_churn_count(db_session, moc
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
+        "last_cycle_productive": True,
+        "consecutive_unproductive_cycles": 0,
         "research_history": [
             {
                 "timestamp": (now - timedelta(days=i)).isoformat(),
-                "tasks_created": 10,
+                "tasks_created": 3,
                 "tasks_completed": 0,
-                "tasks_failed": 9,
+                "tasks_failed": 3,
                 "tasks_failed_infra": 0,
                 "prs_merged": 0,
             }
@@ -3329,15 +3369,16 @@ async def test_lifetime_burn_auto_retire_full_path(db_session, mocker):
 
 
 @pytest.mark.asyncio
-async def test_churn_family_auto_retire_full_path(db_session, mocker):
-    """End-to-end churn/unproductive retire driven by real lifecycle ticks with a
+async def test_churn_family_recommendation_full_path(db_session, mocker):
+    """End-to-end churn/unproductive path driven by real lifecycle ticks with a
     real apply_post_spawn_state call between ticks, starting from counter=0.
 
     Reproduces the production freeze: a churn-paused direction (counter=1) runs a
     research cycle that spawns child tasks. apply_post_spawn_state must NOT reset
     churn_family_pause_count (creating tasks != shipping merges), so a subsequent
-    recovered-then-re-paused tick can still advance the counter to the >=2 retire
-    fence and auto-retire the zombie with ZERO operator action.
+    recovered-then-re-paused tick can still advance the counter to the >=2
+    threshold. At the threshold the direction is flagged with a reviewable
+    retirement recommendation and kept PAUSED — it is no longer auto-retired.
     """
     from sqlalchemy.orm.attributes import flag_modified
 
@@ -3464,23 +3505,34 @@ async def test_churn_family_auto_retire_full_path(db_session, mocker):
     await db_session.commit()
 
     # --- Tick 3: the recovered direction re-trips the churn-family rule, counter
-    #     advances 1->2, and the zombie retire ladder fires. ZERO operator action.
+    #     advances 1->2, crossing the threshold. The direction is flagged with a
+    #     reviewable retirement recommendation and kept paused — not auto-retired.
     await _process_direction_lifecycle(
         project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=74)
     )
     await db_session.refresh(project)
     d = project.directions[0]
-    assert d["status"] == "completed", (
-        "tick 3 must auto-retire the churn direction once the counter reaches the fence"
+    assert d["status"] == "paused", (
+        "tick 3 keeps the churn direction paused (non-terminal) at the threshold"
     )
     assert d.get("churn_family_pause_count") == 2, (
         "counter must advance to 2 (not be reset by the intervening research cycle)"
     )
-    assert d.get("auto_completed") is True
-    # Gap reconciled on terminal retirement.
-    gap = project.problem_model["gaps"][0]
-    assert "d-churn-e2e" not in gap["active_moves"]
-    assert "d-churn-e2e" in gap["past_moves"]
+    assert d.get("auto_completed") is not True
+    assert d.get("churn_retirement_recommended") is True, (
+        "crossing the threshold must record a reviewable retirement recommendation"
+    )
+    # Non-terminal: the direction keeps its gap link and survives (not pruned), so
+    # it remains available to reactivate/retire. The pause itself moves it into the
+    # gap's past_moves (normal pause staffing) — it is NOT terminally retired.
+    assert d.get("gap_id") == "g-churn-e2e"
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now + timedelta(hours=75)
+    )
+    await db_session.refresh(project)
+    assert any(x["id"] == "d-churn-e2e" for x in project.directions), (
+        "recommended-but-not-retired direction must survive the prune tick"
+    )
 
 
 @pytest.mark.asyncio
@@ -3489,10 +3541,13 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
     on the same tick that marks the direction completed, before the next prune pass
     removes it from project.directions.
 
-    Uses the zombie retire path (churn_family_pause_count already at threshold-1) so a
-    single tick exercises the real production retire code without hand-setting the
-    terminal counter.  A second lifecycle tick then prunes the completed direction,
-    confirming the memory survives.
+    Uses the code-failure retire path (code_failure_pause_count already at
+    threshold-1) so a single tick exercises a real production terminal-retire code
+    path without hand-setting the terminal counter. (The churn-family ladder no
+    longer auto-retires — it records a reviewable recommendation — so a still
+    terminal ladder is used here to exercise the retired-memory write.) A second
+    lifecycle tick then prunes the completed direction, confirming the memory
+    survives.
     """
     mocker.patch(
         "app.direction_lifecycle._compute_direction_error_fingerprint",
@@ -3500,6 +3555,20 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
         return_value=None,
     )
     now = datetime.utcnow()
+    # >70% code-failure rate (Rule 3) re-trips a code-failure pause this tick;
+    # code_failure_pause_count preset to 2 → increments to 3 → hits the retire
+    # threshold (_MAX_AUTO_PAUSE_CYCLES = 3).
+    code_failure_history = [
+        {
+            "timestamp": (now - timedelta(days=i)).isoformat(),
+            "tasks_created": 3,
+            "tasks_completed": 0,
+            "tasks_failed": 3,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(3, 0, -1)
+    ]
     direction = {
         "id": "d-retire-mem",
         "text": "Retire memory test direction to verify vision write on auto-retire",
@@ -3507,8 +3576,8 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
         "priority": "medium",
         "paths": [],
         "added_at": "2026-01-01T00:00:00",
-        "research_history": _unproductive_history(now),
-        "churn_family_pause_count": 1,  # one prior pause; next pause retires
+        "research_history": code_failure_history,
+        "code_failure_pause_count": 2,  # one below the terminal fence
         "gap_id": "g-retire-mem",
     }
     project = Project(
@@ -3534,8 +3603,9 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
     await db_session.refresh(project)
     _ss.circuit_breakers.pop(str(project.id), None)
 
-    # Single lifecycle tick: direction trips Unproductive pause with churn_count already
-    # at 1, advances to 2 (>= _MAX_CHURN_PAUSE_CYCLES), triggering zombie auto-retire.
+    # Single lifecycle tick: direction trips a code-failure pause with
+    # code_failure_pause_count already at 2, advances to 3 (>= _MAX_AUTO_PAUSE_CYCLES),
+    # triggering the terminal code-failure auto-retire.
     await _process_direction_lifecycle(
         project, db_session, busy_direction_ids=set(), now=now
     )
@@ -3737,6 +3807,38 @@ async def test_lifecycle_sweep_syncs_direction_table(db_session, mocker):
         f"Direction table row status should be 'paused' after sweep, got {row.status!r}"
     )
 
+
+def test_compact_direction_summary_preserves_churn_retirement_recommendation():
+    """The strategic-payload compactor must keep the churn-retirement
+    recommendation flag and its bounded evidence so the strategist can see it
+    after per-entry compaction (the field is only useful if it survives packing).
+    """
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    stat = {
+        "id": "d-churn",
+        "priority": "medium",
+        "status": "paused",
+        "text": "churn direction recommended for retirement",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged",
+        "churn_retirement_recommended": True,
+        "churn_retirement_evidence": {
+            "churn_family_pause_count": 2,
+            "threshold": 2,
+            "merge_rate": 0.0,
+            "non_merge_finished": 4,
+            "window_cycles": 5,
+            "summary": "Paused 2x for churn with no escape; retirement recommended.",
+        },
+    }
+    out = _compact_direction_summary_entry(stat)
+    assert out.get("churn_retirement_recommended") is True
+    ev = out.get("churn_retirement_evidence") or {}
+    assert ev.get("churn_family_pause_count") == 2
+    assert ev.get("threshold") == 2
+    assert ev.get("merge_rate") == 0.0
+    assert isinstance(ev.get("summary"), str) and ev["summary"]
 
 @pytest.mark.asyncio
 async def test_paused_extend_burn_sets_pending_flag_not_executes(db_session, mocker):

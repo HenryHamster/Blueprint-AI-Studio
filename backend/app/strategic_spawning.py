@@ -5885,6 +5885,16 @@ def _build_direction_stats(
                 stat_entry["auto_retire_pending_at"] = d.get(
                     "auto_retire_pending_at"
                 )
+        # Churn-family retirement recommendation (churn-guardrail redesign
+        # d-73f03cc0): the zombie ladder no longer auto-retires; it flags a
+        # reviewable recommendation and keeps the direction paused. Surface the
+        # flag + bounded evidence so the strategist can decide whether to retire
+        # it through the existing retirement path or give it a new approach.
+        if d.get("churn_retirement_recommended"):
+            stat_entry["churn_retirement_recommended"] = True
+            _cre_ev = d.get("churn_retirement_evidence")
+            if _cre_ev:
+                stat_entry["churn_retirement_evidence"] = _cre_ev
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).
