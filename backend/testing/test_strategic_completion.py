@@ -17666,3 +17666,68 @@ async def test_set_acceptance_criteria_rejects_inactive_or_dangling_direction_ma
     assert dangling_key not in direction.criterion_keys, (
         "Dangling criterion key must be scrubbed from direction.criterion_keys"
     )
+
+
+@pytest.mark.asyncio
+async def test_spawn_retirement_memos_failure_does_not_abort_commit(db_session, mocker):
+    """When _spawn_retirement_memos raises, the surrounding commit still runs and exception is logged."""
+    from unittest.mock import AsyncMock, patch
+    from app.strategic_completion import _handle_strategic_completion, _RETIRED_NOTE_PREFIX
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    direction_id = "d-memo-fail-01"
+    direction = {
+        "id": direction_id,
+        "text": "Memo-fail test direction",
+        "status": "expired",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+        "notes": [
+            {
+                "text": f"{_RETIRED_NOTE_PREFIX}test rationale",
+                "added_at": "2026-01-01T00:00:00",
+            }
+        ],
+    }
+    project = Project(
+        name="MemoFail",
+        user_id="u-memo-fail",
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    sr_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={
+            "_strategic_api_called": True,
+            "_strategic_retired_ids": [direction_id],
+            "_strategic_retired": 1,
+        },
+    )
+    db_session.add(sr_task)
+    await db_session.commit()
+    await db_session.refresh(sr_task)
+
+    async def _blow_up(*args, **kwargs):
+        raise RuntimeError("simulated memo spawn failure")
+
+    with patch("app.strategic_completion._spawn_retirement_memos", new=_blow_up):
+        with patch("app.strategic_completion.logger") as mock_logger:
+            # Must not raise — commit must proceed
+            await _handle_strategic_completion(sr_task, "", db_session)
+
+    error_calls = [str(c) for c in mock_logger.error.call_args_list]
+    assert any("_spawn_retirement_memos" in c or "retirement memo" in c.lower() for c in error_calls), (
+        f"Expected error log for memo spawn failure; got: {error_calls}"
+    )
+
+    # The project must still be committable (no session in error state) and reachable.
+    await db_session.refresh(project)
+    assert project.id is not None, "Project must still be readable after memo-spawn failure"

@@ -88,6 +88,7 @@ from app.routers.admin_onboard import router as admin_onboard_router
 from app.routers.admin_agent_ops import router as admin_agent_ops_router
 from app.routers.admin_agent_ops import _bump_size_limit  # noqa: F401  re-exported for test patches (test_agent_annotate.py)
 from app.routers.admin_acceptance_criteria import router as admin_acceptance_criteria_router
+from app.routers.admin_direction_events import router as admin_direction_events_router
 from app.routers.admin_state import router as admin_state_router
 from app.routers.admin_operator_attention import router as admin_operator_attention_router
 from app.shared_state import limiter
@@ -102,7 +103,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0368"
+EXPECTED_SCHEMA_REVISION = "0374"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -820,6 +821,7 @@ app.include_router(agent_status_router)
 app.include_router(agent_credentials_router)
 app.include_router(agent_compute_jobs_router)
 app.include_router(admin_compute_jobs_router)
+app.include_router(admin_direction_events_router)
 app.include_router(admin_onboard_router)
 app.include_router(admin_agent_ops_router)
 

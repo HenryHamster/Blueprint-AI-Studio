@@ -150,6 +150,8 @@ async def upsert_direction(
             )
         )
     ).scalar_one_or_none()
+    # Snapshot status before any mutation so the event trail sees the old value.
+    prior_status_snapshot = existing.status if existing is not None else None
     if existing is None:
         session.add(
             Direction(
@@ -166,6 +168,20 @@ async def upsert_direction(
         existing.text = promoted["text"]
         existing.updated_at = _utcnow()
         session.add(existing)
+    # Best-effort lifecycle event — prior_status_snapshot captures the old status
+    # before the mutation above so the helper sees the correct prior value.
+    try:
+        from app.direction_event_trail import maybe_record_direction_event
+        await maybe_record_direction_event(
+            session, pid, direction, existing,
+            prior_status_snapshot=prior_status_snapshot,
+        )
+    except Exception as _evt_exc:  # noqa: BLE001
+        logger.warning(
+            "[directions_repo] event trail write failed for %s: %s",
+            direction_key,
+            _evt_exc,
+        )
 
 
 async def sync_directions(
@@ -201,6 +217,31 @@ async def sync_directions(
     )
     stale = existing_keys - keys_in_blob
     if stale:
+        # Emit pruned events before hard-deleting so the event trail survives.
+        try:
+            from app.direction_event_trail import record_direction_pruned
+            stale_rows = (
+                (
+                    await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == pid,
+                            Direction.direction_key.in_(stale),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for stale_row in stale_rows:
+                await record_direction_pruned(
+                    session, pid, stale_row.direction_key, dict(stale_row.data or {})
+                )
+        except Exception as _prune_exc:  # noqa: BLE001
+            logger.warning(
+                "[directions_repo] pruned event trail write failed for project %s: %s",
+                project_id,
+                _prune_exc,
+            )
         await session.execute(
             delete(Direction).where(
                 Direction.project_id == pid,

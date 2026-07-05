@@ -4582,6 +4582,79 @@ async def test_candidate_currency_api_unreachable_distinct_from_unknown(
     _assert_generated_at_iso_utc(cc)
 
 
+@pytest.mark.asyncio
+async def test_pruned_direction_fetch_returns_tombstone_record(
+    client: AsyncClient, db_session
+):
+    """Fetching a pruned direction id returns 410 with structured tombstone data."""
+    pruned_id = "dir-pruned-1"
+    project = Project(
+        name="Prune Test",
+        user_id="test-user-prune",
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": pruned_id,
+                    "retired_at": "2026-07-05T01:00:00+00:00",
+                    "reason": "completed",
+                    "gap_id": "g-done",
+                    "text_tokens": ["fix", "bug"],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-prune")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-prune")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/{pruned_id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 410, res.text
+    body = res.json()
+    tombstone = body["error"]["message"]
+    assert tombstone["status"] == "pruned"
+    assert tombstone["retired_at"] == "2026-07-05T01:00:00+00:00"
+    assert tombstone["reason"] == "completed"
+    assert tombstone["gap_id"] == "g-done"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_direction_never_existed_still_returns_404(
+    client: AsyncClient, db_session
+):
+    """Fetching a direction id that is neither live nor in retired memory returns 404."""
+    project = Project(
+        name="Ghost Test",
+        user_id="test-user-ghost",
+        directions=[{"id": "dir-live", "status": "active", "text": "live"}],
+        vision={"_recently_retired_directions": []},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-ghost")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-ghost")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions/dir-never-existed",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404, res.text
+
+
 def test_recoverable_sections_carry_actionable_fetch_verbs():
     """Every section registered as 'sections' in SECTION_FETCH_INVENTORY is
     actually served by agent_fetch_payload_section (i.e., the dispatch table

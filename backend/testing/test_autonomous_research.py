@@ -17042,3 +17042,131 @@ async def test_research_requeue_clone_reuses_inherited_staging_branch(
         "Fix: research_completion.py must reuse inherited research_branch when "
         "rollup_pr_number is set (mirrors plan_completion.py:554-560)."
     )
+
+
+@pytest.mark.asyncio
+async def test_prune_block_generates_tombstone_for_completed_direction(db_session):
+    """The lifecycle prune block records retired memory for pruned terminal directions.
+
+    A direction with status='completed' is not in the live set and must appear in
+    pending_retired_memory after _process_direction_lifecycle_locked so the
+    with_vision_locked flush writes it to _recently_retired_directions.
+    """
+    from app.direction_lifecycle import _process_direction_lifecycle_locked
+
+    completed_dir = {
+        "id": "d-prune-tombstone-01",
+        "status": "completed",
+        "text": "Tombstone test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test",
+    }
+    project = Project(
+        name="Tombstone Test",
+        user_id="test-user-tombstone",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = datetime.now(timezone.utc)
+    pending_retired_memory: list = []
+    await _process_direction_lifecycle_locked(
+        project,
+        db_session,
+        set(),
+        now,
+        pending_retired_memory=pending_retired_memory,
+    )
+
+    recorded_ids = [d.get("id") for d, _ in pending_retired_memory]
+    assert "d-prune-tombstone-01" in recorded_ids, (
+        f"Pruned completed direction must appear in pending_retired_memory; got {recorded_ids}"
+    )
+    matched_reason = next(
+        reason for d, reason in pending_retired_memory if d.get("id") == "d-prune-tombstone-01"
+    )
+    assert matched_reason == "manually_completed", (
+        f"Expected reason 'manually_completed', got {matched_reason!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vision_lock_miss_logs_warning(db_session, mocker):
+    """When with_vision_locked returns False, a structured warning is emitted and no exception raised."""
+    from unittest.mock import AsyncMock, patch
+    from app.direction_lifecycle import _process_direction_lifecycle
+
+    completed_dir = {
+        "id": "d-lock-miss-01",
+        "status": "completed",
+        "text": "Lock miss test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test-lock-miss",
+    }
+    project = Project(
+        name="Lock Miss Test",
+        user_id="test-user-lock-miss",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    lock_mock = AsyncMock(return_value=False)
+    with patch("app.task_locking.with_vision_locked", new=lock_mock):
+        with patch("app.direction_lifecycle.logger") as mock_logger:
+            await _process_direction_lifecycle(project, db_session, set(), datetime.now(timezone.utc))
+
+    warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+    assert any("d-lock-miss-01" in c for c in warning_calls), (
+        f"Expected warning mentioning dropped direction ID; got: {warning_calls}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_vision_lock_timeout_logs_error_and_reraises(db_session, mocker):
+    """When with_vision_locked raises OperationalError, a structured error is logged and re-raised."""
+    from unittest.mock import patch
+    from sqlalchemy.exc import OperationalError
+    from app.direction_lifecycle import _process_direction_lifecycle
+
+    completed_dir = {
+        "id": "d-lock-timeout-01",
+        "status": "completed",
+        "text": "Lock timeout test direction",
+        "auto_completed_reason": "manually_completed",
+        "gap_id": "g-test-lock-timeout",
+    }
+    project = Project(
+        name="Lock Timeout Test",
+        user_id="test-user-lock-timeout",
+        autonomous_enabled=True,
+        directions=[completed_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    op_err = OperationalError("lock timeout", None, None)
+
+    async def _raise(*args, **kwargs):
+        raise op_err
+
+    with patch("app.task_locking.with_vision_locked", new=_raise):
+        with patch("app.direction_lifecycle.logger") as mock_logger:
+            with pytest.raises(OperationalError):
+                await _process_direction_lifecycle(
+                    project, db_session, set(), datetime.now(timezone.utc)
+                )
+
+    error_calls = [str(c) for c in mock_logger.error.call_args_list]
+    assert any("d-lock-timeout-01" in c for c in error_calls), (
+        f"Expected error mentioning dropped direction ID; got: {error_calls}"
+    )

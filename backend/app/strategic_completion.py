@@ -4070,9 +4070,18 @@ async def _handle_strategic_completion(
         # Per-cycle message post removed: the strategic agent now maintains
         # project.running_update as a living markdown document it rewrites
         # each cycle. Replaces the previous one-message-per-cycle noise.
-        await _spawn_retirement_memos(
-            session, project, task, retired_ids, retired_rationales
-        )
+        try:
+            await _spawn_retirement_memos(
+                session, project, task, retired_ids, retired_rationales
+            )
+        except Exception:
+            logger.error(
+                "[STRATEGIC] Task %s: _spawn_retirement_memos failed; retirement memos not created "
+                "for direction IDs %s — commit will still proceed",
+                task.id,
+                retired_ids,
+                exc_info=True,
+            )
         await session.commit()
         # Post-commit: the live strategic ops already emitted per-write
         # `strategic_updated` events during execution; here we close the cycle.
@@ -5860,9 +5869,18 @@ async def _handle_strategic_completion(
     # cycle; the user acknowledges to stamp a read-marker.
     task.latest_status_message = f"Strategic review complete — vision rev {vision_rev}, {ops_applied} direction ops, {msgs_created} messages, {msgs_resolved} resolved"
     session.add(task)
-    await _spawn_retirement_memos(
-        session, project, task, retired_ids_fb, retired_rationales_fb
-    )
+    try:
+        await _spawn_retirement_memos(
+            session, project, task, retired_ids_fb, retired_rationales_fb
+        )
+    except Exception:
+        logger.error(
+            "[STRATEGIC] Task %s: _spawn_retirement_memos failed (fallback path); retirement memos "
+            "not created for direction IDs %s — commit will still proceed",
+            task.id,
+            retired_ids_fb,
+            exc_info=True,
+        )
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status

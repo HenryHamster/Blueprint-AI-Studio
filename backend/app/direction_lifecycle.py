@@ -373,13 +373,31 @@ async def _process_direction_lifecycle(
     if pending_retired_memory:
         from app.strategic_completion import record_retired_direction_memory
         from app.task_locking import with_vision_locked
+        from sqlalchemy.exc import OperationalError
+
+        dropped_ids = [d.get("id") for d, _ in pending_retired_memory]
 
         def _apply_retired_memory(vision: dict) -> None:
             for direction, reason in pending_retired_memory:
                 record_retired_direction_memory(vision, direction, reason=reason)
 
-        if await with_vision_locked(session, project.id, _apply_retired_memory):
+        try:
+            locked = await with_vision_locked(session, project.id, _apply_retired_memory)
+        except OperationalError:
+            logger.error(
+                "[LIFECYCLE] Vision lock timed out while flushing retired-memory entries; "
+                "entries NOT persisted — direction IDs: %s",
+                dropped_ids,
+            )
+            raise
+        if locked:
             await session.commit()
+        else:
+            logger.warning(
+                "[LIFECYCLE] Vision lock not acquired (project missing?) while flushing "
+                "retired-memory entries; entries silently dropped — direction IDs: %s",
+                dropped_ids,
+            )
     return active
 
 
@@ -574,6 +592,18 @@ async def _process_direction_lifecycle_locked(
         if d.get("status") in ("active", "proposed", "paused", "staged")
     ]
     if len(live_dirs) < len(project.directions or []):
+        pruned_dirs = [
+            d
+            for d in (project.directions or [])
+            if d.get("status") not in ("active", "proposed", "paused", "staged")
+        ]
+        # Record tombstone memory for each pruned direction not already covered
+        # by an explicit auto-retire call earlier in this lifecycle pass.
+        already_recorded_ids = {d.get("id") for d, _ in (pending_retired_memory or [])}
+        for d in pruned_dirs:
+            if d.get("id") not in already_recorded_ids:
+                reason = d.get("auto_completed_reason") or d.get("status") or "pruned"
+                _record_auto_retired_memory(pending_retired_memory, d, reason)
         logger.info(
             f"[AUTONOMOUS] Pruned {len(project.directions or []) - len(live_dirs)} dead directions from {project.id}"
         )

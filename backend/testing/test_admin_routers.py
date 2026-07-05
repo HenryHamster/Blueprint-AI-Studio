@@ -24838,3 +24838,110 @@ async def test_create_direction_retired_match_does_not_block(
     # Grounding attached (landed match)
     assert "retired_grounding" in body
     assert body["retired_grounding"]["classification"] == "landed"
+
+
+@pytest.mark.asyncio
+async def test_direction_created_during_gated_op_survives_commit(
+    client: AsyncClient, db_session, mocker
+):
+    """A direction written by a concurrent writer during the handler's slow
+    awaits must survive in the final array.
+
+    Previously every strategic op used ``lambda _: _d`` which returned the
+    pre-await snapshot regardless of what ``_with_directions_locked`` loaded
+    inside the lock, silently overwriting any direction appended concurrently.
+    The fix replaces each stale-snapshot closure with one that applies only
+    the targeted mutation to the *fresh* list the lock provides.
+
+    This test injects a ``d-concurrent`` direction into the list that
+    ``_with_project_locked_list_mutation`` presents to the mutate_fn so that
+    the CREATE closure (lambda fresh: [*fresh, new_dir]) exercises the fresh
+    path rather than discarding the concurrent write.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    import app.task_locking as _tl
+
+    mocker.patch("app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock())
+
+    concurrent_direction = {
+        "id": "d-concurrent",
+        "text": "concurrent direction written mid-flight",
+        "status": "active",
+        "priority": "low",
+        "notes": [],
+        "research_history": [],
+        "context": {
+            "success_evidence": "seen",
+            "retirement_condition": "done",
+        },
+    }
+
+    original_fn = _tl._with_project_locked_list_mutation
+
+    async def _injecting_wrapper(session, project_id, mutate_fn, *, skip_locked):
+        """Inject a concurrent direction into the fresh list before calling mutate_fn."""
+        def _mutate_with_concurrent(fresh: list):
+            # Simulate a concurrent writer having appended d-concurrent since
+            # the handler's initial load but before the lock was acquired.
+            augmented = list(fresh) + [concurrent_direction]
+            return mutate_fn(augmented)
+
+        return await original_fn(
+            session, project_id, _mutate_with_concurrent, skip_locked=skip_locked
+        )
+
+    mocker.patch.object(_tl, "_with_project_locked_list_mutation", new=_injecting_wrapper)
+
+    project = Project(
+        name="ConcurrentWriteTest",
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-preexisting",
+                "text": "pre-existing direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "context": {
+                    "success_evidence": "done",
+                    "retirement_condition": "done",
+                },
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_strategic_task_for_project(db_session, project)
+    token = create_agent_token(
+        str(task.id), "vm-retired-grounding-test", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "New direction added by strategic op",
+                "priority": "high",
+                "success_evidence": "feature ships",
+                "retirement_condition": "feature verified",
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    new_dir_id = body["direction_id"]
+
+    await db_session.refresh(project)
+    ids = {d.get("id") for d in (project.directions or [])}
+    assert "d-preexisting" in ids, f"pre-existing direction lost; got ids={ids}"
+    assert "d-concurrent" in ids, f"concurrent direction overwritten; got ids={ids}"
+    assert new_dir_id in ids, f"new direction missing; got ids={ids}"

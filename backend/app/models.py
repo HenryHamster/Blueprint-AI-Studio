@@ -3740,6 +3740,68 @@ class Direction(SQLModel, table=True):
     )
 
 
+class DirectionEvent(SQLModel, table=True):
+    """Append-only event log for direction lifecycle transitions.
+
+    One row per notable lifecycle moment on a direction: creation, status
+    transitions (active→paused, active→expired/retired, paused→active, ...),
+    and hard deletion (``pruned``) from the table.  The table is written as a
+    best-effort side-effect inside ``directions_repo.upsert_direction`` and
+    ``sync_directions`` so every write path — lifecycle auto-pauses, strategic
+    ops, user PATCH, staged activation, and whole-array pruning — emits events
+    without touching any in-flight code.
+
+    Queryable via ``GET /api/admin/projects/{pid}/directions/{key}/events``.
+    """
+
+    __tablename__ = "direction_event"
+    __table_args__ = (
+        Index("ix_direction_event_project_key", "project_id", "direction_key"),
+    )
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+
+    project_id: uuid.UUID = Field(
+        sa_column=Column(
+            GUID(),
+            ForeignKey("project.id", ondelete="CASCADE"),
+            nullable=False,
+        ),
+    )
+
+    direction_key: str = Field(sa_column=Column(String(128), nullable=False))
+
+    # "created" | "status_changed" | "pruned"
+    event_kind: str = Field(sa_column=Column(String(32), nullable=False))
+
+    prior_status: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+    new_status: str | None = Field(
+        default=None, sa_column=Column(String(32), nullable=True)
+    )
+
+    # Optional actor (agent id, "system", "operator") and human-readable reason.
+    actor: str | None = Field(
+        default=None, sa_column=Column(String(64), nullable=True)
+    )
+    reason: str | None = Field(
+        default=None, sa_column=Column(Text, nullable=True)
+    )
+
+    # Full direction dict at the moment of the event (nullable to keep row small
+    # for no-op probes; always populated for created/status_changed/pruned).
+    snapshot_data: Dict[str, Any] | None = Field(
+        default=None,
+        sa_column=Column(JSONB, nullable=True),
+    )
+
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
+    )
+
+
 class ReleaseVersion(SQLModel, table=True):
     """Release-version lifecycle record for automain → main promotion gating.
 

@@ -1159,8 +1159,16 @@ async def strategic_operation(
                     "classified drift: %s",
                     _gap_details,
                 )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_new_dir = new_dir
+        await _with_directions_locked(
+            session,
+            project.id,
+            lambda fresh: (
+                [*fresh, _captured_new_dir]
+                if not any(d.get("id") == _captured_new_dir["id"] for d in fresh)
+                else fresh
+            ),
+        )
         ctx = task.context or {}
         created_ids = list(ctx.get("_strategic_created_ids", []))
         created_ids.append(new_dir["id"])
@@ -1483,8 +1491,16 @@ async def strategic_operation(
                 )
 
             await _with_vision_locked(session, project.id, _record_terminal_memory)
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_updated_dir = dict(_updated_dir) if _updated_dir is not None else None
+        _captured_update_id = str(dir_id)
+        def _apply_update(fresh: list) -> list:
+            if _captured_updated_dir is None:
+                return fresh
+            return [
+                _captured_updated_dir if d.get("id") == _captured_update_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_update)
         ctx = task.context or {}
         updated_ids = list(ctx.get("_strategic_updated_ids", []))
         updated_ids.append(str(dir_id))
@@ -1595,8 +1611,14 @@ async def strategic_operation(
             matched_direction["notes"] = _cap_list(
                 notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
             )
-            _d = directions
-            await _with_directions_locked(session, project.id, lambda _: _d)
+            _captured_deferred_dir = dict(matched_direction)
+            _captured_deferred_id = str(dir_id)
+            def _apply_deferred(fresh: list) -> list:
+                return [
+                    _captured_deferred_dir if d.get("id") == _captured_deferred_id else d
+                    for d in fresh
+                ]
+            await _with_directions_locked(session, project.id, _apply_deferred)
             verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
             verdicts.append(gate_audit)
             deferrals = list(ctx.get("_strategic_retirement_deferrals", []))
@@ -1658,8 +1680,14 @@ async def strategic_operation(
         matched_direction["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_retired_dir = dict(matched_direction)
+        _captured_retire_id = str(dir_id)
+        def _apply_retire(fresh: list) -> list:
+            return [
+                _captured_retired_dir if d.get("id") == _captured_retire_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_retire)
         # Reconcile the problem-model gap this direction was staffing in the SAME
         # committed transaction: prune the retired id from gap.active_moves (->
         # past_moves) and, if it was the gap's last active move, record a
@@ -1812,8 +1840,14 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_staged_dir = dict(target)
+        _captured_stage_id = str(dir_id)
+        def _apply_stage(fresh: list) -> list:
+            return [
+                _captured_staged_dir if d.get("id") == _captured_stage_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_stage)
         if _gap_id:
             from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
 
@@ -1951,8 +1985,14 @@ async def strategic_operation(
                     "classified drift: %s",
                     _gap_details,
                 )
-        _d = directions
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_approved_dir = dict(target)
+        _captured_approve_id = str(dir_id)
+        def _apply_approve(fresh: list) -> list:
+            return [
+                _captured_approved_dir if d.get("id") == _captured_approve_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_approve)
         ctx = task.context or {}
         task.context = {
             **ctx,
@@ -2047,8 +2087,18 @@ async def strategic_operation(
                     vm_ids_to_delete.append(t.vm_instance_id)
             cancelled_count += len(cancelled_tasks)
             await session.flush()
-        _d = remaining
-        await _with_directions_locked(session, project.id, lambda _: _d)
+        _captured_reject_id = str(dir_id)
+        _captured_tombstone = tombstone if rejected_text else None
+        def _apply_reject(fresh: list) -> list:
+            _fresh_remaining = [d for d in fresh if d.get("id") != _captured_reject_id]
+            if _captured_tombstone is None:
+                return _fresh_remaining
+            _rejected_bucket = [d for d in _fresh_remaining if d.get("status") == "rejected"]
+            _non_rejected_bucket = [d for d in _fresh_remaining if d.get("status") != "rejected"]
+            _rejected_bucket.append(_captured_tombstone)
+            _rejected_bucket = _rejected_bucket[-20:]
+            return _non_rejected_bucket + _rejected_bucket
+        await _with_directions_locked(session, project.id, _apply_reject)
         ctx = task.context or {}
         task.context = {
             **ctx,

@@ -341,6 +341,24 @@ async def agent_fetch_direction(
         None,
     )
     if direction is None:
+        retired = next(
+            (
+                r
+                for r in ((project.vision or {}).get("_recently_retired_directions") or [])
+                if r.get("id") == direction_id
+            ),
+            None,
+        )
+        if retired is not None:
+            raise HTTPException(
+                status_code=410,
+                detail={
+                    "status": "pruned",
+                    "retired_at": retired.get("retired_at"),
+                    "reason": retired.get("reason"),
+                    "gap_id": retired.get("gap_id"),
+                },
+            )
         raise HTTPException(status_code=404, detail="Direction not found")
     out = dict(direction)
     # Compute merge_credit summary from the full history before capping.
