@@ -48,6 +48,13 @@ vi.mock('../telemetry.js', async (importOriginal) => {
       total_input_tokens: 0,
       total_output_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_cache_creation_input_tokens: 0,
+      total_cache_read_input_tokens: 0,
+      num_turns: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     }),
   };
 });
@@ -87,6 +94,7 @@ describe('handleMemo', () => {
       llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
       total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0, num_turns: 0, total_tool_result_bytes: 0,
+      prompt_size_bytes: null, prompt_section_count: null, prompt_section_sizes: null,
     });
   });
 
@@ -264,6 +272,9 @@ describe('handleMemo', () => {
         viewport_screenshot_forwarded_count: 0,
         num_turns: 0,
         total_tool_result_bytes: 0,
+        prompt_size_bytes: null,
+        prompt_section_count: null,
+        prompt_section_sizes: null,
       };
     });
 

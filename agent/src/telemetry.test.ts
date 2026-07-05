@@ -76,6 +76,9 @@ describe('LLM telemetry', () => {
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
       total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
   it('accumulates call counts and token totals', () => {
@@ -92,6 +95,9 @@ describe('LLM telemetry', () => {
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
       total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
@@ -107,6 +113,9 @@ describe('LLM telemetry', () => {
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
       total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
   it('resets all counters', () => {
@@ -122,6 +131,9 @@ describe('LLM telemetry', () => {
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
       total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
   it('breaks out cache-creation and cache-read while total_input_tokens stays the inclusive sum', () => {

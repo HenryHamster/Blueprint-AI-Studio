@@ -1903,6 +1903,17 @@ def bank_task_current_attempt(
     tool_result_bytes_val = (task.api_call_summary or {}).get("total_tool_result_bytes")
     if isinstance(tool_result_bytes_val, int) and tool_result_bytes_val >= 0:
         snapshot["total_tool_result_bytes"] = tool_result_bytes_val
+    # Carry prompt-size telemetry only when present; omit for older agents or
+    # non-research/plan tasks so downstream attribution can distinguish unknown.
+    prompt_size_val = (task.api_call_summary or {}).get("prompt_size_bytes")
+    if isinstance(prompt_size_val, int) and prompt_size_val >= 0:
+        snapshot["prompt_size_bytes"] = prompt_size_val
+    prompt_section_count_val = (task.api_call_summary or {}).get("prompt_section_count")
+    if isinstance(prompt_section_count_val, int) and prompt_section_count_val >= 0:
+        snapshot["prompt_section_count"] = prompt_section_count_val
+    prompt_section_sizes_val = (task.api_call_summary or {}).get("prompt_section_sizes")
+    if isinstance(prompt_section_sizes_val, list):
+        snapshot["prompt_section_sizes"] = prompt_section_sizes_val
     history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history

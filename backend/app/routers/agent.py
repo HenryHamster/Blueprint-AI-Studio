@@ -4848,6 +4848,9 @@ async def agent_heartbeat(
         or req.total_cache_read_input_tokens is not None
         or req.viewport_screenshot_forwarded_count is not None
         or req.total_tool_result_bytes is not None
+        or req.prompt_size_bytes is not None
+        or req.prompt_section_count is not None
+        or req.prompt_section_sizes is not None
     ):
         summary = {
             "llm_call_count": int(req.llm_call_count or 0),
@@ -4877,6 +4880,16 @@ async def agent_heartbeat(
         # agents leave the key absent (unknown ≠ zero) in downstream aggregations.
         if req.total_tool_result_bytes is not None:
             summary["total_tool_result_bytes"] = int(req.total_tool_result_bytes)
+        # Persist prompt-size telemetry only when sent — backwards-compatible
+        # with older agents that don't emit these fields.
+        if req.prompt_size_bytes is not None:
+            summary["prompt_size_bytes"] = int(req.prompt_size_bytes)
+        if req.prompt_section_count is not None:
+            summary["prompt_section_count"] = int(req.prompt_section_count)
+        if req.prompt_section_sizes is not None:
+            summary["prompt_section_sizes"] = [
+                s.model_dump() for s in req.prompt_section_sizes
+            ]
         task.api_call_summary = summary
 
     # Per-task structured-output format-compliance telemetry (equipping

@@ -18556,6 +18556,78 @@ async def test_heartbeat_persists_tool_result_bytes(client: AsyncClient, db_sess
 
 
 @pytest.mark.asyncio
+async def test_heartbeat_persists_prompt_size_telemetry(client: AsyncClient, db_session):
+    """Heartbeat persists prompt_size_bytes, prompt_section_count, and
+    prompt_section_sizes into api_call_summary; keys are absent when the agent
+    doesn't send them (backwards-compatible with older agents)."""
+    project = Project(name="Prompt Size Telemetry", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "research"}],
+        vm_instance_id="agent-vm-prompt-size",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    assert task.api_call_summary is None
+
+    token = create_agent_token(str(task.id), "agent-vm-prompt-size")
+    section_sizes = [
+        {"name": "context_prefix", "bytes": 4096},
+        {"name": "playbook", "bytes": 2048},
+        {"name": "directions", "bytes": 1024},
+    ]
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 1,
+            "total_input_tokens": 50000,
+            "total_output_tokens": 1000,
+            "prompt_size_bytes": 32768,
+            "prompt_section_count": 12,
+            "prompt_section_sizes": section_sizes,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["prompt_size_bytes"] == 32768
+    assert summary["prompt_section_count"] == 12
+    assert summary["prompt_section_sizes"] == section_sizes
+    # Unrelated summary keys must be present too
+    assert summary["total_input_tokens"] == 50000
+
+    # A heartbeat that omits prompt-size fields leaves those keys absent —
+    # unknown ≠ zero; backwards-compatible with older agents.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 2,
+            "total_input_tokens": 60000,
+            "total_output_tokens": 1200,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert "prompt_size_bytes" not in task.api_call_summary
+    assert "prompt_section_count" not in task.api_call_summary
+    assert "prompt_section_sizes" not in task.api_call_summary
+    # Unrelated summary keys still present
+    assert task.api_call_summary["total_input_tokens"] == 60000
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_omits_api_call_summary_when_fields_absent(
     client: AsyncClient, db_session
 ):

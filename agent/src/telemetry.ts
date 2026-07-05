@@ -44,6 +44,9 @@ let _totalCacheReadInputTokens = 0; // @per-role
 let _viewportScreenshotForwardedCount = 0; // @per-role
 let _totalNumTurns = 0; // @per-role
 let _totalToolResultBytes = 0; // @per-role
+let _promptSizeBytes: number | null = null; // @per-role; set once per prompt assembly
+let _promptSectionCount: number | null = null; // @per-role
+let _promptSectionSizes: Array<{ name: string; bytes: number }> | null = null; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
 export function recordLlmCallStart(): void {
@@ -103,6 +106,18 @@ export function recordToolResultBytes(bytes: number): void {
   }
 }
 
+/** Store prompt-size telemetry so it is included on every subsequent heartbeat.
+ *  Called once after prompt assembly in research/plan handlers. */
+export function setPromptSizeTelemetry(
+  sizeBytes: number,
+  sectionCount: number,
+  sectionSizes: Array<{ name: string; bytes: number }>,
+): void {
+  _promptSizeBytes = sizeBytes;
+  _promptSectionCount = sectionCount;
+  _promptSectionSizes = sectionSizes;
+}
+
 /** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
 export function getLlmTelemetry(): {
   llm_call_count: number;
@@ -113,6 +128,9 @@ export function getLlmTelemetry(): {
   viewport_screenshot_forwarded_count: number;
   num_turns: number;
   total_tool_result_bytes: number;
+  prompt_size_bytes: number | null;
+  prompt_section_count: number | null;
+  prompt_section_sizes: Array<{ name: string; bytes: number }> | null;
 } {
   return {
     llm_call_count: _llmCallCount,
@@ -123,6 +141,9 @@ export function getLlmTelemetry(): {
     viewport_screenshot_forwarded_count: _viewportScreenshotForwardedCount,
     num_turns: _totalNumTurns,
     total_tool_result_bytes: _totalToolResultBytes,
+    prompt_size_bytes: _promptSizeBytes,
+    prompt_section_count: _promptSectionCount,
+    prompt_section_sizes: _promptSectionSizes,
   };
 }
 
@@ -136,6 +157,9 @@ export function resetLlmTelemetry(): void {
   _viewportScreenshotForwardedCount = 0;
   _totalNumTurns = 0;
   _totalToolResultBytes = 0;
+  _promptSizeBytes = null;
+  _promptSectionCount = null;
+  _promptSectionSizes = null;
 }
 
 // ── Per-task structured-output format-compliance telemetry (equipping d-46468a41) ─

@@ -259,7 +259,7 @@ import { handleStrategic } from './strategic.js';
 import { writeDesignDocHelper, readClaudeMd, buildContextPrefix } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
-import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
+import { recordFormatRepairAttempt, recordFormatRepairSuccess, getLlmTelemetry, resetLlmTelemetry } from '../telemetry.js';
 import {
   calcMessageAge,
   parseResearchContext,
@@ -4342,22 +4342,30 @@ describe('research/plan prompt byte-budget ratchet', () => {
   });
 
   it('records prompt size telemetry in the startup heartbeat for plan and research', async () => {
+    resetLlmTelemetry();
     await handlePlan(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
-    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const planTelemetry = getLlmTelemetry();
 
-    const asTelemetry = (value: unknown) => value as {
-      prompt_size_bytes: number;
-      prompt_section_count: number;
-      prompt_section_sizes: Array<{ name: string; bytes: number }>;
-    };
-    const firstTelemetry = asTelemetry(vi.mocked(mockedIndexModule.sendHeartbeatSync).mock.calls[0]?.[2]);
-    const secondTelemetry = asTelemetry(vi.mocked(mockedIndexModule.sendHeartbeatSync).mock.calls[1]?.[2]);
-    expect(firstTelemetry.prompt_size_bytes).toBeGreaterThan(0);
-    expect(firstTelemetry.prompt_section_count).toBeGreaterThan(0);
-    expect(firstTelemetry.prompt_section_sizes[0].name).toBe('prompt_body');
-    expect(secondTelemetry.prompt_size_bytes).toBeGreaterThan(0);
-    expect(secondTelemetry.prompt_section_count).toBeGreaterThan(0);
-    expect(secondTelemetry.prompt_section_sizes[0].name).toBe('prompt_body');
+    resetLlmTelemetry();
+    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    const researchTelemetry = getLlmTelemetry();
+
+    // prompt_size_bytes must be the real assembled-prompt byte length — positive
+    expect(planTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(planTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(planTelemetry.prompt_section_sizes).not.toBeNull();
+    // 'prompt_body' must NOT appear as a section (the whole prompt is not a component of itself)
+    expect((planTelemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    // Component sections summed must not exceed the total (no double-counting)
+    const planSectionSum = (planTelemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(planSectionSum).toBeLessThanOrEqual(planTelemetry.prompt_size_bytes ?? 0);
+
+    expect(researchTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(researchTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(researchTelemetry.prompt_section_sizes).not.toBeNull();
+    expect((researchTelemetry.prompt_section_sizes ?? []).map(s => s.name)).not.toContain('prompt_body');
+    const researchSectionSum = (researchTelemetry.prompt_section_sizes ?? []).reduce((s, e) => s + e.bytes, 0);
+    expect(researchSectionSum).toBeLessThanOrEqual(researchTelemetry.prompt_size_bytes ?? 0);
   });
 });
 

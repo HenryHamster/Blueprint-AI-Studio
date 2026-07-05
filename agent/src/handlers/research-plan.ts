@@ -50,6 +50,7 @@ import { repairStructuredOutput } from './structured-output-repair.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveMigrationLayout } from './specialized.js';
+import { setPromptSizeTelemetry } from '../telemetry.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
   'research', 'investigate', 'audit', 'memo',
@@ -392,13 +393,13 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
   return line1 + line2 + line3 + line4 + line5 + line6 + line7 + priorFailuresLine;
 }
 
-function buildPromptSizeTelemetry(sections: Array<[string, string]>): Record<string, unknown> {
+function buildPromptSizeTelemetry(fullPrompt: string, sections: Array<[string, string]>): Record<string, unknown> {
   const sized = sections
     .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
     .sort((a, b) => b.bytes - a.bytes);
   return {
+    prompt_size_bytes: Buffer.byteLength(fullPrompt, 'utf8'),
     prompt_section_count: sized.length,
-    prompt_size_bytes: sized.reduce((sum, section) => sum + section.bytes, 0),
     prompt_section_sizes: sized.slice(0, 3),
   };
 }
@@ -1939,7 +1940,7 @@ Rules:
 - ALSO write /tmp/plan_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
 ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
-  const planPromptTelemetry = buildPromptSizeTelemetry([
+  const planPromptTelemetry = buildPromptSizeTelemetry(planPrompt, [
     ['playbook', planPlaybookSection],
     ['retry_context', planRetryContext],
     ['context_prefix', contextPrefix],
@@ -1948,9 +1949,13 @@ ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
     ['claude_md_prefix', claudeMdPrefix],
     ['available_capabilities', planAvailableCapabilitiesSection],
     ['greenfield', greenfieldBranch],
-    ['prompt_body', planPrompt],
   ]);
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, ...planPromptTelemetry });
+  setPromptSizeTelemetry(
+    planPromptTelemetry.prompt_size_bytes as number,
+    planPromptTelemetry.prompt_section_count as number,
+    planPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+  );
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -2650,7 +2655,7 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
   const researchPromptFull = researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
-  const researchPromptTelemetry = buildPromptSizeTelemetry([
+  const researchPromptTelemetry = buildPromptSizeTelemetry(researchPromptFull, [
     ['context_prefix', contextPrefix],
     ['playbook', researchPlaybookSection],
     ['retry_context', researchRetryContext],
@@ -2667,9 +2672,13 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
     ['prior_knowledge', priorKnowledgeSection],
     ['pipeline_scope_rates', pipelineScopeRatesSection],
     ['anomaly', anomalySection],
-    ['prompt_body', researchPromptFull],
   ]);
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, ...researchPromptTelemetry });
+  setPromptSizeTelemetry(
+    researchPromptTelemetry.prompt_size_bytes as number,
+    researchPromptTelemetry.prompt_section_count as number,
+    researchPromptTelemetry.prompt_section_sizes as Array<{ name: string; bytes: number }>,
+  );
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
   statusRef.value = 'Running codebase research...';
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPromptFull, ws, statusRef, model, effort, disallowedTools);
 

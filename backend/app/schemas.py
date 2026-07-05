@@ -351,6 +351,12 @@ class ToolTraceEntry(BaseModel):
     input_preview: str
 
 
+class PromptSectionSize(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+    name: str = Field(max_length=100)
+    bytes: int = Field(ge=0)
+
+
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="ignore")
     task_id: uuid.UUID
@@ -448,6 +454,15 @@ class HeartbeatRequest(BaseModel):
     # LLM within this task. Backwards-compatible: older agents omit this field;
     # absent means unknown (not zero) in downstream aggregations.
     total_tool_result_bytes: int | None = Field(None, ge=0)
+    # Prompt-size telemetry for research/plan invocations. prompt_size_bytes is
+    # the true byte-length of the assembled prompt sent to the model (NOT the
+    # inflated sum of component sections). prompt_section_sizes records the
+    # top-3 largest named component sections (excluding the assembled prompt
+    # itself). Backwards-compatible: older agents omit these fields; absent
+    # means unknown in downstream aggregations.
+    prompt_size_bytes: int | None = Field(None, ge=0)
+    prompt_section_count: int | None = Field(None, ge=0)
+    prompt_section_sizes: List[PromptSectionSize] | None = Field(None, max_length=10)
     # Number of agent turns (user→assistant exchanges) in this CLI invocation.
     # Distinct from llm_call_count (API calls): allows per-turn context-size
     # decomposition in the efficiency snapshot. Backwards-compatible: older
