@@ -66,7 +66,8 @@ import {
   computeResearchPlanPromptFingerprint,
 } from '../prompts/thinker.js';
 export { buildThinkerPrompt, runThinkerWithGate, type ThinkerPromptParams } from '../prompts/thinker.js';
-import { ACCEPTANCE_EVIDENCE_RUBRIC } from './research-plan-prompt-blocks.js';
+import { ACCEPTANCE_EVIDENCE_RUBRIC, CAPABILITY_DECLARATION_DOC } from './research-plan-prompt-blocks.js';
+export { CAPABILITY_DECLARATION_DOC } from './research-plan-prompt-blocks.js';
 
 // ── Pure data transformation helpers (exported for testing) ─────────────────
 
@@ -1721,14 +1722,6 @@ export function buildAvailableCapabilitiesSection(caps: unknown): string {
     ...lines,
   ].join('\n') + '\n\n';
 }
-
-// Shared, uniform documentation of the capability-declaration framework, embedded
-// identically in the research, plan, strategic, and design prompts so EVERY task
-// type participates in the same vocabulary (not research special-casing). Frames
-// both the producer stamp and the consumer ref as drawn from AVAILABLE CAPABILITIES.
-export const CAPABILITY_DECLARATION_DOC = [
-  '**Shared capability vocabulary (applies to this and every other task type):** you may declare a `provides_capability` stamp (a capability your work ADVERTISES) and/or a `prerequisite` capability ref (a capability your work DEPENDS ON). BOTH must be drawn from the AVAILABLE CAPABILITIES list above when one fits — the registry is the shared namespace, and the resolver matches EXACTLY (no fuzzy matching), so a free-prose name a different lane will never reproduce leaves the dependency stranded. Use the SAME kebab-case convention and propose a NEW name ONLY for a genuinely new capability absent from the list. An off-registry ref is still accepted (never rejected) and flagged advisory for the strategist to fold into the registry.',
-].join('\n');
 
 // Mirrors the backend's plan-child allowlist: PLAN_SUBTASK_TYPES (the
 // PR-producing implementation subtypes) ∪ PLAN_KNOWLEDGE_SUBTASK_TYPES (the

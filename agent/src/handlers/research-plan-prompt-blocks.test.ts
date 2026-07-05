@@ -1,12 +1,24 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { ACCEPTANCE_EVIDENCE_RUBRIC } from './research-plan-prompt-blocks.js';
+import { CAPABILITY_DECLARATION_DOC, ACCEPTANCE_EVIDENCE_RUBRIC } from './research-plan-prompt-blocks.js';
 
 const RESEARCH_PLAN_SRC = readFileSync(
   fileURLToPath(new URL('./research-plan.ts', import.meta.url)),
   'utf-8',
 );
+
+describe('CAPABILITY_DECLARATION_DOC', () => {
+  it('documents both the provides_capability stamp and the prerequisite ref drawn from the registry', () => {
+    expect(CAPABILITY_DECLARATION_DOC).toContain('provides_capability');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('prerequisite');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('AVAILABLE CAPABILITIES');
+    // Applies to every task type, not research special-casing.
+    expect(CAPABILITY_DECLARATION_DOC).toContain('every other task type');
+    // Off-registry refs are accepted (advisory), never rejected.
+    expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
+  });
+});
 
 describe('ACCEPTANCE_EVIDENCE_RUBRIC', () => {
   it('documents exactly the four payload/merge-gate kinds', () => {
@@ -30,9 +42,14 @@ describe('ACCEPTANCE_EVIDENCE_RUBRIC', () => {
   });
 });
 
-describe('research-plan.ts acceptance_evidence documentation', () => {
+describe('research-plan.ts shared-block references', () => {
   it('references the shared rubric from both the plan and research prompts', () => {
     const refs = RESEARCH_PLAN_SRC.match(/\$\{ACCEPTANCE_EVIDENCE_RUBRIC\}/g) ?? [];
+    expect(refs.length).toBe(2);
+  });
+
+  it('references CAPABILITY_DECLARATION_DOC from both the plan and research prompts', () => {
+    const refs = RESEARCH_PLAN_SRC.match(/\$\{CAPABILITY_DECLARATION_DOC\}/g) ?? [];
     expect(refs.length).toBe(2);
   });
 

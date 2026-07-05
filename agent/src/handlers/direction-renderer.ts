@@ -31,8 +31,11 @@ export function renderDirection(
   // Research context — restructure to avoid anchoring on small past findings.
   // Show failed approaches and open questions in full (high-signal steering).
   // Summarize established findings as a count to inform without anchoring scope.
+  // For the CURRENT direction, skip: ## Direction Context from buildContextPrefix
+  // already carries this narrative authoritatively, so re-emitting it here doubles tokens.
+  const isCurrentDirection = !!currentDirectionId && d.id === currentDirectionId;
   let researchCtx = '';
-  if (typeof d.research_context === 'string' && (d.research_context).length > 0) {
+  if (!isCurrentDirection && typeof d.research_context === 'string' && (d.research_context).length > 0) {
     const sections = parseResearchContext(d.research_context);
     const ctxParts: string[] = [];
     if (sections.established.length > 0) {

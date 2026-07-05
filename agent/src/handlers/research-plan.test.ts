@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync as realReadFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { CAPABILITY_DECLARATION_DOC as CAP_DOC_FROM_BLOCKS, ACCEPTANCE_EVIDENCE_RUBRIC } from './research-plan-prompt-blocks.js';
 
 const {
   INDEX_EXPORT_NAMES,
@@ -120,6 +123,7 @@ const {
     'recordLlmCallStart',
     'recordLlmTokens',
     'recordNumTurns',
+    'recordToolResultBytes',
     'recordToolUse',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
@@ -252,7 +256,7 @@ import { execFileSync } from 'child_process';
 import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
-import { writeDesignDocHelper, readClaudeMd } from '../prompt.js';
+import { writeDesignDocHelper, readClaudeMd, buildContextPrefix } from '../prompt.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
@@ -4354,5 +4358,135 @@ describe('research/plan prompt byte-budget ratchet', () => {
     expect(secondTelemetry.prompt_size_bytes).toBeGreaterThan(0);
     expect(secondTelemetry.prompt_section_count).toBeGreaterThan(0);
     expect(secondTelemetry.prompt_section_sizes[0].name).toBe('prompt_body');
+  });
+});
+
+// ── Owning-direction narrative deduplication ─────────────────────────────────
+// Verifies that when a task has direction_context, the owning direction's
+// research_context-derived prose (failed approaches, open questions) is NOT
+// re-emitted by renderDirection — buildContextPrefix already ships it once.
+// Non-owning directions must still render their research_context.
+describe('owning direction narrative deduplication', () => {
+  const ND_TASK_ID = 'nd-task-001';
+  const ND_GH_TOKEN = 'gh-token';
+  const ND_OWNER = 'owner';
+  const ND_REPO = 'repo';
+  const ND_WS = null;
+  const ND_STATUS_REF = () => ({ value: '' });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+  });
+
+  it('test_owning_direction_narrative_rendered_once', async () => {
+    const UNIQUE_FAILED = 'approach-zeta-unique-dedup-marker';
+    const UNIQUE_OPEN = 'question-eta-unique-dedup-marker';
+    const OTHER_CTX_ITEM = 'approach-theta-other-direction-marker';
+
+    // Simulate buildContextPrefix emitting the owning direction's narrative once
+    // (as ## Direction Context built from task.direction_context)
+    vi.mocked(buildContextPrefix).mockReturnValueOnce(
+      `## Direction Context\nFailed approaches:\n- ${UNIQUE_FAILED}\nOpen questions:\n- ${UNIQUE_OPEN}\n`,
+    );
+
+    const payload = {
+      base_branch: 'main',
+      current_direction_id: 'd-owning',
+      directions: [
+        {
+          id: 'd-owning',
+          text: 'Owning direction',
+          priority: 'medium',
+          status: 'active',
+          research_context: [
+            '## Established Findings',
+            '- finding 1 (merged)',
+            '## Failed Approaches',
+            `- ${UNIQUE_FAILED}`,
+            '## Open Questions',
+            `- ${UNIQUE_OPEN}`,
+          ].join('\n'),
+        },
+        {
+          id: 'd-other',
+          text: 'Other direction',
+          priority: 'medium',
+          status: 'active',
+          research_context: [
+            '## Failed Approaches',
+            `- ${OTHER_CTX_ITEM}`,
+          ].join('\n'),
+        },
+      ],
+    };
+
+    const task = {
+      title: 'Research task',
+      description: 'research',
+      context: {},
+      project_context: {},
+      direction_context: {
+        direction_id: 'd-owning',
+        narrative: {
+          failed_approaches: [UNIQUE_FAILED],
+          open_questions: [UNIQUE_OPEN],
+        },
+      },
+    };
+
+    await handleResearch(ND_TASK_ID, payload, task, ND_GH_TOKEN, ND_OWNER, ND_REPO, ND_WS, ND_STATUS_REF());
+
+    const prompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+
+    // Owning direction's unique markers appear exactly once (from buildContextPrefix),
+    // not doubled by renderDirection's research_context parsing.
+    const failedCount = (prompt.match(new RegExp(UNIQUE_FAILED, 'g')) ?? []).length;
+    const openCount = (prompt.match(new RegExp(UNIQUE_OPEN, 'g')) ?? []).length;
+    expect(
+      failedCount,
+      `'${UNIQUE_FAILED}' should appear exactly once — not re-emitted by renderDirection for the owning direction`,
+    ).toBe(1);
+    expect(
+      openCount,
+      `'${UNIQUE_OPEN}' should appear exactly once — not re-emitted by renderDirection for the owning direction`,
+    ).toBe(1);
+
+    // Non-owning direction's research_context items must still appear
+    expect(prompt).toContain(OTHER_CTX_ITEM);
+  });
+});
+
+// ── Shared boilerplate blocks (extracted to research-plan-prompt-blocks.ts) ───
+describe('shared prompt boilerplate blocks', () => {
+  const RESEARCH_PLAN_SRC = realReadFileSync(
+    fileURLToPath(new URL('./research-plan.ts', import.meta.url)),
+    'utf-8',
+  );
+
+  it('test_shared_boilerplate_blocks_present_in_both_prompts', () => {
+    // CAPABILITY_DECLARATION_DOC is defined in research-plan-prompt-blocks.ts and
+    // re-exported from research-plan.ts — both sources must expose the same string.
+    expect(CAPABILITY_DECLARATION_DOC).toBe(CAP_DOC_FROM_BLOCKS);
+
+    // Both the plan and research prompts must interpolate the shared blocks so
+    // the extracted constants actually reach both prompt strings.
+    const capRefs = RESEARCH_PLAN_SRC.match(/\$\{CAPABILITY_DECLARATION_DOC\}/g) ?? [];
+    expect(capRefs.length).toBe(2);
+
+    const rubricRefs = RESEARCH_PLAN_SRC.match(/\$\{ACCEPTANCE_EVIDENCE_RUBRIC\}/g) ?? [];
+    expect(rubricRefs.length).toBe(2);
+
+    // The shared blocks contain the expected vocabulary.
+    expect(CAPABILITY_DECLARATION_DOC).toContain('provides_capability');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('AVAILABLE CAPABILITIES');
+    expect(CAPABILITY_DECLARATION_DOC).toContain('every other task type');
+    expect(CAPABILITY_DECLARATION_DOC).toMatch(/never rejected/);
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('named_test');
+    expect(ACCEPTANCE_EVIDENCE_RUBRIC).toContain('observable_behavior');
   });
 });
