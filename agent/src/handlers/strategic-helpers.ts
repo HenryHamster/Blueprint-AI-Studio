@@ -114,13 +114,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials' | 'sections' | 'task' | 'tasks';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials', 'sections', 'task', 'tasks',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -152,6 +152,8 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'ci-compliance':       'ci-compliance)        PATH_SUFFIX="ci-compliance"',
   'capability-trials':   'capability-trials)    PATH_SUFFIX="capability-trials"',
   'sections':            'sections)             PATH_SUFFIX="sections/$ID"',
+  'task':                'task)                 PATH_SUFFIX="tasks/$ID"',
+  'tasks':               'tasks)                PATH_SUFFIX="tasks"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -209,6 +211,8 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'ci-compliance':       '`./fetch ci-compliance` — CI compliance status for the current integration branch HEAD: module-size breaches and branch-literal violations (no id)',
   'capability-trials':   '`./fetch capability-trials` — capability-trial verdicts keyed by cap_name: verdict, lift, n_with/n_without, and accrual projection (no id)',
   'sections':            '`./fetch sections <name>` — freshly-built payload section by name (self_reflection_log, anomaly_summary, playbook_summary, retired_directions_summary, rejected_proposals, past_retirement_critiques, previous_decision_outcomes, outcome_evaluation); use when that section was dropped under budget pressure',
+  'task':                '`./fetch task <task_id>` — status and outcome for a single strategic-agent-spawned task by id (status, created_at, progress message, pr_url/failure_reason for terminal tasks)',
+  'tasks':               '`./fetch tasks` — list of recent strategic-agent-spawned tasks for this project (most recent first, default limit 20)',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -253,7 +257,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ "$KIND" != "tasks" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi
