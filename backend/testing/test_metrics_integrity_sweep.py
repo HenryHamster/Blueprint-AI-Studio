@@ -157,6 +157,7 @@ def test_registry_contains_initial_checks():
         "playbook_confirmation_integrity",
         "noncode_outcome_window_accounting",
         "direction_acceptance_metric_invariant",
+        "completion_debt_completeness",
     } <= names
 
 
@@ -682,6 +683,258 @@ async def test_enforce_mode_enrolls_deduped_finding(db):
 
 
 # --- Error isolation --------------------------------------------------------
+
+
+# --- Check: completion_debt_completeness ------------------------------------
+
+
+def _ctx(db, **overrides):
+    base = {
+        "session": db,
+        "now": _utcnow(),
+        "mode": "observe",
+        "max_projects": 25,
+        "sample_limit": 200,
+        "window_days": 14,
+    }
+    base.update(overrides)
+    return SweepContext(**base)
+
+
+async def _debt_row(db, *, dedupe_key, status="open", kind="capability_trial", project_id=None):
+    """Insert a CompletionDebtEntry directly (bypassing the recorders)."""
+    from app.models import CompletionDebtEntry
+
+    row = CompletionDebtEntry(
+        project_id=project_id,
+        kind=kind,
+        dedupe_key=dedupe_key,
+        status=status,
+        title="test debt",
+    )
+    db.add(row)
+    await db.commit()
+    return row
+
+
+def _flagged_for(results, subject):
+    return [r for r in results if r.flagged and r.subject == subject]
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_completeness_flags_missing_expected_obligations(db):
+    """The named acceptance test: with no ledger rows at all, the standing global
+    seed/dormant-knob obligations are recomputed and flagged as an under-count."""
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    global_flags = _flagged_for(results, "global")
+    assert len(global_flags) == 1, f"expected one global flag, got {results}"
+    f = global_flags[0]
+    assert f.check == "completion_debt_completeness"
+    assert f.delta >= 1  # at least the standing seed inventory is missing
+    assert f.self_reported == 0  # no open rows exist
+    assert f.ground_truth == f.delta  # every expected obligation is missing
+    assert "under-count" in f.detail
+    # The recomputed expected set covers the standing seed inventory: delta counts
+    # at least the three seed:* rows plus whatever dormant knobs are currently off.
+    from app.completion_debt import _iter_seed_debts
+
+    seed_keys = {d["dedupe_key"] for d in _iter_seed_debts()}
+    assert any(k.startswith("seed:") for k in seed_keys)
+    assert f.delta >= len(seed_keys)
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_missing_capability_trial_flagged(db):
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    pid_flags = _flagged_for(results, str(project.id))
+    assert len(pid_flags) == 1
+    f = pid_flags[0]
+    assert f.delta == 1
+    assert f"capability_trial:{project.id}:repo_map" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_missing_no_ci_gate_flagged(db):
+    project = await _project(db)
+    project.merge_gate_runtime = {"last_unverified_reason": "verify_setup_failed"}
+    flag_modified(project, "merge_gate_runtime")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    pid_flags = _flagged_for(results, str(project.id))
+    assert len(pid_flags) == 1
+    assert f"no_ci_gate:{project.id}" in pid_flags[0].detail
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_open_row_produces_ok(db):
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+    # The recorder-canonical open row exists — the obligation is satisfied.
+    await _debt_row(
+        db,
+        dedupe_key=f"capability_trial:{project.id}:repo_map",
+        status="open",
+        project_id=project.id,
+    )
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    assert not _flagged_for(results, str(project.id))
+    ok = [
+        r
+        for r in results
+        if r.subject == str(project.id) and r.status == CheckStatus.OK
+    ]
+    assert len(ok) == 1
+    assert ok[0].self_reported == 1
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_dismissed_row_ignored(db):
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+    # Operator dismissed the obligation — an explicit disposition, not missing debt.
+    await _debt_row(
+        db,
+        dedupe_key=f"capability_trial:{project.id}:repo_map",
+        status="dismissed",
+        project_id=project.id,
+    )
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    # Neither flagged (not missing) nor OK-with-drift for this project.
+    assert not _flagged_for(results, str(project.id))
+    assert not [
+        r
+        for r in results
+        if r.subject == str(project.id) and r.status == CheckStatus.OK
+    ]
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_resolved_row_flagged(db):
+    """A live obligation whose only row is RESOLVED (recorder never re-opened it)
+    is a non-open, non-dismissed under-count and must be flagged."""
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+    await _debt_row(
+        db,
+        dedupe_key=f"capability_trial:{project.id}:repo_map",
+        status="resolved",
+        project_id=project.id,
+    )
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    pid_flags = _flagged_for(results, str(project.id))
+    assert len(pid_flags) == 1
+    assert pid_flags[0].delta == 1
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_inconclusive_over_bounds(db):
+    for _ in range(3):
+        await _project(db)
+    results = await mis.check_completion_debt_completeness(_ctx(db, max_projects=2))
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.INCONCLUSIVE
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_check_is_flag_only(db):
+    """Observe + enforce runs never create, reopen, resolve, or dismiss a
+    CompletionDebtEntry row — the ledger is untouched by the audit."""
+    from app.models import CompletionDebtEntry
+
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+    # A dismissed row for a DIFFERENT obligation must survive both runs unchanged.
+    await _debt_row(
+        db,
+        dedupe_key=f"capability_trial:{project.id}:other_cap",
+        status="dismissed",
+        project_id=project.id,
+    )
+
+    async def _snapshot():
+        rows = (await db.execute(select(CompletionDebtEntry))).scalars().all()
+        return sorted((r.dedupe_key, r.status) for r in rows)
+
+    before = await _snapshot()
+
+    now = _utcnow()
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    assert await run_metrics_integrity_sweep(db, now=now) is not None
+    _rc["metrics_integrity_sweep_mode"] = "enforce"
+    assert (
+        await run_metrics_integrity_sweep(db, now=now + timedelta(minutes=61))
+        is not None
+    )
+
+    assert await _snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_enforce_enrolls_for_project_obligation(db):
+    """A missing per-project obligation enrolls exactly one deduped
+    EvergreenBacklogItem (subject is a real project id); re-running enrolls none."""
+    _rc["metrics_integrity_sweep_mode"] = "enforce"
+    project = await _project(db)
+    project.capability_adoption_verdicts = {"repo_map": {"verdict": "continue-trial"}}
+    flag_modified(project, "capability_adoption_verdicts")
+    db.add(project)
+    await db.commit()
+
+    now = _utcnow()
+    tick = await run_metrics_integrity_sweep(db, now=now)
+    assert tick is not None
+    assert tick["enrolled"] >= 1
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    matching = [
+        r
+        for r in rows
+        if r.finding_key
+        == f"metrics-integrity:completion_debt_completeness:{project.id}"
+    ]
+    assert len(matching) == 1
+    before = len(rows)
+
+    tick2 = await run_metrics_integrity_sweep(db, now=now + timedelta(minutes=61))
+    assert tick2 is not None
+    rows2 = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert len(rows2) == before  # deduped: no new enrollment
 
 
 @pytest.mark.asyncio

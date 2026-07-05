@@ -29,6 +29,13 @@ Hard invariants (mirrors ``structural_health_audit.py``):
 * **Registry.** New checks register via :func:`register_check`; the sweep runs
   the registered checks in order, capped at ``max_checks_per_tick``.
 
+Registered checks: ``landed_vs_reported_merges``, ``playbook_confirmation_integrity``,
+``direction_acceptance_metric_invariant``, ``noncode_outcome_window_accounting``,
+and ``completion_debt_completeness`` (recomputes the currently-expected
+completion-debt obligations — seed/dormant-knob inventory, per-project
+continue/trial capability verdicts, per-project no-CI gate fall-opens — and flags
+ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row).
+
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
 * ``metrics_integrity_sweep_mode``            — ``off`` / ``observe`` / ``enforce``
@@ -1095,3 +1102,202 @@ async def check_noncode_outcome_window_accounting(
             detail=f"{considered} non-code terminal task(s) window-consistent",
         )
     ]
+
+
+@register_check(
+    "completion_debt_completeness",
+    "Independently recompute the currently-expected completion-debt obligations "
+    "(global seed/dormant-knob inventory, per-project continue/trial capability "
+    "verdicts, per-project no-CI gate fall-opens) and flag ledger under-counts "
+    "where an expected-active obligation has no open row.",
+)
+async def check_completion_debt_completeness(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: every obligation the recorders SHOULD have opened must carry
+    an OPEN completion-debt row. The recorders are best-effort / non-fatal, so a
+    silently-failed recorder under-counts debt forever unless an independent check
+    recomputes the expected set. This recomputes the set of currently-expected
+    ACTIVE obligations from the SAME canonical dedupe keys the recorder paths mint,
+    then flags any expected obligation whose ledger row is absent or non-open.
+
+    A DISMISSED row is an explicit operator disposition and is treated as
+    satisfied (never as missing debt); an absent row — or one in any non-open,
+    non-dismissed state (e.g. ``resolved`` while the obligation is live again) — is
+    an under-count and is flagged.
+
+    Flag-only: performs ZERO writes to ``CompletionDebtEntry`` in any mode — the
+    only side effect (enforce mode) is the shared deduped ``EvergreenBacklogItem``
+    enrollment path used by every other flagged check. Bounded by
+    ``ctx.max_projects`` (projects scanned) and ``ctx.sample_limit`` (expected
+    keys); when either bound is exceeded it returns ``inconclusive`` rather than
+    claiming a partial ``ok``.
+    """
+    from app.capability_trial_verdict import _CONTINUE_VERDICTS
+    from app.completion_debt import (
+        STATUS_DISMISSED,
+        STATUS_OPEN,
+        _iter_seed_debts,
+    )
+    from app.models import CompletionDebtEntry, Project
+
+    # (subject, dedupe_key) for every currently-expected ACTIVE obligation.
+    expected: List[tuple[str, str]] = []
+
+    # 1) Deployment-global seed inventory + dormant runtime knobs. These reuse the
+    #    exact kwargs bundles the startup seed upserts, so their dedupe_key IS the
+    #    canonical one. Best-effort enumeration — a failure must not abort the check.
+    try:
+        for item in _iter_seed_debts():
+            key = item.get("dedupe_key")
+            if key:
+                expected.append(("global", str(key)))
+    except Exception:  # noqa: BLE001 — seed enumeration is best-effort
+        logger.warning(
+            "[METRICS_INTEGRITY] completion_debt_completeness: seed enumeration failed",
+            exc_info=True,
+        )
+
+    # 2) Per-project obligations. Bounded to max_projects; load one extra so a
+    #    project count OVER the bound can be reported as inconclusive rather than
+    #    silently truncating (which would let an unscanned project's missing debt
+    #    masquerade as fully audited).
+    project_rows = (
+        await ctx.session.execute(
+            select(
+                Project.id,
+                Project.capability_adoption_verdicts,
+                Project.merge_gate_runtime,
+            ).limit(ctx.max_projects + 1)
+        )
+    ).all()
+    if len(project_rows) > ctx.max_projects:
+        return [
+            CheckResult(
+                check="completion_debt_completeness",
+                status=CheckStatus.INCONCLUSIVE,
+                subject="global",
+                detail=(
+                    f"project volume exceeds max_projects={ctx.max_projects}; "
+                    "cannot recompute expected per-project obligations within bounds"
+                ),
+            )
+        ]
+
+    for project_id, verdicts, merge_gate_runtime in project_rows:
+        pid = str(project_id)
+        # Capability-trial obligation: a capability still in continue/trial (no
+        # decided enforce verdict) owes a standing debt row. Canonical key mirrors
+        # the recorder in
+        # capability_trial_verdict.persist_trial_verdicts_in_transaction:
+        #     f"capability_trial:{project_id}:{cap_name}"
+        if isinstance(verdicts, dict):
+            for cap_name, entry in verdicts.items():
+                verdict = entry.get("verdict") if isinstance(entry, dict) else None
+                if verdict in _CONTINUE_VERDICTS:
+                    expected.append((pid, f"capability_trial:{pid}:{cap_name}"))
+        # No-CI gate obligation: a live fall-open to an UNVERIFIED merge
+        # (``merge_gate_runtime.last_unverified_reason`` set) owes a debt row.
+        # Canonical key mirrors the recorder in
+        # ci_resolution.record_no_ci_gate_runtime:  f"no_ci_gate:{project_id}"
+        if isinstance(merge_gate_runtime, dict) and merge_gate_runtime.get(
+            "last_unverified_reason"
+        ):
+            expected.append((pid, f"no_ci_gate:{pid}"))
+
+    if not expected:
+        return [
+            CheckResult(
+                check="completion_debt_completeness",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no currently-expected completion-debt obligations to audit",
+            )
+        ]
+
+    all_keys = sorted({key for _subject, key in expected})
+    if len(all_keys) > ctx.sample_limit:
+        return [
+            CheckResult(
+                check="completion_debt_completeness",
+                status=CheckStatus.INCONCLUSIVE,
+                subject="global",
+                detail=(
+                    f"expected-obligation volume ({len(all_keys)}) exceeds "
+                    f"sample_limit={ctx.sample_limit}; cannot recompute within bounds"
+                ),
+            )
+        ]
+
+    # Single bounded query: dedupe_key -> status for every expected obligation.
+    status_rows = (
+        await ctx.session.execute(
+            select(
+                CompletionDebtEntry.dedupe_key, CompletionDebtEntry.status
+            ).where(CompletionDebtEntry.dedupe_key.in_(all_keys))
+        )
+    ).all()
+    status_by_key = {row[0]: row[1] for row in status_rows}
+
+    # Group expected obligations by subject and classify. A subject with any
+    # missing / non-open (and non-dismissed) obligation is FLAGGED; a subject whose
+    # obligations are all satisfied (open, or operator-dismissed) is OK. A subject
+    # whose every obligation was operator-dismissed produces NO result — there is
+    # nothing owed and nothing drifting.
+    per_subject: Dict[str, set] = {}
+    for subject, key in expected:
+        per_subject.setdefault(subject, set()).add(key)
+
+    results: List[CheckResult] = []
+    for subject in sorted(per_subject):
+        open_count = 0
+        missing: List[str] = []
+        for key in sorted(per_subject[subject]):
+            status = status_by_key.get(key)
+            if status == STATUS_DISMISSED:
+                # Operator explicitly disposed of this obligation — not missing debt.
+                continue
+            if status == STATUS_OPEN:
+                open_count += 1
+                continue
+            # Absent, resolved, or any other non-open/non-dismissed state while the
+            # obligation is currently expected active == an under-count.
+            missing.append(key)
+
+        expected_active = open_count + len(missing)
+        if missing:
+            preview = ", ".join(missing[:3])
+            if len(missing) > 3:
+                preview += f" (+{len(missing) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="completion_debt_completeness",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=open_count,
+                    ground_truth=expected_active,
+                    delta=len(missing),
+                    severity="warn",
+                    subject=subject,
+                    detail=(
+                        f"{len(missing)} currently-expected completion-debt "
+                        f"obligation(s) have no open ledger row (under-count): "
+                        f"{preview}"
+                    ),
+                )
+            )
+        elif expected_active > 0:
+            results.append(
+                CheckResult(
+                    check="completion_debt_completeness",
+                    status=CheckStatus.OK,
+                    self_reported=open_count,
+                    ground_truth=expected_active,
+                    delta=0,
+                    subject=subject,
+                    detail=(
+                        f"{open_count} expected obligation(s) each have an open "
+                        "ledger row"
+                    ),
+                )
+            )
+    return results
