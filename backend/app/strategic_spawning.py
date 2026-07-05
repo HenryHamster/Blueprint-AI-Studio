@@ -1720,9 +1720,11 @@ def _build_cycle_start_reconciliation(
     # accounting conflict; ``unverifiable`` is tallied as unknown, never
     # manufactured into a contradiction.
     merge_accounting: list[dict] = []
+    pending_rollup_accounting: list[dict] = []
     merge_landed_total = 0
     merge_not_landed_total = 0
     merge_unverifiable_total = 0
+    merge_pending_in_open_rollup_total = 0
     for delta in per_direction_delta or []:
         if not isinstance(delta, dict):
             continue
@@ -1746,11 +1748,15 @@ def _build_cycle_start_reconciliation(
         unverifiable_n = (
             _count_field(count_block, "unverifiable") if count_block else None
         )
+        pending_n = (
+            _count_field(count_block, "pending_in_open_rollup") if count_block else None
+        )
         if landed_n is None or not_landed_n is None or unverifiable_n is None:
             not_landed = []
             landed_n = 0
             not_landed_n = 0
             unverifiable_n = 0
+            pending_n = 0
             for entry in titles_list:
                 if not isinstance(entry, dict):
                     continue
@@ -1760,34 +1766,61 @@ def _build_cycle_start_reconciliation(
                     not_landed_n += 1
                 elif verdict == "verified_landed":
                     landed_n += 1
+                elif verdict == "pending_in_open_rollup":
+                    pending_n += 1
                 else:
                     # Absent/unknown verdict → unverifiable, NOT a conflict.
                     unverifiable_n += 1
-        elif not not_landed:
-            for entry in titles_list:
-                if not isinstance(entry, dict):
-                    continue
-                if entry.get("merge_verdict") == "verified_not_landed":
-                    not_landed.append(_label(entry.get("title")))
+        else:
+            if pending_n is None:
+                pending_n = 0
+            if not not_landed:
+                for entry in titles_list:
+                    if not isinstance(entry, dict):
+                        continue
+                    if entry.get("merge_verdict") == "verified_not_landed":
+                        not_landed.append(_label(entry.get("title")))
         merge_landed_total += landed_n
         merge_not_landed_total += not_landed_n
         merge_unverifiable_total += unverifiable_n
+        merge_pending_in_open_rollup_total += pending_n
         # Surface only directions with a genuine verified-not-landed conflict.
-        if not_landed_n <= 0:
-            continue
-        merge_accounting.append(
-            {
-                "direction_id": delta.get("direction_id"),
-                "direction_text": _label(delta.get("direction_text")),
-                "not_landed_titles": not_landed,
-                "landed": landed_n,
-                "not_landed": not_landed_n,
-                "unverifiable": unverifiable_n,
-            }
-        )
+        if not_landed_n > 0:
+            merge_accounting.append(
+                {
+                    "direction_id": delta.get("direction_id"),
+                    "direction_text": _label(delta.get("direction_text")),
+                    "not_landed_titles": not_landed,
+                    "landed": landed_n,
+                    "not_landed": not_landed_n,
+                    "unverifiable": unverifiable_n,
+                }
+            )
+        # Surface directions with PRs pending in an open rollup branch.
+        if pending_n > 0:
+            pending_titles: list[str] = []
+            for entry in titles_list:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("merge_verdict") == "pending_in_open_rollup":
+                    pending_titles.append(_label(entry.get("title")))
+            pending_rollup_accounting.append(
+                {
+                    "direction_id": delta.get("direction_id"),
+                    "direction_text": _label(delta.get("direction_text")),
+                    "pending_in_open_rollup": pending_n,
+                    "pending_in_open_rollup_titles": pending_titles,
+                }
+            )
     merge_accounting.sort(
         key=lambda m: (
             -int(m.get("not_landed") or 0),
+            str(m.get("direction_text") or ""),
+        )
+    )
+    pending_rollup_accounting.sort(
+        key=lambda m: (
+            -int(m.get("pending_in_open_rollup") or 0),
             str(m.get("direction_text") or ""),
         )
     )
@@ -1854,6 +1887,7 @@ def _build_cycle_start_reconciliation(
         and not deferred_gap_count
         and not stale_active_moves
         and not merge_accounting
+        and not pending_rollup_accounting
         and not phantom_direction_refs
         and not qualification_prose_drift
     ):
@@ -1871,6 +1905,7 @@ def _build_cycle_start_reconciliation(
     capped_stale, stale_total = _cap(stale_active_moves)
     capped_pipeline, pipeline_dropped = _cap(direction_pipeline)
     capped_merge, merge_dropped = _cap(merge_accounting)
+    capped_pending_rollup, pending_rollup_dropped = _cap(pending_rollup_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
     capped_qual_drift, qual_drift_total = _cap(qualification_prose_drift)
     # Cap each surfaced direction's not-landed title list too, preserving the
@@ -1883,6 +1918,15 @@ def _build_cycle_start_reconciliation(
         m["not_landed_titles_overflow"] = max(
             0, int(m.get("not_landed") or 0) - len(shown_titles)
         )
+    # Cap each pending-rollup direction's title list too.
+    for m in capped_pending_rollup:
+        full_titles = m["pending_in_open_rollup_titles"]
+        if len(full_titles) > _RECON_LIST_CAP:
+            m["pending_in_open_rollup_titles"] = full_titles[:_RECON_LIST_CAP]
+        shown_titles = m["pending_in_open_rollup_titles"]
+        m["pending_in_open_rollup_titles_overflow"] = max(
+            0, int(m.get("pending_in_open_rollup") or 0) - len(shown_titles)
+        )
 
     return {
         "capability_contradictions": capped_caps,
@@ -1892,6 +1936,7 @@ def _build_cycle_start_reconciliation(
         "stale_active_moves": capped_stale,
         "direction_pipeline": capped_pipeline,
         "merge_accounting": capped_merge,
+        "pending_in_open_rollup": capped_pending_rollup,
         "phantom_direction_refs": capped_phantoms,
         "qualification_prose_drift": capped_qual_drift,
         "counts": {
@@ -1916,6 +1961,10 @@ def _build_cycle_start_reconciliation(
             "merge_landed": merge_landed_total,
             "merge_not_landed": merge_not_landed_total,
             "merge_unverifiable": merge_unverifiable_total,
+            # Pending rollup merges: PRs merged into staging branches not yet
+            # squash-merged into the integration branch. These are NOT conflicts.
+            "merge_pending_in_open_rollup": merge_pending_in_open_rollup_total,
+            "merge_pending_in_open_rollup_accounting": len(capped_pending_rollup) + pending_rollup_dropped,
             "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
             "qualification_prose_drift": len(capped_qual_drift) + qual_drift_total,
         },
@@ -3139,19 +3188,30 @@ def _recent_commit_messages_match_task(
     title: str,
     pr_numbers: set[int],
 ) -> bool:
-    """Return True when a bounded commit-message sample names this task."""
+    """Return True when a bounded commit-message sample names this task.
 
-    normalized_messages = [" ".join(m.casefold().split()) for m in messages]
-    normalized_title = " ".join((title or "").casefold().split())
-    if len(normalized_title) >= 8 and any(
-        normalized_title in message for message in normalized_messages
-    ):
-        return True
+    PR-number references are the primary matching evidence. If PR numbers are
+    available, only they can rescue a task. Title substring matching is used
+    only as a fallback when no PR numbers are available for the task.
+    """
 
+    # Primary: Check PR numbers first — most reliable evidence.
     for pr_number in pr_numbers:
         pr_ref_re = re.compile(rf"(?<![\w#])#{pr_number}(?!\d)")
         if any(pr_ref_re.search(message) for message in messages):
             return True
+
+    # Fallback: Check title substring only if no PR numbers are available.
+    # If PR numbers exist but don't match, don't use title to avoid false
+    # rescues from similar/repeated task titles.
+    if not pr_numbers:
+        normalized_messages = [" ".join(m.casefold().split()) for m in messages]
+        normalized_title = " ".join((title or "").casefold().split())
+        if len(normalized_title) >= 8 and any(
+            normalized_title in message for message in normalized_messages
+        ):
+            return True
+
     return False
 
 
@@ -3383,6 +3443,7 @@ async def _build_recent_interventions(
     _promotion_target_ss = get_project_promotion_target(project)
     _automain_verified: dict[uuid.UUID, bool] = {}
     _on_main_verified: dict[uuid.UUID, bool] = {}
+    _open_rollup_task_ids: set[uuid.UUID] = set()
 
     try:
         from app import github as _github_ss
@@ -3478,14 +3539,16 @@ async def _build_recent_interventions(
 
         async def _verify_pr(
             _pr_num: int,
-        ) -> tuple[int, bool | None, bool | None]:
-            """Return (pr_num, automain_landed, on_main_landed) for one PR.
+        ) -> tuple[int, bool | None, bool | None, bool]:
+            """Return (pr_num, automain_landed, on_main_landed, is_open) for one PR.
 
             ``automain_landed``/``on_main_landed`` mirror the tri-state of
             ``is_ancestor_of``: True = verified landed, False = verified NOT
             landed / no merge SHA, None = unverifiable (API failure) → caller
             leaves the task absent from the verified map and the flag fallback
             applies. ``on_main_landed`` stays None when there is no LTS split.
+            ``is_open`` is True when the PR has no merge SHA and is still open
+            (state == "open") — distinguishes pending-rollup from genuinely lost.
             """
             async with _ancestry_sem:
                 try:
@@ -3501,8 +3564,11 @@ async def _build_recent_interventions(
                     )
                     _merge_sha = _pr_data.get("merge_commit_sha")
                     if not _merge_sha:
-                        # PR has no merge SHA (not yet merged or API gap) → not landed
-                        return _pr_num, False, None
+                        # PR has no merge SHA: open PRs are pending a rollup merge,
+                        # not genuinely lost. Closed PRs without a merge SHA are
+                        # unmerged/abandoned and treated as not-landed.
+                        _is_open = _pr_data.get("state") == "open"
+                        return _pr_num, False, None, _is_open
 
                     _is_anc = await asyncio.wait_for(
                         _github_ss.is_ancestor_of(
@@ -3542,7 +3608,7 @@ async def _build_recent_interventions(
                             timeout=_ANCESTRY_CALL_TIMEOUT_S,
                         )
                         _on_main_landed = _is_anc_main is True
-                    return _pr_num, _automain_landed, _on_main_landed
+                    return _pr_num, _automain_landed, _on_main_landed, False
                 except Exception as _exc_t:  # noqa: BLE001 — API failure → flag fallback
                     logger.debug(
                         "[STRATEGIC] ancestry check failed for pr=%s: %s",
@@ -3551,24 +3617,32 @@ async def _build_recent_interventions(
                     )
                     # None → leave the tasks absent from _automain_verified so the
                     # flag fallback applies (verdict "unverifiable").
-                    return _pr_num, None, None
+                    return _pr_num, None, None, False
 
         if _tasks_by_pr:
             _verify_results = await asyncio.gather(
                 *(_verify_pr(_pr_num) for _pr_num in _tasks_by_pr)
             )
-            for _pr_num, _automain_landed, _on_main_landed in _verify_results:
+            for _pr_num, _automain_landed, _on_main_landed, _is_open in _verify_results:
                 for _tid in _tasks_by_pr[_pr_num]:
                     if _automain_landed is not None:
                         _automain_verified[_tid] = _automain_landed
                     if _on_main_landed is not None:
                         _on_main_verified[_tid] = _on_main_landed
+                    if _is_open:
+                        _open_rollup_task_ids.add(_tid)
 
         # One bounded squash-body scan can rescue rollup-rewritten work from a
         # false NOT-landed verdict. Scan failure degrades those negatives to
         # unverifiable so merge accounting does not manufacture a conflict.
+        # Exclude open-rollup tasks: their pending_in_open_rollup verdict is
+        # already confirmed by a successful get_pull_request call — running the
+        # squash-body scan for them is pointless and, if it fails, would
+        # incorrectly pop() the confirmed verdict back to unverifiable.
         _ancestry_false_task_ids = [
-            _tid for _tid, _landed in _automain_verified.items() if _landed is False
+            _tid
+            for _tid, _landed in _automain_verified.items()
+            if _landed is False and _tid not in _open_rollup_task_ids
         ]
         if _ancestry_false_task_ids:
             try:
@@ -3681,11 +3755,13 @@ async def _build_recent_interventions(
         no second GitHub/ancestry pass.
         """
         if task.id in _automain_verified:
-            return (
-                "verified_landed"
-                if _automain_verified[task.id]
-                else "verified_not_landed"
-            )
+            if _automain_verified[task.id]:
+                return "verified_landed"
+            if task.id in _open_rollup_task_ids:
+                # PR is still open — merged into a staging branch not yet squash-merged
+                # into the integration branch. Not a real accounting conflict.
+                return "pending_in_open_rollup"
+            return "verified_not_landed"
         return "unverifiable"
 
     # For rollups: look up child titles so the agent sees what actually
@@ -3775,6 +3851,7 @@ async def _build_recent_interventions(
             "verified_landed": 0,
             "verified_not_landed": 0,
             "unverifiable": 0,
+            "pending_in_open_rollup": 0,
         }
         for t in d_tasks:
             if (

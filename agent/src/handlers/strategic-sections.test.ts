@@ -580,6 +580,37 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('+3 more not-landed title(s) not shown');
     expect(result).toContain('+3 more direction(s) with drift not shown');
   });
+
+  it('renders pending-in-open-rollup titles outside the conflict list', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      direction_pipeline: [],
+      merge_accounting: [],
+      pending_in_open_rollup: [{
+        direction_id: 'd-rollup',
+        direction_text: 'pending rollup dir',
+        pending_in_open_rollup_titles: ['Feature A (merged to staging)', 'Feature B (merged to staging)'],
+        pending_in_open_rollup_titles_overflow: 0,
+        pending_in_open_rollup: 2,
+      }],
+      counts: {
+        merge_accounting: 0,
+        merge_landed: 1,
+        merge_not_landed: 0,
+        merge_unverifiable: 0,
+        merge_pending_in_open_rollup: 2,
+        merge_pending_in_open_rollup_accounting: 1,
+      },
+    });
+    expect(result).toContain('## Pending rollup merges — work awaiting squash-merge to integration branch');
+    expect(result).toContain('pending rollup dir (id: d-rollup) — 2 pending rollup merge');
+    expect(result).toContain('Feature A (merged to staging)');
+    expect(result).toContain('Feature B (merged to staging)');
+    expect(result).not.toContain('Merge-accounting drift');
+    expect(result).not.toContain('NOT landed');
+  });
 });
 
 describe('buildPruneCandidatesSection', () => {

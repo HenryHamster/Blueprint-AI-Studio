@@ -10650,13 +10650,87 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
     assert verdicts["Badge says merged but stranded"] == "verified_not_landed"
 
 
+@pytest.mark.asyncio
+async def test_recent_merged_titles_pending_in_open_rollup_verdict(
+    db_session, mocker
+):
+    """PRs merged into a still-open rollup branch get verdict pending_in_open_rollup.
+
+    When get_pull_request returns state=open (no merge_commit_sha), the task
+    is in a staging branch waiting for the rollup to squash-merge. This must
+    NOT be classified as verified_not_landed (a real accounting conflict) and
+    must NOT trigger the stranded-discount path.
+    """
+    direction_id = "dir-pending-rollup"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "pending rollup dir", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Impl merged into open rollup branch",
+        description="PR is still open — rollup not yet squash-merged",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 555, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mark_stranded_mock = mocker.patch(
+        "app.strategic_spawning.mark_stranded_non_landing"
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(return_value={"state": "open"}),
+    )
+    mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=[]),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+    titles = delta["recent_merged_titles"]
+    assert len(titles) == 1
+    entry = titles[0]
+    assert entry["title"] == "Impl merged into open rollup branch"
+    assert entry["merge_verdict"] == "pending_in_open_rollup"
+    assert entry["on_automain"] is False
+
+    assert delta["recent_merge_verdict_counts"]["pending_in_open_rollup"] == 1
+    assert delta["recent_merge_verdict_counts"]["verified_not_landed"] == 0
+    assert "recent_not_landed_titles" not in delta
+
+    mark_stranded_mock.assert_not_called()
+
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert ctx.get("stranded_discount_applied") is None
+
+
 @pytest.mark.parametrize(
     ("messages", "expected_verdict", "expected_not_landed_titles"),
     [
         (
             ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
-            "verified_landed",
-            None,
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
         ),
         (
             ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
@@ -10670,7 +10744,7 @@ async def test_recent_merged_titles_carry_tristate_merge_verdict(db_session, moc
         ),
         (None, "unverifiable", None),
     ],
-    ids=["title-evidence", "pr-evidence", "absent", "scan-failure"],
+    ids=["title-only-not-rescued", "pr-evidence", "absent", "scan-failure"],
 )
 @pytest.mark.asyncio
 async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
@@ -10744,6 +10818,104 @@ async def test_rollup_squash_body_evidence_prevents_not_landed_verdict(
     )
     expected_scan_count = 2 if expected_verdict == "verified_landed" else 1
     assert commit_messages_mock.await_count == expected_scan_count
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_verdict", "expected_not_landed_titles"),
+    [
+        (
+            ["Rollup squash\n\nIncluded PRs: #9635, #9639"],
+            "verified_landed",
+            None,
+        ),
+        (
+            ["Rollup squash\n\nIncluded work:\n- Honor rollup squash bodies"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+        (
+            ["Rollup squash\n\nIncluded PRs: #1111"],
+            "verified_not_landed",
+            ["Honor rollup squash bodies"],
+        ),
+    ],
+    ids=["pr-match-rescued", "title-only-not-rescued", "wrong-pr-not-rescued"],
+)
+@pytest.mark.asyncio
+async def test_squash_rescue_requires_pr_number_evidence(
+    db_session, mocker, messages, expected_verdict, expected_not_landed_titles
+):
+    """PR-number references are primary rescue evidence; title-only matches do not rescue.
+
+    When a task has a PR number, only a PR number match in the commit messages
+    can rescue it from a false NOT-landed verdict. Title substring matches are
+    not sufficient for rescue when PR numbers are available.
+    """
+    direction_id = "dir-pr-primary-evidence"
+    project = _make_project(
+        vision={"purpose": "test"},
+        directions=[
+            {"id": direction_id, "text": "pr-number-primary test", "status": "active"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Honor rollup squash bodies",
+        description="task with pr number for rescue evidence",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True, "pr_number": 9635, "direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new=AsyncMock(
+            return_value={
+                "merge_commit_sha": "rewritten-child-sha",
+                "head": {"sha": "head-sha"},
+            }
+        ),
+    )
+    mocker.patch("app.github.is_ancestor_of", new=AsyncMock(return_value=False))
+    commit_messages_mock = mocker.patch(
+        "app.github.list_recent_commit_messages",
+        new=AsyncMock(return_value=messages),
+    )
+
+    result = await _build_recent_interventions(project, db_session)
+    delta = next(
+        d for d in result["per_direction_delta"] if d["direction_id"] == direction_id
+    )
+
+    assert delta["recent_merged_titles"] == [
+        {
+            "title": "Honor rollup squash bodies",
+            "on_automain": expected_verdict == "verified_landed",
+            "merge_verdict": expected_verdict,
+            "landed_on_integration": None,
+        }
+    ]
+    if expected_not_landed_titles:
+        assert delta["recent_not_landed_titles"] == expected_not_landed_titles
+    else:
+        assert "recent_not_landed_titles" not in delta
+    assert delta["recent_merge_verdict_counts"][expected_verdict] == 1
+    assert sum(delta["recent_merge_verdict_counts"].values()) == 1
+    commit_messages_mock.assert_any_await(
+        "tok", "owner", "repo", "automain", project_id=str(project.id)
+    )
 
 
 # ── stranded-PR credit discount persisted by cycle-start reconciliation ────────
@@ -11039,7 +11211,7 @@ async def test_rollup_squash_body_evidence_applies_to_promotion_target(
         new=AsyncMock(
             side_effect=[
                 ["Rollup squash\n\nIncluded PRs: #9635"],
-                ["Promoted rollup\n\nIncluded work: Promoted rollup squash body"],
+                ["Promoted rollup\n\nIncluded PRs: #9635"],
             ]
         ),
     )
@@ -11142,6 +11314,7 @@ async def test_recent_merged_titles_cap_preserves_full_merge_accounting_counts(
         "verified_landed": _RECENT_MERGED_TITLES_CAP,
         "verified_not_landed": 3,
         "unverifiable": 0,
+        "pending_in_open_rollup": 0,
     }
     assert delta["recent_not_landed_titles"] == [
         "stranded 10",
@@ -12161,6 +12334,84 @@ class TestBuildCycleStartReconciliation:
         assert entry["not_landed_titles_overflow"] == 0
         assert out["counts"]["merge_landed"] == _RECENT_MERGED_TITLES_CAP
         assert out["counts"]["merge_not_landed"] == 3
+
+    def test_pending_in_open_rollup_emitted_and_not_treated_as_conflict(self):
+        # PRs merged into an open rollup branch yield pending_in_open_rollup verdict.
+        # They must appear in recon.pending_in_open_rollup (not merge_accounting),
+        # counts.merge_pending_in_open_rollup must carry the title count, and
+        # counts.merge_pending_in_open_rollup_accounting must carry the direction count.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-1", "status": "active", "text": "rollup dir"},
+        ]
+        per_direction_delta = [
+            {
+                "direction_id": "d-1",
+                "direction_text": "rollup dir",
+                "recent_merged_titles": [
+                    {"title": "feat A", "merge_verdict": "pending_in_open_rollup"},
+                    {"title": "feat B", "merge_verdict": "pending_in_open_rollup"},
+                    {"title": "landed C", "merge_verdict": "verified_landed"},
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": 1,
+                    "verified_not_landed": 0,
+                    "unverifiable": 0,
+                    "pending_in_open_rollup": 2,
+                },
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            direction_stats, {}, {}, None, per_direction_delta
+        )
+        assert out is not None
+        # Pending rollup items are NOT merge conflicts.
+        assert out["merge_accounting"] == []
+        assert out["counts"]["merge_accounting"] == 0
+        assert out["counts"]["merge_not_landed"] == 0
+        # They appear in the dedicated pending section.
+        pending = out["pending_in_open_rollup"]
+        assert len(pending) == 1
+        entry = pending[0]
+        assert entry["direction_id"] == "d-1"
+        assert entry["pending_in_open_rollup"] == 2
+        assert "feat A" in entry["pending_in_open_rollup_titles"]
+        assert "feat B" in entry["pending_in_open_rollup_titles"]
+        assert entry["pending_in_open_rollup_titles_overflow"] == 0
+        # Aggregate counts match.
+        assert out["counts"]["merge_pending_in_open_rollup"] == 2
+        assert out["counts"]["merge_pending_in_open_rollup_accounting"] == 1
+        # Landed count is unaffected.
+        assert out["counts"]["merge_landed"] == 1
+
+    def test_pending_in_open_rollup_only_cycle_renders_section(self):
+        # A cycle whose ONLY merge signal is pending rollup work must not hit the
+        # nothing-to-reconcile early return and must still emit the section.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        per_direction_delta = [
+            {
+                "direction_id": "d-2",
+                "direction_text": "pending only dir",
+                "recent_merged_titles": [
+                    {"title": "feat X", "merge_verdict": "pending_in_open_rollup"},
+                ],
+                "recent_merge_verdict_counts": {
+                    "verified_landed": 0,
+                    "verified_not_landed": 0,
+                    "unverifiable": 0,
+                    "pending_in_open_rollup": 1,
+                },
+            },
+        ]
+        out = _build_cycle_start_reconciliation(
+            [], {}, {}, None, per_direction_delta
+        )
+        assert out is not None, "pending-only cycle must not return None"
+        assert len(out["pending_in_open_rollup"]) == 1
+        assert out["counts"]["merge_pending_in_open_rollup"] == 1
+        assert out["counts"]["merge_pending_in_open_rollup_accounting"] == 1
 
     def test_phantom_direction_refs_flagged_in_current_focus(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation

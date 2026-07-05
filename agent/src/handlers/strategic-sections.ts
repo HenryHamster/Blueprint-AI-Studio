@@ -349,6 +349,7 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     ? recon.merge_accounting as Array<Record<string, unknown>> : [];
   const mergeNotLandedTotal = countOr(counts.merge_not_landed, 0);
   const mergeUnverifiableTotal = countOr(counts.merge_unverifiable, 0);
+  const mergePendingInOpenRollupTotal = countOr(counts.merge_pending_in_open_rollup, 0);
   const mergeDirTotal = countOr(counts.merge_accounting, mergeAccounting.length);
   if (mergeAccounting.length > 0 || mergeNotLandedTotal > 0) {
     lines.push(`\n### Merge-accounting drift — badge says shipped, ancestry says NOT landed (${mergeDirTotal} direction(s), ${mergeNotLandedTotal} title(s); ${mergeUnverifiableTotal} unverifiable)`);
@@ -371,6 +372,33 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
     if (mergeDirTotal > mergeAccounting.length) {
       lines.push(`- +${mergeDirTotal - mergeAccounting.length} more direction(s) with drift not shown`);
+    }
+  }
+
+  // Pending rollup merges: PRs merged into staging branches awaiting rollup squash-merge
+  // into the integration branch. These are normal work-in-progress, not accounting conflicts.
+  const pendingRollupAccounting = Array.isArray(recon.pending_in_open_rollup)
+    ? recon.pending_in_open_rollup as Array<Record<string, unknown>> : [];
+  if (pendingRollupAccounting.length > 0 || mergePendingInOpenRollupTotal > 0) {
+    const rollupDirTotal = countOr(counts.merge_pending_in_open_rollup_accounting, pendingRollupAccounting.length);
+    lines.push(`\n### Pending rollup merges — work awaiting squash-merge to integration branch (${rollupDirTotal} direction(s), ${mergePendingInOpenRollupTotal} title(s))`);
+    lines.push('These PRs are merged into staging branches and awaiting the rollup to squash-merge into the integration branch. This is normal in-progress work, not a lost-work alarm.');
+    for (const m of pendingRollupAccounting) {
+      const text = strVal(m.direction_text, '?');
+      const did = strVal(m.direction_id, '?');
+      const pending = countOr(m.pending_in_open_rollup, 0);
+      const titles = Array.isArray(m.pending_in_open_rollup_titles) ? m.pending_in_open_rollup_titles as string[] : [];
+      const titlesOverflow = countOr(m.pending_in_open_rollup_titles_overflow, 0);
+      lines.push(`- ${text} (id: ${did}) — ${pending} pending rollup merge`);
+      for (const t of titles) {
+        lines.push(`  - ⧗ ${strVal(t, '?')}`);
+      }
+      if (titlesOverflow > 0) {
+        lines.push(`  - +${titlesOverflow} more pending title(s) not shown`);
+      }
+    }
+    if (rollupDirTotal > pendingRollupAccounting.length) {
+      lines.push(`- +${rollupDirTotal - pendingRollupAccounting.length} more direction(s) not shown`);
     }
   }
 
