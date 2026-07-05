@@ -17626,6 +17626,62 @@ async def test_spawn_fix_per_review_budget_enforced(db_session, mocker):
     assert flag["scope"] == "per_review"
 
 
+@pytest.mark.asyncio
+async def test_spawn_fix_resident_session_exempt_from_per_review_cap(db_session, mocker):
+    """A resident-session task can exceed the per-review cap without being blocked;
+    only the rolling window cap applies. A batch task remains blocked at the cap."""
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"strategist_spawn_per_review_cap": 2, "strategist_spawn_window_cap": 50},
+    )
+
+    # --- Resident session task: context["_resident_session"] = True ---
+    project = Project(name="P-resident", user_id="u1")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    resident_review = Task(
+        project_id=project.id,
+        user_id="u1",
+        task_type="strategic_review",
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"command": "review"}],
+        context={"_resident_session": True},
+    )
+    db_session.add(resident_review)
+    await db_session.commit()
+    await db_session.refresh(resident_review)
+    resident_id = str(resident_review.id)
+
+    # 3 spawns — exceeds the per-review cap of 2, all should succeed for resident.
+    for n in ("alpha", "beta", "gamma"):
+        body = await _post_spawn_fix(
+            db_session, resident_id, title=f"Fix {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok", f"resident spawn '{n}' was blocked: {body}"
+        assert body["deduplicated"] is False
+
+    # --- Batch task: no _resident_session flag, still blocked at cap ---
+    _project2, batch_id = await _make_strategic_review_task(db_session)
+
+    for n in ("one", "two"):
+        body = await _post_spawn_fix(
+            db_session, batch_id, title=f"Batch fix {n}", prompt=f"do {n}"
+        )
+        assert body["status"] == "ok"
+
+    refused = await _post_spawn_fix(
+        db_session,
+        batch_id,
+        title="Batch fix three",
+        prompt="do three",
+        expect_status=429,
+    )
+    assert refused["status"] == "skipped"
+    assert refused["scope"] == "per_review"
+
+
 # ── CI compliance in strategic review payload ─────────────────────────────────
 
 

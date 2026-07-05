@@ -2811,7 +2811,16 @@ async def strategic_operation(
         # the project-wide spawns in the rolling window, then ask the pure policy
         # helper whether one more fits. When exhausted, stamp an observable flag
         # on the review, log, and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        #
+        # Resident sessions use one long-lived task_id for their entire lifetime
+        # (hours), so the per-review cap would fire after legitimate operator work.
+        # Skip it for resident sessions; the rolling window cap still applies.
+        _is_resident = bool((task.context or {}).get("_resident_session"))
+        per_review_cap = (
+            0
+            if _is_resident
+            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        )
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
@@ -3090,7 +3099,16 @@ async def strategic_operation(
         # fix spawns in the rolling window, then ask the same pure policy helper
         # whether one more fits. When exhausted, stamp an observable flag, log,
         # and refuse with 429 — never a silent swallow.
-        per_review_cap = _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        #
+        # Resident sessions use one long-lived task_id for their entire lifetime
+        # (hours), so the per-review cap would fire after legitimate operator work.
+        # Skip it for resident sessions; the rolling window cap still applies.
+        _is_resident = bool((task.context or {}).get("_resident_session"))
+        per_review_cap = (
+            0
+            if _is_resident
+            else _runtime_config.get("strategist_spawn_per_review_cap", 12)
+        )
         window_cap = _runtime_config.get("strategist_spawn_window_cap", 20)
         window_minutes = _runtime_config.get("strategist_spawn_window_minutes", 60)
 
