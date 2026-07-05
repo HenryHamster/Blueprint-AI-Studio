@@ -12305,6 +12305,182 @@ async def test_cap_preserves_nonempty_mergeable_rollup_pr(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_preserve_creates_handmerge_attention_message(db_session, mocker):
+    """Preserving a non-approved rollup PR creates a durable ProjectMessage (NOTE)
+    keyed to the task, carrying the PR number in context/content."""
+    from app.models import MessageType, ProjectMessage
+
+    _mock_preservable_pr(mocker, changed_files=4, mergeable_state="clean")
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build X", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 711,
+            "review_loop": {
+                "pr_number": 711,
+                "review_history": [
+                    {"verdict": "CHANGES_REQUESTED", "issues": [_issue("x")]},
+                ],
+            },
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 711, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"pr_number": 711}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 711, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
+    assert (orig.context or {}).get("handmerge_pr_number") == 711
+
+    # A durable ProjectMessage (NOTE) must be created.
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key == f"handmerge:{orig.id}",
+            )
+        )
+    ).scalar_one_or_none()
+    assert msg is not None, "A durable handmerge attention message must be created"
+    assert msg.message_type == MessageType.NOTE
+    assert msg.from_type == "system"
+    assert msg.from_task_id == orig.id
+    assert msg.status == "open"
+    assert (msg.context or {}).get("event_type") == "handmerge_pr_preserved"
+    assert (msg.context or {}).get("pr_number") == 711
+    assert "711" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_approved_preserve_creates_handmerge_attention_message(db_session, mocker):
+    """Preserving an APPROVED rollup PR also creates a durable ProjectMessage keyed
+    to the task so the operator has an explicit durable record of the open PR."""
+    from app.models import MessageType, ProjectMessage
+
+    _mock_preservable_pr(mocker, changed_files=4, mergeable_state="clean")
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", new_callable=AsyncMock)
+    mocker.patch("app.routers.agent_status.record_task_result")
+    mocker.patch("app.shared_state.record_direction_result")
+    mocker.patch(
+        "app.task_completion._record_remediation_if_terminal", new_callable=AsyncMock
+    )
+
+    from app.review_pipeline import _handle_cap_exhaustion
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "create", "prompt": "Build Y", "base_branch": "main"}],
+        context={
+            "scope": "medium",
+            "_is_rollup_review": True,
+            "rollup_pr_number": 712,
+            "review_loop": {"review_approved": True, "pr_number": 712},
+        },
+    )
+    db_session.add(orig)
+    source_task = make_task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        payloads=[{"type": "fix", "pr_number": 712, "original_task_id": str(orig.id)}],
+        context={"review_loop": {"review_approved": True, "pr_number": 712}},
+    )
+    db_session.add(source_task)
+    await db_session.commit()
+    await db_session.refresh(orig)
+    await db_session.refresh(source_task)
+
+    await _handle_cap_exhaustion(
+        source_task, str(orig.id), 712, 16, db_session, scope="per-chain"
+    )
+
+    await db_session.refresh(orig)
+    assert (orig.context or {}).get("pr_preserved_for_handmerge") is True
+    assert (orig.context or {}).get("handmerge_pr_number") == 712
+
+    msg = (
+        await db_session.execute(
+            select(ProjectMessage).where(
+                ProjectMessage.project_id == project.id,
+                ProjectMessage.idempotency_key == f"handmerge:{orig.id}",
+            )
+        )
+    ).scalar_one_or_none()
+    assert msg is not None, "Approved preserve path must also create handmerge message"
+    assert msg.message_type == MessageType.NOTE
+    assert msg.from_type == "system"
+    assert msg.status == "open"
+    assert (msg.context or {}).get("pr_number") == 712
+    assert "712" in msg.content
+
+
+@pytest.mark.asyncio
+async def test_preserve_message_idempotent_on_retry(db_session):
+    """Re-calling the preserve path (idempotency guard) must not create a duplicate
+    ProjectMessage for the same task — the idempotency_key prevents double-insert."""
+    from app.models import ProjectMessage
+    from app.review_loop_convergence import _create_handmerge_attention_message
+
+    project = await _make_db_project(db_session)
+    orig = make_task(
+        project_id=project.id,
+        status=TaskStatus.FAILED,
+        payloads=[{"type": "create", "prompt": "Build Z", "base_branch": "main"}],
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 713,
+        },
+    )
+    db_session.add(orig)
+    await db_session.commit()
+    await db_session.refresh(orig)
+
+    # Call message creation twice to verify idempotency.
+    await _create_handmerge_attention_message(orig, 713, 16, "per-chain", db_session)
+    await _create_handmerge_attention_message(orig, 713, 16, "per-chain", db_session)
+
+    msgs = list(
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.idempotency_key == f"handmerge:{orig.id}",
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(msgs) == 1, "Idempotent creation must not insert a duplicate message"
+
+
+@pytest.mark.asyncio
 async def test_cap_closes_empty_rollup_pr(db_session, mocker):
     """GUARDRAIL: an EMPTY rollup PR (changed_files == 0) is not preservable —
     it keeps today's close + FAIL + CODE_ERROR path."""

@@ -292,6 +292,7 @@ from app.reaper_sweeps import (
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
+    sweep_closed_handmerge_prs,
     _sweep_strategic_cycle_starvation,
 )
 
@@ -2479,6 +2480,21 @@ async def reaper_service():
                     logger.error(
                         f"[REAPER] Evergreen fill-decision log purge: {e}",
                         exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 10c: Resolve preserved hand-merge PRs that have been merged/closed.
+                _mark_reaper_progress()
+                try:
+                    _hm_resolved = await sweep_closed_handmerge_prs(session)
+                    if _hm_resolved:
+                        logger.info(
+                            f"[REAPER] Step 10c: cleared {_hm_resolved} closed hand-merge PR(s)"
+                        )
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Handmerge PR sweep error: {e}", exc_info=True
                     )
                     with contextlib.suppress(Exception):
                         await session.rollback()

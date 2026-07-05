@@ -1217,6 +1217,157 @@ from app.reaper_bug_message_sweeps import (  # noqa: E402
     sweep_wake_delivery_stall_alerts,
 )
 
+async def sweep_closed_handmerge_prs(session) -> int:
+    """Resolve the operator-attention record for preserved hand-merge PRs that have since been merged or closed.
+
+    Finds FAILED tasks with ``pr_preserved_for_handmerge=True``, fetches each
+    PR's current state from GitHub, and — when the PR is no longer open —
+    clears the flag (removing the ``hand_merge_required`` attention item) and
+    resolves the associated ProjectMessage created at preservation time.
+
+    Capped at ``_HANDMERGE_SWEEP_BATCH`` tasks per reaper cycle to bound
+    GitHub API call volume (each task needs one round-trip).
+    """
+    import contextlib as _contextlib
+
+    from app.models import ArtifactType, ProjectMessage, Task, TaskStatus
+    from app.models import Artifact as _Artifact
+    from sqlalchemy.orm.attributes import flag_modified
+    from sqlmodel import select as _select
+
+    _HANDMERGE_SWEEP_BATCH = 10
+
+    # Order by updated_at ASC so that tasks whose context was most recently
+    # stamped (open-PR checks bump updated_at) rotate to the back, ensuring
+    # every preserved task is eventually checked regardless of batch size.
+    preserved_tasks = list(
+        (
+            await session.execute(
+                _select(Task)
+                .where(
+                    Task.archived.is_(False),
+                    Task.status == TaskStatus.FAILED,
+                    Task.context["pr_preserved_for_handmerge"].as_boolean().is_(True),
+                )
+                .order_by(Task.updated_at.asc())
+                .limit(_HANDMERGE_SWEEP_BATCH)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not preserved_tasks:
+        return 0
+
+    try:
+        from app.github import get_pull_request as _get_pull_request
+        from app.routers.agent import get_github_token_for_task as _get_token
+    except ImportError:
+        return 0
+
+    resolved = 0
+    for task in preserved_tasks:
+        ctx = dict(task.context or {})
+        pr_number = ctx.get("handmerge_pr_number")
+        if not isinstance(pr_number, int):
+            # Fall back to the PULL_REQUEST artifact for tasks preserved before
+            # handmerge_pr_number was stored in context.
+            artifact = (
+                await session.execute(
+                    _select(_Artifact).where(
+                        _Artifact.task_id == task.id,
+                        _Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    )
+                )
+            ).scalar_one_or_none()
+            if artifact and artifact.pr_url:
+                try:
+                    pr_number = int(artifact.pr_url.rstrip("/").split("/")[-1])
+                except (ValueError, IndexError):
+                    pr_number = None
+        if not pr_number:
+            continue
+
+        try:
+            gh_token, owner, repo = await _get_token(task.id, session)
+            pr = await _get_pull_request(
+                gh_token, owner, repo, pr_number, project_id=str(task.project_id)
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] handmerge-sweep: failed to check PR #%s for task %s: %s",
+                pr_number,
+                task.id,
+                _e,
+            )
+            continue
+
+        if (pr.get("state") or "").lower() == "open":
+            # Stamp last-checked time and commit so updated_at advances,
+            # rotating this task to the back of the ordered batch next cycle.
+            ctx["handmerge_last_checked_at"] = _utcnow().isoformat()
+            task.context = ctx
+            flag_modified(task, "context")
+            session.add(task)
+            try:
+                await session.commit()
+            except Exception as _e:  # noqa: BLE001
+                logger.warning(
+                    "[REAPER] handmerge-sweep: failed to stamp last-checked for task %s: %s",
+                    task.id,
+                    _e,
+                )
+                with _contextlib.suppress(Exception):
+                    await session.rollback()
+            continue
+
+        # PR is no longer open — clear the flag so the attention item disappears.
+        resolution = "merged" if pr.get("merged_at") else "closed"
+        ctx.pop("pr_preserved_for_handmerge", None)
+        ctx["handmerge_pr_resolved"] = True
+        ctx["handmerge_pr_resolution"] = resolution
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+
+        # Resolve the associated operator-attention ProjectMessage if open.
+        ikey = f"handmerge:{task.id}"
+        msg = (
+            await session.execute(
+                _select(ProjectMessage).where(
+                    ProjectMessage.project_id == task.project_id,
+                    ProjectMessage.idempotency_key == ikey,
+                    ProjectMessage.status == "open",
+                )
+            )
+        ).scalar_one_or_none()
+        if msg is not None:
+            msg.status = "resolved"
+            msg.resolution = f"PR #{pr_number} {resolution}"
+            msg.resolved_at = _utcnow()
+            session.add(msg)
+
+        try:
+            await session.commit()
+            resolved += 1
+            logger.info(
+                "[REAPER] handmerge-sweep: cleared PR #%s (%s) for task %s",
+                pr_number,
+                resolution,
+                task.id,
+            )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(
+                "[REAPER] handmerge-sweep: commit failed for task %s: %s",
+                task.id,
+                _e,
+            )
+            with _contextlib.suppress(Exception):
+                await session.rollback()
+
+    return resolved
+
+
 __all__ = [
     # Re-exported from app.blocked_task_unblock_sweeps (constants)
     "_BLOCKED_ESCALATE_AFTER",
@@ -1257,4 +1408,5 @@ __all__ = [
     "sweep_resolve_open_owned_bug_messages",
     "sweep_resolve_stale_open_bug_messages",
     "sweep_wake_delivery_stall_alerts",
+    "sweep_closed_handmerge_prs",
 ]

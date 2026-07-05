@@ -6726,6 +6726,329 @@ async def test_operator_attention_surfaces_stuck_criteria_direction_retired(
     assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"
 
 
+# ── sweep_closed_handmerge_prs tests ──────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_resolves_merged_pr(db_session, mocker):
+    """When a preserved-for-handmerge task's PR has been merged, the sweep clears
+    pr_preserved_for_handmerge from context and resolves the ProjectMessage."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup for hand-merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 999,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        from_task_id=None,
+        content="PR #999 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 999},
+        idempotency_key=None,  # set after task.id is known
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Now fix the idempotency_key (task.id available after commit).
+    msg.idempotency_key = f"handmerge:{task.id}"
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T10:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "pr_preserved_for_handmerge" not in ctx, "Flag must be cleared after merge"
+    assert ctx.get("handmerge_pr_resolved") is True
+    assert ctx.get("handmerge_pr_resolution") == "merged"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #999 merged"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_resolves_closed_unmerged_pr(db_session, mocker):
+    """When a preserved PR is closed without merging, the sweep clears the flag
+    and resolves the message with resolution='closed'."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup closed without merge",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 888,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR #888 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 888},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": None},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    assert "pr_preserved_for_handmerge" not in (task.context or {})
+    assert (task.context or {}).get("handmerge_pr_resolution") == "closed"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #888 closed"
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_skips_open_pr(db_session, mocker):
+    """When the PR is still open, the sweep must not clear the flag or resolve
+    the message."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Rollup still open",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 777,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR #777 preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 777},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "open", "merged_at": None},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 0
+    await db_session.refresh(task)
+    assert (task.context or {}).get("pr_preserved_for_handmerge") is True, (
+        "Flag must NOT be cleared while PR is still open"
+    )
+    await db_session.refresh(msg)
+    assert msg.status == "open", "Message must remain open while PR is open"
+    # Fairness: last-checked timestamp must be stamped so updated_at advances,
+    # rotating this task to the back of the ordered batch in future cycles.
+    assert (task.context or {}).get("handmerge_last_checked_at") is not None, (
+        "handmerge_last_checked_at must be set after an open-PR check"
+    )
+
+
+@pytest.mark.asyncio
+async def test_sweep_closed_handmerge_prs_legacy_fallback_artifact(db_session, mocker):
+    """When a preserved task has no handmerge_pr_number in context (legacy path),
+    the sweep falls back to the PULL_REQUEST artifact's pr_url to find the PR number,
+    and still clears the flag and resolves the ProjectMessage when the PR is closed."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    # Task does NOT have handmerge_pr_number in context — simulates tasks
+    # preserved before handmerge_pr_number was stored in context.
+    task = Task(
+        project_id=project.id,
+        title="Legacy hand-merge no PR number in context",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # PULL_REQUEST artifact provides the PR URL (legacy path).
+    artifact = Artifact(
+        task_id=task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/owner/repo/pull/404",
+    )
+    db_session.add(artifact)
+
+    msg = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="system",
+        content="PR preserved for hand-merge",
+        context={"event_type": "handmerge_pr_preserved", "pr_number": 404},
+        idempotency_key=f"handmerge:{task.id}",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T11:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+
+    assert resolved == 1
+    await db_session.refresh(task)
+    ctx = task.context or {}
+    assert "pr_preserved_for_handmerge" not in ctx, (
+        "Flag must be cleared even when PR number came from artifact fallback"
+    )
+    assert ctx.get("handmerge_pr_resolved") is True
+    assert ctx.get("handmerge_pr_resolution") == "merged"
+
+    await db_session.refresh(msg)
+    assert msg.status == "resolved"
+    assert msg.resolution == "PR #404 merged"
+    assert msg.resolved_at is not None
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_clears_after_sweep_resolves_handmerge_pr(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end: after sweep_closed_handmerge_prs clears pr_preserved_for_handmerge,
+    the operator_attention endpoint no longer shows a hand_merge_required item."""
+    from app.reaper_sweeps import sweep_closed_handmerge_prs
+
+    project = await _make_project(db_session)
+    task = Task(
+        project_id=project.id,
+        title="Preserved hand-merge PR — sweep integration",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        context={
+            "pr_preserved_for_handmerge": True,
+            "handmerge_pr_number": 555,
+            "failure_detail": "review_cap_preserved_for_handmerge",
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Before sweep: attention shows the hand_merge_required item.
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention_before = resp.json()
+    assert attention_before["counts"]["handmerge_preserved_tasks"] == 1
+    assert attention_before["counts"]["needs_operator"] == 1
+    assert any(
+        item["reason"] == "hand_merge_required"
+        for item in attention_before["items"]
+    )
+
+    # Simulate PR being merged by having GitHub return state=closed.
+    mocker.patch(
+        "app.routers.agent.get_github_token_for_task",
+        new_callable=AsyncMock,
+        return_value=("tok", "owner", "repo"),
+    )
+    mocker.patch(
+        "app.github.get_pull_request",
+        new_callable=AsyncMock,
+        return_value={"state": "closed", "merged_at": "2026-07-05T10:00:00Z"},
+    )
+
+    resolved = await sweep_closed_handmerge_prs(db_session)
+    assert resolved == 1
+
+    # After sweep: attention no longer shows the hand_merge_required item.
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention_after = resp.json()
+    assert attention_after["counts"]["handmerge_preserved_tasks"] == 0
+    assert attention_after["counts"]["needs_operator"] == 0
+    assert not any(
+        item["reason"] == "hand_merge_required"
+        for item in attention_after["items"]
+    )
+
+
 @pytest.mark.asyncio
 async def test_coverage_blocked_version_without_stuck_criteria_raises_attention(
     client: AsyncClient, db_session
