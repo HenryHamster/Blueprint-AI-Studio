@@ -9,6 +9,7 @@ from unittest.mock import patch
 from app.finding_deduplication import (
     CODE_ERROR_COOLDOWN,
     DedupOutcome,
+    STRONG_REGION_MIN_SHARED,
     _check_evidence_overlap,
     _extract_normalized_claims,
     _extract_source_refs,
@@ -2045,12 +2046,13 @@ def test_is_duplicate_plain_words_no_false_positive():
     assert is_duplicate(title3, "dir-1", existing3) is False
 
 
-def test_deduplicate_findings_catches_same_file_region_duplicate():
-    # A reworded finding about the SAME file (declared in related_files) is
-    # blocked via region identity — the shared file establishes the region and
-    # the near-identical file set corroborates. (Previously this relied on a
-    # title technical-token gate, which also fired on generic tokens like
-    # ``a/b`` and dropped distinct work; region keying removes that.)
+def test_deduplicate_findings_single_file_no_title_claim_overlap_kept():
+    # After the STRONG_REGION_MIN_SHARED fix: a finding that shares only ONE file
+    # with an active task (jaccard = 1.0) is NOT auto-deduped unless title words
+    # OR a claim also corroborate — a 1-file overlap is not strong enough signal
+    # alone. The jaccard-only arm now requires >= 3 shared files to fire.
+    # (Previously this identical-1-file case was wrongly filtered by jaccard=1.0
+    # alone with no title/claim agreement required.)
     findings = [
         {
             "title": "finding_deduplication.py misses paraphrased cross-cycle titles",
@@ -2075,8 +2077,10 @@ def test_deduplicate_findings_catches_same_file_region_duplicate():
         existing_tasks_with_dirs=existing,
         open_pr_files=set(),
     )
-    assert len(outcome.deduplicated) == 0
-    assert outcome.word_overlap_count == 1
+    # 1 shared file, title overlap = 1 word ("finding_deduplication.py") < 3
+    # threshold, no claims → NOT a duplicate under the fixed threshold.
+    assert len(outcome.deduplicated) == 1
+    assert outcome.word_overlap_count == 0
 
 
 def test_deduplicate_findings_passes_unrelated_technical_token_finding():
@@ -2099,5 +2103,354 @@ def test_deduplicate_findings_passes_unrelated_technical_token_finding():
         existing_tasks_with_dirs=existing,
         open_pr_files=set(),
     )
+    assert len(outcome.deduplicated) == 1
+    assert outcome.word_overlap_count == 0
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for the small-file-set jaccard auto-duplicate false positive
+# (STRONG_REGION_MIN_SHARED fix + 5-tuple claims support)
+# Incident: two findings sharing identical 1-2-file sets were wrongly dropped
+# against "fix pr #12662" (zero title/claim agreement) because jaccard=1.0>=0.7
+# fired unconditionally, producing "2 duplicates skipped -> 0 tasks" NOTE.
+# ---------------------------------------------------------------------------
+
+
+def test_strong_region_min_shared_constant_is_three():
+    """STRONG_REGION_MIN_SHARED must equal 3 — the minimum shared-file count
+    required for the jaccard-only corroborator to assert duplicate identity."""
+    assert STRONG_REGION_MIN_SHARED == 3
+
+
+def test_incident_two_files_disjoint_titles_and_claims_kept():
+    """Regression for the live incident: two findings sharing an identical 2-file
+    set (acceptance_criteria.py + routers/admin_acceptance_criteria.py) with
+    completely different titles and no claims must NOT be auto-deduped.
+
+    Before the fix: file_jaccard=1.0>=STRONG_REGION_JACCARD fired unconditionally
+    and both findings were dropped against "fix pr #12662".
+    After the fix: the jaccard arm requires >=3 shared files; 2-file sets need
+    title-word or claim corroboration, which is absent here → KEPT.
+    """
+    finding_a = {
+        "title": "fix: backfill late criterion mappings onto tasks",
+        "description": "Criterion mappings created after task spawn are not backfilled.",
+        "priority": "medium",
+        "direction_id": "dir-db2679e9",
+        "related_files": [
+            "backend/app/acceptance_criteria.py",
+            "backend/app/routers/admin_acceptance_criteria.py",
+        ],
+        "claims": ["late-mapped criteria never reach existing tasks"],
+    }
+    finding_b = {
+        "title": "feat: import HEAD regression evidence for criteria",
+        "description": "Criteria lack HEAD regression evidence on initial import.",
+        "priority": "medium",
+        "direction_id": "dir-db2679e9",
+        "related_files": [
+            "backend/app/acceptance_criteria.py",
+            "backend/app/routers/admin_acceptance_criteria.py",
+        ],
+        "claims": ["criteria import has no regression evidence"],
+    }
+    # Active fix-review task inherits the same 2-file set; no claims on this candidate
+    existing = [
+        (
+            "dir-db2679e9",
+            "fix pr #12662",
+            "fix",
+            [
+                "backend/app/acceptance_criteria.py",
+                "backend/app/routers/admin_acceptance_criteria.py",
+            ],
+        )
+    ]
+    outcome_a = deduplicate_findings(
+        [finding_a],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    outcome_b = deduplicate_findings(
+        [finding_b],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert len(outcome_a.deduplicated) == 1, (
+        "finding_a must not be dropped: 2 shared files + no title/claim agreement"
+    )
+    assert outcome_a.word_overlap_count == 0
+    assert len(outcome_b.deduplicated) == 1, (
+        "finding_b must not be dropped: 2 shared files + no title/claim agreement"
+    )
+    assert outcome_b.word_overlap_count == 0
+
+
+def test_incident_two_findings_both_kept_in_same_batch():
+    """Both findings from the incident survive as a batch: neither is a duplicate
+    of the other (distinct claims) and neither is a duplicate of the active task
+    (no title/claim corroboration, file set < STRONG_REGION_MIN_SHARED)."""
+    finding_a = {
+        "title": "fix: backfill late criterion mappings onto tasks",
+        "description": "Late-mapped criteria never reach tasks already spawned.",
+        "priority": "medium",
+        "direction_id": "dir-db2679e9",
+        "related_files": [
+            "backend/app/acceptance_criteria.py",
+            "backend/app/routers/admin_acceptance_criteria.py",
+        ],
+        "claims": ["late-mapped criteria never reach existing tasks"],
+    }
+    finding_b = {
+        "title": "feat: import HEAD regression evidence for criteria",
+        "description": "Criteria import lacks HEAD regression evidence.",
+        "priority": "medium",
+        "direction_id": "dir-db2679e9",
+        "related_files": [
+            "backend/app/acceptance_criteria.py",
+            "backend/app/routers/admin_acceptance_criteria.py",
+        ],
+        "claims": ["criteria import has no regression evidence"],
+    }
+    existing = [
+        (
+            "dir-db2679e9",
+            "fix pr #12662",
+            "fix",
+            [
+                "backend/app/acceptance_criteria.py",
+                "backend/app/routers/admin_acceptance_criteria.py",
+            ],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding_a, finding_b],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert len(outcome.deduplicated) == 2, (
+        "Both distinct findings must survive; was 0 before STRONG_REGION_MIN_SHARED fix"
+    )
+    assert outcome.word_overlap_count == 0
+
+
+def test_two_files_shared_claim_still_filtered():
+    """When two findings share a claim AND a 2-file set, the claim corroborator
+    fires correctly and the duplicate IS filtered — the fix only drops the
+    jaccard-only arm for small file sets; the claim arm is unchanged."""
+    finding = {
+        "title": "fix: backfill late criterion mappings onto tasks",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["app/acceptance_criteria.py", "app/routers/admin_ac.py"],
+        "claims": ["late-mapped criteria never reach existing tasks"],
+    }
+    existing = [
+        (
+            "dir-1",
+            "fix: criterion late-backfill is missing",
+            "fix",
+            ["app/acceptance_criteria.py", "app/routers/admin_ac.py"],
+            ["late-mapped criteria never reach existing tasks"],  # shared claim → 5-tuple
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert outcome.word_overlap_count == 1, "shared claim should still dedup 2-file match"
+    assert outcome.deduplicated == []
+
+
+def test_three_or_more_shared_files_jaccard_still_filters():
+    """The jaccard-only corroborator IS still trusted when >=3 files are shared:
+    three distinct but related findings anchored on the same three-file module
+    with jaccard=1.0 and no title/claim agreement are filtered correctly."""
+    finding = {
+        "title": "perf: trim agent direction fetch response to agent fields",
+        "description": "Full direction payload sent to agent is 3x larger than needed.",
+        "priority": "medium",
+        "direction_id": "dir-cf2897a6",
+        "related_files": [
+            "backend/app/routers/agent_strategic_fetch.py",
+            "backend/app/schemas.py",
+            "backend/app/models.py",
+        ],
+    }
+    existing = [
+        (
+            "dir-cf2897a6",
+            "fix: mark cross-attempt evidence in qualification",
+            "fix",
+            [
+                "backend/app/routers/agent_strategic_fetch.py",
+                "backend/app/schemas.py",
+                "backend/app/models.py",
+            ],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    # jaccard=1.0 with 3 shared files (>= STRONG_REGION_MIN_SHARED=3) → still filtered
+    assert outcome.word_overlap_count == 1
+    assert outcome.deduplicated == []
+    # reason embeds the matched candidate title
+    assert "fix: mark cross-attempt" in outcome.filtered[0]["reason"]
+
+
+def test_five_tuple_claim_corroboration_for_active_task():
+    """5-tuple active-task candidates carry claims (P2): the claim arm fires
+    correctly for small file sets, so legitimate same-intent duplicates are
+    still caught even when the jaccard arm no longer fires for < 3 files."""
+    finding = {
+        "title": "reworded version of existing fix approach",
+        "description": "Agent re-derives the same fix with different phrasing.",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["app/acceptance_criteria.py", "app/routers/ac.py"],
+        "claims": ["criterion backfill path skips tasks created before mapping"],
+    }
+    # 5-tuple: (dir, title, task_type, related_files, claims)
+    existing_5tuple = [
+        (
+            "dir-1",
+            "fix: backfill criterion mapping for pre-existing tasks",
+            "fix",
+            ["app/acceptance_criteria.py", "app/routers/ac.py"],
+            ["criterion backfill path skips tasks created before mapping"],  # shared claim
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing_5tuple,
+        open_pr_files=set(),
+    )
+    # Shared claim corroborates → filtered, even though only 2 files shared
+    assert outcome.word_overlap_count == 1
+    assert outcome.deduplicated == []
+    assert "reworded version" in outcome.filtered[0]["title"]
+
+
+def test_five_tuple_no_claim_match_two_files_kept():
+    """5-tuple active-task candidate with DIFFERENT claims and only 2 shared
+    files: no claim corroboration, jaccard arm requires >=3 files → KEPT."""
+    finding = {
+        "title": "distinct finding about a different aspect",
+        "description": "Different aspect of the same module.",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["app/acceptance_criteria.py", "app/routers/ac.py"],
+        "claims": ["some completely different claim about a distinct issue"],
+    }
+    existing_5tuple = [
+        (
+            "dir-1",
+            "fix: backfill criterion mapping for pre-existing tasks",
+            "fix",
+            ["app/acceptance_criteria.py", "app/routers/ac.py"],
+            ["criterion backfill path skips tasks created before mapping"],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing_5tuple,
+        open_pr_files=set(),
+    )
+    # No shared claim, 2 files < STRONG_REGION_MIN_SHARED=3, low word overlap → KEPT
+    assert len(outcome.deduplicated) == 1
+    assert outcome.word_overlap_count == 0
+
+
+def test_cross_direction_two_files_no_claim_kept():
+    """Cross-direction: two findings sharing a 2-file set but with no shared
+    claims must NOT be auto-deduped (previously jaccard=1.0 fired unconditionally
+    for cross-direction candidates too, conflating distinct work from independent
+    directions that shared a module's hot files — confirmed live in d-a94e67f5
+    where test-invariants finding was dropped against a feature task)."""
+    finding = {
+        "title": "test: packer floor-sum and monotonic degradation invariants",
+        "description": "Add invariant tests for the packer floor-sum.",
+        "priority": "medium",
+        "direction_id": "dir-a94e67f5",
+        "related_files": [
+            "backend/app/strategic_payload_compaction.py",
+            "backend/testing/test_pack_under_budget.py",
+        ],
+    }
+    existing = [
+        (
+            "dir-other",  # DIFFERENT direction
+            "feat: sized trim log with per-section recovery hints",
+            "fix",
+            [
+                "backend/app/strategic_payload_compaction.py",
+                "backend/testing/test_pack_under_budget.py",
+            ],
+        )
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing,
+        open_pr_files=set(),
+    )
+    assert len(outcome.deduplicated) == 1, (
+        "cross-direction 2-file identical sets without claim agreement must be KEPT"
+    )
+    assert outcome.word_overlap_count == 0
+
+
+def test_five_tuple_legacy_four_tuple_claims_fallback():
+    """Legacy 4-tuple candidates still work — the claims slot defaults to frozenset()
+    and the fix does not break existing callers that have not yet been updated."""
+    finding = {
+        "title": "investigate alpha serialization latency",
+        "description": "desc",
+        "priority": "medium",
+        "direction_id": "dir-1",
+        "related_files": ["app/foo.py", "app/bar.py"],
+        "claims": ["alpha serialization causes latency spikes"],
+    }
+    # 4-tuple (no claims) — legacy format; title has no overlapping words with finding
+    existing_4tuple = [
+        ("dir-1", "migrate beta compression pipeline", "fix", ["app/foo.py", "app/bar.py"])
+    ]
+    outcome = deduplicate_findings(
+        [finding],
+        task_context=None,
+        recent_finding_hashes=set(),
+        failed_hashes={},
+        existing_tasks_with_dirs=existing_4tuple,
+        open_pr_files=set(),
+    )
+    # 4-tuple has no claims → claim arm cannot fire; 2 shared files < 3 → kept
     assert len(outcome.deduplicated) == 1
     assert outcome.word_overlap_count == 0

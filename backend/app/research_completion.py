@@ -2973,16 +2973,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         .all()
     )
     # Build compact active-task overlap candidates for region-identity dedup:
-    # (direction_id, title, task_type, related_files). The related_files (4th
-    # element) are the necessary signal for region matching — a spawned task
+    # (direction_id, title, task_type, related_files, claims). The related_files
+    # (4th element) are the necessary signal for region matching — a spawned task
     # records the finding's related_files in its context (see the spawn payload
-    # below), so in-flight work exposes the files it targets.
+    # below), so in-flight work exposes the files it targets. The claims (5th
+    # element) feed claim-agreement corroboration for small-file-set cases.
     existing_tasks_with_dirs = [
         (
             (t.context or {}).get("direction_id"),
             t.title.lower(),
             (t.first_payload or {}).get("type"),
             (t.context or {}).get("related_files"),
+            (t.context or {}).get("claims") or [],
         )
         for t in existing_tasks
     ]
@@ -4627,6 +4629,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 "original_base": original_base,
                 "research_depth": research_depth + 1,
                 "related_files": related_files,
+                "claims": (finding.get("claims") or [])[:8],
                 "finding_hash": fhash,
                 "finding_lineage": sorted(_finding_lineage),
                 **(
