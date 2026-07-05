@@ -87,6 +87,7 @@ _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
+    ("needs_operator", "hand_merge_required"): 15,
     ("needs_operator", "alert"): 20,
     ("needs_operator", "local_runner_hold"): 30,
     ("needs_operator", "stale_runner_pin"): 40,
@@ -143,6 +144,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "task_lifecycle",
         "clears_when": "approval_resolved_or_task_terminal_or_archived",
         "operator_action": "approve_or_reject_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "hand_merge_required": {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_pr_merged_or_closed",
+        "operator_action": "hand_merge_or_archive_task",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -363,6 +371,7 @@ def _task_attention_item(task: Task, *, reason: str, severity: str) -> dict[str,
     status = _enum_value(task.status)
     label = {
         "approval_required": "Approval required",
+        "hand_merge_required": "Hand-merge required",
         "failed_task": "Task failed",
         "blocked_task": "Task blocked",
         "parked_task": "Task parked",
@@ -619,6 +628,15 @@ def _runner_is_stale_or_missing(runner: LocalRunner | None) -> bool:
     if runner is None:
         return True
     return not bool(_runner_health(runner).get("is_live"))
+
+
+def _handmerge_preserved_task_filter(project_id: uuid.UUID) -> tuple[Any, ...]:
+    return (
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        Task.status == TaskStatus.FAILED,
+        Task.context["pr_preserved_for_handmerge"].as_boolean().is_(True),
+    )
 
 
 async def _load_stale_runner_pins(
@@ -1290,6 +1308,33 @@ async def build_operator_attention(
     blocked_count = int(task_count_result.blocked or 0)
     parked_count = int(task_count_result.parked or 0)
 
+    handmerge_preserved_filters = _handmerge_preserved_task_filter(project.id)
+    handmerge_preserved_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Task)
+                .where(*handmerge_preserved_filters)
+            )
+        ).scalar()
+        or 0
+    )
+    handmerge_preserved_tasks = list(
+        (
+            await session.execute(
+                select(Task)
+                .where(*handmerge_preserved_filters)
+                .order_by(Task.updated_at.desc())
+                .limit(_STALE_TASK_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    # Keep preserved hand-merge PRs visible as their own operator item rather
+    # than letting the generic FAILED-task watch preview consume the signal.
+    generic_failed_count = max(failed_count - handmerge_preserved_count, 0)
+
     local_runner_hold_filters = local_runner_hold_task_filters(project.id)
     strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
         project.id
@@ -1451,6 +1496,7 @@ async def build_operator_attention(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
                     Task.status == TaskStatus.FAILED,
+                    Task.context["pr_preserved_for_handmerge"].as_boolean().is_not(True),
                 )
                 .order_by(Task.updated_at.desc())
                 .limit(3)
@@ -1625,6 +1671,14 @@ async def build_operator_attention(
     for task in held_tasks:
         reason = "parked_task" if task.status == TaskStatus.PARKED else "blocked_task"
         add_candidate(_task_attention_item(task, reason=reason, severity="watch"))
+    for task in handmerge_preserved_tasks:
+        add_candidate(
+            _task_attention_item(
+                task,
+                reason="hand_merge_required",
+                severity="needs_operator",
+            )
+        )
     for task in failed_tasks:
         add_candidate(_task_attention_item(task, reason="failed_task", severity="watch"))
     for task in unmet_experiment_preview:
@@ -1650,6 +1704,7 @@ async def build_operator_attention(
         open_question_count
         + open_blocker_count
         + approval_count
+        + handmerge_preserved_count
         + total_local_runner_hold_count
         + stale_runner_pin_count
         + dead_runner_needs_operator_count
@@ -1660,7 +1715,7 @@ async def build_operator_attention(
         + stuck_criteria_count
     )
     total_watch = (
-        failed_count
+        generic_failed_count
         + blocked_count
         + parked_count
         + warning_alert_count
@@ -1725,9 +1780,10 @@ async def build_operator_attention(
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,
-            "failed_tasks": failed_count,
+            "failed_tasks": generic_failed_count,
             "blocked_tasks": blocked_count,
             "parked_tasks": parked_count,
+            "handmerge_preserved_tasks": handmerge_preserved_count,
             "experiment_outcomes": unmet_experiment_count,
         },
         "items": items,

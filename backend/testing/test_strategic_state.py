@@ -5719,6 +5719,98 @@ async def test_operator_attention_approval_precedence_over_blocked(
 
 
 @pytest.mark.asyncio
+async def test_operator_attention_surfaces_preserved_handmerge_failed_task_as_needs_operator_and_clears_when_archived(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    preserved = Task(
+        project_id=project.id,
+        title="Preserved hand-merge PR",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        requires_approval=True,
+        latest_status_message="Review-fix cap reached (4 iterations, per-chain) - PR #123 LEFT OPEN with mergeable work; manual hand-merge required (not auto-closed)",
+        context={
+            "failure_detail": "review_cap_preserved_for_handmerge",
+            "pr_preserved_for_handmerge": True,
+        },
+    )
+    db_session.add(preserved)
+    await db_session.commit()
+    await db_session.refresh(preserved)
+
+    newer_failed_tasks = []
+    for idx in range(4):
+        task = Task(
+            project_id=project.id,
+            title=f"New failure {idx + 1}",
+            payloads=[{"type": "create"}],
+            status=TaskStatus.FAILED,
+            latest_status_message=f"Newer failure #{idx + 1}",
+        )
+        newer_failed_tasks.append(task)
+    db_session.add_all(newer_failed_tasks)
+    await db_session.commit()
+    for task in newer_failed_tasks:
+        await db_session.refresh(task)
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["needs_operator"] == 1
+    assert attention["counts"]["watch"] == 4
+    assert attention["counts"]["failed_tasks"] == 4
+    assert attention["counts"]["handmerge_preserved_tasks"] == 1
+
+    item_ids = {item["id"] for item in attention["items"]}
+    preserved_id = f"task:{preserved.id}:hand_merge_required"
+    assert preserved_id in item_ids
+    assert f"task:{preserved.id}:failed_task" not in item_ids
+    visible_failed_task_ids = {
+        item["id"] for item in attention["items"] if item["reason"] == "failed_task"
+    }
+    assert len(visible_failed_task_ids) == 3
+    assert visible_failed_task_ids.issubset(
+        {f"task:{task.id}:failed_task" for task in newer_failed_tasks}
+    )
+
+    preserved_item = next(
+        item for item in attention["items"] if item["id"] == preserved_id
+    )
+    assert preserved_item["severity"] == "needs_operator"
+    assert preserved_item["reason"] == "hand_merge_required"
+    assert preserved_item["label"] == "Hand-merge required"
+    assert preserved_item["lifecycle"] == {
+        "mode": "task_lifecycle",
+        "clears_when": "task_archived_or_pr_merged_or_closed",
+        "operator_action": "hand_merge_or_archive_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    }
+
+    preserved.archived = True
+    db_session.add(preserved)
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "watch"
+    assert attention["counts"]["needs_operator"] == 0
+    assert attention["counts"]["watch"] == 4
+    assert attention["counts"]["failed_tasks"] == 4
+    assert attention["counts"]["handmerge_preserved_tasks"] == 0
+    assert preserved_id not in {item["id"] for item in attention["items"]}
+
+
+@pytest.mark.asyncio
 async def test_operator_attention_pure_blocked_not_requiring_approval_stays_in_watch(
     client: AsyncClient, db_session
 ):
