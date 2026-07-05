@@ -1560,7 +1560,10 @@ def pack_under_budget(
         ):
             packed[key] = candidate["value"]
             used += candidate["size"]
-            trimmed.append(candidate["meta"])
+            _trim_rec = {**candidate["meta"], "bytes_original": size, "bytes_trimmed": candidate["size"]}
+            if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                _trim_rec["fetch_verb"] = _fv
+            trimmed.append(_trim_rec)
             logger.info(
                 "pack_under_budget: trimmed %r (summarized from floor, %d→%d bytes)",
                 key, size, candidate["size"],
@@ -1571,7 +1574,10 @@ def pack_under_budget(
             if summarized is not None and summarized["size"] <= remaining:
                 packed[key] = summarized["value"]
                 used += summarized["size"]
-                trimmed.append(summarized["meta"])
+                _trim_rec = {**summarized["meta"], "bytes_original": size, "bytes_trimmed": summarized["size"]}
+                if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                    _trim_rec["fetch_verb"] = _fv
+                trimmed.append(_trim_rec)
                 logger.info(
                     "pack_under_budget: trimmed %r (%d→%d bytes)",
                     key, size, summarized["size"],
@@ -1586,7 +1592,10 @@ def pack_under_budget(
                 # the last-resort working set the strategist must always receive.
                 packed[key] = floor["value"]
                 used += floor["size"]
-                trimmed.append({"key": key, "kind": "floored"})
+                _trim_rec = {"key": key, "kind": "floored", "bytes_original": size, "bytes_trimmed": floor["size"]}
+                if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                    _trim_rec["fetch_verb"] = _fv
+                trimmed.append(_trim_rec)
                 logger.info(
                     "pack_under_budget: trimmed %r to floor (%d→%d bytes)",
                     key, size, floor["size"],
@@ -1604,7 +1613,10 @@ def pack_under_budget(
                 if p["summarize"]
                 else "exceeds remaining budget (no summarize_fn)"
             )
-            dropped.append({"key": key, "reason": drop_reason, "priority": p["priority"]})
+            _drop_rec: dict = {"key": key, "reason": drop_reason, "priority": p["priority"], "bytes": size}
+            if _fv := (schema.get(key) or {}).get("fetch_verb"):
+                _drop_rec["fetch_verb"] = _fv
+            dropped.append(_drop_rec)
             has_floor_in_schema = (schema.get(key) or {}).get("floor") is not None
             if has_floor_in_schema:
                 logger.error(

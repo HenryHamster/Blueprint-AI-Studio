@@ -527,12 +527,16 @@ export async function handleStrategic(
         for (const t of trimmed) {
           const k = strVal(t.key, '?');
           const kind = strVal(t.kind, 'summarized');
+          const bytesOrig = typeof t.bytes_original === 'number'
+            ? ` (${t.bytes_original}→${typeof t.bytes_trimmed === 'number' ? t.bytes_trimmed : '?'} bytes)` : '';
+          const fetchVerb = strVal(t.fetch_verb);
+          const recovery = fetchVerb ? `; run \`./fetch ${fetchVerb}\` for full detail` : '';
           if (kind === 'list_trimmed') {
             const shown = (t.shown as number | undefined) ?? '?';
             const total = (t.total as number | undefined) ?? '?';
-            lines.push(`  - ${k}: showing ${shown} of ${total} entries`);
+            lines.push(`  - ${k}: showing ${shown} of ${total} entries${bytesOrig}${recovery}`);
           } else {
-            lines.push(`  - ${k}: shipped in summarized form`);
+            lines.push(`  - ${k}: shipped in ${kind} form${bytesOrig}${recovery}`);
           }
         }
       }
@@ -541,7 +545,10 @@ export async function handleStrategic(
         for (const d of dropped) {
           const k = strVal(d.key, '?');
           const reason = strVal(d.reason, 'budget exhausted');
-          lines.push(`  - ${k}: ${reason}`);
+          const bytes = typeof d.bytes === 'number' ? ` (${d.bytes} bytes)` : '';
+          const fetchVerb = strVal(d.fetch_verb);
+          const recovery = fetchVerb ? `; run \`./fetch ${fetchVerb}\` to recover` : '';
+          lines.push(`  - ${k}${bytes}: ${reason}${recovery}`);
         }
       }
       lines.push(

@@ -604,3 +604,145 @@ async def test_supersession_target_valid_active_key_accepted(client: AsyncClient
     await db_session.refresh(source)
     assert source.status == "superseded"
     assert source.superseded_by_key == successor.criterion_key
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/projects/{project_id}/acceptance-criteria/{key}/reinstate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reinstate_criterion_happy_path(client: AsyncClient, db_session):
+    """Reinstating a retracted criterion flips it back to active and clears retraction fields."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Criterion to retract then reinstate",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion.criterion_key,
+        reason="loop retracted this",
+        retracted_by="strategist",
+    )
+    await db_session.refresh(criterion)
+    assert criterion.status == "retracted"
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["criterion_key"] == criterion.criterion_key
+
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+    assert criterion.retraction_reason is None
+    assert criterion.retracted_at is None
+    assert criterion.retracted_by is None
+    assert criterion.superseded_by_key is None
+
+
+@pytest.mark.asyncio
+async def test_reinstate_already_active_idempotent(client: AsyncClient, db_session):
+    """Reinstating an already-active criterion is a no-op returning 200."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Active criterion",
+    )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+
+    await db_session.refresh(criterion)
+    assert criterion.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_reinstate_not_found_404(client: AsyncClient, db_session):
+    """Returns 404 when the criterion key does not exist in the open version."""
+    project = await _make_project_member(db_session, role="member")
+    await _make_version(db_session, project)
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/c-doesnotexist/reinstate"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_reinstate_409_no_open_version(client: AsyncClient, db_session):
+    """Returns 409 when there is no open release version."""
+    project = await _make_project_member(db_session, role="member")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/c-any/reinstate"
+    )
+    assert resp.status_code == 409, f"expected 409 (no open version), got {resp.status_code}: {resp.text}"
+
+
+@pytest.mark.asyncio
+async def test_reinstate_409_cap_exceeded(client: AsyncClient, db_session):
+    """Returns 409 when reinstating would exceed the active-criteria cap."""
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+
+    # Create a criterion, retract it, then fill the cap with other criteria.
+    to_reinstate = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Will be retracted",
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=to_reinstate.criterion_key,
+        reason="test retraction",
+        retracted_by="test",
+    )
+
+    # Fill up active slots to the cap.
+    for i in range(ac.MAX_CRITERIA_PER_VERSION):
+        await ac.create_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            text=f"Filler {i}",
+        )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/{to_reinstate.criterion_key}/reinstate"
+    )
+    assert resp.status_code == 409, f"expected 409 (cap exceeded), got {resp.status_code}: {resp.text}"
+    assert "cap" in resp.json().get("error", {}).get("message", resp.text).lower()
+
+
+@pytest.mark.asyncio
+async def test_reinstate_requires_member_role(client: AsyncClient, db_session):
+    """Project non-member receives 403/404 on the reinstate endpoint."""
+    other_project = Project(name="OtherReinstate", user_id="other-user")
+    db_session.add(other_project)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{other_project.id}/acceptance-criteria/c-any/reinstate"
+    )
+    assert resp.status_code in (403, 404)

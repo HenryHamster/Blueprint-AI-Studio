@@ -141,6 +141,67 @@ async def delete_acceptance_criterion(
     return {"status": "deleted", "criterion_key": criterion_key}
 
 
+@router.post("/projects/{project_id}/acceptance-criteria/{criterion_key}/reinstate")
+async def reinstate_acceptance_criterion(
+    project_id: uuid.UUID,
+    criterion_key: str,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Reinstate a retracted or superseded criterion back to active status.
+
+    This operator-only endpoint reverses a loop-driven retraction the operator
+    disagrees with. Idempotent: calling on an already-active criterion returns 200.
+    Enforces the per-version active-criteria cap before reinstating.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    from app.release_version import current_open_version
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+
+    existing = await ac.get_criteria_by_keys(
+        session,
+        project_id,
+        [criterion_key],
+        release_version_id=open_version.id,
+    )
+    if not existing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Criterion key not found in open version: {criterion_key}",
+        )
+
+    row = existing[0]
+    if row.status != "active":
+        active_count = await ac.count_active_criteria_for_version(session, open_version.id)
+        if active_count >= ac.MAX_CRITERIA_PER_VERSION:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Version already has {ac.MAX_CRITERIA_PER_VERSION} active criteria (cap reached); cannot reinstate",
+            )
+
+    reinstated = await ac.reinstate_criterion(
+        session,
+        project_id=project_id,
+        release_version_id=open_version.id,
+        criterion_key=criterion_key,
+    )
+    if reinstated is None:
+        raise HTTPException(status_code=404, detail="Criterion not found")
+
+    logger.info(
+        "[AC] Operator reinstated criterion %s for project %s version %s",
+        criterion_key,
+        project_id,
+        open_version.id,
+    )
+    return {"status": "ok", "criterion_key": criterion_key}
+
+
 class LinkDirectionRequest(BaseModel):
     direction_key: str = Field(..., max_length=128)
     criterion_keys: List[str] = Field(..., max_length=50)
@@ -278,6 +339,11 @@ async def attest_criterion(
         )
 
     row = existing[0]
+    if row.status != "active":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Criterion '{criterion_key}' is {row.status} and cannot be attested",
+        )
     evidence = CriterionEvidence(
         criterion_id=row.id,
         project_id=project_id,

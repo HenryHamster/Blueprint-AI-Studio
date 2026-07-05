@@ -2777,6 +2777,22 @@ export async function deleteAcceptanceCriterion(
   }
 }
 
+export async function reinstateAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+): Promise<{ status: string; criterion_key: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/reinstate`,
+    { method: 'POST' },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to reinstate criterion: ${res.status}`;
+    throw new Error(detail);
+  }
+  return data;
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'

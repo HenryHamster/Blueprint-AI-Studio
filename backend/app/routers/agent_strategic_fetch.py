@@ -1020,6 +1020,139 @@ async def agent_fetch_compute_sweep(
     return {"status": "success", "data": docs}
 
 
+# ---------------------------------------------------------------------------
+# Payload-section fetch inventory + generic section recovery endpoint
+# ---------------------------------------------------------------------------
+
+# Maps every _STRATEGIC_REVIEW_SCHEMA key to its recovery path:
+#   - a fetch verb string ("problem-model", "direction", ...) — dedicated endpoint
+#   - "sections" — served by agent_fetch_payload_section below
+#   - None — no recovery (ephemeral, in-memory, or always-critical)
+# This dict must stay in sync with _STRATEGIC_REVIEW_SCHEMA; the inventory
+# test enforces that every schema key has an explicit entry here.
+SECTION_FETCH_INVENTORY: dict[str, str | None] = {
+    # Critical identity/routing — always ships, never dropped
+    "type": None, "research_mode": None, "project_name": None, "base_branch": None,
+    "is_self_repo": None, "enable_self_improvement": None, "model": None, "effort": None,
+    "vision": None, "direction_counts": None, "max_active_directions": None,
+    "open_message_count": None,
+    # High — dedicated fetch verbs
+    "open_messages": "message",
+    "directions_summary": "direction",
+    "problem_model": "problem-model",
+    "version_phase": "version-phase",
+    # Medium/high — dedicated fetch verbs
+    "design_doc": "section",
+    "knowledge_index": "knowledge",
+    "compute_experiment_sweeps": "compute-sweeps",
+    "capability_trial_verdicts": "capability-trials",
+    "efficiency_snapshot": "efficiency-snapshot",
+    "ci_compliance": "ci-compliance",
+    # Low — generic section endpoint (project-data-based, no complex async)
+    "self_reflection_log": "sections",
+    "anomaly_summary": "sections",
+    "playbook_summary": "sections",
+    "retired_directions_summary": "sections",
+    "rejected_proposals": "sections",
+    "past_retirement_critiques": "sections",
+    "previous_decision_outcomes": "sections",
+    "outcome_evaluation": "sections",
+    # High/medium exempt — ephemeral, bounded at build time, or tiny scalars
+    "prompt_suffix": None, "running_update": None,
+    "running_update_acknowledged_at": None, "user_last_active_at": None,
+    "first_autonomous_improvement_at": None,
+    "operator_context_refs": None, "cycle_start_reconciliation": None,
+    "model_health": None, "prune_candidates": None, "playbook_keys_index": None,
+    "staged_directions": None, "retirement_deferrals": None,
+    "payload_staleness": None, "deployment_state": None,
+    "operator_overrides": None, "missing_capability_demand": None,
+    "available_capabilities": None, "local_runner_status": None,
+    # Medium — no recovery (require complex async or ephemeral session data)
+    "conversation_thread": None,
+    "recent_interventions": None,   # requires GitHub API fan-out
+    "drift_signals": None,          # requires async DB compute
+    "memo_citations": None,         # requires cycle-scoped Task query
+    # Low — no recovery (in-memory runtime state or tiny unactionable scalars)
+    "held_directions": None,        # in-memory shared state, not persisted
+    "running_update_superseded": None,
+    "prediction_calibration_factor": None,
+    "prediction_calibration_note": None,
+    "system_maturity": None,
+}
+
+_SECTIONS_NEEDING_CYCLE_HISTORY: frozenset[str] = frozenset({
+    "past_retirement_critiques",
+    "previous_decision_outcomes",
+    "outcome_evaluation",
+})
+
+
+@router.get("/projects/{project_id}/sections/{section_name}")
+@limiter.limit("60/minute")
+async def agent_fetch_payload_section(
+    request: Request,
+    project_id: uuid.UUID,
+    section_name: str,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a freshly-built payload section by name for sections that have no
+    dedicated fetch verb. Only sections registered as 'sections' in
+    SECTION_FETCH_INVENTORY are served here; others get 404. Used as the
+    recovery path when a low-priority section was dropped under budget pressure.
+    Cross-project access returns 404 (not 403)."""
+    if SECTION_FETCH_INVENTORY.get(section_name) != "sections":
+        raise HTTPException(status_code=404, detail="Section not available via this endpoint")
+    project = await _resolve_agent_project(project_id, token, session)
+
+    from datetime import timedelta  # noqa: PLC0415
+    from app.strategic_spawning import (  # noqa: PLC0415
+        _build_anomaly_summary,
+        _build_playbook_summary,
+        _build_past_retirement_critiques,
+        _build_previous_decision_outcomes,
+    )
+    from app.strategic_analysis import (  # noqa: PLC0415
+        _build_retired_directions_summary,
+        _build_outcome_evaluation,
+    )
+    from app import strategic_cycle as _sc  # noqa: PLC0415
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    if section_name == "self_reflection_log":
+        data: Any = project.self_reflection_log or []
+    elif section_name == "anomaly_summary":
+        data = _build_anomaly_summary(project)
+    elif section_name == "playbook_summary":
+        data = _build_playbook_summary(project)
+    elif section_name == "retired_directions_summary":
+        data = _build_retired_directions_summary(project)
+    elif section_name == "rejected_proposals":
+        cutoff = (_utcnow() - timedelta(days=30)).isoformat()
+        rows = [
+            {
+                "text": (d.get("text") or "")[:300],
+                "rejected_at": d.get("rejected_at"),
+                "rationale": (d.get("rationale") or "")[:300] if d.get("rationale") else None,
+            }
+            for d in (project.directions or [])
+            if d.get("status") == "rejected" and (d.get("rejected_at") or "") >= cutoff
+        ]
+        rows.sort(key=lambda r: r.get("rejected_at") or "", reverse=True)
+        data = rows[:10]
+    else:
+        # past_retirement_critiques, previous_decision_outcomes, outcome_evaluation
+        cycle_history = await _sc.recent_for_agent_context(session, project.id)
+        if section_name == "past_retirement_critiques":
+            data = _build_past_retirement_critiques(cycle_history)
+        elif section_name == "previous_decision_outcomes":
+            data = _build_previous_decision_outcomes(project, cycle_history)
+        else:
+            data = _build_outcome_evaluation(project, cycle_history)
+
+    return {"status": "success", "data": data}
+
+
 @router.get("/projects/{project_id}/gaps/{gap_id}")
 @limiter.limit("60/minute")
 async def agent_fetch_gap(

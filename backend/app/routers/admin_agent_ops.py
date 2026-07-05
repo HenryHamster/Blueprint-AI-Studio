@@ -1626,6 +1626,19 @@ async def strategic_operation(
             )
 
         await _with_vision_locked(session, project.id, _record_retire_memory)
+        # Criterion-link guard: clear criterion_keys from the Direction ORM row so
+        # downstream spawn paths don't propagate stale criterion links from a now-dead
+        # direction.  Best-effort (non-blocking) — a missing ORM row is harmless.
+        from app.directions_repo import get_direction_row as _get_retire_dir_row
+        _retire_dir_row = await _get_retire_dir_row(session, project.id, str(dir_id))
+        if _retire_dir_row is not None and _retire_dir_row.criterion_keys:
+            _cleared_keys = list(_retire_dir_row.criterion_keys)
+            _retire_dir_row.criterion_keys = []
+            session.add(_retire_dir_row)
+            warnings.append(
+                f"Retired direction {dir_id} had {len(_cleared_keys)} criterion "
+                f"link(s) cleared: {_cleared_keys}"
+            )
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))
@@ -3702,9 +3715,16 @@ async def strategic_operation(
                 # keeping only keys that are active in this version or were
                 # added during this call (not yet flushed to DB).
                 _valid_keys = _db_active_crit_keys | _call_crit_keys
+                _prior_keys = set(dir_row.criterion_keys or [])
                 merged = list(
-                    (_valid_keys & set(dir_row.criterion_keys or [])) | {criterion_key}
+                    (_valid_keys & _prior_keys) | {criterion_key}
                 )
+                _scrubbed = _prior_keys - _valid_keys - {criterion_key}
+                if _scrubbed:
+                    warnings.append(
+                        f"Direction '{dk}': {len(_scrubbed)} stale criterion key(s) "
+                        f"removed: {sorted(_scrubbed)}"
+                    )
                 dir_row.criterion_keys = merged
                 session.add(dir_row)
                 mapped_keys.append(dk)

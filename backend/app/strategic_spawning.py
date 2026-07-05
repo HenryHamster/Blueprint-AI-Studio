@@ -3172,6 +3172,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "high",
         "summarize": _summarize_open_messages,
         "floor": _floor_open_messages,
+        "fetch_verb": "message",
     },
     "running_update": {"priority": "high", "exempt": True},
     "running_update_acknowledged_at": {"priority": "high", "exempt": True},
@@ -3210,6 +3211,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         "priority": "high",
         "summarize": _summarize_directions,
         "floor": _directions_summary_floor,
+        "fetch_verb": "direction",
     },
     # Directions already queued for the NEXT version (status=staged). Medium
     # priority with no summarize_fn: it is already capped at build time, so the
@@ -3230,6 +3232,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
         # independent function that cannot fail, so the reservation is honored
         # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
+        "fetch_verb": "problem-model",
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
@@ -3251,7 +3254,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # per-section content is fetched on demand via POST /api/agent/design-doc
     # (op:get) — see _design_doc_index. The summarize fallback drops per-entry
     # summaries to a navigation skeleton under genuine budget exhaustion.
-    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
+    "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
     # Compact, body-omitted index of existing knowledge documents (web_research /
     # design output). Medium priority. Summarize fallback keeps the newest few
     # entries with their navigation pointers (id/title/topic/direction) and drops
@@ -3260,6 +3263,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "knowledge_index": {
         "priority": "medium",
         "summarize": _summarize_knowledge_index,
+        "fetch_verb": "knowledge",
     },
     # Per-sweep comparative arm grouping — bounded at build time so the packer
     # drops it whole under budget rather than trimming. Same tier as
@@ -3297,6 +3301,7 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "playbook_summary": {
         "priority": "low",
         "summarize": _summarize_playbook_summary,
+        "fetch_verb": "playbook",
     },
     "rejected_proposals": {"priority": "low", "exempt": True},
     "running_update_superseded": {"priority": "low", "exempt": True},
@@ -3392,6 +3397,7 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
         "priority": "high",
         "summarize": _summarize_open_messages,
         "floor": _floor_open_messages,
+        "fetch_verb": "message",
     },
     # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context. Exempt:
     # bounded at build time (short ref strings, no unbounded growth).
@@ -3399,7 +3405,7 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # Compact, bounded navigation index over the grounded agent-view design doc
     # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
     # per-section content is fetched on demand via POST /api/agent/design-doc.
-    "design_doc": {"priority": "high", "summarize": _summarize_design_doc_index},
+    "design_doc": {"priority": "high", "summarize": _summarize_design_doc_index, "fetch_verb": "section"},
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
@@ -3414,6 +3420,7 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
         # independent function that cannot fail, so the reservation is honored
         # even if the summarize callback raises an exception.
         "floor": _agent_view_problem_model_floor,
+        "fetch_verb": "problem-model",
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
     # Exempt: small and bounded (a single computed dict).

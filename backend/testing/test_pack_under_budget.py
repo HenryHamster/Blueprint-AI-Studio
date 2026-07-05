@@ -58,13 +58,12 @@ def test_drops_lowest_priority_first():
     out = pack_under_budget(payload, schema, budget=250)
     assert "must_keep" in out
     assert "nice_to_have" not in out
-    assert out["_packer_meta"]["dropped"] == [
-        {
-            "key": "nice_to_have",
-            "reason": "exceeds remaining budget (no summarize_fn)",
-            "priority": "low",
-        },
-    ]
+    assert len(out["_packer_meta"]["dropped"]) == 1
+    d = out["_packer_meta"]["dropped"][0]
+    assert d["key"] == "nice_to_have"
+    assert d["reason"] == "exceeds remaining budget (no summarize_fn)"
+    assert d["priority"] == "low"
+    assert d["bytes"] == _size("y" * 200)
 
 
 def test_summarize_invoked_when_full_overflows():
@@ -77,9 +76,13 @@ def test_summarize_invoked_when_full_overflows():
     }
     out = pack_under_budget(payload, schema, budget=200)
     assert out["items"] == list(range(10))
-    assert out["_packer_meta"]["trimmed"] == [
-        {"key": "items", "kind": "list_trimmed", "shown": 10, "total": 1000},
-    ]
+    assert len(out["_packer_meta"]["trimmed"]) == 1
+    t = out["_packer_meta"]["trimmed"][0]
+    assert t["key"] == "items"
+    assert t["kind"] == "list_trimmed"
+    assert t["shown"] == 10
+    assert t["total"] == 1000
+    assert t["bytes_original"] > t["bytes_trimmed"] > 0
     assert out["_packer_meta"]["dropped"] == []
 
 
@@ -94,13 +97,12 @@ def test_summarize_still_overflows_drops_part():
     }
     out = pack_under_budget(payload, schema, budget=100)
     assert "huge" not in out
-    assert out["_packer_meta"]["dropped"] == [
-        {
-            "key": "huge",
-            "reason": "exceeds remaining budget even after summarize",
-            "priority": "medium",
-        },
-    ]
+    assert len(out["_packer_meta"]["dropped"]) == 1
+    d = out["_packer_meta"]["dropped"][0]
+    assert d["key"] == "huge"
+    assert d["reason"] == "exceeds remaining budget even after summarize"
+    assert d["priority"] == "medium"
+    assert d["bytes"] == _size("x" * 5000)
 
 
 def test_critical_overflow_raises():
@@ -314,7 +316,7 @@ def test_floor_used_when_summarize_absent_or_raises():
     }
     out = pack_under_budget(payload, schema, budget=200)
     assert out["model"] == {"floored": True}
-    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+    assert any(t["key"] == "model" and t["kind"] == "floored" for t in out["_packer_meta"]["trimmed"])
 
 
 def test_floor_full_value_ships_when_budget_allows():
@@ -427,7 +429,7 @@ def test_full_model_floor_does_not_starve_critical_keys(caplog):
     assert out["model"].get("_agent_view_floor_applied"), (
         "the degraded model must carry the loud floor-applied marker"
     )
-    assert {"key": "model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    assert any(t["key"] == "model" and t["kind"] == "summarized" for t in out["_packer_meta"]["trimmed"])
     assert any(
         "exceed budget" in rec.message and "critical" in rec.message
         for rec in caplog.records
@@ -491,7 +493,7 @@ def test_degraded_floor_reservation_survives_mixed_high_contention():
 
     assert "problem_model" in out, "degraded reservation must keep problem_model delivered"
     assert out["problem_model"] == summarized_model
-    assert {"key": "problem_model", "kind": "summarized"} in out["_packer_meta"]["trimmed"]
+    assert any(t["key"] == "problem_model" and t["kind"] == "summarized" for t in out["_packer_meta"]["trimmed"])
     dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
     assert "problem_model" not in dropped_keys, f"problem_model dropped: {out['_packer_meta']['dropped']}"
     assert {"sibling_a", "sibling_b"} & dropped_keys, (
@@ -553,7 +555,7 @@ def test_degraded_reservation_preserves_floor_without_summarize(caplog):
     # model_a kept its floor reservation and shipped the floor value (loudly),
     # instead of being cleared and dropped for lack of a summarized candidate.
     assert out["model_a"] == floor_a, "floored key must ship its floor value"
-    assert {"key": "model_a", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+    assert any(t["key"] == "model_a" and t["kind"] == "floored" for t in out["_packer_meta"]["trimmed"])
     dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
     assert "model_a" not in dropped_keys, f"model_a dropped: {out['_packer_meta']['dropped']}"
     assert any(
@@ -627,7 +629,7 @@ def test_floor_survives_when_summarize_raises(caplog):
     assert any("summarize" in rec.message.lower() and "raised" in rec.message.lower()
                for rec in caplog.records)
     # The floored entry is marked as floored in the metadata.
-    assert {"key": "model", "kind": "floored"} in out["_packer_meta"]["trimmed"]
+    assert any(t["key"] == "model" and t["kind"] == "floored" for t in out["_packer_meta"]["trimmed"])
 
 
 def test_floor_survives_when_both_summarize_and_floor_raise():
@@ -1425,6 +1427,87 @@ def test_core_sections_survive_realistic_worst_case():
     assert "problem_model" in out
     assert "problem_model" not in dropped_keys
     assert out["_packer_meta"]["budget_used"] <= budget
+
+
+def test_trim_and_drop_records_include_byte_counts_and_fetch_verb():
+    """Trimmed and dropped entries carry byte counts and fetch_verb where declared.
+
+    This is the acceptance test for the sized trim-log feature: every trim/drop
+    record must carry the original byte size, trimmed entries must also carry the
+    post-trim byte count, and entries for schema keys that declare a ``fetch_verb``
+    must include it so the agent knows exactly which recovery verb to run.
+    """
+    items_full = list(range(500))
+    huge_str = "x" * 5000
+    payload = {
+        "items": items_full,  # summarized → trimmed record
+        "huge": huge_str,     # dropped (exceeds budget even after summarize)
+    }
+    schema = {
+        "items": {
+            "priority": "medium",
+            "summarize": lambda v: v[:5],
+            "fetch_verb": "direction",
+        },
+        "huge": {
+            "priority": "low",
+            "fetch_verb": "message",
+        },
+    }
+    out = pack_under_budget(payload, schema, budget=500)
+
+    # --- trimmed entry ---
+    trimmed = out["_packer_meta"]["trimmed"]
+    assert len(trimmed) == 1, f"expected 1 trimmed entry, got {trimmed}"
+    t = trimmed[0]
+    assert t["key"] == "items"
+    assert t["kind"] == "list_trimmed"
+    assert t["shown"] == 5
+    assert t["total"] == 500
+    # Byte counts must be present and correctly ordered
+    assert "bytes_original" in t, "trimmed entry must carry bytes_original"
+    assert "bytes_trimmed" in t, "trimmed entry must carry bytes_trimmed"
+    assert t["bytes_original"] == _size(items_full), "bytes_original must equal full serialized size"
+    assert t["bytes_trimmed"] == _size(list(range(5))), "bytes_trimmed must equal trimmed serialized size"
+    assert t["bytes_original"] > t["bytes_trimmed"], "trimmed form must be smaller than original"
+    # Recovery hint from schema
+    assert t.get("fetch_verb") == "direction", "trimmed entry must carry fetch_verb from schema"
+
+    # --- dropped entry ---
+    dropped = out["_packer_meta"]["dropped"]
+    assert len(dropped) == 1, f"expected 1 dropped entry, got {dropped}"
+    d = dropped[0]
+    assert d["key"] == "huge"
+    assert "bytes" in d, "dropped entry must carry bytes"
+    assert d["bytes"] == _size(huge_str), "bytes must equal original serialized size"
+    # Recovery hint from schema
+    assert d.get("fetch_verb") == "message", "dropped entry must carry fetch_verb from schema"
+
+
+def test_trim_and_drop_records_omit_fetch_verb_when_not_declared():
+    """When a schema entry does not declare fetch_verb, the records do not carry it.
+
+    Fetch verbs are only surfaced for sections that have a documented recovery
+    path. Sections without one should not emit a fetch_verb field so the agent
+    does not try to run a non-existent recovery verb.
+    """
+    payload = {
+        "section_a": list(range(100)),  # summarized
+        "section_b": "y" * 5000,        # dropped
+    }
+    schema = {
+        "section_a": {"priority": "medium", "summarize": lambda v: v[:3]},
+        "section_b": {"priority": "low"},
+    }
+    out = pack_under_budget(payload, schema, budget=200)
+
+    trimmed = out["_packer_meta"]["trimmed"]
+    assert len(trimmed) == 1
+    assert "fetch_verb" not in trimmed[0], "fetch_verb must not appear when not declared in schema"
+
+    dropped = out["_packer_meta"]["dropped"]
+    assert len(dropped) == 1
+    assert "fetch_verb" not in dropped[0], "fetch_verb must not appear when not declared in schema"
 
 
 def test_first_autonomous_improvement_at_registered_in_schema(caplog):

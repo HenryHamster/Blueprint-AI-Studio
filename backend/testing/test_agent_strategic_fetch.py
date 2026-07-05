@@ -4382,6 +4382,159 @@ async def test_candidate_currency_indeterminate_marker(
     _assert_generated_at_iso_utc(cc)
 
 
+# ---------------------------------------------------------------------------
+# Generic payload-section fetch endpoint + inventory contract
+# ---------------------------------------------------------------------------
+
+
+def test_section_fetch_inventory_covers_all_schema_keys():
+    """Every key in _STRATEGIC_REVIEW_SCHEMA must appear in SECTION_FETCH_INVENTORY.
+
+    This is the cross-surface inventory contract: any new section added to the
+    schema must declare its recovery path (or None) here, preventing silent gaps
+    where a dropped section has no documented fallback.
+    """
+    from app.routers.agent_strategic_fetch import SECTION_FETCH_INVENTORY
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    missing = set(_STRATEGIC_REVIEW_SCHEMA) - set(SECTION_FETCH_INVENTORY)
+    assert not missing, (
+        f"Sections in _STRATEGIC_REVIEW_SCHEMA missing from SECTION_FETCH_INVENTORY: "
+        f"{sorted(missing)}. Add an entry to SECTION_FETCH_INVENTORY in "
+        f"app/routers/agent_strategic_fetch.py (use None if no fetch path exists)."
+    )
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_payload_section_self_reflection_log(
+    client: AsyncClient, db_session
+):
+    """Generic /sections endpoint returns self_reflection_log from project data."""
+    project = Project(
+        name="Section Log Test",
+        user_id="test-user-sf-log",
+        self_reflection_log=[
+            {"entry": "first reflection", "created_at": "2026-01-01T00:00:00"},
+            {"entry": "second reflection", "created_at": "2026-01-02T00:00:00"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-sf-log")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sf-log")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/sections/self_reflection_log",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    assert len(body["data"]) == 2
+    assert body["data"][0]["entry"] == "first reflection"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_payload_section_rejected_proposals(
+    client: AsyncClient, db_session
+):
+    """Generic /sections endpoint returns only recent (within 30d) rejected directions."""
+    project = Project(
+        name="Rejected Props Test",
+        user_id="test-user-sf-rp",
+        directions=[
+            {"status": "rejected", "text": "Recent rejected", "rejected_at": "2026-07-01T00:00:00"},
+            {"status": "rejected", "text": "Old rejected", "rejected_at": "2026-04-01T00:00:00"},
+            {"status": "active", "text": "Active direction"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-sf-rp")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sf-rp")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/sections/rejected_proposals",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    # Only the recent (within 30d of 2026-07-05) rejected direction appears
+    assert len(body["data"]) == 1
+    assert body["data"][0]["text"] == "Recent rejected"
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_payload_section_rejects_non_section_verbs(
+    client: AsyncClient, db_session
+):
+    """Sections with a dedicated verb (problem-model, etc.) return 404 from /sections/."""
+    project = Project(name="Sec 404 Test", user_id="test-user-sf-404")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-sf-404")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-sf-404")
+    # 'problem_model' has a dedicated endpoint, not served via /sections/
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/sections/problem_model",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+    # Completely unknown section name also 404s
+    res2 = await client.get(
+        f"/api/agent/projects/{project.id}/sections/does_not_exist",
+        headers={"x-agent-token": token},
+    )
+    assert res2.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_payload_section_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Generic section endpoint rejects cross-project access (404, not 403)."""
+    project_a = Project(name="SFX A", user_id="test-user-sfx-a")
+    project_b = Project(
+        name="SFX B",
+        user_id="test-user-sfx-b",
+        self_reflection_log=[{"entry": "secret", "created_at": "2026-01-01T00:00:00"}],
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-sfx-a")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-sfx-a")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/sections/self_reflection_log",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
 @pytest.mark.asyncio
 async def test_candidate_currency_api_unreachable_distinct_from_unknown(
     client: AsyncClient, db_session, mocker

@@ -3026,3 +3026,254 @@ def test_criterion_link_invalid_rejected_at_write():
     assert classify_criterion_key("c-superseded", active, inactive) == "inactive"
     assert classify_criterion_key("c-missing", active, inactive) == "dangling"
     assert classify_criterion_key("", active, inactive) == "dangling"
+
+
+# ---------------------------------------------------------------------------
+# Supersession chain staleness and retraction atomicity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retract_successor_clears_superseded_by_key_on_predecessor(db_session):
+    """Retracting criterion B clears superseded_by_key on predecessor A.
+
+    When A.superseded_by_key == B.criterion_key and B is later retracted,
+    A's superseded_by_key must be set to None so the chain does not dangle.
+    """
+    project = await _make_project(db_session, "ChainClear")
+    version = await _make_version(db_session, project)
+    criterion_a = await ac.create_criterion(
+        db_session, project.id, version.id, "Predecessor criterion"
+    )
+    criterion_b = await ac.create_criterion(
+        db_session, project.id, version.id, "Successor criterion"
+    )
+
+    # Mark A as superseded by B.
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion_a.criterion_key,
+        reason="Superseded",
+        superseded_by_key=criterion_b.criterion_key,
+    )
+    await db_session.refresh(criterion_a)
+    assert criterion_a.superseded_by_key == criterion_b.criterion_key
+
+    # Now retract B — A's superseded_by_key must be cleared.
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion_b.criterion_key,
+        reason="B is no longer valid",
+    )
+    await db_session.refresh(criterion_a)
+    assert criterion_a.superseded_by_key is None
+
+
+@pytest.mark.asyncio
+async def test_retract_predecessor_does_not_affect_unrelated_superseded_by_keys(db_session):
+    """Retracting criterion X does not clear superseded_by_key on an unrelated row.
+
+    Only rows whose superseded_by_key matches the retracted criterion_key are
+    affected; other superseded_by_key values must be left unchanged.
+    """
+    project = await _make_project(db_session, "ChainIsolation")
+    version = await _make_version(db_session, project)
+    criterion_a = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion A"
+    )
+    criterion_b = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion B (successor of A)"
+    )
+    criterion_x = await ac.create_criterion(
+        db_session, project.id, version.id, "Unrelated criterion X"
+    )
+
+    # A superseded by B.
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion_a.criterion_key,
+        reason="Superseded by B",
+        superseded_by_key=criterion_b.criterion_key,
+    )
+    await db_session.refresh(criterion_a)
+    assert criterion_a.superseded_by_key == criterion_b.criterion_key
+
+    # Retract unrelated X — must not touch A.superseded_by_key.
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion_x.criterion_key,
+        reason="X retired",
+    )
+    await db_session.refresh(criterion_a)
+    assert criterion_a.superseded_by_key == criterion_b.criterion_key
+
+
+@pytest.mark.asyncio
+async def test_attest_retracted_criterion_returns_409(client: AsyncClient, db_session):
+    """POST .../attest on a retracted criterion returns 409."""
+    project = await _make_project_with_member(db_session, name="Attest-Retracted")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion to retract"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        criterion.criterion_key,
+        reason="No longer needed",
+        retracted_by="operator",
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{criterion.criterion_key}/attest",
+        json={"reason": "I still want to attest this"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "retracted" in resp.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_attest_superseded_criterion_returns_409(client: AsyncClient, db_session):
+    """POST .../attest on a superseded criterion returns 409."""
+    project = await _make_project_with_member(db_session, name="Attest-Superseded")
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    predecessor = await ac.create_criterion(
+        db_session, project.id, version.id, "Old criterion"
+    )
+    successor = await ac.create_criterion(
+        db_session, project.id, version.id, "New replacement criterion"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project.id,
+        version.id,
+        predecessor.criterion_key,
+        reason="Replaced",
+        superseded_by_key=successor.criterion_key,
+    )
+
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/{predecessor.criterion_key}/attest",
+        json={"reason": "I want to attest the old one"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "superseded" in resp.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# retire_direction criterion-link guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_clears_criterion_keys(
+    client: AsyncClient, db_session, mocker
+):
+    """retire_direction must clear criterion_keys from the Direction ORM row.
+
+    When a direction is retired the autonomous loop must not propagate its
+    criterion links to newly spawned tasks.  The criterion-link guard in the
+    retire_direction path sets Direction.criterion_keys to [] and surfaces a
+    warning in the response so the strategist knows stale links were cleared.
+    """
+    from app.auth import create_agent_token
+    from app import strategic_cycle
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+
+    dir_id = "d-retire-crit-guard"
+    project = Project(
+        name="RetireCritGuard",
+        user_id="test-user-crit-guard",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": dir_id,
+                "text": "direction with criterion links",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion linked to direction"
+    )
+
+    # Wire the Direction ORM row (dual-write peer) with criterion_keys.
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=dir_id,
+        data={"id": dir_id, "text": "direction with criterion links", "status": "active"},
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-retire-crit-guard",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-retire-crit-guard", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "retire_direction",
+            "data": {
+                "direction_id": dir_id,
+                "rationale": "work is done",
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    # Guard must surface a warning that criterion links were cleared.
+    warnings = body.get("warnings", [])
+    assert any("criterion" in w.lower() and dir_id in w for w in warnings), (
+        f"retire_direction must warn about cleared criterion_keys; got warnings={warnings}"
+    )
+
+    # The Direction ORM row must have criterion_keys cleared.
+    await db_session.refresh(dir_row)
+    assert dir_row.criterion_keys == [] or dir_row.criterion_keys is None, (
+        f"Direction ORM row criterion_keys must be cleared after retire; "
+        f"got {dir_row.criterion_keys}"
+    )

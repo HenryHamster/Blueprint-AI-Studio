@@ -6,6 +6,7 @@ import {
   cutVersion,
   fetchQualificationVerdicts,
   patchAdminSettings,
+  reinstateAcceptanceCriterion,
   setProjectPromotionEnabled,
   setVersionPhase,
   setVersionGoal,
@@ -390,6 +391,17 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
     });
   };
 
+  const handleReinstate = projectId
+    ? async (criterionKey: string) => {
+        try {
+          await reinstateAcceptanceCriterion(projectId, criterionKey);
+          onRefresh();
+        } catch (err) {
+          setActionMsg(err instanceof Error ? err.message : 'Failed to reinstate criterion');
+        }
+      }
+    : undefined;
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
@@ -746,7 +758,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} onReinstate={handleReinstate} />
                 )}
               </div>
             )}

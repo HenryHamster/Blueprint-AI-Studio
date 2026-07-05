@@ -495,11 +495,13 @@ async def retract_criterion(
     retraction path leaves the flag ``False`` and can retract anything.
     """
     result = await session.execute(
-        select(VersionAcceptanceCriterion).where(
+        select(VersionAcceptanceCriterion)
+        .where(
             VersionAcceptanceCriterion.project_id == project_id,
             VersionAcceptanceCriterion.release_version_id == release_version_id,
             VersionAcceptanceCriterion.criterion_key == criterion_key,
         )
+        .with_for_update()
     )
     row = result.scalar_one_or_none()
     if row is None:
@@ -512,6 +514,56 @@ async def retract_criterion(
         row.retracted_at = _utcnow()
         row.retracted_by = retracted_by
         row.superseded_by_key = superseded_by_key
+        session.add(row)
+
+        # Clear dangling superseded_by_key pointers: any predecessor on the
+        # same version that pointed to this criterion is now stale.
+        predecessors_result = await session.execute(
+            select(VersionAcceptanceCriterion)
+            .where(
+                VersionAcceptanceCriterion.release_version_id == release_version_id,
+                VersionAcceptanceCriterion.superseded_by_key == criterion_key,
+            )
+            .with_for_update()
+        )
+        for pred in predecessors_result.scalars().all():
+            pred.superseded_by_key = None
+            session.add(pred)
+
+        await session.commit()
+        await session.refresh(row)
+    return row
+
+
+async def reinstate_criterion(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    release_version_id: uuid.UUID,
+    criterion_key: str,
+) -> VersionAcceptanceCriterion | None:
+    """Reinstate a retracted or superseded criterion back to active status.
+
+    Returns the row when found and ``None`` when the key does not belong to the
+    requested project/version. The transition is idempotent: a criterion already
+    active is returned unchanged. Callers must enforce the active-criteria cap
+    before calling this function.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.project_id == project_id,
+            VersionAcceptanceCriterion.release_version_id == release_version_id,
+            VersionAcceptanceCriterion.criterion_key == criterion_key,
+        )
+    )
+    row = result.scalar_one_or_none()
+    if row is None:
+        return None
+    if row.status != "active":
+        row.status = "active"
+        row.retraction_reason = None
+        row.retracted_at = None
+        row.retracted_by = None
+        row.superseded_by_key = None
         session.add(row)
         await session.commit()
         await session.refresh(row)
