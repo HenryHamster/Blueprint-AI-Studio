@@ -34,6 +34,10 @@ _DEFAULT_POLICY: dict[str, Any] = {
     "threshold": 0.90,
 }
 
+# total_open count at which _score_completion_debt_pressure reaches 0.0.
+# A linear decay: 0 items → 1.0; _DEBT_PRESSURE_CEIL items → 0.0.
+_DEBT_PRESSURE_CEIL = 20
+
 
 def _clamp01(value: float) -> float:
     """Clamp a numeric sub-score into [0.0, 1.0]."""
@@ -314,6 +318,23 @@ def compute_goal_coverage_drift(
     }
 
 
+def _score_completion_debt_pressure(
+    debt_snapshot: dict[str, Any] | None,
+) -> float:
+    """Convert an open-debt snapshot to a [0, 1] pressure score.
+
+    Returns 1.0 when there is no open debt (optimal state).  Decays linearly
+    toward 0.0 as ``total_open`` grows, reaching 0.0 at ``_DEBT_PRESSURE_CEIL``
+    open items.  A missing or empty snapshot is treated as zero debt (1.0).
+    """
+    if not debt_snapshot:
+        return 1.0
+    total_open = int(debt_snapshot.get("total_open") or 0)
+    if total_open <= 0:
+        return 1.0
+    return max(0.0, 1.0 - total_open / _DEBT_PRESSURE_CEIL)
+
+
 def compute_composite(
     ci_green: bool,
     audit_score: float,
@@ -328,6 +349,7 @@ def compute_composite(
     migration_apply_blocked: bool = False,
     criterion_coverage: dict[str, Any] | None = None,
     merge_grade_misses: bool = False,
+    debt_pressure_score: float | None = None,
 ) -> dict[str, Any]:
     """Compute the composite promotion confidence for a release candidate.
 
@@ -494,6 +516,10 @@ def compute_composite(
         "test_erosion": _clamp01(test_erosion) if test_erosion is not None else 0.0,
         "smoketest": _clamp01(smoketest_score) if smoketest_score is not None else 0.0,
     }
+    # Debt-pressure sub-score: always recorded when provided (observe mode);
+    # only blended into confidence when completion_debt_weight > 0 in policy.
+    if debt_pressure_score is not None:
+        sub_scores["debt_pressure"] = _clamp01(debt_pressure_score)
 
     if blocker is not None:
         return {
@@ -503,13 +529,25 @@ def compute_composite(
             "blocker": blocker,
         }
 
+    # Debt-pressure weight (defaults to 0.0 = observe mode: recorded but not
+    # blended).  When > 0 the existing sub-scores are scaled by (1 - w_debt)
+    # and the debt-pressure term is added so the total remains in [0, 1].
+    w_debt = float((policy.get("weights") or {}).get("completion_debt", 0.0))
+    w_debt = max(0.0, min(w_debt, 0.5))  # cap at 50% to bound disruption
+
     # When the smoketest dimension is dropped its weight is 0.0, so the term
     # contributes nothing regardless of the (unused) smoketest sub-score.
-    confidence = (
+    existing_confidence = (
         w_audit * sub_scores["audit"]
         + w_test * sub_scores["test_erosion"]
         + w_smoke * sub_scores["smoketest"]
     )
+    if w_debt > 0.0 and debt_pressure_score is not None:
+        # Enforce mode: scale existing confidence down by (1 - w_debt) and
+        # blend in the debt-pressure term so total weight stays at 1.0.
+        confidence = (1.0 - w_debt) * existing_confidence + w_debt * sub_scores["debt_pressure"]
+    else:
+        confidence = existing_confidence
     confidence = round(_clamp01(confidence), 4)
     return {
         "confidence": confidence,

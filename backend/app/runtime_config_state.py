@@ -1097,6 +1097,12 @@ _DORMANT_MODE_KNOBS = {
     "direction_gap_respawn_block_mode": (
         "Direction-gap respawn block in observe-only mode"
     ),
+    "review_fix_lane_pilot_mode": (
+        "Review-fix lane pilot mode shipping inert (default-off)"
+    ),
+    "completion_debt_weight_mode": (
+        "Completion-debt pressure signal observe-mode: recorded in sub_scores, not blended into confidence"
+    ),
 }
 # Master feature flags that ship OFF still owe an enablement decision.
 _DORMANT_OFF_FLAGS = {

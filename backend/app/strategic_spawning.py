@@ -7995,7 +7995,7 @@ async def _spawn_strategic_review(
                 )
     except Exception:
         logger.exception("[STRATEGIC] ci_compliance signal build failed; continuing")
-    _open_completion_debt_block: list[dict[str, Any]] | None = None
+    _open_completion_debt_block: dict[str, Any] | None = None
     try:
         from importlib import import_module
 

@@ -25064,6 +25064,52 @@ class TestCompletionDebtAdmin:
         assert data["count"] == 0
         assert data["entries"] == []
 
+    @pytest.mark.asyncio
+    async def test_dismiss_and_resolve_global_completion_debt_row(
+        self, client: AsyncClient, db_session
+    ):
+        """Global debt rows (project_id=None) must be dismissible and resolvable
+        via any project URL — not just the project that owns them."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+
+        # Create two global rows (project_id=None — deployment-wide seeds)
+        dismiss_entry = CompletionDebtEntry(
+            project_id=None,
+            kind="seed_inventory",
+            title="Global seed: no-CI gate live trial",
+        )
+        resolve_entry = CompletionDebtEntry(
+            project_id=None,
+            kind="dormant_knob",
+            title="Global dormant knob: auto-fill mode",
+        )
+        db_session.add(dismiss_entry)
+        db_session.add(resolve_entry)
+        await db_session.commit()
+        await db_session.refresh(dismiss_entry)
+        await db_session.refresh(resolve_entry)
+
+        # Dismiss the global entry via a project-scoped URL
+        dismiss_resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{dismiss_entry.id}/dismiss",
+            json={"reason": "No longer applicable"},
+        )
+        assert dismiss_resp.status_code == 200, dismiss_resp.text
+        dismissed = dismiss_resp.json()
+        assert dismissed["entry"]["status"] == "dismissed"
+        assert dismissed["entry"]["dismiss_reason"] == "No longer applicable"
+
+        # Resolve the global entry via the same project-scoped URL
+        resolve_resp = await client.post(
+            f"/api/admin/projects/{project.id}/completion-debts/{resolve_entry.id}/resolve"
+        )
+        assert resolve_resp.status_code == 200, resolve_resp.text
+        resolved = resolve_resp.json()
+        assert resolved["entry"]["status"] == "resolved"
+        assert resolved["entry"]["resolved_at"] is not None
+
 
 @pytest.mark.asyncio
 async def test_direction_created_during_gated_op_survives_commit(

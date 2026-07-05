@@ -619,6 +619,99 @@ class TestComputeCompositeSmoketestDisabled:
 
 
 # ===========================================================================
+# compute_composite — debt-pressure signal (observe mode)
+# ===========================================================================
+
+
+class TestComputeCompositeDebtPressure:
+    """Observe-mode debt-pressure signal: debt_pressure appears in sub_scores
+    without altering confidence or promote when no completion_debt weight is
+    set in the policy (the default)."""
+
+    def test_completion_debt_pressure_recorded_in_observe_mode(self):
+        """Observe mode: debt_pressure_score is recorded in sub_scores but
+        confidence and promote are identical to a call without the score."""
+        # Baseline: same inputs, no debt_pressure_score passed.
+        base = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.8,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        # With debt pressure — policy has no completion_debt weight → observe mode.
+        with_debt = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.8,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            debt_pressure_score=0.2,
+        )
+        # Observe mode: confidence and promote are unchanged.
+        assert with_debt["confidence"] == base["confidence"]
+        assert with_debt["promote"] == base["promote"]
+        assert with_debt["blocker"] is None
+        # debt_pressure sub-score is recorded for observability.
+        assert "debt_pressure" in with_debt["sub_scores"]
+        assert with_debt["sub_scores"]["debt_pressure"] == pytest.approx(0.2)
+        # Baseline call without the score has no debt_pressure key.
+        assert "debt_pressure" not in base["sub_scores"]
+
+    def test_debt_pressure_none_omits_key_from_sub_scores(self):
+        """When debt_pressure_score is None (debt module unavailable), the
+        debt_pressure key is absent from sub_scores."""
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+        )
+        assert "debt_pressure" not in result["sub_scores"]
+
+    def test_debt_pressure_recorded_even_when_blocker_fires(self):
+        """debt_pressure_score appears in sub_scores even when a hard blocker
+        forces confidence to zero — consistent with how other sub-scores work."""
+        result = rq.compute_composite(
+            ci_green=False,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=_POLICY,
+            debt_pressure_score=0.5,
+        )
+        assert result["blocker"] == "ci_not_green"
+        assert result["confidence"] == 0.0
+        assert "debt_pressure" in result["sub_scores"]
+        assert result["sub_scores"]["debt_pressure"] == pytest.approx(0.5)
+
+    def test_debt_pressure_blended_when_policy_weight_set(self):
+        """When completion_debt_weight > 0 in policy, the score is blended:
+        confidence = (1 - w) * existing + w * debt_pressure."""
+        policy_with_debt = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": 0.1,
+            },
+            "threshold": 0.75,
+        }
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=1.0,
+            test_erosion=1.0,
+            smoketest_score=1.0,
+            policy=policy_with_debt,
+            debt_pressure_score=0.0,  # zero pressure (high debt)
+        )
+        # existing_confidence = 1.0; blended = 0.9 * 1.0 + 0.1 * 0.0 = 0.9
+        assert result["confidence"] == pytest.approx(0.9)
+        assert result["promote"] is True  # 0.9 >= 0.75
+
+
+# ===========================================================================
 # _load_policy — read promotion_policy.yaml, fall back on failure
 # ===========================================================================
 

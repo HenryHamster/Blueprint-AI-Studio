@@ -1292,10 +1292,24 @@ export function buildCiComplianceSection(ciCompliance: unknown): string {
 }
 
 export function buildCompletionDebtSection(debt: unknown): string {
-  if (!Array.isArray(debt) || debt.length === 0) return '';
-  const entries = debt as Array<Record<string, unknown>>;
+  // Accept the new dict shape {items: [...], total_open: N} or the legacy array shape.
+  let entries: Array<Record<string, unknown>>;
+  let totalOpen: number;
+  if (debt && typeof debt === 'object' && !Array.isArray(debt)) {
+    const d = debt as Record<string, unknown>;
+    entries = Array.isArray(d.items) ? d.items as Array<Record<string, unknown>> : [];
+    totalOpen = typeof d.total_open === 'number' ? d.total_open : entries.length;
+  } else if (Array.isArray(debt)) {
+    entries = debt as Array<Record<string, unknown>>;
+    totalOpen = entries.length;
+  } else {
+    return '';
+  }
+  if (totalOpen === 0 && entries.length === 0) return '';
   const lines: string[] = ['\n## Open Completion Debt'];
-  lines.push(`${entries.length} open obligation(s) — unfinished work from merged features, knob activations, or retired directions:`);
+  const hiddenCount = Math.max(0, totalOpen - entries.length);
+  const tailNote = hiddenCount > 0 ? ` (+${hiddenCount} more not shown)` : '';
+  lines.push(`${totalOpen} open obligation(s)${tailNote} — unfinished work from merged features, knob activations, or retired directions:`);
   for (const e of entries) {
     const kind = strVal(e.kind, 'unknown');
     const desc = strVal(e.description, '(no description)');

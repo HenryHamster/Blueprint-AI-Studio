@@ -161,9 +161,10 @@ async def _query_completion_debts(
     limit: int = 100,
     offset: int = 0,
     newest_first: bool = True,
+    project_first: bool = False,
 ) -> list[Any]:
     from app.models import CompletionDebtEntry
-    from sqlalchemy import or_
+    from sqlalchemy import case, or_
 
     if project_id is not None:
         # Include both project-scoped rows and deployment-global rows (project_id
@@ -183,7 +184,26 @@ async def _query_completion_debts(
         q = q.where(CompletionDebtEntry.status == status)
     if kind is not None:
         q = q.where(CompletionDebtEntry.kind == kind)
-    if newest_first:
+    if project_first and project_id is not None:
+        # Float project-scoped rows above global (project_id IS NULL) rows so
+        # the bounded snapshot shows per-project debt before global seed debt.
+        scope_rank = case(
+            (CompletionDebtEntry.project_id.is_(None), 1),
+            else_=0,
+        )
+        if newest_first:
+            q = q.order_by(
+                scope_rank,
+                CompletionDebtEntry.created_at.desc(),
+                CompletionDebtEntry.id.desc(),
+            )
+        else:
+            q = q.order_by(
+                scope_rank,
+                CompletionDebtEntry.created_at.asc(),
+                CompletionDebtEntry.id.asc(),
+            )
+    elif newest_first:
         q = q.order_by(
             CompletionDebtEntry.created_at.desc(),
             CompletionDebtEntry.id.desc(),
@@ -196,6 +216,35 @@ async def _query_completion_debts(
     q = q.offset(max(0, int(offset))).limit(max(0, min(int(limit), 200)))
     result = await session.execute(q)
     return list(result.scalars().all())
+
+
+async def _count_open_completion_debts(session: Any, project_id: Any) -> int:
+    """Return the total count of open debt rows visible to this project."""
+    from app.models import CompletionDebtEntry
+    from sqlalchemy import func, or_
+
+    if project_id is not None:
+        q = (
+            select(func.count())
+            .select_from(CompletionDebtEntry)
+            .where(
+                or_(
+                    CompletionDebtEntry.project_id == project_id,
+                    CompletionDebtEntry.project_id.is_(None),
+                ),
+                CompletionDebtEntry.status == STATUS_OPEN,
+            )
+        )
+    else:
+        q = (
+            select(func.count())
+            .select_from(CompletionDebtEntry)
+            .where(
+                CompletionDebtEntry.project_id.is_(None),
+                CompletionDebtEntry.status == STATUS_OPEN,
+            )
+        )
+    return (await session.execute(q)).scalar_one()
 
 
 async def list_completion_debts(
@@ -229,7 +278,9 @@ async def dismiss_debt(
     from app.models import CompletionDebtEntry
 
     entry = await session.get(CompletionDebtEntry, debt_id)
-    if entry is None or entry.project_id != project_id:
+    if entry is None or (
+        entry.project_id is not None and entry.project_id != project_id
+    ):
         raise ValueError("not_found")
     if entry.status != STATUS_OPEN:
         raise ValueError("not_open")
@@ -255,7 +306,9 @@ async def resolve_debt(
     from app.models import CompletionDebtEntry
 
     entry = await session.get(CompletionDebtEntry, debt_id)
-    if entry is None or entry.project_id != project_id:
+    if entry is None or (
+        entry.project_id is not None and entry.project_id != project_id
+    ):
         raise ValueError("not_found")
     if entry.status != STATUS_OPEN:
         raise ValueError("not_open")
@@ -273,8 +326,15 @@ def debt_to_dict(entry) -> dict[str, Any]:
     return _serialize_debt(entry)
 
 
-async def get_open_completion_debt(session: Any, project_id: Any) -> list[dict[str, Any]]:
-    """Return a bounded, project-scoped open-debt snapshot for strategist use."""
+async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, Any]:
+    """Return a bounded, project-scoped open-debt snapshot for strategist use.
+
+    Returns ``{"items": [...], "total_open": N}`` where ``total_open`` is the
+    true count of open rows visible to this project (may exceed ``len(items)``
+    when the ledger has more than ``_OPEN_COMPLETION_DEBT_LIMIT`` open rows).
+    Project-scoped rows appear before global seed rows in the snapshot.
+    """
+    total_open = await _count_open_completion_debts(session, project_id)
     entries = await _query_completion_debts(
         session,
         project_id=project_id,
@@ -282,12 +342,13 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> list[dict[s
         limit=_OPEN_COMPLETION_DEBT_LIMIT,
         offset=0,
         newest_first=False,
+        project_first=True,
     )
     now = _utcnow()
-    snapshot: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
     for entry in entries:
         created_at = entry.created_at
-        snapshot.append(
+        items.append(
             {
                 "id": str(entry.id),
                 "kind": entry.kind,
@@ -299,7 +360,7 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> list[dict[s
                 ),
             }
         )
-    return snapshot
+    return {"items": items, "total_open": total_open}
 
 
 # ── Recorders ────────────────────────────────────────────────────────────────
@@ -331,13 +392,33 @@ def record_completion_debt(
     try:
         from app.models import CompletionDebtEntry
 
-        existing = session.execute(
-            select(CompletionDebtEntry.id).where(
+        existing_open = session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == dedupe_key,
+                CompletionDebtEntry.status == STATUS_OPEN,
+            )
+        ).scalar_one_or_none()
+        if existing_open is not None:
+            return False
+        # Check for a resolved/dismissed row to reopen (dedupe_key is globally
+        # unique, so INSERT would violate the constraint if such a row exists).
+        existing_any = session.execute(
+            select(CompletionDebtEntry).where(
                 CompletionDebtEntry.dedupe_key == dedupe_key
             )
-        ).first()
-        if existing is not None:
-            return False
+        ).scalar_one_or_none()
+        if existing_any is not None:
+            try:
+                with session.begin_nested():
+                    existing_any.status = STATUS_OPEN
+                    existing_any.resolved_at = None
+                    existing_any.resolution_reason = None
+                    existing_any.updated_at = _utcnow()
+                    session.add(existing_any)
+                    session.flush()
+            except Exception:  # noqa: BLE001
+                return False
+            return True
         entry = _new_entry(
             dedupe_key=dedupe_key,
             kind=kind,
@@ -384,15 +465,37 @@ async def arecord_completion_debt(
     try:
         from app.models import CompletionDebtEntry
 
-        existing = (
+        existing_open = (
             await session.execute(
-                select(CompletionDebtEntry.id).where(
+                select(CompletionDebtEntry).where(
+                    CompletionDebtEntry.dedupe_key == dedupe_key,
+                    CompletionDebtEntry.status == STATUS_OPEN,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing_open is not None:
+            return False
+        # Check for a resolved/dismissed row to reopen (dedupe_key is globally
+        # unique, so INSERT would violate the constraint if such a row exists).
+        existing_any = (
+            await session.execute(
+                select(CompletionDebtEntry).where(
                     CompletionDebtEntry.dedupe_key == dedupe_key
                 )
             )
-        ).first()
-        if existing is not None:
-            return False
+        ).scalar_one_or_none()
+        if existing_any is not None:
+            try:
+                async with session.begin_nested():
+                    existing_any.status = STATUS_OPEN
+                    existing_any.resolved_at = None
+                    existing_any.resolution_reason = None
+                    existing_any.updated_at = _utcnow()
+                    session.add(existing_any)
+                    await session.flush()
+            except Exception:  # noqa: BLE001
+                return False
+            return True
         entry = _new_entry(
             dedupe_key=dedupe_key,
             kind=kind,

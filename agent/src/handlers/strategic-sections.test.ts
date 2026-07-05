@@ -18,6 +18,7 @@ import {
   buildCiComplianceSection,
   buildSweepComparisonSection,
   buildPayloadStalenessSection,
+  buildCompletionDebtSection,
 } from './strategic-sections.js';
 import { buildThinkerPrompt } from '../prompts/thinker.js';
 
@@ -2154,5 +2155,53 @@ describe('buildPayloadStalenessSection', () => {
     expect(stalenessPos).toBeGreaterThan(-1);
     expect(problemModelPos).toBeGreaterThan(-1);
     expect(stalenessPos).toBeLessThan(problemModelPos);
+  });
+});
+
+describe('buildCompletionDebtSection', () => {
+  it('returns empty string for null, undefined, empty array, and empty dict', () => {
+    expect(buildCompletionDebtSection(null)).toBe('');
+    expect(buildCompletionDebtSection(undefined)).toBe('');
+    expect(buildCompletionDebtSection([])).toBe('');
+    expect(buildCompletionDebtSection({ items: [], total_open: 0 })).toBe('');
+  });
+
+  it('renders total_open from dict shape, not list length', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { kind: 'dormant_knob', description: 'Knob X default-off', age_days: 3 },
+      ],
+      total_open: 25,
+    });
+    expect(result).toContain('25 open obligation(s)');
+    expect(result).toContain('+24 more not shown');
+    expect(result).toContain('[dormant_knob] Knob X default-off');
+    expect(result).toContain('(3d old)');
+  });
+
+  it('shows no tail note when items length equals total_open', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { kind: 'no_ci_gate', description: 'Gate fell open', age_days: 1 },
+        { kind: 'capability_trial', description: 'Trial pending', age_days: 0 },
+      ],
+      total_open: 2,
+    });
+    expect(result).toContain('2 open obligation(s)');
+    expect(result).not.toContain('more not shown');
+  });
+
+  it('backward-compat: accepts a plain array and uses its length as total', () => {
+    const result = buildCompletionDebtSection([
+      { kind: 'seed_inventory', description: 'Legacy item', age_days: 10 },
+    ]);
+    expect(result).toContain('1 open obligation(s)');
+    expect(result).not.toContain('more not shown');
+    expect(result).toContain('[seed_inventory] Legacy item');
+  });
+
+  it('includes advisory footer', () => {
+    const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', description: 'x', age_days: 0 }], total_open: 1 });
+    expect(result).toContain('Address open completion debt');
   });
 });

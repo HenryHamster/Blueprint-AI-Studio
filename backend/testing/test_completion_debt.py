@@ -21,6 +21,12 @@ from sqlmodel import SQLModel
 from app import ci_resolution, completion_debt as cd
 from app.capability_trial_verdict import persist_trial_verdicts_in_transaction
 from app.models import CompletionDebtEntry, Project, Task
+from app.runtime_config_state import (
+    _DORMANT_MODE_KNOBS,
+    _DORMANT_OFF_FLAGS,
+    iter_dormant_knob_debts,
+    runtime_config,
+)
 from app.strategic_completion import _spawn_retirement_memos
 from app.time_utils import _utcnow
 
@@ -216,8 +222,12 @@ async def test_get_open_completion_debt_returns_bounded_snapshot(db_session):
 
     snapshot = await cd.get_open_completion_debt(db_session, project.id)
 
-    assert len(snapshot) == 1
-    entry = snapshot[0]
+    assert isinstance(snapshot, dict)
+    assert "items" in snapshot
+    assert "total_open" in snapshot
+    assert len(snapshot["items"]) == 1
+    assert snapshot["total_open"] == 1
+    entry = snapshot["items"][0]
     assert entry["kind"] == cd.KIND_NO_CI_GATE
     assert entry["description"] == "Unverified merge"
     assert entry["created_at"] is not None
@@ -249,11 +259,68 @@ async def test_get_open_completion_debt_includes_global_rows(db_session):
     await db_session.commit()
 
     snapshot = await cd.get_open_completion_debt(db_session, project.id)
-    kinds = {e["kind"] for e in snapshot}
+    kinds = {e["kind"] for e in snapshot["items"]}
     assert cd.KIND_SEED_INVENTORY in kinds, (
         "global seed rows (project_id=None) must surface in per-project snapshots"
     )
     assert cd.KIND_NO_CI_GATE in kinds, "project-scoped rows must also surface"
+
+
+@pytest.mark.asyncio
+async def test_open_debt_snapshot_reports_true_totals_and_per_kind_bounds(db_session):
+    """total_open reflects reality even when items are capped; project rows first."""
+    project = Project(name="p", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Insert 6 project-scoped rows across two kinds.
+    for i in range(4):
+        await cd.arecord_completion_debt(
+            db_session,
+            dedupe_key=f"proj:knob:{project.id}:{i}",
+            kind=cd.KIND_DORMANT_KNOB,
+            title=f"Dormant knob {i}",
+            project_id=project.id,
+        )
+    for i in range(2):
+        await cd.arecord_completion_debt(
+            db_session,
+            dedupe_key=f"proj:gate:{project.id}:{i}",
+            kind=cd.KIND_NO_CI_GATE,
+            title=f"Gate fell open {i}",
+            project_id=project.id,
+        )
+    # Insert 7 global rows that would overflow the 10-row snapshot cap.
+    for i in range(7):
+        await cd.arecord_completion_debt(
+            db_session,
+            dedupe_key=f"global:seed:{i}",
+            kind=cd.KIND_SEED_INVENTORY,
+            title=f"Global seed {i}",
+            project_id=None,
+        )
+    await db_session.commit()
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+
+    # total_open must reflect all 13 open rows, not just the 10-item cap.
+    assert snapshot["total_open"] == 13
+    assert len(snapshot["items"]) == 10  # bounded by _OPEN_COMPLETION_DEBT_LIMIT
+
+    # Project-scoped rows float to the top: all 6 project rows must appear in
+    # the snapshot before any global seed rows.
+    project_items = [e for e in snapshot["items"] if e["kind"] != cd.KIND_SEED_INVENTORY]
+    global_items = [e for e in snapshot["items"] if e["kind"] == cd.KIND_SEED_INVENTORY]
+    assert len(project_items) == 6, "all 6 project-scoped rows must appear in snapshot"
+    assert len(global_items) == 4, "remaining 4 slots filled from global rows"
+    # Project rows come before global rows in the snapshot.
+    if project_items and global_items:
+        last_project_idx = max(snapshot["items"].index(e) for e in project_items)
+        first_global_idx = min(snapshot["items"].index(e) for e in global_items)
+        assert last_project_idx < first_global_idx, (
+            "project-scoped rows must appear before global rows in the snapshot"
+        )
 
 
 # ── Writer family: no_ci_gate (ci_resolution.record_no_ci_gate_runtime) ──────
@@ -451,3 +518,119 @@ async def test_retirement_writer_records_residual_debt(db_session):
     assert row.kind == cd.KIND_RETIREMENT_RESIDUAL
     assert row.status == cd.STATUS_OPEN
     assert row.project_id == project.id
+
+
+# ── Two-way reconciliation ───────────────────────────────────────────────────
+
+
+def test_resolved_debt_can_be_reopened(sync_session):
+    """A resolved obligation with the same dedupe_key is reopened when re-recorded."""
+    key = "unit:reopen-me"
+    first = cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T"
+    )
+    assert first is True
+    # Manually resolve the row.
+    row = sync_session.execute(
+        select(CompletionDebtEntry).where(CompletionDebtEntry.dedupe_key == key)
+    ).scalar_one()
+    row.status = cd.STATUS_RESOLVED
+    sync_session.flush()
+
+    # Re-recording after resolution must succeed (returns True) and leave exactly
+    # one open row (the original row is reopened in-place).
+    second = cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="T (recurred)"
+    )
+    sync_session.commit()
+
+    assert second is True
+    open_rows = sync_session.execute(
+        select(CompletionDebtEntry).where(
+            CompletionDebtEntry.dedupe_key == key,
+            CompletionDebtEntry.status == cd.STATUS_OPEN,
+        )
+    ).scalars().all()
+    assert len(open_rows) == 1, "exactly one open row must exist after re-record"
+    assert _count(sync_session, dedupe_key=key) == 1, "still a single row (reopened)"
+
+
+def test_open_debt_still_idempotent_after_reopen_fix(sync_session):
+    """An already-open debt must still be a no-op (unchanged behavior)."""
+    key = "unit:still-idempotent"
+    first = cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="First"
+    )
+    second = cd.record_completion_debt(
+        sync_session, dedupe_key=key, kind=cd.KIND_DORMANT_KNOB, title="Second"
+    )
+    sync_session.commit()
+
+    assert first is True
+    assert second is False
+    assert _count(sync_session, dedupe_key=key) == 1
+
+
+@pytest.mark.asyncio
+async def test_knob_graduation_resolves_dormant_debt(db_session):
+    """Patching a dormant knob to 'enforce' via _apply_settings resolves its debt."""
+    from app.routers.admin_settings import _apply_settings
+
+    # Seed the dormant-knob debt row for evergreen_fill_mode.
+    seeded = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key="dormant_knob:evergreen_fill_mode",
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Evergreen fill mode is off/observe",
+        project_id=None,
+    )
+    await db_session.commit()
+    assert seeded is True
+
+    # Call _apply_settings directly with a session and a minimal runtime_config.
+    _rc: dict = {"evergreen_fill_mode": "observe"}
+    await _apply_settings({"evergreen_fill_mode": "enforce"}, db_session, _rc)
+    # _apply_settings may or may not have committed, but the resolution savepoint
+    # is flushed — expire so we read the updated state.
+    db_session.expire_all()
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == "dormant_knob:evergreen_fill_mode"
+            )
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_RESOLVED, (
+        "graduating evergreen_fill_mode to 'enforce' must resolve its completion-debt entry"
+    )
+
+
+# ── Dormant-knob registry completeness ───────────────────────────────────
+
+
+def test_dormant_knob_registry_covers_all_dormant_defaults():
+    """Verify that iter_dormant_knob_debts covers all dormant mode knobs and flags.
+
+    The registry enumerates knobs that ship in a dormant/default-off/observe state.
+    This test ensures no dormant knobs silently under-record in the ledger by
+    verifying that every knob with a dormant value is represented in the debt
+    entries returned by iter_dormant_knob_debts().
+    """
+    debts = iter_dormant_knob_debts()
+    registered_knobs = {d["detail"]["knob"] for d in debts}
+
+    # Verify all dormant mode knobs are registered.
+    for knob_key in _DORMANT_MODE_KNOBS:
+        value = str(runtime_config.get(knob_key, "")).lower()
+        if value in ("off", "observe"):
+            assert (
+                knob_key in registered_knobs
+            ), f"Dormant mode knob '{knob_key}' (value={value}) not in registry"
+
+    # Verify all dormant off flags are registered.
+    for knob_key in _DORMANT_OFF_FLAGS:
+        if not runtime_config.get(knob_key, False):
+            assert (
+                knob_key in registered_knobs
+            ), f"Dormant flag '{knob_key}' (value=False) not in registry"

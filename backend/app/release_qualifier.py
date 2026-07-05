@@ -192,6 +192,7 @@ from app.release_scoring import (
     _fmt_sub_scores,
     _reconcile_audit_with_challenge,
     _score_audit,
+    _score_completion_debt_pressure,
     _score_smoketest,
     compute_challenged_vs_unchallenged_telemetry,  # noqa: F401 — re-exported for callers/tests
     compute_composite,
@@ -3872,6 +3873,27 @@ async def _finalize_qualification(
             "status": "already_on_main_exempt",
             "blocked": False,
         }
+    # --- Completion-debt snapshot (additive, informational, best-effort) ------
+    # Fetched before compute_composite so the pressure score can be passed in as
+    # an observe-mode sub-score signal.  Never a blocker.  Best-effort: if the
+    # completion_debt module is not yet landed or raises, finalize continues
+    # with completion_debt=None (pressure score = None → omitted from sub_scores).
+    _completion_debt: dict[str, Any] | None = None
+    try:
+        from importlib import import_module  # noqa: PLC0415
+
+        _cd_mod = import_module("app.completion_debt")
+        _completion_debt = await _cd_mod.get_open_completion_debt(
+            session, version.project_id
+        )
+    except Exception:
+        pass
+    _debt_pressure_score: float | None = (
+        _score_completion_debt_pressure(_completion_debt)
+        if _completion_debt is not None
+        else None
+    )
+
     composite = compute_composite(
         ci_green=ci_green,
         audit_score=audit_score,
@@ -3885,6 +3907,7 @@ async def _finalize_qualification(
         migration_apply_blocked=migration_apply_blocked,
         criterion_coverage=criterion_coverage,
         merge_grade_misses=merge_grade_misses,
+        debt_pressure_score=_debt_pressure_score,
     )
 
     # --- Acceptance-window counts (additive evidence, no score impact) -----
@@ -3895,22 +3918,6 @@ async def _finalize_qualification(
     acceptance_window = await _compute_acceptance_window_aggregate(session, version)
     extended_sub_scores = dict(composite["sub_scores"])
     extended_sub_scores.update(acceptance_window)
-
-    # --- Completion-debt snapshot (additive, informational, best-effort) ------
-    # Reports open ledger debt at qualification time. Never a blocker — purely
-    # advisory context for the operator and strategist.  Best-effort: if the
-    # completion_debt module is not yet landed or raises, finalize continues
-    # with completion_debt=None in the record.
-    _completion_debt: dict[str, Any] | None = None
-    try:
-        from importlib import import_module  # noqa: PLC0415
-
-        _cd_mod = import_module("app.completion_debt")
-        _completion_debt = await _cd_mod.get_open_completion_debt(
-            session, version.project_id
-        )
-    except Exception:
-        pass
 
     finalized_at = _utcnow().isoformat()
     base_record: dict[str, Any] = {

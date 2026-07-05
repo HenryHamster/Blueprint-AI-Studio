@@ -740,6 +740,8 @@ async def _apply_settings(
     # Snapshot config so we can restore on DB commit failure
     _config_snapshot = dict(_runtime_config)
     clear_pause_state = False
+    # Dormant-knob debts to resolve when a knob graduates to an enforcing value.
+    _debt_keys_to_resolve: list[str] = []
 
     # Validate the payload keys BEFORE applying anything. An unknown/misspelled
     # key was previously silently ignored — a typo like "promotion_treshold"
@@ -839,6 +841,8 @@ async def _apply_settings(
                 detail="evergreen_fill_mode must be one of: off, observe, enforce",
             )
         _runtime_config["evergreen_fill_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:evergreen_fill_mode")
     if "evergreen_fill_interval_minutes" in payload:
         try:
             val = int(payload["evergreen_fill_interval_minutes"])
@@ -925,6 +929,8 @@ async def _apply_settings(
                 detail="structural_health_audit_mode must be one of: off, observe, enforce",
             )
         _runtime_config["structural_health_audit_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:structural_health_audit_mode")
     if "structural_health_audit_interval_minutes" in payload:
         try:
             val = int(payload["structural_health_audit_interval_minutes"])
@@ -1167,6 +1173,8 @@ async def _apply_settings(
                 detail="strategic_session_enabled must be a boolean",
             )
         _runtime_config["strategic_session_enabled"] = val
+        if val:
+            _debt_keys_to_resolve.append("dormant_knob:strategic_session_enabled")
     # Resident strategic-session integer knobs. Each is clamped to a sane range:
     # the continuation TTL and local-hold timeout are the safety windows (min 60s
     # so a live session can never be reaped mid-turn; ceiling 7200s / 2h so an
@@ -1313,6 +1321,10 @@ async def _apply_settings(
                 ),
             )
         _runtime_config["strategic_retirement_challenge_gate_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append(
+                "dormant_knob:strategic_retirement_challenge_gate_mode"
+            )
     if "cochange_decomposition_enabled" in payload:
         val = payload["cochange_decomposition_enabled"]
         if not isinstance(val, bool):
@@ -1796,6 +1808,8 @@ async def _apply_settings(
                 ),
             )
         _runtime_config["direction_gap_respawn_block_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:direction_gap_respawn_block_mode")
     if "direction_gap_respawn_cooldown_days" in payload:
         try:
             fval = float(payload["direction_gap_respawn_cooldown_days"])
@@ -2704,6 +2718,15 @@ async def _apply_settings(
         except httpx.RequestError as e:
             raise HTTPException(status_code=502, detail=f"Webhook request failed: {e}")
         return {"ok": True, "test_notification_sent": True}
+
+    # Best-effort: resolve dormant-knob debts for any knobs that graduated this
+    # request. Each call uses its own SAVEPOINT so a ledger failure never rolls
+    # back the config change.
+    if _debt_keys_to_resolve:
+        from app.completion_debt import aresolve_completion_debt
+
+        for _dk in _debt_keys_to_resolve:
+            await aresolve_completion_debt(session, _dk, reason="graduated:enforce")
 
     # Detect a genuine warm_pool_enabled True→False transition. Computed here —
     # after all config changes but before the DB persist block — so the flag is
