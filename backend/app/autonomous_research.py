@@ -2803,13 +2803,26 @@ async def _spawn_periodic_task(project: Project, task_type: str, session: AsyncS
 
 
 async def _check_autonomous_research(owner: str, repo: str):
-    """Post-merge hook: check if we should spawn a research task."""
+    """Post-merge hook: check if we should spawn a research task.
+
+    Each matching project is spawned in its OWN short-lived session so a
+    lock-timeout / deadlock / cancelled-mid-query error on one project rolls back
+    only that project's transaction and the others still get a chance to spawn.
+    The previous single shared session across the whole loop meant one DB error
+    (deadlock, "connection is closed", or a PendingRollbackError from a
+    rollback-expired lazy-load) poisoned the session and silently killed spawning
+    for every project while churning the connection pool.
+    """
+    from sqlalchemy import func
+
+    # Phase 1 — enumerate matching projects + the global VM-slot gate in one
+    # short read session, so no per-project spawn can hold this open.
     try:
         async with AsyncSessionLocal() as session:
-            projects = (
+            project_ids = (
                 (
                     await session.execute(
-                        select(Project).where(
+                        select(Project.id).where(
                             Project.github_owner == owner,
                             Project.github_repo == repo,
                             Project.autonomous_enabled.is_(True),
@@ -2823,12 +2836,10 @@ async def _check_autonomous_research(owner: str, repo: str):
                 .scalars()
                 .all()
             )
-            if not projects:
+            if not project_ids:
                 return
 
             # Spawn if VM slots are available (PROVISIONING + IN_PROGRESS, not blocked QUEUED)
-            from sqlalchemy import func
-
             vm_consuming = (
                 await session.execute(
                     select(func.count())
@@ -2840,15 +2851,29 @@ async def _check_autonomous_research(owner: str, repo: str):
                     )
                 )
             ).scalar() or 0
-
-            if vm_consuming < _runtime_config["max_concurrent_vms"]:
-                for project in projects:
-                    await _spawn_research_task(project, session)
     except Exception as e:
         logger.error(
-            f"[AUTONOMOUS] Error checking research trigger for {owner}/{repo}: {e}",
+            f"[AUTONOMOUS] Error enumerating projects for research trigger {owner}/{repo}: {e}",
             exc_info=True,
         )
+        return
+
+    if vm_consuming >= _runtime_config["max_concurrent_vms"]:
+        return
+
+    # Phase 2 — spawn per project, each in its own isolated session.
+    for project_id in project_ids:
+        try:
+            async with AsyncSessionLocal() as session:
+                project = await session.get(Project, project_id)
+                if project is None:
+                    continue
+                await _spawn_research_task(project, session)
+        except Exception as e:
+            logger.error(
+                f"[AUTONOMOUS] Research trigger spawn failed for project {project_id} ({owner}/{repo}): {e}",
+                exc_info=True,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -2864,9 +2889,79 @@ from app.autonomous_research_residual import (
 )
 
 
+async def _run_idle_research_for_project(
+    project: Project, session: AsyncSession, vm_consuming: int
+) -> None:
+    """Idle-research spawn work for a single project.
+
+    Runs inside a per-project session owned by ``_check_idle_research``; a
+    failure here is contained to this project's transaction (see that function's
+    note on why a shared session across the whole loop was structurally unsafe).
+    """
+    # Log pending proposals awaiting review
+    pending_proposals = [
+        d for d in (project.directions or []) if d.get("status") == "proposed"
+    ]
+    if pending_proposals:
+        logger.info(
+            f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review"
+        )
+
+    active_directions = [
+        d for d in (project.directions or []) if d.get("status") == "active"
+    ]
+    # Allow projects with no directions through if vision needs bootstrapping
+    vision_needs_bootstrap = not (project.vision or {}).get("purpose")
+    strategic_recovery_needed = not active_directions and (
+        (project.vision or {}).get("_strategic_failures", 0) < 3
+    )
+    if (
+        not active_directions
+        and not vision_needs_bootstrap
+        and not strategic_recovery_needed
+    ):
+        return
+
+    if vm_consuming < _runtime_config["max_concurrent_vms"]:
+        await _spawn_research_task(project, session)
+
+        for task_type in ("security_audit", "qa", "deps"):
+            await _spawn_periodic_task(project, task_type, session)
+
+    # Spawn the working residual-fingerprint create-fix lane for any
+    # recurring failure pattern that warrants a targeted fix.
+    # Guard with the same spend-ceiling check used by _spawn_research_task
+    # and _spawn_periodic_task so an over-budget project cannot spawn new
+    # work through this lane either.
+    _residual_defer_reason = await _project_spend_ceiling_spawn_defer_reason(
+        project, session
+    )
+    if _residual_defer_reason:
+        logger.info(
+            "[AUTONOMOUS] Skipping residual remediation spawn for project %s — %s",
+            project.id,
+            _residual_defer_reason,
+        )
+    else:
+        await _spawn_residual_fingerprint_remediation(project, session)
+        await _spawn_viewport_regression_remediation(project, session)
+    await session.commit()
+
+
 async def _check_idle_research():
-    """Periodic check: spawn research if projects are idle with active directions."""
+    """Periodic check: spawn research if projects are idle with active directions.
+
+    Structure: enumerate candidate projects + the global VM-slot gate in one
+    short read-only session, then spawn each project in its OWN session. A
+    lock-timeout / deadlock / cancelled-mid-query error on one project rolls back
+    only that project's transaction and the sweep continues. The previous single
+    shared session across the whole loop meant one DB error (deadlock,
+    "connection is closed", or a PendingRollbackError from a rollback-expired
+    lazy-load) poisoned the session and silently killed spawning for EVERY
+    project while churning the connection pool.
+    """
     from app.anomaly_detection import _expire_stale_proposals
+    from sqlalchemy import func
 
     now = _utcnow()
     interval_minutes = _runtime_config.get("autonomous_research_interval_minutes", 30)
@@ -2876,17 +2971,17 @@ async def _check_idle_research():
         return
     _shared_state.last_idle_check = now
 
+    # Phase 1 — enumerate candidates + the global VM gate in a short session.
     try:
         async with AsyncSessionLocal() as session:
-            from sqlalchemy import func
-
             # Expire stale proposals before processing
             await _expire_stale_proposals(session)
+            await session.commit()
 
-            projects = (
+            project_ids = (
                 (
                     await session.execute(
-                        select(Project).where(
+                        select(Project.id).where(
                             Project.autonomous_enabled.is_(True),
                             # Skip paused projects: pause blocks ALL new work
                             # (research, periodic, and residual remediation)
@@ -2900,73 +2995,40 @@ async def _check_idle_research():
                 .all()
             )
 
-            for project in projects:
-                # Log pending proposals awaiting review
-                pending_proposals = [
-                    d
-                    for d in (project.directions or [])
-                    if d.get("status") == "proposed"
-                ]
-                if pending_proposals:
-                    logger.info(
-                        f"[DIRECTIONS] Project {project.name} has {len(pending_proposals)} pending direction proposals awaiting review"
+            # Spawn if VM slots are available — count only tasks consuming VMs,
+            # not QUEUED tasks blocked on dependencies. Newly spawned research is
+            # QUEUED, so this global gate is stable across the per-project loop.
+            vm_consuming = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Task)
+                    .where(
+                        Task.status.in_(
+                            [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
+                        ),
                     )
-
-                active_directions = [
-                    d for d in (project.directions or []) if d.get("status") == "active"
-                ]
-                # Allow projects with no directions through if vision needs bootstrapping
-                vision_needs_bootstrap = not (project.vision or {}).get("purpose")
-                strategic_recovery_needed = not active_directions and (
-                    (project.vision or {}).get("_strategic_failures", 0) < 3
                 )
-                if (
-                    not active_directions
-                    and not vision_needs_bootstrap
-                    and not strategic_recovery_needed
-                ):
-                    continue
-
-                # Spawn if VM slots are available — count only tasks consuming VMs,
-                # not QUEUED tasks blocked on dependencies
-                vm_consuming = (
-                    await session.execute(
-                        select(func.count())
-                        .select_from(Task)
-                        .where(
-                            Task.status.in_(
-                                [TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]
-                            ),
-                        )
-                    )
-                ).scalar() or 0
-
-                if vm_consuming < _runtime_config["max_concurrent_vms"]:
-                    await _spawn_research_task(project, session)
-
-                    for task_type in ("security_audit", "qa", "deps"):
-                        await _spawn_periodic_task(project, task_type, session)
-
-                # Spawn the working residual-fingerprint create-fix lane for any
-                # recurring failure pattern that warrants a targeted fix.
-                # Guard with the same spend-ceiling check used by _spawn_research_task
-                # and _spawn_periodic_task so an over-budget project cannot spawn new
-                # work through this lane either.
-                _residual_defer_reason = (
-                    await _project_spend_ceiling_spawn_defer_reason(project, session)
-                )
-                if _residual_defer_reason:
-                    logger.info(
-                        "[AUTONOMOUS] Skipping residual remediation spawn for project %s — %s",
-                        project.id,
-                        _residual_defer_reason,
-                    )
-                else:
-                    await _spawn_residual_fingerprint_remediation(project, session)
-                    await _spawn_viewport_regression_remediation(project, session)
-                await session.commit()
+            ).scalar() or 0
     except Exception as e:
-        logger.error(f"[AUTONOMOUS] Error in idle research check: {e}", exc_info=True)
+        logger.error(
+            f"[AUTONOMOUS] Error enumerating projects for idle research: {e}",
+            exc_info=True,
+        )
+        return
+
+    # Phase 2 — spawn per project, each in its own isolated session.
+    for project_id in project_ids:
+        try:
+            async with AsyncSessionLocal() as session:
+                project = await session.get(Project, project_id)
+                if project is None:
+                    continue
+                await _run_idle_research_for_project(project, session, vm_consuming)
+        except Exception as e:
+            logger.error(
+                f"[AUTONOMOUS] Idle research spawn failed for project {project_id}: {e}",
+                exc_info=True,
+            )
 
 
 async def refresh_research_task_verification(
