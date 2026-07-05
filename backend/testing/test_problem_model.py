@@ -275,6 +275,47 @@ def test_archive_is_idempotent_and_preserves_prior_archive():
     assert {g.id for g in model.archived_gaps} == {"g-old", "g-closed"}
 
 
+def test_archive_closed_gaps_skips_already_archived_id():
+    """A gap already in archived_gaps must not be duplicated when it also
+    appears in gaps with status=closed -- the upstream trigger for the
+    production duplicate bug (stale strategist payload re-submits a gap that
+    was archived in a prior cycle)."""
+    model = ProblemModel(
+        gaps=[Gap(id="g-already-archived", name="done", status="closed")],
+        archived_gaps=[Gap(id="g-already-archived", name="done", status="closed")],
+    )
+    archive_closed_gaps(model)
+    # Still exactly one entry, not two.
+    assert len(model.archived_gaps) == 1
+    assert model.archived_gaps[0].id == "g-already-archived"
+    # The closed gap is removed from the active gaps list regardless.
+    assert model.gaps == []
+
+
+def test_apply_agent_update_no_duplicate_when_archived_gap_reappears_in_gaps():
+    """Regression: submitting a problem-model update where a gap already in
+    archived_gaps also appears in gaps with status=closed must not create a
+    second archived_gaps entry with the same id."""
+    current = {
+        "revision": 3,
+        "archived_gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
+        ],
+    }
+    # Stale strategist payload re-submits the same gap in the active gaps list.
+    proposed = {
+        "gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
+        ],
+    }
+    new_raw, _ = apply_agent_update(current, proposed, "2026-07-05T00:00:00")
+    archived_ids = [g["id"] for g in new_raw["archived_gaps"]]
+    assert archived_ids.count("g-self-qualify-ci-wedge") == 1, (
+        f"duplicate archived_gaps entry: {archived_ids}"
+    )
+    assert len([g for g in new_raw["gaps"] if g["id"] == "g-self-qualify-ci-wedge"]) == 0
+
+
 # ---------------------------------------------------------------------------
 # Revision log
 # ---------------------------------------------------------------------------

@@ -575,12 +575,18 @@ def parse_problem_model(raw: dict | None) -> ProblemModel:
 
 def archive_closed_gaps(model: ProblemModel) -> ProblemModel:
     """Move any gaps whose status is ``closed`` or ``abandoned`` from
-    ``gaps`` into ``archived_gaps``. Returns the same instance for
-    chaining; mutation is in place."""
+    ``gaps`` into ``archived_gaps``. Skips gaps whose id is already present
+    in ``archived_gaps`` so repeated calls or stale strategist payloads that
+    re-submit an already-archived gap cannot create duplicate entries.
+    Returns the same instance for chaining; mutation is in place."""
+    already_archived_ids = {g.id for g in model.archived_gaps}
     still_active: list[Gap] = []
     for gap in model.gaps:
         if gap.status in ("closed", "abandoned"):
-            model.archived_gaps.append(gap)
+            if gap.id not in already_archived_ids:
+                model.archived_gaps.append(gap)
+                already_archived_ids.add(gap.id)
+            # Either way, remove from active gaps — don't keep a closed gap active.
         else:
             still_active.append(gap)
     model.gaps = still_active
