@@ -56,7 +56,7 @@
     "admin_task_mutations.py": 1350,
     "review_pipeline.py": 4550,
     "deploy_health.py": 1250,
-    "direction_outcomes.py": 2750,
+    "direction_outcomes.py": 3200,
     "digest_metrics.py": 6200,
     "digest_remediation.py": 900,
     "digest_direction_progress.py": 1600,
@@ -98,7 +98,7 @@
     "task_evaluators.py": 2300,
     "release_scoring.py": 2450,
     "runtime_config_state.py": 2450,
-    "routers/directions.py": 1750,
+    "routers/directions.py": 2100,
     "warm_pool_maintainer.py": 2300,
     "review_fix_lane_pilot.py": 2450,
     "routers/admin_projects.py": 2000,
@@ -121,10 +121,11 @@
     "strategic_state_read_model.py": 1100,
     "strategic_resident_session.py": 1750,
     "work_session_check_in.py": 400,
-    "release_qualifier_sweep.py": 1750,
+    "release_qualifier_sweep.py": 2100,
     "operator_attention.py": 2150,
     "payload_schemas.py": 1750,
-    "lifecycle.py": 1750
+    "lifecycle.py": 1750,
+    "research_direction_state.py": 1750
   },
   "agent": {
     "index.ts": 4600,

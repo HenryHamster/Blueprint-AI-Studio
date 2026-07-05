@@ -1594,7 +1594,7 @@ async def run_qualification(
         version.last_qualification = {
             "status": "error",
             "error": "sha_error",
-            "detail": str(exc)[:300],
+            "detail": f"{type(exc).__name__}: {exc}"[:300],
             "started_at": _utcnow().isoformat(),
         }
         flag_modified(version, "last_qualification")
@@ -4951,7 +4951,7 @@ async def force_promote_current_version(
                 token, owner, repo, integration_branch
             )
         except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
-            return {"status": "sha_error", "detail": str(exc)[:300]}
+            return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
     if not candidate_sha:
         return {"status": "sha_error", "detail": "empty candidate sha"}
     candidate_diff_hash = compute_audited_surface_hash(

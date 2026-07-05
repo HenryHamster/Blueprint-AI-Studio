@@ -88,6 +88,16 @@ _MAX_SWEEP_CRASH_STREAK = 3
 # to cover the v5 ~5h-late case with wide margin.
 _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
 
+# Maximum number of sweep-driven re-entries for a ``status=error`` version.
+# A single transient GitHub outage (sha_error, no_credentials) should clear on
+# the next sweep; a persistent failure is an operator issue.  Cap at 5 so a
+# permanently broken credential path does not retry forever.
+_MAX_ERROR_REDRIVE_ATTEMPTS = 5
+
+# Transient error codes the sweep is allowed to re-drive.  Permanent errors
+# (e.g. project misconfiguration) should not be blindly retried.
+_TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials"})
+
 
 def _parse_started_at(qual: dict[str, Any]) -> datetime | None:
     """Parse ``last_qualification["started_at"]`` to a datetime, or None.
@@ -375,6 +385,75 @@ async def _redrive_deferred_unsynced_qualification(
         # (only deferred_unsynced versions are picked up by the next sweep).
         await redrive_session.rollback()
         return False
+
+
+async def _redrive_error_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``status=error`` version caused by a transient failure.
+
+    A single transient GitHub outage (``sha_error``, ``no_credentials``) records
+    ``last_qualification.status == "error"`` and parks the version indefinitely
+    because nothing schedules a retry — neither the strategist (which reads
+    a standing ``error`` state as settled) nor any other sweep loop.
+
+    This re-driver fires for open, stabilize-phase versions whose
+    ``last_qualification.status == "error"`` AND whose ``error`` code is in
+    ``_TRANSIENT_ERROR_CODES`` AND whose ``qualification_attempts`` is below
+    ``_MAX_ERROR_REDRIVE_ATTEMPTS``.  The attempt cap prevents a permanently
+    broken credential path from retrying forever.
+
+    Returns True only when the re-entry actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op returns False.
+
+    ``run_qualification`` is fully self-defending (phase check, in-flight check,
+    all under a ``FOR UPDATE`` lock), so a version that changed state between the
+    scan and the re-drive is a safe no-op.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "error"
+            or qual.get("error") not in _TRANSIENT_ERROR_CODES
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Bounded attempts: do not retry a permanently broken path.
+        if (version.qualification_attempts or 0) >= _MAX_ERROR_REDRIVE_ATTEMPTS:
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
+        # COMMIT on every outcome — do NOT roll back the non-spawned paths.
+        #
+        # Unlike the deferred_unsynced re-drive (which rolls back to protect the
+        # accruing ``first_deferred_at`` clock), the error re-drive MUST persist
+        # whatever run_qualification wrote, because the transient-error early
+        # returns (``sha_error`` / ``no_credentials``) bump ``qualification_attempts``
+        # via an atomic UPDATE on THIS session.  Rolling back on a non-spawned
+        # result discards that increment, so the ``>= _MAX_ERROR_REDRIVE_ATTEMPTS``
+        # cap above never advances and a permanently broken path (e.g. missing
+        # credentials) would be re-driven — and hit the GitHub API — every sweep
+        # forever.  Committing is safe here because the version STARTS in an
+        # ``error`` state that is meant to be overwritten:
+        #   * a repeated transient error rewrites last_qualification to a fresh
+        #     ``sha_error`` / ``no_credentials`` (still in _TRANSIENT_ERROR_CODES,
+        #     so it stays eligible for the next sweep) with attempts now +1, so
+        #     the cap converges and the retry loop is bounded; and
+        #   * any genuine transition (spawned / deferred_unsynced / not_promoted /
+        #     a self-defending guard no-op) is a legitimate new state we want to
+        #     keep, not revert to a stale ``error``.
+        await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
 
 
 async def _redrive_not_promoted_qualification(
@@ -1220,6 +1299,34 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
                 "(now synced — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded at ``status=error`` due to a transient
+    # GitHub failure (sha_error, no_credentials).  A single outage parks the
+    # version indefinitely because the strategist reads a standing error as
+    # settled.  This loop re-enters run_qualification for each open,
+    # stabilize-phase version with a transient error code, subject to a bounded
+    # attempt cap (_MAX_ERROR_REDRIVE_ATTEMPTS) so a permanently broken path
+    # does not retry forever.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_error_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: error re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove error version %s "
+                "(transient error cleared — qualification spawned)",
                 version_id,
             )
 

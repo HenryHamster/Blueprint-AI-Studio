@@ -17122,6 +17122,187 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
 
 
 @pytest.mark.asyncio
+async def test_sweep_redrives_transient_sha_error_version(db_session, mocker):
+    """A stabilize version stranded at status=error/sha_error is re-driven by
+    the sweep once GitHub recovers.
+
+    Acceptance proof: after the sweep, version transitions from error to pending
+    — the transient outage is recovered automatically.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "aabbcc" * 6 + "aabb"
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-err",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # The autouse fixture _qualifier_ci_resolves_green handles token + CI
+    # resolution mocks. Only need to override get_branch_sha and spawn.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-abc",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_respects_attempt_cap(db_session, mocker):
+    """A stabilize version at status=error is NOT re-driven once qualification_attempts
+    reaches _MAX_ERROR_REDRIVE_ATTEMPTS, preventing infinite retries on a
+    permanently broken path."""
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "HTTPException: connection refused",
+        "started_at": "2026-07-05T10:00:00",
+    }
+    version.qualification_attempts = _MAX_ERROR_REDRIVE_ATTEMPTS
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No spawn should have happened — attempt cap blocks re-drive.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_accumulates_attempts_until_capped(
+    db_session, mocker
+):
+    """A persistently-failing transient path is re-driven only a BOUNDED number
+    of times: qualification_attempts must ACCUMULATE across sweeps and converge
+    on _MAX_ERROR_REDRIVE_ATTEMPTS, at which point re-drive stops.
+
+    This is the regression proof for the rollback-defeats-the-cap bug: the
+    transient-error early returns in run_qualification bump qualification_attempts
+    on the re-drive session, so if that session is rolled back on the (non-spawned)
+    error result, the increment is discarded and the cap NEVER advances — a broken
+    path (e.g. a permanently unreachable GitHub) is re-driven, hitting the API,
+    every sweep forever.  Here get_branch_sha ALWAYS raises, so every re-drive
+    returns sha_error; the counter must still stop climbing at the cap and the
+    GitHub call count must be bounded, not unbounded.
+    """
+    from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+    }
+    # Start from a clean slate — the cap must be reached purely by accumulation.
+    version.qualification_attempts = 0
+    db_session.add(version)
+    await db_session.commit()
+
+    sha_mock = mocker.patch(
+        "app.github.get_branch_sha",
+        side_effect=RuntimeError("transient GitHub 503 — permanently down"),
+    )
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    # Run the sweep more times than the cap allows — extra sweeps must be no-ops.
+    for _ in range(_MAX_ERROR_REDRIVE_ATTEMPTS + 3):
+        await rq.sweep_stuck_qualifications(
+            db_session, session_factory=_shared_session_factory(db_session)
+        )
+        await db_session.commit()
+
+    await db_session.refresh(version)
+    # The increment PERSISTED across sweeps (not rolled back) and converged on the
+    # cap exactly — never exceeding it, never stalling below it.
+    assert version.qualification_attempts == _MAX_ERROR_REDRIVE_ATTEMPTS
+    # GitHub was hit at most once per re-drive and re-drive stopped at the cap:
+    # the API call count is bounded, not unbounded (the bug would loop forever).
+    assert sha_mock.call_count == _MAX_ERROR_REDRIVE_ATTEMPTS
+    # Never spawned (every attempt failed) and stays in the transient-error state.
+    spawn_mock.assert_not_called()
+    assert version.last_qualification["status"] == "error"
+    assert version.last_qualification["error"] == "sha_error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_does_not_redrive_non_transient_error(db_session, mocker):
+    """A status=error version with an error code NOT in _TRANSIENT_ERROR_CODES
+    is not re-driven by the sweep — only transient errors are retried."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "spawn_failed",  # not in _TRANSIENT_ERROR_CODES
+        "started_at": "2026-07-05T10:00:00",
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Non-transient error: no spawn.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "error"
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA
@@ -20197,6 +20378,36 @@ async def test_qualification_attempts_increments_atomically_on_sha_error(
     assert version.last_qualification["error"] == "sha_error"
     # The atomic increment ran.
     assert version.qualification_attempts == 1
+
+
+@pytest.mark.asyncio
+async def test_sha_error_detail_includes_exception_class(db_session, mocker):
+    """sha_error detail uses f"{type(exc).__name__}: {exc}" so that exceptions
+    with an empty str() (e.g. timeout-class errors) still record a useful label."""
+
+    class TimeoutError(Exception):
+        def __str__(self):
+            return ""  # empty str — the old format recorded an empty detail
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=TimeoutError()),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "sha_error"
+    await db_session.refresh(version)
+    detail = version.last_qualification["detail"]
+    # Must include the class name even when str(exc) is empty.
+    assert "TimeoutError" in detail
 
 
 # ===========================================================================
