@@ -3203,12 +3203,16 @@ async def orchestrator_worker():
         _last_local_runner_hold_sweep
     while True:
         queued_tasks = []
-        # Reset at the very top of the loop body (before the try) so a stale
-        # count from a prior cycle can never leak into the end-of-cycle sleep
-        # decision (_select_cycle_sleep). The authoritative per-cycle reset still
-        # lives with its sibling counters inside the dispatch block below; this
-        # is defensive belt-and-suspenders in case any early-exit path reaches
-        # the sleep decision without having entered that block.
+        # Reset at the very top of the loop body (before the try) — REQUIRED for
+        # correctness, not merely defensive. The end-of-cycle sleep decision reads
+        # _cycle_dispatched from a SEPARATE try-block (the _select_cycle_sleep call)
+        # that runs even when the main dispatch try raises before reaching its own
+        # authoritative per-cycle reset (with the sibling counters, in the dispatch
+        # block below). Without this top-of-loop init, a first-cycle early crash
+        # leaves _cycle_dispatched unbound → NameError on that read → swallowed by
+        # the sleep block's except → no sleep runs → the loop spins at zero delay
+        # (the exact busy-loop WI-4 fixes). It also keeps a stale prior-cycle count
+        # from leaking into the sleep decision.
         _cycle_dispatched = 0
         session = None  # defined before try so except handler can reference it
         try:

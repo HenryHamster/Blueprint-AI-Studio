@@ -86,12 +86,14 @@ PRECOMPUTE_TICK_BUDGET_SECONDS: int = 35
 # Last-resort HARD timeout for the whole tick, kept only so a single pathological
 # unit that ignores its own statement_timeout (e.g. a wedged connection checkout,
 # before any query even runs) can never pin the worker task forever — which would
-# make the ``_tick_in_progress`` guard skip every future tick. A generous multiple
-# of the cooperative budget (>= 3x) so it effectively NEVER fires mid-query: the
-# cooperative check returns early at ``PRECOMPUTE_TICK_BUDGET_SECONDS`` between
-# units, and the worst single unit is capped at 30s, long before this. If it ever
-# does fire it will cancel a query (the old failure mode), but only in a genuine
-# wedge — not the chronic every-tick overrun the cooperative budget eliminates.
+# make the ``_tick_in_progress`` guard skip every future tick. Individual queries
+# are each capped by their own statement_timeout (5s digest / 30s health), but a
+# unit issues SEVERAL of them, so 180s is a generous — not a provable — upper
+# bound: in the common case the cooperative check returns early at
+# ``PRECOMPUTE_TICK_BUDGET_SECONDS`` between units, nowhere near this. A genuine
+# multi-query DB wedge (N_queries x statement_timeout) can still trip it — accepted:
+# rare, not the chronic every-tick overrun the cooperative budget eliminates. If it
+# does fire it cancels a query (the old failure mode), but only in that real wedge.
 PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS: int = 180
 
 # How long a precomputed entry is considered fresh enough to serve directly.
@@ -681,8 +683,11 @@ async def digest_precompute_service() -> None:
     the next tick resumes where it left off. A generous
     ``PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS`` (>= 3x the cooperative budget) wraps
     the tick purely as a last-resort guard against a wedged unit that ignores its
-    own statement_timeout; it effectively never fires mid-query. The lifecycle
-    monitor restarts the loop on crash. Cancellation (shutdown) propagates cleanly.
+    own statement_timeout. Because a unit issues several queries (each capped by
+    its own statement_timeout), 180s is a generous — not a provable — upper bound:
+    the common every-tick path never approaches it, though a genuine multi-query DB
+    wedge can still trip it (accepted: rare). The lifecycle monitor restarts the
+    loop on crash. Cancellation (shutdown) propagates cleanly.
 
     The ``_tick_in_progress`` flag prevents tick overlap: if a previous tick
     hasn't finished when the next interval fires (e.g. a hard-timeout wedge held

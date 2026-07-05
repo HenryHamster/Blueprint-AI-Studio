@@ -1199,7 +1199,13 @@ async def _resolve_review_second_opinion(
         status=TaskStatus.COMPLETED,
         verdict_json=json.dumps(
             {
-                "verdict": record["reconciled_verdict"],
+                # ``record`` may be a stored record loaded on the pending-application
+                # REPLAY path; a fail-closed escalation can persist one without a
+                # ``reconciled_verdict`` key. Fall back to the (in-scope) primary
+                # verdict — the fail-closed value that preserves current behavior on
+                # every reachable path (reconcile_review_second_opinion always sets
+                # the key, so the default is only used by a keyless replay record).
+                "verdict": record.get("reconciled_verdict", primary_verdict),
                 "issues": record.get("surviving_issues", []),
                 "feedback": parked.get("feedback", ""),
                 "investigated_files": parked.get("investigated_files", []),
@@ -1212,7 +1218,7 @@ async def _resolve_review_second_opinion(
         review.id,
         record["state"],
         primary_verdict,
-        record["reconciled_verdict"],
+        record.get("reconciled_verdict", primary_verdict),
     )
     # Release the review row's FOR UPDATE lock (acquired above) BEFORE
     # _process_post_commit: it opens a SEPARATE session and re-acquires FOR UPDATE
@@ -1498,10 +1504,15 @@ async def _process_post_commit(
         # Project→Task, and the opposite orders deadlocked (Postgres 40P01
         # DeadlockDetected, ~6/hr on bursty concurrent agent-status callbacks).
         # Acquire Project→Task up front for ALL types via the canonical
-        # pair-locker so the whole transaction observes a single order; every
-        # downstream project lock is then a re-entrant no-op (the same
-        # transaction already holds the row, so FOR NO KEY UPDATE re-acquires
-        # without blocking).
+        # pair-locker. The invariant this establishes is ORDER, not duration: the
+        # Project row is always acquired FIRST (before the Task), by every path.
+        # (The up-front locks are RELEASED at the Phase-B3 lock-release commit —
+        # "release the lock before slow GitHub calls" — so a downstream project
+        # lock taken after that commit is a fresh same-connection acquisition, not
+        # a held-through re-entrant no-op. A downstream lock taken while the up-front
+        # lock is still held IS re-entrant / non-blocking, but the deadlock freedom
+        # comes purely from Project-before-Task being universal, not from holding
+        # the row across the whole unit.)
         _peek_row = (
             await session.execute(select(Task.project_id).where(Task.id == task_id))
         ).first()
