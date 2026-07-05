@@ -3575,10 +3575,12 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
         if finding_type == "design_doc_observation":
             # Append to design doc proposals for Phase 1 to review
+            _obs_text = finding.get("description", "")[:500]
+            _obs_section = finding.get("section", "general")
             _obs_entry = {
                 "id": f"pc-{uuid.uuid4().hex[:8]}",
-                "observation": finding.get("description", "")[:500],
-                "section": finding.get("section", "general"),
+                "observation": _obs_text,
+                "section": _obs_section,
                 "proposed_by_task": str(task.id),
                 "proposed_at": _utcnow().isoformat(),
                 "status": "pending",
@@ -3586,7 +3588,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
 
             def _add_obs_proposal(doc: dict) -> None:
                 proposals = doc.get("proposed_changes", [])
-                proposals.append(_obs_entry)
+                # Dedup: skip if identical observation already exists
+                existing = next(
+                    (p for p in proposals
+                     if p.get("observation") == _obs_text and p.get("section") == _obs_section),
+                    None
+                )
+                if not existing:
+                    proposals.append(_obs_entry)
                 doc["proposed_changes"] = proposals[-30:]  # cap at 30 pending
 
             await with_design_doc_locked(session, task.project_id, _add_obs_proposal)
@@ -6103,6 +6112,16 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
                             _ev.get(
                                 "autonomous_prs_merged",
                                 _ev.get("prs_merged", 0),
+                            )
+                            or 0
+                        ),
+                        "verified_autonomous_prs_merged": int(
+                            _ev.get(
+                                "verified_autonomous_prs_merged",
+                                _ev.get(
+                                    "autonomous_prs_merged",
+                                    _ev.get("prs_merged", 0),
+                                ),
                             )
                             or 0
                         ),

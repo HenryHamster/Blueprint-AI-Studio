@@ -5063,6 +5063,69 @@ async def test_non_spawning_findings_skip_grader_even_when_enabled(db_session, m
 
 
 @_pytest.mark.asyncio
+async def test_design_doc_observation_dedup_on_reprocessing(db_session, mocker):
+    """Re-processing the same design_doc_observation finding appends no duplicate."""
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-obs-dedup")
+    obs_finding = {
+        "title": "design observation",
+        "description": "An observation about the design doc",
+        "section": "architecture",
+        "prompt": "noted",
+        "type": "design_doc_observation",
+        "direction_id": direction["id"],
+    }
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[obs_finding],
+    )
+    _enable_grader(mocker)
+
+    # Process the same observation twice
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(_project)
+    proposals_after_first = _project.design_doc.get("proposed_changes", [])
+    first_count = len(proposals_after_first)
+
+    # Create a second task to simulate re-processing the same finding
+    task2 = _Task(
+        project_id=_project.id,
+        title="Research task 2",
+        payloads=[
+            {"type": "research", "directions": [direction], "base_branch": "main"}
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    mocker.patch(
+        "app.research_completion._parse_research_findings",
+        return_value=[obs_finding],
+    )
+    await _handle_research_completion(task2, "", db_session)
+    await db_session.refresh(_project)
+    proposals_after_second = _project.design_doc.get("proposed_changes", [])
+    second_count = len(proposals_after_second)
+
+    assert first_count == second_count, (
+        "re-processing identical design_doc_observation must not append duplicate"
+    )
+    # Verify the observation is still there
+    assert any(
+        p.get("observation") == "An observation about the design doc"
+        and p.get("section") == "architecture"
+        for p in proposals_after_second
+    ), "the original observation must still be in proposed_changes"
+
+
+@_pytest.mark.asyncio
 async def test_finding_prerequisite_wires_depends_on_to_inflight_foundation(
     db_session, mocker
 ):

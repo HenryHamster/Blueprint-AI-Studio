@@ -16,6 +16,7 @@ from app.direction_outcomes import (
     PR_INELIGIBLE_TASK_TYPES,
     _SPAWN_GATE_REASON_MAX_LEN,
     _SPAWN_GATE_REASONS_SAMPLE_CAP,
+    compute_direction_autonomy_state,
     declared_merged_count,
     proven_merged_count,
     verified_merged_count,
@@ -870,16 +871,18 @@ async def compute_direction_progress(
             if lifetime_pr_eligible_tasks_created > 0
             else None
         )
-        lifetime_autonomous_prs_merged = sum(
-            h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in _history_all
-        ) + (_agg.get("total_autonomous_prs_merged") or 0)
-        lifetime_operator_actions = sum(
-            h.get("operator_action_count", 0) for h in _history_all
-        ) + (_agg.get("total_operator_actions") or 0)
+        # Autonomy lifetime totals + retirement eligibility — derived by the
+        # single source of truth (compute_direction_autonomy_state) rather than
+        # re-computed inline, so this digest surface can never silently disagree
+        # with the strategist payload or the helper. It credits only verifiably-
+        # landed autonomous merges toward the 10-merge milestone.
+        _autonomy_state = compute_direction_autonomy_state(d)
+        lifetime_autonomous_prs_merged = _autonomy_state[
+            "lifetime_autonomous_prs_merged"
+        ]
+        lifetime_operator_actions = _autonomy_state["lifetime_operator_actions"]
         lifetime_generalized_state = _compute_lifetime_generalized_outcome_state(d)
-        retirement_eligible = (
-            lifetime_autonomous_prs_merged >= 10 and lifetime_operator_actions == 0
-        )
+        retirement_eligible = _autonomy_state["retirement_eligible"]
         evicted_findings_count = len(_agg.get("evicted_findings") or [])
         direction_text = (d.get("text") or d.get("description") or "")[:80]
 

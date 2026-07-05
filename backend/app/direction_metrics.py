@@ -192,6 +192,13 @@ _HISTORY_AGG_DEFAULTS = {
     "total_tasks_cancelled": 0,
     "first_cycle_at": None,
     "total_autonomous_prs_merged": 0,
+    # Verification-aware lifetime autonomous merge count: the honest basis for
+    # the retirement-eligibility milestone in compute_direction_autonomy_state.
+    # Only autonomous merges that also landed in a verified acceptance bucket
+    # count, so this stays <= total_autonomous_prs_merged and survives cycle
+    # eviction. Two-step legacy fallback on fold (see _fold_evicted_into_aggregate)
+    # keeps pre-field entries whole rather than dropping them to zero.
+    "total_verified_autonomous_prs_merged": 0,
     "total_assisted_prs_merged": 0,
     "total_operator_actions": 0,
     "total_generalized_successes": 0,
@@ -470,8 +477,33 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
     directions older than 10 cycles silently lost all scope/decomposition data.
     """
     agg = prev_agg or {}
+    # Detect legacy aggregates that have accumulated autonomous credit in
+    # total_autonomous_prs_merged but predate total_verified_autonomous_prs_merged.
+    # Must check BEFORE setdefault materializes the key at 0.
+    _seed_verified_autonomous = (
+        "total_verified_autonomous_prs_merged" not in agg
+        and agg.get("total_autonomous_prs_merged", 0) > 0
+    )
     for k, v in _HISTORY_AGG_DEFAULTS.items():
         agg.setdefault(k, v)
+    # Seed from total_autonomous_prs_merged so pre-deploy folded credit is not
+    # silently dropped the first time this key is materialized. Subsequent folds
+    # find the key present and skip this branch.
+    if _seed_verified_autonomous:
+        agg["total_verified_autonomous_prs_merged"] = agg["total_autonomous_prs_merged"]
+        # Backfill legacy eviction snapshots with the autonomous fallback so that
+        # post-eviction delta calculations (_apply_direction_outcomes) compute the
+        # correct _snap_val baseline. Without this, a late-merge event on a legacy
+        # snapshot (_snap_val=0) adds the full recomputed total on top of the
+        # already-seeded aggregate, counting pre-eviction merges twice.
+        for _snap in (agg.get("_evicted_cycle_snapshots") or {}).values():
+            if "verified_autonomous_prs_merged" not in _snap:
+                _snap["verified_autonomous_prs_merged"] = int(
+                    _snap.get(
+                        "autonomous_prs_merged", _snap.get("prs_merged", 0)
+                    )
+                    or 0
+                )
     normalized_generalized = _normalize_aggregate_generalized_state(agg)
     agg["total_generalized_successes"] = normalized_generalized[
         "total_generalized_successes"
@@ -530,6 +562,14 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         # treat all merges as autonomous so CPM is conservative for old data.
         agg["total_autonomous_prs_merged"] += ev.get(
             "autonomous_prs_merged", ev.get("prs_merged", 0)
+        )
+        # Verification-aware autonomous fold. Two-step legacy fallback consistent
+        # with verified_autonomous_merged_count: pre-field entries degrade to the
+        # raw autonomous count, and pre-attribution entries to prs_merged, so no
+        # historical direction silently loses accumulated autonomy credit.
+        agg["total_verified_autonomous_prs_merged"] += ev.get(
+            "verified_autonomous_prs_merged",
+            ev.get("autonomous_prs_merged", ev.get("prs_merged", 0)),
         )
         agg["total_assisted_prs_merged"] += ev.get("assisted_prs_merged", 0)
         agg["total_operator_actions"] += ev.get("operator_action_count", 0)

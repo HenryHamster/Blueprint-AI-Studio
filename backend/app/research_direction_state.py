@@ -659,6 +659,16 @@ async def apply_post_spawn_state(
                                         )
                                         or 0
                                     ),
+                                    "verified_autonomous_prs_merged": int(
+                                        _ev.get(
+                                            "verified_autonomous_prs_merged",
+                                            _ev.get(
+                                                "autonomous_prs_merged",
+                                                _ev.get("prs_merged", 0),
+                                            ),
+                                        )
+                                        or 0
+                                    ),
                                     "assisted_prs_merged": int(
                                         _ev.get("assisted_prs_merged") or 0
                                     ),

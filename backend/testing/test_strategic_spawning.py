@@ -2041,6 +2041,66 @@ async def test_retirement_eligibility_fields_in_direction_stats(db_session):
 
 
 @pytest.mark.asyncio
+async def test_stat_payload_autonomy_agrees_with_helper_and_excludes_degraded(
+    db_session,
+):
+    """The strategist stat payload derives autonomy from the single source of
+    truth (compute_direction_autonomy_state) — the two surfaces cannot disagree,
+    and degraded/unverified autonomous merges do NOT advance retirement.
+
+    The direction has 10 RAW autonomous merges but only 8 verified, so the raw
+    milestone would (wrongly) fire while the verified milestone does not.
+    """
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    direction = {
+        "id": "d-verified-autonomy-payload",
+        "status": "active",
+        "text": "Direction with degraded autonomous merges",
+        "priority": "high",
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 8,
+                "prs_merged": 10,
+                "operator_action_count": 0,
+            },
+        ],
+        "history_aggregate": {
+            "total_autonomous_prs_merged": 0,
+            "total_verified_autonomous_prs_merged": 0,
+            "total_operator_actions": 0,
+        },
+    }
+    project = _make_project(directions=[direction], vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    stat = {s["id"]: s for s in payload["directions_summary"]}[
+        "d-verified-autonomy-payload"
+    ]
+
+    # The payload agrees byte-for-byte with the helper on the same input.
+    expected = compute_direction_autonomy_state(direction)
+    assert (
+        stat["lifetime_autonomous_prs_merged"]
+        == expected["lifetime_autonomous_prs_merged"]
+        == 8
+    )
+    assert stat["lifetime_operator_actions"] == expected["lifetime_operator_actions"]
+    # 8 verified (not the raw 10) → NOT retirement-eligible.
+    assert stat["retirement_eligible"] == expected["retirement_eligible"] is False
+
+
+@pytest.mark.asyncio
 async def test_cost_fields_present_when_history_has_merge_data(db_session):
     """cost_per_merged_pr and estimated_cost_usd appear when history has tasks_created + avg_time_to_merge_hours + merges."""
     from app.routers.admin_analytics import ON_DEMAND_RATE

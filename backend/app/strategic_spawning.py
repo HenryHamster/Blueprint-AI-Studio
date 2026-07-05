@@ -20,6 +20,7 @@ from sqlmodel import select
 from app import strategic_cycle
 from app.direction_metrics import _compute_direction_quality_score
 from app.direction_outcomes import (
+    compute_direction_autonomy_state,
     declared_merged_count,
     discount_stranded_pr_from_direction_credit,
     proven_merged_count,
@@ -5711,15 +5712,15 @@ def _build_direction_stats(
         total_failed_infra = sum(h.get("tasks_failed_infra", 0) for h in history) + (
             agg.get("total_tasks_failed_infra") or 0
         )
-        # Autonomy lifetime totals — legacy fallback treats prs_merged as autonomous
-        # (same interpretation as admin_digest.py and direction_metrics.py).
-        lifetime_autonomous = sum(
-            h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
-        ) + (agg.get("total_autonomous_prs_merged") or 0)
-        lifetime_op_actions = sum(
-            h.get("operator_action_count", 0) for h in history
-        ) + (agg.get("total_operator_actions") or 0)
-        retirement_eligible = lifetime_autonomous >= 10 and lifetime_op_actions == 0
+        # Autonomy lifetime totals + retirement eligibility — derived by the
+        # single source of truth (compute_direction_autonomy_state) rather than
+        # re-computed inline, so this payload can never silently disagree with the
+        # helper. It credits only verifiably-landed autonomous merges toward the
+        # 10-merge milestone and applies the same two-step legacy fallback.
+        _autonomy_state = compute_direction_autonomy_state(d)
+        lifetime_autonomous = _autonomy_state["lifetime_autonomous_prs_merged"]
+        lifetime_op_actions = _autonomy_state["lifetime_operator_actions"]
+        retirement_eligible = _autonomy_state["retirement_eligible"]
         taxonomy_totals: dict[str, int] = {}
         for h in history:
             for tkey, tval in (h.get("taxonomy_summary") or {}).items():

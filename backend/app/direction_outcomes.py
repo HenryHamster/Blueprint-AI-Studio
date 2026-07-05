@@ -184,6 +184,33 @@ def verified_merged_count(entry: dict) -> int:
     return int(entry.get("prs_merged") or 0)
 
 
+def verified_autonomous_merged_count(entry: dict) -> int:
+    """Verification-aware AUTONOMOUS merged-PR count for a research_history entry.
+
+    The honest counterpart to the raw ``autonomous_prs_merged`` field: counts
+    only autonomous merges (no operator intervention) that ALSO landed in a
+    verified acceptance bucket — i.e. the intersection recorded as
+    ``verified_autonomous_prs_merged`` by ``_update_direction_research_outcomes``.
+    Degraded-unverified and acceptance-unsatisfied autonomous merges are excluded
+    (they count in ``autonomous_prs_merged`` but not here), and confirmed-stranded
+    merges are already absent because a full recompute drops them from the merged
+    rows entirely. By construction ``verified_autonomous_prs_merged`` is never
+    larger than either ``autonomous_prs_merged`` or ``verified_prs_merged``.
+
+    This is the honest basis for the 10-merge retirement-eligibility milestone in
+    :func:`compute_direction_autonomy_state`. A two-step legacy fallback keeps
+    historical directions whole: entries written before this field existed fall
+    back to the raw ``autonomous_prs_merged`` count, and pre-attribution entries
+    lacking even that fall back to ``prs_merged`` — degrading to the prior
+    (raw-autonomous / all-merges-autonomous) behavior rather than dropping to zero.
+    """
+    if "verified_autonomous_prs_merged" in entry:
+        return int(entry.get("verified_autonomous_prs_merged") or 0)
+    if "autonomous_prs_merged" in entry:
+        return int(entry.get("autonomous_prs_merged") or 0)
+    return int(entry.get("prs_merged") or 0)
+
+
 def credit_gate_merged_count(entry: dict) -> int:
     """Credit-eligible merge count for direction decision gates (auto-completion, churn, lifetime burn).
 
@@ -324,6 +351,27 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
             violations.append(
                 f"reachable ({reachable}) exceeds prs_merged ({prs_merged})"
             )
+    # verified_autonomous_prs_merged is the honest, verification-aware subset of
+    # autonomous_prs_merged used for the retirement milestone. It must never
+    # outrun either the raw autonomous count or the verified count. Only checked
+    # when present — legacy entries without it are skipped.
+    if "verified_autonomous_prs_merged" in entry:
+        verified_autonomous = int(entry.get("verified_autonomous_prs_merged") or 0)
+        autonomous = int(entry.get("autonomous_prs_merged") or 0)
+        if verified_autonomous < 0:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) is negative"
+            )
+        if verified_autonomous > autonomous:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) exceeds "
+                f"autonomous ({autonomous})"
+            )
+        if verified_autonomous > verified:
+            violations.append(
+                f"verified-autonomous ({verified_autonomous}) exceeds "
+                f"verified ({verified})"
+            )
     # stranded_prs_merged is a delta-patch applied between stranding and the next
     # full recompute; _update_direction_research_outcomes resets it to 0 once a
     # recompute runs (stranded tasks are already absent from prs_merged at that
@@ -395,9 +443,21 @@ _SPAWN_GATE_REASON_MAX_LEN = 200
 def compute_direction_autonomy_state(direction: dict) -> dict:
     """Return lifetime autonomy metrics and retirement eligibility for a direction.
 
-    Reads research_history and history_aggregate; applies a legacy fallback so
-    pre-attribution entries (no autonomous_prs_merged key) treat prs_merged as
-    autonomous — consistent with _fold_evicted_into_aggregate and admin_digest.
+    The SINGLE source of truth for the retirement-eligibility milestone —
+    strategic_spawning.py's strategist stat payload calls this rather than
+    re-deriving the rule inline, so the two surfaces can never disagree.
+
+    Retirement eligibility credits only VERIFIABLY-LANDED autonomous merges:
+    ``lifetime_autonomous_prs_merged`` sums the verification-aware
+    ``verified_autonomous_prs_merged`` field (see
+    :func:`verified_autonomous_merged_count`) across research_history plus the
+    ``total_verified_autonomous_prs_merged`` aggregate. Degraded-unverified and
+    acceptance-unsatisfied autonomous merges — merges that never verifiably
+    landed — are therefore NOT counted, mirroring how ``verified_prs_merged``
+    relates to the raw ``prs_merged``. A two-step legacy fallback keeps
+    historical directions whole: entries without the verified field fall back to
+    the raw ``autonomous_prs_merged`` count, and pre-attribution entries fall
+    back to ``prs_merged``, so no direction silently loses accumulated credit.
 
     A direction is retirement-eligible when lifetime_autonomous_prs_merged >= 10
     AND lifetime_operator_actions == 0 (zero-tolerance for operator intervention).
@@ -405,8 +465,14 @@ def compute_direction_autonomy_state(direction: dict) -> dict:
     history = direction.get("research_history") or []
     agg = direction.get("history_aggregate") or {}
     lifetime_autonomous = sum(
-        h.get("autonomous_prs_merged", h.get("prs_merged", 0)) for h in history
-    ) + (agg.get("total_autonomous_prs_merged") or 0)
+        verified_autonomous_merged_count(h) for h in history
+    ) + (
+        agg.get(
+            "total_verified_autonomous_prs_merged",
+            agg.get("total_autonomous_prs_merged", 0),
+        )
+        or 0
+    )
     lifetime_op_actions = sum(h.get("operator_action_count", 0) for h in history) + (
         agg.get("total_operator_actions") or 0
     )
@@ -578,6 +644,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "autonomous_prs_merged": {
         "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py, DirectionCard.tsx"
+    },
+    "verified_autonomous_prs_merged": {
+        "consumer": "compute_direction_autonomy_state (this module), strategic_spawning.py"
     },
     "assisted_prs_merged": {
         "consumer": "digest_direction_progress.py, direction_metrics.py"
@@ -1285,6 +1354,23 @@ async def _update_direction_research_outcomes(
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
         + aggregate_buckets["undeclared"]
+    )
+    # verified_autonomous_prs_merged: the honest basis for the retirement-
+    # eligibility milestone (compute_direction_autonomy_state). A merge counts
+    # here only when it is BOTH autonomous (no operator intervention) AND lands
+    # in one of the same verified acceptance buckets as verified_prs_merged
+    # (proven + satisfied_unproven + undeclared). Degraded-unverified and
+    # acceptance-unsatisfied autonomous merges are excluded, so by construction
+    # verified_autonomous_prs_merged <= autonomous_prs_merged and
+    # <= verified_prs_merged. Confirmed-stranded merges are already absent from
+    # _merged_rows (is_merged_completion returns False when landed_on_integration
+    # is explicitly False), so they never inflate this count on a full recompute.
+    _VERIFIED_ACCEPTANCE_BUCKETS = ("proven", "satisfied_unproven", "undeclared")
+    entry["verified_autonomous_prs_merged"] = sum(
+        1
+        for ct in _merged_rows
+        if is_autonomous_merge(ct)
+        and classify_merged_acceptance(ct) in _VERIFIED_ACCEPTANCE_BUCKETS
     )
     # A full recompute already excludes confirmed-stranded tasks from prs_merged
     # and verified_prs_merged (is_merged_completion returns False when
@@ -2173,6 +2259,7 @@ async def _update_direction_research_outcomes(
         ("prs_merged", "total_prs_merged"),
         ("verified_prs_merged", "total_verified_prs_merged"),
         ("autonomous_prs_merged", "total_autonomous_prs_merged"),
+        ("verified_autonomous_prs_merged", "total_verified_autonomous_prs_merged"),
         ("assisted_prs_merged", "total_assisted_prs_merged"),
         ("reachable_prs_merged", "total_reachable_prs_merged"),
         ("stranded_prs_merged", "total_stranded_prs_merged"),

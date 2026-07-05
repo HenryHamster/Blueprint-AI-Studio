@@ -4345,6 +4345,87 @@ def test_fold_evicted_attribution_accumulates_on_prior_agg():
     assert agg["total_autonomous_prs_merged"] == 5  # 4 + 1
     assert agg["total_assisted_prs_merged"] == 2  # 1 + 1
     assert agg["total_operator_actions"] == 2  # 1 + 1
+    # Seeding branch: prior has total_autonomous=4 but no total_verified_autonomous.
+    # Seed fires → 4, then evicted cycle contributes autonomous=1 via fallback → 5.
+    assert agg["total_verified_autonomous_prs_merged"] == 5  # seeded 4 + folded 1
+
+
+def test_fold_evicted_seed_backfills_legacy_snapshots_no_double_count():
+    """When the legacy-aggregate seed fires, _evicted_cycle_snapshots are backfilled
+    with the autonomous fallback so a subsequent late-merge delta does not double-count
+    the pre-eviction merges that are already represented by the seed."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    # Legacy aggregate: autonomous credit folded but no verified_autonomous field yet.
+    # Snapshot T1 is legacy (lacks verified_autonomous_prs_merged).
+    prior = {
+        "total_autonomous_prs_merged": 5,
+        "_evicted_cycle_snapshots": {
+            "T1": {"prs_merged": 3, "autonomous_prs_merged": 3},
+        },
+    }
+    # Trigger a fold (e.g. one more cycle evicted with 1 autonomous merge).
+    evicted = [
+        {
+            "timestamp": "2025-04-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "autonomous_prs_merged": 1,
+            "verified_autonomous_prs_merged": 1,
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    # Aggregate: seeded 5 + folded 1 = 6.
+    assert agg["total_verified_autonomous_prs_merged"] == 6
+
+    # Snapshot T1 must now have verified_autonomous_prs_merged = 3 (fallback from
+    # autonomous_prs_merged). Without the backfill a late-merge delta for T1 would
+    # compute _snap_val=0 and add its full recomputed total on top of the seeded 5,
+    # causing a double-count.
+    t1_snap = agg["_evicted_cycle_snapshots"]["T1"]
+    assert t1_snap["verified_autonomous_prs_merged"] == 3
+
+    # Simulate late-merge event for T1: recomputed value is 4 (3 pre-eviction + 1 new).
+    # The correct delta is 1, not 4.
+    _snap_val = t1_snap.get("verified_autonomous_prs_merged", 0)
+    _new_val = 4
+    _delta = _new_val - _snap_val
+    assert _delta == 1, "late-merge delta must be incremental (1), not the full total (4)"
+    agg["total_verified_autonomous_prs_merged"] += _delta
+    assert agg["total_verified_autonomous_prs_merged"] == 7  # 6 + 1, not 6 + 4 = 10
+
+
+def test_fold_evicted_verified_autonomous_two_step_legacy_fallback():
+    """total_verified_autonomous_prs_merged folds with a two-step legacy fallback:
+    new field → autonomous_prs_merged → prs_merged, so historical directions keep
+    accumulated autonomy credit rather than dropping to zero."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    evicted = [
+        # Pre-attribution: only prs_merged → falls back to prs_merged (3).
+        {"timestamp": "2025-01-01T00:00:00", "tasks_created": 3, "prs_merged": 3},
+        # Pre-verified-field: has autonomous but not verified → falls back to 2.
+        {
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 5,
+            "prs_merged": 3,
+            "autonomous_prs_merged": 2,
+        },
+        # New field present: uses verified count (1), NOT the raw autonomous (4).
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "tasks_created": 6,
+            "prs_merged": 5,
+            "autonomous_prs_merged": 4,
+            "verified_autonomous_prs_merged": 1,
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_verified_autonomous_prs_merged"] == 6  # 3 + 2 + 1
+    # Raw autonomous still folds the un-verified counts (3 + 2 + 4).
+    assert agg["total_autonomous_prs_merged"] == 9
 
 
 def test_fold_evicted_acceptance_aggregates_survive_eviction():
@@ -4627,6 +4708,196 @@ def test_autonomy_state_combines_history_and_aggregate():
     result = compute_direction_autonomy_state(d)
     assert result["lifetime_autonomous_prs_merged"] == 10
     assert result["retirement_eligible"] is True
+
+
+def test_verified_autonomous_merged_count_prefers_new_key():
+    """The verified field wins even when the raw autonomous count is larger."""
+    from app.direction_outcomes import verified_autonomous_merged_count
+
+    assert (
+        verified_autonomous_merged_count(
+            {"autonomous_prs_merged": 5, "verified_autonomous_prs_merged": 3}
+        )
+        == 3
+    )
+
+
+def test_verified_autonomous_merged_count_falls_back_to_autonomous():
+    """No verified field → fall back to the raw autonomous count (legacy step 1)."""
+    from app.direction_outcomes import verified_autonomous_merged_count
+
+    assert verified_autonomous_merged_count({"autonomous_prs_merged": 4}) == 4
+
+
+def test_verified_autonomous_merged_count_falls_back_to_prs_merged():
+    """Pre-attribution entry (no autonomous field) → prs_merged (legacy step 2)."""
+    from app.direction_outcomes import verified_autonomous_merged_count
+
+    assert verified_autonomous_merged_count({"prs_merged": 6}) == 6
+
+
+def test_autonomy_state_credits_only_verified_autonomous_merges():
+    """10 raw autonomous merges but only 8 verified → NOT retirement-eligible."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    d = {
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 8,
+                "operator_action_count": 0,
+            }
+        ]
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 8
+    assert result["retirement_eligible"] is False
+
+
+def test_autonomy_state_ten_verified_autonomous_merges_eligible():
+    """10 verified autonomous merges → retirement-eligible."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    d = {
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 10,
+                "operator_action_count": 0,
+            }
+        ]
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 10
+    assert result["retirement_eligible"] is True
+
+
+def test_autonomy_state_aggregate_verified_autonomous_legacy_fallback():
+    """Aggregate with only total_autonomous_prs_merged falls back to it."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    d = {
+        "research_history": [],
+        "history_aggregate": {
+            "total_autonomous_prs_merged": 11,
+            "total_operator_actions": 0,
+        },
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 11
+    assert result["retirement_eligible"] is True
+
+
+def test_autonomy_state_aggregate_prefers_verified_autonomous():
+    """When present, total_verified_autonomous_prs_merged wins over the raw total."""
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    d = {
+        "research_history": [],
+        "history_aggregate": {
+            "total_verified_autonomous_prs_merged": 8,
+            "total_autonomous_prs_merged": 12,
+            "total_operator_actions": 0,
+        },
+    }
+    result = compute_direction_autonomy_state(d)
+    assert result["lifetime_autonomous_prs_merged"] == 8
+    assert result["retirement_eligible"] is False
+
+
+@pytest.mark.asyncio
+async def test_autonomy_state_excludes_degraded_autonomous_merges(
+    db_session: AsyncSession,
+):
+    """End-to-end: degraded autonomous merges count in autonomous_prs_merged but
+    NOT in verified_autonomous_prs_merged, so they do not advance retirement.
+
+    Also pins the milestone contrast: 10 partly-unverified autonomous merges are
+    NOT retirement-eligible while 10 fully-verified ones ARE.
+    """
+    from app.direction_outcomes import compute_direction_autonomy_state
+
+    direction_id = "d-verified-autonomy"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=5)
+    ]
+    await db_session.flush()
+
+    # 3 clean autonomous merges (verified) ...
+    for i in range(3):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            context={"pr_merged": True, "landed_on_integration": True},
+            title=f"clean-autonomous-{i}",
+        )
+    # ... and 2 degraded autonomous merges (env/setup failure blocked verification).
+    for i in range(2):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            context={
+                "pr_merged": True,
+                "landed_on_integration": True,
+                "review_loop": {"unverified_merge_reason": "verify_setup_failed"},
+            },
+            title=f"degraded-autonomous-{i}",
+        )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    direction = project.directions[0]
+    entry = direction["research_history"][0]
+    # All 5 merges are autonomous, but only the 3 clean ones are verified.
+    assert entry["autonomous_prs_merged"] == 5
+    assert entry["verified_autonomous_prs_merged"] == 3
+    # Subset invariants: verified-autonomous never exceeds autonomous or verified.
+    assert entry["verified_autonomous_prs_merged"] <= entry["autonomous_prs_merged"]
+    assert entry["verified_autonomous_prs_merged"] <= entry["verified_prs_merged"]
+    # The single source of truth credits only the 3 verified autonomous merges.
+    state = compute_direction_autonomy_state(direction)
+    assert state["lifetime_autonomous_prs_merged"] == 3
+    assert state["retirement_eligible"] is False
+
+    # Milestone contrast at the 10-merge threshold: raw count is not enough.
+    partly_unverified = {
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 8,
+                "operator_action_count": 0,
+            }
+        ]
+    }
+    assert (
+        compute_direction_autonomy_state(partly_unverified)["retirement_eligible"]
+        is False
+    )
+    fully_verified = {
+        "research_history": [
+            {
+                "autonomous_prs_merged": 10,
+                "verified_autonomous_prs_merged": 10,
+                "operator_action_count": 0,
+            }
+        ]
+    }
+    assert (
+        compute_direction_autonomy_state(fully_verified)["retirement_eligible"] is True
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5939,6 +6210,26 @@ def test_acceptance_metric_invariant_violations_detects_drift():
             "prs_merged": 0,
             "acceptance_declaration_coverage": 0.5,
         }
+    )
+    # verified-autonomous drifts above the raw autonomous count.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "autonomous_prs_merged": 1, "verified_autonomous_prs_merged": 2}
+    )
+    # verified-autonomous drifts above the verified count.
+    assert acceptance_metric_invariant_violations(
+        {
+            **clean,
+            "autonomous_prs_merged": 4,
+            "verified_autonomous_prs_merged": 3,
+            "verified_prs_merged": 2,
+        }
+    )
+    # A consistent verified-autonomous subset does not violate.
+    assert (
+        acceptance_metric_invariant_violations(
+            {**clean, "autonomous_prs_merged": 3, "verified_autonomous_prs_merged": 2}
+        )
+        == []
     )
 
 
