@@ -207,6 +207,12 @@ def _build_retired_directions_summary(
             }
             if mem_entry.get("reason"):
                 mem_result["retirement_reason"] = str(mem_entry["reason"])[:200]
+            # Surface the compact retirement outcome ("why it was retired / what
+            # landed" — rationale or a superseded-by successor pointer) so the
+            # agent sees what a retired direction actually shipped, not just its
+            # coarse reason category.
+            if mem_entry.get("outcome"):
+                mem_result["retirement_outcome"] = str(mem_entry["outcome"])[:200]
             results.append(mem_result)
             existing_ids.add(entry_id)
 

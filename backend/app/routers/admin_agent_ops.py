@@ -55,6 +55,7 @@ from app.source_ref_validation import (
     ground_design_doc_value,
     resolve_branch_verification_context as _resolve_branch_verification_context,
 )
+from app.direction_grounding import validate_create_direction_grounding
 from app.shared_state import (
     get_project_integration_branch as _get_project_integration_branch,
     limiter,
@@ -67,6 +68,7 @@ from app.strategic_completion import (
     _normalize_recommended_mode,
     _reset_scaffolding_state_on_outcome_change,
     _spawn_retirement_memos,
+    record_retired_direction_memory,
     STRATEGIC_CHALLENGE_CONTEXT_KEY,
     challenge_approves_retirement,
     spawn_budget_status,
@@ -92,6 +94,7 @@ from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
     with_directions_locked as _with_directions_locked,
+    with_vision_locked as _with_vision_locked,
 )
 from app.time_utils import _utcnow
 
@@ -1030,6 +1033,11 @@ async def strategic_operation(
                 dr["distinction"] = distinction[:_DIR_FIELD_MAX]
             if dr:
                 new_dir["context"]["dedup_reasoning"] = dr
+                new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
+                    dr,
+                    directions,
+                    (project.vision or {}).get("_recently_retired_directions") or [],
+                )
         if data.get("system_id"):
             new_dir["system_id"] = _cap_str(
                 data["system_id"], STRATEGIC_SYSTEM_ID_MAX, "system_id", warnings
@@ -1124,6 +1132,7 @@ async def strategic_operation(
             "status": "ok",
             "op": "create_direction",
             "direction_id": new_dir["id"],
+            "grounding_verdict": new_dir.get("context", {}).get("grounding_verdict"),
         }
         if staged_create:
             resp_body["staged_for_version"] = staged_for_version
@@ -1132,6 +1141,7 @@ async def strategic_operation(
     elif payload.op == "update_direction":
         dir_id = data.get("direction_id")
         changes = data.get("changes", {})
+        raw_dedup_reasoning = data.get("dedup_reasoning")
         if not dir_id or not changes:
             raise HTTPException(
                 status_code=400, detail="direction_id and changes required"
@@ -1153,6 +1163,11 @@ async def strategic_operation(
         # ``(new_gap_id, prior_gap_id)`` once a gap_id change is observed.
         _gap_reground: tuple[str | None, str | None] | None = None
         _pre_status: str | None = None
+        retired_memory = list((project.vision or {}).get("_recently_retired_directions") or [])
+        # Set to the terminal status ("expired"/"superseded") when this update
+        # flips the direction INTO a terminal state from a non-terminal one, so
+        # retired-direction memory is recorded exactly once after the loop.
+        _terminal_flip: str | None = None
         for d in directions:
             if d.get("id") == dir_id:
                 _pre_text = d.get("text")
@@ -1224,6 +1239,11 @@ async def strategic_operation(
                                 }
                         if superseded_by:
                             d["superseded_by"] = superseded_by
+                    if changes["status"] in (
+                        "expired",
+                        "superseded",
+                    ) and _pre_status not in ("expired", "superseded"):
+                        _terminal_flip = changes["status"]
                 if "recommended_mode" in changes:
                     mode = _normalize_recommended_mode(changes["recommended_mode"])
                     if mode is not None:
@@ -1312,6 +1332,21 @@ async def strategic_operation(
                     d["notes"] = _cap_list(
                         notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
                     )
+                if isinstance(raw_dedup_reasoning, dict):
+                    dr: dict = {}
+                    closest = raw_dedup_reasoning.get("closest_directions")
+                    if isinstance(closest, list):
+                        dr["closest_directions"] = closest[:3]
+                    distinction = str(raw_dedup_reasoning.get("distinction") or "").strip()
+                    if distinction:
+                        dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                    if dr:
+                        ctx = dict(d.get("context") or {})
+                        ctx["dedup_reasoning"] = dr
+                        ctx["grounding_verdict"] = validate_create_direction_grounding(
+                            dr, directions, retired_memory
+                        )
+                        d["context"] = ctx
                 if (
                     d.get("text") != _pre_text
                     or (d.get("context") or {}).get("success_evidence") != _pre_se
@@ -1358,6 +1393,33 @@ async def strategic_operation(
                     if _pm is not None:
                         project.problem_model = _pm
                         flag_modified(project, "problem_model")
+        # Record retired-direction memory when this update flipped the direction
+        # into a terminal state, in the SAME committed transaction (mirrors the
+        # retire_direction op). Only fires on a real non-terminal->terminal
+        # transition, so repeated updates or already-terminal directions record
+        # nothing.
+        if _terminal_flip and _updated_dir is not None:
+            if _terminal_flip == "superseded":
+                _term_reason = "strategic_superseded"
+                _sb = _updated_dir.get("superseded_by")
+                _succ = (
+                    _sb.get("direction_id") if isinstance(_sb, dict) else None
+                )
+                _term_outcome = f"superseded by {_succ}" if _succ else None
+            else:
+                _term_reason = "strategic_expired"
+                _term_outcome = rationale or None
+            _term_snapshot = dict(_updated_dir)
+
+            def _record_terminal_memory(vision: dict) -> None:
+                record_retired_direction_memory(
+                    vision,
+                    _term_snapshot,
+                    reason=_term_reason,
+                    outcome=_term_outcome,
+                )
+
+            await _with_vision_locked(session, project.id, _record_terminal_memory)
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1378,7 +1440,16 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Updated direction {dir_id}")
-        return _resp({"status": "ok", "op": "update_direction", "direction_id": dir_id})
+        return _resp(
+            {
+                "status": "ok",
+                "op": "update_direction",
+                "direction_id": dir_id,
+                "grounding_verdict": (_updated_dir.get("context") or {}).get(
+                    "grounding_verdict"
+                ),
+            }
+        )
 
     elif payload.op == "retire_direction":
         dir_id = data.get("direction_id")
@@ -1538,6 +1609,23 @@ async def strategic_operation(
             reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
 
         await with_problem_model_locked(session, project.id, _reconcile_pm)
+        # Record retired-direction memory in the SAME committed transaction so a
+        # strategist-retired direction blocks a same-gap / text-overlap re-spawn
+        # next cycle (mirrors the fallback retire path's deferred vision write).
+        # Only reached on a real commit — the challenge-gate deferral branch
+        # returns above without ever getting here.
+        _retire_snapshot = dict(matched_direction)
+        _retire_outcome = rationale or None
+
+        def _record_retire_memory(vision: dict) -> None:
+            record_retired_direction_memory(
+                vision,
+                _retire_snapshot,
+                reason="strategic_retire",
+                outcome=_retire_outcome,
+            )
+
+        await _with_vision_locked(session, project.id, _record_retire_memory)
         verdicts = list(ctx.get("_strategic_retirement_gate_verdicts", []))
         verdicts.append(gate_audit)
         retired_ids = list(ctx.get("_strategic_retired_ids", []))

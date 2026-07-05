@@ -1219,6 +1219,48 @@ class TestRecordRetiredDirectionMemory:
         assert "add" not in tokens
         assert "database" in tokens
 
+    def test_no_outcome_key_when_omitted(self):
+        # Backward compatibility: existing callers that omit outcome keep the
+        # previous entry shape (no 'outcome' key at all).
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        assert "outcome" not in vision["_recently_retired_directions"][0]
+
+    def test_records_bounded_outcome_when_provided(self):
+        from app.strategic_completion import _RETIRED_OUTCOME_CHAR_CAP
+
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        long_outcome = "x" * (_RETIRED_OUTCOME_CHAR_CAP + 50)
+        record_retired_direction_memory(
+            vision, d, reason="strategic_retire", outcome=long_outcome
+        )
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["outcome"] == "x" * _RETIRED_OUTCOME_CHAR_CAP
+        assert len(entry["outcome"]) == _RETIRED_OUTCOME_CHAR_CAP
+
+    def test_empty_or_whitespace_outcome_not_stored(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(
+            vision, d, reason="strategic_superseded", outcome="   "
+        )
+        assert "outcome" not in vision["_recently_retired_directions"][0]
+
+    def test_superseded_outcome_carries_successor_pointer(self):
+        vision: dict = {}
+        d = {"id": "d-1", "text": "cache layer optimization database"}
+        record_retired_direction_memory(
+            vision,
+            d,
+            reason="strategic_superseded",
+            outcome="superseded by d-successor",
+        )
+        entry = vision["_recently_retired_directions"][0]
+        assert entry["reason"] == "strategic_superseded"
+        assert entry["outcome"] == "superseded by d-successor"
+
 
 class TestCheckGapRespawnBlock:
     def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):
@@ -3944,7 +3986,16 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
         name="DR1",
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
-        directions=[],
+        directions=[
+            {
+                "id": "d-grounded",
+                "text": "Improve login flow",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            }
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -3972,7 +4023,7 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
                     "success_evidence": "All auth tests pass",
                     "retirement_condition": "OAuth2 flow live for 3 cycles",
                     "dedup_reasoning": {
-                        "closest_directions": ["Improve login flow", "Add SSO support"],
+                        "closest_directions": ["d-grounded", "Add SSO support"],
                         "distinction": "Targets the auth backend protocol, not the UI flow",
                     },
                 }
@@ -3987,8 +4038,12 @@ async def test_dedup_reasoning_persisted_on_successful_create_fallback_path(
     ctx = dirs[0].get("context") or {}
     dr = ctx.get("dedup_reasoning")
     assert dr is not None, "dedup_reasoning should be stored in context"
-    assert dr["closest_directions"] == ["Improve login flow", "Add SSO support"]
+    assert dr["closest_directions"] == ["d-grounded", "Add SSO support"]
     assert dr["distinction"] == "Targets the auth backend protocol, not the UI flow"
+    verdict = ctx.get("grounding_verdict")
+    assert verdict is not None
+    assert verdict["status"] == "validated"
+    assert verdict["live_direction_ids"] == ["d-grounded"]
 
 
 @pytest.mark.asyncio
@@ -6522,6 +6577,10 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
                     "direction_id": "d-legacy",
                     "successor_id": "d-successor",
                     "rationale": "replaced",
+                    "dedup_reasoning": {
+                        "closest_directions": ["d-legacy"],
+                        "distinction": "This is a status reviver, not a new direction",
+                    },
                     "changes": {"status": "superseded"},
                 },
             ],
@@ -6537,6 +6596,215 @@ async def test_strategic_completion_fallback_superseded_derives_superseded_by_fr
     assert sb is not None, "superseded_by must be derived from successor_id"
     assert sb.get("direction_id") == "d-successor"
     assert "set_at" in sb
+    verdict = (target.get("context") or {}).get("grounding_verdict")
+    assert verdict and verdict["status"] == "validated"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_to_superseded_records_retired_memory(
+    db_session, mocker
+):
+    """Fallback op=update flipping status->superseded records retired-direction memory.
+
+    The strategist-driven terminal-status write must queue a
+    _recently_retired_directions entry (reason=strategic_superseded, outcome
+    carrying the successor pointer) so a same-gap re-spawn is blocked next cycle.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="SUP-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-sup",
+                "text": "model gc garbage collection optimize performance",
+                "status": "active",
+                "priority": "medium",
+                "gap_id": "g-model-gc",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-sup",
+                    "rationale": "replaced by newer approach",
+                    "changes": {
+                        "status": "superseded",
+                        "superseded_by": {
+                            "direction_id": "d-new",
+                            "set_at": "2026-01-01T00:00:00",
+                        },
+                    },
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-sup"), None)
+    assert entry is not None, (
+        f"update->superseded must record retired memory; got {mem}"
+    )
+    assert entry["reason"] == "strategic_superseded"
+    assert entry.get("gap_id") == "g-model-gc"
+    assert entry.get("outcome") == "superseded by d-new"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_to_expired_records_retired_memory(db_session, mocker):
+    """Fallback op=update flipping status->expired records retired memory (reason+rationale)."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="EXP-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-exp",
+                "text": "cache layer optimization database query performance",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-exp",
+                    "rationale": "no longer relevant after refactor",
+                    "changes": {"status": "expired"},
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-exp"), None)
+    assert entry is not None, f"update->expired must record retired memory; got {mem}"
+    assert entry["reason"] == "strategic_expired"
+    assert entry.get("outcome") == "no longer relevant after refactor"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_non_terminal_records_no_retired_memory(
+    db_session, mocker
+):
+    """Fallback op=update that does NOT flip to a terminal status records no memory."""
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="NONTERM-MEM-FB",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-live",
+                "text": "keep improving the live direction",
+                "status": "active",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 2},
+            "direction_operations": [
+                {
+                    "op": "update",
+                    "direction_id": "d-live",
+                    "rationale": "bump priority",
+                    "changes": {"priority": "high"},
+                },
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-live" for m in mem), (
+        f"non-terminal update must NOT record retired memory; got {mem}"
+    )
 
 
 @pytest.mark.asyncio

@@ -3393,6 +3393,49 @@ def test_retired_directions_summary_includes_durable_memory_entries():
     assert "auth" in entry["text"]
 
 
+def test_retired_directions_summary_surfaces_outcome():
+    """The compact outcome ('why retired / what landed') is surfaced to the agent."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-sup",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "strategic_superseded",
+                    "outcome": "superseded by d-successor",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    assert entry["retirement_reason"] == "strategic_superseded"
+    assert entry["retirement_outcome"] == "superseded by d-successor"
+
+
+def test_retired_directions_summary_omits_outcome_when_absent():
+    """Entries without an outcome do not emit a retirement_outcome key."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-old",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    assert "retirement_outcome" not in result[0]
+
+
 def test_retired_directions_summary_deduplicates_live_and_memory():
     """A direction present in both the live list and durable memory is not duplicated."""
     project = _make_project(

@@ -24,6 +24,7 @@ from app.direction_metrics import (
     proof_weighted_merged,
 )
 from app.direction_outcomes import credit_gate_merged_count, verified_merged_count
+from app.direction_grounding import validate_create_direction_grounding
 
 # Stopword set reused so the spawn-title redundancy check matches the project's
 # established word-overlap semantics (same tokens ignored: articles,
@@ -3104,6 +3105,10 @@ def _find_matching_direction(
 
 _RETIRED_MEMORY_CAP = 30
 _RETIRED_TEXT_TOKEN_CAP = 20
+# Bounded char cap for the optional per-entry outcome blurb ("why it was
+# retired / what landed"). The list is shipped in the strategist payload, so
+# the outcome must stay compact — same spirit as the token cap above.
+_RETIRED_OUTCOME_CHAR_CAP = 200
 
 
 def record_retired_direction_memory(
@@ -3111,12 +3116,19 @@ def record_retired_direction_memory(
     direction: dict,
     *,
     reason: str,
+    outcome: str | None = None,
 ) -> None:
     """Add a compact entry to vision['_recently_retired_directions'].
 
     Called at every terminal-status write so the create_direction dedup check
     can block same-gap or text-overlap re-spawns even after direction pruning.
     Mutates vision in place; caller is responsible for flag_modified + session.add.
+
+    ``outcome`` is an OPTIONAL compact blurb capturing *why* the direction was
+    retired / *what* it shipped (e.g. the retirement rationale, or a
+    ``superseded by <id>`` successor pointer). It is bounded to
+    ``_RETIRED_OUTCOME_CHAR_CAP`` chars and only stored when non-empty, so
+    existing callers that omit it keep the previous entry shape unchanged.
     """
     text = direction.get("text") or ""
     tokens = list(
@@ -3131,6 +3143,10 @@ def record_retired_direction_memory(
     gap_id = direction.get("gap_id")
     if gap_id:
         entry["gap_id"] = str(gap_id)
+    if outcome:
+        _bounded = str(outcome).strip()[:_RETIRED_OUTCOME_CHAR_CAP]
+        if _bounded:
+            entry["outcome"] = _bounded
     existing = list(vision.get("_recently_retired_directions") or [])
     existing.append(entry)
     vision["_recently_retired_directions"] = existing[-_RETIRED_MEMORY_CAP:]
@@ -4493,6 +4509,11 @@ async def _handle_strategic_completion(
                         dr["distinction"] = distinction[:_DIR_FIELD_MAX]
                     if dr:
                         new_dir["context"]["dedup_reasoning"] = dr
+                        new_dir["context"]["grounding_verdict"] = validate_create_direction_grounding(
+                            dr,
+                            directions,
+                            _retired_memory,
+                        )
                 if op_entry.get("source"):
                     new_dir["source"] = str(op_entry["source"])[:64]
                 # Persist the direction→gap linkage (mirrors the API write path
@@ -4583,6 +4604,7 @@ async def _handle_strategic_completion(
             elif op == "update_direction":
                 dir_id = op_entry.get("direction_id")
                 changes = op_entry.get("changes", {})
+                raw_dedup_reasoning = op_entry.get("dedup_reasoning")
                 if not dir_id or not changes:
                     continue
                 blocked, why = challenge_rejects_portfolio_op(
@@ -4609,6 +4631,11 @@ async def _handle_strategic_completion(
                         # Prior gap_id captured before the change, for re-ground
                         # reconciliation (prune old gap, stage the new one).
                         _pre_gap_id_fb = d.get("gap_id")
+                        # Prior status, so a flip INTO a terminal state
+                        # (expired/superseded) records retired-direction memory
+                        # exactly once (and not on updates that were already
+                        # terminal).
+                        _pre_status_fb = d.get("status")
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -4658,6 +4685,9 @@ async def _handle_strategic_completion(
                                 d["system_id"] = sid_new[:STRATEGIC_SYSTEM_ID_MAX]
                             else:
                                 d["system_id"] = None
+                        retired_memory = list(
+                            (project.vision or {}).get("_recently_retired_directions") or []
+                        )
                         if "status" in changes and changes["status"] in (
                             "active",
                             "paused",
@@ -4675,6 +4705,7 @@ async def _handle_strategic_completion(
                                 )
                             else:
                                 d["status"] = changes["status"]
+                                superseded_by = None
                                 if changes["status"] == "superseded":
                                     d["completed_at"] = _utcnow().isoformat()
                                     superseded_by = changes.get("superseded_by")
@@ -4692,6 +4723,61 @@ async def _handle_strategic_completion(
                                             }
                                     if superseded_by:
                                         d["superseded_by"] = superseded_by
+                            # Record retired-direction memory when this update
+                            # flips the direction INTO a terminal state. Queue
+                            # into the deferred batch (flushed under the single
+                            # post-loop with_vision_locked pass) - do NOT write
+                            # vision inside the op loop. Guard on the prior
+                            # status so an update that was already terminal, or
+                            # that sets a non-terminal status, records nothing.
+                            if (
+                                changes["status"] in ("expired", "superseded")
+                                and _pre_status_fb
+                                not in ("expired", "superseded")
+                            ):
+                                if changes["status"] == "superseded":
+                                    _fb_term_reason = "strategic_superseded"
+                                    _fb_sb = d.get("superseded_by")
+                                    _fb_succ = (
+                                        _fb_sb.get("direction_id")
+                                        if isinstance(_fb_sb, dict)
+                                        else None
+                                    )
+                                    _fb_term_outcome = (
+                                        f"superseded by {_fb_succ}"
+                                        if _fb_succ
+                                        else None
+                                    )
+                                else:
+                                    _fb_term_reason = "strategic_expired"
+                                    _fb_term_outcome = rationale or None
+                                _pending_retire_memory.append(
+                                    {
+                                        "snapshot": dict(d),
+                                        "reason": _fb_term_reason,
+                                        "outcome": _fb_term_outcome,
+                                    }
+                                )
+                        _DIR_FIELD_MAX = 500
+                        if isinstance(raw_dedup_reasoning, dict):
+                            dr: dict = {}
+                            closest = raw_dedup_reasoning.get("closest_directions")
+                            if isinstance(closest, list):
+                                dr["closest_directions"] = closest[:3]
+                            distinction = str(
+                                raw_dedup_reasoning.get("distinction") or ""
+                            ).strip()
+                            if distinction:
+                                dr["distinction"] = distinction[:_DIR_FIELD_MAX]
+                            if dr:
+                                ctx = dict(d.get("context") or {})
+                                ctx["dedup_reasoning"] = dr
+                                ctx["grounding_verdict"] = validate_create_direction_grounding(
+                                    dr,
+                                    directions,
+                                    retired_memory,
+                                )
+                                d["context"] = ctx
                         if "category" in changes:
                             if changes["category"] in (
                                 "product",
@@ -4830,7 +4916,13 @@ async def _handle_strategic_completion(
                     if d.get("id") == dir_id:
                         d["status"] = "retired"
                         d["retired_at"] = _utcnow().isoformat()
-                        _pending_retire_memory.append(dict(d))
+                        _pending_retire_memory.append(
+                            {
+                                "snapshot": dict(d),
+                                "reason": "strategic_retire",
+                                "outcome": rationale or None,
+                            }
+                        )
                         if rationale:
                             notes = d.get("notes", [])
                             notes.append(
@@ -5138,7 +5230,12 @@ async def _handle_strategic_completion(
 
             def _apply_retire_memory(vision: dict) -> None:
                 for _rd in _retire_batch:
-                    record_retired_direction_memory(vision, _rd, reason="strategic_retire")
+                    record_retired_direction_memory(
+                        vision,
+                        _rd["snapshot"],
+                        reason=_rd["reason"],
+                        outcome=_rd.get("outcome"),
+                    )
 
             await with_vision_locked(session, task.project_id, _apply_retire_memory)
 

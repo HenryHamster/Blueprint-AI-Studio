@@ -18741,6 +18741,461 @@ async def test_strategic_api_output_update_events_include_live_linkage(
     assert emit.await_args_list[2].kwargs["running_update_changed"] is True
 
 
+async def _make_strategic_retire_task(
+    db_session, *, name, vm, direction_id, context=None, gap_id=None
+):
+    """Build a project + strategic_review task with one active direction."""
+    from app import strategic_cycle
+
+    direction = {
+        "id": direction_id,
+        "text": "model gc garbage collection optimize performance",
+        "status": "active",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+    }
+    if gap_id:
+        direction["gap_id"] = gap_id
+    project = Project(
+        name=name,
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id, **(context or {})},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_records_retired_memory(
+    client: AsyncClient, db_session, mocker
+):
+    """API retire_direction records a _recently_retired_directions memory entry.
+
+    The strategist-driven retire path must write cross-cycle dedup memory (with
+    a descriptive reason and the retire rationale as the outcome) so the same
+    gap cannot be immediately re-staffed next cycle.
+    """
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="RetireMemory",
+        vm="vm-retire-mem",
+        direction_id="d-retire-mem",
+        gap_id="g-model-gc",
+    )
+    token = create_agent_token(
+        str(task.id), "vm-retire-mem", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "retire_direction",
+            "data": {
+                "direction_id": "d-retire-mem",
+                "rationale": "lane is complete, evidence shipped",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"
+
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-retire-mem"), None)
+    assert entry is not None, f"retire must record retired memory; got {mem}"
+    assert entry["reason"] == "strategic_retire"
+    assert entry.get("gap_id") == "g-model-gc"
+    assert entry.get("outcome") == "lane is complete, evidence shipped"
+
+
+@pytest.mark.asyncio
+async def test_retire_direction_deferral_does_not_record_retired_memory(
+    client: AsyncClient, db_session, mocker
+):
+    """The challenge-gate DEFERRAL branch must NOT record retired memory.
+
+    In enforce mode with a rejected retirement challenge the retire is deferred
+    (direction stays active), so no _recently_retired_directions entry is written.
+    """
+    from app.auth import create_agent_token
+    from app.shared_state import runtime_config
+    from app.strategic_completion import (
+        STRATEGIC_CHALLENGE_CONTEXT_KEY,
+        STRATEGIC_CHALLENGE_RECORD_VERSION,
+        sanitize_strategic_challenge_record,
+    )
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    rejected_challenge = sanitize_strategic_challenge_record(
+        {
+            "version": STRATEGIC_CHALLENGE_RECORD_VERSION,
+            "status": "ok",
+            "portfolio_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-defer-mem",
+                    "verdict": "approved",
+                }
+            ],
+            "retirement_approvals": [
+                {
+                    "direction_id": "d-defer-mem",
+                    "verdict": "rejected",
+                    "rationale": "shallow and unsupported",
+                }
+            ],
+        }
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="RetireDeferNoMemory",
+        vm="vm-defer-mem",
+        direction_id="d-defer-mem",
+        context={STRATEGIC_CHALLENGE_CONTEXT_KEY: rejected_challenge},
+    )
+    token = create_agent_token(
+        str(task.id), "vm-defer-mem", task_type="strategic_review"
+    )
+    _prev_mode = runtime_config.get("strategic_retirement_challenge_gate_mode")
+    try:
+        runtime_config["strategic_retirement_challenge_gate_mode"] = "enforce"
+        resp = await client.post(
+            "/api/agent/strategic",
+            json={
+                "task_id": str(task.id),
+                "op": "retire_direction",
+                "data": {"direction_id": "d-defer-mem", "rationale": "kill it"},
+            },
+            headers={"x-agent-token": token},
+        )
+    finally:
+        if _prev_mode is None:
+            runtime_config.pop("strategic_retirement_challenge_gate_mode", None)
+        else:
+            runtime_config["strategic_retirement_challenge_gate_mode"] = _prev_mode
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "deferred"
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-defer-mem"
+    )
+    assert target["status"] == "active"
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-defer-mem" for m in mem), (
+        f"deferral branch must NOT record retired memory; got {mem}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_update_direction_expired_records_retired_memory(
+    client: AsyncClient, db_session, mocker
+):
+    """API update_direction flipping status->expired records retired memory."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="UpdateExpiredMemory",
+        vm="vm-upd-exp",
+        direction_id="d-upd-exp",
+        gap_id="g-model-gc",
+    )
+    token = create_agent_token(str(task.id), "vm-upd-exp", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-upd-exp",
+                "rationale": "superseded by refactor lane",
+                "changes": {"status": "expired"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-upd-exp"), None)
+    assert entry is not None, f"update->expired must record memory; got {mem}"
+    assert entry["reason"] == "strategic_expired"
+    assert entry.get("gap_id") == "g-model-gc"
+    assert entry.get("outcome") == "superseded by refactor lane"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_superseded_records_retired_memory(
+    client: AsyncClient, db_session, mocker
+):
+    """API update_direction flipping status->superseded records memory with successor."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="UpdateSupersededMemory",
+        vm="vm-upd-sup",
+        direction_id="d-upd-sup",
+    )
+    token = create_agent_token(str(task.id), "vm-upd-sup", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-upd-sup",
+                "rationale": "replaced",
+                "changes": {
+                    "status": "superseded",
+                    "superseded_by": {
+                        "direction_id": "d-successor",
+                        "set_at": "2026-01-01T00:00:00",
+                    },
+                },
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    entry = next((m for m in mem if m.get("id") == "d-upd-sup"), None)
+    assert entry is not None, f"update->superseded must record memory; got {mem}"
+    assert entry["reason"] == "strategic_superseded"
+    assert entry.get("outcome") == "superseded by d-successor"
+
+
+@pytest.mark.asyncio
+async def test_update_direction_non_terminal_records_no_retired_memory(
+    client: AsyncClient, db_session, mocker
+):
+    """API update_direction that does NOT flip to terminal records no memory."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_retire_task(
+        db_session,
+        name="UpdateNonTerminalMemory",
+        vm="vm-upd-live",
+        direction_id="d-upd-live",
+    )
+    token = create_agent_token(
+        str(task.id), "vm-upd-live", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-upd-live",
+                "rationale": "raise priority",
+                "changes": {"priority": "high"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    await db_session.refresh(project)
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(m.get("id") == "d-upd-live" for m in mem), (
+        f"non-terminal update must NOT record memory; got {mem}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_direction_grounding_verdict_in_op_result(client: AsyncClient, db_session):
+    from app.auth import create_agent_token
+
+    project = Project(
+        name="Strategic Grounding",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": [
+                {
+                    "id": "d-retired-1",
+                    "text_tokens": ["billing", "webhooks", "stabilize", "retries"],
+                    "retired_at": "2026-07-05T00:00:00+00:00",
+                    "reason": "strategic_retire",
+                }
+            ],
+        },
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-strategic-grounding",
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-strategic-grounding", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "create_direction",
+            "data": {
+                "text": "Stabilize billing webhooks",
+                "priority": "high",
+                "success_evidence": "Webhook retries are verified",
+                "retirement_condition": "No open webhook incidents",
+                "dedup_reasoning": {
+                    "closest_directions": ["d-retired-1"],
+                    "distinction": "This one hardens retries rather than changing scope",
+                },
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    verdict = body["grounding_verdict"]
+    assert verdict["status"] == "validated"
+    assert verdict["retired_direction_ids"] == ["d-retired-1"]
+
+
+@pytest.mark.asyncio
+async def test_update_direction_revival_attaches_prior_outcome(client: AsyncClient, db_session):
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="Strategic Revival",
+        user_id=TEST_USER_ID,
+        vision={
+            "purpose": "test",
+            "revision": 1,
+            "_recently_retired_directions": [
+                {
+                    "id": "d-retired-1",
+                    "text_tokens": ["billing", "webhooks", "stabilize", "retries"],
+                    "retired_at": "2026-07-05T00:00:00+00:00",
+                    "reason": "strategic_retire",
+                }
+            ],
+        },
+        problem_model={
+            "gaps": [
+                {"id": "g-old", "name": "Old gap", "status": "active"},
+                {"id": "g-open", "name": "Open gap", "status": "active"},
+            ]
+        },
+        directions=[
+            {
+                "id": "d-revive",
+                "text": "Retired billing webhooks work",
+                "status": "expired",
+                "priority": "medium",
+                "gap_id": "g-old",
+                "notes": [],
+                "research_history": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-update-revival",
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-update-revival", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-revive",
+                "dedup_reasoning": {
+                    "closest_directions": ["d-retired-1"],
+                    "distinction": "This revives the prior work on a new gap",
+                },
+                "changes": {
+                    "status": "active",
+                    "gap_id": "g-open",
+                    "text": "Revived billing webhook stabilizer",
+                },
+            },
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    verdict = body["grounding_verdict"]
+    assert verdict["status"] == "validated"
+    assert verdict["retired_direction_ids"] == ["d-retired-1"]
+
+    await db_session.refresh(project)
+    revived = next(d for d in project.directions if d.get("id") == "d-revive")
+    assert revived["status"] == "active"
+    assert revived["gap_id"] == "g-open"
+    assert (revived.get("context") or {}).get("grounding_verdict") == verdict
+
+
 @pytest.mark.asyncio
 async def test_strategic_create_message_rejects_oversized_context(
     client: AsyncClient, db_session
