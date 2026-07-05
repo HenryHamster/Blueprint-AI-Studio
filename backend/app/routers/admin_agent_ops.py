@@ -111,6 +111,21 @@ router = APIRouter()
 
 logger = logging.getLogger(__name__)
 
+# Keys in project.design_doc that are owned by the playbook system or reserved
+# for internal orchestration. These are excluded from design-doc list responses
+# and rejected by set/delete operations (use /api/agent/playbook instead).
+_RESERVED_DESIGN_DOC_KEYS = frozenset(
+    {
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    }
+)
+
 # Mixed surface marker: this module deliberately hosts both /api/admin and
 # /api/agent routes. The route-table invariant in backend/testing/test_invariants.py
 # uses this marker to include the sibling /api/agent endpoints in the same
@@ -188,7 +203,15 @@ async def update_design_doc(
     if payload.op == "list":
         project = await session.get(Project, task.project_id)
         doc = project.design_doc or {} if project else {}
-        return {"keys": [k for k in doc if not k.startswith("_")]}
+        return {
+            "keys": [
+                k
+                for k in doc
+                if not k.startswith("_")
+                and not k.startswith("playbook/")
+                and k not in _RESERVED_DESIGN_DOC_KEYS
+            ]
+        }
 
     if payload.op == "get":
         project = await session.get(Project, task.project_id)
@@ -220,6 +243,11 @@ async def update_design_doc(
     if not key or len(key) > 100 or key.startswith("_"):
         raise HTTPException(
             status_code=400, detail="Invalid key (max 100 chars, no _ prefix)"
+        )
+    if key.startswith("playbook/") or key in _RESERVED_DESIGN_DOC_KEYS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Key '{key}' is reserved. Use the /api/agent/playbook endpoint for playbook/* keys.",
         )
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)

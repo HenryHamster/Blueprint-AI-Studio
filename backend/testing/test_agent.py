@@ -24932,3 +24932,143 @@ async def test_sr_analytics_sibling_isolation_after_rollback(
         assert isinstance(fp, dict), (
             f"first_payload is not a dict after sibling rollback: {type(fp)}"
         )
+
+
+@pytest.mark.asyncio
+async def test_design_doc_playbook_and_reserved_keys_protected(
+    client: AsyncClient, db_session
+):
+    """playbook/* and reserved keys are excluded from list and rejected by set/delete."""
+    project = Project(
+        name="Design Doc Reserved Key Test",
+        user_id="test-user-123",
+        design_doc={
+            "normal-key": "visible",
+            "playbook/lint-rules": "hidden",
+            "playbook_archive": [],
+            "proposed_changes": {},
+            "lane_baselines": {},
+            "module_feedback": {},
+            "sr_catch_rate_trends": {},
+            "efficiency_baseline": {},
+            "retired_diagnoses_archive": [],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "design_doc_update"}],
+        vm_instance_id="agent-vm-reserved-keys",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-reserved-keys", task_type="design_doc_update"
+    )
+    headers = {"x-agent-token": token}
+
+    # list must omit playbook/* and all reserved keys
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "list"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    keys = resp.json()["keys"]
+    assert "normal-key" in keys
+    assert "playbook/lint-rules" not in keys
+    for reserved in (
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    ):
+        assert reserved not in keys, f"Reserved key '{reserved}' must not appear in list"
+
+    # set on a playbook/* key must return 400
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "playbook/some-entry",
+            "value": "oops",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "playbook" in resp.json()["error"]["message"].lower()
+
+    # delete on a playbook/* key must return 400
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "delete",
+            "key": "playbook/lint-rules",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 400
+    assert "playbook" in resp.json()["error"]["message"].lower()
+
+    # set/delete on each exact reserved key must return 400
+    for reserved in (
+        "playbook_archive",
+        "proposed_changes",
+        "lane_baselines",
+        "module_feedback",
+        "sr_catch_rate_trends",
+        "efficiency_baseline",
+        "retired_diagnoses_archive",
+    ):
+        r_set = await client.post(
+            "/api/agent/design-doc",
+            json={
+                "task_id": str(task.id),
+                "op": "set",
+                "key": reserved,
+                "value": "nope",
+            },
+            headers=headers,
+        )
+        assert r_set.status_code == 400, (
+            f"Expected 400 for set on reserved key '{reserved}', got {r_set.status_code}"
+        )
+        r_del = await client.post(
+            "/api/agent/design-doc",
+            json={"task_id": str(task.id), "op": "delete", "key": reserved},
+            headers=headers,
+        )
+        assert r_del.status_code == 400, (
+            f"Expected 400 for delete on reserved key '{reserved}', got {r_del.status_code}"
+        )
+
+    # normal keys are unaffected
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={
+            "task_id": str(task.id),
+            "op": "set",
+            "key": "normal-key",
+            "value": "updated",
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 200
+
+    resp = await client.post(
+        "/api/agent/design-doc",
+        json={"task_id": str(task.id), "op": "delete", "key": "normal-key"},
+        headers=headers,
+    )
+    assert resp.status_code == 200
