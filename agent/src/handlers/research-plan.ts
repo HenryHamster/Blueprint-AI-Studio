@@ -45,7 +45,7 @@ import { renderDirection } from './direction-renderer.js';
 import {
   writeFetchHelper, buildFetchGuidance, RESEARCH_FETCH_VERBS, PLAN_FETCH_VERBS,
 } from './strategic-helpers.js';
-import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
+import { fetchPriorKnowledge, buildPriorKnowledgeSection, filterKnowledgeDuplicates } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import { resolveBuildConfig } from '../build-config.js';
 import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
@@ -389,6 +389,17 @@ export function buildScopeCalibrationSignal(history: Array<Record<string, unknow
 
   if (!line1 && !line2 && !line3 && !line4 && !line5 && !line6 && !line7 && !priorFailuresLine) return '';
   return line1 + line2 + line3 + line4 + line5 + line6 + line7 + priorFailuresLine;
+}
+
+function buildPromptSizeTelemetry(sections: Array<[string, string]>): Record<string, unknown> {
+  const sized = sections
+    .map(([name, text]) => ({ name, bytes: Buffer.byteLength(text, 'utf8') }))
+    .sort((a, b) => b.bytes - a.bytes);
+  return {
+    prompt_section_count: sized.length,
+    prompt_size_bytes: sized.reduce((sum, section) => sum + section.bytes, 0),
+    prompt_section_sizes: sized.slice(0, 3),
+  };
 }
 
 /**
@@ -1821,7 +1832,6 @@ export async function handlePlan(
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
   if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
   const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   const contextPrefix = buildContextPrefix(task);
 
@@ -1934,6 +1944,18 @@ Rules:
 - ALSO write /tmp/plan_progress_${taskId}.md ${READ_ONLY_BASH_WRITE_NOTE} — a concise markdown summary (under ~3000 chars) of your decomposition: which areas of the codebase you explored, the rationale for how you split the work, the file targets and key constraints per subtask, and any risks or open questions. This artifact is surfaced to retry agents if this task fails, so they can pick up without re-investigating.${planPromptSuffix}${planFirstTaskSection}${PLAYBOOK_GUIDANCE}
 
 ${planFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const planPromptTelemetry = buildPromptSizeTelemetry([
+    ['playbook', planPlaybookSection],
+    ['retry_context', planRetryContext],
+    ['context_prefix', contextPrefix],
+    ['cochange_hints', cochangeHintsSection],
+    ['decomposition_outcomes', decompositionOutcomesSection],
+    ['claude_md_prefix', claudeMdPrefix],
+    ['available_capabilities', planAvailableCapabilitiesSection],
+    ['greenfield', greenfieldBranch],
+    ['prompt_body', planPrompt],
+  ]);
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, ...planPromptTelemetry });
 
   statusRef.value = `Running ${getProviderRunner().displayName} for planning...`;
   const { exitCode, allOutput, lastResultText } = await runClaudeCode(planPrompt, ws, statusRef, model, effort, disallowedTools);
@@ -2042,7 +2064,6 @@ export async function handleResearch(
   const setPromptFingerprint = (indexMod as { setCurrentPromptFingerprint?: (fp: string) => void }).setCurrentPromptFingerprint;
   if (setPromptFingerprint) setPromptFingerprint(promptFingerprint);
   const sendHeartbeat = (indexMod as { sendHeartbeatSync?: (taskId: string, status: string, extra?: Record<string, unknown>) => void }).sendHeartbeatSync;
-  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint });
 
   let gitLogOutput = '';
   let gitDiffStatOutput = '';
@@ -2127,7 +2148,16 @@ export async function handleResearch(
   const currentDirectionText = directions.length > 0
     ? strVal((directions.find(d => d.id === currentDirectionId) ?? directions[0]).text)
     : '';
-  const priorDocs = await fetchPriorKnowledge(userPrompt || currentDirectionText);
+  const knowledgeIndexForFilter = Array.isArray(payload.knowledge_index)
+    ? (payload.knowledge_index as Array<Record<string, unknown>>)
+    : [];
+  const knownKnowledgeIds = new Set<string>(
+    knowledgeIndexForFilter.map(e => strVal(e.id)).filter(Boolean),
+  );
+  const priorDocs = filterKnowledgeDuplicates(
+    await fetchPriorKnowledge(userPrompt || currentDirectionText),
+    knownKnowledgeIds,
+  );
   if (priorDocs.length > 0) {
     sendLog(ws, `Injecting ${priorDocs.length} prior knowledge document(s) into the research prompt\n`);
   }
@@ -2624,8 +2654,29 @@ Routing: large scope → plan agent (decomposition), medium → create agent (si
 - Optional: /tmp/research_insights_${taskId}.json ${READ_ONLY_BASH_WRITE_NOTE} with [{"summary": "<200 chars", "area": "path"}] for observations not worth implementing.`;
 
   const researchPromptSuffix = payload.prompt_suffix ? `\n\nAdditional instructions:\n${strVal(payload.prompt_suffix)}` : '';
+  const researchPromptFull = researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`;
+  const researchPromptTelemetry = buildPromptSizeTelemetry([
+    ['context_prefix', contextPrefix],
+    ['playbook', researchPlaybookSection],
+    ['retry_context', researchRetryContext],
+    ['codebase_instructions', codebaseSummary],
+    ['file_tree', fileTreeSection],
+    ['git_history', gitHistorySection],
+    ['design_doc_highlight', designDocHighlight],
+    ['design_doc', designDocSection],
+    ['system_verification', systemVerificationSection],
+    ['capability_verification', capabilityVerificationSection],
+    ['available_capabilities', researchAvailableCapabilitiesSection],
+    ['directions', directionsText],
+    ['cross_direction', crossDirSection],
+    ['prior_knowledge', priorKnowledgeSection],
+    ['pipeline_scope_rates', pipelineScopeRatesSection],
+    ['anomaly', anomalySection],
+    ['prompt_body', researchPromptFull],
+  ]);
+  if (sendHeartbeat) sendHeartbeat(taskId, statusRef.value, { prompt_fingerprint: promptFingerprint, ...researchPromptTelemetry });
   statusRef.value = 'Running codebase research...';
-  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPrompt + researchPromptSuffix + researchFirstTaskSection + PLAYBOOK_GUIDANCE + '\nNote: If your research uncovered operational knowledge (build patterns, module relationships, common failure modes), save the most reusable findings to the playbook.\n' + `\n\n${researchFetchGuidance}${DEFAULT_TOOL_GUIDANCE}`, ws, statusRef, model, effort, disallowedTools);
+  const { exitCode, allOutput, lastResultText } = await runClaudeCode(researchPromptFull, ws, statusRef, model, effort, disallowedTools);
 
   // Prefer reading findings from /tmp/ file (avoids output truncation), fall back to output parsing
   const researchFindings = readHandlerOutput(taskId, 'research_findings', ws);

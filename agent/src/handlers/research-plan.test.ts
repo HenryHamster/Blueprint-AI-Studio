@@ -4336,4 +4336,23 @@ describe('research/plan prompt byte-budget ratchet', () => {
     const bytes = Buffer.byteLength(prompt, 'utf8');
     expect(bytes, `research prompt grew to ${bytes} bytes (ceiling: ${RESEARCH_PROMPT_BYTE_CEILING}). Bump RESEARCH_PROMPT_BYTE_CEILING in research-plan.test.ts if this is intentional.`).toBeLessThan(RESEARCH_PROMPT_BYTE_CEILING);
   });
+
+  it('records prompt size telemetry in the startup heartbeat for plan and research', async () => {
+    await handlePlan(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+    await handleResearch(RB_TASK_ID, RB_PAYLOAD, RB_TASK, RB_GH_TOKEN, RB_OWNER, RB_REPO, RB_WS, RB_STATUS_REF());
+
+    const asTelemetry = (value: unknown) => value as {
+      prompt_size_bytes: number;
+      prompt_section_count: number;
+      prompt_section_sizes: Array<{ name: string; bytes: number }>;
+    };
+    const firstTelemetry = asTelemetry(vi.mocked(mockedIndexModule.sendHeartbeatSync).mock.calls[0]?.[2]);
+    const secondTelemetry = asTelemetry(vi.mocked(mockedIndexModule.sendHeartbeatSync).mock.calls[1]?.[2]);
+    expect(firstTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(firstTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(firstTelemetry.prompt_section_sizes[0].name).toBe('prompt_body');
+    expect(secondTelemetry.prompt_size_bytes).toBeGreaterThan(0);
+    expect(secondTelemetry.prompt_section_count).toBeGreaterThan(0);
+    expect(secondTelemetry.prompt_section_sizes[0].name).toBe('prompt_body');
+  });
 });

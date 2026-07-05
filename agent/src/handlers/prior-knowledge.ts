@@ -169,6 +169,16 @@ ${entries.join('\n')}
 `;
 }
 
+// Drop prior-knowledge docs whose id already appears in a caller-supplied set.
+// Used to prevent the same document appearing twice — once in the payload-built
+// `## Existing knowledge documents` index and again in `## Prior Knowledge`.
+// Pure function: never modifies `docs` in place. Returns all docs when
+// `knownIds` is empty so the no-payload-index case is a zero-cost no-op.
+export function filterKnowledgeDuplicates(docs: PriorKnowledgeDoc[], knownIds: Set<string>): PriorKnowledgeDoc[] {
+  if (knownIds.size === 0) return docs;
+  return docs.filter(d => !knownIds.has(d.id));
+}
+
 // Build a clearly delimited `## Prior Knowledge` section listing each retrieved
 // document's title, summary, and id, with an explicit instruction to build on /
 // extend / supersede the prior knowledge and cite the relevant document ids

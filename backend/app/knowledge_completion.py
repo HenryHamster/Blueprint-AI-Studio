@@ -2830,14 +2830,24 @@ def _build_research_audit_document(
     base_tags = [str(t) for t in raw_tags[:28]] if isinstance(raw_tags, list) else []
     tags = list(dict.fromkeys([*base_tags, "research_audit"]))[:30]
 
-    title_parts = [f"Research audit: {str(topic)[:200]}"]
-    title = title_parts[0][:500]
+    _FALLBACK_TOPIC = "Research audit"
+    topic_str = str(topic)[:200]
+    if topic_str == _FALLBACK_TOPIC:
+        title = _FALLBACK_TOPIC
+    else:
+        title = f"Research audit: {topic_str}"[:500]
 
     summary_parts: list[str] = []
     if findings:
-        summary_parts.append(f"{len(findings)} finding(s) recorded.")
+        n = len(findings)
+        leading_titles = [
+            str(f.get("title") or f"Finding {i + 1}").strip()[:80]
+            for i, f in enumerate(findings[:3])
+        ]
+        title_text = "; ".join(leading_titles)
+        summary_parts.append(f"{n} finding(s): {title_text}.")
     if insights:
-        summary_parts.append(f"{len(insights)} insight(s) recorded.")
+        summary_parts.append(f"{len(insights)} insight(s).")
     summary = " ".join(summary_parts) or "Research audit report."
 
     body_lines = [f"# Research audit: {topic}", ""]

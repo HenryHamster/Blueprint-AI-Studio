@@ -4035,3 +4035,102 @@ async def test_compute_sweep_groups_expose_existing_disposition_state(db_session
     assert "sweep_disposition" not in first_b, (
         "sweep_b must not have sweep_disposition when no disposition task exists"
     )
+
+
+# ── _build_research_audit_document: summary signal + title deduplication ─────
+
+
+class TestBuildResearchAuditDocument:
+    """Unit tests for _build_research_audit_document (pure function, no DB)."""
+
+    def _make_task_with_topic(self, topic=None):
+        from testing.factories import make_task
+
+        payloads = [{"type": "research"}]
+        if topic:
+            payloads = [{"type": "research", "topic": topic}]
+        return make_task(
+            project_id=uuid.uuid4(),
+            title="Research task",
+            payloads=payloads,
+        )
+
+    def test_research_audit_summary_carries_signal(self):
+        """Summary includes leading finding titles, not just a bare count."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("context efficiency")
+        findings = [
+            {"title": "TypeScript migration gap", "description": "desc 1"},
+            {"title": "Missing error boundaries", "description": "desc 2"},
+            {"title": "Stale test fixtures", "description": "desc 3"},
+        ]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert "TypeScript migration gap" in doc["summary"]
+        assert "Missing error boundaries" in doc["summary"]
+        # Should NOT be just a bare count like "3 finding(s) recorded."
+        assert "finding(s) recorded" not in doc["summary"]
+        # Should include the count
+        assert "3" in doc["summary"]
+
+    def test_research_audit_title_no_redundant_prefix(self):
+        """When topic falls back to 'Research audit', title is not 'Research audit: Research audit'."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        # No topic in payload, no direction title — falls back to "Research audit"
+        task = self._make_task_with_topic(topic=None)
+        findings = [{"title": "Some finding", "description": "d"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        # Title must NOT be the redundant double form
+        assert doc["title"] != "Research audit: Research audit"
+        # Title should be the clean fallback
+        assert doc["title"] == "Research audit"
+
+    def test_research_audit_title_with_real_topic(self):
+        """When a real topic is present, the 'Research audit: <topic>' prefix is used."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("context efficiency cuts")
+        findings = [{"title": "Finding A", "description": "d"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert doc["title"] == "Research audit: context efficiency cuts"
+
+    def test_research_audit_summary_fallback_with_no_findings_but_insights(self):
+        """When there are only insights (no findings), the summary still carries signal."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("some topic")
+        insights = [
+            {"summary": "First insight text."},
+            {"summary": "Second insight text."},
+        ]
+        doc = _build_research_audit_document(task, [], insights, None)
+
+        assert doc is not None
+        assert "insight(s)" in doc["summary"]
+        assert "2" in doc["summary"]
+
+    def test_research_audit_summary_single_finding_title(self):
+        """With a single finding, summary contains just that title."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("perf")
+        findings = [{"title": "Cache miss on hot path"}]
+        doc = _build_research_audit_document(task, findings, [], None)
+
+        assert doc is not None
+        assert "Cache miss on hot path" in doc["summary"]
+        assert "1" in doc["summary"]
+
+    def test_research_audit_returns_none_when_empty(self):
+        """Empty findings and insights yield None (no document to persist)."""
+        from app.knowledge_completion import _build_research_audit_document
+
+        task = self._make_task_with_topic("topic")
+        assert _build_research_audit_document(task, [], [], None) is None
