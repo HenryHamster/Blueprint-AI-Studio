@@ -546,7 +546,11 @@ async def _reconcile_if_criterion_coverage_now_complete(
     Returns True iff a new qualification was spawned.
     """
     from app import github, release_qualifier
-    from app.acceptance_criteria import get_version_coverage_summary
+    from app.acceptance_criteria import (
+        backfill_direction_merge_evidence,
+        get_version_coverage_summary,
+    )
+    from app.models import Direction
 
     factory = session_factory or AsyncSessionLocal
     async with factory() as session:
@@ -571,6 +575,56 @@ async def _reconcile_if_criterion_coverage_now_complete(
             coverage = await get_version_coverage_summary(session, version.id)
             total = int(coverage.get("total") or 0)
             covered = int(coverage.get("covered") or 0)
+
+            if total > 0 and covered < total:
+                # Before giving up, attempt to backfill merge evidence for any
+                # uncovered criteria that have an active direction mapping.  Tasks
+                # that merged before the criterion-direction mapping was created
+                # were never given a chance to record evidence; replaying them here
+                # lets the gate re-evaluate on fresher data without requiring a
+                # human to call the manual reconcile-backfill endpoint.
+                uncovered_with_mapping = [
+                    c["criterion_key"]
+                    for c in coverage.get("criteria", [])
+                    if c.get("coverage") == "uncovered"
+                    and c.get("status") == "active"
+                    and c.get("stuck_reason") is None
+                ]
+                if uncovered_with_mapping:
+                    result = await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == version.project_id,
+                            Direction.status.notin_(
+                                ["expired", "retired", "superseded", "completed"]
+                            ),
+                        )
+                    )
+                    active_directions = list(result.scalars().all())
+                    keys_to_backfill: set[str] = set()
+                    for direction in active_directions:
+                        dkeys = set(direction.criterion_keys or [])
+                        if dkeys & set(uncovered_with_mapping):
+                            keys_to_backfill.add(direction.direction_key)
+                    for dk in keys_to_backfill:
+                        await backfill_direction_merge_evidence(
+                            session, version.project_id, dk
+                        )
+                    if keys_to_backfill:
+                        coverage = await get_version_coverage_summary(
+                            session, version.id
+                        )
+                        total = int(coverage.get("total") or 0)
+                        covered = int(coverage.get("covered") or 0)
+                        logger.info(
+                            "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                            "backfilled evidence for %d direction(s) on v%d "
+                            "(total=%d covered=%d after backfill)",
+                            len(keys_to_backfill),
+                            version.version_number,
+                            total,
+                            covered,
+                        )
+
             if not (total == 0 or covered >= total):
                 return False
 

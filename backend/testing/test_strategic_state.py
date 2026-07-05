@@ -6724,3 +6724,58 @@ async def test_operator_attention_surfaces_stuck_criteria_direction_retired(
     assert item["severity"] == "needs_operator"
     assert "retired" in item["detail"]
     assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"
+
+
+@pytest.mark.asyncio
+async def test_coverage_blocked_version_without_stuck_criteria_raises_attention(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion mapped to an active direction raises coverage_blocked attention."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion_key = "c-cov-blocked-01"
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        text="Feature X fully shipped",
+        status="active",
+    )
+    # Map the criterion to an active direction (stuck_reason will be None).
+    active_direction = Direction(
+        project_id=project.id,
+        direction_key="d-active-for-cov",
+        status="active",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add_all([criterion, active_direction])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    # coverage_blocked should be counted and surfaced as needs_operator
+    assert attention["counts"]["coverage_blocked"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    # stuck_criteria must NOT fire for this criterion (it has an active mapping)
+    assert attention["counts"]["stuck_criteria"] == 0
+
+    coverage_blocked_items = [
+        item for item in attention["items"] if item["reason"] == "coverage_blocked"
+    ]
+    assert len(coverage_blocked_items) == 1
+    cb_item = coverage_blocked_items[0]
+    assert cb_item["severity"] == "needs_operator"
+    assert "active" in cb_item["detail"]
+    assert cb_item["lifecycle"]["operator_action"] == "monitor_active_direction_progress"

@@ -171,6 +171,7 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
             : c.stuck_reason === 'direction_retired'
               ? 'direction retired'
               : null;
+          const isInProgress = status === 'active' && c.coverage === 'uncovered' && stuckLabel == null;
           return (
             <li
               key={c.criterion_key}
@@ -194,6 +195,11 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
                   {stuckLabel}
                 </span>
               )}
+              {isInProgress && (
+                <span className="shrink-0 text-ui-sm text-slate-400 ml-1" data-testid={`in-progress-${c.criterion_key}`} title="Active direction is working on this criterion">
+                  in progress
+                </span>
+              )}
               {c.evidence_count > 0 && (
                 <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
               )}
@@ -213,6 +219,15 @@ function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirecti
                   onClick={() => onLinkDirection(c.criterion_key)}
                 >
                   Link direction
+                </button>
+              )}
+              {isInProgress && onLinkDirection != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                  data-testid={`relink-direction-btn-${c.criterion_key}`}
+                  onClick={() => onLinkDirection(c.criterion_key)}
+                >
+                  Relink
                 </button>
               )}
               {status !== 'active' && onReinstate != null && (

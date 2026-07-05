@@ -1689,6 +1689,102 @@ async def test_agent_fetch_qualification_falls_back_to_last_qualification(
 
 
 @pytest.mark.asyncio
+async def test_qualification_fetch_carries_block_reason_fields(
+    client: AsyncClient, db_session
+):
+    """Block-reason fields (error/detail/blocker/qualify_request_blocked/
+    qualify_request_blocked_at) written by the hotfixed instrumentation paths are
+    surfaced by the qualification fetch verb on both the fallback and verdict paths.
+
+    Acceptance gate: named test required by the task acceptance criteria.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+
+    # --- fallback path: no verdict row ---
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-block-fb"
+    )
+    version.last_qualification = {
+        "status": "error",
+        "candidate_sha": "deadbeef" * 5,
+        "error": "no_credentials",
+        "detail": "GitHub token missing",
+        "blocker": "ci_compliance",
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "violation_count": 3,
+            "head_sha": "cafebabe" * 5,
+        },
+        "qualify_request_blocked_at": "2026-07-05T10:00:00",
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    assert body["status"] == "error"
+    assert body["error"] == "no_credentials"
+    assert body["detail"] == "GitHub token missing"
+    assert body["blocker"] == "ci_compliance"
+    assert body["qualify_request_blocked"] == {
+        "blocker": "ci_compliance",
+        "violation_count": 3,
+        "head_sha": "cafebabe" * 5,
+    }
+    assert body["qualify_request_blocked_at"] == "2026-07-05T10:00:00"
+
+    # --- verdict path: verdict row present, lq has block-reason fields ---
+    project2, task2, version2 = await _make_project_with_version(
+        db_session, vm="agent-vm-block-vp"
+    )
+    version2.last_qualification = {
+        "status": "error",
+        "candidate_sha": "aabbccdd" * 5,
+        "error": "spawn_failed",
+        "detail": "Worker capacity exhausted",
+        "blocker": "capacity",
+        "qualify_request_blocked_at": "2026-07-05T11:00:00",
+    }
+    flag_modified(version2, "last_qualification")
+    db_session.add(version2)
+
+    verdict2 = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project2.id,
+        release_version_id=version2.id,
+        candidate_sha="aabbccdd" * 5,
+        confidence=0.6,
+        terminal_status="not_promoted",
+        audit_findings=[{"severity": "HIGH", "summary": "Missing guard"}],
+    )
+    db_session.add(verdict2)
+    await db_session.commit()
+
+    token2 = create_agent_token(str(task2.id), task2.vm_instance_id)
+    res2 = await client.get(
+        f"/api/agent/projects/{project2.id}/qualification",
+        headers={"x-agent-token": token2},
+    )
+    assert res2.status_code == 200, res2.text
+    body2 = res2.json()
+
+    assert body2["source"] == "qualification_verdict"
+    assert body2["error"] == "spawn_failed"
+    assert body2["detail"] == "Worker capacity exhausted"
+    assert body2["blocker"] == "capacity"
+    assert body2["qualify_request_blocked"] is None
+    assert body2["qualify_request_blocked_at"] == "2026-07-05T11:00:00"
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_qualification_no_open_version(
     client: AsyncClient, db_session
 ):

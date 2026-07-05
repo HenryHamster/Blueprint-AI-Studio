@@ -649,6 +649,11 @@ async def agent_fetch_qualification(
             "challenger_refuted_findings": verdict.challenger_refuted_audit_findings
             or [],
             "goal_alignment": verdict.goal_alignment,
+            "error": lq.get("error") or None,
+            "detail": lq.get("detail") or None,
+            "blocker": lq.get("blocker") or None,
+            "qualify_request_blocked": lq.get("qualify_request_blocked") or None,
+            "qualify_request_blocked_at": lq.get("qualify_request_blocked_at") or None,
             "source": "qualification_verdict",
             "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
@@ -667,6 +672,11 @@ async def agent_fetch_qualification(
         "challenger_refuted_findings": qual.get("challenger_refuted_audit_findings")
         or [],
         "goal_alignment": qual.get("goal_alignment"),
+        "error": qual.get("error") or None,
+        "detail": qual.get("detail") or None,
+        "blocker": qual.get("blocker") or None,
+        "qualify_request_blocked": qual.get("qualify_request_blocked") or None,
+        "qualify_request_blocked_at": qual.get("qualify_request_blocked_at") or None,
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,
         **requalification_extra,

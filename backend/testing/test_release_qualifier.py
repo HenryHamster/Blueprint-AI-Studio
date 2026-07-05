@@ -8035,6 +8035,124 @@ async def test_reconcile_if_criterion_coverage_now_complete_respawns_after_retra
 
 
 @pytest.mark.asyncio
+async def test_coverage_recovery_backfills_stranded_evidence_before_check(
+    db_session, mocker
+):
+    """Reconciler replays merge evidence for stranded tasks before deciding
+    whether coverage is complete.
+
+    A task may have merged BEFORE the criterion-direction mapping was created,
+    leaving it with a proven acceptance verdict but no CriterionEvidence row.
+    The reconciler must call backfill_direction_merge_evidence for active
+    directions that cover uncovered criteria, then re-evaluate coverage — not
+    hard-return False on the first snapshot.
+    """
+    from app.acceptance_criteria import get_version_coverage_summary
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.models import Direction
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "bkfill00" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create an uncovered acceptance criterion for this version.
+    criterion = await _add_version_criterion(
+        db_session, project, version,
+        key="c-backfill-stranded", text="Stranded criterion needing backfill",
+    )
+
+    # Create a Direction mapped to that criterion.
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-backfill01",
+        data={"id": "d-backfill01", "text": "Fix stranded criterion", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Create a COMPLETED task with pr_merged=True (landed signal) and a proven
+    # acceptance verdict, carrying direction_id in context.  This simulates a
+    # task that merged BEFORE the criterion-direction mapping was created and
+    # thus never had record_task_merge_evidence called on its behalf.
+    task = Task(
+        project_id=project.id,
+        title="Fix stranded criterion task",
+        payloads=[{"type": "create", "prompt": "fix it"}],
+        context={
+            "direction_id": "d-backfill01",
+            "pr_merged": True,
+            "review_loop": {"pr_number": 42},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "test ran green under verified merge",
+                "proof_ref": "testing/test_backfill.py::test_stranded_criterion",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Pre-condition: coverage is incomplete before the reconciler runs.
+    pre_coverage = await get_version_coverage_summary(db_session, version.id)
+    assert pre_coverage["covered"] == 0
+    assert pre_coverage["total"] == 1
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    reconciled = await rq._reconcile_if_criterion_coverage_now_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # The reconciler must have backfilled the evidence and then spawned
+    # a fresh qualification — not returned False on the stale snapshot.
+    assert reconciled is True, (
+        "Expected reconciled=True after backfill cleared coverage; "
+        "reconciler may have returned False on the pre-backfill snapshot"
+    )
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+    # Post-condition: evidence was recorded.
+    from app.acceptance_criteria import get_evidence_for_criterion
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) > 0, "Expected evidence rows after backfill"
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_cached_promoted_same_sha_is_noop(db_session, mocker):
     """Idempotent qualification: when a conclusive promoted verdict exists
     for this candidate_sha and automain HEAD still equals it, run_qualification

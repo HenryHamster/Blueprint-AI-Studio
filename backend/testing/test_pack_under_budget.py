@@ -2084,3 +2084,46 @@ def test_core_floor_reserved_accounting_in_metadata():
             f"critical section {crit_key!r} was dropped — "
             f"floor reservation may have starved critical keys"
         )
+
+
+def test_compact_last_qualification_includes_qualify_request_blocked():
+    """_compact_last_qualification preserves qualify_request_blocked dict and
+    qualify_request_blocked_at scalar — the durable block-reason fields written
+    by the hotfixed instrumentation paths in strategic_completion.py."""
+    from app.strategic_payload_compaction import _compact_last_qualification
+
+    value = {
+        "status": "error",
+        "candidate_sha": "deadbeef" * 5,
+        "error": "no_credentials",
+        "detail": "GitHub token missing for this project",
+        "blocker": "ci_compliance",
+        "qualify_request_blocked": {
+            "blocker": "ci_compliance",
+            "violation_count": 3,
+            "head_sha": "cafebabe" * 5,
+            "cap_bump_task": "task-abc123",
+        },
+        "qualify_request_blocked_at": "2026-07-05T10:00:00",
+    }
+
+    out = _compact_last_qualification(value)
+    assert out is not None
+
+    # scalar fields
+    assert out["error"] == "no_credentials"
+    assert out["blocker"] == "ci_compliance"
+    assert out["qualify_request_blocked_at"] == "2026-07-05T10:00:00"
+    # text-capped field
+    assert out["detail"] == "GitHub token missing for this project"
+    # nested dict compacted
+    qrb = out["qualify_request_blocked"]
+    assert qrb is not None
+    assert qrb["blocker"] == "ci_compliance"
+    assert qrb["violation_count"] == 3
+
+    # floor=True should also preserve the fields
+    out_floor = _compact_last_qualification(value, floor=True)
+    assert out_floor is not None
+    assert out_floor["qualify_request_blocked_at"] == "2026-07-05T10:00:00"
+    assert out_floor["qualify_request_blocked"]["blocker"] == "ci_compliance"

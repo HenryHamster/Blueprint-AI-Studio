@@ -96,6 +96,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stale_queued_task"): 60,
     ("needs_operator", "stuck_criteria"): 65,
     ("needs_operator", "stuck_acceptance_criterion"): 65,
+    ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
@@ -207,6 +208,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed_or_attested",
         "operator_action": "remap_direction_or_attest_criterion",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "coverage_blocked": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed",
+        "operator_action": "monitor_active_direction_progress",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -1124,6 +1132,33 @@ def _stuck_criteria_attention_item(
     }
 
 
+def _coverage_blocked_attention_item(
+    project_id: uuid.UUID,
+    coverage_blocked_count: int,
+) -> dict[str, Any]:
+    plural = "criteria" if coverage_blocked_count != 1 else "criterion"
+    return {
+        "id": f"project:{project_id}:coverage_blocked",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "coverage_blocked",
+        "label": f"{coverage_blocked_count} acceptance {plural} awaiting active direction",
+        "detail": (
+            f"{coverage_blocked_count} uncovered {plural} mapped to active "
+            "direction(s) — promotion is blocked until covered"
+        ),
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "acceptance_criteria",
+        }),
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -1562,6 +1597,7 @@ async def build_operator_attention(
     stuck_direction_retired_count = 0
     stuck_acceptance_criteria_count = 0
     stuck_acceptance_criteria: list[dict[str, Any]] = []
+    coverage_blocked_count = 0
     try:
         open_version = await current_open_version(session, project.id)
         if open_version is not None:
@@ -1573,6 +1609,12 @@ async def build_operator_attention(
                     stuck_no_mapping_count += 1
                 elif reason == "direction_retired":
                     stuck_direction_retired_count += 1
+                elif (
+                    criterion.get("status") == "active"
+                    and criterion.get("coverage") == "uncovered"
+                    and reason is None
+                ):
+                    coverage_blocked_count += 1
             stuck_by_key = {
                 c["criterion_key"]: c
                 for c in coverage.get("criteria", [])
@@ -1662,6 +1704,8 @@ async def build_operator_attention(
                 stuck_direction_retired_count,
             )
         )
+    if coverage_blocked_count > 0:
+        add_candidate(_coverage_blocked_attention_item(project.id, coverage_blocked_count))
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
     for item in stuck_acceptance_criteria:
@@ -1713,6 +1757,7 @@ async def build_operator_attention(
         + len(manual_directions)
         + error_alert_count
         + stuck_criteria_count
+        + coverage_blocked_count
     )
     total_watch = (
         generic_failed_count
@@ -1777,6 +1822,7 @@ async def build_operator_attention(
             "stuck_acceptance_criteria": stuck_acceptance_criteria_count,
             "manual_directions": len(manual_directions),
             "stuck_criteria": stuck_criteria_count,
+            "coverage_blocked": coverage_blocked_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,

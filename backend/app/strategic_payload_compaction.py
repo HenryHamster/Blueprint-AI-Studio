@@ -218,6 +218,7 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
         "first_deferred_at",
         "deferred_at",
         "prior_superseded",
+        "qualify_request_blocked_at",
     ):
         _put_present(out, value, key)
     for key in (
@@ -252,6 +253,9 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
     acceptance = value.get("acceptance_aggregate")
     if isinstance(acceptance, dict):
         out["acceptance_aggregate"] = acceptance
+    qrb = _compact_scalar_mapping(value.get("qualify_request_blocked"), text_cap=text_cap)
+    if qrb:
+        out["qualify_request_blocked"] = qrb
     promo = _compact_promotion_pending(value.get("promotion_pending"), text_cap=text_cap)
     if promo:
         out["promotion_pending"] = promo
