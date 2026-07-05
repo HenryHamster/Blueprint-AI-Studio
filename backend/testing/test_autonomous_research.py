@@ -24,6 +24,8 @@ import app.shared_state as _shared_state
 from app.models import (
     Alert,
     AlertSeverity,
+    Artifact,
+    ArtifactType,
     MessageType,
     Project,
     ProjectMessage,
@@ -7432,6 +7434,307 @@ async def test_stage_dropout_breakdown(db_session):
     # rollup succeeded (research task COMPLETED) — no staging-only merges
     assert dropout.get("tasks_merged_staging_only") == 0, (
         f"Expected 0 staging-only, got {dropout}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# _opened_pr type-awareness — review/fix tasks must NOT be misclassified
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed review task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr, not as having opened a PR.
+    ReviewPayload.pr_number is the PR under review, not one opened by the task.
+    """
+    direction_id = "d-openedpr001"
+    direction = _active_direction(direction_id, "Opened-PR classification test")
+    project = Project(
+        name="Opened PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    # A review task: pr_number is the PR being reviewed (input), not a new PR opened.
+    review_task = Task(
+        project_id=project.id,
+        title="Review PR #42",
+        payloads=[{"type": "review", "pr_number": 42, "branch": "feature/x"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(review_task)
+    await db_session.commit()
+    await db_session.refresh(review_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # review task with pr_number but no artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Review task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_with_pr_artifact_does_not_count_as_no_pr(db_session):
+    """A completed create task with a PULL_REQUEST artifact must NOT appear in
+    tasks_completed_no_pr — it genuinely opened a PR.
+    """
+    direction_id = "d-openedpr002"
+    direction = _active_direction(direction_id, "Create-task PR classification")
+    project = Project(
+        name="Create PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    create_task = Task(
+        project_id=project.id,
+        title="Implement feature X",
+        payloads=[{"type": "create", "prompt": "add feature X"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(create_task)
+    await db_session.commit()
+    await db_session.refresh(create_task)
+
+    # The create task recorded a PULL_REQUEST artifact when it opened the PR.
+    pr_artifact = Artifact(
+        task_id=create_task.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/acme/repo/pull/99",
+    )
+    db_session.add(pr_artifact)
+    await db_session.commit()
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # create task has a PULL_REQUEST artifact → it opened a PR, not a no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Create task with PULL_REQUEST artifact should NOT count as tasks_completed_no_pr; "
+        f"got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed fix task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr.
+    Fix tasks iterate an existing PR rather than opening a new one.
+    """
+    direction_id = "d-openedpr003"
+    direction = _active_direction(direction_id, "Fix-task PR classification")
+    project = Project(
+        name="Fix PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    fix_task = Task(
+        project_id=project.id,
+        title="Fix lint errors on PR #55",
+        payloads=[{"type": "fix", "prompt": "fix lints", "pr_number": 55, "branch": "feature/y"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(fix_task)
+    await db_session.commit()
+    await db_session.refresh(fix_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # fix task with pr_number but no PULL_REQUEST artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Fix task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
+    """A completed panel_review task with pr_number in payload and no PULL_REQUEST artifact
+    must be counted as tasks_completed_no_pr, not as having opened a PR.
+    PanelReviewPayload.pr_number is the PR under review (input), not one opened by the task.
+    """
+    direction_id = "d-openedpr004"
+    direction = _active_direction(direction_id, "Panel-review PR classification")
+    project = Project(
+        name="Panel Review PR Test",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[direction],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    research_task = await _make_research_task(project, direction, db_session)
+
+    panel_review_task = Task(
+        project_id=project.id,
+        title="Panel review of PR #77",
+        payloads=[{"type": "panel_review", "pr_number": 77, "branch": "feature/z"}],
+        status=TaskStatus.COMPLETED,
+        context={"research_task_id": str(research_task.id)},
+        parent_task_id=research_task.id,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(panel_review_task)
+    await db_session.commit()
+    await db_session.refresh(panel_review_task)
+
+    dirs = project.directions or []
+    for d in dirs:
+        if d.get("id") == direction_id:
+            d["research_history"] = [
+                {
+                    "timestamp": "2026-04-07T00:00:00",
+                    "task_id": str(research_task.id),
+                    "tasks_created": 1,
+                    "finding_titles": [],
+                }
+            ]
+            break
+    project.directions = dirs
+    from sqlalchemy.orm.attributes import flag_modified
+
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=str(research_task.id),
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    dirs = project.directions or []
+    d = next(x for x in dirs if x.get("id") == direction_id)
+    entry = d["research_history"][0]
+
+    # panel_review task with pr_number but no PULL_REQUEST artifact → no-PR completion
+    assert entry.get("tasks_completed_no_pr") == 1, (
+        f"Panel_review task with pr_number but no PULL_REQUEST artifact should count as "
+        f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
+        f"entry={entry}"
     )
 
 

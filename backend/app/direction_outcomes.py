@@ -1141,9 +1141,20 @@ async def _update_direction_research_outcomes(
     )
 
     def _opened_pr(ct: Task) -> bool:
-        """True when *ct* opened a PR (via any reliable signal)."""
+        """True when *ct* opened a PR (via any reliable signal).
+
+        PULL_REQUEST artifact is the authoritative signal.  The pr_number
+        fallbacks below are intentionally skipped for 'review', 'fix', and
+        'panel_review' task types: ReviewPayload/PanelReviewPayload.pr_number
+        is the PR under review (not one opened by the task), and fix tasks
+        iterate an existing PR rather than opening a new one (see
+        _PR_OPENING_COMPLETION_TYPES in task_lifecycle.py).
+        """
         if ct.id in _pr_artifact_task_ids:
             return True
+        ct_type = (ct.first_payload or {}).get("type", "")
+        if ct_type in ("review", "fix", "panel_review"):
+            return False
         ctx_ = ct.context or {}
         if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
             return True
