@@ -1943,7 +1943,14 @@ async def _provision_gcp(
     # GPU jobs boot the driver-preinstalled Deep Learning VM GPU image family
     # (NVIDIA drivers + ML stack baked in); CPU jobs keep the agent image.
     initialize_params.source_image = GPU_IMAGE_FAMILY if is_gpu else AGENT_IMAGE_FAMILY
-    initialize_params.disk_size_gb = 50
+    # GPU jobs keep the larger disk: the Deep Learning VM image (NVIDIA/CUDA + ML
+    # stack) plus experiment datasets need the room. The agent image is a ~20GB
+    # baked image (infra/packer/agent.pkr.hcl) whose real per-task peak is ~15-18GB
+    # (docker deps image, git mirror, npm cache, Playwright Chromium all pre-baked),
+    # so 30GB is ample and nearly doubles how many agent VMs fit under the regional
+    # SSD_TOTAL_GB quota (50GB→30GB = 30→50 VMs at a 1500GB limit). Floor is the
+    # 20GB source-image size; 30GB leaves ~12-15GB headroom over peak.
+    initialize_params.disk_size_gb = 50 if is_gpu else 30
 
     disk = compute_v1.AttachedDisk()
     disk.boot = True
