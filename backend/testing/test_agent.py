@@ -3167,6 +3167,110 @@ async def test_refresh_token_replaces_expiring_token(client: AsyncClient, db_ses
     )
 
 
+@pytest.mark.asyncio
+async def test_git_read_token_returns_token(client: AsyncClient, db_session, mocker):
+    """GET /api/agent/git-read-token returns owner/repo/token for a valid task."""
+    project = Project(
+        name="Git Token Test",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-git",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_test_installation_token",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["token"] == "ghs_test_installation_token"
+    assert data["owner"] == "testowner"
+    assert data["repo"] == "testrepo"
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_missing_github_repo(client: AsyncClient, db_session):
+    """GET /api/agent/git-read-token returns 422 when project has no GitHub repo."""
+    project = Project(name="No Repo", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-no-repo",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-no-repo")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["error"]["message"] == "project_has_no_github_repo"
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_no_installation(client: AsyncClient, db_session, mocker):
+    """GET /api/agent/git-read-token returns 502 when GitHub App is not installed."""
+    project = Project(
+        name="No App",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-no-app",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value=None,
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-no-app")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 502, resp.text
+    assert resp.json()["error"]["message"] == "github_token_unavailable"
+
+
 def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
     if endpoint == "status":
         return {"task_id": task_id, "status": "COMPLETED"}

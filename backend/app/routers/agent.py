@@ -643,6 +643,40 @@ async def agent_refresh_token(
     return {"token": new_token, "token_expires_at": expires_at.isoformat()}
 
 
+@router.get("/git-read-token")
+@limiter.limit("120/minute")
+async def agent_git_read_token(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return a fresh GitHub App installation read token for the task's repo.
+
+    Called periodically by the strategic resident VM to keep its local
+    git remote credential fresh (resident needs `git fetch origin` for
+    automain verification; it never pushes — push credentials are per-task).
+
+    Uses `get_repo_installation_token` (cached 50 min per repo) so a warm
+    cache costs zero GitHub API calls.
+    """
+    task_id = uuid.UUID(token["sub"])
+    task = await session.get(Task, task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    project = await session.get(Project, task.project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="project_not_found")
+    owner = project.github_owner
+    repo = project.github_repo
+    if not owner or not repo:
+        raise HTTPException(status_code=422, detail="project_has_no_github_repo")
+    from app.github_auth import get_repo_installation_token
+    gh_token = await get_repo_installation_token(owner, repo)
+    if not gh_token:
+        raise HTTPException(status_code=502, detail="github_token_unavailable")
+    return {"token": gh_token, "owner": owner, "repo": repo}
+
+
 async def _stamp_reviewer_recovery_count(
     session: AsyncSession,
     project_id: uuid.UUID,

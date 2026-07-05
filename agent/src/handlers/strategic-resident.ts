@@ -11,6 +11,9 @@ import {
 import { writeStrategicHelpers } from './strategic-helpers.js';
 import { provisionAmbientHelpers } from '../providers/runners.js';
 import {
+  writeGitTokenFile, setupGitCredentialHelper, GIT_TOKEN_REFRESH_MS,
+} from '../git-credential.js';
+import {
   startResidentClaudeSession,
   type ResidentSession, type ResidentTurnResult,
 } from '../providers/resident-session.js';
@@ -214,6 +217,20 @@ export async function handleStrategicResident(
     workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken,
     branch: baseBranch, baseBranch, depth: 0,
   });
+
+  // ── Git read-credential refresh setup ────────────────────────────────────────
+  // Write the initial token then switch the remote URL from the baked-in
+  // token-embedded form to a plain HTTPS URL backed by a credential helper that
+  // reads a refreshed token file. This prevents `git fetch origin` from failing
+  // after the 60-minute GitHub App installation token TTL.
+  writeGitTokenFile(ghToken);
+  try {
+    setupGitCredentialHelper(owner, repo, WORKSPACE);
+    sendLog(ws, '[resident] git credential helper configured (read-only refresh every 40 min)\n');
+  } catch (e) {
+    sendLog(ws, `[resident] WARNING: git credential helper setup failed (git fetch may expire): ${String(e)}\n`);
+  }
+
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
   const researchMode = strVal(payload.research_mode, 'research');
@@ -463,6 +480,30 @@ export async function handleStrategicResident(
     }
   };
 
+  // ── Git read-token background refresh ────────────────────────────────────────
+  // Periodically calls /api/agent/git-read-token and updates the credential
+  // helper's token file so `git fetch origin` keeps working beyond the 60-minute
+  // GitHub App installation token TTL. Self-scheduling named function expression
+  // so the timer reference is always non-null and cleared cleanly in the finally.
+  let gitTokenRefreshTimer: ReturnType<typeof setTimeout>;
+  function gitReadTokenRefreshTick(): void {
+    void (async () => {
+      try {
+        const result = await apiGet('/api/agent/git-read-token') as { token?: string } | null;
+        if (result?.token) {
+          writeGitTokenFile(result.token);
+          sendLog(ws, '[resident] git read token refreshed\n');
+        } else {
+          sendLog(ws, '[resident] git read token refresh: empty response (keeping existing token)\n');
+        }
+      } catch (e) {
+        sendLog(ws, `[resident] git read token refresh failed (keeping existing token): ${String(e)}\n`);
+      }
+      gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
+    })();
+  }
+  gitTokenRefreshTimer = setTimeout(gitReadTokenRefreshTick, GIT_TOKEN_REFRESH_MS);
+
   // ── Two-speed loop ──────────────────────────────────────────────────────────
   try {
     for (;;) {
@@ -544,6 +585,7 @@ export async function handleStrategicResident(
     stopReason = `loop_error: ${String(e)}`;
     sendLog(ws, `[resident] loop error: ${String(e)}\n`);
   } finally {
+    clearTimeout(gitTokenRefreshTimer);
     streamer.flush();
     session.close();
   }
