@@ -3931,6 +3931,26 @@ async def strategic_operation(
             skipped_over_cap,
             len(warnings),
         )
+
+        # Best-effort backfill: for each direction that received new criterion
+        # mappings, replay merge evidence for tasks that already landed.
+        _mapped_directions: set[str] = set()
+        for item in processed:
+            for dk in item.get("direction_keys", []):
+                _mapped_directions.add(dk)
+        if _mapped_directions:
+            from app.acceptance_criteria import backfill_direction_merge_evidence as _backfill
+            for _dk in _mapped_directions:
+                try:
+                    await _backfill(session, project.id, _dk)
+                except Exception:
+                    logger.warning(
+                        "[STRATEGIC API] set_acceptance_criteria backfill failed "
+                        "for direction %s (non-fatal)",
+                        _dk,
+                        exc_info=True,
+                    )
+
         return _resp(
             {
                 "status": "ok",

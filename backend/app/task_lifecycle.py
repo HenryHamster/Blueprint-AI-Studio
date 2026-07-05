@@ -6018,9 +6018,13 @@ async def _process_post_commit(
         # after children spawn, never in QUEUED. Production incident: task
         # 582a0210 force-failed at 19:47:30 while waiting on a warm-handoff
         # from sibling 609b380c on agent-vm-540ee.
-        all_tasks_stmt = select(Task).where(Task.project_id == task.project_id)
-        all_tasks = (await session.execute(all_tasks_stmt)).scalars().all()
-        executable_statuses = [t.status for t in all_tasks if t.vm_instance_id]
+        # Column-selective scan — avoids loading large JSONB context blobs for
+        # every task on every completion event.
+        all_tasks_stmt = select(
+            Task.id, Task.status, Task.vm_instance_id
+        ).where(Task.project_id == task.project_id)
+        all_task_rows = (await session.execute(all_tasks_stmt)).all()
+        executable_statuses = [r.status for r in all_task_rows if r.vm_instance_id]
         # A PARKED task is live work waiting on an external wake; park_task
         # clears vm_instance_id=None on park, so it is already invisible to
         # ``executable_statuses``. This guard provides defence-in-depth: without
@@ -6030,12 +6034,12 @@ async def _process_post_commit(
         # converge COMPLETED/FAILED while a parked child is still waiting to be
         # woken — an early-converge. Treat any live PARKED child as in-flight so
         # the all-terminal guard below cannot trip while one exists.
-        has_parked_task = any(t.status == TaskStatus.PARKED for t in all_tasks)
-        parent_tasks = [
-            t
-            for t in all_tasks
-            if not t.vm_instance_id
-            and t.status
+        has_parked_task = any(r.status == TaskStatus.PARKED for r in all_task_rows)
+        _parent_task_ids = [
+            r.id
+            for r in all_task_rows
+            if not r.vm_instance_id
+            and r.status
             not in [
                 TaskStatus.QUEUED,  # leaf awaiting claim/warm-handoff, not a parent
                 # PARKED leaf is live work awaiting an external wake, not a
@@ -6046,6 +6050,18 @@ async def _process_post_commit(
                 TaskStatus.CANCELLED,
             ]
         ]
+        # Fetch full ORM objects only for parent tasks — needed for mutation.
+        parent_tasks = (
+            (
+                await session.execute(
+                    select(Task).where(Task.id.in_(_parent_task_ids))
+                )
+            )
+            .scalars()
+            .all()
+            if _parent_task_ids
+            else []
+        )
 
         project_stmt = select(Project).where(Project.id == task.project_id)
         project = (await session.execute(project_stmt)).scalars().first()

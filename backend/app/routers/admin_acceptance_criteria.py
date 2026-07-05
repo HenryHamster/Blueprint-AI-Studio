@@ -281,6 +281,26 @@ async def link_criteria_to_direction(
         body.direction_key,
         project_id,
     )
+
+    # Best-effort backfill: replay merge evidence for tasks that merged before
+    # this mapping was created so they are not stranded without evidence.
+    try:
+        backfilled = await ac.backfill_direction_merge_evidence(
+            session, project_id, body.direction_key
+        )
+        if backfilled:
+            logger.info(
+                "[AC] link-direction backfill: direction=%s recorded=%d",
+                body.direction_key,
+                backfilled,
+            )
+    except Exception:
+        logger.warning(
+            "[AC] link-direction backfill failed for direction %s (non-fatal)",
+            body.direction_key,
+            exc_info=True,
+        )
+
     return {
         "status": "ok",
         "direction_key": body.direction_key,
@@ -360,3 +380,71 @@ async def attest_criterion(
         body.reason,
     )
     return {"status": "ok", "criterion_key": criterion_key, "coverage": "covered"}
+
+
+class ReconcileBackfillRequest(BaseModel):
+    direction_key: str | None = Field(
+        None,
+        description="Specific direction to backfill. Omit to backfill all directions.",
+    )
+
+
+@router.post("/projects/{project_id}/acceptance-criteria/reconcile-backfill")
+async def reconcile_backfill(
+    project_id: uuid.UUID,
+    body: ReconcileBackfillRequest,
+    current_user: dict = Depends(get_current_user),
+    session: AsyncSession = Depends(get_session),
+) -> dict:
+    """Run the merge-evidence backfill on demand for stranded criterion mappings.
+
+    Backfills evidence for already-merged tasks in the given direction (or all
+    directions in the project when ``direction_key`` is omitted).  Idempotent
+    — duplicate evidence rows are silently skipped.  Returns a per-direction
+    summary of newly recorded rows.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    if body.direction_key is not None:
+        # Backfill a single direction.
+        rows = await ac.backfill_direction_merge_evidence(
+            session, project_id, body.direction_key
+        )
+        return {
+            "status": "ok",
+            "results": [{"direction_key": body.direction_key, "evidence_recorded": rows}],
+            "total_evidence_recorded": rows,
+        }
+
+    # Backfill all directions in the project.
+    from sqlmodel import select as _select
+    from app.models import Direction as _Direction
+
+    dir_result = await session.execute(
+        _select(_Direction.direction_key).where(
+            _Direction.project_id == project_id,
+        )
+    )
+    direction_keys = list(dir_result.scalars().all())
+
+    results = []
+    total = 0
+    for dk in direction_keys:
+        recorded = await ac.backfill_direction_merge_evidence(session, project_id, dk)
+        total += recorded
+        if recorded:
+            results.append({"direction_key": dk, "evidence_recorded": recorded})
+
+    logger.info(
+        "[AC] reconcile-backfill: project=%s directions=%d total_recorded=%d",
+        project_id,
+        len(direction_keys),
+        total,
+    )
+    return {
+        "status": "ok",
+        "results": results,
+        "total_evidence_recorded": total,
+    }

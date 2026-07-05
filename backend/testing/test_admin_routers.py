@@ -11674,7 +11674,7 @@ class TestAcceptanceCriteriaRouter:
             },
         )
         assert bad_patch.status_code == 400
-        assert "Unknown criterion keys" in bad_patch.text
+        assert "criterion_key_invalid" in bad_patch.text
 
         viewer_id = "viewer-ac-guard"
 
@@ -19616,7 +19616,7 @@ async def test_create_direction_endpoint_without_retired_match_has_unchanged_sha
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert "retired_grounding" not in body
-    assert set(body) == {"status", "op", "direction_id"}
+    assert set(body) == {"status", "op", "direction_id", "grounding_verdict"}
 
 
 @pytest.mark.asyncio

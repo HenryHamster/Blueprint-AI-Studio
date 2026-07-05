@@ -18,6 +18,7 @@ Exercises :mod:`app.acceptance_criteria`:
 from __future__ import annotations
 
 import uuid
+from datetime import timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -1157,7 +1158,7 @@ async def test_autonomous_direction_task_inherits_criterion_ids_and_records_evid
     #    refresh_direction_outcomes_after_merge after a task's PR merges
     recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
 
-    assert recorded == 1, "Expected one criterion to be recorded"
+    assert recorded == 2, "Expected 2 evidence rows (task_merge + reachability) for one criterion"
 
     # 5. Verify the evidence is correct and satisfies the 'covered' predicate
     evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
@@ -1282,6 +1283,53 @@ async def test_get_version_coverage_summary_evidence_provenance(db_session):
 
 
 @pytest.mark.asyncio
+async def test_get_version_coverage_summary_caps_evidence_preview(db_session):
+    """Coverage summaries keep full counts but bound the serialized evidence list."""
+    project = await _make_project(db_session, "CoverageSummaryEvidenceCap")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Evidence preview is bounded"
+    )
+
+    base_time = criterion.created_at
+    total_evidence = ac.MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY + 3
+    for i in range(total_evidence):
+        db_session.add(
+            CriterionEvidence(
+                criterion_id=criterion.id,
+                project_id=project.id,
+                source_kind="operator",
+                source_id=f"note-{i:02d}",
+                detail={"index": i},
+                recorded_at=base_time + timedelta(seconds=i),
+            )
+        )
+    db_session.add(
+        CriterionEvidence(
+            criterion_id=criterion.id,
+            project_id=project.id,
+            source_kind="reachability",
+            source_id="final-proof",
+            detail={"proven": True},
+            recorded_at=base_time + timedelta(seconds=total_evidence),
+        )
+    )
+    await db_session.commit()
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    item = summary["criteria"][0]
+
+    assert item["coverage"] == "covered"
+    assert item["evidence_count"] == total_evidence + 1
+    assert item["evidence_truncated"] is True
+    assert len(item["evidence"]) == ac.MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY
+    assert item["evidence"][-1]["source_id"] == "final-proof"
+    assert item["evidence"][0]["source_id"] == (
+        f"note-{total_evidence + 1 - ac.MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY:02d}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_list_criteria_evidence_field_present(db_session):
     """Criteria items from get_version_coverage_summary always include an evidence list.
 
@@ -1369,7 +1417,7 @@ async def test_refresh_after_merge_scopes_to_open_version_and_is_idempotent(
     ev_b_again = await ac.get_evidence_for_criterion(db_session, open_criterion_b.id)
     assert len(ev_a_again) == 2
     assert len(ev_b_again) == 2
-    assert first == 2
+    assert first == 4  # 2 criteria × 2 rows each (task_merge + reachability)
     assert second == 0
 
     summary = await ac.get_version_coverage_summary(db_session, reopened_version.id)
@@ -1439,9 +1487,9 @@ async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_sess
 
     recorded = await ac.record_task_merge_evidence(db_session, task, project.id)
 
-    assert recorded == 1, (
-        "Expected one criterion recorded via late direction mapping; "
-        f"got {recorded}"
+    assert recorded == 2, (
+        "Expected 2 evidence rows (task_merge + reachability) for one criterion recorded "
+        f"via late direction mapping; got {recorded}"
     )
 
     evidence = await ac.get_evidence_for_criterion(db_session, late_criterion.id)
@@ -1564,7 +1612,7 @@ async def test_retracted_criterion_clears_coverage_and_gate(db_session):
     )
     db_session.add(task)
     await db_session.commit()
-    assert await ac.record_task_merge_evidence(db_session, task, project.id) == 1
+    assert await ac.record_task_merge_evidence(db_session, task, project.id) == 2
 
     before = await ac.get_version_coverage_summary(db_session, version.id)
     assert before["total"] == 2
@@ -3208,7 +3256,7 @@ async def test_record_task_merge_evidence_skips_inactive_criteria(db_session):
     await db_session.refresh(task)
 
     count = await ac.record_task_merge_evidence(db_session, task, project.id)
-    assert count == 1, "Only the active criterion should receive evidence"
+    assert count == 2, "Only the active criterion should receive evidence (2 rows: task_merge + reachability)"
 
     active_evidence = await ac.get_evidence_for_criterion(db_session, active_c.id)
     assert len(active_evidence) == 2  # task_merge + reachability
@@ -3513,3 +3561,355 @@ async def test_retire_direction_clears_criterion_keys(
         f"Direction ORM row criterion_keys must be cleared after retire; "
         f"got {dir_row.criterion_keys}"
     )
+
+
+# ---------------------------------------------------------------------------
+# backfill_direction_merge_evidence
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_backfill_direction_merge_evidence_covers_late_mapping(db_session):
+    """Criterion mapped AFTER a proven merged task already exists flips to covered.
+
+    This is the primary acceptance requirement: a criterion-direction mapping
+    created late must not leave the criterion stranded.  The backfill helper
+    must replay the merge evidence so the criterion reaches 'covered'.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BackfillLateMappingCoverage")
+    version = await _make_version(db_session, project)
+
+    # Create a direction row WITHOUT criterion_keys yet.
+    direction_key = "d-backfill-late"
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Backfill test direction", "status": "active"},
+        status="active",
+        criterion_keys=[],
+    )
+    db_session.add(dir_row)
+
+    # Create a proven merged task for the direction (simulates already-landed PR).
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+                "proof_ref": "testing/test_backfill.py::test_x",
+            },
+        },
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # NOW map the criterion to the direction (this is the late mapping scenario).
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Late-mapped criterion that should be covered by backfill",
+        created_by="operator",
+    )
+    dir_row.criterion_keys = [criterion.criterion_key]
+    db_session.add(dir_row)
+    await db_session.commit()
+
+    # Before backfill: the criterion has no evidence.
+    evidence_before = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence_before == [], "No evidence before backfill"
+
+    # Run backfill.
+    recorded = await ac.backfill_direction_merge_evidence(db_session, project.id, direction_key)
+
+    assert recorded == 2, f"Expected 2 evidence rows (task_merge + reachability) for 1 criterion; got {recorded}"
+    evidence_after = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence_after) == 2
+    assert {e.source_kind for e in evidence_after} == {"task_merge", "reachability"}
+
+    coverage = ac.compute_criterion_coverage(evidence_after)
+    assert coverage == "covered", f"Expected 'covered', got '{coverage}'"
+
+
+@pytest.mark.asyncio
+async def test_backfill_direction_merge_evidence_idempotent(db_session):
+    """Calling backfill twice on the same proven merged task records 0 new rows the second time."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BackfillIdempotent")
+    version = await _make_version(db_session, project)
+    direction_key = "d-backfill-idempotent"
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Idempotent criterion"
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Idempotent direction", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    first = await ac.backfill_direction_merge_evidence(db_session, project.id, direction_key)
+    second = await ac.backfill_direction_merge_evidence(db_session, project.id, direction_key)
+
+    assert first == 2, f"First run should record 2 rows (task_merge + reachability); got {first}"
+    assert second == 0, f"Second run must be idempotent (0 new rows); got {second}"
+
+
+@pytest.mark.asyncio
+async def test_backfill_direction_merge_evidence_skips_unproven(db_session):
+    """A merged task WITHOUT a proven acceptance verdict yields no evidence."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BackfillSkipsUnproven")
+    version = await _make_version(db_session, project)
+    direction_key = "d-backfill-unproven"
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Unproven criterion"
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Unproven direction", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    # Task merged but verdict is proven=False.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "proven": False},
+        },
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_direction_merge_evidence(db_session, project.id, direction_key)
+
+    assert recorded == 0, f"Unproven task must not produce evidence; got {recorded}"
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert evidence == [], "No evidence for unproven task"
+
+
+@pytest.mark.asyncio
+async def test_backfill_direction_merge_evidence_scopes_to_direction(db_session):
+    """Tasks from a different direction are not included in the backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BackfillScoped")
+    version = await _make_version(db_session, project)
+    target_key = "d-backfill-scoped-target"
+    other_key = "d-backfill-scoped-other"
+
+    criterion_target = await ac.create_criterion(
+        db_session, project.id, version.id, "Target direction criterion"
+    )
+    criterion_other = await ac.create_criterion(
+        db_session, project.id, version.id, "Other direction criterion"
+    )
+
+    for dk, criterion in [(target_key, criterion_target), (other_key, criterion_other)]:
+        dir_row = Direction(
+            project_id=project.id,
+            direction_key=dk,
+            data={"id": dk, "text": dk, "status": "active"},
+            status="active",
+            criterion_keys=[criterion.criterion_key],
+        )
+        db_session.add(dir_row)
+
+    # Task belongs to the OTHER direction.
+    other_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "other"}],
+        context={
+            "direction_id": other_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(other_task)
+    await db_session.commit()
+
+    # Backfill only the target direction.
+    recorded = await ac.backfill_direction_merge_evidence(db_session, project.id, target_key)
+
+    assert recorded == 0, f"Other direction's task must not evidence target; got {recorded}"
+    ev_target = await ac.get_evidence_for_criterion(db_session, criterion_target.id)
+    assert ev_target == [], "Target criterion must have no evidence from other direction's task"
+
+    ev_other = await ac.get_evidence_for_criterion(db_session, criterion_other.id)
+    assert ev_other == [], "Other criterion was not the backfill target"
+
+
+@pytest.mark.asyncio
+async def test_backfill_direction_merge_evidence_skips_retracted_criterion(db_session):
+    """Retracted criteria are not covered by backfill."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "BackfillSkipsRetracted")
+    version = await _make_version(db_session, project)
+    direction_key = "d-backfill-retracted"
+
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Retracted criterion"
+    )
+    # Retract the criterion before backfill.
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion.criterion_key,
+        reason="superseded",
+    )
+
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Retracted test", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test"},
+        },
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    recorded = await ac.backfill_direction_merge_evidence(db_session, project.id, direction_key)
+
+    assert recorded == 0, f"Retracted criterion must not receive backfill evidence; got {recorded}"
+
+
+@pytest.mark.asyncio
+async def test_link_direction_endpoint_triggers_backfill(client, db_session):
+    """POST link-direction with an already-merged proven task causes evidence to appear.
+
+    Acceptance requirement: the link-direction endpoint must run the backfill
+    so criteria stranded before this feature shipped can be cleared without
+    re-editing them.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+    from app.landed_signal import LANDED_ON_INTEGRATION_KEY, LANDED_SIGNAL_KEY
+
+    project = await _make_project(db_session, "LinkDirectionBackfill")
+    member = ProjectMember(
+        project_id=project.id, user_id=_TEST_USER_ID, role="owner"
+    )
+    db_session.add(member)
+    version = await _make_version(db_session, project)
+
+    direction_key = "d-link-backfill"
+    # Create direction row without criterion_keys.
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key=direction_key,
+        data={"id": direction_key, "text": "Link backfill direction", "status": "active"},
+        status="active",
+        criterion_keys=[],
+    )
+    db_session.add(dir_row)
+
+    # Proven merged task already exists for this direction.
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "implement it"}],
+        context={
+            "direction_id": direction_key,
+            LANDED_SIGNAL_KEY: True,
+            LANDED_ON_INTEGRATION_KEY: True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green CI",
+            },
+        },
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # Create the criterion AFTER the task already merged.
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Late criterion — backfill coverage test",
+        created_by="operator",
+    )
+    await db_session.commit()
+
+    # POST link-direction — this is the surface that must trigger backfill.
+    resp = await client.post(
+        f"/api/admin/projects/{project.id}/acceptance-criteria/link-direction",
+        json={"direction_key": direction_key, "criterion_keys": [criterion.criterion_key]},
+        headers={"x-test-user-id": _TEST_USER_ID},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["direction_key"] == direction_key
+
+    # The backfill should have run, recording evidence for the criterion.
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) >= 1, (
+        "link-direction must trigger backfill; criterion should have evidence after the call"
+    )
+    assert any(e.source_kind == "task_merge" for e in evidence), (
+        "Expected task_merge evidence from backfill"
+    )
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "covered", f"Expected 'covered' after backfill, got '{coverage}'"

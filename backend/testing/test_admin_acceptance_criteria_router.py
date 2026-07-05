@@ -11,11 +11,23 @@ Role-enforcement, happy path, 400/404/409 branches.
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from httpx import AsyncClient
+from sqlmodel import select
 
 from app import acceptance_criteria as ac
-from app.models import Direction, Project, ProjectMember, ReleaseVersion
+from app.models import (
+    CriterionEvidence,
+    Direction,
+    Project,
+    ProjectMember,
+    ReleaseVersion,
+    Task,
+    TaskStatus,
+    VersionAcceptanceCriterion,
+)
 
 TEST_USER_ID = "test-user-123"
 
@@ -784,3 +796,194 @@ async def test_reinstate_requires_member_role(client: AsyncClient, db_session):
         f"{_BASE}/projects/{other_project.id}/acceptance-criteria/c-any/reinstate"
     )
     assert resp.status_code in (403, 404)
+
+
+# ---------------------------------------------------------------------------
+# POST /api/admin/projects/{project_id}/acceptance-criteria/reconcile-backfill
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_single_direction(client: AsyncClient, db_session):
+    """Single-direction branch: returns ok with per-direction summary (0 rows when no tasks)."""
+    project = await _make_project_member(db_session, role="member")
+    direction = await _make_direction(db_session, project, key="d-backfill1")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": direction.direction_key},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert isinstance(data["results"], list)
+    assert len(data["results"]) == 1
+    assert data["results"][0]["direction_key"] == direction.direction_key
+    assert data["results"][0]["evidence_recorded"] == 0
+    assert data["total_evidence_recorded"] == 0
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_all_directions(client: AsyncClient, db_session):
+    """All-directions branch: iterates every Direction row for the project and returns aggregate."""
+    project = await _make_project_member(db_session, role="member")
+    dir_a = await _make_direction(db_session, project, key="d-all-a")
+    dir_b = await _make_direction(db_session, project, key="d-all-b")
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    # Results list omits directions with 0 new rows, but total is the sum.
+    assert data["total_evidence_recorded"] == 0
+    assert isinstance(data["results"], list)
+    # Verify that both directions were scanned (they produced 0 rows, so results list is empty).
+    assert data["results"] == []
+    _ = dir_a, dir_b  # referenced above; silence linter
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_requires_member_role(client: AsyncClient, db_session):
+    """Project non-member receives 403/404 on the reconcile-backfill endpoint."""
+    other_project = Project(name="OtherBackfill", user_id="other-user")
+    db_session.add(other_project)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{other_project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": "d-any"},
+    )
+    assert resp.status_code in (403, 404)
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_single_direction_with_merged_task(
+    client: AsyncClient, db_session
+):
+    """Single-direction backfill records evidence for a pre-existing proven merged task.
+
+    Exercises the non-zero path: a task that merged before the criterion-direction
+    mapping was created should have evidence recorded on backfill.  Asserts both
+    the per-direction result and that CriterionEvidence rows are actually persisted.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project, status="open")
+    direction = await _make_direction(db_session, project, key="d-backfill-merged")
+
+    # Create a criterion and link it to the direction so record_task_merge_evidence
+    # can find it via direction.criterion_keys.
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-backfill-test",
+        text="Backfill test criterion",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+    await db_session.refresh(criterion)
+
+    # Link criterion to direction via criterion_keys.
+    direction.criterion_keys = ["c-backfill-test"]
+    db_session.add(direction)
+    await db_session.commit()
+
+    # Create a task that already merged (proven) in the current version window.
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={
+            "direction_id": direction.direction_key,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={"direction_key": direction.direction_key},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    assert data["results"][0]["direction_key"] == direction.direction_key
+    # Two evidence rows per criterion: task_merge + reachability.
+    assert data["results"][0]["evidence_recorded"] == 2
+    assert data["total_evidence_recorded"] == 2
+
+    # Verify CriterionEvidence rows are actually persisted.
+    ev_rows = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion.id
+            )
+        )
+    ).scalars().all()
+    source_kinds = {e.source_kind for e in ev_rows}
+    assert "task_merge" in source_kinds
+    assert "reachability" in source_kinds
+
+
+@pytest.mark.asyncio
+async def test_reconcile_backfill_all_directions_with_merged_task(
+    client: AsyncClient, db_session
+):
+    """All-directions backfill aggregates evidence across directions with proven merged tasks."""
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project, status="open")
+    dir_a = await _make_direction(db_session, project, key="d-all-proven-a")
+    dir_b = await _make_direction(db_session, project, key="d-all-proven-b")
+
+    for direction, ckey in [
+        (dir_a, "c-all-proven-a"),
+        (dir_b, "c-all-proven-b"),
+    ]:
+        criterion = VersionAcceptanceCriterion(
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=ckey,
+            text=f"Criterion for {direction.direction_key}",
+            status="active",
+        )
+        db_session.add(criterion)
+        await db_session.commit()
+        direction.criterion_keys = [ckey]
+        db_session.add(direction)
+        await db_session.commit()
+
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.COMPLETED,
+            completed_at=version.opened_at + timedelta(seconds=1),
+            context={
+                "direction_id": direction.direction_key,
+                "pr_merged": True,
+                CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/reconcile-backfill",
+        json={},
+    )
+    assert resp.status_code == 200, f"expected 200, got {resp.status_code}: {resp.text}"
+    data = resp.json()
+    assert data["status"] == "ok"
+    # 2 evidence rows per direction (task_merge + reachability) × 2 directions = 4
+    assert data["total_evidence_recorded"] == 4
+    direction_keys_in_results = {r["direction_key"] for r in data["results"]}
+    assert dir_a.direction_key in direction_keys_in_results
+    assert dir_b.direction_key in direction_keys_in_results

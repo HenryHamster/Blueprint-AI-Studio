@@ -72,7 +72,7 @@ from app.strategic_spawning import (
 )
 from app.strategic_analysis import _build_outcome_evaluation
 from app.direction_lifecycle import _reset_outcome_detection_state
-from app.models import Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, VersionAcceptanceCriterion
+from app.models import CriterionEvidence, Direction, Project, ProjectMember, ReleaseVersion, StrategicCycle, Task, TaskStatus, VersionAcceptanceCriterion
 from app.auth import create_agent_token
 from httpx import AsyncClient
 from sqlmodel import select
@@ -18049,6 +18049,123 @@ async def test_set_acceptance_criteria_rejects_inactive_or_dangling_direction_ma
     assert dangling_key not in direction.criterion_keys, (
         "Dangling criterion key must be scrubbed from direction.criterion_keys"
     )
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_backfills_evidence_for_prelanded_task(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria backfill hook records evidence for a task that already
+    merged before the criterion-direction mapping was created.
+
+    This exercises the 'late-mapping' scenario: a task shipped, then the strategist
+    maps a new criterion to that direction.  The backfill hook in the strategic op
+    should replay evidence for the pre-existing proven task.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    # --- Setup ---
+    project = Project(name="AC-Backfill-Strategic", user_id="test-user-ac-bf")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-ac-bf-test1",
+        data={"id": "d-ac-bf-test1", "text": "Backfill test direction", "status": "active"},
+        status="active",
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    # Pre-existing task that already merged in the current version window.
+    pre_landed_task = Task(
+        project_id=project.id,
+        status=TaskStatus.COMPLETED,
+        completed_at=version.opened_at + timedelta(seconds=1),
+        context={
+            "direction_id": direction.direction_key,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+    )
+    db_session.add(pre_landed_task)
+    await db_session.commit()
+    await db_session.refresh(pre_landed_task)
+
+    # Strategic task that will author the criterion.
+    strategic_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-bf",
+    )
+    db_session.add(strategic_task)
+    await db_session.commit()
+    await db_session.refresh(strategic_task)
+
+    token = create_agent_token(
+        str(strategic_task.id), "agent-vm-ac-bf", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # Call set_acceptance_criteria — maps a new criterion to the direction that
+    # already has a proven merged task.
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(strategic_task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "Pre-landed criterion coverage check",
+                        "direction_keys": [direction.direction_key],
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    criterion_key = body["criteria"][0]["criterion_key"]
+
+    # The backfill hook should have created evidence for the pre-landed task.
+    criteria_rows = (
+        await db_session.execute(
+            select(VersionAcceptanceCriterion).where(
+                VersionAcceptanceCriterion.criterion_key == criterion_key
+            )
+        )
+    ).scalars().all()
+    assert len(criteria_rows) == 1, "Criterion row must exist"
+    criterion_id = criteria_rows[0].id
+
+    ev_rows = (
+        await db_session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id == criterion_id
+            )
+        )
+    ).scalars().all()
+    source_kinds = {e.source_kind for e in ev_rows}
+    assert "task_merge" in source_kinds, (
+        "Backfill hook must have recorded task_merge evidence for the pre-landed task"
+    )
+    assert "reachability" in source_kinds, (
+        "Backfill hook must have recorded reachability evidence for the pre-landed task"
+    )
+    # All evidence rows reference the pre-landed task.
+    for ev in ev_rows:
+        assert ev.source_id == str(pre_landed_task.id)
 
 
 @pytest.mark.asyncio

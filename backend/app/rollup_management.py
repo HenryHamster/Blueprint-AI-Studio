@@ -1550,25 +1550,25 @@ async def _check_and_trigger_rollup(
             respawned = 0
             # Phase A: decide under lock; collect respawn candidates.
             respawn_candidates: list[dict] = []
+            # Batch-fetch PR artifacts for all unmerged children in one query.
+            _unmerged_ids = [c.id for c in unmerged]
+            _pr_arts_result = await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id.in_(_unmerged_ids),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                )
+            )
+            _pr_art_by_task: dict = {}
+            for _art in _pr_arts_result.scalars().all():
+                if _art.task_id not in _pr_art_by_task:
+                    _pr_art_by_task[_art.task_id] = _art
             for c in unmerged:
                 age = (now - c.updated_at).total_seconds() if c.updated_at else 0
                 if age < stale_threshold.total_seconds():
                     continue  # Too recent — normal pipeline may still be working
                 # Look up PR artifact to get pr_number and branch
-                pr_art = (
-                    (
-                        await session.execute(
-                            select(Artifact)
-                            .where(
-                                Artifact.task_id == c.id,
-                                Artifact.artifact_type == ArtifactType.PULL_REQUEST,
-                            )
-                            .limit(1)
-                        )
-                    )
-                    .scalars()
-                    .first()
-                )
+                pr_art = _pr_art_by_task.get(c.id)
                 if not pr_art or not pr_art.pr_url:
                     # No PR artifact — _verify_pr_merged should have handled this.
                     # Force-set pr_merged so next cycle picks it up.

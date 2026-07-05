@@ -94,6 +94,7 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
 
 
 MAX_CRITERIA_PER_VERSION = 50
+MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY = 10
 
 
 def generate_criterion_key() -> str:
@@ -301,6 +302,22 @@ def compute_criterion_coverage(evidence: list[CriterionEvidence]) -> str:
     return "partial"
 
 
+def _criterion_evidence_summary_entries(
+    evidence: list[CriterionEvidence],
+) -> list[dict[str, Any]]:
+    """Return the bounded evidence preview carried by coverage summaries."""
+    preview = evidence[-MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY:]
+    return [
+        {
+            "source_kind": e.source_kind,
+            "source_id": e.source_id,
+            "detail": e.detail,
+            "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+        }
+        for e in preview
+    ]
+
+
 async def filter_active_criterion_keys(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -476,7 +493,6 @@ async def record_task_merge_evidence(
         for row in rows:
             existing = evidence_by_criterion[row.id]
             source_id = task_id_str or None
-            wrote = False
             if ("task_merge", source_id) not in existing:
                 await record_evidence(
                     session,
@@ -486,7 +502,7 @@ async def record_task_merge_evidence(
                     source_id=source_id,
                     detail=task_merge_detail,
                 )
-                wrote = True
+                recorded += 1
             if ("reachability", source_id) not in existing:
                 await record_evidence(
                     session,
@@ -496,14 +512,104 @@ async def record_task_merge_evidence(
                     source_id=source_id,
                     detail={"proven": True},
                 )
-                wrote = True
-            if wrote:
                 recorded += 1
         return recorded
     except Exception:
         logger.exception(
             "record_task_merge_evidence: failed for task %s",
             getattr(task, "id", None),
+        )
+        return 0
+
+
+async def backfill_direction_merge_evidence(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str,
+) -> int:
+    """Replay merge evidence for already-merged tasks belonging to a direction.
+
+    Called after a criterion-direction mapping is created so that tasks that
+    merged *before* the mapping was set are not stranded without evidence.
+
+    Queries Task rows for this project with status COMPLETED whose context
+    carries ``direction_id == direction_key``, then applies
+    :func:`record_task_merge_evidence` to each.  That function gates on the
+    proven acceptance verdict and is idempotent (duplicate evidence rows are
+    skipped), so calling this multiple times is safe.
+
+    Returns the total count of evidence rows newly recorded across all tasks.
+    Best-effort: any exception is logged and swallowed so a backfill failure
+    never raises to the caller.
+    """
+    try:
+        from app.landed_signal import is_merged_completion, landed_signal_predicate
+        from app.models import Task, TaskStatus
+        from app.database import resolve_dialect_name
+        from app.release_version import current_open_version as _cur_open_ver
+
+        # Scope replay to the current open version window so tasks that merged
+        # in a prior release cannot satisfy current-version criteria.  The
+        # intended "late-mapping" case (task merged in the current window before
+        # the criterion-direction mapping existed) is preserved because those
+        # tasks completed AFTER the current version opened.
+        open_version = await _cur_open_ver(session, project_id)
+        if open_version is None:
+            logger.info(
+                "backfill_direction_merge_evidence: no open version for "
+                "project %s; skipping backfill for direction %s",
+                project_id,
+                direction_key,
+            )
+            return 0
+        version_opened_at = open_version.opened_at
+
+        dialect = resolve_dialect_name(session)
+        if dialect == "sqlite":
+            from sqlalchemy import func as _func
+            direction_filter = _func.json_extract(Task.context, "$.direction_id") == direction_key
+        else:
+            from sqlalchemy import cast as _cast
+            from sqlalchemy.dialects.postgresql import JSONB as _JSONB
+            direction_filter = Task.context.op("@>")(_cast({"direction_id": direction_key}, _JSONB))
+
+        result = await session.execute(
+            select(Task).where(
+                Task.project_id == project_id,
+                Task.status == TaskStatus.COMPLETED,
+                Task.completed_at >= version_opened_at,
+                landed_signal_predicate(session),
+                direction_filter,
+            )
+        )
+        tasks = list(result.scalars().all())
+
+        total = 0
+        for task in tasks:
+            if not is_merged_completion(task):
+                continue
+            try:
+                total += await record_task_merge_evidence(session, task, project_id)
+            except Exception:
+                logger.warning(
+                    "backfill_direction_merge_evidence: failed for task %s, skipping",
+                    task.id,
+                    exc_info=True,
+                )
+        logger.info(
+            "backfill_direction_merge_evidence: direction=%s project=%s "
+            "tasks_scanned=%d evidence_recorded=%d",
+            direction_key,
+            project_id,
+            len(tasks),
+            total,
+        )
+        return total
+    except Exception:
+        logger.exception(
+            "backfill_direction_merge_evidence: failed for direction %s project %s",
+            direction_key,
+            project_id,
         )
         return 0
 
@@ -707,7 +813,9 @@ async def get_version_coverage_summary(
                     'coverage': 'covered' | 'partial' | 'uncovered',
                     'status': 'active' | 'retracted' | 'superseded',
                     'evidence_count': int,
+                    'evidence_truncated': bool,
                     'stuck_reason': 'no_mapping' | 'direction_retired' | None,
+                    'evidence': [ ... ],  # capped provenance preview
                 },
                 ...
             ],
@@ -781,6 +889,7 @@ async def get_version_coverage_summary(
         stuck_reason = stuck_reasons.get(criterion.criterion_key)
         if stuck_reason is not None:
             stuck_count += 1
+        evidence_truncated = len(evidence) > MAX_EVIDENCE_PER_CRITERION_IN_SUMMARY
         criteria_detail.append(
             {
                 "criterion_key": criterion.criterion_key,
@@ -788,16 +897,9 @@ async def get_version_coverage_summary(
                 "coverage": coverage,
                 "status": criterion.status,
                 "evidence_count": len(evidence),
+                "evidence_truncated": evidence_truncated,
                 "stuck_reason": stuck_reason,
-                "evidence": [
-                    {
-                        "source_kind": e.source_kind,
-                        "source_id": e.source_id,
-                        "detail": e.detail,
-                        "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
-                    }
-                    for e in evidence
-                ],
+                "evidence": _criterion_evidence_summary_entries(evidence),
             }
         )
 
