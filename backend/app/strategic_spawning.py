@@ -2916,6 +2916,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "running_update": {"priority": "high", "exempt": True},
     "running_update_acknowledged_at": {"priority": "high", "exempt": True},
     "user_last_active_at": {"priority": "high", "exempt": True},
+    # Timestamp when the first autonomous improvement (create/fix/refactor task)
+    # merged on external projects. Absent for self-repo and projects with no
+    # merged autonomous improvements yet. High priority, exempt: tiny scalar.
+    "first_autonomous_improvement_at": {"priority": "high", "exempt": True},
     # Bounded summary of the operator's recent reconciliation overrides (what the
     # agent proposed vs. what the operator kept, per document). Medium priority
     # with no summarize_fn: it is already capped + char-bounded at build time, so

@@ -1352,3 +1352,40 @@ def test_core_sections_survive_realistic_worst_case():
     assert "problem_model" in out
     assert "problem_model" not in dropped_keys
     assert out["_packer_meta"]["budget_used"] <= budget
+
+
+def test_first_autonomous_improvement_at_registered_in_schema(caplog):
+    """The first_autonomous_improvement_at timestamp field is properly registered
+    in the schema, so it does not trigger a missing-schema warning and is treated
+    as high-priority exempt (not demoted to low).
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    # Verify the field is registered in the schema with correct priority.
+    assert "first_autonomous_improvement_at" in _STRATEGIC_REVIEW_SCHEMA
+    entry = _STRATEGIC_REVIEW_SCHEMA["first_autonomous_improvement_at"]
+    assert entry.get("priority") == "high"
+    assert entry.get("exempt") is True
+
+    # Pack a payload with the field — no missing-schema warning should appear.
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "demo"},
+        "first_autonomous_improvement_at": "2026-07-05T12:00:00Z",
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "critical"},
+        "first_autonomous_improvement_at": _STRATEGIC_REVIEW_SCHEMA[
+            "first_autonomous_improvement_at"
+        ],
+    }
+    with caplog.at_level(logging.WARNING):
+        out = pack_under_budget(payload, schema, budget=10_000)
+
+    # Field is present in the output.
+    assert out["first_autonomous_improvement_at"] == "2026-07-05T12:00:00Z"
+    # No missing-schema warning logged.
+    assert not any(
+        "no schema entry" in rec.message.lower() for rec in caplog.records
+    )
