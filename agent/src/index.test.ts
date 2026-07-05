@@ -891,6 +891,10 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
     expect(_getWarmStartForTesting()).toBe(true);
   });
@@ -7083,6 +7087,10 @@ describe('LLM telemetry counters', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7099,6 +7107,10 @@ describe('LLM telemetry counters', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7114,6 +7126,10 @@ describe('LLM telemetry counters', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 
@@ -7129,6 +7145,10 @@ describe('LLM telemetry counters', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      total_tool_result_bytes: 0,
+      prompt_size_bytes: null,
+      prompt_section_count: null,
+      prompt_section_sizes: null,
     });
   });
 });

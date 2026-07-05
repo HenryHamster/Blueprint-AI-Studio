@@ -13577,14 +13577,30 @@ async def test_system_verification_path_symbol_pointer_not_flagged_missing(
     await db_session.commit()
     await db_session.refresh(project)
 
-    # Return True only for bare file paths (no :Symbol suffix). This discriminates
-    # between the pre-fix call with raw "models.py:Alert" (→ False, missing) and
-    # the post-fix normalized call with "models.py" (→ True, present).
+    # The real _file_exists_at_head normalizes a path:Symbol pointer internally
+    # (via _normalize_module_ptr) BEFORE the existence check, so 'models.py:Alert'
+    # resolves to the bare file. Stub it faithfully: run that same real
+    # normalization, then report the bare file present. Returning True only for a
+    # normalized bare path (no residual :Symbol) is what discriminates a working
+    # normalizer (→ present, verified) from a regressed one (→ missing). This
+    # exercises the real normalizer while staying hermetic — no /tmp/workspace.
+    from app.source_ref_validation import _normalize_module_ptr
+
     async def _exists(path, **kwargs):
-        return ":" not in path and "/" in path
+        normalized = _normalize_module_ptr(path)
+        return ":" not in normalized and "/" in normalized
 
     mocker.patch(
         "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    # The symbol-level depth check (detect_absent_symbols → _symbol_defined_at_head)
+    # shells out to `git show` in /tmp/workspace, which does not exist in the test
+    # harness. Symbol absence is out of scope for this file-normalization test
+    # (covered by the symbol-verification tests); stub it to report none absent so
+    # the test stays hermetic and asserts only the path-normalization behavior.
+    mocker.patch(
+        "app.autonomous_research.detect_absent_symbols",
+        new=AsyncMock(return_value=[]),
     )
 
     payload = await _spawn_and_get_research_payload(project, db_session)
@@ -13621,11 +13637,24 @@ async def test_capability_verification_path_symbol_pointer_not_flagged_missing(
     await db_session.commit()
     await db_session.refresh(project)
 
+    # See the system-verification sibling above: the real _file_exists_at_head
+    # normalizes the path:Symbol suffix internally, so stub it to run that same
+    # real normalization and report the bare file present. Hermetic — no
+    # /tmp/workspace dependency.
+    from app.source_ref_validation import _normalize_module_ptr
+
     async def _exists(path, **kwargs):
-        return ":" not in path and "/" in path
+        normalized = _normalize_module_ptr(path)
+        return ":" not in normalized and "/" in normalized
 
     mocker.patch(
         "app.source_ref_validation._file_exists_at_head", side_effect=_exists
+    )
+    # The symbol-level check shells out to `git show` in /tmp/workspace (absent in
+    # the harness); symbol absence is out of scope here, so report none absent.
+    mocker.patch(
+        "app.autonomous_research.detect_absent_symbols",
+        new=AsyncMock(return_value=[]),
     )
 
     payload = await _spawn_and_get_research_payload(project, db_session)
