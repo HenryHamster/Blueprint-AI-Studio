@@ -163,6 +163,13 @@ export interface Direction {
     implementation_constraints?: string;
     [key: string]: unknown;
   } | null;
+  // Churn-retirement recommendation: set by the zombie-retire ladder when a
+  // paused direction has hit the max churn-pause-cycles threshold. The direction
+  // is held PAUSED pending an explicit operator Keep/Retire decision. All three
+  // fields are cleared once the operator submits a decision.
+  churn_retirement_recommended?: boolean;
+  churn_retirement_recommended_reason?: string | null;
+  churn_retirement_recommended_at?: string | null;
   // Advisory outcome-less-scaffolding flag: set by the backend detector when a
   // long-running direction keeps merging PRs at a healthy rate but shows no
   // progress toward its stated success_evidence. ADVISORY ONLY — never auto-pauses.
@@ -457,6 +464,7 @@ export function DirectionsPanel({
             dismissDirectionUpdate={data.dismissDirectionUpdate}
             triggerResearch={data.triggerResearch}
             reorderDirections={data.reorderDirections}
+            decideChurnRetirement={data.decideChurnRetirement}
             taskCounts={data.taskCounts}
             activeTasks={data.activeTasks}
             cooldownMinutes={config.cooldownMinutes}

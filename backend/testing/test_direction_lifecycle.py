@@ -4387,3 +4387,365 @@ async def test_resurrected_direction_survives_next_lifecycle_tick(db_session, mo
         "auto_recovered_at should remain set while still in grace period"
     )
     assert d.get("churn_family_pause_count", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# Churn-retirement RECOMMENDATION-and-hold lifecycle (replaces the former
+# silent terminal zombie retire). See direction_lifecycle churn ladder site.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_churn_retirement_recommended_survives_ttl_and_cooldown(db_session, mocker):
+    """NAMED acceptance test. A churn-retirement-recommended direction is HELD
+    PAUSED indefinitely: neither the 72h needs_manual_intervention TTL fallback
+    nor the 48h auto-recovery cooldown silently un-flags or reactivates it. It
+    survives repeated lifecycle ticks well past BOTH windows without reactivating
+    and without the recommendation clearing — only an explicit keep/retire
+    decision may release it."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    direction = {
+        "id": "d-hold",
+        "text": "Churn direction held for a keep/retire decision",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": _unproductive_history(now),
+        "churn_family_pause_count": 1,  # next churn pause hits the recommend fence
+        "gap_id": "g-hold",
+    }
+    project = Project(
+        name="Churn Hold Test",
+        user_id="u-hold",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+        problem_model={
+            "gaps": [
+                {
+                    "id": "g-hold",
+                    "name": "Hold gap",
+                    "status": "active",
+                    "active_moves": ["d-hold"],
+                    "past_moves": [],
+                }
+            ]
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # Tick 1: drive the direction to the churn-retirement recommendation + hold.
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "paused", "recommendation must hold the direction paused"
+    assert d.get("churn_retirement_recommended") is True
+    assert d.get("needs_manual_intervention") is True
+    assert d.get("auto_completed") is not True
+
+    # Repeatedly age the hold past BOTH the 72h intervention TTL and the 48h
+    # auto-recovery cooldown (both computed against real wall-clock _utcnow()),
+    # then tick. Without the churn_retirement_recommended guards the TTL loop
+    # would clear needs_manual_intervention and a follow-up recovery tick would
+    # reactivate the direction. The guards must keep it held every time.
+    for i in range(3):
+        stale = (datetime.utcnow() - timedelta(hours=200)).isoformat()
+        project.directions[0]["paused_at"] = stale
+        project.directions[0]["needs_manual_intervention_at"] = stale
+        flag_modified(project, "directions")
+        db_session.add(project)
+        await db_session.commit()
+
+        await _process_direction_lifecycle(
+            project,
+            db_session,
+            busy_direction_ids=set(),
+            now=now + timedelta(hours=200 * (i + 1)),
+        )
+        await db_session.refresh(project)
+        d = project.directions[0]
+        assert d["status"] == "paused", (
+            f"tick {i + 2}: churn-recommended direction must not silently reactivate"
+        )
+        assert d.get("churn_retirement_recommended") is True, (
+            f"tick {i + 2}: recommendation must not be cleared by time alone"
+        )
+        assert d.get("needs_manual_intervention") is True, (
+            f"tick {i + 2}: needs_manual_intervention must survive the 72h TTL fallback"
+        )
+        assert d.get("churn_family_pause_count") == 2, (
+            f"tick {i + 2}: ladder counter must not advance while held paused"
+        )
+
+    # Never terminally retired by a time-based pass: no auto-retired memory is
+    # ever written across all the aged ticks.
+    retired_memory = (project.vision or {}).get("_recently_retired_directions") or []
+    assert not any(mem.get("id") == "d-hold" for mem in retired_memory), (
+        "a held direction must never record retired memory via a time-based pass"
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_recovery_recovers_normal_but_not_recommended(db_session, mocker):
+    """The churn_retirement_recommended auto-recovery guard is targeted: a normal
+    auto-paused direction past the cooldown still auto-recovers to active, while a
+    churn-retirement-recommended direction at the same age stays paused."""
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    stale = (now - timedelta(hours=200)).isoformat()
+
+    normal = {
+        "id": "d-normal-recover",
+        "text": "Ordinary auto-paused direction past cooldown",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged across 5 cycles",
+        "paused_at": stale,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [
+            {
+                "timestamp": (now - timedelta(days=1)).isoformat(),
+                "tasks_created": 2,
+                "tasks_completed": 2,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 1,
+            }
+        ],
+    }
+    recommended = {
+        "id": "d-recommended-held",
+        "text": "Churn-retirement-recommended direction past cooldown",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged across 5 cycles",
+        "paused_at": stale,
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie",
+        "churn_retirement_recommended_at": stale,
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": stale,
+        "churn_family_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    project = Project(
+        name="Recovery Guard Contrast",
+        user_id="u-recover-guard",
+        autonomous_enabled=True,
+        directions=[normal, recommended],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    by_id = {d["id"]: d for d in project.directions}
+    assert by_id["d-normal-recover"]["status"] == "active", (
+        "a normal auto-paused direction past cooldown must still auto-recover"
+    )
+    held = by_id["d-recommended-held"]
+    assert held["status"] == "paused", (
+        "a churn-retirement-recommended direction must NOT auto-recover"
+    )
+    assert held.get("churn_retirement_recommended") is True
+    assert held.get("needs_manual_intervention") is True
+
+
+def test_reactivate_clears_churn_retirement_recommendation():
+    """reactivate_paused_direction (operator/strategist keep decision) clears the
+    churn-retirement recommendation cleanly so the hold is released and cannot
+    silently re-apply."""
+    from app.direction_lifecycle import reactivate_paused_direction
+
+    d = {
+        "id": "d-reactivate",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_at": "2026-01-01T00:00:00",
+        "paused_reason": "Unproductive: 0 PRs merged across 5 cycles",
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie",
+        "churn_retirement_recommended_at": "2026-01-01T00:00:00",
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-01-01T00:00:00",
+        "churn_family_pause_count": 2,
+    }
+    assert reactivate_paused_direction(d, allow_user_paused=False) is True
+    assert d["status"] == "active"
+    assert "churn_retirement_recommended" not in d
+    assert "churn_retirement_recommended_reason" not in d
+    assert "churn_retirement_recommended_at" not in d
+    assert "needs_manual_intervention" not in d
+
+
+def test_resurrect_strips_churn_retirement_recommendation():
+    """resurrect_direction strips the churn-retirement recommendation from a
+    snapshot AND resets the churn ladder counters, so a resurrected direction
+    leaves with the recommendation gone and cannot immediately re-recommend."""
+    from app.direction_lifecycle import resurrect_direction
+
+    d = {
+        "id": "d-resurrect-churn",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_at": "2026-01-01T00:00:00",
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie",
+        "churn_retirement_recommended_at": "2026-01-01T00:00:00",
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-01-01T00:00:00",
+        "churn_family_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    resurrect_direction(d)
+    assert d["status"] == "active"
+    assert "churn_retirement_recommended" not in d
+    assert "churn_retirement_recommended_reason" not in d
+    assert "churn_retirement_recommended_at" not in d
+    assert d["churn_family_pause_count"] == 0, (
+        "ladder reset so a resurrected direction cannot immediately re-recommend"
+    )
+
+
+def test_keep_decision_reactivates_and_resets_churn_ladder():
+    """apply_churn_retirement_keep reactivates a held-paused direction, clears the
+    recommendation + manual-hold residue, and resets the churn ladder to 0."""
+    from app.direction_lifecycle import apply_churn_retirement_keep
+
+    d = {
+        "id": "d-keep",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_at": "2026-01-01T00:00:00",
+        "paused_reason": "Churn guardrail: repeated no-merge",
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended",
+        "churn_retirement_recommended_at": "2026-01-01T00:00:00",
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-01-01T00:00:00",
+        "churn_family_pause_count": 2,
+        "churn_pause_evidence": {"windowed_non_merge": 9},
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    assert apply_churn_retirement_keep(d, allow_user_paused=True) is True
+    assert d["status"] == "active"
+    assert "churn_retirement_recommended" not in d
+    assert "needs_manual_intervention" not in d
+    assert d["churn_family_pause_count"] == 0
+    assert "churn_pause_evidence" not in d
+    assert d.get("auto_recovered_at")
+
+
+def test_retire_decision_completes_and_clears_recommendation():
+    """apply_churn_retirement_retire confirms the terminal outcome and clears the
+    recommendation + manual-hold flags."""
+    from app.direction_lifecycle import apply_churn_retirement_retire
+
+    d = {
+        "id": "d-retire",
+        "status": "paused",
+        "auto_paused": True,
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended",
+        "churn_retirement_recommended_at": "2026-01-01T00:00:00",
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-01-01T00:00:00",
+        "churn_family_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+    apply_churn_retirement_retire(d, reason="Retired by explicit decision")
+    assert d["status"] == "completed"
+    assert d["auto_completed"] is True
+    assert d["auto_completed_reason"] == "Retired by explicit decision"
+    assert d["completed_at"]
+    assert "churn_retirement_recommended" not in d
+    assert "needs_manual_intervention" not in d
+
+
+@pytest.mark.asyncio
+async def test_paused_churn_recommended_direction_surfaces_to_operator(db_session):
+    """A paused churn-retirement-recommended direction produces a needs_operator
+    attention item even though the manual-intervention path only sees active ones,
+    and the strategist payload surfaces the recommendation flag."""
+    from app.operator_attention import build_operator_attention
+    from app.strategic_spawning import _build_direction_stats
+
+    direction = {
+        "id": "d-churn-attn",
+        "text": "Zombie direction pending decision",
+        "status": "paused",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "auto_paused": True,
+        "paused_at": "2026-06-01T00:00:00",
+        "churn_family_pause_count": 2,
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-06-01T00:00:00",
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie loop",
+        "churn_retirement_recommended_at": "2026-06-01T00:00:00",
+    }
+    project = Project(
+        name="Churn Attention Test",
+        user_id="u-churn",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    attention = await build_operator_attention(db_session, project, "u-churn")
+    churn_items = [
+        item
+        for item in attention["items"]
+        if item.get("reason") == "churn_retirement_recommended"
+    ]
+    assert churn_items, "paused churn-recommended direction must surface to operator"
+    assert churn_items[0]["severity"] == "needs_operator"
+    assert churn_items[0]["ref"]["id"] == "d-churn-attn"
+    assert "zombie loop" in churn_items[0]["detail"]
+    assert attention["counts"]["churn_retirement_recommended"] == 1
+
+    _included, stats = _build_direction_stats(project)
+    stat = next(s for s in stats if s["id"] == "d-churn-attn")
+    assert stat["churn_retirement_recommended"] is True
+    assert "zombie loop" in stat["churn_retirement_recommended_reason"]

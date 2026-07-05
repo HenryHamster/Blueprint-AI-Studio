@@ -33,10 +33,15 @@ from app.task_locking import (
     acquire_direction_research_spawn_lock,
     lock_project_or_429,
     with_directions_locked,
+    with_problem_model_locked,
+    with_vision_locked,
 )
 from app.direction_lifecycle import (
     _clear_direction_reactivation_state,
     _reset_outcome_detection_state,
+    apply_churn_retirement_keep,
+    apply_churn_retirement_retire,
+    direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
     resurrect_direction,
 )
@@ -54,6 +59,7 @@ from app.problem_model import (
     check_gap_id_write,
     compute_model_size_signal,
     reconcile_gap_staffing_raw_result,
+    reconcile_gaps_for_retired_directions,
 )
 
 logger = logging.getLogger(__name__)
@@ -1383,6 +1389,145 @@ async def resurrect_direction_endpoint(
         "direction": resurrected_holder[0],
         "resurrected_at": now_iso,
     }
+
+
+_CHURN_DECISIONS = {"KEEP", "RETIRE"}
+_CHURN_RATIONALE_MAX = 512
+
+
+@router.post(
+    "/projects/{project_id}/directions/{direction_id}/churn-retirement-decision"
+)
+async def decide_churn_retirement(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Operator keep/retire decision for a churn-retirement-recommended direction.
+
+    The churn/zombie retire ladder flags a direction
+    ``churn_retirement_recommended=True`` and HOLDS it paused pending an explicit
+    decision (see ``direction_lifecycle``). This is the first-class decision seam:
+
+    * ``KEEP``   — clear the recommendation, reactivate the direction to
+      ``active``, and reset the churn-family ladder counter to 0 (a genuine fresh
+      start). Routed through ``reactivate_paused_direction`` so the user-paused
+      reactivation block is preserved and pause residue / grace are handled the
+      same way every other reactivation is.
+    * ``RETIRE`` — confirm the terminal outcome the recommendation proposed
+      (``completed``/``auto_completed``) with a reason attributing it to the
+      explicit decision, clear the recommendation, and reconcile the freed
+      problem-model gap plus record retired-direction memory (mirroring the
+      auto-retire ladders / strategist retire op).
+
+    Idempotent: a direction with no pending recommendation returns a clear no-op
+    response rather than a 500. Follows the resurrect/unhold conventions —
+    project role check + locked JSONB mutation via ``with_directions_locked``.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="request body required")
+    decision = payload.get("decision")
+    if not isinstance(decision, str) or decision.upper() not in _CHURN_DECISIONS:
+        raise HTTPException(
+            status_code=400, detail="decision must be 'KEEP' or 'RETIRE'"
+        )
+    decision = decision.upper()
+    rationale = payload.get("rationale")
+    if rationale is not None and not isinstance(rationale, str):
+        raise HTTPException(
+            status_code=400, detail="rationale must be a string or null"
+        )
+
+    actor = current_user.get("email") or current_user.get("user_id") or "operator"
+    now_iso = _utcnow().isoformat()
+
+    outcome: Dict[str, Any] = {}
+    result_holder: list[dict] = []
+    retire_holder: list[dict] = []
+
+    def _mutate(directions: list) -> None:
+        target = next(
+            (d for d in directions if d.get("id") == direction_id), None
+        )
+        if target is None:
+            raise HTTPException(status_code=404, detail="Direction not found")
+        if not direction_has_churn_retirement_recommendation(target):
+            # Idempotent no-op: nothing pending to decide (never a 500).
+            outcome["status"] = "noop"
+            result_holder.append(target)
+            return
+        if decision == "KEEP":
+            # Operator may resume even a user-paused direction; a churn-recommended
+            # direction is auto_paused so this never hits the user-paused block,
+            # but pass allow_user_paused=True to match the operator PATCH convention.
+            apply_churn_retirement_keep(target, allow_user_paused=True)
+            outcome["status"] = "kept"
+        else:
+            reason = (
+                f"Retired by explicit keep/retire decision ({actor}): "
+                "churn/zombie retirement recommendation confirmed."
+            )
+            if rationale and rationale.strip():
+                reason = f"{reason} {rationale.strip()[:_CHURN_RATIONALE_MAX]}"
+            apply_churn_retirement_retire(target, reason=reason, now_iso=now_iso)
+            outcome["status"] = "retired"
+            retire_holder.append(dict(target))
+        result_holder.append(target)
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
+
+    if outcome.get("status") == "retired" and retire_holder:
+        # Reconcile the freed gap and record retired-direction memory in the SAME
+        # committed transaction, mirroring the strategist retire_direction op so a
+        # decided-retire direction cannot linger in a gap's active_moves and blocks
+        # a same-gap / text-overlap re-spawn next cycle.
+        def _reconcile_pm(pm: dict) -> None:
+            reconcile_gaps_for_retired_directions(pm, [direction_id], now_iso)
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm)
+
+        from app.strategic_completion import (  # noqa: PLC0415
+            record_retired_direction_memory,
+        )
+
+        _retire_snapshot = retire_holder[0]
+
+        def _record_memory(vision: dict) -> None:
+            record_retired_direction_memory(
+                vision,
+                _retire_snapshot,
+                reason="churn_retirement_decision",
+                outcome=(rationale.strip() if rationale and rationale.strip() else None),
+            )
+
+        await with_vision_locked(session, project.id, _record_memory)
+
+    await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
+
+    resp: Dict[str, Any] = {
+        "status": outcome.get("status", "noop"),
+        "decision": decision,
+        "direction_id": direction_id,
+    }
+    if result_holder:
+        resp["direction"] = result_holder[0]
+    if outcome.get("status") == "noop":
+        resp["reason"] = "No pending churn-retirement recommendation"
+    return resp
 
 
 @router.post("/projects/{project_id}/directions/{direction_id}/research")

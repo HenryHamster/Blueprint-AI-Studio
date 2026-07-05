@@ -1401,6 +1401,21 @@ export async function fetchEvictedFindings(
   return res.json();
 }
 
+export async function submitChurnRetirementDecision(
+  projectId: string,
+  directionId: string,
+  decision: 'KEEP' | 'RETIRE',
+  rationale?: string,
+): Promise<void> {
+  const body: Record<string, unknown> = { decision };
+  if (rationale) body.rationale = rationale;
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/directions/${encodeURIComponent(directionId)}/churn-retirement-decision`,
+    { method: 'POST', body: JSON.stringify(body) },
+  );
+  if (!res.ok) throw new Error(`Failed to submit churn-retirement decision: ${res.status}`);
+}
+
 export interface SrCategoryTrend {
   current_hit_rate?: number | null;
   previous_hit_rate?: number | null;

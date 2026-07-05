@@ -5907,6 +5907,14 @@ def _build_direction_stats(
             _cre_ev = d.get("churn_retirement_evidence")
             if _cre_ev:
                 stat_entry["churn_retirement_evidence"] = _cre_ev
+            if d.get("churn_retirement_recommended_reason"):
+                stat_entry["churn_retirement_recommended_reason"] = d.get(
+                    "churn_retirement_recommended_reason"
+                )
+            if d.get("churn_retirement_recommended_at"):
+                stat_entry["churn_retirement_recommended_at"] = d.get(
+                    "churn_retirement_recommended_at"
+                )
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).

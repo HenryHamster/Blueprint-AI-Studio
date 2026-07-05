@@ -135,6 +135,13 @@ def _clear_direction_reactivation_state(direction: dict) -> None:
         "auto_retire_pending",
         "auto_retire_pending_reason",
         "auto_retire_pending_at",
+        # Clear the churn-retirement recommendation: a sanctioned reactivation
+        # (operator PATCH / strategist reactivate) is the explicit keep decision
+        # the hold was waiting for, so the recommendation must not survive it and
+        # silently re-hold the direction.
+        "churn_retirement_recommended",
+        "churn_retirement_recommended_reason",
+        "churn_retirement_recommended_at",
     ):
         direction.pop(key, None)
     direction["remediation_attempts"] = 0
@@ -211,6 +218,15 @@ _TERMINAL_RESIDUE_KEYS = (
     "auto_retire_pending",
     "auto_retire_pending_reason",
     "auto_retire_pending_at",
+    # Churn-retirement recommendation residue: a direction resurrected from a
+    # DirectionEvent snapshot (possibly captured while the recommendation was
+    # set) must not carry the flag into its new life and immediately re-hold /
+    # re-recommend. resurrect_direction also resets the churn ladder counters, so
+    # the resurrected direction leaves with the recommendation gone AND the
+    # ladder at zero.
+    "churn_retirement_recommended",
+    "churn_retirement_recommended_reason",
+    "churn_retirement_recommended_at",
 )
 # Cap on the audit-note rationale so a resurrected direction can't bloat the
 # directions JSONB with an unbounded operator string.
@@ -289,6 +305,74 @@ def resurrect_direction(
     direction["resurrection_notes"] = notes
 
     return direction
+
+
+# Fields stamped by the churn/zombie retire-RECOMMENDATION ladder. Both keep and
+# retire decisions clear them (KEEP via _clear_direction_reactivation_state, which
+# lists the same keys; RETIRE explicitly below), so a decided direction never
+# carries a stale recommendation that would silently re-hold it.
+_CHURN_RETIREMENT_RECOMMENDATION_KEYS = (
+    "churn_retirement_recommended",
+    "churn_retirement_recommended_reason",
+    "churn_retirement_recommended_at",
+)
+
+
+def direction_has_churn_retirement_recommendation(direction: dict) -> bool:
+    """True when a direction is held paused pending an explicit keep/retire decision."""
+    return isinstance(direction, dict) and bool(
+        direction.get("churn_retirement_recommended")
+    )
+
+
+def apply_churn_retirement_keep(direction: dict, *, allow_user_paused: bool) -> bool:
+    """KEEP decision on a churn-retirement-recommended direction.
+
+    Reactivates the held-paused direction back to ``active`` via
+    :func:`reactivate_paused_direction` — which clears the recommendation fields
+    and pause/intervention residue (through
+    :func:`_clear_direction_reactivation_state`) and stamps the
+    ``auto_recovered_at`` grace marker so frozen ``research_history`` cannot
+    immediately re-pause it — and then gives the churn ladder a GENUINE fresh
+    start by zeroing ``churn_family_pause_count`` and dropping its evidence blob,
+    so the same zombie ladder does not immediately re-recommend retirement on the
+    next pause.
+
+    Returns ``False`` WITHOUT mutating when the user-paused block applies
+    (mirrors :func:`reactivate_paused_direction`), so the caller can emit its own
+    block response and the user-paused reactivation guard is never weakened.
+    """
+    if not reactivate_paused_direction(direction, allow_user_paused=allow_user_paused):
+        return False
+    # Fresh start scoped to the churn family — the ladder that produced the
+    # recommendation. Other ladder counters are intentionally left untouched.
+    direction["churn_family_pause_count"] = 0
+    direction.pop("churn_pause_evidence", None)
+    return True
+
+
+def apply_churn_retirement_retire(
+    direction: dict, *, reason: str, now_iso: str | None = None
+) -> None:
+    """RETIRE decision on a churn-retirement-recommended direction.
+
+    Confirms the terminal outcome the recommendation was proposing: marks the
+    direction ``completed``/``auto_completed`` with a reason attributing the
+    retirement to an explicit keep/retire decision, and clears the recommendation
+    fields plus the manual-hold flags the recommendation set (retirement
+    supersedes them — mirrors :func:`_retire_lifetime_burn`). Gap reconciliation
+    and retired-direction memory are the caller's responsibility (they need the
+    problem_model / vision, which live outside the direction dict).
+    """
+    now = now_iso or _utcnow().isoformat()
+    direction["status"] = "completed"
+    direction["auto_completed"] = True
+    direction["auto_completed_reason"] = reason
+    direction["completed_at"] = now
+    for key in _CHURN_RETIREMENT_RECOMMENDATION_KEYS:
+        direction.pop(key, None)
+    direction.pop("needs_manual_intervention", None)
+    direction.pop("needs_manual_intervention_at", None)
 
 
 def _detect_partial_remediation_success(direction: dict) -> bool | None:
@@ -1005,6 +1089,14 @@ async def _process_direction_lifecycle_locked(
         # intervention and should not auto-expire.
         if (d.get("paused_reason") or "").startswith("Lifetime burn backstop:"):
             continue
+        # Skip TTL clear for churn-retirement-recommended directions — the
+        # recommendation holds the direction paused pending an explicit
+        # keep/retire decision. Silently clearing needs_manual_intervention here
+        # (after 72h) would let the auto-recovery pass reactivate it with no
+        # decision made. It must survive indefinitely until a sanctioned
+        # reactivation/undo path clears churn_retirement_recommended.
+        if d.get("churn_retirement_recommended"):
+            continue
         flagged_at = d.get("needs_manual_intervention_at")
         if not flagged_at:
             continue
@@ -1031,6 +1123,14 @@ async def _process_direction_lifecycle_locked(
             or not d.get("auto_paused")
             or not d.get("paused_at")
         ):
+            continue
+        # Churn-retirement-recommended directions are held paused pending an
+        # explicit keep/retire decision — never silently reactivate them by time
+        # alone. This guard is defensive-in-depth alongside the needs_manual_
+        # intervention flag (which the branch below already respects): even if
+        # that flag were cleared elsewhere, the recommendation itself keeps the
+        # direction paused until a sanctioned undo path clears the flag.
+        if d.get("churn_retirement_recommended"):
             continue
         recovery_hours = default_recovery_hours
         try:
@@ -1600,6 +1700,15 @@ async def _process_direction_lifecycle_locked(
                     pause_reason,
                     churn_metrics,
                 )
+                # Mirror the structured evidence summary into a human-readable
+                # reason so the strategist decision endpoints, operator-attention
+                # surface, and DirectionCard (which read
+                # churn_retirement_recommended_reason) show a meaningful
+                # explanation. Cleared alongside the other recommendation fields
+                # on a keep/retire decision (_CHURN_RETIREMENT_RECOMMENDATION_KEYS).
+                d["churn_retirement_recommended_reason"] = d[
+                    "churn_retirement_evidence"
+                ]["summary"]
                 # Flag for manual intervention so operator-facing surfaces treat it
                 # like the lifetime-burn recommendation (a retire/reset decision is
                 # owed), without touching the auto-recovery/reactivation-grace path

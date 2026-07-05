@@ -19224,6 +19224,156 @@ async def test_retire_direction_records_retired_memory(
     assert entry.get("outcome") == "lane is complete, evidence shipped"
 
 
+async def _make_strategic_churn_recommended_task(
+    db_session, *, name, vm, direction_id, gap_id="g-churn"
+):
+    """Build a project + strategic_review task with one churn-retirement-recommended
+    direction held PAUSED, staffing a problem-model gap."""
+    from app import strategic_cycle
+
+    direction = {
+        "id": direction_id,
+        "text": "zombie direction pending keep/retire decision",
+        "status": "paused",
+        "priority": "medium",
+        "notes": [],
+        "research_history": [],
+        "gap_id": gap_id,
+        "auto_paused": True,
+        "paused_reason": "Churn guardrail: repeated no-merge",
+        "paused_at": "2026-06-01T00:00:00",
+        "churn_family_pause_count": 2,
+        "churn_pause_evidence": {"windowed_non_merge": 9},
+        "needs_manual_intervention": True,
+        "needs_manual_intervention_at": "2026-06-01T00:00:00",
+        "churn_retirement_recommended": True,
+        "churn_retirement_recommended_reason": "Retirement recommended: zombie loop",
+        "churn_retirement_recommended_at": "2026-06-01T00:00:00",
+    }
+    project = Project(
+        name=name,
+        user_id=TEST_USER_ID,
+        vision={"purpose": "test", "revision": 1},
+        directions=[direction],
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": gap_id,
+                    "name": "churn gap",
+                    "status": "active",
+                    "active_moves": [direction_id],
+                    "past_moves": [],
+                }
+            ],
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id=vm,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_strategic_decide_churn_retirement_keep(
+    client: AsyncClient, db_session, mocker
+):
+    """The strategist decide_churn_retirement KEEP op reactivates the held direction
+    and resets the churn ladder, clearing the recommendation."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_churn_recommended_task(
+        db_session, name="ChurnKeep", vm="vm-churn-keep", direction_id="d-churn-keep"
+    )
+    token = create_agent_token(
+        str(task.id), "vm-churn-keep", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "decide_churn_retirement",
+            "data": {"direction_id": "d-churn-keep", "decision": "KEEP"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "kept"
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-churn-keep")
+    assert d["status"] == "active"
+    assert not d.get("churn_retirement_recommended")
+    assert d["churn_family_pause_count"] == 0
+    assert not d.get("needs_manual_intervention")
+
+
+@pytest.mark.asyncio
+async def test_strategic_decide_churn_retirement_retire(
+    client: AsyncClient, db_session, mocker
+):
+    """The strategist decide_churn_retirement RETIRE op completes the direction,
+    clears the recommendation, reconciles the gap, and records retired memory."""
+    from app.auth import create_agent_token
+
+    mocker.patch(
+        "app.routers.admin_agent_ops.emit_strategic_updated", new=AsyncMock()
+    )
+    project, task = await _make_strategic_churn_recommended_task(
+        db_session,
+        name="ChurnRetire",
+        vm="vm-churn-retire",
+        direction_id="d-churn-retire",
+        gap_id="g-churn-r",
+    )
+    token = create_agent_token(
+        str(task.id), "vm-churn-retire", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "decide_churn_retirement",
+            "data": {
+                "direction_id": "d-churn-retire",
+                "decision": "RETIRE",
+                "rationale": "no path to value",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "retired"
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-churn-retire")
+    assert d["status"] == "completed"
+    assert d["auto_completed"] is True
+    assert not d.get("churn_retirement_recommended")
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-churn-r")
+    assert "d-churn-retire" not in gap["active_moves"]
+    assert "d-churn-retire" in gap["past_moves"]
+    mem = (project.vision or {}).get("_recently_retired_directions") or []
+    assert any(m.get("id") == "d-churn-retire" for m in mem)
+
+
 @pytest.mark.asyncio
 async def test_retire_direction_deferral_does_not_record_retired_memory(
     client: AsyncClient, db_session, mocker

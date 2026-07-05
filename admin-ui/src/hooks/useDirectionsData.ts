@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { apiFetch, fetchVersionLifecycle } from '../api';
+import { apiFetch, fetchVersionLifecycle, submitChurnRetirementDecision } from '../api';
 import type { CurrentVersion } from '../api';
 import { generateIdempotencyKey } from '../utils/idempotencyKey';
 import { useDirectionForm } from './useDirectionForm';
@@ -549,6 +549,18 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     }
   }, [selectedProjectId, addToast]);
 
+  const decideChurnRetirement = useCallback(async (id: string, decision: 'KEEP' | 'RETIRE', rationale?: string) => {
+    if (!selectedProjectId) return;
+    setError(null);
+    try {
+      await submitChurnRetirementDecision(selectedProjectId, id, decision, rationale);
+      addToast(decision === 'KEEP' ? 'Direction kept — retirement recommendation cleared' : 'Direction retired', 'success');
+      fetchDirectionsLatestRef.current();
+    } catch {
+      setError('Failed to submit churn-retirement decision. Please try again.');
+    }
+  }, [selectedProjectId, addToast]);
+
   const triggerResearch = useCallback(async (id: string, bypass = false) => {
     setResearchingIds(prev => ({ ...prev, [id]: true }));
     setForceConfirmId(null);
@@ -614,6 +626,7 @@ export function useDirectionsData({ selectedProjectId, addToast, fetchDirections
     toggleAutonomous,
     reorderDirections,
     triggerResearch,
+    decideChurnRetirement,
     linkDirectionToGap,
   };
 }

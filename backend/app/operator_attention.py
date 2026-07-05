@@ -98,6 +98,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stuck_acceptance_criterion"): 65,
     ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "manual_intervention"): 70,
+    ("needs_operator", "churn_retirement_recommended"): 72,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
     ("watch", "alert"): 200,
@@ -329,6 +330,20 @@ def _direction_manual_intervention(direction: Any) -> bool:
     if not isinstance(context, dict):
         return False
     return context.get("needs_manual_intervention") is True
+
+
+def _direction_churn_retirement_recommended(direction: Any) -> bool:
+    """True when a direction is held PAUSED pending a keep/retire decision.
+
+    The churn/zombie retire ladder flags ``churn_retirement_recommended=True`` and
+    holds the direction paused (not active), so the ``status=='active'``
+    manual-intervention path never surfaces it — this makes the pending decision
+    visible to the operator instead.
+    """
+    return (
+        isinstance(direction, dict)
+        and bool(direction.get("churn_retirement_recommended"))
+    )
 
 
 def _direction_priority(direction: dict[str, Any]) -> int:
@@ -567,6 +582,36 @@ def _direction_attention_item(
         "severity": "needs_operator",
         "reason": "manual_intervention",
         "label": "Direction needs intervention",
+        "detail": _compact_text(detail, max_chars=180),
+        "ref": {
+            "kind": "direction",
+            "id": direction_id,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "directions",
+            "direction_id": direction_id,
+        }),
+    }
+
+
+def _churn_retirement_recommended_attention_item(
+    project_id: uuid.UUID,
+    direction: dict[str, Any],
+) -> dict[str, Any]:
+    """Attention item for a paused-pending-decision churn-retirement recommendation."""
+    direction_id = str(direction.get("id") or "unknown")
+    detail = direction.get("churn_retirement_recommended_reason") or direction.get(
+        "text"
+    )
+    return {
+        "id": f"direction:{direction_id}:churn_retirement_recommended",
+        "kind": "direction",
+        "severity": "needs_operator",
+        "reason": "churn_retirement_recommended",
+        "label": "Direction retirement recommended",
         "detail": _compact_text(detail, max_chars=180),
         "ref": {
             "kind": "direction",
@@ -1661,6 +1706,17 @@ async def build_operator_attention(
     ]
     manual_directions.sort(key=_direction_priority)
 
+    # Churn-retirement-recommended directions are held PAUSED (not active) pending
+    # an explicit keep/retire decision, so the active-only manual-intervention path
+    # above skips them. Surface them as their own needs_operator items so the
+    # pending decision is visible even though the direction is paused.
+    churn_recommended_directions = [
+        direction
+        for direction in directions
+        if _direction_churn_retirement_recommended(direction)
+    ]
+    churn_recommended_directions.sort(key=_direction_priority)
+
     candidate_items: list[dict[str, Any]] = []
 
     def add_candidate(item: dict[str, Any]) -> None:
@@ -1708,6 +1764,10 @@ async def build_operator_attention(
         add_candidate(_coverage_blocked_attention_item(project.id, coverage_blocked_count))
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
+    for direction in churn_recommended_directions[:3]:
+        add_candidate(
+            _churn_retirement_recommended_attention_item(project.id, direction)
+        )
     for item in stuck_acceptance_criteria:
         add_candidate(item)
     for alert in alerts:
@@ -1755,6 +1815,7 @@ async def build_operator_attention(
         + stale_provisioning_count
         + stale_queued_count
         + len(manual_directions)
+        + len(churn_recommended_directions)
         + error_alert_count
         + stuck_criteria_count
         + coverage_blocked_count
@@ -1821,6 +1882,7 @@ async def build_operator_attention(
             "stale_queued_tasks": stale_queued_count,
             "stuck_acceptance_criteria": stuck_acceptance_criteria_count,
             "manual_directions": len(manual_directions),
+            "churn_retirement_recommended": len(churn_recommended_directions),
             "stuck_criteria": stuck_criteria_count,
             "coverage_blocked": coverage_blocked_count,
             "alerts": error_alert_count + warning_alert_count,

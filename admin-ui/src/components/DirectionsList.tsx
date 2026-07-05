@@ -41,6 +41,7 @@ export interface DirectionsListProps {
   dismissDirectionUpdate: (id: string) => Promise<void>;
   triggerResearch: (id: string, bypass?: boolean) => Promise<void>;
   reorderDirections: (newOrder: Direction[]) => Promise<void>;
+  decideChurnRetirement?: (id: string, decision: 'KEEP' | 'RETIRE', rationale?: string) => Promise<void>;
   // Per-direction display state
   taskCounts: Record<string, number>;
   activeTasks: Record<string, Array<{ id: string; status: string; title: string; latest_status_message?: string }>>;
@@ -188,6 +189,7 @@ export function DirectionsList(props: DirectionsListProps) {
                         dismissDirectionUpdate={props.dismissDirectionUpdate}
                         triggerResearch={props.triggerResearch}
                         reorderDirections={props.reorderDirections}
+                        decideChurnRetirement={props.decideChurnRetirement}
                         taskCounts={taskCounts}
                         activeTasks={activeTasks}
                         cooldownMinutes={cooldownMinutes}

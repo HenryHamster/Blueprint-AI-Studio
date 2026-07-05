@@ -903,6 +903,171 @@ async def test_update_direction_status_stage_sets_version_marker(
     assert row.data["staged_for_version"] == 7
 
 
+async def _seed_churn_recommended_direction(
+    db_session,
+    project_id: str,
+    direction_id: str,
+    *,
+    gap_id: str = "g-churn",
+    churn_count: int = 2,
+) -> None:
+    """Seed a direction held PAUSED pending a keep/retire decision, staffing a gap."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": gap_id,
+                "name": "churn gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            }
+        ],
+    }
+    flag_modified(project, "problem_model")
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Zombie direction pending keep/retire decision",
+            "status": "paused",
+            "priority": "medium",
+            "paths": [],
+            "gap_id": gap_id,
+            "added_at": "2026-01-01T00:00:00",
+            "auto_paused": True,
+            "paused_reason": "Churn guardrail: repeated no-merge cycles",
+            "paused_at": "2026-06-01T00:00:00",
+            "churn_family_pause_count": churn_count,
+            "churn_pause_evidence": {"windowed_non_merge": 9},
+            "needs_manual_intervention": True,
+            "needs_manual_intervention_at": "2026-06-01T00:00:00",
+            "churn_retirement_recommended": True,
+            "churn_retirement_recommended_reason": (
+                "Retirement recommended: zombie direction paused twice."
+            ),
+            "churn_retirement_recommended_at": "2026-06-01T00:00:00",
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+
+@pytest.mark.asyncio
+async def test_churn_retirement_decision_keep_and_retire_clear_flag(
+    client: AsyncClient, db_session, mocker
+):
+    """The keep/retire decision seam clears the churn-retirement recommendation.
+
+    KEEP reactivates the held-paused direction, resets the churn-family ladder
+    counter to 0, and clears the recommendation + manual-hold flags. RETIRE
+    confirms the terminal outcome (completed/auto_completed), clears the
+    recommendation, and reconciles the freed problem-model gap.
+    """
+    # ── KEEP ────────────────────────────────────────────────────────────────
+    keep_project_id = await _deploy_project(client, mocker)
+    keep_dir = "d-keep-churn"
+    await _seed_churn_recommended_direction(db_session, keep_project_id, keep_dir)
+
+    keep_resp = await client.post(
+        f"/api/admin/projects/{keep_project_id}/directions/{keep_dir}/churn-retirement-decision",
+        json={"decision": "KEEP", "rationale": "still worth pursuing"},
+    )
+    assert keep_resp.status_code == 200, keep_resp.text
+    keep_body = keep_resp.json()
+    assert keep_body["status"] == "kept"
+    assert keep_body["decision"] == "KEEP"
+    kept = keep_body["direction"]
+    assert kept["status"] == "active"
+    # Recommendation + manual-hold residue cleared; churn ladder reset to 0.
+    assert "churn_retirement_recommended" not in kept
+    assert "churn_retirement_recommended_reason" not in kept
+    assert "needs_manual_intervention" not in kept
+    assert kept["churn_family_pause_count"] == 0
+    assert "churn_pause_evidence" not in kept
+    # Grace marker stamped so frozen history can't immediately re-pause it.
+    assert kept.get("auto_recovered_at")
+
+    # Persisted state matches the response.
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(keep_project_id))
+        )
+    ).scalar_one()
+    await db_session.refresh(project)
+    blob = next(d for d in project.directions if d["id"] == keep_dir)
+    assert blob["status"] == "active"
+    assert not blob.get("churn_retirement_recommended")
+    assert blob["churn_family_pause_count"] == 0
+
+    # Idempotent: a second KEEP on a now-decided direction is a clean no-op.
+    noop_resp = await client.post(
+        f"/api/admin/projects/{keep_project_id}/directions/{keep_dir}/churn-retirement-decision",
+        json={"decision": "KEEP"},
+    )
+    assert noop_resp.status_code == 200, noop_resp.text
+    assert noop_resp.json()["status"] == "noop"
+
+    # ── RETIRE ──────────────────────────────────────────────────────────────
+    retire_project_id = await _deploy_project(client, mocker)
+    retire_dir = "d-retire-churn"
+    await _seed_churn_recommended_direction(
+        db_session, retire_project_id, retire_dir, gap_id="g-retire"
+    )
+
+    retire_resp = await client.post(
+        f"/api/admin/projects/{retire_project_id}/directions/{retire_dir}/churn-retirement-decision",
+        json={"decision": "RETIRE", "rationale": "no path to value"},
+    )
+    assert retire_resp.status_code == 200, retire_resp.text
+    retire_body = retire_resp.json()
+    assert retire_body["status"] == "retired"
+    assert retire_body["decision"] == "RETIRE"
+    retired = retire_body["direction"]
+    assert retired["status"] == "completed"
+    assert retired["auto_completed"] is True
+    assert "decision" in retired["auto_completed_reason"].lower()
+    assert retired["completed_at"]
+    assert "churn_retirement_recommended" not in retired
+    assert "needs_manual_intervention" not in retired
+
+    # Gap reconciled: the retired direction is pruned from active_moves.
+    retire_project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(retire_project_id))
+        )
+    ).scalar_one()
+    await db_session.refresh(retire_project)
+    gap = next(g for g in retire_project.problem_model["gaps"] if g["id"] == "g-retire")
+    assert retire_dir not in gap["active_moves"]
+    assert retire_dir in gap["past_moves"]
+    # Retired-direction memory recorded so a same-gap re-spawn is blocked next cycle.
+    retired_mem = (retire_project.vision or {}).get("_recently_retired_directions") or []
+    assert any(m.get("id") == retire_dir for m in retired_mem)
+
+
+@pytest.mark.asyncio
+async def test_churn_retirement_decision_rejects_invalid_decision(
+    client: AsyncClient, db_session, mocker
+):
+    """An unknown decision value is a 400, not a silent no-op or 500."""
+    project_id = await _deploy_project(client, mocker)
+    direction_id = "d-bad-decision"
+    await _seed_churn_recommended_direction(db_session, project_id, direction_id)
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/churn-retirement-decision",
+        json={"decision": "MAYBE"},
+    )
+    assert resp.status_code == 400
+
+
 @pytest.mark.asyncio
 async def test_update_direction_stage_for_explicit_future_version(
     client: AsyncClient, db_session, mocker

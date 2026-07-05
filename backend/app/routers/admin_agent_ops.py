@@ -38,6 +38,9 @@ from app.strategic_events import (
 )
 from app.direction_lifecycle import (
     _reset_outcome_detection_state,
+    apply_churn_retirement_keep,
+    apply_churn_retirement_retire,
+    direction_has_churn_retirement_recommendation,
     reactivate_paused_direction,
 )
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
@@ -666,7 +669,7 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "decide_churn_retirement", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
     data: Any = {}
 
 
@@ -1809,6 +1812,138 @@ async def strategic_operation(
                 f"{MIN_HEALTHY_ACTIVE_DIRECTIONS} active)."
             )
         return _resp({"status": "ok", "op": "retire_direction", "direction_id": dir_id})
+
+    elif payload.op == "decide_churn_retirement":
+        # Autonomous keep/retire decision for a direction the churn/zombie retire
+        # ladder held PAUSED pending review (churn_retirement_recommended). Mirrors
+        # the operator decision seam (directions.decide_churn_retirement) so the
+        # flagged direction can be decided by the strategist as well as an operator.
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        decision = data.get("decision")
+        if not isinstance(decision, str) or decision.upper() not in ("KEEP", "RETIRE"):
+            raise HTTPException(
+                status_code=400, detail="decision must be 'KEEP' or 'RETIRE'"
+            )
+        decision = decision.upper()
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        now_iso = _utcnow().isoformat()
+        directions = list(project.directions or [])
+        matched_direction = next(
+            (d for d in directions if d.get("id") == dir_id), None
+        )
+        if matched_direction is None:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+
+        if not direction_has_churn_retirement_recommendation(matched_direction):
+            # Idempotent no-op — nothing pending to decide.
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return _resp(
+                {
+                    "status": "noop",
+                    "op": "decide_churn_retirement",
+                    "direction_id": dir_id,
+                    "reason": "No pending churn-retirement recommendation",
+                }
+            )
+
+        _did_retire = False
+        if decision == "KEEP":
+            # The autonomous strategist may NOT resume a user-paused direction;
+            # a churn-recommended direction is auto_paused so this never blocks,
+            # but keep the guard for parity with the other reactivation paths.
+            if not apply_churn_retirement_keep(
+                matched_direction, allow_user_paused=False
+            ):
+                ctx = task.context or {}
+                task.context = {**ctx, "_strategic_api_called": True}
+                flag_modified(task, "context")
+                session.add(task)
+                await session.commit()
+                return _resp(
+                    {
+                        "status": "blocked",
+                        "reason": "Cannot reactivate user-paused direction",
+                    }
+                )
+            result_status = "kept"
+        else:
+            reason = (
+                "Retired by explicit strategic keep/retire decision: "
+                "churn/zombie retirement recommendation confirmed."
+            )
+            if rationale:
+                reason = f"{reason} {rationale}"
+            apply_churn_retirement_retire(
+                matched_direction, reason=reason, now_iso=now_iso
+            )
+            result_status = "retired"
+            _did_retire = True
+
+        _captured_dir = dict(matched_direction)
+        _captured_id = str(dir_id)
+
+        def _apply_decision(fresh: list) -> list:
+            return [
+                _captured_dir if d.get("id") == _captured_id else d for d in fresh
+            ]
+
+        await _with_directions_locked(session, project.id, _apply_decision)
+
+        if _did_retire:
+            # Reconcile the freed gap + record retired-direction memory in the same
+            # committed transaction, mirroring the retire_direction op.
+            from app.problem_model import reconcile_gaps_for_retired_directions
+            from app.task_locking import with_problem_model_locked
+
+            def _reconcile_pm(pm: dict) -> None:
+                reconcile_gaps_for_retired_directions(pm, [dir_id], now_iso)
+
+            await with_problem_model_locked(session, project.id, _reconcile_pm)
+
+            _retire_snapshot = dict(matched_direction)
+            _retire_outcome = rationale or None
+
+            def _record_memory(vision: dict) -> None:
+                record_retired_direction_memory(
+                    vision,
+                    _retire_snapshot,
+                    reason="churn_retirement_decision",
+                    outcome=_retire_outcome,
+                )
+
+            await _with_vision_locked(session, project.id, _record_memory)
+
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
+        logger.info(
+            "[STRATEGIC API] Churn-retirement decision %s for direction %s",
+            decision,
+            dir_id,
+        )
+        return _resp(
+            {
+                "status": result_status,
+                "op": "decide_churn_retirement",
+                "direction_id": dir_id,
+                "decision": decision,
+            }
+        )
 
     elif payload.op == "stage_direction":
         # Stage an EXISTING direction for the NEXT version: flip status to
