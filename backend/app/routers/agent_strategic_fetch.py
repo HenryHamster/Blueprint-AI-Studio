@@ -79,6 +79,8 @@ def _compact_last_qualification(qual: dict[str, Any] | None) -> dict[str, Any] |
         "merge_grade_status",
         "merge_grade_coverage",
         "merge_grade_biggest_gap",
+        "debt_enforce_confidence_preview",
+        "debt_enforce_weight_preview",
     )
     out = {key: qual.get(key) for key in keys if qual.get(key) is not None}
 

@@ -1957,6 +1957,8 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
             {"severity": "MEDIUM", "summary": "False positive"}
         ],
         "goal_alignment": {"state": "shortfall", "biggest_gap": "release gate"},
+        "debt_enforce_confidence_preview": 0.52,
+        "debt_enforce_weight_preview": 0.15,
     }
     flag_modified(version, "last_qualification")
 
@@ -2019,6 +2021,8 @@ async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     assert "audit_findings" not in qual
     assert "excluded_audit_findings" not in qual
     assert "challenger_refuted_audit_findings" not in qual
+    assert qual["debt_enforce_confidence_preview"] == pytest.approx(0.52)
+    assert qual["debt_enforce_weight_preview"] == pytest.approx(0.15)
 
     recent = data["recent_versions"]
     assert len(recent) == 1

@@ -219,6 +219,8 @@ def _compact_last_qualification(value: Any, *, floor: bool = False) -> dict | No
         "deferred_at",
         "prior_superseded",
         "qualify_request_blocked_at",
+        "debt_enforce_confidence_preview",
+        "debt_enforce_weight_preview",
     ):
         _put_present(out, value, key)
     for key in (
@@ -901,4 +903,3 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
     if grounding:
         out["retired_direction_grounding"] = grounding
     return out
-

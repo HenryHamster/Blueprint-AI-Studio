@@ -7023,6 +7023,59 @@ async def test_version_phase_qualification_state_reconciles_finalized_verdict(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_narrates_debt_enforce_preview(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload keeps the observe-mode debt-enforce preview on the
+    compacted version_phase.last_qualification block."""
+    from app.models import ReleaseVersion
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=_utcnow_naive(),
+        last_qualification={
+            "status": "not_promoted",
+            "candidate_sha": "d" * 40,
+            "confidence": 0.72,
+            "threshold": 0.8,
+            "sub_scores": {"audit": 0.9, "test_erosion": 0.8, "smoketest": 0.95},
+            "debt_enforce_confidence_preview": 0.61,
+            "debt_enforce_weight_preview": 0.15,
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+    qual = vp.get("last_qualification")
+    assert qual is not None, "last_qualification should be present"
+    assert qual["debt_enforce_confidence_preview"] == pytest.approx(0.61)
+    assert qual["debt_enforce_weight_preview"] == pytest.approx(0.15)
+
+
+@pytest.mark.asyncio
 async def test_version_phase_qualification_state_reconciles_crashed_audit(
     db_session, mocker, _lts_split_active
 ):

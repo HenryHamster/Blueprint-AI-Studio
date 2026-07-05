@@ -381,6 +381,16 @@ async def _record_qualification_verdict(
         if "completion_debt" in base_record:
             sub_scores = dict(sub_scores)
             sub_scores["completion_debt"] = base_record["completion_debt"]
+        # Carry the observe-mode debt-enforce preview into the immutable verdict
+        # row so verdict history can show what enforce would have done at this
+        # attempt without re-deriving it from mutable last_qualification state.
+        for preview_key in (
+            "debt_enforce_confidence_preview",
+            "debt_enforce_weight_preview",
+        ):
+            if preview_key in base_record:
+                sub_scores = dict(sub_scores)
+                sub_scores[preview_key] = base_record[preview_key]
 
         confidence = base_record.get("confidence")
         threshold = base_record.get("threshold")

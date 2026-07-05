@@ -27502,6 +27502,9 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
         "test_erosion_detail": {"deleted_test_files": ["t.py"]},
         "smoketest_detail": {"passed": False},
         "audit_reconciliation": {"reconciled": False},
+        "completion_debt": {"total_open": 5, "items": []},
+        "debt_enforce_confidence_preview": 0.31,
+        "debt_enforce_weight_preview": 0.15,
     }
     version.last_qualification = dict(base_record)
     db_session.add(version)
@@ -27531,6 +27534,9 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
     assert row.test_erosion_detail == {"deleted_test_files": ["t.py"]}
     assert row.smoketest_detail == {"passed": False}
     assert row.audit_reconciliation == {"reconciled": False}
+    assert row.sub_scores["completion_debt"] == {"total_open": 5, "items": []}
+    assert row.sub_scores["debt_enforce_confidence_preview"] == 0.31
+    assert row.sub_scores["debt_enforce_weight_preview"] == 0.15
     # Promotion-attempt columns stay NULL on a non-promotion attempt.
     assert row.promotion_pr_url is None
     assert row.promotion_conflict is None
@@ -27570,6 +27576,13 @@ async def test_blocked_attempt_persists_evidence_on_verdict_row(db_session):
     # The new attempt carries its own (different) evidence.
     assert second.migration_safety == "pass"
     assert second.migration_safety_detail == "clean"
+
+    from app import release_readiness as rr
+
+    api_view = rr.format_verdict_for_api(first)
+    assert api_view["completion_debt"] == {"total_open": 5, "items": []}
+    assert api_view["debt_enforce_confidence_preview"] == 0.31
+    assert api_view["debt_enforce_weight_preview"] == 0.15
 
 
 @pytest.mark.asyncio

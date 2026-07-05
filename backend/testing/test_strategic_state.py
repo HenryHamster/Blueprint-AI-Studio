@@ -7165,15 +7165,24 @@ async def test_operator_attention_does_not_surface_young_completion_debt(
 async def test_operator_attention_does_not_surface_debt_with_linked_tasks(
     client: AsyncClient, db_session
 ):
-    """Old debt that already has linked tasks is NOT surfaced (work is in progress)."""
+    """Old debt linked to a genuinely active Task is NOT surfaced (work is in progress)."""
     project = await _make_project(db_session)
+    # Create a real Task in an active status so the linked-task resolver finds it.
+    active_task = Task(
+        project_id=project.id,
+        title="In-flight work addressing the debt",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(active_task)
+    await db_session.flush()
     linked_entry = CompletionDebtEntry(
         project_id=project.id,
         kind="dormant_knob",
         title="Old knob obligation with work in flight",
         status="open",
         created_at=_utcnow() - timedelta(hours=48),
-        detail={"linked_tasks": [{"task_id": str(uuid.uuid4())}]},
+        detail={"linked_tasks": [{"task_id": str(active_task.id)}]},
     )
     db_session.add(linked_entry)
     await db_session.commit()
@@ -7185,6 +7194,45 @@ async def test_operator_attention_does_not_surface_debt_with_linked_tasks(
     assert attention["counts"]["stale_completion_debts"] == 0
     stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
     assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_debt_with_only_failed_linked_task(
+    client: AsyncClient, db_session
+):
+    """Old debt whose only linked task is FAILED resurfaces as stale-unworked.
+
+    A FAILED linked task does NOT count as work-in-progress; the debt should
+    surface so the operator/strategist can spawn a new follow-up or dispose it.
+    """
+    project = await _make_project(db_session)
+    failed_task = Task(
+        project_id=project.id,
+        title="Failed follow-up for the debt",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.FAILED,
+    )
+    db_session.add(failed_task)
+    await db_session.flush()
+    linked_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Knob obligation whose only follow-up failed",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+        detail={"linked_tasks": [{"task_id": str(failed_task.id)}]},
+    )
+    db_session.add(linked_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    # The debt should resurface because the only linked task failed.
+    assert attention["counts"]["stale_completion_debts"] >= 1
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) >= 1
 
 
 @pytest.mark.asyncio

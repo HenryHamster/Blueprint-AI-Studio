@@ -2209,7 +2209,7 @@ describe('buildCompletionDebtSection', () => {
   it('renders total_open from dict shape, not list length', () => {
     const result = buildCompletionDebtSection({
       items: [
-        { kind: 'dormant_knob', description: 'Knob X default-off', age_days: 3 },
+        { kind: 'dormant_knob', title: 'Knob X default-off', description: 'Knob X default-off', age_days: 3 },
       ],
       total_open: 25,
     });
@@ -2233,7 +2233,7 @@ describe('buildCompletionDebtSection', () => {
 
   it('backward-compat: accepts a plain array and uses its length as total', () => {
     const result = buildCompletionDebtSection([
-      { kind: 'seed_inventory', description: 'Legacy item', age_days: 10 },
+      { kind: 'seed_inventory', title: 'Legacy item', description: 'Legacy item', age_days: 10 },
     ]);
     expect(result).toContain('1 open obligation(s)');
     expect(result).not.toContain('more not shown');
@@ -2241,14 +2241,14 @@ describe('buildCompletionDebtSection', () => {
   });
 
   it('includes advisory footer', () => {
-    const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', description: 'x', age_days: 0 }], total_open: 1 });
+    const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', title: 'x', description: 'x', age_days: 0 }], total_open: 1 });
     expect(result).toContain('Address open completion debt');
   });
 
   it('renders the stable debt id and the disposition/linkage hint', () => {
     const result = buildCompletionDebtSection({
       items: [
-        { id: 'debt-abc123', kind: 'dormant_knob', description: 'Knob X default-off', age_days: 4 },
+        { id: 'debt-abc123', kind: 'dormant_knob', title: 'Knob X default-off', description: 'Knob X default-off', age_days: 4 },
       ],
       total_open: 1,
     });
@@ -2259,6 +2259,100 @@ describe('buildCompletionDebtSection', () => {
     expect(result).toContain('dispose-completion-debt');
     expect(result).toContain('"disposition":"resolved"');
     expect(result).toContain('"debt_id":"<id>"');
+  });
+
+  it('leads with title and does NOT show bare knob value for dormant_knob row', () => {
+    // The backend sets description = title for dormant_knob to avoid "off"/"observe"
+    // being the primary label. The renderer must not show the bare knob state.
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          id: 'debt-knob1',
+          kind: 'dormant_knob',
+          title: 'Feature X shipped default-off',
+          description: 'Feature X shipped default-off',
+          age_days: 5,
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('[dormant_knob] `debt-knob1` Feature X shipped default-off');
+    // The bare knob value "off" must NOT appear as a standalone label.
+    expect(result).not.toContain('[dormant_knob] `debt-knob1` off');
+  });
+
+  it('appends description only when it differs from title', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'No-CI gate fell open',
+          description: 'Unverified merge',
+          age_days: 2,
+        },
+      ],
+      total_open: 1,
+    });
+    // Title appears as the primary label.
+    expect(result).toContain('No-CI gate fell open');
+    // Description (distinct from title) appended.
+    expect(result).toContain('Unverified merge');
+  });
+
+  it('renders linked task statuses inline', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'Gate fell open',
+          description: 'Unverified merge',
+          age_days: 1,
+          linked_tasks: [
+            { task_id: 'aaaa1111bbbb2222', status: 'IN_PROGRESS' },
+          ],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('Linked task(s):');
+    expect(result).toContain('aaaa1111: IN_PROGRESS');
+  });
+
+  it('emits dispose nudge when a linked task is COMPLETED', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'no_ci_gate',
+          title: 'Gate fell open',
+          description: 'Gate fell open',
+          age_days: 3,
+          linked_tasks: [
+            { task_id: 'cccc3333dddd4444', status: 'COMPLETED' },
+          ],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).toContain('COMPLETED');
+    expect(result).toContain('dispose-completion-debt');
+    // Specifically the inline nudge for the completed task.
+    expect(result).toContain('work landed; consider dispose-completion-debt');
+  });
+
+  it('omits linked_tasks block when list is empty or absent', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        {
+          kind: 'dormant_knob',
+          title: 'Knob Y',
+          description: 'Knob Y',
+          age_days: 0,
+          linked_tasks: [],
+        },
+      ],
+      total_open: 1,
+    });
+    expect(result).not.toContain('Linked task(s)');
   });
 });
 

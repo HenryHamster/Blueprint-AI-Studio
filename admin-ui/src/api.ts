@@ -2182,6 +2182,8 @@ export interface VersionQualification {
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
   completion_debt?: CompletionDebtQualSnapshot | null;
+  debt_enforce_confidence_preview?: number | null;
+  debt_enforce_weight_preview?: number | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2929,6 +2931,8 @@ export interface QualificationVerdictRecord {
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
   completion_debt?: CompletionDebtQualSnapshot | null;
+  debt_enforce_confidence_preview?: number | null;
+  debt_enforce_weight_preview?: number | null;
 }
 
 export interface QualificationVerdictsInfraContext {

@@ -1169,3 +1169,135 @@ async def test_completion_debt_weight_mode_graduation_resolves_debt(db_session):
         "graduating completion_debt_weight_mode to 'enforce' must resolve its "
         "completion-debt entry"
     )
+
+
+# ── New behavior: title/description and linked-task status ───────────────────
+
+
+@pytest.mark.asyncio
+async def test_dormant_knob_description_is_title_not_bare_knob_value(db_session):
+    """dormant_knob rows must surface their human title as description, not 'off'/'observe'."""
+    project = Project(name="p", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"dormant_knob:test:{project.id}",
+        kind=cd.KIND_DORMANT_KNOB,
+        title="Feature X shipped default-off",
+        project_id=project.id,
+        detail={"knob": "feature_x_enabled", "value": "off"},
+    )
+    await db_session.commit()
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+    assert len(snapshot["items"]) == 1
+    item = snapshot["items"][0]
+    assert item["kind"] == cd.KIND_DORMANT_KNOB
+    # Description must be the human title, NOT the bare knob value.
+    assert item["description"] == "Feature X shipped default-off"
+    assert item["description"] != "off"
+    assert item["title"] == "Feature X shipped default-off"
+
+
+@pytest.mark.asyncio
+async def test_get_open_completion_debt_includes_linked_tasks_with_statuses(db_session):
+    """Snapshot items include linked_tasks list with resolved Task.status values."""
+    project = Project(name="p", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a real Task so its status can be resolved.
+    task = Task(
+        project_id=project.id,
+        title="Follow-up task for the debt",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.flush()
+
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"no_ci_gate:linked:{project.id}",
+        kind=cd.KIND_NO_CI_GATE,
+        title="No-CI gate fell open",
+        project_id=project.id,
+        detail={"description": "Unverified merge", "linked_tasks": [{"task_id": str(task.id)}]},
+    )
+    await db_session.commit()
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+    assert len(snapshot["items"]) == 1
+    item = snapshot["items"][0]
+    assert "linked_tasks" in item
+    assert len(item["linked_tasks"]) == 1
+    lt = item["linked_tasks"][0]
+    assert lt["task_id"] == str(task.id)
+    assert lt["status"] == "IN_PROGRESS"
+
+
+@pytest.mark.asyncio
+async def test_get_open_completion_debt_linked_task_missing_yields_unknown(db_session):
+    """A linked task_id that matches no Task row gets status='unknown'."""
+    import uuid as _uuid
+
+    project = Project(name="p", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    phantom_id = str(_uuid.uuid4())
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"no_ci_gate:phantom:{project.id}",
+        kind=cd.KIND_NO_CI_GATE,
+        title="Gate fell open (linked task gone)",
+        project_id=project.id,
+        detail={"linked_tasks": [{"task_id": phantom_id}]},
+    )
+    await db_session.commit()
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+    item = snapshot["items"][0]
+    assert "linked_tasks" in item
+    lt = item["linked_tasks"][0]
+    assert lt["task_id"] == phantom_id
+    assert lt["status"] == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_get_open_completion_debt_completed_linked_task_is_dispose_ready(db_session):
+    """Snapshot flags a COMPLETED linked task so the strategist knows to dispose the debt."""
+    project = Project(name="p", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    completed_task = Task(
+        project_id=project.id,
+        title="The work is done",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(completed_task)
+    await db_session.flush()
+
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=f"no_ci_gate:completed:{project.id}",
+        kind=cd.KIND_NO_CI_GATE,
+        title="Gate fell open — work done",
+        project_id=project.id,
+        detail={"linked_tasks": [{"task_id": str(completed_task.id)}]},
+    )
+    await db_session.commit()
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+    item = snapshot["items"][0]
+    assert "linked_tasks" in item
+    lt = item["linked_tasks"][0]
+    assert lt["status"] == "COMPLETED"

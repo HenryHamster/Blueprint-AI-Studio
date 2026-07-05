@@ -39,7 +39,7 @@ from app.models import (
     TaskStatus,
     VmContact,
 )
-from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN
+from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN, resolve_linked_task_statuses as _resolve_linked_task_statuses
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
@@ -1216,58 +1216,99 @@ def _coverage_blocked_attention_item(
     }
 
 
+# Statuses that indicate a linked task is genuinely in-flight or already
+# succeeded — a debt with at least one such task is NOT stale-unworked.
+# FAILED, CANCELLED, and missing (unknown) task ids do NOT count.
+_DEBT_LINKED_WORKING_STATUSES: frozenset[str] = frozenset({
+    "QUEUED",
+    "PROVISIONING",
+    "IN_PROGRESS",
+    "EVALUATING",
+    "BLOCKED",
+    "PARKED",
+    "COMPLETED",
+})
+
+# Upper bound on aged-open-debt candidates we inspect per call. A debt with
+# more than this many aged open rows is an anomaly; the count is therefore
+# capped at this many.
+_STALE_DEBT_SCAN_LIMIT = 200
+
+
 async def _load_stale_unworked_completion_debts(
     session: AsyncSession,
     project_id: uuid.UUID,
 ) -> tuple[int, list[CompletionDebtEntry]]:
-    """Return (count, oldest_preview) of open debts with no linked tasks older than the threshold.
+    """Return (count, oldest_preview) of aged open debts with no genuinely
+    active or successful linked task.
 
     Scoped to the project plus global (project_id IS NULL) rows, matching the
     visibility rule used by the strategist completion-debt fetch.
+
+    A debt is considered UNWORKED unless it has at least one linked task whose
+    live status is in :data:`_DEBT_LINKED_WORKING_STATUSES` (QUEUED/IN_PROGRESS/
+    EVALUATING/BLOCKED/PARKED or COMPLETED).  Linked task ids that resolve to
+    FAILED, CANCELLED, or no Task row at all do NOT count as work-in-progress
+    and the debt resurfaces as stale after the age threshold.
     """
     cutoff = _utcnow() - _STALE_COMPLETION_DEBT_AFTER
-    linked_tasks_col = CompletionDebtEntry.detail["linked_tasks"]
-    no_linked_tasks = or_(
-        linked_tasks_col.is_(None),
-        func.jsonb_array_length(linked_tasks_col) == 0,
-    )
-    filters = (
+    base_filters = (
         or_(
             CompletionDebtEntry.project_id == project_id,
             CompletionDebtEntry.project_id.is_(None),
         ),
         CompletionDebtEntry.status == _DEBT_STATUS_OPEN,
         CompletionDebtEntry.created_at < cutoff,
-        no_linked_tasks,
     )
-    count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(CompletionDebtEntry)
-                .where(*filters)
-            )
-        ).scalar()
-        or 0
-    )
-    if count == 0:
-        return 0, []
-    entries = list(
+    # Load a bounded set of aged open candidates (all linked-task configurations).
+    candidates = list(
         (
             await session.execute(
                 select(CompletionDebtEntry)
-                .where(*filters)
+                .where(*base_filters)
                 .order_by(
                     CompletionDebtEntry.created_at.asc(),
                     CompletionDebtEntry.id.asc(),
                 )
-                .limit(_STALE_COMPLETION_DEBT_PREVIEW_LIMIT)
+                .limit(_STALE_DEBT_SCAN_LIMIT)
             )
         )
         .scalars()
         .all()
     )
-    return count, entries
+    if not candidates:
+        return 0, []
+
+    # Collect all referenced task ids so we can resolve statuses in one query.
+    all_task_ids: list[str] = []
+    for entry in candidates:
+        detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
+        linked = detail_dict.get("linked_tasks")
+        if isinstance(linked, list):
+            for x in linked:
+                if isinstance(x, dict) and x.get("task_id"):
+                    all_task_ids.append(str(x["task_id"]))
+
+    status_map = await _resolve_linked_task_statuses(session, all_task_ids)
+
+    # Keep only debts with no genuinely active or successful linked task.
+    unworked: list[CompletionDebtEntry] = []
+    for entry in candidates:
+        detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
+        linked = detail_dict.get("linked_tasks")
+        if not isinstance(linked, list) or len(linked) == 0:
+            unworked.append(entry)
+            continue
+        has_working = any(
+            status_map.get(str(x.get("task_id")), "") in _DEBT_LINKED_WORKING_STATUSES
+            for x in linked
+            if isinstance(x, dict) and x.get("task_id")
+        )
+        if not has_working:
+            unworked.append(entry)
+
+    count = len(unworked)
+    return count, unworked[:_STALE_COMPLETION_DEBT_PREVIEW_LIMIT]
 
 
 def _stale_completion_debt_attention_item(

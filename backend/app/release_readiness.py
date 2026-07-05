@@ -419,9 +419,27 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
     )
     sub_scores = verdict.sub_scores
     if isinstance(sub_scores, dict):
+        debt_enforce_confidence_preview = sub_scores.get(
+            "debt_enforce_confidence_preview"
+        )
+        debt_enforce_weight_preview = sub_scores.get("debt_enforce_weight_preview")
         sub_scores = {
-            k: v for k, v in sub_scores.items() if k != "acceptance_aggregate"
+            k: v
+            for k, v in sub_scores.items()
+            if k
+            not in {
+                "acceptance_aggregate",
+                "debt_enforce_confidence_preview",
+                "debt_enforce_weight_preview",
+            }
         }
+    else:
+        debt_enforce_confidence_preview = getattr(
+            verdict, "debt_enforce_confidence_preview", None
+        )
+        debt_enforce_weight_preview = getattr(
+            verdict, "debt_enforce_weight_preview", None
+        )
     return {
         "id": str(verdict.id),
         "release_version_id": str(verdict.release_version_id),
@@ -489,6 +507,9 @@ def format_verdict_for_api(verdict: QualificationVerdict) -> dict[str, Any]:
         # Open completion-debt snapshot embedded in sub_scores at verdict-recording time.
         # None on legacy rows or when the ledger was unavailable at finalization.
         "completion_debt": _sub(verdict, "completion_debt"),
+        # Observe-mode preview of the enforce-path confidence / weight.
+        "debt_enforce_confidence_preview": debt_enforce_confidence_preview,
+        "debt_enforce_weight_preview": debt_enforce_weight_preview,
     }
 
 

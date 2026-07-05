@@ -59,6 +59,33 @@ function generateIdempotencyKey(): string {
   return `idem-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function DebtEnforcePreview({
+  q,
+}: {
+  q: {
+    debt_enforce_confidence_preview?: number | null;
+    debt_enforce_weight_preview?: number | null;
+  } | null;
+}) {
+  if (
+    !q ||
+    q.debt_enforce_confidence_preview == null ||
+    q.debt_enforce_weight_preview == null
+  ) {
+    return null;
+  }
+  return (
+    <span
+      data-testid="debt-enforce-preview"
+      className="text-ui-xs font-mono text-cyan-400"
+      title="Observe-mode confidence preview if completion-debt weight mode were enforced"
+    >
+      enforce {Math.round(q.debt_enforce_confidence_preview * 100)}%
+      {` @w${q.debt_enforce_weight_preview.toFixed(2)}`}
+    </span>
+  );
+}
+
 interface VersionLifecyclePanelProps {
   data: VersionLifecycleResponse | null;
   loading: boolean;
@@ -725,6 +752,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
               <div className="pl-2 border-l border-neutral-700/50 space-y-0.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <QualSummary q={cv.last_qualification} />
+                  <DebtEnforcePreview q={cv.last_qualification} />
                   {cv.last_qualification.candidate_sha && (() => {
                     const matchedVerdict = verdicts.find(v => v.candidate_sha === cv.last_qualification?.candidate_sha);
                     return matchedVerdict?.terminal_status === 'promoted' ? (
@@ -978,6 +1006,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
                     <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                     {v.promotion_enabled && <span className="text-ui-xs font-mono text-emerald-600">LIVE</span>}
+                    <DebtEnforcePreview q={v} />
                     {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}{v.sub_scores.debt_pressure != null ? ` d:${v.completion_debt?.total_open ?? '?'}open` : ''}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}

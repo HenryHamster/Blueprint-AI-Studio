@@ -3489,6 +3489,8 @@ describe('VersionLifecyclePanel', () => {
         started_at: null,
         finalized_at: '2026-01-01T00:00:00Z',
         created_at: '2026-01-01T00:00:00Z',
+        debt_enforce_confidence_preview: 0.81,
+        debt_enforce_weight_preview: 0.15,
       };
     }
 
@@ -3548,6 +3550,35 @@ describe('VersionLifecyclePanel', () => {
 
       await screen.findByTestId('verdict-history');
       expect(screen.queryByTestId('confidence-sparkline')).not.toBeInTheDocument();
+    });
+
+    it('renders debt-enforce previews in the current summary and verdict history rows', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [makeVerdict(0.91)],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({
+            current_version: makeCurrentVersion({
+              last_qualification: makeQualification({
+                debt_enforce_confidence_preview: 0.73,
+                debt_enforce_weight_preview: 0.15,
+              }),
+            }),
+          })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await screen.findByTestId('verdict-history');
+      const previews = screen.getAllByTestId('debt-enforce-preview');
+      expect(previews).toHaveLength(2);
+      expect(previews[0]).toHaveTextContent('enforce 73% @w0.15');
+      expect(previews[1]).toHaveTextContent('enforce 81% @w0.15');
     });
   });
 

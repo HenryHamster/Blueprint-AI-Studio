@@ -1301,6 +1301,9 @@ export function buildCiComplianceSection(ciCompliance: unknown): string {
   return lines.join('\n');
 }
 
+// Statuses that indicate a linked task has successfully completed its work.
+const _DEBT_COMPLETED_STATUSES = new Set(['COMPLETED']);
+
 export function buildCompletionDebtSection(debt: unknown): string {
   // Accept the new dict shape {items: [...], total_open: N} or the legacy array shape.
   let entries: Array<Record<string, unknown>>;
@@ -1322,11 +1325,32 @@ export function buildCompletionDebtSection(debt: unknown): string {
   lines.push(`${totalOpen} open obligation(s)${tailNote} — unfinished work from merged features, knob activations, or retired directions:`);
   for (const e of entries) {
     const kind = strVal(e.kind, 'unknown');
-    const desc = strVal(e.description, '(no description)');
+    const title = strVal(e.title, '');
+    const desc = strVal(e.description, '');
+    // Always lead with the human title. Append description only when it adds
+    // information beyond the title (e.g. no_ci_gate detail text). For
+    // dormant_knob rows the backend sets description == title so nothing extra
+    // is appended, avoiding the bare "off"/"observe" knob state showing up.
+    const label = title || desc || '(no description)';
+    const extraDesc = desc && desc !== label ? ` — ${desc}` : '';
     const ageDays = typeof e.age_days === 'number' ? ` (${e.age_days}d old)` : '';
     const id = strVal(e.id);
     const idTag = id ? ` \`${id}\`` : '';
-    lines.push(`  - [${kind}]${idTag} ${desc}${ageDays}`);
+    lines.push(`  - [${kind}]${idTag} ${label}${extraDesc}${ageDays}`);
+    // Render linked task statuses so the strategist knows if follow-up work
+    // is in flight, already completed (dispose-ready), or failed.
+    const linkedTasks = Array.isArray(e.linked_tasks) ? e.linked_tasks as Array<Record<string, unknown>> : [];
+    if (linkedTasks.length > 0) {
+      const hasCompleted = linkedTasks.some(lt => _DEBT_COMPLETED_STATUSES.has(strVal(lt.status, '').toUpperCase()));
+      const taskSummaries = linkedTasks.map(lt => {
+        const tid = strVal(lt.task_id, '?');
+        const shortId = tid.length > 8 ? tid.slice(0, 8) : tid;
+        const status = strVal(lt.status, 'unknown');
+        return `${shortId}: ${status}`;
+      }).join(', ');
+      const disposeNudge = hasCompleted ? ' ← work landed; consider dispose-completion-debt' : '';
+      lines.push(`    Linked task(s): ${taskSummaries}${disposeNudge}`);
+    }
   }
   lines.push('\n_Dispose an obligation once its work lands: `./strategic dispose-completion-debt \'{"debt_id":"<id>","disposition":"resolved","evidence":"<what proved it done>"}\'` (use `"dismissed"` with a reason if it no longer applies). When spawning follow-up work, pass `"debt_id":"<id>"` in the spawn-task/spawn-fix DATA to link the task to its obligation._');
   lines.push('_Address open completion debt before adding new obligations in the same area._');

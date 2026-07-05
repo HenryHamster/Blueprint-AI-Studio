@@ -401,6 +401,39 @@ def debt_to_dict(entry) -> dict[str, Any]:
     return _serialize_debt(entry)
 
 
+async def resolve_linked_task_statuses(
+    session: Any,
+    task_ids: list[str],
+) -> dict[str, str]:
+    """Return a mapping of task_id -> status string for the given task ids.
+
+    Missing ids (no matching Task row) are absent from the returned dict.
+    Performs a single bounded query so callers can batch across many debt entries.
+    """
+    if not task_ids:
+        return {}
+    import uuid as _uuid
+
+    from app.models import Task
+
+    valid_ids: list[_uuid.UUID] = []
+    for tid in task_ids:
+        try:
+            valid_ids.append(_uuid.UUID(str(tid)))
+        except (ValueError, AttributeError, TypeError):
+            continue
+    if not valid_ids:
+        return {}
+    rows = (
+        await session.execute(select(Task.id, Task.status).where(Task.id.in_(valid_ids)))
+    ).all()
+    result: dict[str, str] = {}
+    for row in rows:
+        status = row.status
+        result[str(row.id)] = status.value if hasattr(status, "value") else str(status)
+    return result
+
+
 async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, Any]:
     """Return a bounded, project-scoped open-debt snapshot for strategist use.
 
@@ -408,6 +441,11 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, A
     true count of open rows visible to this project (may exceed ``len(items)``
     when the ledger has more than ``_OPEN_COMPLETION_DEBT_LIMIT`` open rows).
     Project-scoped rows appear before global seed rows in the snapshot.
+
+    Each item carries ``linked_tasks`` (a list of ``{task_id, status}`` dicts)
+    when the debt entry has referenced tasks so the strategist can see whether
+    follow-up work is still in flight or already completed.  Dormant-knob rows
+    surface their human title as the description instead of the bare knob value.
     """
     total_open = await _count_open_completion_debts(session, project_id)
     entries = await _query_completion_debts(
@@ -419,22 +457,68 @@ async def get_open_completion_debt(session: Any, project_id: Any) -> dict[str, A
         newest_first=False,
         project_first=True,
     )
+
+    # Collect all linked task ids from all entries in one pass so we can
+    # resolve their live statuses in a single DB round-trip.
+    all_linked_ids: list[str] = []
+    entry_linked_records: dict[str, list[dict]] = {}
+    for entry in entries:
+        detail_dict = entry.detail if isinstance(entry.detail, dict) else {}
+        raw_linked = detail_dict.get("linked_tasks")
+        recs = (
+            [x for x in raw_linked if isinstance(x, dict)]
+            if isinstance(raw_linked, list)
+            else []
+        )
+        entry_linked_records[str(entry.id)] = recs
+        for x in recs:
+            tid = x.get("task_id")
+            if tid:
+                all_linked_ids.append(str(tid))
+    status_map = await resolve_linked_task_statuses(session, all_linked_ids)
+
     now = _utcnow()
     items: list[dict[str, Any]] = []
     for entry in entries:
         created_at = entry.created_at
-        items.append(
-            {
-                "id": str(entry.id),
-                "kind": entry.kind,
-                "title": entry.title,
-                "description": _detail_to_text(entry.detail) or entry.title,
-                "created_at": created_at.isoformat() if created_at else None,
-                "age_days": (
-                    max(0, (now - created_at).days) if created_at is not None else None
-                ),
+
+        # For dormant_knob rows the detail["value"] is just "off"/"observe" —
+        # return the human title instead so it is never shadowed by a bare knob
+        # state.  For other kinds, use the detail text when it adds information.
+        if entry.kind == KIND_DORMANT_KNOB:
+            description = entry.title
+        else:
+            raw_desc = _detail_to_text(entry.detail)
+            description = raw_desc if raw_desc else entry.title
+
+        # Build linked tasks list with resolved live statuses.
+        recs = entry_linked_records.get(str(entry.id), [])
+        linked_tasks: list[dict[str, Any]] = []
+        for x in recs:
+            tid = x.get("task_id")
+            if not tid:
+                continue
+            lt: dict[str, Any] = {
+                "task_id": str(tid),
+                "status": status_map.get(str(tid), "unknown"),
             }
-        )
+            if x.get("note"):
+                lt["note"] = x["note"]
+            linked_tasks.append(lt)
+
+        item: dict[str, Any] = {
+            "id": str(entry.id),
+            "kind": entry.kind,
+            "title": entry.title,
+            "description": description,
+            "created_at": created_at.isoformat() if created_at else None,
+            "age_days": (
+                max(0, (now - created_at).days) if created_at is not None else None
+            ),
+        }
+        if linked_tasks:
+            item["linked_tasks"] = linked_tasks
+        items.append(item)
     return {"items": items, "total_open": total_open}
 
 
