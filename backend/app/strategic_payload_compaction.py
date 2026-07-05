@@ -546,6 +546,15 @@ _DIRECTIONS_SUMMARY_KEEP = 12
 _OUTCOME_DIRECTION_OUTCOMES_KEEP = 10
 _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED = 8
 
+# Core-floor caps for directions_summary. The floor is the guaranteed-minimum
+# active-direction core the strategist ALWAYS receives even under extreme byte
+# pressure — tighter than the summarize path (_DIRECTIONS_SUMMARY_KEEP) and
+# stripped to the load-bearing identity/status scalars plus a short headline.
+# Fuller per-direction detail (and dropped directions) stay fetchable via
+# ``./fetch direction <id>``.
+_DIRECTIONS_FLOOR_KEEP = 5
+_DIRECTION_FLOOR_TEXT_CAP = 120
+
 
 def _direction_activity_score(stat: dict) -> int:
     """Sort key for choosing which direction stats stay in the strategic payload.
@@ -588,6 +597,42 @@ def _summarize_directions(stats: list) -> list:
     return [
         _compact_direction_summary_entry(stat)
         for stat in sorted_stats[:_DIRECTIONS_SUMMARY_KEEP]
+        if isinstance(stat, dict)
+    ]
+
+
+def _floor_direction_entry(stat: dict) -> dict:
+    """Ultra-compact per-direction skeleton for the core floor.
+
+    Keeps only the load-bearing identity/status scalars plus a short text
+    headline — enough for the strategist to know which active directions exist
+    and their state. Everything else is fetchable via ``./fetch direction <id>``.
+    """
+    out: dict[str, Any] = {}
+    for key in ("id", "priority", "status", "gap_id", "system_id"):
+        _put_present(out, stat, key)
+    headline = _bounded_text(stat.get("text"), _DIRECTION_FLOOR_TEXT_CAP)
+    if headline:
+        out["text"] = headline
+    return out
+
+
+def _directions_summary_floor(stats: list) -> list:
+    """Guaranteed-minimum core floor for ``directions_summary``.
+
+    Keeps the top :data:`_DIRECTIONS_FLOOR_KEEP` highest-activity directions as
+    compact id/priority/status/headline skeletons so the active-direction core
+    NEVER disappears entirely under budget pressure. This is the floor callback
+    registered in the strategic pack schema; the packer reserves its bytes off
+    the top of the budget so recoverable siblings degrade first. Fuller detail
+    and dropped directions remain fetchable via ``./fetch direction <id>``.
+    """
+    if not isinstance(stats, list):
+        return stats
+    sorted_stats = sorted(stats, key=_direction_activity_score, reverse=True)
+    return [
+        _floor_direction_entry(stat)
+        for stat in sorted_stats[:_DIRECTIONS_FLOOR_KEEP]
         if isinstance(stat, dict)
     ]
 

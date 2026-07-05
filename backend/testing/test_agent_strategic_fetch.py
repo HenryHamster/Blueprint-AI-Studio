@@ -2700,6 +2700,121 @@ async def test_agent_fetch_vm_cost_rejects_cross_project(
 
 
 @pytest.mark.asyncio
+async def test_directions_list_mode(
+    client: AsyncClient, db_session
+):
+    """No-id directions list returns compact (id, status, text, priority) for all
+    directions — the recovery path when directions_summary was dropped entirely."""
+    project = Project(
+        name="Dir List Test",
+        user_id="test-user-dirlist",
+        directions=[
+            {"id": "d-1", "status": "active", "text": "First direction", "priority": "high"},
+            {"id": "d-2", "status": "paused", "text": "Second direction", "priority": "low"},
+            {"id": "d-3", "status": "retired", "text": "Old direction"},
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-dirlist")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-dirlist")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/directions",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    assert len(data) == 3
+    by_id = {d["id"]: d for d in data}
+    assert by_id["d-1"] == {"id": "d-1", "status": "active", "text": "First direction", "priority": "high"}
+    assert by_id["d-2"] == {"id": "d-2", "status": "paused", "text": "Second direction", "priority": "low"}
+    # retired direction with no priority — only present keys included
+    assert by_id["d-3"]["status"] == "retired"
+    assert "priority" not in by_id["d-3"]
+
+
+@pytest.mark.asyncio
+async def test_open_messages_list_mode(
+    client: AsyncClient, db_session
+):
+    """No-id messages list returns compact open-message listing with id, ref,
+    type, from_type, content excerpt, status."""
+    project, task = await _make_project_task(db_session, vm="agent-vm-msglist")
+    open_msg = await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.BUG_REPORT,
+        from_type="user",
+        content="x" * 300,
+        status="open",
+    )
+    await _add_message(
+        db_session,
+        project,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="resolved note",
+        status="resolved",
+    )
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "success"
+    data = body["data"]
+    # Only the open message is returned
+    assert len(data) == 1
+    item = data[0]
+    assert item["id"] == str(open_msg.id)
+    assert item["ref"] == open_msg.id.hex[:8]
+    assert item["type"] == "BUG_REPORT"
+    assert item["from_type"] == "user"
+    assert item["status"] == "open"
+    # Content is truncated to 200 chars
+    assert len(item["content"]) == 200
+
+
+@pytest.mark.asyncio
+async def test_directions_list_mode_rejects_cross_project(
+    client: AsyncClient, db_session
+):
+    """Token from project A cannot list directions for project B (404)."""
+    project_a = Project(name="Dir List A", user_id="test-user-dla")
+    project_b = Project(
+        name="Dir List B",
+        user_id="test-user-dlb",
+        directions=[{"id": "d-b1", "status": "active", "text": "B direction"}],
+    )
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    task_a = Task(project_id=project_a.id, payloads=[{}], vm_instance_id="agent-vm-dla")
+    db_session.add(task_a)
+    await db_session.commit()
+    await db_session.refresh(task_a)
+
+    token = create_agent_token(str(task_a.id), "agent-vm-dla")
+    res = await client.get(
+        f"/api/agent/projects/{project_b.id}/directions",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_capability_trials_returns_verdicts(
     client: AsyncClient, db_session
 ):

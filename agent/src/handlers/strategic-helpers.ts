@@ -114,13 +114,13 @@ echo ""
 // /api/agent/projects/{project_id}/... — all share the standard agent auth and
 // are callable by any of the project's agent tokens, so the helper works for
 // every task type, not just strategic-cycle agents.
-export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance';
+export type FetchVerb = 'problem-model' | 'direction' | 'playbook' | 'gap' | 'message' | 'section' | 'knowledge' | 'compute-sweeps' | 'qualification' | 'version-phase' | 'vm-cost' | 'efficiency-snapshot' | 'ci-compliance' | 'capability-trials';
 
 // Canonical order of the full vocabulary. STRATEGIC provisions all of these.
 // `knowledge` is a SEARCH-shaped verb (token-scoped list/search + get-by-id),
 // distinct from the single-id project-path verbs that precede it.
 export const STRATEGIC_FETCH_VERBS: FetchVerb[] = [
-  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance',
+  'problem-model', 'direction', 'playbook', 'gap', 'message', 'section', 'knowledge', 'compute-sweeps', 'qualification', 'version-phase', 'vm-cost', 'efficiency-snapshot', 'ci-compliance', 'capability-trials',
 ];
 
 // Read-only verb subsets for non-strategic agents. Research resolves directions,
@@ -139,10 +139,10 @@ export const DESIGN_DOC_FETCH_VERBS: FetchVerb[] = ['direction', 'section', 'pla
 // query filters, no project path) and gets a self-contained arm below.
 const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'problem-model': 'problem-model) PATH_SUFFIX="problem-model"',
-  'direction':     'direction)  PATH_SUFFIX="directions/$ID"',
+  'direction':     'direction)  PATH_SUFFIX="directions${ID:+/$ID}"',
   'playbook':      'playbook)   PATH_SUFFIX="playbook/$ID"',
   'gap':           'gap)        PATH_SUFFIX="gaps/$ID"',
-  'message':       'message)    PATH_SUFFIX="messages/$ID"',
+  'message':       'message)    PATH_SUFFIX="messages${ID:+/$ID}"',
   'section':       'section)    PATH_SUFFIX="design-doc/$ID"',
   'compute-sweeps': 'compute-sweeps) PATH_SUFFIX="compute-sweeps${ID:+/$ID}"',
   'qualification': 'qualification) PATH_SUFFIX="qualification"',
@@ -150,6 +150,7 @@ const FETCH_VERB_CASE: Partial<Record<FetchVerb, string>> = {
   'vm-cost':            'vm-cost)              PATH_SUFFIX="vm-cost"',
   'efficiency-snapshot': 'efficiency-snapshot)  PATH_SUFFIX="efficiency-snapshot"',
   'ci-compliance':       'ci-compliance)        PATH_SUFFIX="ci-compliance"',
+  'capability-trials':   'capability-trials)    PATH_SUFFIX="capability-trials"',
 };
 
 // Self-contained case arm for the SEARCH-shaped `knowledge` verb. Unlike the
@@ -193,10 +194,10 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
 // One-line description of what each verb resolves, for the prompt guidance block.
 export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'problem-model': '`./fetch problem-model` — the full current problem model (no id)',
-  'direction':     '`./fetch direction <id>` — full detail for a direction',
+  'direction':     '`./fetch direction [id]` — compact listing of all directions (no id), or full detail for one direction by id',
   'playbook':      '`./fetch playbook <key>` — a full playbook entry',
   'gap':           '`./fetch gap <id>` — a full gap record',
-  'message':       '`./fetch message <ref>` — an operator message (short ref or UUID)',
+  'message':       '`./fetch message [ref]` — compact listing of open messages (no id), or full detail for one message by short ref or UUID',
   'section':       '`./fetch section <key>` — a full design-doc section',
   'knowledge':     '`./fetch knowledge [--topic T] [--direction D] [--q TERM] [--source-kind K] [--sweep-id S] [--tag T]` — list/search knowledge documents (web_research/design outputs); `./fetch knowledge <id>` for one document\'s full body',
   'compute-sweeps': '`./fetch compute-sweeps [sweep_id]` — list completed compute experiment sweeps, or fetch one sweep by id',
@@ -205,6 +206,7 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'vm-cost':            '`./fetch vm-cost` — live VM cost by task type: cost_usd, task/VM count, merged count, and merge-yield per type over the last 7 days (no id)',
   'efficiency-snapshot': '`./fetch efficiency-snapshot` — current efficiency metrics: cost_per_merged_pr, vm_reuse_rate, llm_cost_per_merged_pr, and format_compliance over the last 7 days (no id)',
   'ci-compliance':       '`./fetch ci-compliance` — CI compliance status for the current integration branch HEAD: module-size breaches and branch-literal violations (no id)',
+  'capability-trials':   '`./fetch capability-trials` — capability-trial verdicts keyed by cap_name: verdict, lift, n_with/n_without, and accrual projection (no id)',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -249,7 +251,7 @@ case "$KIND" in
 ${caseBody}
 esac
 
-if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ -z "$ID" ]; then
+if [ "$KIND" != "problem-model" ] && [ "$KIND" != "compute-sweeps" ] && [ "$KIND" != "qualification" ] && [ "$KIND" != "version-phase" ] && [ "$KIND" != "vm-cost" ] && [ "$KIND" != "efficiency-snapshot" ] && [ "$KIND" != "ci-compliance" ] && [ "$KIND" != "capability-trials" ] && [ "$KIND" != "direction" ] && [ "$KIND" != "message" ] && [ -z "$ID" ]; then
   echo "[ERROR] fetch $KIND requires an id argument" >&2
   exit 1
 fi

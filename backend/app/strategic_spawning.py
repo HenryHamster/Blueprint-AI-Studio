@@ -46,6 +46,7 @@ from app.strategic_payload_compaction import (
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
+    _directions_summary_floor,
     _enrich_drift_with_trend,
     _summarize_directions,
     _summarize_drift_signals,
@@ -2483,6 +2484,37 @@ def _summarize_open_messages(messages: list) -> list:
     return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
 
 
+# Guaranteed-minimum core floor for the open-message inbox: tighter than the
+# summarize fallback (fewer items, shorter excerpts) so the operator inbox
+# NEVER disappears entirely under extreme byte pressure. Fuller content is
+# fetchable on demand; the survival ordering keeps reproducing BUG_REPORT/
+# BLOCKER (then oldest-open) items as the last to be trimmed.
+_OPEN_MESSAGES_FLOOR_KEEP = 8
+_OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS = 200
+
+
+def _floor_open_messages(messages: list) -> list:
+    """Core floor callback for the ``open_messages`` pack key.
+
+    Keeps only the highest-survival-priority inbox items with a tight excerpt
+    cap so the strategist always sees the operator-inbox core even when the
+    fuller feed cannot fit. Distinct from :func:`_summarize_open_messages`,
+    which keeps a larger window — this is the last-resort minimum the packer
+    reserves off the top of the budget.
+    """
+    bounded = _bound_open_messages(messages, _OPEN_MESSAGES_FLOOR_KEEP)
+    if not isinstance(bounded, list):
+        return bounded
+    floored: list = []
+    for m in bounded:
+        if isinstance(m, dict) and isinstance(m.get("content"), str):
+            content = m["content"]
+            if len(content) > _OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS:
+                m = {**m, "content": content[:_OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS]}
+        floored.append(m)
+    return floored
+
+
 def _operator_context_text(
     value: Any,
     *,
@@ -2819,6 +2851,26 @@ async def _fetch_open_messages(
     return _bound_open_messages(messages, limit)
 
 
+def _summarize_recent_interventions(v: Any) -> dict:
+    """Keep rolling rates and per-direction deltas; truncate the raw merge list."""
+    if not isinstance(v, dict):
+        return v
+    out = {k: val for k, val in v.items() if k != "merges"}
+    merges = v.get("merges")
+    if isinstance(merges, list):
+        out["merges"] = merges[:5]
+        out["merges_total"] = len(merges)
+    return out
+
+
+def _summarize_capability_trial_verdicts(v: Any) -> dict:
+    """Under budget pressure, prefer decided verdicts (adopt/reject) over in-trial ones."""
+    if not isinstance(v, dict):
+        return v
+    decided = {k: e for k, e in v.items() if isinstance(e, dict) and e.get("verdict") not in (None, "continue_trial")}
+    return decided if decided else dict(list(v.items())[:8])
+
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -2845,41 +2897,56 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # heavier ``directions_summary`` detail list is trimmed or dropped for budget.
     "direction_counts": {"priority": "critical"},
     "max_active_directions": {"priority": "critical"},
-    "prompt_suffix": {"priority": "high"},
+    # Trim-proof authoritative count of unresolved open operator messages computed
+    # BEFORE packing. Critical tier (tiny scalar) so the agent sees the true inbox
+    # depth even when ``open_messages`` itself is trimmed/dropped under byte budget.
+    "open_message_count": {"priority": "critical"},
+    "prompt_suffix": {"priority": "high", "exempt": True},
     # Vision + intent — small but load-bearing for every decision
     "vision": {"priority": "critical"},
-    # User-facing state the agent must respond to. The open-message inbox is
-    # packed high but with a summarize fallback so BUG_REPORT/BLOCKER (and the
-    # oldest-open) items survive budget pressure instead of the whole inbox
-    # being dropped wholesale.
-    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
-    "running_update": {"priority": "high"},
-    "running_update_acknowledged_at": {"priority": "high"},
-    "user_last_active_at": {"priority": "high"},
+    # User-facing state the agent must respond to. Core section: the open-message
+    # inbox has BOTH a summarize fallback AND a floor callback, so at least its
+    # floored form (top survival-priority items, tight excerpts) ALWAYS ships —
+    # the whole inbox is never dropped wholesale under budget pressure.
+    "open_messages": {
+        "priority": "high",
+        "summarize": _summarize_open_messages,
+        "floor": _floor_open_messages,
+    },
+    "running_update": {"priority": "high", "exempt": True},
+    "running_update_acknowledged_at": {"priority": "high", "exempt": True},
+    "user_last_active_at": {"priority": "high", "exempt": True},
     # Bounded summary of the operator's recent reconciliation overrides (what the
     # agent proposed vs. what the operator kept, per document). Medium priority
     # with no summarize_fn: it is already capped + char-bounded at build time, so
     # the packer drops it whole under budget rather than trimming. Closes the
     # operator-wins reconciliation loop so the agent reconciles instead of
     # re-proposing overridden values.
-    "operator_overrides": {"priority": "medium"},
+    "operator_overrides": {"priority": "medium", "exempt": True},
     # Recent operator-selected Strategic workbench pointers promoted out of
     # ProjectMessage.context.strategic_session so selected refs survive when the
     # conversation thread is trimmed. Already capped and pointer-only.
-    "operator_context_refs": {"priority": "high"},
+    "operator_context_refs": {"priority": "high", "exempt": True},
     # Computed cycle-start reconciliation of the four strategic surfaces
     # (capabilities vs grounding, gaps vs directions, per-direction research
     # pipeline). Conflict-focused and bounded at build time, so it ships whole
     # or not at all. High priority: it is the authoritative starting state the
     # agent reasons from, and it is small.
-    "cycle_start_reconciliation": {"priority": "high"},
-    # Core working set (the big stuff) — summarize when over budget
-    "directions_summary": {"priority": "high", "summarize": _summarize_directions},
+    "cycle_start_reconciliation": {"priority": "high", "exempt": True},
+    # Core working set (the big stuff) — summarize when over budget. Core
+    # section: the floor callback guarantees a compact active-direction skeleton
+    # (top directions, id/status/headline only) ALWAYS ships, so per-direction
+    # detail degrades before the active-direction core disappears entirely.
+    "directions_summary": {
+        "priority": "high",
+        "summarize": _summarize_directions,
+        "floor": _directions_summary_floor,
+    },
     # Directions already queued for the NEXT version (status=staged). Medium
     # priority with no summarize_fn: it is already capped at build time, so the
     # packer drops it whole under budget rather than trimming. Surfaced so the
     # strategist knows what is already staged and does NOT re-propose it.
-    "staged_directions": {"priority": "medium"},
+    "staged_directions": {"priority": "medium", "exempt": True},
     "problem_model": {
         "priority": "high",
         "summarize": _agent_view_problem_model_packed,
@@ -2897,18 +2964,18 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     },
     # Tiny, load-bearing soft size/health signal computed from the DURABLE
     # problem_model (honest counts, not the trimmed agent view). High priority,
-    # no summarize_fn — it should only drop under genuine budget exhaustion.
-    "model_health": {"priority": "high"},
+    # exempt — it should only drop under genuine budget exhaustion.
+    "model_health": {"priority": "high", "exempt": True},
     # Concrete cleanup candidates surfaced only when the model is large/oversized.
     # High priority so the block survives the same payload pressure that triggered
     # the large/oversized status — a medium-priority block would be dropped under
     # the exact budget conditions where the candidates are most actionable.
-    "prune_candidates": {"priority": "high"},
+    "prune_candidates": {"priority": "high", "exempt": True},
     # Compact index of all playbook keys — survives budget pressure so the
     # strategist always knows what operational knowledge exists and can fetch
     # entries on demand via `./fetch playbook <key>`. High priority to persist
     # under budget pressure, even if the heavier playbook_summary is dropped.
-    "playbook_keys_index": {"priority": "high"},
+    "playbook_keys_index": {"priority": "high", "exempt": True},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # (one entry per non-internal section: key + bounded summary + reconciled
     # presence status/modules/warning for systems/capabilities). The full
@@ -2917,49 +2984,57 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # summaries to a navigation skeleton under genuine budget exhaustion.
     "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
     # Compact, body-omitted index of existing knowledge documents (web_research /
-    # design output). Medium priority with no summarize_fn: it is already capped
-    # (count) and char-bounded (per-entry summary) at build time, so the packer
-    # drops it whole under budget rather than trimming — mirroring
-    # staged_directions / operator_overrides. Full bodies fetched on demand.
-    "knowledge_index": {"priority": "medium"},
+    # design output). Medium priority, exempt: already capped (count) and
+    # char-bounded (per-entry summary) at build time, so drop-whole is correct.
+    # Full bodies fetched on demand.
+    "knowledge_index": {"priority": "medium", "exempt": True},
     # Per-sweep comparative arm grouping — bounded at build time so the packer
     # drops it whole under budget rather than trimming. Same tier as
     # knowledge_index.
-    "compute_experiment_sweeps": {"priority": "medium"},
-    "capability_trial_verdicts": {"priority": "medium"},
+    "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
+    "capability_trial_verdicts": {
+        "priority": "medium",
+        "summarize": _summarize_capability_trial_verdicts,
+    },
     "outcome_evaluation": {
         "priority": "medium",
         "summarize": _summarize_outcome_evaluation,
     },
-    "recent_interventions": {"priority": "medium"},
+    "recent_interventions": {
+        "priority": "medium",
+        "summarize": _summarize_recent_interventions,
+    },
     "conversation_thread": {
         "priority": "medium",
         "summarize": _summarize_conversation_thread,
     },
-    # Long-tail context — first to be dropped when budget is tight
-    "self_reflection_log": {"priority": "low"},
-    "previous_decision_outcomes": {"priority": "low"},
-    "anomaly_summary": {"priority": "low"},
-    "playbook_summary": {"priority": "low"},
-    "rejected_proposals": {"priority": "low"},
-    "running_update_superseded": {"priority": "low"},
-    "prediction_calibration_factor": {"priority": "low"},
-    "prediction_calibration_note": {"priority": "low"},
+    # Long-tail context — first to be dropped when budget is tight.
+    # All exempt: already bounded at build time (list caps + char limits applied
+    # before packing), so drop-whole is correct degradation for these low-priority
+    # sections. Fuller detail is fetchable via playbook/direction fetch verbs.
+    "self_reflection_log": {"priority": "low", "exempt": True},
+    "previous_decision_outcomes": {"priority": "low", "exempt": True},
+    "anomaly_summary": {"priority": "low", "exempt": True},
+    "playbook_summary": {"priority": "low", "exempt": True},
+    "rejected_proposals": {"priority": "low", "exempt": True},
+    "running_update_superseded": {"priority": "low", "exempt": True},
+    "prediction_calibration_factor": {"priority": "low", "exempt": True},
+    "prediction_calibration_note": {"priority": "low", "exempt": True},
     # Mode-aware additions: only present when non-empty
-    "system_maturity": {"priority": "low"},
+    "system_maturity": {"priority": "low", "exempt": True},
     # drift_signals is actionable mode-switch input (audit/pause triggers), so it
     # must survive budget pressure — promoted to medium alongside conversation_thread.
-    "drift_signals": {"priority": "medium"},
+    "drift_signals": {"priority": "medium", "summarize": _summarize_drift_signals},
     # Lessons from retired directions — helps the agent avoid repeating patterns.
-    "past_retirement_critiques": {"priority": "low"},
+    "past_retirement_critiques": {"priority": "low", "exempt": True},
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
-    "retired_directions_summary": {"priority": "low"},
+    "retired_directions_summary": {"priority": "low", "exempt": True},
     # Bounded fail-closed retirement deferrals from the prior cycle. High
     # priority so a supported/unsupported retirement second opinion stays
     # visible to the next strategist pass instead of getting dropped behind
     # lower-value long-tail context.
-    "retirement_deferrals": {"priority": "high"},
+    "retirement_deferrals": {"priority": "high", "exempt": True},
     # LTS version/phase context — present only on self-repo projects. High priority
     # so it survives budget pressure (the agent needs it for phase-transition decisions).
     "version_phase": {
@@ -2970,11 +3045,11 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # Cycle-start SHA divergence check: present only when _resolve_candidate_currency
     # resolves.  Small dict of scalars — no summarize_fn, drops whole under extreme
     # pressure.  High priority so it ships alongside version_phase.
-    "payload_staleness": {"priority": "high"},
+    "payload_staleness": {"priority": "high", "exempt": True},
     # What is actually deployed (running live on the promotion target) vs what
     # has merged to the integration branch but is not yet promoted. High
     # priority: it is load-bearing for every runtime-metric judgment, and small.
-    "deployment_state": {"priority": "high"},
+    "deployment_state": {"priority": "high", "exempt": True},
     # Citable memo digest — terminal reasoning artifacts spawned from dropped research
     # findings. Medium priority so it survives typical payload pressure; the summarize_fn
     # trims memos and excerpts so it degrades gracefully (fewer memos / shorter text)
@@ -2991,28 +3066,25 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # guardrail breaches and branch-literal violations. Low priority — advisory
     # signal that degrades before load-bearing state. Dropped whole under budget;
     # full detail fetchable via ./fetch ci-compliance.
-    "ci_compliance": {"priority": "low"},
+    "ci_compliance": {"priority": "low", "exempt": True},
     # Held-directions block: directions that have hit the consecutive-failure
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
-    "held_directions": {"priority": "low"},
+    "held_directions": {"priority": "low", "exempt": True},
     # Aggregated missing-foundation demand (capability/foundation prerequisites
-    # declared by dependents that no task provides). Medium priority and bounded at
-    # build time by collect_missing_capability_demand, so the packer drops it whole
-    # under budget rather than trimming. Actionable: the strategist can open a
-    # foundation direction or record an explicit retirement.
-    "missing_capability_demand": {"priority": "medium"},
+    # declared by dependents that no task provides). Medium priority, exempt:
+    # bounded at build time by collect_missing_capability_demand.
+    "missing_capability_demand": {"priority": "medium", "exempt": True},
     # Shared capability vocabulary (canonical registry name + status) the strategist
-    # draws prerequisite / provides_capability refs from. Small and bounded; medium
-    # priority so it survives typical pressure but degrades before load-bearing state.
-    "available_capabilities": {"priority": "medium"},
+    # draws prerequisite / provides_capability refs from. Small and bounded; exempt.
+    "available_capabilities": {"priority": "medium", "exempt": True},
     # Live local-runner availability (ever_registered, active_total, active_gpu,
     # require_local_runner). Surfaced only when the project has ever registered a
     # runner OR declares the enforce-local policy. Medium priority: it is small
     # (4 scalars) and actionable — the strategist uses it to avoid authoring GPU
     # experiments that would fall back to billable cloud GPU (or be held
     # indefinitely when require_local_runner is set).
-    "local_runner_status": {"priority": "medium"},
+    "local_runner_status": {"priority": "medium", "exempt": True},
 }
 
 
@@ -3023,9 +3095,20 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     "model": {"priority": "critical"},
     "effort": {"priority": "critical"},
     "vision": {"priority": "critical"},
-    "open_messages": {"priority": "high", "summarize": _summarize_open_messages},
-    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context.
-    "operator_context_refs": {"priority": "high"},
+    # Trim-proof authoritative count of unresolved open operator messages — see
+    # _STRATEGIC_REVIEW_SCHEMA["open_message_count"]. Critical tier so the agent
+    # sees the true inbox depth even when open_messages is dropped under budget.
+    "open_message_count": {"priority": "critical"},
+    # Core section — see _STRATEGIC_REVIEW_SCHEMA["open_messages"]: floor callback
+    # guarantees the operator inbox never drops wholesale under budget pressure.
+    "open_messages": {
+        "priority": "high",
+        "summarize": _summarize_open_messages,
+        "floor": _floor_open_messages,
+    },
+    # See _STRATEGIC_REVIEW_SCHEMA: compact pointer-only operator context. Exempt:
+    # bounded at build time (short ref strings, no unbounded growth).
+    "operator_context_refs": {"priority": "high", "exempt": True},
     # Compact, bounded navigation index over the grounded agent-view design doc
     # — see _STRATEGIC_REVIEW_SCHEMA["design_doc"] and _design_doc_index. Full
     # per-section content is fetched on demand via POST /api/agent/design-doc.
@@ -3046,24 +3129,25 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
         "floor": _agent_view_problem_model_floor,
     },
     # See _STRATEGIC_REVIEW_SCHEMA: tiny, load-bearing soft size/health signal.
-    "model_health": {"priority": "high"},
-    "proposed_changes": {"priority": "high"},
-    "shipped_changes_manifest": {"priority": "medium"},
+    # Exempt: small and bounded (a single computed dict).
+    "model_health": {"priority": "high", "exempt": True},
+    # Exempt: bounded at build time (list cap applied by _build_proposed_changes).
+    "proposed_changes": {"priority": "high", "exempt": True},
+    # Exempt: capped at 50 merged tasks at build time.
+    "shipped_changes_manifest": {"priority": "medium", "exempt": True},
     # Advisory prompt hint framing missing-foundation demand to act on. High
     # priority so the directive survives budget pressure (it is small).
-    "prompt_suffix": {"priority": "high"},
+    "prompt_suffix": {"priority": "high", "exempt": True},
     # Aggregated missing-foundation demand — see _STRATEGIC_REVIEW_SCHEMA. Medium
-    # priority; bounded at build time so the packer drops it whole under budget.
-    "missing_capability_demand": {"priority": "medium"},
+    # priority; exempt: bounded at build time by collect_missing_capability_demand.
+    "missing_capability_demand": {"priority": "medium", "exempt": True},
     # Compact, body-omitted index of existing knowledge documents — see
-    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Capped at build time, dropped
-    # whole under budget; full bodies fetched on demand.
-    "knowledge_index": {"priority": "medium"},
-    # Per-sweep comparative arm grouping — bounded at build time, dropped whole
-    # under budget; full bodies fetched on demand.
-    "compute_experiment_sweeps": {"priority": "medium"},
-    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Small, bounded.
-    "available_capabilities": {"priority": "medium"},
+    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Exempt: capped at build time.
+    "knowledge_index": {"priority": "medium", "exempt": True},
+    # Per-sweep comparative arm grouping — exempt: bounded at build time.
+    "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
+    # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Exempt: small, bounded.
+    "available_capabilities": {"priority": "medium", "exempt": True},
 }
 
 
@@ -4531,6 +4615,7 @@ async def _spawn_design_doc_update(project: Project, session: AsyncSession) -> b
                 if (_dd_model_health := _compute_model_health(project.problem_model))
                 else {}
             ),
+            "open_message_count": len(open_msgs),
             "open_messages": open_msgs,
             **(
                 {"operator_context_refs": operator_context_refs}
@@ -5704,6 +5789,7 @@ async def _spawn_strategic_review(
                     # DB-only open-operator-message feed (no network) — the
                     # load-bearing key: surfaces messages older than the runner's
                     # first-poll cursor that would otherwise be missed entirely.
+                    "open_message_count": len(_res_open_messages),
                     "open_messages": _res_open_messages,
                     **({"model": review_model} if review_model else {}),
                     **({"effort": review_effort} if review_effort else {}),
@@ -7438,6 +7524,7 @@ async def _spawn_strategic_review(
                 else {}
             ),
             "project_name": project.name,
+            "open_message_count": len(open_msgs),
             "open_messages": open_msgs,
             **(
                 {"operator_context_refs": operator_context_refs}

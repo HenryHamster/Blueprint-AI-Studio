@@ -970,6 +970,49 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
   });
 
 
+  it('dropped inbox: executor prompt contains fetch-message guidance with correct command when open_message_count > 0 and open_messages dropped', async () => {
+    vi.mocked(runClaudeCode).mockClear();
+    vi.mocked(runThinkerWithGate).mockResolvedValueOnce({
+      ok: true,
+      analysisText: 'analysis',
+    });
+    vi.mocked(runClaudeCode).mockResolvedValue({
+      exitCode: 0,
+      allOutput: '',
+      lastResultText: '',
+    });
+
+    const statusRef = { value: '' };
+    await handleStrategic(
+      'task-dropped-inbox',
+      {
+        project_name: 'Blueprint',
+        // open_messages absent (dropped under byte budget) but count is known
+        open_message_count: 3,
+        _packer_meta: {
+          dropped: [{ key: 'open_messages', reason: 'exceeds remaining budget even after summarize' }],
+          trimmed: [],
+        },
+      },
+      {},
+      'tok',
+      'owner',
+      'repo',
+      null,
+      statusRef,
+    );
+
+    const executorPrompt = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(executorPrompt).toBeDefined();
+    // Must render the fallback section (not the full open_messages section)
+    expect(executorPrompt).toContain('inbox not shipped');
+    expect(executorPrompt).toContain('3 messages available');
+    // Must use the correct singular fetch verb with no subcommand
+    expect(executorPrompt).toContain('./fetch message`');
+    // Must NOT use the invalid 'messages list' form
+    expect(executorPrompt).not.toContain('./fetch messages list');
+  });
+
   it('does not record format miss or repair attempt for a command-mode strategic run', async () => {
     vi.mocked(runClaudeCode).mockClear();
     vi.mocked(recordFormatMiss).mockClear();

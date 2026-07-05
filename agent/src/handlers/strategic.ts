@@ -294,6 +294,11 @@ export async function handleStrategic(
     const openMessages = Array.isArray(payload.open_messages)
       ? payload.open_messages as Array<Record<string, unknown>>
       : [];
+    // Trim-proof inbox depth: shipped at critical tier so it survives even when
+    // open_messages itself is dropped under byte budget pressure.
+    const openMessageCount = typeof payload.open_message_count === 'number'
+      ? payload.open_message_count
+      : openMessages.length;
 
     const visionJson = vision && Object.keys(vision).length > 0
       ? JSON.stringify(vision, null, 2)
@@ -1007,7 +1012,7 @@ ${renderStrategicFetchVerbHelpLines().join('\n')}
 # Existing directions (for update/retire operations)
 ${dirSummaryText}
 
-${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : ''}
+${questionSection}${feedbackSection}${openMessagesText ? `# Open Messages (resolve addressed ones, respond to questions)\nA message tagged \`⚠ STALE\` is a BUG_REPORT/BLOCKER citing code that no longer exists on HEAD — treat it as discounted/unproven: do NOT spawn a fix or investigation to chase it. Resolve/close it as already-fixed, or re-verify the defect still reproduces on HEAD before acting.\n${openMessagesText}\n` : openMessageCount > 0 ? `# Open Messages (inbox not shipped — ${openMessageCount} message${openMessageCount === 1 ? '' : 's'} available)\nThe open-message inbox was dropped under byte-budget pressure this cycle. Run \`./fetch message\` to retrieve the ${openMessageCount} unresolved message${openMessageCount === 1 ? '' : 's'} before responding to or resolving any operator requests.\n` : ''}
 # Strategic analysis to execute
 
 ${analysisText.slice(0, 50_000)}

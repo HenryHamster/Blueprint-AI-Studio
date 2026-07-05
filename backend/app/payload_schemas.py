@@ -501,6 +501,12 @@ class StrategicReviewPayload(_SystemPopulated):
     # runner OR declares the enforce-local policy. Optional + default None so
     # existing payloads without it still validate identically.
     local_runner_status: dict[str, Any] | None = None
+    # Trim-proof count of unresolved open operator messages, shipped at critical
+    # tier. Computed from the fetch window (_OPEN_MESSAGES_KEEP=40), so it may
+    # under-report when the live inbox exceeds that window — but it is always
+    # >= what byte-packing surfaces, so the agent can reliably distinguish a
+    # dropped inbox from a genuinely empty one and knows to ./fetch messages.
+    open_message_count: int | None = None
 
 
 class DesignDocUpdatePayload(_SystemPopulated):
@@ -1325,6 +1331,7 @@ def pack_under_budget(
             reserved_remaining -= floor["size"]
         if p["unserializable"]:
             dropped.append({"key": key, "reason": "value not JSON-serializable"})
+            logger.warning("pack_under_budget: dropped %r — value not JSON-serializable", key)
             continue
         size = p["size"]
         assert size is not None
@@ -1343,6 +1350,10 @@ def pack_under_budget(
             packed[key] = candidate["value"]
             used += candidate["size"]
             trimmed.append(candidate["meta"])
+            logger.info(
+                "pack_under_budget: trimmed %r (summarized from floor, %d→%d bytes)",
+                key, size, candidate["size"],
+            )
             included = True
         if not included:
             summarized = _compute_summarized_candidate(p)
@@ -1350,6 +1361,10 @@ def pack_under_budget(
                 packed[key] = summarized["value"]
                 used += summarized["size"]
                 trimmed.append(summarized["meta"])
+                logger.info(
+                    "pack_under_budget: trimmed %r (%d→%d bytes)",
+                    key, size, summarized["size"],
+                )
                 included = True
         if not included:
             if floor is not None:
@@ -1361,6 +1376,10 @@ def pack_under_budget(
                 packed[key] = floor["value"]
                 used += floor["size"]
                 trimmed.append({"key": key, "kind": "floored"})
+                logger.info(
+                    "pack_under_budget: trimmed %r to floor (%d→%d bytes)",
+                    key, size, floor["size"],
+                )
                 continue
             if p["priority"] == "critical":
                 top_keys = sorted(
@@ -1369,16 +1388,24 @@ def pack_under_budget(
                     reverse=True,
                 )
                 raise PayloadTooLargeError(used + (p["size"] or 0), budget, top_keys)
-            dropped.append(
-                {
-                    "key": key,
-                    "reason": (
-                        "exceeds remaining budget even after summarize"
-                        if p["summarize"]
-                        else "exceeds remaining budget (no summarize_fn)"
-                    ),
-                }
+            drop_reason = (
+                "exceeds remaining budget even after summarize"
+                if p["summarize"]
+                else "exceeds remaining budget (no summarize_fn)"
             )
+            dropped.append({"key": key, "reason": drop_reason})
+            has_floor_in_schema = (schema.get(key) or {}).get("floor") is not None
+            if has_floor_in_schema:
+                logger.error(
+                    "pack_under_budget: CORE section %r dropped (%d bytes) — "
+                    "floor guarantee lost; %s",
+                    key, size, drop_reason,
+                )
+            else:
+                logger.warning(
+                    "pack_under_budget: dropped %r (%d bytes) — %s",
+                    key, size, drop_reason,
+                )
 
     # Surface any pre-trim marker carried on a shipped section into the packer
     # metadata. The packed section still holds its own marker, but reflecting it

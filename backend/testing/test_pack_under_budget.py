@@ -1122,3 +1122,233 @@ def test_design_doc_index_and_whole_problem_model_coexist_in_realistic_payload()
 
     # The payload stayed under budget.
     assert out["_packer_meta"]["budget_used"] <= 120 * 1024
+
+
+def test_droppable_sections_declare_summarize_or_exemption():
+    """Every non-critical schema entry must declare a summarize fallback OR an
+    explicit ``exempt`` marker.  Without one, a section can silently vanish from
+    the payload with no trim-log record and no degraded form for the agent to
+    observe.  ``exempt`` is the opt-out: sections already bounded+capped at build
+    time don't need a summarize_fn, but they must say so explicitly so this
+    invariant can distinguish deliberate design from an accidental omission.
+
+    Both _STRATEGIC_REVIEW_SCHEMA and _DESIGN_DOC_UPDATE_SCHEMA are checked so
+    the two sibling schemas stay consistent under the same contract.
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA, _DESIGN_DOC_UPDATE_SCHEMA
+
+    schemas = {
+        "_STRATEGIC_REVIEW_SCHEMA": _STRATEGIC_REVIEW_SCHEMA,
+        "_DESIGN_DOC_UPDATE_SCHEMA": _DESIGN_DOC_UPDATE_SCHEMA,
+    }
+    all_failures = []
+    for schema_name, schema in schemas.items():
+        for key, entry in schema.items():
+            if entry.get("priority") == "critical":
+                continue  # critical keys always ship; no summarize/exempt needed
+            if entry.get("summarize") or entry.get("floor"):
+                continue  # has a degradation path
+            if entry.get("exempt"):
+                continue  # explicitly exempted (bounded/capped at build time)
+            all_failures.append(f"{schema_name}.{key}")
+
+    assert not all_failures, (
+        f"Schema keys lack both 'summarize' and 'exempt': {all_failures}. "
+        "Add a summarize_fn for sections that can grow under budget pressure, "
+        "or add 'exempt': True for sections already bounded at build time."
+    )
+
+
+def test_dropped_sections_logged_with_byte_accounting(caplog):
+    """Dropped sections log with byte count; core (floored) drops log at ERROR.
+
+    Part 1: a regular (non-core) drop emits a WARNING that includes the
+    serialized byte size of the dropped section.
+    Part 2: a core section (one with a ``floor`` callback in schema) that
+    gets dropped when floor guarantees are cleared emits an ERROR log with
+    byte accounting so operators can diagnose budget violations immediately
+    from the backend log stream without needing to inspect _packer_meta.
+    """
+    # --- Part 1: regular (non-core) drop → WARNING with byte count ---
+    payload_reg = {"big": "x" * 200}
+    schema_reg = {"big": {"priority": "medium"}}
+    with caplog.at_level(logging.INFO, logger="app.payload_schemas"):
+        out_reg = pack_under_budget(payload_reg, schema_reg, budget=10)
+    assert "big" not in out_reg
+    big_bytes = _size("x" * 200)
+    drop_logs = [
+        r for r in caplog.records
+        if "dropped" in r.message.lower() and "big" in r.message
+    ]
+    assert drop_logs, "expected a log record for the dropped 'big' section"
+    assert drop_logs[0].levelno == logging.WARNING, (
+        "non-core drop must log at WARNING, not ERROR"
+    )
+    assert str(big_bytes) in drop_logs[0].message, (
+        f"expected byte count {big_bytes} in drop log: {drop_logs[0].message}"
+    )
+
+    # --- Part 2: core section (has floor) dropped → ERROR with byte count ---
+    # Build a payload where reserved_remaining + critical_full > budget so the
+    # packer clears all floor guarantees. With degraded_budget too small to fit
+    # even the floor value, the floored key ends up unprotected and is dropped.
+    caplog.clear()
+    critical_data = "c" * 400
+    core_data = "f" * 200
+    critical_bytes = _size(critical_data)
+    floor_bytes = _size({"minimal": True})  # the floor callback's output size
+    core_bytes = _size(core_data)
+    # Budget: fits critical alone; adding the floor pushes reserved+critical over.
+    budget = critical_bytes + floor_bytes - 1
+    payload_core = {"identity": critical_data, "core": core_data}
+    schema_core = {
+        "identity": {"priority": "critical"},
+        "core": {"priority": "high", "floor": lambda v: {"minimal": True}},
+    }
+    with caplog.at_level(logging.INFO, logger="app.payload_schemas"):
+        out_core = pack_under_budget(payload_core, schema_core, budget=budget)
+    assert "core" not in out_core, (
+        "core section should be dropped when floor guarantee is lost"
+    )
+    error_logs = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and "core" in r.message
+    ]
+    assert error_logs, "expected an ERROR log when a core (floored) section is dropped"
+    assert str(core_bytes) in error_logs[0].message, (
+        f"expected byte count {core_bytes} in ERROR log: {error_logs[0].message}"
+    )
+
+
+def test_core_sections_survive_realistic_worst_case():
+    """Worst case: an oversized problem_model dominates the budget, yet the three
+    strategic CORE sections — active-direction summaries, the open-message inbox,
+    and version/phase state — ALWAYS ship at least a compact floored/summarized
+    form. None is dropped wholesale.
+
+    This is the core-section floor guarantee: the 2026-07-04 cycle shipped with
+    the entire open-message inbox and all per-direction detail dropped while a
+    large problem_model consumed the byte budget. Each core key now declares a
+    ``floor`` callback whose bytes are reserved off the top, so a big
+    problem_model degrades the recoverable long-tail — not the core.
+    """
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _agent_view_problem_model,
+    )
+
+    # An oversized problem_model: many active gaps with substantial evidence so
+    # the whole agent-view model dominates (but still floor-reserves) the budget.
+    big_pm = {
+        "gaps": [
+            {
+                "id": f"g-{i:03d}",
+                "name": f"Gap {i}",
+                "priority": "high",
+                "status": "active",
+                "opened": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z",
+                "evidence": "e" * 900,
+                "description": "d" * 600,
+            }
+            for i in range(60)
+        ],
+        "capabilities": [
+            {"name": f"cap {i}", "status": "working", "notes": "n" * 300}
+            for i in range(20)
+        ],
+    }
+    problem_model = _agent_view_problem_model(big_pm)
+
+    # Core section 1: many directions, each with a bulky text body so the full
+    # directions_summary far exceeds any leftover budget.
+    directions_summary = [
+        {
+            "id": f"d-{i:03d}",
+            "priority": "high" if i % 2 else "medium",
+            "status": "active",
+            "total_cycles": i,
+            "prs_merged": i % 4,
+            "text": f"Direction {i}: " + ("t" * 1500),
+        }
+        for i in range(30)
+    ]
+
+    # Core section 2: a full open-message inbox with long per-message content.
+    open_messages = [
+        {
+            "id": f"m-{i:03d}",
+            "type": "BUG_REPORT" if i < 3 else "NOTE",
+            "created_at": f"2026-06-{(i % 27) + 1:02d}T00:00:00Z",
+            "content": f"message {i}: " + ("c" * 800),
+        }
+        for i in range(40)
+    ]
+
+    # Core section 3: version/phase state with a bulky raw block (big goal text,
+    # a long per-criterion coverage list, and several recent versions).
+    version_phase = {
+        "version_number": 22,
+        "phase": "build",
+        "goal": "Ship the core-floor guarantee. " + ("g" * 4000),
+        "phase_reasoning": "r" * 4000,
+        "criterion_coverage": {
+            "total": 200,
+            "covered": 40,
+            "criteria": [
+                {"id": f"c-{i:03d}", "text": "criterion " + ("x" * 200)}
+                for i in range(200)
+            ],
+        },
+        "recent_versions": [
+            {
+                "version_number": 22 - i,
+                "status": "promoted",
+                "last_qualification": {"status": "not_promoted", "detail": "z" * 1000},
+            }
+            for i in range(10)
+        ],
+    }
+
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "Deliver true user-visible improvements."},
+        "problem_model": problem_model,
+        "directions_summary": directions_summary,
+        "open_messages": open_messages,
+        "version_phase": version_phase,
+    }
+
+    # The three core sections are each individually larger than the whole budget
+    # would allow once the oversized problem_model reserves its bytes — proving
+    # the floors, not luck, are what keeps them present.
+    budget = 120 * 1024
+    assert _size(problem_model) + _size(directions_summary) > budget
+
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+
+    dropped_keys = {d["key"] for d in out["_packer_meta"]["dropped"]}
+    trimmed_keys = {t["key"] for t in out["_packer_meta"]["trimmed"]}
+
+    for core in ("directions_summary", "open_messages", "version_phase"):
+        assert core in out, f"core section {core!r} was dropped wholesale"
+        assert core not in dropped_keys, f"core section {core!r} in dropped: {out['_packer_meta']['dropped']}"
+        # Present in COMPACT form — it could not fit at full size, so the packer
+        # summarized or floored it (recorded in _packer_meta.trimmed).
+        assert core in trimmed_keys, (
+            f"core section {core!r} expected to ship compacted, not full-size"
+        )
+
+    # The core sections shipped in genuinely reduced form (smaller than raw).
+    assert _size(out["directions_summary"]) < _size(directions_summary)
+    assert _size(out["open_messages"]) < _size(open_messages)
+    assert _size(out["version_phase"]) < _size(version_phase)
+
+    # The open-message inbox floor keeps the reproducing BUG_REPORT items — the
+    # highest survival-priority rows — not an arbitrary slice.
+    shipped_types = {m.get("type") for m in out["open_messages"] if isinstance(m, dict)}
+    assert "BUG_REPORT" in shipped_types, "core inbox floor dropped the BUG_REPORT items"
+
+    # The problem_model is still delivered (never silently dropped either).
+    assert "problem_model" in out
+    assert "problem_model" not in dropped_keys
+    assert out["_packer_meta"]["budget_used"] <= budget

@@ -13634,6 +13634,81 @@ def test_open_message_citation_summary_empty_without_warning():
     assert _open_message_citation_summary({"_provenance_warnings": "nope"}) == {}
 
 
+@pytest.mark.asyncio
+async def test_open_message_counts_ship_when_inbox_dropped(db_session):
+    """Trim-proof open-message count ships at critical tier and survives a full inbox drop.
+
+    open_message_count is computed from the raw feed BEFORE packing and placed at
+    critical tier, so even when the entire open_messages list is dropped under byte
+    budget pressure the agent can distinguish a genuinely empty inbox from a dropped
+    one and knows to ./fetch messages list to retrieve them.
+    """
+    from app.payload_schemas import pack_under_budget
+    from app.strategic_spawning import (
+        _summarize_open_messages,
+        _floor_open_messages,
+    )
+
+    # Build a schema that gives open_messages only 1 byte of budget by inflating
+    # all critical+high content to crowd it out — simulating extreme byte pressure
+    # where the inbox would normally be dropped wholesale.
+    # We test the pack contract directly rather than spawning a task.
+    messages = [
+        {
+            "id": f"msg-{i}",
+            "type": "NOTE",
+            "content": f"operator message #{i} with some content",
+            "created_at": f"2026-06-01T00:00:{i:02d}",
+        }
+        for i in range(40)
+    ]
+
+    # Use a tiny budget so open_messages (high priority, multi-KB) gets dropped
+    # while open_message_count (critical, tiny scalar) always ships.
+    tiny_budget = 512  # bytes — far too small to hold the message list
+
+    packed = pack_under_budget(
+        {
+            "open_message_count": len(messages),
+            "open_messages": messages,
+        },
+        schema={
+            "open_message_count": {"priority": "critical"},
+            "open_messages": {
+                "priority": "high",
+                "summarize": _summarize_open_messages,
+                "floor": _floor_open_messages,
+            },
+        },
+        budget=tiny_budget,
+    )
+
+    meta = packed["_packer_meta"]
+    dropped_keys = {entry["key"] for entry in meta["dropped"]}
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+
+    # The trim-proof count must always ship at critical tier.
+    assert "open_message_count" in packed, (
+        "open_message_count must ship at critical tier even under extreme budget pressure"
+    )
+    assert packed["open_message_count"] == 40, (
+        f"open_message_count must equal the full pre-trim inbox depth; got {packed.get('open_message_count')}"
+    )
+    # The critical scalar must never appear in trimmed or dropped lists.
+    assert "open_message_count" not in dropped_keys | trimmed_keys, (
+        f"open_message_count must not be dropped or trimmed; meta={meta}"
+    )
+    # open_messages was dropped or trimmed (i.e. the inbox did NOT ship in full).
+    assert "open_messages" in dropped_keys or "open_messages" in trimmed_keys, (
+        "Under tiny budget open_messages must be dropped or trimmed to exercise the count-fallback path"
+    )
+    # open_messages must NOT appear in packed when dropped.
+    if "open_messages" in dropped_keys:
+        assert "open_messages" not in packed, (
+            "Dropped open_messages must not appear in the packed payload"
+        )
+
+
 class TestParallelismHint:
     """_build_parallelism_hint nudges toward enough INDEPENDENT direction lanes.
 

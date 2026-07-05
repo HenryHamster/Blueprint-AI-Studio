@@ -30,7 +30,7 @@ from app.database import get_session
 from app.direction_outcomes import proven_merged_count, reachable_merged_count, verified_merged_count
 from app.knowledge_query import build_compute_sweep_groups, build_sweep_knowledge_index
 from app.message_convergence import get_message_link, resolve_message_ref
-from app.models import Project, QualificationVerdict, ReleaseVersion, Task
+from app.models import Project, ProjectMessage, QualificationVerdict, ReleaseVersion, Task
 from app.project_message_projection import agent_fetch_message_dict
 from app.routers.agent import verify_agent_token
 from app.shared_state import limiter
@@ -254,6 +254,73 @@ async def _resolve_agent_project(
     if project is None:
         raise HTTPException(status_code=404, detail="Project not found")
     return project
+
+
+@router.get("/projects/{project_id}/directions")
+@limiter.limit("60/minute")
+async def agent_fetch_directions_list(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return compact direction listing (id, status, text, priority) for all
+    directions in the project. Used as a recovery path when directions_summary
+    was dropped entirely under budget pressure so no ids were shipped — the
+    agent can call this with no id to discover direction ids, then pull full
+    detail with ``./fetch direction <id>``."""
+    project = await _resolve_agent_project(project_id, token, session)
+    _COMPACT_KEYS = ("id", "status", "text", "priority")
+    directions = [
+        {k: d[k] for k in _COMPACT_KEYS if k in d}
+        for d in (project.directions or [])
+        if isinstance(d, dict)
+    ]
+    return {"status": "success", "data": directions}
+
+
+@router.get("/projects/{project_id}/messages")
+@limiter.limit("60/minute")
+async def agent_fetch_open_messages_list(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    token: dict = Depends(verify_agent_token),
+):
+    """Return compact open-message listing (id, ref, type, from_type, content
+    excerpt, status). Used as a recovery path when open_messages was dropped
+    entirely under budget pressure so no message refs were shipped — the agent
+    can call this with no id to see what messages exist, then pull a full
+    message with ``./fetch message <ref>``."""
+    await _resolve_agent_project(project_id, token, session)
+    rows = (
+        (
+            await session.execute(
+                select(ProjectMessage)
+                .where(
+                    ProjectMessage.project_id == project_id,
+                    ProjectMessage.status == "open",
+                )
+                .order_by(ProjectMessage.created_at.asc())
+                .limit(50)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    _CONTENT_CAP = 200
+    items = [
+        {
+            "id": str(m.id),
+            "ref": m.id.hex[:8],
+            "type": getattr(m.message_type, "value", str(m.message_type)),
+            "from_type": m.from_type,
+            "content": (m.content or "")[:_CONTENT_CAP],
+            "status": m.status,
+        }
+        for m in rows
+    ]
+    return {"status": "success", "data": items}
 
 
 @router.get("/projects/{project_id}/directions/{direction_id}")
