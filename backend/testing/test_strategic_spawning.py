@@ -12668,6 +12668,244 @@ class TestBuildCycleStartReconciliation:
         assert out["qualification_prose_drift"] == []
         assert out["counts"]["qualification_prose_drift"] == 0
 
+    def test_qualification_surface_conflicts_stale_candidate_with_pending_status(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "qualifying"},
+            # Production shape emitted by _resolve_candidate_currency: verdict
+            # is "stale" (resolved=True, current=False) when the pinned SHA is
+            # behind integration HEAD. There is no "is_stale" key.
+            "last_qualification_candidate_currency": {
+                "verdict": "stale",
+                "resolved": True,
+                "current": False,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "9998887776665554443",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        assert len(conflicts) >= 1
+        stale_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "stale_candidate_with_pending_status"
+        ]
+        assert len(stale_conflicts) == 1
+        assert "stale" in stale_conflicts[0]["description"].lower()
+        assert "pending" in stale_conflicts[0]["description"].lower()
+
+    def test_qualification_surface_conflicts_status_state_mismatch(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            # Deliberately mismatched: status="pending" but state="promoted"
+            # (promoted is not a valid state for pending status)
+            "qualification_state": {"state": "promoted"},
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        status_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "status_state_mismatch"
+        ]
+        assert len(status_conflicts) == 1
+        assert "status" in status_conflicts[0]["description"].lower()
+        assert "state" in status_conflicts[0]["description"].lower()
+
+    def test_qualification_surface_conflicts_criterion_coverage_vs_confidence(self):
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                # Confidence MEETS threshold
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "qualifying"},
+            # But only 2 of 5 criteria are covered
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 2,
+                "partial": 1,
+                "uncovered": 2,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        coverage_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "criterion_coverage_vs_confidence"
+        ]
+        assert len(coverage_conflicts) == 1
+        assert "confidence" in coverage_conflicts[0]["description"].lower()
+        assert "covered" in coverage_conflicts[0]["description"].lower()
+
+    def test_qualification_surface_conflicts_none_when_surfaces_agree(self):
+        # A genuinely agreeing set of surfaces should produce NO conflicts
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promoted",
+                "confidence": 0.95,
+                "threshold": 0.80,
+            },
+            "qualification_state": {"state": "promoted"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            # All criteria are covered
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": True,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        assert out["qualification_surface_conflicts"] == []
+        assert out["counts"]["qualification_surface_conflicts"] == 0
+
+    def test_qualification_surface_conflicts_promotion_readiness_unready(self):
+        # promotion_readiness.ready=False while last_qualification.status=
+        # "promotion_failed" should produce a promotion_readiness_unready
+        # conflict. ("passed" is not a real last_qualification.status value —
+        # the persisted vocabulary is pending/promotion_failed/promoted/etc.)
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "promotion_failed",
+                "confidence": 0.85,
+                "threshold": 0.80,
+            },
+            # State kept consistent with status so only the promotion-readiness
+            # conflict fires (promotion_failed is a valid state for this status).
+            "qualification_state": {"state": "promotion_failed"},
+            "last_qualification_candidate_currency": {
+                "verdict": "fresh",
+                "resolved": True,
+                "current": True,
+                "candidate_sha": "abc123def456789",
+                "head_sha": "abc123def456789",
+            },
+            "criterion_coverage": {
+                "total": 5,
+                "covered": 5,
+                "partial": 0,
+                "uncovered": 0,
+            },
+            "promotion_readiness": {
+                "ready": False,
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        pr_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "promotion_readiness_unready"
+        ]
+        assert len(pr_conflicts) == 1
+        assert "not ready" in pr_conflicts[0]["description"].lower()
+        assert "promotion_failed" in pr_conflicts[0]["description"]
+
+    def test_qualification_surface_conflicts_absent_without_version_phase_block(self):
+        # When version_phase_block is None (no LTS split), the check simply
+        # doesn't run, so the field is empty even if surfaces would disagree.
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=None,
+        )
+        assert out is not None
+        assert out["qualification_surface_conflicts"] == []
+        assert out["counts"]["qualification_surface_conflicts"] == 0
+
 
 # ── _build_prune_candidates: concrete cleanup list when the model is heavy ─────
 

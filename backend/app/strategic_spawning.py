@@ -1451,6 +1451,7 @@ def _build_cycle_start_reconciliation(
     per_direction_delta: list[dict] | None = None,
     running_update: str | None = None,
     last_qual: dict | None = None,
+    version_phase_block: dict | None = None,
 ) -> dict | None:
     """Compute one authoritative cycle-start reconciliation of the strategic surfaces.
 
@@ -1503,6 +1504,12 @@ def _build_cycle_start_reconciliation(
         ``direction_stats``. A phantom ref means the prose narrates a direction
         that no longer exists (or was never created), silently persisting stale
         framing across cycles.
+      * ``qualification_surface_conflicts`` — disagreements between the payload's
+        qualification narrative surfaces (``last_qualification``, derived
+        ``qualification_state``, ``criterion_coverage``, ``promotion_readiness``,
+        and candidate currency). Populated only when ``version_phase_block`` is
+        present (LTS split). Each conflict names the two surfaces, what each
+        asserts, and a reason for the disagreement.
 
     Returns ``None`` when there is nothing to reconcile (no active directions and
     no conflicts), so the caller omits the field for cold-start projects. Pure
@@ -1880,6 +1887,138 @@ def _build_cycle_start_reconciliation(
                         }
                     )
 
+    # 8. Qualification surface coherence: cross-check the payload's own
+    # qualification narrative (last_qualification record, qualification_state,
+    # criterion_coverage, promotion_readiness, candidate currency) for
+    # disagreements. Only runs when version_phase_block is present (LTS split).
+    qualification_surface_conflicts: list[dict] = []
+    if isinstance(version_phase_block, dict):
+        vpb_last_qual = version_phase_block.get("last_qualification")
+        vpb_qual_state = version_phase_block.get("qualification_state")
+        vpb_criterion_cov = version_phase_block.get("criterion_coverage")
+        vpb_promotion_ready = version_phase_block.get("promotion_readiness")
+        vpb_candidate_currency = version_phase_block.get(
+            "last_qualification_candidate_currency"
+        )
+
+        # Disagreement 1: candidate currency says stale while last_qual presents
+        # a passing/promotable candidate
+        if isinstance(vpb_candidate_currency, dict) and isinstance(
+            vpb_last_qual, dict
+        ):
+            # The currency dict stored here is the raw return of
+            # ``_resolve_candidate_currency`` (verdict/resolved/current/
+            # candidate_sha/head_sha) — it emits "stale" as the verdict when
+            # the pinned SHA is resolved and no longer equals integration HEAD.
+            is_stale = vpb_candidate_currency.get("verdict") == "stale"
+            candidate_status = vpb_last_qual.get("status")
+            if (
+                is_stale
+                and candidate_status in ("pending", "promotion_failed")
+            ):
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "stale_candidate_with_pending_status",
+                        "description": (
+                            "Candidate currency says the pinned SHA is stale/behind "
+                            f"HEAD, but last_qualification.status is '{candidate_status}' "
+                            "(not disqualified). The version may be advancing when its "
+                            "candidate is no longer the integration branch HEAD."
+                        ),
+                    }
+                )
+
+        # Disagreement 2: last_qualification.status vs qualification_state
+        if isinstance(vpb_last_qual, dict) and isinstance(vpb_qual_state, dict):
+            raw_status = vpb_last_qual.get("status")
+            derived_state = vpb_qual_state.get("state")
+            if (
+                raw_status is not None
+                and derived_state is not None
+                and raw_status != derived_state
+            ):
+                # Map status to expected states to detect genuine disagreements
+                # (not all status/state pairs are incompatible)
+                status_to_expected_states = {
+                    "pending": {
+                        "qualifying",
+                        "promotion_in_flight",
+                        "promotion_check_wait",
+                        "audit_crashed",
+                    },
+                    "promotion_failed": {
+                        "promotion_failed",
+                        "required_check_failed",
+                        "protection_blocked_review",
+                    },
+                    "promoted": {
+                        "promoted",
+                        "promoted_unconfirmed",
+                        "promotion_deploy_failed",
+                        "promotion_confirmation_timed_out",
+                    },
+                }
+                expected_states = status_to_expected_states.get(raw_status, {})
+                if derived_state not in expected_states:
+                    qualification_surface_conflicts.append(
+                        {
+                            "conflict_type": "status_state_mismatch",
+                            "description": (
+                                f"last_qualification.status='{raw_status}' but "
+                                f"qualification_state.state='{derived_state}' "
+                                "(states do not align for this status)."
+                            ),
+                        }
+                    )
+
+        # Disagreement 3: criterion_coverage unmapped vs confidence/threshold
+        if isinstance(vpb_criterion_cov, dict) and isinstance(vpb_last_qual, dict):
+            covered = int(vpb_criterion_cov.get("covered", 0) or 0)
+            total = int(vpb_criterion_cov.get("total", 0) or 0)
+            confidence = vpb_last_qual.get("confidence")
+            threshold = vpb_last_qual.get("threshold")
+            # When confidence meets threshold but NOT all criteria are covered,
+            # the two surfaces disagree on "ready to promote" assessment.
+            if (
+                total > 0
+                and covered < total
+                and confidence is not None
+                and threshold is not None
+                and isinstance(confidence, (int, float))
+                and isinstance(threshold, (int, float))
+                and confidence >= threshold
+            ):
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "criterion_coverage_vs_confidence",
+                        "description": (
+                            f"Confidence {confidence:.2%} meets threshold "
+                            f"{threshold:.2%}, but only {covered}/{total} criteria "
+                            "are covered. The version is deemed ready by confidence "
+                            "but incomplete by criterion coverage."
+                        ),
+                    }
+                )
+
+        # Disagreement 4: promotion_readiness trend vs current qualification status
+        if isinstance(vpb_promotion_ready, dict) and isinstance(vpb_last_qual, dict):
+            ready_state = vpb_promotion_ready.get("ready")
+            qual_status = vpb_last_qual.get("status")
+            # If promotion_readiness says not ready but status is
+            # "promotion_failed", the surfaces contradict.
+            if ready_state is False and qual_status == "promotion_failed":
+                qualification_surface_conflicts.append(
+                    {
+                        "conflict_type": "promotion_readiness_unready",
+                        "description": (
+                            "Promotion readiness is not ready, but "
+                            f"last_qualification.status is '{qual_status}'. "
+                            "The trend advises against promotion while the "
+                            "qualification is progressing."
+                        ),
+                    }
+                )
+
     # Nothing to reconcile (e.g. a cold-start project): let the caller omit it.
     if (
         not active_dirs
@@ -1892,6 +2031,7 @@ def _build_cycle_start_reconciliation(
         and not pending_rollup_accounting
         and not phantom_direction_refs
         and not qualification_prose_drift
+        and not qualification_surface_conflicts
     ):
         return None
 
@@ -1910,6 +2050,7 @@ def _build_cycle_start_reconciliation(
     capped_pending_rollup, pending_rollup_dropped = _cap(pending_rollup_accounting)
     capped_phantoms, phantoms_total = _cap(phantom_direction_refs)
     capped_qual_drift, qual_drift_total = _cap(qualification_prose_drift)
+    capped_qual_conflicts, qual_conflicts_total = _cap(qualification_surface_conflicts)
     # Cap each surfaced direction's not-landed title list too, preserving the
     # true count (``not_landed``) so the renderer can show "+N more".
     for m in capped_merge:
@@ -1941,6 +2082,7 @@ def _build_cycle_start_reconciliation(
         "pending_in_open_rollup": capped_pending_rollup,
         "phantom_direction_refs": capped_phantoms,
         "qualification_prose_drift": capped_qual_drift,
+        "qualification_surface_conflicts": capped_qual_conflicts,
         "counts": {
             # True totals (shown + overflow) so the renderer can say "+N more".
             "capability_contradictions": len(capped_caps) + caps_total,
@@ -1969,6 +2111,7 @@ def _build_cycle_start_reconciliation(
             "merge_pending_in_open_rollup_accounting": len(capped_pending_rollup) + pending_rollup_dropped,
             "phantom_direction_refs": len(capped_phantoms) + phantoms_total,
             "qualification_prose_drift": len(capped_qual_drift) + qual_drift_total,
+            "qualification_surface_conflicts": len(capped_qual_conflicts) + qual_conflicts_total,
         },
     }
 
@@ -7748,6 +7891,7 @@ async def _spawn_strategic_review(
         (recent_interventions or {}).get("per_direction_delta"),
         running_update=project.running_update or "",
         last_qual=_open_version.last_qualification if _open_version is not None else None,
+        version_phase_block=_version_phase_block,
     )
     # Soft size/health signal from the DURABLE pre-trim model so counts are honest
     # (the agent view above is trimmed). Fail-open: None when the durable model
