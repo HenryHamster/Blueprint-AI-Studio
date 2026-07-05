@@ -2086,6 +2086,228 @@ def test_core_floor_reserved_accounting_in_metadata():
         )
 
 
+# ---------------------------------------------------------------------------
+# Named-open test gaps: watermark monotonicity, floor-sum, per-section accounting
+# Criterion: c-5257b111
+# ---------------------------------------------------------------------------
+
+def _worst_case_floor_inputs() -> dict:
+    """Shared worst-case values exercising each core section's floor callback."""
+    return {
+        "open_messages": [
+            {"id": f"m-{i}", "type": "BUG_REPORT", "title": f"Bug {i}", "content": "c" * 500}
+            for i in range(50)
+        ],
+        "directions_summary": [
+            {
+                "id": f"d-{i}",
+                "priority": "high",
+                "status": "active",
+                "text": "t" * 1200,
+                "gap_id": f"g-{i}",
+                "system_id": f"s-{i}",
+            }
+            for i in range(40)
+        ],
+        "problem_model": {
+            "gaps": [
+                {
+                    "id": f"g-{i}",
+                    "name": f"Gap {i}",
+                    "status": "active",
+                    "priority": "high",
+                    "opened": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z",
+                    "evidence": "e" * 800,
+                    "description": "d" * 400,
+                }
+                for i in range(30)
+            ]
+        },
+        "version_phase": {
+            "version_number": 22,
+            "phase": "build",
+            "goal": "g" * 2000,
+            "phase_reasoning": "r" * 3000,
+            "criterion_coverage": {
+                "total": 80,
+                "covered": 20,
+                "criteria": [
+                    {
+                        "criterion_key": f"c-{i}",
+                        "text": "x" * 200,
+                        "coverage": "uncovered",
+                        "stuck_reason": "s" * 100,
+                    }
+                    for i in range(80)
+                ],
+            },
+        },
+    }
+
+
+def test_floor_size_watermark_monotonicity():
+    """For each core section, floor(v).bytes ≤ full(v).bytes and summarize(v).bytes ≤ full(v).bytes.
+
+    Watermark-monotonicity invariant: neither the floor nor the summarize callback
+    may grow the payload beyond the full value. The floor is the section's
+    low-water mark — the minimum representation guaranteed to ship — so it must
+    always be no larger than the raw value. The same non-expansion constraint
+    applies to summarize. Violations corrupt budget-reservation accounting: a
+    floor larger than full means the packer reserves MORE than the section
+    actually costs at full size, crowding out other sections unnecessarily.
+
+    Note: floor_size ≤ summarize_size does NOT always hold. For problem_model,
+    the floor is the whole agent-view model (preserved intact for the strategist)
+    while the summarize callback produces a smaller skeleton — an intentional
+    design where the floor is the guaranteed-rich form and summarize is the
+    emergency fallback.
+
+    Criterion: c-5257b111
+    """
+    import json as _json
+
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    def _sz(v: object) -> int:
+        return len(_json.dumps(v, default=str).encode())
+
+    worst_case = _worst_case_floor_inputs()
+
+    for key, entry in _STRATEGIC_REVIEW_SCHEMA.items():
+        floor_fn = entry.get("floor")
+        if floor_fn is None or key not in worst_case:
+            continue
+
+        value = worst_case[key]
+        full_size = _sz(value)
+
+        floored = floor_fn(value)
+        floor_size = _sz(floored)
+
+        assert floor_size <= full_size, (
+            f"section {key!r}: floor_size={floor_size} > full_size={full_size} — "
+            "floor callback must not grow the payload (watermark monotonicity violated)"
+        )
+
+        summarize_fn = entry.get("summarize")
+        if summarize_fn is not None:
+            summarized = summarize_fn(value)
+            summarize_size = _sz(summarized)
+
+            assert summarize_size <= full_size, (
+                f"section {key!r}: summarize_size={summarize_size} > full_size={full_size} — "
+                "summarize callback must not grow the payload (watermark monotonicity violated)"
+            )
+
+
+def test_floor_sum_measured_under_half_budget():
+    """Raw sum of floor bytes across all core sections must be ≤ half the budget.
+
+    This test directly measures floor-reservation cost by applying each floor
+    callback to a worst-case input and summing the resulting byte sizes. If the
+    sum exceeds half the default budget (60 KB out of 120 KB), the reserved bytes
+    leave insufficient headroom for critical sections and other high-tier context,
+    risking PayloadTooLargeError on critical keys or unnecessary degradation.
+
+    Unlike test_core_floor_sum_stays_under_half_budget (which verifies end-to-end
+    packing behaviour), this test measures the raw floor-callback output sizes so
+    any new floor callback that adds unexpectedly large reservations fails loudly.
+
+    Criterion: c-5257b111
+    """
+    import json as _json
+
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    def _sz(v: object) -> int:
+        return len(_json.dumps(v, default=str).encode())
+
+    worst_case = _worst_case_floor_inputs()
+    budget = 120 * 1024
+    half_budget = budget // 2
+
+    floor_bytes_per_section: dict[str, int] = {}
+    for key, entry in _STRATEGIC_REVIEW_SCHEMA.items():
+        floor_fn = entry.get("floor")
+        if floor_fn is None or key not in worst_case:
+            continue
+        floored = floor_fn(worst_case[key])
+        floor_bytes_per_section[key] = _sz(floored)
+
+    assert floor_bytes_per_section, "expected at least one core section with a floor callback"
+
+    total_floor_bytes = sum(floor_bytes_per_section.values())
+    assert total_floor_bytes <= half_budget, (
+        f"sum of core-section floor bytes ({total_floor_bytes}) exceeds half the "
+        f"default budget ({half_budget} of {budget}). "
+        f"Per-section: {floor_bytes_per_section}"
+    )
+
+
+def test_per_section_byte_count_matches_serialized_size():
+    """Each section's reported byte count in _packer_meta matches its actual serialized size.
+
+    Per-section accounting invariant: for every shipped entry, meta["shipped"][i]["bytes"]
+    must equal the actual JSON byte length of the packed value, and for every trimmed
+    entry, meta["trimmed"][i]["bytes_trimmed"] must match the packed value's size.
+    A mismatch means the packer is mis-counting bytes, leading to incorrect budget
+    enforcement on subsequent sections packed in the same call.
+
+    Criterion: c-5257b111
+    """
+    import json as _json
+
+    def _sz(v: object) -> int:
+        return len(_json.dumps(v, default=str).encode())
+
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "per-section accounting test"},
+        "items_high": "h" * 800,
+        "items_medium": list(range(200)),
+        "items_low": "l" * 600,
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "high"},
+        "items_high": {"priority": "high"},
+        "items_medium": {"priority": "medium", "summarize": lambda v: v[:10]},
+        "items_low": {"priority": "low"},
+    }
+    # Budget=900 forces items_medium to be summarized (890→30 bytes) and
+    # drops items_low (602 bytes) — exercising the trimmed-path accounting.
+    out = pack_under_budget(payload, schema, budget=900)
+    meta = out["_packer_meta"]
+
+    for entry in meta["shipped"]:
+        key = entry["key"]
+        reported = entry["bytes"]
+        actual = _sz(out[key])
+        assert reported == actual, (
+            f"shipped section {key!r}: reported bytes={reported} but actual "
+            f"serialized size={actual} — per-section accounting is wrong"
+        )
+
+    # Verify trimming actually happened — items_medium must be summarized.
+    trimmed_keys = {entry["key"] for entry in meta["trimmed"]}
+    assert "items_medium" in trimmed_keys, (
+        f"items_medium should be trimmed at budget=900 but meta['trimmed']={meta['trimmed']}"
+    )
+    # items_low must be dropped (too large even after trimming attempt).
+    assert "items_low" not in out, (
+        "items_low should be dropped at budget=900 but it appears in the packed output"
+    )
+
+    for entry in meta["trimmed"]:
+        key = entry["key"]
+        reported_trimmed = entry["bytes_trimmed"]
+        actual = _sz(out[key])
+        assert reported_trimmed == actual, (
+            f"trimmed section {key!r}: bytes_trimmed={reported_trimmed} but actual "
+            f"serialized size={actual} — per-section trimmed accounting is wrong"
+        )
+
+
 def test_compact_last_qualification_includes_qualify_request_blocked():
     """_compact_last_qualification preserves qualify_request_blocked dict and
     qualify_request_blocked_at scalar — the durable block-reason fields written
