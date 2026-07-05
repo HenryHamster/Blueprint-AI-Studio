@@ -591,6 +591,83 @@ async def test_post_event_message_with_context_and_task_id(db_session):
 
 
 @pytest.mark.asyncio
+async def test_post_criterion_retracted_message(db_session):
+    project_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    msg = await nd.post_criterion_retracted_message(
+        db_session,
+        project_id,
+        criterion_key="c-1a2b3c4d",
+        text="Uncoverable acceptance criterion",
+        reason="No feasible evidence path",
+        release_version_id=version_id,
+        retracted_by="strategist",
+    )
+    assert msg.project_id == project_id
+    assert msg.message_type == MessageType.NOTE
+    assert msg.from_type == "system"
+    assert msg.context["event_type"] == "criterion_retracted"
+    assert msg.context["criterion_key"] == "c-1a2b3c4d"
+    assert msg.context["reason"] == "No feasible evidence path"
+    assert msg.context["retracted_by"] == "strategist"
+    assert msg.context["release_version_id"] == str(version_id)
+    assert "c-1a2b3c4d" in msg.content
+    assert msg in db_session
+
+
+@pytest.mark.asyncio
+async def test_post_criterion_retracted_message_truncates_reason_and_text(db_session):
+    project_id = uuid.uuid4()
+    msg = await nd.post_criterion_retracted_message(
+        db_session,
+        project_id,
+        criterion_key="c-deadbeef",
+        text="t" * 500,
+        reason="r" * 900,
+        release_version_id=uuid.uuid4(),
+        retracted_by="strategist",
+    )
+    assert len(msg.context["text"]) <= 200
+    assert len(msg.context["reason"]) <= 400
+
+
+@pytest.mark.asyncio
+async def test_post_criterion_superseded_message(db_session):
+    project_id = uuid.uuid4()
+    version_id = uuid.uuid4()
+    msg = await nd.post_criterion_superseded_message(
+        db_session,
+        project_id,
+        criterion_key="c-1a2b3c4d",
+        text="Old criterion",
+        reason="Replaced by a sharper criterion",
+        release_version_id=version_id,
+        superseded_by_key="c-99887766",
+        retracted_by="strategist",
+    )
+    assert msg.message_type == MessageType.NOTE
+    assert msg.from_type == "system"
+    assert msg.context["event_type"] == "criterion_superseded"
+    assert msg.context["criterion_key"] == "c-1a2b3c4d"
+    assert msg.context["superseded_by_key"] == "c-99887766"
+    assert msg.context["retracted_by"] == "strategist"
+    assert "c-99887766" in msg.content
+
+
+def test_criterion_events_are_high_signal_note_types():
+    """Both criterion lifecycle events must be registered as high-signal NOTEs
+    so they survive paging in the operator-attention read model."""
+    assert "criterion_retracted" in nd.HIGH_SIGNAL_NOTE_EVENT_TYPES
+    assert "criterion_superseded" in nd.HIGH_SIGNAL_NOTE_EVENT_TYPES
+    from app.routers.admin_notifications import (
+        HIGH_SIGNAL_NOTE_EVENT_TYPES as AN_HIGH_SIGNAL,
+    )
+
+    assert "criterion_retracted" in AN_HIGH_SIGNAL
+    assert "criterion_superseded" in AN_HIGH_SIGNAL
+
+
+@pytest.mark.asyncio
 async def test_post_pr_merged_message(db_session):
     project_id = uuid.uuid4()
     msg = await post_pr_merged_message(

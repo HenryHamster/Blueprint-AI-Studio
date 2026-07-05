@@ -82,6 +82,8 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "capability_trial_stalled",  # raise_stalled_trial_notice
         "capability_verdict_decided",  # raise_capability_verdict_notice
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
+        "criterion_retracted",  # post_criterion_retracted_message
+        "criterion_superseded",  # post_criterion_superseded_message
     }
 )
 
@@ -509,6 +511,83 @@ async def post_event_message(
     )
     session.add(msg)
     return msg
+
+
+async def post_criterion_retracted_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    criterion_key: str,
+    text: str,
+    reason: str,
+    release_version_id: Any,
+    retracted_by: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL system NOTE when an active acceptance criterion is retracted.
+
+    Fired by the autonomous safety valve (and any loop-driven retraction) when a
+    previously-active criterion transitions to ``retracted``. Operators must see
+    that a quality gate was removed without their action, so the event type is
+    registered in ``HIGH_SIGNAL_NOTE_EVENT_TYPES`` and survives paging.
+    """
+    summary = (
+        f"Acceptance criterion {criterion_key} retracted by {retracted_by} — "
+        f"{(reason or '').strip()[:160]}"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="criterion_retracted",
+        summary=summary,
+        context={
+            "criterion_key": criterion_key,
+            "text": (text or "")[:200],
+            "reason": (reason or "")[:400],
+            "release_version_id": str(release_version_id),
+            "retracted_by": retracted_by,
+        },
+        task_id=task_id,
+    )
+
+
+async def post_criterion_superseded_message(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    criterion_key: str,
+    text: str,
+    reason: str,
+    release_version_id: Any,
+    superseded_by_key: str,
+    retracted_by: str,
+    task_id: Optional[uuid.UUID] = None,
+) -> ProjectMessage:
+    """Post a HIGH-SIGNAL system NOTE when an active acceptance criterion is superseded.
+
+    Symmetric to :func:`post_criterion_retracted_message` but for the
+    supersession case, where the criterion is replaced by ``superseded_by_key``
+    rather than simply retracted. Registered in ``HIGH_SIGNAL_NOTE_EVENT_TYPES``.
+    """
+    summary = (
+        f"Acceptance criterion {criterion_key} superseded by {superseded_by_key} "
+        f"({retracted_by}) — {(reason or '').strip()[:160]}"
+    )
+    return await post_event_message(
+        session,
+        project_id,
+        event_type="criterion_superseded",
+        summary=summary,
+        context={
+            "criterion_key": criterion_key,
+            "text": (text or "")[:200],
+            "reason": (reason or "")[:400],
+            "release_version_id": str(release_version_id),
+            "superseded_by_key": superseded_by_key,
+            "retracted_by": retracted_by,
+        },
+        task_id=task_id,
+    )
 
 
 async def post_strategic_steering_deferred_message(

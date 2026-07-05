@@ -771,6 +771,9 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
       const criterionCoverage = typeof criterion.coverage === 'string' ? criterion.coverage.trim() : '';
       if (criterionCoverage !== 'uncovered' && criterionCoverage !== 'partial') continue;
 
+      const status = typeof criterion.status === 'string' ? criterion.status.trim() : 'active';
+      if (status !== 'active') continue;
+
       const key = typeof criterion.criterion_key === 'string' && criterion.criterion_key.trim()
         ? criterion.criterion_key.trim()
         : null;

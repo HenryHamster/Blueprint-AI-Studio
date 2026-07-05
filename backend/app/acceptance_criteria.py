@@ -33,6 +33,46 @@ _RETIRED_DIRECTION_STATUSES = frozenset(
     {"expired", "retired", "superseded", "completed"}
 )
 
+# ``created_by`` provenance values that mark a criterion as human/operator
+# authored. The autonomous loop must NOT retract these — an operator has to act.
+# Loop/strategist provenance ("strategist", "STRATEGIC_AGENT") and legacy-null
+# rows are deliberately absent, so the safety valve can still retract every
+# criterion the loop itself authored (that is the whole point of the valve).
+OPERATOR_AUTHORED_PROVENANCE: frozenset[str] = frozenset(
+    {"operator", "user", "human"}
+)
+
+
+def is_operator_authored_criterion(created_by: str | None) -> bool:
+    """True when ``created_by`` marks a criterion as human/operator authored.
+
+    Case-insensitive membership test against ``OPERATOR_AUTHORED_PROVENANCE``.
+    ``None``/empty (legacy rows) and loop provenance ("strategist",
+    "STRATEGIC_AGENT") return ``False`` — those stay retractable by the valve.
+    """
+    if not created_by:
+        return False
+    return created_by.strip().lower() in OPERATOR_AUTHORED_PROVENANCE
+
+
+class OperatorAuthoredRetractionError(Exception):
+    """Raised when a loop-authored retraction targets an operator-authored criterion.
+
+    Carries the offending ``criterion_key`` and its ``created_by`` provenance so
+    the caller can surface a clear operator-facing error. The autonomous loop is
+    only permitted to retract criteria it authored; operator-authored criteria
+    require operator action.
+    """
+
+    def __init__(self, criterion_key: str, created_by: str | None) -> None:
+        self.criterion_key = criterion_key
+        self.created_by = created_by
+        super().__init__(
+            f"criterion '{criterion_key}' was authored by "
+            f"'{created_by}' (operator/human) and cannot be retracted by the "
+            f"autonomous loop; operator action is required"
+        )
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the 'covered' condition.
 
@@ -440,12 +480,19 @@ async def retract_criterion(
     reason: str,
     retracted_by: str | None = None,
     superseded_by_key: str | None = None,
+    enforce_loop_authored: bool = False,
 ) -> VersionAcceptanceCriterion | None:
     """Retract or supersede a criterion without deleting its audit history.
 
     Returns the scoped row when found and ``None`` when the key does not belong
     to the requested project/version. The transition is idempotent: a criterion
     already marked non-active is returned unchanged.
+
+    When ``enforce_loop_authored`` is ``True`` (the strategist/autonomous-loop
+    path), an attempt to retract an operator/human-authored criterion raises
+    :class:`OperatorAuthoredRetractionError` BEFORE any mutation, so the valve
+    can only retract criteria the loop itself authored. The operator-facing
+    retraction path leaves the flag ``False`` and can retract anything.
     """
     result = await session.execute(
         select(VersionAcceptanceCriterion).where(
@@ -457,6 +504,8 @@ async def retract_criterion(
     row = result.scalar_one_or_none()
     if row is None:
         return None
+    if enforce_loop_authored and is_operator_authored_criterion(row.created_by):
+        raise OperatorAuthoredRetractionError(criterion_key, row.created_by)
     if row.status == "active":
         row.status = "superseded" if superseded_by_key else "retracted"
         row.retraction_reason = reason

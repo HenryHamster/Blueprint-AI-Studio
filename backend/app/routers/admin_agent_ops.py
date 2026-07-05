@@ -3344,8 +3344,14 @@ async def strategic_operation(
             get_criterion_by_key as _get_criterion_by_key,
             get_criterion_by_text as _get_criterion_by_text,
             generate_criterion_key as _gen_criterion_key,
+            is_operator_authored_criterion as _is_operator_authored_criterion,
             MAX_CRITERIA_PER_VERSION as _MAX_CRITERIA,
+            OperatorAuthoredRetractionError as _OperatorAuthoredRetractionError,
             retract_criterion as _retract_criterion,
+        )
+        from app.notification_dispatch import (
+            post_criterion_retracted_message as _post_criterion_retracted_message,
+            post_criterion_superseded_message as _post_criterion_superseded_message,
         )
         from app.directions_repo import get_direction_row as _get_direction_row
         from app.models import VersionAcceptanceCriterion as _VAC
@@ -3417,6 +3423,34 @@ async def strategic_operation(
                 status_code=409,
             )
 
+        # LOOP-AUTHORSHIP GUARD. Validate ALL retract targets up front so a
+        # strategist/loop-driven retraction can only touch criteria the loop
+        # authored. Operator/human-authored criteria (created_by=operator/user/
+        # human) require operator action; refuse the WHOLE request before any
+        # retraction commits so a partial batch cannot leave some retracted.
+        # Also snapshot each target's pre-retraction status so the notification
+        # step only fires when a previously-active criterion actually changes.
+        pre_status_by_key: dict[str, str | None] = {}
+        for item in retract_input:
+            criterion_key = item["criterion_key"].strip()
+            existing = await _get_criterion_by_key(
+                session, open_version.id, criterion_key
+            )
+            pre_status_by_key[criterion_key] = (
+                existing.status if existing is not None else None
+            )
+            if existing is not None and _is_operator_authored_criterion(
+                existing.created_by
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"set_acceptance_criteria: criterion '{criterion_key}' was "
+                        f"authored by an operator and cannot be retracted by the "
+                        f"autonomous loop; operator action is required to retract it"
+                    ),
+                )
+
         # Validate supersession targets before executing any retractions.
         for item in retract_input:
             criterion_key = item["criterion_key"].strip()
@@ -3457,18 +3491,65 @@ async def strategic_operation(
                 and superseded_by_key_raw.strip()
                 else None
             )
-            row = await _retract_criterion(
-                session,
-                project_id=project.id,
-                release_version_id=open_version.id,
-                criterion_key=criterion_key,
-                reason=reason,
-                retracted_by="strategist",
-                superseded_by_key=superseded_by_key,
+            try:
+                row = await _retract_criterion(
+                    session,
+                    project_id=project.id,
+                    release_version_id=open_version.id,
+                    criterion_key=criterion_key,
+                    reason=reason,
+                    retracted_by="strategist",
+                    superseded_by_key=superseded_by_key,
+                    enforce_loop_authored=True,
+                )
+            except _OperatorAuthoredRetractionError as exc:
+                # Belt-and-suspenders: the up-front guard already rejected
+                # operator-authored targets, so reaching here means state
+                # changed under us. Refuse cleanly rather than partially commit.
+                raise HTTPException(status_code=422, detail=str(exc)) from exc
+            took_effect = (
+                row is not None
+                and row.status != "active"
+                and pre_status_by_key.get(criterion_key) == "active"
             )
-            if row is not None and row.status != "active":
-                # Row was active and is now retracted/superseded — headroom freed
+            if took_effect:
+                # Row was active and is now retracted/superseded — headroom freed.
                 retracted_active_count += 1
+                # OPERATOR-ATTENTION SIGNAL. Best-effort: a failure to post the
+                # notification must NEVER abort or roll back the retraction. The
+                # message rides the caller's transaction (post_event_message only
+                # session.add()s; the commit below flushes it).
+                try:
+                    if superseded_by_key:
+                        await _post_criterion_superseded_message(
+                            session,
+                            project.id,
+                            criterion_key=criterion_key,
+                            text=row.text,
+                            reason=reason,
+                            release_version_id=open_version.id,
+                            superseded_by_key=superseded_by_key,
+                            retracted_by="strategist",
+                            task_id=task.id,
+                        )
+                    else:
+                        await _post_criterion_retracted_message(
+                            session,
+                            project.id,
+                            criterion_key=criterion_key,
+                            text=row.text,
+                            reason=reason,
+                            release_version_id=open_version.id,
+                            retracted_by="strategist",
+                            task_id=task.id,
+                        )
+                except Exception as exc:  # noqa: BLE001 — signal is best-effort
+                    logger.warning(
+                        "[STRATEGIC API] Failed to post criterion "
+                        "retraction/supersession notification for %s: %s",
+                        criterion_key,
+                        exc,
+                    )
             retracted.append(
                 {
                     "criterion_key": criterion_key,

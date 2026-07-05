@@ -1502,6 +1502,412 @@ async def test_set_acceptance_criteria_op_retracts_criterion(
 
 
 @pytest.mark.asyncio
+async def test_loop_cannot_retract_operator_authored_criterion(
+    client: AsyncClient, db_session
+):
+    """The autonomous loop must NOT retract an operator-authored criterion.
+
+    Exercises the loop-authorship guard (acceptance_criteria.retract_criterion
+    with ``enforce_loop_authored`` + the up-front router validation): a
+    strategist/loop-driven ``set_acceptance_criteria`` retract targeting a
+    criterion with ``created_by="operator"`` is refused with HTTP 422 and the
+    criterion stays active. A batch that includes an operator-authored key is
+    rejected wholesale — no criterion in the batch is retracted.
+    """
+    from app.auth import create_agent_token
+    from app.models import MessageType, ProjectMessage
+
+    project = await _make_project(db_session, "OperatorAuthoredGuard")
+    version = await _make_version(db_session, project)
+    operator_criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Operator-authored gate that must survive the loop",
+        created_by="operator",
+    )
+    # A loop-authored criterion in the SAME batch must not be retracted either,
+    # proving the whole request is rejected before any retraction commits.
+    loop_criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Loop-authored criterion in the same batch",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-operator-guard",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "agent-vm-operator-guard",
+        task_type="strategic_review",
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": loop_criterion.criterion_key,
+                        "reason": "Loop cleanup",
+                    },
+                    {
+                        "criterion_key": operator_criterion.criterion_key,
+                        "reason": "Loop tried to retract an operator gate",
+                    },
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 422, (
+        f"Expected 422 refusing operator-authored retraction, got "
+        f"{resp.status_code}: {resp.text}"
+    )
+    message = resp.json()["error"]["message"]
+    assert operator_criterion.criterion_key in message
+    assert "operator" in message.lower()
+
+    # Both criteria remain active — the whole batch was rejected atomically.
+    await db_session.refresh(operator_criterion)
+    await db_session.refresh(loop_criterion)
+    assert operator_criterion.status == "active"
+    assert loop_criterion.status == "active"
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["retracted"] == 0
+    assert summary["superseded"] == 0
+    assert summary["total"] == 2
+
+    # No operator-attention notification is emitted for a refused retraction.
+    notes = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert not any(
+        (m.context or {}).get("event_type")
+        in ("criterion_retracted", "criterion_superseded")
+        for m in notes
+    )
+
+
+@pytest.mark.asyncio
+async def test_loop_can_retract_strategist_authored_criterion(
+    client: AsyncClient, db_session
+):
+    """The safety valve stays intact: a loop-authored criterion still retracts.
+
+    Guards against the loop-authorship check over-reaching and breaking the
+    core valve. A ``created_by="strategist"`` (and a legacy-null) criterion must
+    retract cleanly and free coverage headroom.
+    """
+    from app.auth import create_agent_token
+
+    project = await _make_project(db_session, "StrategistAuthoredValve")
+    version = await _make_version(db_session, project)
+    loop_criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Loop-authored uncoverable criterion",
+        created_by="strategist",
+    )
+    legacy_criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Legacy criterion with null provenance",
+        created_by=None,
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-valve-intact",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id),
+        "agent-vm-valve-intact",
+        task_type="strategic_review",
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": loop_criterion.criterion_key,
+                        "reason": "Uncoverable — clearing via the valve",
+                    },
+                    {
+                        "criterion_key": legacy_criterion.criterion_key,
+                        "reason": "Legacy rows remain retractable",
+                    },
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    retracted_status = {
+        r["criterion_key"]: r["status"] for r in body["retracted"]
+    }
+    assert retracted_status[loop_criterion.criterion_key] == "retracted"
+    assert retracted_status[legacy_criterion.criterion_key] == "retracted"
+
+    await db_session.refresh(loop_criterion)
+    await db_session.refresh(legacy_criterion)
+    assert loop_criterion.status == "retracted"
+    assert legacy_criterion.status == "retracted"
+
+
+@pytest.mark.asyncio
+async def test_loop_retraction_emits_operator_attention_signal(
+    client: AsyncClient, db_session
+):
+    """A successful loop retraction emits a high-signal ``criterion_retracted`` NOTE."""
+    from app.auth import create_agent_token
+    from app.models import MessageType, ProjectMessage
+
+    project = await _make_project(db_session, "RetractSignal")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Loop-authored criterion to retract with signal",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-retract-signal",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-retract-signal", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "No feasible evidence path",
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    notes = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    signal = [
+        m
+        for m in notes
+        if (m.context or {}).get("event_type") == "criterion_retracted"
+    ]
+    assert len(signal) == 1, f"expected one criterion_retracted NOTE, got {len(signal)}"
+    msg = signal[0]
+    assert msg.from_type == "system"
+    ctx = msg.context or {}
+    assert ctx["criterion_key"] == criterion.criterion_key
+    assert ctx["reason"] == "No feasible evidence path"
+    assert ctx["retracted_by"] == "strategist"
+    assert ctx["release_version_id"] == str(version.id)
+    assert "superseded_by_key" not in ctx
+
+
+@pytest.mark.asyncio
+async def test_loop_supersession_emits_operator_attention_signal(
+    client: AsyncClient, db_session
+):
+    """A successful loop supersession emits a high-signal ``criterion_superseded`` NOTE."""
+    from app.auth import create_agent_token
+    from app.models import MessageType, ProjectMessage
+
+    project = await _make_project(db_session, "SupersedeSignal")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Loop-authored criterion to supersede with signal",
+        created_by="strategist",
+    )
+    successor = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Replacement criterion",
+        created_by="strategist",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review"}],
+        vm_instance_id="agent-vm-supersede-signal",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-supersede-signal", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers={"x-agent-token": token},
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "retract": [
+                    {
+                        "criterion_key": criterion.criterion_key,
+                        "reason": "Replaced by sharper criterion",
+                        "superseded_by_key": successor.criterion_key,
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    notes = (
+        (
+            await db_session.execute(
+                select(ProjectMessage).where(
+                    ProjectMessage.project_id == project.id,
+                    ProjectMessage.message_type == MessageType.NOTE,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    signal = [
+        m
+        for m in notes
+        if (m.context or {}).get("event_type") == "criterion_superseded"
+    ]
+    assert len(signal) == 1, (
+        f"expected one criterion_superseded NOTE, got {len(signal)}"
+    )
+    ctx = signal[0].context or {}
+    assert ctx["criterion_key"] == criterion.criterion_key
+    assert ctx["superseded_by_key"] == successor.criterion_key
+    assert ctx["retracted_by"] == "strategist"
+    # A retracted (non-superseded) NOTE must NOT be emitted for this case.
+    assert not any(
+        (m.context or {}).get("event_type") == "criterion_retracted" for m in notes
+    )
+
+
+@pytest.mark.asyncio
+async def test_retract_criterion_helper_enforces_loop_authored_guard(db_session):
+    """Unit-level: ``retract_criterion`` refuses operator-authored rows when
+    ``enforce_loop_authored`` is set, and leaves them untouched.
+
+    The operator-facing path (flag left False) is unaffected — it can still
+    retract an operator-authored criterion.
+    """
+    project = await _make_project(db_session, "HelperGuard")
+    version = await _make_version(db_session, project)
+    operator_criterion = await ac.create_criterion(
+        db_session,
+        project.id,
+        version.id,
+        "Operator gate",
+        created_by="operator",
+    )
+
+    with pytest.raises(ac.OperatorAuthoredRetractionError) as excinfo:
+        await ac.retract_criterion(
+            db_session,
+            project_id=project.id,
+            release_version_id=version.id,
+            criterion_key=operator_criterion.criterion_key,
+            reason="loop attempt",
+            retracted_by="strategist",
+            enforce_loop_authored=True,
+        )
+    assert excinfo.value.criterion_key == operator_criterion.criterion_key
+    await db_session.refresh(operator_criterion)
+    assert operator_criterion.status == "active"
+
+    # Operator-facing path (flag omitted) can still retract the same criterion.
+    row = await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=operator_criterion.criterion_key,
+        reason="operator retracts their own criterion",
+        retracted_by="operator",
+    )
+    assert row is not None
+    assert row.status == "retracted"
+
+
+def test_is_operator_authored_criterion_provenance():
+    """Provenance classifier: operator/human authored vs loop/legacy."""
+    assert ac.is_operator_authored_criterion("operator") is True
+    assert ac.is_operator_authored_criterion("OPERATOR") is True
+    assert ac.is_operator_authored_criterion("user") is True
+    assert ac.is_operator_authored_criterion("human") is True
+    # Loop and legacy provenance stay retractable.
+    assert ac.is_operator_authored_criterion("strategist") is False
+    assert ac.is_operator_authored_criterion("STRATEGIC_AGENT") is False
+    assert ac.is_operator_authored_criterion(None) is False
+    assert ac.is_operator_authored_criterion("") is False
+
+
+@pytest.mark.asyncio
 async def test_set_acceptance_criteria_supersession_rejects_self_reference(
     client: AsyncClient, db_session
 ):

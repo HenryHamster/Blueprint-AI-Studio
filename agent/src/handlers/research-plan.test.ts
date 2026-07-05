@@ -2228,6 +2228,48 @@ describe('buildVersionPhaseSection', () => {
     expect(coveredLine).toBeUndefined();
   });
 
+  it('does not surface retracted criteria as needing evidence', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Active and uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'active' },
+          { criterion_key: 'AC-2', text: 'Retracted but still uncovered.', coverage: 'uncovered', evidence_count: 0, status: 'retracted' },
+          { criterion_key: 'AC-3', text: 'Covered and superseded.', coverage: 'covered', evidence_count: 2, status: 'superseded' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-1: uncovered, evidence=0 — Active and uncovered.');
+    expect(result).not.toContain('AC-2');
+    expect(result).not.toContain('AC-3');
+  });
+
+  it('does not surface superseded criteria as needing evidence', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      criterion_coverage: {
+        total: 3,
+        covered: 1,
+        partial: 1,
+        uncovered: 1,
+        criteria: [
+          { criterion_key: 'AC-1', text: 'Active and partial.', coverage: 'partial', evidence_count: 1, status: 'active' },
+          { criterion_key: 'AC-2', text: 'Superseded and partial.', coverage: 'partial', evidence_count: 0, status: 'superseded' },
+        ],
+      },
+    });
+
+    expect(result).toContain('AC-1: partial, evidence=1 — Active and partial.');
+    expect(result).not.toContain('AC-2');
+  });
+
   it('renders counts-only criterion coverage without requiring a criteria list', () => {
     const result = buildVersionPhaseSection({
       version_number: 5,

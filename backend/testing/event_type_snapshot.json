@@ -227,6 +227,18 @@
       "classification": "routine",
       "message_type": "NOTE",
       "source_fn": "post_question_answer"
+    },
+    {
+      "name": "criterion_retracted",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_criterion_retracted_message"
+    },
+    {
+      "name": "criterion_superseded",
+      "classification": "high_signal",
+      "message_type": "NOTE",
+      "source_fn": "post_criterion_superseded_message"
     }
   ]
 }
