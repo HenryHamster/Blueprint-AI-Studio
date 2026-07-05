@@ -7,6 +7,7 @@ import {
   writeStrategicHelpers,
   writeFetchHelper,
   buildFetchGuidance,
+  renderStrategicFetchVerbHelpLines,
   RESEARCH_FETCH_VERBS,
   PLAN_FETCH_VERBS,
   DESIGN_DOC_FETCH_VERBS,
@@ -595,6 +596,27 @@ describe('buildFetchGuidance', () => {
 
   it('returns empty string when no verbs are granted', () => {
     expect(buildFetchGuidance([])).toBe('');
+  });
+});
+
+describe('renderStrategicFetchVerbHelpLines', () => {
+  it('lists every verb in STRATEGIC_FETCH_VERBS with its description', () => {
+    const lines = renderStrategicFetchVerbHelpLines();
+    expect(lines).toHaveLength(STRATEGIC_FETCH_VERBS.length);
+    for (const verb of STRATEGIC_FETCH_VERBS) {
+      const match = lines.find(l => l.includes(`./fetch ${verb}`));
+      expect(match, `expected a line advertising ./fetch ${verb}`).toBeDefined();
+    }
+  });
+
+  it('includes the previously-omitted verbs', () => {
+    const joined = renderStrategicFetchVerbHelpLines().join('\n');
+    expect(joined).toContain('./fetch efficiency-snapshot');
+    expect(joined).toContain('./fetch ci-compliance');
+    expect(joined).toContain('./fetch qualification');
+    expect(joined).toContain('./fetch compute-sweeps');
+    expect(joined).toContain('./fetch vm-cost');
+    expect(joined).toContain('./fetch knowledge');
   });
 });
 

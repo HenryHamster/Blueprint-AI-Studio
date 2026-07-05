@@ -191,7 +191,7 @@ const KNOWLEDGE_FETCH_CASE = `  knowledge)
     ;;`;
 
 // One-line description of what each verb resolves, for the prompt guidance block.
-const FETCH_VERB_HELP: Record<FetchVerb, string> = {
+export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'problem-model': '`./fetch problem-model` — the full current problem model (no id)',
   'direction':     '`./fetch direction <id>` — full detail for a direction',
   'playbook':      '`./fetch playbook <key>` — a full playbook entry',
@@ -331,6 +331,15 @@ Available verbs in this workspace:
 ${lines}
 
 `;
+}
+
+// Returns the full STRATEGIC_FETCH_VERBS set as an array of one-line
+// description strings (the FETCH_VERB_HELP values in canonical order).
+// Consumed by strategic.ts to render both the packer-meta recovery bullet list
+// and the executor tools reference block from a single canonical source, so
+// neither list can drift from the provisioned verb set.
+export function renderStrategicFetchVerbHelpLines(): string[] {
+  return STRATEGIC_FETCH_VERBS.map(v => FETCH_VERB_HELP[v]);
 }
 
 // ── Strategic judgment challenge (independent adversarial second opinion) ────

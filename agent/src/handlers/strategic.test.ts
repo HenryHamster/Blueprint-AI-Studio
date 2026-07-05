@@ -169,6 +169,7 @@ const {
   ],
   STRATEGIC_HELPERS_EXPORT_NAMES: [
     'DESIGN_DOC_FETCH_VERBS',
+    'FETCH_VERB_HELP',
     'PLAN_FETCH_VERBS',
     'RESEARCH_FETCH_VERBS',
     'STRATEGIC_CHALLENGE_VERSION',
@@ -179,6 +180,7 @@ const {
     'buildStrategicChallengePrompt',
     'parseStrategicChallengeRecord',
     'portfolioOperationFingerprint',
+    'renderStrategicFetchVerbHelpLines',
     'runStrategicChallenge',
     'writeFetchHelper',
     'writeStrategicHelpers',
@@ -331,50 +333,56 @@ const { DEFAULT_CHALLENGE_RECORD } = vi.hoisted(() => ({
   },
 }));
 
-vi.mock('./strategic-helpers.js', () => ({
-  ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
-  DESIGN_DOC_FETCH_VERBS: [],
-  PLAN_FETCH_VERBS: [],
-  RESEARCH_FETCH_VERBS: [],
-  STRATEGIC_CHALLENGE_VERSION: 1,
-  STRATEGIC_FETCH_VERBS: [],
-  writeStrategicHelpers: vi.fn(),
-  // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
-  // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
-  // existing executor-prompt assertions.
-  runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
-  // Degraded record the handler substitutes when the challenge persist fails:
-  // a blocked record approves nothing, so the executor section renders
-  // status=blocked with no approved pairs (matches the backend's fail-closed gate).
-  blockedChallengeRecord: (note: string) => ({
-    challenge_version: 1,
-    status: 'blocked' as const,
-    evidence_progress: [],
-    retirement_approvals: [],
-    retirement_critique_quality: { verdict: 'not_assessed', rationale: note },
-    portfolio_shape_risk: { verdict: 'not_assessed', rationale: note },
-    portfolio_operations: [],
-    notes: note,
-  }),
-  // Echo the record's status + approved pairs so wiring tests can assert the
-  // section is built from the record runStrategicChallenge returned and is
-  // threaded into the executor prompt.
-  buildStrategicChallengeExecutorSection: (record: {
-    status: string;
-    evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
-    retirement_approvals?: Array<{ direction_id: string; verdict: string }>;
-  }) => {
-    const approved = record.evidence_progress
-      .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
-      .map(e => `${e.direction_id}:${e.status}`)
-      .join(',');
-    const retirementApproved = (record.retirement_approvals || [])
-      .filter(r => r.verdict === 'approved')
-      .map(r => r.direction_id)
-      .join(',');
-    return `CHALLENGE_SECTION(status=${record.status};approved=${approved};retirements=${retirementApproved})`;
-  },
-}));
+vi.mock('./strategic-helpers.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./strategic-helpers.js')>();
+  return {
+    ...Object.fromEntries(STRATEGIC_HELPERS_EXPORT_NAMES.map((name) => [name, vi.fn()])),
+    DESIGN_DOC_FETCH_VERBS: [],
+    FETCH_VERB_HELP: actual.FETCH_VERB_HELP,
+    PLAN_FETCH_VERBS: [],
+    RESEARCH_FETCH_VERBS: [],
+    STRATEGIC_CHALLENGE_VERSION: 1,
+    STRATEGIC_FETCH_VERBS: [],
+    writeStrategicHelpers: vi.fn(),
+    // Use the real implementation so prompt blocks that call this get actual verb lines.
+    renderStrategicFetchVerbHelpLines: actual.renderStrategicFetchVerbHelpLines,
+    // Mocked so the wiring tests do NOT spawn the real challenge runClaudeCode
+    // pass — that keeps runClaudeCode.mock.calls[0] the executor prompt for the
+    // existing executor-prompt assertions.
+    runStrategicChallenge: vi.fn().mockResolvedValue(DEFAULT_CHALLENGE_RECORD),
+    // Degraded record the handler substitutes when the challenge persist fails:
+    // a blocked record approves nothing, so the executor section renders
+    // status=blocked with no approved pairs (matches the backend's fail-closed gate).
+    blockedChallengeRecord: (note: string) => ({
+      challenge_version: 1,
+      status: 'blocked' as const,
+      evidence_progress: [],
+      retirement_approvals: [],
+      retirement_critique_quality: { verdict: 'not_assessed', rationale: note },
+      portfolio_shape_risk: { verdict: 'not_assessed', rationale: note },
+      portfolio_operations: [],
+      notes: note,
+    }),
+    // Echo the record's status + approved pairs so wiring tests can assert the
+    // section is built from the record runStrategicChallenge returned and is
+    // threaded into the executor prompt.
+    buildStrategicChallengeExecutorSection: (record: {
+      status: string;
+      evidence_progress: Array<{ direction_id: string; status: string; verdict: string }>;
+      retirement_approvals?: Array<{ direction_id: string; verdict: string }>;
+    }) => {
+      const approved = record.evidence_progress
+        .filter(e => e.verdict === 'approved' && (e.status === 'advancing' || e.status === 'met'))
+        .map(e => `${e.direction_id}:${e.status}`)
+        .join(',');
+      const retirementApproved = (record.retirement_approvals || [])
+        .filter(r => r.verdict === 'approved')
+        .map(r => r.direction_id)
+        .join(',');
+      return `CHALLENGE_SECTION(status=${record.status};approved=${approved};retirements=${retirementApproved})`;
+    },
+  };
+});
 
 vi.mock('../utils/time.js', () => ({
   parseBackendTimestamp: () => null,
@@ -786,6 +794,30 @@ describe('handleStrategic problem_model recovery framing', () => {
     const section = String(capturedThinkerParams?.packerMetaSection);
     expect(section).toContain('version_phase');
     expect(section).toContain('./fetch version-phase');
+  });
+
+  it('packer-meta recovery block advertises all strategic fetch verbs including previously-omitted ones', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'efficiency_snapshot', reason: 'budget' }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-full-verbs', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // Previously present
+    expect(section).toContain('./fetch problem-model');
+    expect(section).toContain('./fetch version-phase');
+    // Previously missing — must now appear
+    expect(section).toContain('./fetch efficiency-snapshot');
+    expect(section).toContain('./fetch ci-compliance');
+    expect(section).toContain('./fetch qualification');
+    expect(section).toContain('./fetch compute-sweeps');
+    expect(section).toContain('./fetch vm-cost');
+    expect(section).toContain('./fetch knowledge');
   });
 
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
