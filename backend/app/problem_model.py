@@ -2051,6 +2051,12 @@ def _merge_agent_owned_collections(
             _restore_floored_fields(c, p, _FRICTION_FLOOR_FIELDS)
         return p
 
+    archived_gap_ids = {g.id for g in proposed.archived_gaps}
+    current_live_gaps = [g for g in current.gaps if g.id not in archived_gap_ids]
+    proposed_live_gaps = [
+        g for g in proposed.gaps if g.id not in archived_gap_ids
+    ]
+
     proposed.capabilities = _upsert_by_key(
         current.capabilities,
         proposed.capabilities,
@@ -2059,8 +2065,8 @@ def _merge_agent_owned_collections(
         merge_fn=_merge_cap_preserving,
     )
     proposed.gaps = _upsert_by_key(
-        current.gaps,
-        proposed.gaps,
+        current_live_gaps,
+        proposed_live_gaps,
         lambda g: g.id,
         del_gaps,
         merge_fn=_merge_gap_preserving,

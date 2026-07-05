@@ -292,19 +292,22 @@ def test_archive_closed_gaps_skips_already_archived_id():
     assert model.gaps == []
 
 
-def test_apply_agent_update_no_duplicate_when_archived_gap_reappears_in_gaps():
-    """Regression: submitting a problem-model update where a gap already in
-    archived_gaps also appears in gaps with status=closed must not create a
-    second archived_gaps entry with the same id."""
+def test_stale_echo_of_archived_gap_does_not_duplicate_or_resurrect():
+    """A stale strategist echo must not repopulate ``gaps`` or duplicate
+    ``archived_gaps`` when it re-sends a gap id that is already archived."""
     current = {
         "revision": 3,
         "archived_gaps": [
             {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
         ],
     }
-    # Stale strategist payload re-submits the same gap in the active gaps list.
+    # Stale strategist payload re-submits the same gap in the active gaps list
+    # and also echoes the historical archived entry.
     proposed = {
         "gaps": [
+            {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "active"},
+        ],
+        "archived_gaps": [
             {"id": "g-self-qualify-ci-wedge", "name": "ci wedge", "status": "closed"},
         ],
     }
