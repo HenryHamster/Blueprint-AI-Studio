@@ -522,8 +522,6 @@ export async function handleStrategic(
       'directions_summary':         './fetch direction',
       'staged_directions':          './fetch direction',
       'open_messages':              './fetch message',
-      'playbook_summary':           './fetch playbook <key>',
-      'playbook_keys_index':        './fetch playbook <key>',
       'knowledge_index':            './fetch knowledge',
       'version_phase':              './fetch version-phase',
       'design_doc':                 './fetch section <key>',
@@ -531,10 +529,15 @@ export async function handleStrategic(
       'compute_experiment_sweeps':  './fetch compute-sweeps',
       'efficiency_snapshot':        './fetch efficiency-snapshot',
       'ci_compliance':              './fetch ci-compliance',
-      'retirement_deferrals':       './fetch direction',
-      'past_retirement_critiques':  './fetch direction',
-      'retired_directions_summary': './fetch direction',
-      'previous_decision_outcomes': './fetch direction',
+      // sections-type keys: served by /api/agent/projects/{id}/sections/{name}
+      'self_reflection_log':        './fetch sections self_reflection_log',
+      'anomaly_summary':            './fetch sections anomaly_summary',
+      'playbook_summary':           './fetch sections playbook_summary',
+      'retired_directions_summary': './fetch sections retired_directions_summary',
+      'rejected_proposals':         './fetch sections rejected_proposals',
+      'past_retirement_critiques':  './fetch sections past_retirement_critiques',
+      'previous_decision_outcomes': './fetch sections previous_decision_outcomes',
+      'outcome_evaluation':         './fetch sections outcome_evaluation',
     };
     const renderPackerMeta = (meta: Record<string, unknown> | undefined): string => {
       if (!meta) return '';
@@ -571,6 +574,8 @@ export async function handleStrategic(
           const fetchVerb = strVal(d.fetch_verb);
           const recovery = fetchVerb ? `; run \`./fetch ${fetchVerb}\` to recover` : '';
           lines.push(`  - ${k}${bytes}: ${reason}${recovery}`);
+          const fetchHint = PAYLOAD_KEY_FETCH_VERB[k];
+          if (fetchHint) lines.push(`    → ${fetchHint}`);
         }
       }
       return lines.join('\n');

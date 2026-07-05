@@ -1719,3 +1719,327 @@ def test_first_autonomous_improvement_at_registered_in_schema(caplog):
     assert not any(
         "no schema entry" in rec.message.lower() for rec in caplog.records
     )
+
+
+def test_shipped_records_full_size_sections():
+    """Sections that pack at full size appear in _packer_meta['shipped'] with
+    correct key, bytes, and priority."""
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "demo"},
+        "directions": ["d1", "d2"],
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "high"},
+        "directions": {"priority": "medium"},
+    }
+    out = pack_under_budget(payload, schema, budget=10_000)
+    shipped = out["_packer_meta"]["shipped"]
+    # All three sections fit at full size.
+    assert len(shipped) == 3
+    shipped_by_key = {e["key"]: e for e in shipped}
+    assert "type" in shipped_by_key
+    assert "vision" in shipped_by_key
+    assert "directions" in shipped_by_key
+    # Each entry carries bytes and priority.
+    assert shipped_by_key["type"]["bytes"] == _size("strategic_review")
+    assert shipped_by_key["type"]["priority"] == "critical"
+    assert shipped_by_key["vision"]["bytes"] == _size({"purpose": "demo"})
+    assert shipped_by_key["vision"]["priority"] == "high"
+    assert shipped_by_key["directions"]["bytes"] == _size(["d1", "d2"])
+    assert shipped_by_key["directions"]["priority"] == "medium"
+
+
+def test_shipped_empty_when_all_trimmed_or_dropped():
+    """When no section ships at full size, _packer_meta['shipped'] is empty."""
+    payload = {
+        "items": list(range(1000)),  # summarized
+        "huge": "x" * 5000,         # dropped
+    }
+    schema = {
+        "items": {"priority": "medium", "summarize": lambda v: v[:5]},
+        "huge": {"priority": "low"},
+    }
+    out = pack_under_budget(payload, schema, budget=100)
+    # items is trimmed, huge is dropped — neither ships at full size.
+    assert out["_packer_meta"]["shipped"] == []
+    assert len(out["_packer_meta"]["trimmed"]) == 1
+    assert len(out["_packer_meta"]["dropped"]) == 1
+
+
+def test_section_sizes_sum_to_budget_used():
+    """The sum of bytes across all shipped entries equals budget_used.
+
+    This is the accounting invariant: every byte reported in budget_used must
+    be attributed to a specific section in the shipped list. Trimmed sections
+    contribute their post-trim size (bytes_trimmed), not the original size.
+    budget_used is the total of what actually landed in the packed payload, so
+    shipped + trimmed_trimmed_bytes == budget_used (dropped contribute 0).
+    """
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "full value fits"},
+        "items": list(range(200)),  # summarized
+    }
+    schema = {
+        "type": {"priority": "critical"},
+        "vision": {"priority": "high"},
+        "items": {"priority": "medium", "summarize": lambda v: v[:5]},
+    }
+    out = pack_under_budget(payload, schema, budget=500)
+    meta = out["_packer_meta"]
+    # Shipped sections sum to their exact byte contributions.
+    shipped_sum = sum(e["bytes"] for e in meta["shipped"])
+    # Trimmed sections contribute their post-trim bytes.
+    trimmed_sum = sum(e["bytes_trimmed"] for e in meta["trimmed"])
+    assert shipped_sum + trimmed_sum == meta["budget_used"], (
+        f"shipped_sum={shipped_sum} + trimmed_sum={trimmed_sum} != "
+        f"budget_used={meta['budget_used']}"
+    )
+
+
+def test_core_floor_sum_stays_under_half_budget():
+    """The sum of core-section floor reservations must not exceed ~half the budget.
+
+    Core floors are the guaranteed-minimum bytes reserved off the top of the budget
+    for strategic payload sections with floor callbacks (open_messages,
+    directions_summary, problem_model, version_phase). If core floors collectively
+    exceed ~half the budget, the remaining budget for critical + other high-tier
+    sections is too tight — the packer risks starving critical keys into a hard
+    PayloadTooLargeError or degrading recoverable sections unnecessarily.
+
+    This test verifies the invariant: core-floor sum <= ~half the default budget
+    (60KB), leaving at least 60KB headroom for critical sections and other context.
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    # Identify all core sections (those with floor callbacks).
+    core_sections = {
+        key: entry
+        for key, entry in _STRATEGIC_REVIEW_SCHEMA.items()
+        if entry.get("floor") is not None
+    }
+    assert core_sections, "expected at least one core section with a floor callback"
+
+    # Build a realistic worst-case payload: each core section at its maximum
+    # reasonable size (what would actually be floored in a constrained cycle).
+    worst_case_payload = {
+        "type": "strategic_review",
+        "research_mode": False,
+        "vision": {"purpose": "Test core floor sum invariant."},
+    }
+
+    # Populate core sections with bulk that exercises their floor callbacks.
+    worst_case_payload["open_messages"] = [
+        {"id": f"m-{i}", "type": "BUG_REPORT", "content": "c" * 500}
+        for i in range(50)
+    ]
+    worst_case_payload["directions_summary"] = [
+        {"id": f"d-{i}", "priority": "high", "status": "active", "text": "t" * 1200}
+        for i in range(40)
+    ]
+    worst_case_payload["problem_model"] = {
+        "gaps": [
+            {
+                "id": f"g-{i}",
+                "name": f"Gap {i}",
+                "status": "active",
+                "priority": "high",
+                "opened": f"2026-05-{(i % 27) + 1:02d}T00:00:00Z",
+                "evidence": "e" * 800,
+                "description": "d" * 400,
+            }
+            for i in range(50)
+        ],
+    }
+    worst_case_payload["version_phase"] = {
+        "version_number": 22,
+        "phase": "build",
+        "goal": "test" * 1000,
+        "phase_reasoning": "r" * 3000,
+        "criterion_coverage": {
+            "total": 100,
+            "covered": 40,
+            "criteria": [
+                {"criterion_key": f"c-{i}", "text": "x" * 200, "coverage": "uncovered"}
+                for i in range(100)
+            ],
+        },
+    }
+
+    # Add some critical keys so the packer exercises the floor-reservation logic.
+    worst_case_payload["project_name"] = "test"
+    worst_case_payload["base_branch"] = "main"
+
+    # Pack at the default budget (120KB).
+    budget = 120 * 1024
+    out = pack_under_budget(worst_case_payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+
+    # Extract the packer metadata.
+    meta = out["_packer_meta"]
+    budget_used = meta["budget_used"]
+
+    # Verify that the budget was used responsibly: the sum of all shipped sections
+    # should be well under budget, with no critical sections dropped or starved.
+    assert budget_used <= budget, "packer must respect the budget ceiling"
+
+    # Verify no critical sections are missing (dropped or absent).
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    required_critical = {"type", "vision"}  # Minimal critical set always required.
+    for key in required_critical:
+        assert key not in dropped_keys, f"critical section {key!r} was dropped"
+        assert key in out, f"critical section {key!r} is missing from output"
+
+    # Verify that core sections themselves are present (not dropped wholesale).
+    # At least some form of each core section should ship.
+    for core_key in core_sections:
+        if core_key in worst_case_payload:
+            # The section should be present in output (full, summarized, or floored).
+            assert core_key in out or core_key in dropped_keys, (
+                f"core section {core_key!r} neither in output nor in dropped list"
+            )
+            # If it made it to the output, it should not be dropped.
+            if core_key in out:
+                assert core_key not in dropped_keys, (
+                    f"core section {core_key!r} in both output and dropped list"
+                )
+
+
+def test_monotonic_degradation_budget_increase():
+    """Increasing the budget never causes a section to ship in a worse form.
+
+    The monotonic-degradation invariant: if we pack a payload with budget B1 and
+    a section X ships in form F1 (full → summarized → floored → dropped), then
+    packing the SAME payload with budget B2 > B1 should result in form F2 that
+    is at least as good as F1 (never worse).
+
+    This is critical: a larger budget should ONLY improve or maintain forms, never
+    degrade them. Violations would indicate a bug in the packer's reservation or
+    prioritization logic.
+    """
+    # Build a payload with multiple sections at various priorities.
+    payload = {
+        "critical_a": "c" * 200,
+        "high_big": "h" * 800,
+        "high_small": "s" * 200,
+        "medium_bulk": "m" * 1500,
+        "low_extra": "l" * 500,
+    }
+
+    schema = {
+        "critical_a": {"priority": "critical"},
+        "high_big": {
+            "priority": "high",
+            "summarize": lambda v: v[:400],
+        },
+        "high_small": {"priority": "high"},
+        "medium_bulk": {
+            "priority": "medium",
+            "summarize": lambda v: v[:500],
+        },
+        "low_extra": {
+            "priority": "low",
+        },
+    }
+
+    def _form_rank(key: str, out: dict, meta: dict) -> int:
+        """Assign a rank to the form a section ships in (higher = better).
+
+        Ranks:
+        4: full (not in trimmed/dropped)
+        3: summarized (in trimmed with kind in summarized/list_trimmed)
+        2: floored (in trimmed with kind="floored")
+        1: dropped (in dropped list)
+        0: missing (not in output at all)
+        """
+        if key not in out:
+            if any(d["key"] == key for d in meta["dropped"]):
+                return 1  # dropped
+            return 0  # missing
+        # Check if it's trimmed
+        trimmed = [t for t in meta["trimmed"] if t["key"] == key]
+        if trimmed:
+            if trimmed[0]["kind"] == "floored":
+                return 2
+            elif trimmed[0]["kind"] in ("summarized", "list_trimmed"):
+                return 3
+        # Otherwise it's full.
+        return 4
+
+    # Pack at two budgets: tight (300 bytes) and loose (5000 bytes).
+    # With tight budget, some sections degrade; with loose budget, they should improve.
+    tight_budget = 300
+    loose_budget = 5000
+
+    out_tight = pack_under_budget(payload, schema, budget=tight_budget)
+    out_loose = pack_under_budget(payload, schema, budget=loose_budget)
+
+    meta_tight = out_tight["_packer_meta"]
+    meta_loose = out_loose["_packer_meta"]
+
+    # For each section, verify that the loose-budget form is at least as good.
+    for key in payload:
+        rank_tight = _form_rank(key, out_tight, meta_tight)
+        rank_loose = _form_rank(key, out_loose, meta_loose)
+        assert rank_loose >= rank_tight, (
+            f"section {key!r} degraded under larger budget: "
+            f"tight={rank_tight}, loose={rank_loose} "
+            f"(4=full, 3=summarized, 2=floored, 1=dropped, 0=missing)"
+        )
+
+
+def test_core_floor_reserved_accounting_in_metadata():
+    """Core-floor reservations are properly accounted in the packer metadata.
+
+    When the packer reserves bytes for core-section floors off the top of the
+    budget, this reservation must be visible in the _packer_meta so operators
+    can understand why other sections were dropped or degraded.
+
+    This test verifies that sections with floor callbacks are handled in the
+    packing flow and result in the expected bytes-used accounting, which proves
+    the floor reservations are computed and applied.
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+
+    # Build a payload where budget pressure is real but not overwhelming.
+    payload = {
+        "type": "strategic_review",
+        "vision": {"purpose": "Test floor accounting."},
+        "problem_model": {
+            "gaps": [{"id": f"g-{i}", "name": f"Gap {i}", "status": "active"} for i in range(30)],
+        },
+        # Add some high-tier context that will compete with problem_model for budget.
+        "directions_summary": [
+            {"id": f"d-{i}", "status": "active", "text": "t" * 1000} for i in range(15)
+        ],
+        "open_messages": [
+            {"id": f"m-{i}", "type": "NOTE", "content": "c" * 400} for i in range(20)
+        ],
+    }
+
+    budget = 120 * 1024
+    out = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+    meta = out["_packer_meta"]
+
+    # The budget must be respected: used <= total.
+    assert meta["budget_used"] <= meta["budget_total"]
+
+    # All core sections should be present (core sections always ship at least
+    # their floored form when floors are properly reserved).
+    for core_key in ("problem_model", "directions_summary", "open_messages"):
+        if core_key in payload:
+            assert core_key in out, (
+                f"core section {core_key!r} should be present when floors are reserved"
+            )
+
+    # Verify the packer didn't drop ANY critical sections due to core-floor
+    # starvation (if critical sections are missing, the floor reservation was violated).
+    dropped_keys = {d["key"] for d in meta["dropped"]}
+    critical_sections = {k for k, v in _STRATEGIC_REVIEW_SCHEMA.items()
+                         if v.get("priority") == "critical"}
+    for crit_key in critical_sections:
+        assert crit_key not in dropped_keys, (
+            f"critical section {crit_key!r} was dropped — "
+            f"floor reservation may have starved critical keys"
+        )

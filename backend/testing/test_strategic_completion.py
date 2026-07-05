@@ -16516,6 +16516,78 @@ def test_cycle_telemetry_records_core_section_survival():
     assert result_survived["version_phase_dropped"] is False
 
 
+def test_compute_model_gc_telemetry_budget_utilization():
+    """_packer_meta with shipped entries produces budget_utilization_pct and
+    non-empty top_budget_consumers reflecting the largest shipped sections."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={"intent": {"purpose": "t", "current_focus": ""}, "capabilities": [], "gaps": [], "friction": []},
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 100_000,
+                    "budget_used": 80_000,
+                    "trimmed": [],
+                    "dropped": [],
+                    "shipped": [
+                        {"key": "problem_model", "bytes": 50_000, "priority": "high"},
+                        {"key": "directions_summary", "bytes": 20_000, "priority": "high"},
+                        {"key": "vision", "bytes": 10_000, "priority": "critical"},
+                    ],
+                    "gap_memory_trimmed": [],
+                },
+            }
+        ],
+        context={},
+    )
+    result = _compute_model_gc_telemetry(project, task)
+    assert result["budget_utilization_pct"] == 80.0
+    consumers = result["top_budget_consumers"]
+    assert len(consumers) > 0
+    # Largest section is problem_model at 50 KB.
+    assert consumers[0]["key"] == "problem_model"
+    assert consumers[0]["bytes"] == 50_000
+    # Descending order.
+    for i in range(len(consumers) - 1):
+        assert consumers[i]["bytes"] >= consumers[i + 1]["bytes"]
+
+
+def test_compute_model_gc_telemetry_shipped_absent_backward_compat():
+    """Old _packer_meta without 'shipped' key still returns budget_utilization_pct
+    (derived from budget_used/budget_total) and an empty top_budget_consumers."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={"intent": {"purpose": "t", "current_focus": ""}, "capabilities": [], "gaps": [], "friction": []},
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120_000,
+                    "budget_used": 60_000,
+                    "trimmed": [],
+                    "dropped": [],
+                    # no "shipped" key — old payload format
+                },
+            }
+        ],
+        context={},
+    )
+    result = _compute_model_gc_telemetry(project, task)
+    # Still derives utilization from existing budget fields.
+    assert result["budget_utilization_pct"] == 50.0
+    # No shipped entries → no section_bytes from that path.
+    assert result["top_budget_consumers"] == []
+
+
 # ── QUESTION answer threading tests ──────────────────────────────────────────
 
 

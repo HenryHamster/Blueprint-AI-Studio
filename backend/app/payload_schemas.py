@@ -1523,6 +1523,7 @@ def pack_under_budget(
     used = 0
     trimmed: list[dict] = []
     dropped: list[dict] = []
+    shipped: list[dict] = []
 
     for p in parts:
         key = p["key"]
@@ -1550,6 +1551,7 @@ def pack_under_budget(
         if size <= remaining:
             packed[key] = p["value"]
             used += size
+            shipped.append({"key": key, "bytes": size, "priority": p["priority"]})
             continue
         included = False
         candidate = floors.get(key)
@@ -1655,6 +1657,7 @@ def pack_under_budget(
         "budget_used": used,
         "trimmed": trimmed,
         "dropped": dropped,
+        "shipped": shipped,
         "gap_memory_trimmed": gap_memory_trimmed,
     }
     return packed

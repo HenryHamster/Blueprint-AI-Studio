@@ -825,6 +825,51 @@ describe('handleStrategic problem_model recovery framing', () => {
     expect(section).not.toContain('./fetch playbook');
   });
 
+  it('dropped section without backend fetch_verb uses PAYLOAD_KEY_FETCH_VERB fallback', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [{ key: 'retired_directions_summary', reason: 'budget exhausted', bytes: 8192 }],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-drop-fallback', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // Fallback hint from PAYLOAD_KEY_FETCH_VERB, shown on the → line (no inline fetch_verb on the drop record)
+    expect(section).toContain('./fetch sections retired_directions_summary');
+    // Byte size still rendered
+    expect(section).toContain('8192');
+  });
+
+  it('newly-mapped sections-type keys render correct recovery hints when dropped', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        dropped: [
+          { key: 'self_reflection_log', reason: 'budget exhausted', bytes: 1024 },
+          { key: 'anomaly_summary', reason: 'budget exhausted', bytes: 2048 },
+          { key: 'outcome_evaluation', reason: 'budget exhausted', bytes: 4096 },
+          { key: 'rejected_proposals', reason: 'budget exhausted', bytes: 512 },
+          { key: 'past_retirement_critiques', reason: 'budget exhausted', bytes: 3000 },
+        ],
+        trimmed: [],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-sections-hints', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    expect(section).toContain('./fetch sections self_reflection_log');
+    expect(section).toContain('./fetch sections anomaly_summary');
+    expect(section).toContain('./fetch sections outcome_evaluation');
+    expect(section).toContain('./fetch sections rejected_proposals');
+    expect(section).toContain('./fetch sections past_retirement_critiques');
+    // Stale direction-verb entries are gone from previously incorrect mappings
+    expect(section).not.toContain('./fetch direction');
+  });
+
   it('true-empty: no packer drop/trim and empty model → bootstrap framing (first cycle)', async () => {
     const payload: Record<string, unknown> = {
       project_name: 'Blueprint',

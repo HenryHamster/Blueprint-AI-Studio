@@ -3597,6 +3597,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
 
     dropped: list = packer_meta.get("dropped") or []
     trimmed: list = packer_meta.get("trimmed") or []
+    shipped: list = packer_meta.get("shipped") or []
 
     directions_dropped_count: int = sum(
         1
@@ -3648,6 +3649,31 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
                 if isinstance(total, int) and isinstance(shown, int):
                     gap_memory_hidden_entries += max(0, total - shown)
 
+    budget_total: int = packer_meta.get("budget_total") or 0
+    budget_used: int = packer_meta.get("budget_used") or 0
+    budget_utilization_pct: float | None = (
+        round(budget_used / budget_total * 100, 1) if budget_total > 0 else None
+    )
+
+    # Merge byte sizes from all three accounting paths: shipped (full-size),
+    # trimmed (bytes_trimmed = shipped size), dropped (bytes = original size).
+    section_bytes: dict[str, int] = {}
+    for entry in shipped:
+        if isinstance(entry, dict) and entry.get("key"):
+            section_bytes[str(entry["key"])] = int(entry.get("bytes") or 0)
+    for entry in trimmed:
+        if isinstance(entry, dict) and entry.get("key"):
+            section_bytes[str(entry["key"])] = int(entry.get("bytes_trimmed") or 0)
+    for entry in dropped:
+        if isinstance(entry, dict) and entry.get("key"):
+            # dropped sections contributed 0 bytes to the packed payload
+            section_bytes.setdefault(str(entry["key"]), 0)
+    top_budget_consumers: list[dict] = sorted(
+        [{"key": k, "bytes": v} for k, v in section_bytes.items()],
+        key=lambda x: x["bytes"],
+        reverse=True,
+    )[:5]
+
     return {
         "model_bytes": model_bytes,
         "capability_count": capability_count,
@@ -3660,6 +3686,8 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         "high_tier_dropped": high_tier_dropped,
         "gap_memory_trimmed_count": gap_memory_trimmed_count,
         "gap_memory_hidden_entries": gap_memory_hidden_entries,
+        "budget_utilization_pct": budget_utilization_pct,
+        "top_budget_consumers": top_budget_consumers,
     }
 
 
