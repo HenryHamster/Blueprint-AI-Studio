@@ -2244,6 +2244,22 @@ describe('buildCompletionDebtSection', () => {
     const result = buildCompletionDebtSection({ items: [{ kind: 'dormant_knob', description: 'x', age_days: 0 }], total_open: 1 });
     expect(result).toContain('Address open completion debt');
   });
+
+  it('renders the stable debt id and the disposition/linkage hint', () => {
+    const result = buildCompletionDebtSection({
+      items: [
+        { id: 'debt-abc123', kind: 'dormant_knob', description: 'Knob X default-off', age_days: 4 },
+      ],
+      total_open: 1,
+    });
+    // The stable id must be surfaced so the strategist can address it.
+    expect(result).toContain('`debt-abc123`');
+    expect(result).toContain('[dormant_knob] `debt-abc123` Knob X default-off');
+    // The disposition/linkage instruction must be present.
+    expect(result).toContain('dispose-completion-debt');
+    expect(result).toContain('"disposition":"resolved"');
+    expect(result).toContain('"debt_id":"<id>"');
+  });
 });
 
 // ── Reconciliation sections fixture contract (agent render coverage) ──────────

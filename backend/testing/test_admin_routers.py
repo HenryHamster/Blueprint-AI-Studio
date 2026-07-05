@@ -25731,6 +25731,289 @@ class TestCompletionDebtAdmin:
         assert resolved["entry"]["resolved_at"] is not None
 
 
+class TestStrategistDisposeCompletionDebt:
+    """Strategic ops: dispose_completion_debt + debt_id linkage on spawn."""
+
+    async def _make_strategic_task(self, db_session, project, vm="agent-vm-debt-op"):
+        task = Task(
+            project_id=project.id,
+            title="Strategic review for debt disposition",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id=vm,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        from app.auth import create_agent_token
+
+        token = create_agent_token(str(task.id), vm, task_type="strategic_review")
+        return task, token
+
+    @pytest.mark.asyncio
+    async def test_strategist_resolve_completion_debt_requires_evidence(
+        self, client: AsyncClient, db_session
+    ):
+        """Resolving a debt with no evidence is a 400; with evidence it resolves
+        and persists the reason. (Named acceptance test for this task.)"""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id, kind="dormant_knob", title="Wire enforce path"
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+        task, token = await self._make_strategic_task(db_session, project)
+
+        # No evidence → 400, row stays open.
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {"debt_id": str(entry.id), "disposition": "resolved"},
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        await db_session.refresh(entry)
+        assert entry.status == "open"
+
+        # With evidence → resolves and persists the reason.
+        resp2 = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {
+                    "debt_id": str(entry.id),
+                    "disposition": "resolved",
+                    "evidence": "Enforce path merged in PR #123; knob now default-on",
+                },
+            },
+        )
+        assert resp2.status_code == 200, resp2.text
+        body = resp2.json()
+        assert body["op"] == "dispose_completion_debt"
+        assert body["entry"]["status"] == "resolved"
+        await db_session.refresh(entry)
+        assert entry.status == "resolved"
+        assert entry.resolution_reason == (
+            "Enforce path merged in PR #123; knob now default-on"
+        )
+
+    @pytest.mark.asyncio
+    async def test_strategist_dismiss_completion_debt(
+        self, client: AsyncClient, db_session
+    ):
+        """Disposition=dismissed sets the dismiss reason and status."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id, kind="capability_trial", title="Trial pending"
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+        task, token = await self._make_strategic_task(db_session, project, vm="vm-dismiss")
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {
+                    "debt_id": str(entry.id),
+                    "disposition": "dismissed",
+                    "reason": "Capability abandoned; no longer relevant",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["entry"]["status"] == "dismissed"
+        await db_session.refresh(entry)
+        assert entry.status == "dismissed"
+        assert entry.resolution_reason == "Capability abandoned; no longer relevant"
+
+    @pytest.mark.asyncio
+    async def test_dispose_unknown_id_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Disposing a nonexistent debt id returns 404."""
+        project = await _make_project(db_session)
+        task, token = await self._make_strategic_task(db_session, project, vm="vm-404")
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {
+                    "debt_id": "00000000-0000-0000-0000-0000000000ff",
+                    "disposition": "resolved",
+                    "evidence": "done",
+                },
+            },
+        )
+        assert resp.status_code == 404, resp.text
+
+    @pytest.mark.asyncio
+    async def test_dispose_already_resolved_returns_409(
+        self, client: AsyncClient, db_session
+    ):
+        """Disposing an already-resolved debt returns 409."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id,
+            kind="dormant_knob",
+            title="Already resolved",
+            status="resolved",
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+        task, token = await self._make_strategic_task(db_session, project, vm="vm-409")
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {
+                    "debt_id": str(entry.id),
+                    "disposition": "resolved",
+                    "evidence": "already done",
+                },
+            },
+        )
+        assert resp.status_code == 409, resp.text
+
+    @pytest.mark.asyncio
+    async def test_dispose_requires_strategic_task_type(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-strategic task type may not dispose completion debt (403)."""
+        from app.auth import create_agent_token
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id, kind="dormant_knob", title="X"
+        )
+        db_session.add(entry)
+        task = Task(
+            project_id=project.id,
+            title="Non-strategic task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "build"}],
+            vm_instance_id="vm-nonstrat",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        await db_session.refresh(entry)
+        token = create_agent_token(str(task.id), "vm-nonstrat", task_type="create")
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "dispose_completion_debt",
+                "data": {
+                    "debt_id": str(entry.id),
+                    "disposition": "resolved",
+                    "evidence": "done",
+                },
+            },
+        )
+        assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_spawn_task_links_debt(self, client: AsyncClient, db_session):
+        """spawn_task with debt_id stamps detail.linked_tasks and echoes
+        linked_debt_id."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id, kind="dormant_knob", title="Needs follow-up work"
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+        task, token = await self._make_strategic_task(db_session, project, vm="vm-spawn-link")
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_task",
+                "data": {
+                    "type": "research",
+                    "title": "Investigate the dormant knob",
+                    "prompt": "Research how to graduate the dormant knob to enforce",
+                    "debt_id": str(entry.id),
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "spawn_task"
+        assert body["linked_debt_id"] == str(entry.id)
+
+        await db_session.refresh(entry)
+        linked = (entry.detail or {}).get("linked_tasks") or []
+        assert any(x.get("task_id") == body["task_id"] for x in linked), (
+            f"spawned task must be linked; got detail={entry.detail!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_spawn_fix_links_debt(self, client: AsyncClient, db_session):
+        """spawn_fix with debt_id also links to the debt row."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+        entry = CompletionDebtEntry(
+            project_id=project.id, kind="no_ci_gate", title="Gate fell open"
+        )
+        db_session.add(entry)
+        await db_session.commit()
+        await db_session.refresh(entry)
+        task, token = await self._make_strategic_task(db_session, project, vm="vm-fix-link")
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "spawn_fix",
+                "data": {
+                    "type": "create",
+                    "title": "Wire the enforce gate",
+                    "prompt": "Implement the enforce path for the no-CI gate",
+                    "debt_id": str(entry.id),
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["op"] == "spawn_fix"
+        assert body["linked_debt_id"] == str(entry.id)
+        await db_session.refresh(entry)
+        linked = (entry.detail or {}).get("linked_tasks") or []
+        assert any(x.get("task_id") == body["task_id"] for x in linked)
+
+
 @pytest.mark.asyncio
 async def test_direction_created_during_gated_op_survives_commit(
     client: AsyncClient, db_session, mocker

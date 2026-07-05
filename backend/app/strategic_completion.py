@@ -1818,6 +1818,22 @@ async def _spawn_retirement_memos(
     by_id = {d.get("id"): d for d in (project.directions or []) if d.get("id")}
     spawned = 0
     for did in retired_ids:
+        # A retirement that was previously DEFERRED by the challenge gate left an
+        # open ``retirement_residual:{project}:{direction}:deferred`` debt row.
+        # The retire has now succeeded, so resolve that residual. Runs BEFORE the
+        # memo-dedup ``continue`` so a duplicate-memo direction still gets its
+        # deferred debt cleared. Best-effort/non-fatal; does not touch the
+        # separate memo handoff debt written below.
+        try:
+            from app.completion_debt import aresolve_deferred_retirement_debt
+
+            await aresolve_deferred_retirement_debt(session, project.id, did)
+        except Exception:
+            logger.exception(
+                "[STRATEGIC] deferred-retirement debt resolve failed for "
+                "direction %s (non-fatal)",
+                did,
+            )
         if did in already_memed:
             logger.debug(
                 "[STRATEGIC] Skipping duplicate retirement memo for direction %s", did

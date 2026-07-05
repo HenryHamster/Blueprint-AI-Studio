@@ -55,6 +55,7 @@ from app.models import (
     Project,
     ProjectMessage,
     QualificationVerdict,
+    CompletionDebtEntry,
     CriterionEvidence,
     Task,
     TaskStatus,
@@ -709,6 +710,49 @@ class TestComputeCompositeDebtPressure:
         # existing_confidence = 1.0; blended = 0.9 * 1.0 + 0.1 * 0.0 = 0.9
         assert result["confidence"] == pytest.approx(0.9)
         assert result["promote"] is True  # 0.9 >= 0.75
+
+    def test_project_actionable_open_preferred_over_total_open(self):
+        """Scoring-only project_actionable_open overrides deployment-wide total_open."""
+        assert rq._score_completion_debt_pressure(
+            {"total_open": 10, "project_actionable_open": 0}
+        ) == pytest.approx(1.0)
+        assert rq._score_completion_debt_pressure({"total_open": 10}) == pytest.approx(
+            0.5
+        )
+
+    def test_global_standing_debt_does_not_block_passing_candidate_on_enforce(self):
+        """NAMED ACCEPTANCE TEST — global debt does not drag enforce-mode promotion.
+
+        A 0.92 candidate should remain above the 0.90 threshold when the only
+        open debt is deployment-global standing debt.  The scoring snapshot may
+        still report total_open=10 for visibility, but the blend must use the
+        project-actionable count of zero.
+        """
+        policy_with_default_enforce_debt = {
+            "weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+                "completion_debt": rq.DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
+            },
+            "threshold": 0.90,
+        }
+        debt_pressure = rq._score_completion_debt_pressure(
+            {"total_open": 10, "project_actionable_open": 0}
+        )
+
+        result = rq.compute_composite(
+            ci_green=True,
+            audit_score=0.92,
+            test_erosion=0.92,
+            smoketest_score=0.92,
+            policy=policy_with_default_enforce_debt,
+            debt_pressure_score=debt_pressure,
+        )
+
+        assert debt_pressure == pytest.approx(1.0)
+        assert result["confidence"] == pytest.approx(0.932)
+        assert result["promote"] is True
 
 
 # ===========================================================================
@@ -30605,6 +30649,80 @@ async def test_qualification_verdict_includes_completion_debt_block(
         f"completion_debt missing or wrong in verdict sub_scores: "
         f"{verdict_row.sub_scores.get('completion_debt')}"
     )
+
+
+@pytest.mark.asyncio
+async def test_finalize_debt_pressure_uses_project_actionable_open_count(
+    db_session, mocker
+):
+    """Finalize scores project-owned open debt without mutating the public snapshot."""
+    from app import shared_state
+
+    mocker.patch.dict(
+        shared_state.runtime_config,
+        {
+            "promotion_enabled": False,
+            "completion_debt_weight_mode": "enforce",
+            "promotion_threshold": 0.90,
+            "promotion_weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+            },
+        },
+        clear=False,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.92,
+            "findings": [],
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 0,
+                "test_count_delta": 0,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "smoke-project-debt", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+    for idx in range(10):
+        db_session.add(
+            CompletionDebtEntry(
+                project_id=None,
+                kind="seed_inventory",
+                dedupe_key=f"global-standing-{idx}",
+                title=f"Global standing debt {idx}",
+            )
+        )
+    db_session.add(
+        CompletionDebtEntry(
+            project_id=project.id,
+            kind="retirement_residual",
+            dedupe_key="project-actionable-one",
+            title="Project actionable debt",
+        )
+    )
+    await db_session.commit()
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result = await rq._finalize_qualification(db_session, version)
+    await db_session.commit()
+
+    assert result["status"] == "dry_run"
+    await db_session.refresh(version)
+    qual = version.last_qualification
+    assert qual["completion_debt"]["total_open"] == 11
+    assert "project_actionable_open" not in qual["completion_debt"]
+    assert qual["sub_scores"]["debt_pressure"] == pytest.approx(0.95)
+    assert qual["confidence"] == pytest.approx(0.9925)
 
 
 @pytest.mark.asyncio

@@ -37,6 +37,7 @@ from typing import Any, Iterable
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm.attributes import flag_modified
 
 from app.time_utils import _utcnow
 
@@ -302,7 +303,14 @@ async def resolve_debt(
     debt_id: Any,
     *,
     project_id: Any,
+    reason: str | None = None,
 ):
+    """Flip an OPEN debt row to resolved, optionally stamping an evidence reason.
+
+    ``reason`` is keyword-optional so the admin resolve endpoint (which passes no
+    evidence) keeps working unchanged; when a strategist supplies disposition
+    evidence it is persisted (bounded) to ``resolution_reason``.
+    """
     from app.models import CompletionDebtEntry
 
     entry = await session.get(CompletionDebtEntry, debt_id)
@@ -312,11 +320,65 @@ async def resolve_debt(
         raise ValueError("not_found")
     if entry.status != STATUS_OPEN:
         raise ValueError("not_open")
+    reason_text = str(reason).strip() if reason is not None else ""
     async with session.begin_nested():
         entry.status = STATUS_RESOLVED
-        entry.resolution_reason = None
+        entry.resolution_reason = reason_text[:_MAX_TITLE_LEN] if reason_text else None
         entry.resolved_at = _utcnow()
         entry.updated_at = _utcnow()
+        session.add(entry)
+        await session.flush()
+    return entry
+
+
+# Bound the number of linked-task records stamped onto a debt entry's detail so
+# repeated linkage can never grow the JSONB column unbounded.
+_MAX_LINKED_TASKS = 25
+
+
+async def link_task_to_debt(
+    session: Any,
+    debt_id: Any,
+    *,
+    project_id: Any,
+    task_id: Any,
+    note: str | None = None,
+):
+    """Record that a spawned task addresses an OPEN completion-debt entry.
+
+    Appends ``{task_id, note?}`` to the entry's ``detail['linked_tasks']`` list
+    (deduplicated on ``task_id`` and bounded to :data:`_MAX_LINKED_TASKS`). Reuses
+    the ``not_found`` / ``not_open`` ValueError contract shared with
+    :func:`resolve_debt` / :func:`dismiss_debt`. The row stays OPEN — linkage is a
+    forward pointer, not a disposition; the strategist closes the row separately
+    once the work merges.
+    """
+    from app.models import CompletionDebtEntry
+
+    entry = await session.get(CompletionDebtEntry, debt_id)
+    if entry is None or (
+        entry.project_id is not None and entry.project_id != project_id
+    ):
+        raise ValueError("not_found")
+    if entry.status != STATUS_OPEN:
+        raise ValueError("not_open")
+    task_ref = str(task_id).strip()
+    if not task_ref:
+        raise ValueError("invalid_task")
+    detail = dict(entry.detail) if isinstance(entry.detail, dict) else {}
+    linked = detail.get("linked_tasks")
+    linked = [x for x in linked if isinstance(x, dict)] if isinstance(linked, list) else []
+    if not any(x.get("task_id") == task_ref for x in linked):
+        record: dict[str, Any] = {"task_id": task_ref}
+        note_text = str(note).strip() if note else ""
+        if note_text:
+            record["note"] = note_text[:_MAX_TITLE_LEN]
+        linked.append(record)
+    detail["linked_tasks"] = linked[-_MAX_LINKED_TASKS:]
+    async with session.begin_nested():
+        entry.detail = _bound_detail(detail)
+        entry.updated_at = _utcnow()
+        flag_modified(entry, "detail")
         session.add(entry)
         await session.flush()
     return entry
@@ -579,6 +641,40 @@ async def aresolve_completion_debt(
             exc_info=True,
         )
         return False
+
+
+def deferred_retirement_dedupe_key(project_id: Any, direction_id: Any) -> str:
+    """Return the stable dedupe key for a gate-DEFERRED retirement residual.
+
+    This is the ``:deferred`` sibling of the ordinary retirement handoff key
+    ``retirement_residual:{project}:{direction}`` written by
+    ``_spawn_retirement_memos``.  The two are DISTINCT obligations: the deferred
+    row is the "the retire is still owed once the gate clears" residual that this
+    module resolves on success; the un-suffixed row is the retirement handoff
+    memo debt, which must stay open.
+    """
+    return f"retirement_residual:{project_id}:{direction_id}:deferred"
+
+
+async def aresolve_deferred_retirement_debt(
+    session: Any,
+    project_id: Any,
+    direction_id: Any,
+) -> bool:
+    """Best-effort resolve of the gate-DEFERRED retirement residual (ASYNC).
+
+    Called when a previously-deferred retirement finally succeeds (via the
+    strategic ``retire_direction`` endpoint or the log-parse fallback). Resolves
+    ONLY the ``:deferred`` key; the ordinary ``retirement_residual:{p}:{d}`` memo
+    handoff obligation is intentionally left untouched. Delegates to
+    :func:`aresolve_completion_debt`, which is non-fatal, skips missing/already
+    resolved rows, and never reopens a dismissed row. Never raises.
+    """
+    return await aresolve_completion_debt(
+        session,
+        deferred_retirement_dedupe_key(project_id, direction_id),
+        reason="retirement succeeded",
+    )
 
 
 # ── Seed inventory ───────────────────────────────────────────────────────────

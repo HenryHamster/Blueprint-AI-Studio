@@ -2864,6 +2864,25 @@ async def _candidate_already_on_main_at_finalize(
         return False
 
 
+async def _count_project_actionable_open_completion_debt(
+    session: AsyncSession, project_id: Any
+) -> int:
+    """Count open completion-debt rows owned by the qualified project only."""
+    if project_id is None:
+        return 0
+    from app.models import CompletionDebtEntry  # noqa: PLC0415
+
+    stmt = (
+        select(sa_func.count())
+        .select_from(CompletionDebtEntry)
+        .where(
+            CompletionDebtEntry.project_id == project_id,
+            CompletionDebtEntry.status == "open",
+        )
+    )
+    return int((await session.execute(stmt)).scalar_one() or 0)
+
+
 async def _finalize_qualification(
     session: AsyncSession,
     version: release_version.ReleaseVersion,
@@ -3975,9 +3994,26 @@ async def _finalize_qualification(
         )
     except Exception:
         pass
+    _project_actionable_open: int | None = None
+    if _completion_debt is not None:
+        try:
+            _project_actionable_open = (
+                await _count_project_actionable_open_completion_debt(
+                    session, version.project_id
+                )
+            )
+        except Exception:
+            pass
+    _completion_debt_scoring_snapshot: dict[str, Any] | None = None
+    if _completion_debt is not None:
+        _completion_debt_scoring_snapshot = dict(_completion_debt)
+        if _project_actionable_open is not None:
+            _completion_debt_scoring_snapshot["project_actionable_open"] = (
+                _project_actionable_open
+            )
     _debt_pressure_score: float | None = (
-        _score_completion_debt_pressure(_completion_debt)
-        if _completion_debt is not None
+        _score_completion_debt_pressure(_completion_debt_scoring_snapshot)
+        if _completion_debt_scoring_snapshot is not None
         else None
     )
 

@@ -158,6 +158,94 @@ async def test_async_resolve_flips_open_to_resolved(db_session):
     assert row.resolution_reason == "decided:adopt"
 
 
+# ── resolve_debt evidence + link_task_to_debt (strategist disposition path) ──
+
+
+async def _seed_open_debt(session, project_id, *, title="Open obligation"):
+    entry = CompletionDebtEntry(project_id=project_id, kind=cd.KIND_DORMANT_KNOB, title=title)
+    session.add(entry)
+    await session.commit()
+    await session.refresh(entry)
+    return entry
+
+
+@pytest.mark.asyncio
+async def test_resolve_debt_persists_evidence_reason(db_session):
+    """resolve_debt stores the supplied evidence in resolution_reason and stays
+    optional (no reason → None) for the admin resolve endpoint."""
+    project = Project(name="ResolveEvidence", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    with_reason = await _seed_open_debt(db_session, project.id, title="With reason")
+    resolved = await cd.resolve_debt(
+        db_session, with_reason.id, project_id=project.id, reason="proof: merged in #42"
+    )
+    await db_session.commit()
+    assert resolved.status == cd.STATUS_RESOLVED
+    assert resolved.resolution_reason == "proof: merged in #42"
+
+    no_reason = await _seed_open_debt(db_session, project.id, title="No reason")
+    resolved2 = await cd.resolve_debt(db_session, no_reason.id, project_id=project.id)
+    await db_session.commit()
+    assert resolved2.status == cd.STATUS_RESOLVED
+    assert resolved2.resolution_reason is None
+
+
+@pytest.mark.asyncio
+async def test_link_task_to_debt_stamps_detail_and_dedupes(db_session):
+    """link_task_to_debt appends a linked-task record to detail and dedupes on
+    task_id while leaving the row open."""
+    project = Project(name="LinkDebt", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    entry = await _seed_open_debt(db_session, project.id)
+
+    await cd.link_task_to_debt(
+        db_session, entry.id, project_id=project.id, task_id="task-1", note="spawned"
+    )
+    await db_session.commit()
+    # Re-linking the same task is idempotent; a different task appends.
+    await cd.link_task_to_debt(db_session, entry.id, project_id=project.id, task_id="task-1")
+    await cd.link_task_to_debt(db_session, entry.id, project_id=project.id, task_id="task-2")
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    linked = (entry.detail or {}).get("linked_tasks") or []
+    task_ids = [x.get("task_id") for x in linked]
+    assert task_ids == ["task-1", "task-2"], task_ids
+    assert linked[0].get("note") == "spawned"
+    # Linking never disposes the row — it stays open.
+    assert entry.status == cd.STATUS_OPEN
+
+
+@pytest.mark.asyncio
+async def test_link_task_to_debt_not_found_and_not_open(db_session):
+    """link_task_to_debt raises not_found for unknown/foreign rows and not_open
+    for a disposed row."""
+    project = Project(name="LinkGuards", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    import uuid as _uuid
+
+    with pytest.raises(ValueError, match="not_found"):
+        await cd.link_task_to_debt(
+            db_session, _uuid.uuid4(), project_id=project.id, task_id="t"
+        )
+
+    entry = await _seed_open_debt(db_session, project.id)
+    await cd.resolve_debt(db_session, entry.id, project_id=project.id)
+    await db_session.commit()
+    with pytest.raises(ValueError, match="not_open"):
+        await cd.link_task_to_debt(
+            db_session, entry.id, project_id=project.id, task_id="t"
+        )
+
+
 # ── Seed idempotency (repeated seed → no duplicates) ─────────────────────────
 
 
@@ -518,6 +606,196 @@ async def test_retirement_writer_records_residual_debt(db_session):
     assert row.kind == cd.KIND_RETIREMENT_RESIDUAL
     assert row.status == cd.STATUS_OPEN
     assert row.project_id == project.id
+
+
+# ── Deferred-retirement residual resolution ──────────────────────────────────
+
+
+def test_deferred_retirement_dedupe_key():
+    """The deferred key is the ``:deferred`` sibling of the memo handoff key."""
+    key = cd.deferred_retirement_dedupe_key("proj-1", "dir-9")
+    assert key == "retirement_residual:proj-1:dir-9:deferred"
+    # Distinct from the ordinary (memo) retirement residual key.
+    assert key != "retirement_residual:proj-1:dir-9"
+
+
+async def _make_retire_fixture(db_session, direction_id: str):
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {"id": direction_id, "text": "Direction to retire", "status": "retired"}
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "r"}],
+        status=TaskStatus.COMPLETED if TaskStatus else None,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return project, task
+
+
+@pytest.mark.asyncio
+async def test_successful_retirement_resolves_deferred_residual_debt(db_session):
+    """A gate-deferred retirement residual is resolved once the retire succeeds,
+    while the separate memo handoff debt is created and left open."""
+    direction_id = "dir-deferred-1"
+    project, task = await _make_retire_fixture(db_session, direction_id)
+
+    # Simulate the earlier gate-DEFERRED path opening the deferred residual row.
+    deferred_key = cd.deferred_retirement_dedupe_key(project.id, direction_id)
+    opened = await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=deferred_key,
+        kind=cd.KIND_RETIREMENT_RESIDUAL,
+        title="Retirement deferred for direction",
+        project_id=project.id,
+        source="admin_agent_ops",
+        detail={"direction_id": direction_id, "kind": "deferred"},
+    )
+    await db_session.commit()
+    assert opened is True
+
+    # The retirement now succeeds through the memo-spawn path.
+    spawned = await _spawn_retirement_memos(
+        db_session,
+        project,
+        task,
+        retired_ids=[direction_id],
+        rationales={direction_id: "Delivered full scope."},
+    )
+    await db_session.commit()
+
+    # Original outcome unchanged: exactly one memo spawned.
+    assert spawned == 1
+
+    # The deferred residual is now resolved and absent from the open snapshot.
+    deferred_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == deferred_key
+            )
+        )
+    ).scalar_one()
+    assert deferred_row.status == cd.STATUS_RESOLVED
+    assert deferred_row.resolved_at is not None
+
+    snapshot = await cd.get_open_completion_debt(db_session, project.id)
+    open_keys = {item["id"] for item in snapshot["items"]}
+    assert str(deferred_row.id) not in open_keys
+
+    # The ordinary memo handoff debt is a SEPARATE obligation, created and open.
+    memo_key = f"retirement_residual:{project.id}:{direction_id}"
+    memo_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == memo_key
+            )
+        )
+    ).scalar_one()
+    assert memo_row.status == cd.STATUS_OPEN
+
+
+@pytest.mark.asyncio
+async def test_deferred_resolution_leaves_ordinary_residual_untouched(db_session):
+    """Resolving the deferred residual must not touch an already-open
+    ordinary (memo) retirement residual for the same direction."""
+    direction_id = "dir-deferred-2"
+    project, _task = await _make_retire_fixture(db_session, direction_id)
+
+    # Pre-open BOTH the deferred residual and the ordinary memo handoff debt.
+    deferred_key = cd.deferred_retirement_dedupe_key(project.id, direction_id)
+    memo_key = f"retirement_residual:{project.id}:{direction_id}"
+    for key in (deferred_key, memo_key):
+        await cd.arecord_completion_debt(
+            db_session,
+            dedupe_key=key,
+            kind=cd.KIND_RETIREMENT_RESIDUAL,
+            title="pre-existing residual",
+            project_id=project.id,
+        )
+    await db_session.commit()
+
+    resolved = await cd.aresolve_deferred_retirement_debt(
+        db_session, project.id, direction_id
+    )
+    await db_session.commit()
+    assert resolved is True
+
+    deferred_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == deferred_key
+            )
+        )
+    ).scalar_one()
+    memo_row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == memo_key
+            )
+        )
+    ).scalar_one()
+    assert deferred_row.status == cd.STATUS_RESOLVED
+    # The ordinary memo residual stays open — it is a distinct obligation.
+    assert memo_row.status == cd.STATUS_OPEN
+
+
+@pytest.mark.asyncio
+async def test_deferred_resolution_does_not_reopen_dismissed(db_session):
+    """A dismissed deferred residual must not be reopened or altered by the
+    resolver; resolution only touches OPEN rows."""
+    direction_id = "dir-deferred-3"
+    project, _task = await _make_retire_fixture(db_session, direction_id)
+
+    deferred_key = cd.deferred_retirement_dedupe_key(project.id, direction_id)
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key=deferred_key,
+        kind=cd.KIND_RETIREMENT_RESIDUAL,
+        title="deferred residual",
+        project_id=project.id,
+    )
+    await db_session.commit()
+    # Dismiss the row (operator disposition — permanent).
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == deferred_key
+            )
+        )
+    ).scalar_one()
+    dismissed = await cd.dismiss_debt(
+        db_session, row.id, project_id=project.id, reason="obsolete"
+    )
+    await db_session.commit()
+    assert dismissed.status == cd.STATUS_DISMISSED
+
+    # Resolving is a no-op — there is no OPEN row to flip.
+    resolved = await cd.aresolve_deferred_retirement_debt(
+        db_session, project.id, direction_id
+    )
+    await db_session.commit()
+    assert resolved is False
+
+    row = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == deferred_key
+            )
+        )
+    ).scalar_one()
+    assert row.status == cd.STATUS_DISMISSED
+    assert row.resolution_reason == "obsolete"
 
 
 # ── Two-way reconciliation ───────────────────────────────────────────────────

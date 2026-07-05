@@ -361,15 +361,22 @@ def _score_completion_debt_pressure(
     """Convert an open-debt snapshot to a [0, 1] pressure score.
 
     Returns 1.0 when there is no open debt (optimal state).  Decays linearly
-    toward 0.0 as ``total_open`` grows, reaching 0.0 at ``_DEBT_PRESSURE_CEIL``
-    open items.  A missing or empty snapshot is treated as zero debt (1.0).
+    toward 0.0 as the actionable open count grows, reaching 0.0 at
+    ``_DEBT_PRESSURE_CEIL`` open items.  A scoring-only
+    ``project_actionable_open`` count is preferred when present; older callers
+    that only provide ``total_open`` keep the legacy behavior.  A missing or
+    empty snapshot is treated as zero debt (1.0).
     """
     if not debt_snapshot:
         return 1.0
-    total_open = int(debt_snapshot.get("total_open") or 0)
-    if total_open <= 0:
+    open_count = int(
+        debt_snapshot.get("project_actionable_open")
+        if "project_actionable_open" in debt_snapshot
+        else debt_snapshot.get("total_open") or 0
+    )
+    if open_count <= 0:
         return 1.0
-    return max(0.0, 1.0 - total_open / _DEBT_PRESSURE_CEIL)
+    return max(0.0, 1.0 - open_count / _DEBT_PRESSURE_CEIL)
 
 
 def compute_composite(

@@ -665,11 +665,49 @@ async def agent_annotate(
     return response
 
 
+async def _maybe_link_task_to_debt(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    debt_id: Any,
+    task_id: uuid.UUID,
+) -> str | None:
+    """Best-effort link a freshly-spawned task to an open completion-debt row.
+
+    Returns the debt id (str) on success, ``None`` when no debt_id was supplied
+    or linkage failed. Linkage is a convenience forward-pointer and must NEVER
+    fail the spawn that already committed, so all errors (unknown/closed debt,
+    ledger write failure) are swallowed after rolling back the linkage attempt.
+    """
+    if not debt_id:
+        return None
+    from app.completion_debt import link_task_to_debt as _link_task_to_debt
+
+    try:
+        await _link_task_to_debt(
+            session,
+            debt_id,
+            project_id=project_id,
+            task_id=task_id,
+            note="spawned by strategist",
+        )
+        await session.commit()
+        return str(debt_id)
+    except Exception:  # noqa: BLE001 — best-effort; spawn already committed
+        await session.rollback()
+        logger.warning(
+            "[STRATEGIC API] link_task_to_debt failed (debt_id=%s task=%s) — non-fatal",
+            debt_id,
+            task_id,
+            exc_info=True,
+        )
+        return None
+
+
 class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "decide_churn_retirement", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria"
+    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "decide_churn_retirement", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria", "dispose_completion_debt"
     data: Any = {}
 
 
@@ -1793,6 +1831,22 @@ async def strategic_operation(
             changed_count=1,
         )
         logger.info(f"[STRATEGIC API] Retired direction {dir_id}")
+        # Resolve the gate-DEFERRED retirement residual now that the retire has
+        # committed. Best-effort/non-fatal and idempotent w.r.t. the same
+        # resolution done inside ``_spawn_retirement_memos`` below (the second
+        # call is a no-op on an already-resolved row). Only touches the
+        # ``:deferred`` key — the memo handoff debt is a separate obligation.
+        try:
+            from app.completion_debt import aresolve_deferred_retirement_debt
+
+            await aresolve_deferred_retirement_debt(session, project.id, dir_id)
+            await session.commit()
+        except Exception:
+            logger.exception(
+                "[STRATEGIC API] deferred-retirement debt resolve failed for "
+                "direction %s (non-fatal)",
+                dir_id,
+            )
         await _spawn_retirement_memos(
             session, project, task, [dir_id], {dir_id: rationale}
         )
@@ -2869,6 +2923,9 @@ async def strategic_operation(
             f"[STRATEGIC API] Spawned {spawn_type} task {new_task.id} "
             f"(priority=100) from strategic review {task.id} for project {project.id}"
         )
+        linked_debt_id = await _maybe_link_task_to_debt(
+            session, project.id, data.get("debt_id"), new_task.id
+        )
         return _resp(
             {
                 "status": "ok",
@@ -2876,6 +2933,7 @@ async def strategic_operation(
                 "task_id": str(new_task.id),
                 "type": spawn_type,
                 "priority": 100,
+                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
             }
         )
 
@@ -3111,6 +3169,9 @@ async def strategic_operation(
             f"(priority=100, no direction) from strategic review {task.id} "
             f"for project {project.id}"
         )
+        linked_debt_id = await _maybe_link_task_to_debt(
+            session, project.id, data.get("debt_id"), new_task.id
+        )
         return _resp(
             {
                 "status": "ok",
@@ -3119,6 +3180,7 @@ async def strategic_operation(
                 "type": spawn_type,
                 "priority": 100,
                 "deduplicated": False,
+                **({"linked_debt_id": linked_debt_id} if linked_debt_id else {}),
             }
         )
 
@@ -4170,6 +4232,72 @@ async def strategic_operation(
                 "criteria": processed,
                 "retracted": retracted,
                 "skipped_over_cap": skipped_over_cap,
+            }
+        )
+
+    elif payload.op == "dispose_completion_debt":
+        # Strategist disposition of an open completion-debt row: resolve it (with
+        # required evidence) or dismiss it (with a reason). Scoped to this
+        # project so a strategist can never touch another project's ledger.
+        from app.completion_debt import (
+            debt_to_dict as _debt_to_dict,
+            dismiss_debt as _dismiss_debt,
+            resolve_debt as _resolve_debt,
+        )
+
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="dispose_completion_debt data must be an object"
+            )
+        debt_id = data.get("debt_id")
+        if not debt_id:
+            raise HTTPException(status_code=400, detail="debt_id is required")
+        disposition = str(data.get("disposition", "")).strip().lower()
+        if disposition not in ("resolved", "dismissed"):
+            raise HTTPException(
+                status_code=400,
+                detail="disposition must be one of ['resolved', 'dismissed']",
+            )
+        reason = str(data.get("reason") or data.get("evidence") or "").strip()
+        # Resolving a debt REQUIRES evidence — a bare "resolved" with no proof is
+        # exactly the green-CI churn the ledger exists to prevent. Dismissal also
+        # requires a reason (enforced by dismiss_debt).
+        if disposition == "resolved" and not reason:
+            raise HTTPException(
+                status_code=400,
+                detail="resolving completion debt requires evidence (reason)",
+            )
+        try:
+            if disposition == "resolved":
+                entry = await _resolve_debt(
+                    session, debt_id, project_id=project.id, reason=reason
+                )
+            else:
+                entry = await _dismiss_debt(
+                    session, debt_id, project_id=project.id, reason=reason
+                )
+        except ValueError as exc:
+            if "not_found" in str(exc):
+                raise HTTPException(
+                    status_code=404, detail="Completion debt entry not found"
+                ) from exc
+            if "invalid_reason" in str(exc):
+                raise HTTPException(
+                    status_code=400, detail="reason must be a non-empty string"
+                ) from exc
+            raise HTTPException(status_code=409, detail="Entry is not open") from exc
+
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        return _resp(
+            {
+                "status": "ok",
+                "op": "dispose_completion_debt",
+                "disposition": disposition,
+                "entry": _debt_to_dict(entry),
             }
         )
 
