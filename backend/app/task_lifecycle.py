@@ -1484,26 +1484,30 @@ async def _process_post_commit(
 
     factory = _session_factory or AsyncSessionLocal
     async with factory() as session:
-        # Round 3 C3 + C4: strategic tasks (design_doc_update, strategic_review)
-        # have a downstream completion chain that needs both the Project and
-        # the Task locked. The canonical order is **Project before Task,
-        # always** (docs/concurrency.md). Locking Task first then Project
-        # second reintroduces the cross-table deadlock vector C5 originally
-        # closed, so we peek at the task type via a non-locking read and use
-        # the canonical pair-locker for strategic types. Non-strategic types
-        # use the existing task-only lock pattern.
+        # WI-6 (deadlock remediation) + Round 3 C3/C4: the post-commit unit
+        # can lock BOTH the Project and the Task row — strategic tasks in their
+        # completion chain, and every other type via the downstream project-row
+        # writers reached from the completion handlers / rollup / spawn
+        # (with_vision_locked, with_design_doc_locked, with_directions_locked,
+        # project_lock, ...). The canonical order is **Project before Task,
+        # always** (docs/concurrency.md). Previously only strategic types used
+        # the canonical pair-locker; every other type locked the Task first
+        # (task-only FOR UPDATE) and reached the Project lock downstream — so
+        # two concurrent non-strategic post-commits in the same project took
+        # Task→Project while a strategic / dispatch / reaper path took
+        # Project→Task, and the opposite orders deadlocked (Postgres 40P01
+        # DeadlockDetected, ~6/hr on bursty concurrent agent-status callbacks).
+        # Acquire Project→Task up front for ALL types via the canonical
+        # pair-locker so the whole transaction observes a single order; every
+        # downstream project lock is then a re-entrant no-op (the same
+        # transaction already holds the row, so FOR NO KEY UPDATE re-acquires
+        # without blocking).
         _peek_row = (
-            await session.execute(
-                select(Task.payloads, Task.project_id).where(Task.id == task_id)
-            )
+            await session.execute(select(Task.project_id).where(Task.id == task_id))
         ).first()
         if _peek_row is None:
             return {"status": "accepted"}
-        _peek_payload_list = _peek_row[0] or []
-        _peek_first = _peek_payload_list[0] if _peek_payload_list else {}
-        _peek_type = _peek_first.get("type") if isinstance(_peek_first, dict) else None
-        _peek_project_id = _peek_row[1]
-        _is_strategic_type = _peek_type in STRATEGIC_TASK_TYPES
+        _peek_project_id = _peek_row[0]
 
         # skip_locked + bounded retry: the row is typically only held briefly
         # (by the agent_status early-commit path that just released it, or by a
@@ -1511,19 +1515,20 @@ async def _process_post_commit(
         # queue behind GitHub API calls (15-120s) and hit the Postgres
         # lock_timeout as LockNotAvailableError, which tears down the session.
         task = None
-        # Round 3 C3 + C4: ``locked_project`` is set ONLY when the post-commit
-        # is processing a strategic task and the canonical pair-lock succeeded.
-        # The strategic-completion chain handlers below receive this via
-        # ``project=`` so they skip their own (legacy) re-acquisition.
+        # ``locked_project`` holds the canonically pre-locked Project (acquired
+        # BEFORE the task). The strategic-completion chain handlers
+        # (``completion_needs_locked_project``) receive it via ``project=`` so
+        # they skip their own (legacy) re-acquisition; non-strategic handlers
+        # ignore it and re-lock the same row re-entrantly under the held lock.
         locked_project: Project | None = None
-        for _attempt in range(3):
-            if _is_strategic_type and _peek_project_id is not None:
-                # Canonical Project → Task ordering for strategic tasks. The
-                # helper acquires Project first; if the task row is held it
-                # yields ``(project, None)`` and we retry. If the project is
-                # held it yields ``(None, None)`` and we retry as well.
-                from app.task_locking import lock_project_then_task
+        from app.task_locking import lock_project_then_task
 
+        for _attempt in range(3):
+            if _peek_project_id is not None:
+                # Canonical Project → Task ordering. The helper acquires
+                # Project first; if the task row is held it yields
+                # ``(project, None)`` and we retry; if the project is held it
+                # yields ``(None, None)`` and we retry as well.
                 async with lock_project_then_task(
                     session,
                     _peek_project_id,
@@ -1547,6 +1552,8 @@ async def _process_post_commit(
                     if _p is not None:
                         await session.rollback()
             else:
+                # Defensive fallback only: Task.project_id is NOT NULL, so this
+                # fires solely if the peek raced a hard delete. Task-only lock.
                 task = (
                     (
                         await session.execute(

@@ -106,6 +106,33 @@ router = APIRouter()
 
 _recorded_task_ids: set = set()  # Track which task IDs have already recorded results
 _AGENT_STATUS_TERMINAL_STATUSES = TASK_AGENT_STATUS_IDEMPOTENT_STATUSES
+
+
+def _is_deadlock_error(exc: BaseException) -> bool:
+    """True when exc is a Postgres deadlock (40P01, DeadlockDetected).
+
+    WI-6 defense-in-depth. The primary fix acquires the Project row lock
+    before the Task row lock in ``_process_post_commit`` (canonical
+    Project-before-Task ordering), removing the known cross-table deadlock
+    vector on concurrent agent-status callbacks. Should any residual deadlock
+    still occur, Postgres has already rolled the victim transaction back
+    cleanly (no partial commit), so it is safe to route into the existing
+    post-commit retry-pending path — persist the write-ahead marker and return
+    a clean 200 so ``_sweep_post_commit_pending`` re-runs the deferred side
+    effects — rather than surfacing a 5xx that Cloud Run flags as a
+    ContainerError and quarantines the instance. Detection mirrors
+    ``migration_retry.is_transient_lock_error`` (SQLAlchemy wraps the asyncpg
+    exception, so the stable surface is the sqlstate / message text) but is
+    scoped to deadlock ONLY — lock_timeout / LockNotAvailable keep their
+    existing 500 path.
+    """
+    orig = getattr(exc, "orig", None)
+    if getattr(orig, "sqlstate", None) == "40P01":
+        return True
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    return "deadlockdetected" in msg or "deadlock detected" in msg or "40p01" in msg
+
+
 _PARK_AND_RETARGET_DEFAULT_BUDGET_SECONDS = 600
 _PARK_AND_RETARGET_MAX_BUDGET_SECONDS = 1800
 
@@ -1052,6 +1079,22 @@ async def update_agent_status(
                         "[PIPELINE] Post-commit retry for %s hit a disconnection-class "
                         "DB error (instance-shutdown collateral); leaving "
                         "post_commit_pending set for the sweep",
+                        _task_id_str,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+                    return {
+                        "status": "post_commit_retry_pending",
+                        "task_id": _task_id_str,
+                    }
+                # WI-6 defense-in-depth: a residual deadlock (40P01) on the
+                # retry path is the same shape — Postgres rolled the victim
+                # back cleanly and post_commit_pending is still set, so the
+                # sweep owns the retry. Return a clean 200 rather than 500ing.
+                if _is_deadlock_error(e):
+                    logger.warning(
+                        "[PIPELINE] Post-commit retry for %s hit a Postgres deadlock "
+                        "(40P01); leaving post_commit_pending set for the sweep",
                         _task_id_str,
                     )
                     with contextlib.suppress(Exception):
@@ -3775,6 +3818,12 @@ async def update_agent_status(
             is_disconnect = bool(
                 getattr(e, "connection_invalidated", False)
             ) or isinstance(e, InterfaceError)
+            # WI-6 defense-in-depth: a residual cross-table deadlock (40P01)
+            # after the Project-before-Task ordering fix. Postgres rolled the
+            # victim transaction back cleanly, so it is safe to route into the
+            # same retry-pending path — the sweep re-runs the deferred side
+            # effects — instead of a 500 → Cloud Run ContainerError → quarantine.
+            is_deadlock = _is_deadlock_error(e)
             if is_timeout:
                 reason = "post_commit_timeout"
             elif is_locked:
@@ -3783,6 +3832,8 @@ async def update_agent_status(
                 reason = "post_commit_final_commit_failed"
             elif is_disconnect:
                 reason = "post_commit_disconnect"
+            elif is_deadlock:
+                reason = "post_commit_deadlock"
             else:
                 reason = "post_commit_error"
             logger.error(  # noqa: TRY400 — conditional exc_info: suppress for expected timeout/lock, show for real errors
@@ -3820,7 +3871,9 @@ async def update_agent_status(
             # 5xx → Cloud Run ContainerError for what is benign contention with a
             # peer post-commit driver, exactly the case the row-lock guard above
             # converts to a 429. So treat it like the final-commit case.
-            if (is_final_commit or is_locked or is_disconnect) and _persist_err is None:
+            if (
+                is_final_commit or is_locked or is_disconnect or is_deadlock
+            ) and _persist_err is None:
                 if is_disconnect:
                     logger.warning(
                         "[PIPELINE] Post-commit hit a disconnection-class DB error "
@@ -3828,6 +3881,15 @@ async def update_agent_status(
                         "already committed, retry marker persisted; returning 200 so "
                         "the sweep owns the deferred side effects instead of 500ing the "
                         "agent.",
+                        _task_id_str,
+                    )
+                elif is_deadlock:
+                    logger.warning(
+                        "[PIPELINE] Post-commit hit a Postgres deadlock (40P01) for "
+                        "task %s — victim transaction rolled back cleanly, retry "
+                        "marker persisted; returning 200 so the sweep re-runs the "
+                        "deferred side effects instead of 500ing the agent. If this "
+                        "recurs, an un-audited Task-before-Project lock path remains.",
                         _task_id_str,
                     )
                 return {
