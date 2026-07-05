@@ -192,6 +192,13 @@ export interface StrategicSessionControlProps {
   onOpenSpend?: () => void;
   showMonitoringControls?: boolean;
   density?: 'default' | 'compact';
+  /**
+   * Collapse the detail/session-status chips below the `md` breakpoint while
+   * keeping the Chat/Workday mode toggle visible. Lets the toggle render on
+   * mobile (where the full control is otherwise too wide) without the chips
+   * overflowing the narrow header.
+   */
+  hideDetailsOnMobile?: boolean;
   className?: string;
 }
 
@@ -840,6 +847,7 @@ export function StrategicSessionControl({
   onOpenSpend,
   showMonitoringControls = true,
   density = 'default',
+  hideDetailsOnMobile = false,
   className = '',
 }: StrategicSessionControlProps) {
   const compact = density === 'compact';
@@ -955,7 +963,7 @@ export function StrategicSessionControl({
         })}
       </div>
 
-      <div className={`${compact ? 'flex flex-row items-center justify-end gap-1' : 'flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end'}`}>
+      <div className={`${hideDetailsOnMobile ? 'max-md:hidden ' : ''}${compact ? 'flex flex-row items-center justify-end gap-1' : 'flex min-w-0 flex-col gap-1.5 sm:flex-row sm:flex-wrap sm:items-center sm:justify-end'}`}>
         {showSessionControl && (
           <>
             <span

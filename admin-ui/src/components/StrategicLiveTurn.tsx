@@ -24,7 +24,7 @@ export function StrategicStreamingBubble({ text }: { text: string }) {
       data-testid="strategic-streaming-bubble"
       className="group flex scroll-mt-24 justify-start rounded-md"
     >
-      <div className="flex w-full max-w-[92%] flex-col items-start md:max-w-[76%]">
+      <div className="flex w-full min-w-0 max-w-[92%] flex-col items-start md:max-w-[76%]">
         <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
           <span className="font-medium text-neutral-400">Strategic</span>
           <span aria-hidden="true">·</span>
@@ -34,7 +34,7 @@ export function StrategicStreamingBubble({ text }: { text: string }) {
           </span>
         </div>
         <div className="rounded-md border border-transparent bg-transparent px-0.5 py-0.5">
-          <div className="whitespace-pre-wrap text-sm leading-relaxed text-neutral-100">{text}</div>
+          <div className="whitespace-pre-wrap break-all min-w-0 text-sm leading-relaxed text-neutral-100">{text}</div>
         </div>
       </div>
     </div>
@@ -53,7 +53,7 @@ export function StrategicActivityStrip({ items }: { items: StrategicActivityItem
       data-testid="strategic-activity-strip"
       className="group flex scroll-mt-24 justify-start rounded-md"
     >
-      <div className="flex w-full max-w-[92%] flex-col items-start md:max-w-[76%]">
+      <div className="flex w-full min-w-0 max-w-[92%] flex-col items-start md:max-w-[76%]">
         <div className="mb-0.5 flex items-center gap-1.5 px-0.5 text-ui-md text-neutral-500">
           <span className="inline-flex items-center gap-1">
             <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-cyan-400" aria-hidden="true" />
@@ -70,12 +70,12 @@ export function StrategicActivityStrip({ items }: { items: StrategicActivityItem
             {items.map((item, idx) => (
               <div
                 key={item.id}
-                className={`flex items-baseline gap-1.5 truncate ${idx === items.length - 1 ? 'text-neutral-200' : ''}`}
+                className={`flex min-w-0 items-baseline gap-1.5 truncate ${idx === items.length - 1 ? 'text-neutral-200' : ''}`}
               >
                 <span className="shrink-0 text-cyan-500/70" aria-hidden="true">
                   {STRATEGIC_ACTIVITY_GLYPH[item.kind] ?? '·'}
                 </span>
-                <span className="truncate">{item.text}</span>
+                <span className="min-w-0 truncate">{item.text}</span>
               </div>
             ))}
           </div>

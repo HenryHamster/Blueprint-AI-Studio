@@ -333,7 +333,7 @@ export function HeaderBar(props: HeaderBarProps) {
             </button>
             {showMobileMenu && (
               <div className="absolute right-0 top-full z-50 mt-2 max-h-[calc(100vh-96px)] w-60 overflow-auto rounded-md border border-workbench-border bg-workbench-panel p-2 shadow-2xl">
-                {props.activeTab !== 'chat' && props.onOpenCommandPalette && (
+                {props.onOpenCommandPalette && (
                   <button
                     onClick={() => {
                       props.onOpenCommandPalette?.();

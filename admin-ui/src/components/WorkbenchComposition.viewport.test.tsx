@@ -388,7 +388,8 @@ describe('WorkbenchComposition viewport regression', () => {
                     onOpenAccounts={options.onOpenAccounts ?? vi.fn()}
                     showMonitoringControls={false}
                     density="compact"
-                    className="hidden md:flex"
+                    hideDetailsOnMobile
+                    className="flex"
                   />
                 </>
               )}
@@ -541,7 +542,7 @@ describe('WorkbenchComposition viewport regression', () => {
     expect(onOpenPipeline).toHaveBeenCalledOnce();
   });
 
-  test('mobile shell keeps composer, hides rail, and exposes one context launcher without overflow', async () => {
+  test('mobile shell keeps composer, hides rail, exposes the Workday mode toggle and one context launcher without overflow', async () => {
     await expectNoOverflowAt(375, renderWorkbenchShell, { height: 800, waitMs: 50 });
 
     const composer = host?.querySelector('[data-testid="strategic-composer-box"]');
@@ -556,7 +557,13 @@ describe('WorkbenchComposition viewport regression', () => {
 
     expect(composer).toBeTruthy();
     expect(sessionControl).toBeTruthy();
-    expect(getComputedStyle(sessionControl as Element).display).toBe('none');
+    // The compact Chat/Workday mode toggle stays visible on mobile; only the
+    // detail/session chips collapse (hideDetailsOnMobile), so the operator can
+    // switch into Workday from the narrow chat header.
+    expect(getComputedStyle(sessionControl as Element).display).not.toBe('none');
+    const mobileWorkdayToggle = sessionControl?.querySelector<HTMLButtonElement>('button[aria-label="Switch Strategic mode to Workday"]');
+    expect(mobileWorkdayToggle).toBeTruthy();
+    expect(getComputedStyle(mobileWorkdayToggle as Element).display).not.toBe('none');
     expect(railAside).toBeTruthy();
     expect(getComputedStyle(railAside!).display).toBe('none');
     expect(contextButtons).toHaveLength(1);

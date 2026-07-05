@@ -1506,7 +1506,8 @@ export default function App() {
                 onOpenSpend={openRuntimeAnalytics}
                 showMonitoringControls={false}
                 density="compact"
-                className="hidden md:flex"
+                hideDetailsOnMobile
+                className="flex"
               />
               {!chatComposerContextDescriptor && (
                 <button
