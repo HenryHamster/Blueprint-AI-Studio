@@ -1536,6 +1536,7 @@ class Task(SQLModel, table=True):
         # this metadata Index registers the name for
         # test_model_indexes_covered_by_migrations.
         Index("ix_task_created_at", "created_at"),
+        Index("ix_task_started_at", "started_at"),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in
@@ -4088,6 +4089,9 @@ class ReleaseVersion(SQLModel, table=True):
 
     __table_args__ = (
         Index("ix_releaseversion_project_status", "project_id", "status"),
+        Index("ix_releaseversion_project_opened_at", "project_id", "opened_at"),
+        Index("ix_releaseversion_project_served_at", "project_id", "served_at"),
+        Index("ix_releaseversion_project_promoted_at", "project_id", "promoted_at"),
         UniqueConstraint(
             "project_id",
             "version_number",
