@@ -2864,6 +2864,80 @@ async def test_reactivation_clears_manual_intervention_state(
 
 
 @pytest.mark.asyncio
+async def test_operator_reactivation_stamps_grace_blocks_immediate_repause(
+    client: AsyncClient, db_session, mocker
+):
+    """Operator reactivating an auto-paused churn direction stamps grace so the
+    frozen unproductive research_history cannot immediately re-pause or
+    zombie-retire it on the next lifecycle tick until a new cycle is appended."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Churn direction")
+    direction_id = direction["id"]
+
+    # Auto-paused (churn-family) with 5 stale cycles, 0 merges — Rule 2 would fire.
+    paused_at = datetime.utcnow() - timedelta(days=1)
+    stale_history = [
+        {
+            "timestamp": (paused_at - timedelta(days=i)).isoformat(),
+            "tasks_created": 5,
+            "tasks_completed": 5,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(5, 0, -1)
+    ]
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    for d in project.directions:
+        if d["id"] == direction_id:
+            d["status"] = "paused"
+            d["auto_paused"] = True
+            d["paused_reason"] = "Unproductive: 0 PRs merged across 5 cycles"
+            d["paused_at"] = paused_at.isoformat()
+            d["research_history"] = stale_history
+            d["churn_family_pause_count"] = 1
+    flag_modified(project, "directions")
+    await db_session.commit()
+
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert resp.status_code == 200
+    d = resp.json()["direction"]
+    assert d["status"] == "active"
+    # Grace marker stamped, counter preserved.
+    assert d.get("auto_recovered_at") is not None
+    assert d.get("churn_family_pause_count") == 1
+
+    # A lifecycle tick must NOT immediately re-pause the just-reactivated
+    # direction while the stale history predates the grace stamp.
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=datetime.utcnow(),
+    )
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == direction_id)
+    assert d["status"] == "active", (
+        "grace should block immediate re-pause of an operator-reactivated direction"
+    )
+    assert d.get("auto_recovered_at") is not None
+
+
+@pytest.mark.asyncio
 async def test_merge_rate_in_list(client: AsyncClient, db_session, mocker):
     """GET directions returns merges_per_cycle for each direction based on research_history."""
     project_id = await _deploy_project(client, mocker)

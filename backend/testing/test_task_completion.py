@@ -1387,6 +1387,43 @@ class TestRemediationSuccessPropagation:
         assert target["last_remediation_result"] == "merged"
 
     @pytest.mark.asyncio
+    async def test_resumed_paused_sibling_gets_grace_marker(self, db_session):
+        """A paused sibling resumed by remediation propagation gets the
+        auto_recovered_at grace marker so its frozen research_history cannot
+        immediately re-pause or zombie-retire it before a new cycle runs."""
+        project = make_project(
+            directions=[
+                {"id": "dir-1", "status": "active"},
+                self._paused_sibling("dir-2", "fp-shared"),
+            ]
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+        task = make_task(
+            project_id=project.id,
+            payloads=[{"prompt": "Fix the shared import error."}],
+            context={
+                "diagnosis_task_id": "diag-1",
+                "direction_id": "dir-1",
+                "diagnosis_fingerprint": "fp-shared",
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        await _record_remediation_outcome(task, merged=True, session=db_session)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        sibling = next(d for d in project.directions if d["id"] == "dir-2")
+        assert sibling["status"] == "active"
+        assert sibling.get("auto_recovered_at") is not None, (
+            "resuming a paused sibling must stamp the grace marker"
+        )
+
+    @pytest.mark.asyncio
     async def test_noop_when_no_siblings_share_fingerprint(self, db_session):
         project = make_project(
             directions=[

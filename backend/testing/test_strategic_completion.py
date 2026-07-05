@@ -7263,6 +7263,162 @@ async def test_strategic_http_update_direction_superseded_persists_superseded_by
 
 
 @pytest.mark.asyncio
+async def test_strategic_http_update_direction_auto_paused_reactivation_stamps_grace(
+    client, db_session, mocker
+):
+    """HTTP update_direction reactivating an auto-paused direction clears residue,
+    stamps the auto_recovered_at grace marker, and preserves the churn counter."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="REACT-HTTP",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-auto-paused",
+                "text": "auto-paused churn direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "Churn guardrail: low merge rate",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+                "churn_family_pause_count": 1,
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-react-http",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-react-http", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-auto-paused",
+                "rationale": "resume auto-paused direction",
+                "changes": {"status": "active"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-auto-paused"
+    )
+    assert target.get("status") == "active"
+    assert target.get("auto_recovered_at") is not None
+    assert "auto_paused" not in target
+    assert "paused_reason" not in target
+    assert target.get("churn_family_pause_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_strategic_http_update_direction_user_paused_reactivation_blocked(
+    client, db_session, mocker
+):
+    """HTTP update_direction must not resume a USER-paused direction: the response
+    is blocked, the status stays paused, and no grace marker is stamped."""
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import strategic_cycle
+
+    project = Project(
+        name="REACT-HTTP-USER",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[
+            {
+                "id": "d-http-user-paused",
+                "text": "user-paused direction",
+                "status": "paused",
+                # No auto_paused flag → user/operator paused it.
+                "paused_reason": "operator paused",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "notes": [],
+                "research_history": [],
+            },
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-react-http-user",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "vm-react-http-user", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "update_direction",
+            "data": {
+                "direction_id": "d-http-user-paused",
+                "rationale": "try to resume user-paused direction",
+                "changes": {"status": "active"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json().get("status") == "blocked"
+
+    await db_session.refresh(project)
+    target = next(
+        d for d in (project.directions or []) if d.get("id") == "d-http-user-paused"
+    )
+    assert target.get("status") == "paused"
+    assert "auto_recovered_at" not in target
+    assert target.get("paused_reason") == "operator paused"
+
+
+@pytest.mark.asyncio
 async def test_strategic_http_update_direction_clears_scaffolding_state_on_outcome_change(
     client, db_session, mocker
 ):
@@ -12586,6 +12742,155 @@ async def test_fallback_direction_ops_accept_http_style_create_direction(
     ]
     assert len(created) == 1
     assert created[0].get("status") == "active"
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_direction_auto_paused_reactivation_stamps_grace(
+    db_session, mocker
+):
+    """Fallback update_direction reactivating an AUTO-paused direction clears
+    residue and stamps the auto_recovered_at grace marker while preserving the
+    churn counter."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackAutoPausedReactivate",
+        user_id="u-fallback-auto-paused",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-auto-paused",
+                "text": "Auto-paused churn direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "Churn guardrail: low merge rate",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "churn_family_pause_count": 1,
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-auto-paused",
+                    "changes": {"status": "active"},
+                    "rationale": "resume the auto-paused direction",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-auto-paused")
+    assert d["status"] == "active"
+    assert d.get("auto_recovered_at") is not None
+    assert "auto_paused" not in d
+    assert "paused_reason" not in d
+    assert "paused_at" not in d
+    # Counter must survive the reactivation.
+    assert d.get("churn_family_pause_count") == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_update_direction_user_paused_reactivation_blocked(
+    db_session, mocker
+):
+    """Fallback update_direction must NOT resume a USER-paused direction: status
+    stays paused, no grace is stamped, and the block is logged."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="FallbackUserPausedBlocked",
+        user_id="u-fallback-user-paused",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-user-paused",
+                "text": "User-paused direction",
+                "status": "paused",
+                # No auto_paused flag → operator/user paused it.
+                "paused_reason": "operator paused",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "update_direction",
+                    "direction_id": "d-user-paused",
+                    "changes": {"status": "active"},
+                    "rationale": "try to resume the user-paused direction",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    d = next(x for x in project.directions if x["id"] == "d-user-paused")
+    assert d["status"] == "paused", "user-paused direction must not be resumed"
+    assert "auto_recovered_at" not in d
+    # Residue is untouched because the reactivation was blocked.
+    assert d.get("paused_reason") == "operator paused"
 
 
 @pytest.mark.asyncio

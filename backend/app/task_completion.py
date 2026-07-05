@@ -684,6 +684,7 @@ def _propagate_remediation_success_to_siblings(
             continue
         # Clear the auto-pause so the direction can resume on the next lifecycle
         # sweep without waiting out its own cooldown.
+        _prior_status = direction.get("status")
         direction["status"] = "active"
         for field in (
             "auto_paused",
@@ -693,6 +694,13 @@ def _propagate_remediation_success_to_siblings(
             "escalation_notification_pending",
         ):
             direction.pop(field, None)
+        # Grace period: when this resumes a paused direction, stamp the recovery
+        # marker consumed by _check_direction_health so the same frozen
+        # research_history that drove the pause cannot immediately re-pause or
+        # zombie-retire the direction before a new research cycle is appended —
+        # matching cooldown auto-recovery and the operator/strategist surfaces.
+        if _prior_status == "paused":
+            direction["auto_recovered_at"] = now_iso
         # Stamp prior art so autonomous_research_diagnosis can surface what
         # worked if the same fingerprint resurfaces on this direction.
         direction["last_remediation_task_id"] = str(task.id)

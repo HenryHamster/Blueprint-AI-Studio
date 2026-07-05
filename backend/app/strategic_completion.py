@@ -4931,15 +4931,25 @@ async def _handle_strategic_completion(
                             "expired",
                             "superseded",
                         ):
-                            # Block reactivating a direction the user manually paused
-                            if (
-                                changes["status"] == "active"
-                                and d.get("status") == "paused"
-                                and not d.get("auto_paused")
-                            ):
-                                logger.warning(
-                                    f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
+                            # Reactivation goes through the shared seam so it clears
+                            # pause residue AND stamps the auto_recovered_at grace
+                            # marker when resuming from paused — preventing frozen
+                            # research_history from immediately re-pausing or
+                            # zombie-retiring the direction. The strategist may NOT
+                            # resume a user-paused direction (allow_user_paused=False):
+                            # the helper returns False and we keep the existing
+                            # blocked-reactivation warning, mutating nothing.
+                            if changes["status"] == "active":
+                                from app.direction_lifecycle import (
+                                    reactivate_paused_direction,
                                 )
+
+                                if not reactivate_paused_direction(
+                                    d, allow_user_paused=False
+                                ):
+                                    logger.warning(
+                                        f"[STRATEGIC] Blocked reactivation of user-paused direction {dir_id}"
+                                    )
                             else:
                                 d["status"] = changes["status"]
                                 superseded_by = None

@@ -3675,3 +3675,143 @@ async def test_lifecycle_sweep_syncs_direction_table(db_session, mocker):
     assert row.status == "paused", (
         f"Direction table row status should be 'paused' after sweep, got {row.status!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# reactivate_paused_direction: the shared paused→active seam
+# ---------------------------------------------------------------------------
+from app.direction_lifecycle import reactivate_paused_direction  # noqa: E402
+from app.strategic_completion import _check_direction_health  # noqa: E402
+
+
+def _auto_paused_direction() -> dict:
+    """An auto-paused churn-family direction with residue and preserved counters."""
+    return {
+        "id": "d-reactivate",
+        "text": "auto-paused churn direction",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Churn guardrail: high churn, low merge rate",
+        "paused_at": "2026-01-01T00:00:00",
+        "needs_manual_intervention": False,
+        "escalation_notification_pending": True,
+        "escalation_notification_retries": 2,
+        "last_researched_at": "2026-01-01T00:00:00",
+        "remediation_attempts": 3,
+        "churn_family_pause_count": 1,
+        "lifetime_burn_pause_count": 2,
+        "research_history": [],
+    }
+
+
+def test_reactivate_auto_paused_stamps_grace_and_clears_residue():
+    d = _auto_paused_direction()
+    result = reactivate_paused_direction(d, allow_user_paused=False)
+    assert result is True
+    assert d["status"] == "active"
+    # Grace marker stamped because the prior status was 'paused'
+    assert d.get("auto_recovered_at") is not None
+    # Pause/intervention residue cleared
+    for key in (
+        "auto_paused",
+        "paused_reason",
+        "paused_at",
+        "escalation_notification_pending",
+        "escalation_notification_retries",
+        "last_researched_at",
+    ):
+        assert key not in d, f"{key} should be cleared on reactivation"
+    assert d["remediation_attempts"] == 0
+    # Counters that must survive a reactivation are untouched
+    assert d["churn_family_pause_count"] == 1
+    assert d["lifetime_burn_pause_count"] == 2
+
+
+def test_reactivate_user_paused_blocked_when_not_allowed():
+    d = {
+        "id": "d-user-paused",
+        "status": "paused",
+        "auto_paused": False,  # user-paused, not auto-paused
+        "paused_reason": "operator paused",
+        "paused_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    snapshot = dict(d)
+    result = reactivate_paused_direction(d, allow_user_paused=False)
+    assert result is False
+    # No mutation on a blocked reactivation
+    assert d == snapshot
+    assert d["status"] == "paused"
+    assert "auto_recovered_at" not in d
+
+
+def test_reactivate_user_paused_allowed_for_operator():
+    d = {
+        "id": "d-user-paused",
+        "status": "paused",
+        "auto_paused": False,
+        "paused_reason": "operator paused",
+        "paused_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+    result = reactivate_paused_direction(d, allow_user_paused=True)
+    assert result is True
+    assert d["status"] == "active"
+    # Prior status was 'paused' → grace stamped even for a user-paused resume
+    assert d.get("auto_recovered_at") is not None
+    assert "auto_paused" not in d
+
+
+def test_reactivate_staged_does_not_stamp_grace():
+    d = {
+        "id": "d-staged",
+        "status": "staged",
+        "staged_for_version": "v22",
+        "staged_activated_at": None,
+        "research_history": [],
+    }
+    result = reactivate_paused_direction(d, allow_user_paused=False)
+    assert result is True
+    assert d["status"] == "active"
+    # Ordinary staged→active activation is grace-free
+    assert "auto_recovered_at" not in d
+
+
+def test_reactivate_proposed_does_not_stamp_grace():
+    d = {"id": "d-proposed", "status": "proposed", "research_history": []}
+    result = reactivate_paused_direction(d, allow_user_paused=False)
+    assert result is True
+    assert d["status"] == "active"
+    assert "auto_recovered_at" not in d
+
+
+def test_reactivated_direction_survives_health_check_with_stale_history():
+    """Grace stamped by the helper makes _check_direction_health return None even
+    when the frozen research_history would otherwise trip Rule 2 (Unproductive)."""
+    # 5 pre-recovery cycles with 0 merges — Rule 2 would normally fire.
+    history = [
+        {
+            "timestamp": f"2026-01-0{i}T00:00:00",
+            "tasks_created": 5,
+            "tasks_completed": 5,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 0,
+        }
+        for i in range(1, 6)
+    ]
+    d = {
+        "id": "d-stale",
+        "text": "stale unproductive",
+        "status": "paused",
+        "auto_paused": True,
+        "paused_reason": "Unproductive: 0 PRs merged across 5 cycles",
+        "paused_at": "2026-01-06T00:00:00",
+        "research_history": history,
+    }
+    # Before reactivation the health check would want to pause it.
+    assert _check_direction_health(d) is not None
+    assert reactivate_paused_direction(d, allow_user_paused=False) is True
+    # After reactivation the stamped grace suppresses the history-based re-pause
+    # until a cycle newer than auto_recovered_at is appended.
+    assert _check_direction_health(d) is None

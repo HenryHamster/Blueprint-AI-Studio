@@ -102,6 +102,80 @@ def _reset_outcome_detection_state(d: dict) -> None:
         d.pop(key, None)
 
 
+def _clear_direction_reactivation_state(direction: dict) -> None:
+    """Drop transient status residue so active/staged transitions start clean.
+
+    Import-safe home for the residue-clear used by the operator PATCH and
+    strategist HTTP/fallback reactivation surfaces (via
+    :func:`reactivate_paused_direction`). Kept as pure dict mutation so it can
+    live in this module without pulling in strategic_completion (which imports
+    this module lazily). NOTE: cooldown auto-recovery intentionally does NOT use
+    this full clear — it preserves ``last_researched_at`` (research-cooldown
+    eligibility) and ``remediation_attempts`` (escalation ladder), popping only
+    the pause markers directly.
+    """
+    for key in (
+        "paused_reason",
+        "paused_at",
+        "auto_paused",
+        "expired_at",
+        "needs_manual_intervention",
+        "needs_manual_intervention_at",
+        "escalation_notification_pending",
+        "escalation_notification_retries",
+        "last_researched_at",
+        "staged_activated_at",
+        "staged_for_version",
+    ):
+        direction.pop(key, None)
+    direction["remediation_attempts"] = 0
+
+
+def reactivate_paused_direction(direction: dict, *, allow_user_paused: bool) -> bool:
+    """Transition a paused/staged/proposed direction back to ``active`` cleanly.
+
+    Centralizes the paused→active transition so every accepted reactivation of
+    an auto-paused direction gets the same lifecycle grace that cooldown
+    auto-recovery relies on:
+
+    * Enforces the user-paused block: when the prior status is ``paused`` and
+      the direction was NOT auto-paused, a reactivation is only allowed when
+      ``allow_user_paused`` is True (operators may resume their own paused
+      directions; the autonomous strategist may not). Returns ``False`` WITHOUT
+      mutating the direction so the caller can emit its own block response.
+    * Clears pause/intervention residue via
+      :func:`_clear_direction_reactivation_state` so no stale ``auto_paused`` /
+      ``paused_at`` / intervention flags survive the transition.
+    * Sets ``status`` to ``active``.
+    * Stamps ``auto_recovered_at`` — the grace marker consumed by
+      ``_check_direction_health`` — ONLY when the prior status was ``paused``.
+      This is what prevents the frozen ``research_history`` that originally
+      triggered the pause from immediately re-pausing or zombie-retiring the
+      direction before a new research cycle is appended. Ordinary
+      proposed/staged→active activation is left grace-free.
+
+    Counters that must survive a reactivation (``churn_family_pause_count``,
+    ``lifetime_burn_pause_count``, ``code_failure_pause_count``) are NOT touched.
+
+    Returns ``True`` when the direction was reactivated, ``False`` when the
+    user-paused block prevented it.
+    """
+    prior_status = direction.get("status")
+    if (
+        prior_status == "paused"
+        and not direction.get("auto_paused")
+        and not allow_user_paused
+    ):
+        return False
+    _clear_direction_reactivation_state(direction)
+    direction["status"] = "active"
+    if prior_status == "paused":
+        # Grace period: stamp recovery time so _check_direction_health skips
+        # history-based health rules until at least one new cycle is appended.
+        direction["auto_recovered_at"] = _utcnow().isoformat()
+    return True
+
+
 def _detect_partial_remediation_success(direction: dict) -> bool | None:
     """Return True if post-remediation code-failure rate is materially lower than pre-remediation.
 

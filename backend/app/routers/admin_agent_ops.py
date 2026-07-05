@@ -36,7 +36,10 @@ from app.strategic_events import (
     STRATEGIC_KIND_RUNNING_UPDATE,
     emit_strategic_updated,
 )
-from app.direction_lifecycle import _reset_outcome_detection_state
+from app.direction_lifecycle import (
+    _reset_outcome_detection_state,
+    reactivate_paused_direction,
+)
 from app.models import MessageType, Project, ProjectMessage, Task, TaskStatus
 from app.payload_schemas import (
     ALL_TASK_TYPES as _VALID_TASK_TYPES,
@@ -1278,23 +1281,30 @@ async def strategic_operation(
                     "expired",
                     "superseded",
                 ):
-                    if (
-                        changes["status"] == "active"
-                        and d.get("status") == "paused"
-                        and not d.get("auto_paused")
-                    ):
-                        ctx = task.context or {}
-                        task.context = {**ctx, "_strategic_api_called": True}
-                        flag_modified(task, "context")
-                        session.add(task)
-                        await session.commit()
-                        return _resp(
-                            {
-                                "status": "blocked",
-                                "reason": "Cannot reactivate user-paused direction",
-                            }
-                        )
-                    d["status"] = changes["status"]
+                    if changes["status"] == "active":
+                        # Route reactivation through the shared seam: clears pause
+                        # residue and stamps the auto_recovered_at grace marker when
+                        # resuming from paused, so frozen research_history cannot
+                        # immediately re-pause/zombie-retire the direction. The
+                        # autonomous strategist may NOT resume a user-paused
+                        # direction (allow_user_paused=False) → returns False and we
+                        # emit the existing blocked response.
+                        if not reactivate_paused_direction(
+                            d, allow_user_paused=False
+                        ):
+                            ctx = task.context or {}
+                            task.context = {**ctx, "_strategic_api_called": True}
+                            flag_modified(task, "context")
+                            session.add(task)
+                            await session.commit()
+                            return _resp(
+                                {
+                                    "status": "blocked",
+                                    "reason": "Cannot reactivate user-paused direction",
+                                }
+                            )
+                    else:
+                        d["status"] = changes["status"]
                     if changes["status"] == "superseded":
                         d["completed_at"] = _utcnow().isoformat()
                         superseded_by = changes.get("superseded_by")

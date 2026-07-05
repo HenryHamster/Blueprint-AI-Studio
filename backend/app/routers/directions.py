@@ -32,7 +32,11 @@ from app.task_locking import (
     lock_project_or_429,
     with_directions_locked,
 )
-from app.direction_lifecycle import _reset_outcome_detection_state
+from app.direction_lifecycle import (
+    _clear_direction_reactivation_state,
+    _reset_outcome_detection_state,
+    reactivate_paused_direction,
+)
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
@@ -102,25 +106,6 @@ def _compute_direction_merges_per_cycle(d: dict) -> Any:
 
 
 VALID_CATEGORIES = {"product", "structural", "mixed"}
-
-
-def _clear_direction_reactivation_state(direction: dict) -> None:
-    """Drop transient status residue so active/staged transitions start clean."""
-    for key in (
-        "paused_reason",
-        "paused_at",
-        "auto_paused",
-        "expired_at",
-        "needs_manual_intervention",
-        "needs_manual_intervention_at",
-        "escalation_notification_pending",
-        "escalation_notification_retries",
-        "last_researched_at",
-        "staged_activated_at",
-        "staged_for_version",
-    ):
-        direction.pop(key, None)
-    direction["remediation_attempts"] = 0
 
 
 class _DirectionPayload(BaseModel):
@@ -974,9 +959,19 @@ async def update_direction(
                 if "priority" in payload:
                     d["priority"] = payload["priority"]
                 if "status" in payload:
-                    d["status"] = payload["status"]
-                    if payload["status"] in ("active", "staged"):
-                        _clear_direction_reactivation_state(d)
+                    if payload["status"] == "active":
+                        # Reactivating a paused/staged direction goes through the
+                        # shared seam so it clears residue AND stamps the lifecycle
+                        # grace marker (auto_recovered_at) when resuming from paused,
+                        # preventing frozen research_history from immediately
+                        # re-pausing/zombie-retiring it. Operators may resume their
+                        # own user-paused directions (allow_user_paused=True), so the
+                        # helper never blocks here.
+                        reactivate_paused_direction(d, allow_user_paused=True)
+                    else:
+                        d["status"] = payload["status"]
+                        if payload["status"] == "staged":
+                            _clear_direction_reactivation_state(d)
                     if payload["status"] == "staged":
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
