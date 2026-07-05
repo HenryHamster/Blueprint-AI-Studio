@@ -1970,8 +1970,18 @@ def _build_cycle_start_reconciliation(
                     }
                 )
 
-        # Disagreement 2: last_qualification.status vs qualification_state
-        if isinstance(vpb_last_qual, dict) and isinstance(vpb_qual_state, dict):
+        # Disagreement 2: last_qualification.status vs qualification_state.
+        # Skip when qualification_state_disagreement is already present — the
+        # resolver documented the substitution explicitly, so the raw/derived
+        # divergence is an EXPLAINED mismatch, not an unexplained conflict.
+        vpb_qual_disagreement = version_phase_block.get(
+            "qualification_state_disagreement"
+        )
+        if (
+            vpb_qual_disagreement is None
+            and isinstance(vpb_last_qual, dict)
+            and isinstance(vpb_qual_state, dict)
+        ):
             raw_status = vpb_last_qual.get("status")
             derived_state = vpb_qual_state.get("state")
             if (
@@ -7535,7 +7545,6 @@ async def _spawn_strategic_review(
     if _open_version is not None:
         from app.release_version import (
             QUALIFICATION_STATE_VOCAB as _QUAL_STATE_VOCAB,
-            summarize_qualification_state as _summarize_qual_state,
         )
 
         _QUAL_HINT_STATES = {
@@ -7548,7 +7557,10 @@ async def _spawn_strategic_review(
         assert (
             _QUAL_HINT_STATES <= _QUAL_STATE_VOCAB
         ), "prompt-suffix states not in vocab"
-        _qual_state = _summarize_qual_state(_open_version.last_qualification)
+        # Use the resolver-applied qualification_state from _version_phase_block
+        # rather than re-deriving from the raw last_qualification record, so the
+        # hint reflects the finalized-verdict substitution (if any).
+        _qual_state = (_version_phase_block or {}).get("qualification_state")
         if _qual_state and _qual_state.get("state") in _QUAL_HINT_STATES:
             _qual_hint = (
                 f"Qualification sub-state: {_qual_state['state'].upper()} — "

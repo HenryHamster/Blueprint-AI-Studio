@@ -2538,6 +2538,50 @@ describe('buildVersionPhaseSection', () => {
     });
     expect(result).not.toContain('Qualification candidate currency');
   });
+
+  it('renders qualification_state_disagreement note when present', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
+      qualification_state_disagreement: {
+        last_qualification_status: 'pending',
+        verdict_terminal_status: 'not_promoted',
+      },
+    });
+    expect(result).toContain('qualification_state_disagreement');
+    expect(result).toContain("last_qualification_status='pending'");
+    expect(result).toContain("verdict_terminal_status='not_promoted'");
+    expect(result).toContain('finalized verdict');
+  });
+
+  it('omits qualification_state_disagreement note when absent', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 4,
+      phase: 'stabilize',
+      last_qualification: { status: 'not_promoted', candidate_sha: 'deadbeef1234' },
+    });
+    expect(result).not.toContain('qualification_state_disagreement');
+  });
+
+  it('renders enriched qualification_state and serving_status for recent_versions entries', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      recent_versions: [
+        {
+          version_number: 4,
+          status: 'promoted',
+          serving_status: 'serving',
+          last_qualification: { status: 'promoted', confidence: 0.88 },
+          qualification_state: { state: 'promoted', serving_status: 'serving' },
+        },
+      ],
+    });
+    expect(result).toContain('Recent versions');
+    expect(result).toContain('qual_state=promoted');
+    expect(result).toContain('serving=serving');
+  });
 });
 
 describe('buildMemoCitationsSection', () => {

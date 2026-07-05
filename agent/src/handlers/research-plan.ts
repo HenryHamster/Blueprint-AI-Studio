@@ -918,6 +918,20 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     }
   }
 
+  // Qualification-state disagreement — surfaced when a finalized verdict
+  // superseded a stale pending last_qualification record. Tells the strategist
+  // the displayed qualification state reflects the finalized verdict, not the
+  // stale 'pending' record that was stored on the version.
+  const disagreementRaw = versionPhase.qualification_state_disagreement;
+  if (disagreementRaw && typeof disagreementRaw === 'object' && !Array.isArray(disagreementRaw)) {
+    const disagreement = disagreementRaw as Record<string, unknown>;
+    const lqStoredStatus = typeof disagreement.last_qualification_status === 'string' ? disagreement.last_qualification_status : null;
+    const verdictFinalStatus = typeof disagreement.verdict_terminal_status === 'string' ? disagreement.verdict_terminal_status : null;
+    if (lqStoredStatus && verdictFinalStatus) {
+      parts.push(`  Note: qualification_state_disagreement — stored last_qualification.status='${lqStoredStatus}' but finalized verdict reports '${verdictFinalStatus}'. The qualification state above reflects the finalized verdict.`);
+    }
+  }
+
   // Version-phase candidate currency: is the last qualification's candidate SHA still HEAD?
   const lqCurrencyRaw = versionPhase.last_qualification_candidate_currency;
   if (lqCurrencyRaw && typeof lqCurrencyRaw === 'object' && !Array.isArray(lqCurrencyRaw)) {
@@ -1032,10 +1046,19 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
       const lqStatus = lqRec && typeof lqRec.status === 'string' ? lqRec.status : null;
       const lqConf = lqRec && typeof lqRec.confidence === 'number' ? lqRec.confidence : null;
       const lqBlocker = lqRec && typeof lqRec.blocker === 'string' && lqRec.blocker ? lqRec.blocker : null;
+      const rvQs = rvRec.qualification_state;
+      const rvQsRec = rvQs && typeof rvQs === 'object' && !Array.isArray(rvQs) ? rvQs as Record<string, unknown> : null;
       const lqBits: string[] = [];
       if (lqStatus) lqBits.push(`qual=${lqStatus}`);
       if (lqConf !== null) lqBits.push(`confidence=${lqConf}`);
       if (lqBlocker) lqBits.push(`blocker=${lqBlocker}`);
+      // Enriched qualification state and serving status for closed versions.
+      if (rvQsRec && typeof rvQsRec.state === 'string') {
+        lqBits.push(`qual_state=${rvQsRec.state}`);
+      }
+      const rvServingStatus = typeof rvRec.serving_status === 'string' ? rvRec.serving_status :
+        (rvQsRec && typeof rvQsRec.serving_status === 'string' ? rvQsRec.serving_status : null);
+      if (rvServingStatus) lqBits.push(`serving=${rvServingStatus}`);
       const lqSuffix = lqBits.length > 0 ? ` [${lqBits.join(', ')}]` : '';
       rvLines.push(`  - v${rvNum} (${rvStatus})${lqSuffix}`);
       if (lqRec) {

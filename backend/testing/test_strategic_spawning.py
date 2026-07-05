@@ -8717,6 +8717,94 @@ async def test_qualification_substate_hint_absent_while_auditing(
 
 
 @pytest.mark.asyncio
+async def test_qualification_substate_hint_suppressed_when_verdict_supersedes_pending(
+    db_session, mocker, _lts_split_active
+):
+    """When a finalized QualificationVerdict (terminal_status='promoted') exists
+    and last_qualification still says 'pending'+'promotion_pending', the resolver
+    substitutes the effective status to 'promoted'.  The prompt-suffix hint must
+    use the resolver-applied qualification_state (NOT the raw last_qualification)
+    so PROMOTION_IN_FLIGHT is absent — the promotion already resolved."""
+    from app.models import QualificationVerdict, ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=3,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+        phase_changed_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "f" * 40
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=sha,
+            confidence=0.92,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=False,
+            finalized_at=now,
+        )
+    )
+    # Stale last_qualification: still shows pending+promotion_pending even though
+    # the verdict is already finalized.
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.92,
+        "promotion_pending": {
+            "pr_number": 9002,
+            "pr_url": "https://github.com/x/y/pull/9002",
+            "auto_merge_enabled": True,
+            "enabled_at": now.isoformat(),
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    assert await _spawn_strategic_review(project, db_session) is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    suffix = payload.get("prompt_suffix", "")
+    assert "PROMOTION_IN_FLIGHT" not in suffix, (
+        "prompt-suffix must NOT assert PROMOTION_IN_FLIGHT when the verdict "
+        f"has already finalized as promoted; got suffix: {suffix!r}"
+    )
+    # The version_phase qualification_state must reflect the resolved outcome
+    vp = payload.get("version_phase") or {}
+    qs = vp.get("qualification_state", {})
+    assert qs.get("state") == "promoted", (
+        f"qualification_state must be resolver-applied 'promoted', got: {qs}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stabilize_findings_hint_softens_when_remediation_direction_exists(
     db_session, mocker, _lts_split_active
 ):
@@ -13095,6 +13183,64 @@ class TestBuildCycleStartReconciliation:
         assert len(status_conflicts) == 1
         assert "status" in status_conflicts[0]["description"].lower()
         assert "state" in status_conflicts[0]["description"].lower()
+
+    def test_status_state_mismatch_not_flagged_for_finalized_verdict_substitution(self):
+        """When qualification_state_disagreement is present the resolver already
+        documented the status→state divergence (e.g. pending→promoted via a
+        finalized QualificationVerdict).  _build_cycle_start_reconciliation must
+        NOT flag it as a status_state_mismatch conflict — that would be a false
+        positive against the resolver's own deliberate substitution.
+
+        Acceptance evidence: named_test requirement from direction task."""
+        from app.strategic_spawning import _build_cycle_start_reconciliation
+
+        direction_stats = [
+            {"id": "d-working", "status": "active", "gap_id": "g-1"}
+        ]
+        pm = {"gaps": [{"id": "g-1", "name": "gap1", "status": "active"}]}
+        # Simulate what the resolver produces when a merge-test verdict with
+        # terminal_status="promoted" exists while last_qualification.status is
+        # still "pending" (the stale-pending window):
+        #   - last_qualification.status = "pending"  (raw, unmodified)
+        #   - qualification_state.state = "promoted"  (resolver-applied)
+        #   - qualification_state_disagreement = {...}  (resolver note)
+        version_phase_block = {
+            "last_qualification": {
+                "candidate_sha": "abc123def456789",
+                "status": "pending",
+                "promotion_pending": {
+                    "pr_number": 9001,
+                    "pr_url": "https://github.com/x/y/pull/9001",
+                    "auto_merge_enabled": True,
+                },
+                "confidence": 0.92,
+                "threshold": 0.80,
+            },
+            # Resolver substituted "pending" → "promoted" via QualificationVerdict
+            "qualification_state": {"state": "promoted", "summary": "Promoted."},
+            # Resolver documented the substitution here:
+            "qualification_state_disagreement": {
+                "last_qualification_status": "pending",
+                "verdict_terminal_status": "promoted",
+            },
+        }
+        out = _build_cycle_start_reconciliation(
+            direction_stats,
+            pm,
+            {},
+            version_phase_block=version_phase_block,
+        )
+        assert out is not None
+        conflicts = out["qualification_surface_conflicts"]
+        status_conflicts = [
+            c
+            for c in conflicts
+            if c.get("conflict_type") == "status_state_mismatch"
+        ]
+        assert status_conflicts == [], (
+            "status_state_mismatch must NOT fire when qualification_state_disagreement "
+            f"is present (resolver already documented the substitution); got: {conflicts}"
+        )
 
     def test_qualification_surface_conflicts_criterion_coverage_vs_confidence(self):
         from app.strategic_spawning import _build_cycle_start_reconciliation
