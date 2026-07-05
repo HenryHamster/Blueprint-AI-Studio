@@ -28,7 +28,10 @@ from app.shared_state import (
     runtime_config as _runtime_config,
 )
 from app.release_artifacts import version_serving_summary as _version_serving_summary
-from app.qualification_state_resolver import resolve_effective_qualification_state
+from app.qualification_state_resolver import (
+    resolve_effective_qualification_state,
+    resolve_open_version_qualification_state,
+)
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
 from app import compute as _compute
@@ -623,7 +626,13 @@ async def get_version_lifecycle(
             # so a crashed audit (terminal-failed, no report) reconciles to
             # ``audit_crashed`` instead of a misleading ``qualifying``/'wait' — the top
             # badge and the audit-findings section then agree by construction.
-            qual_state, _ = resolve_effective_qualification_state(
+            # Routed through the shared OPEN-version resolver so this endpoint ALSO
+            # applies the finalized-verdict substitution (stale-pending window) that
+            # it previously omitted: reuse the ``latest_audit`` already resolved above
+            # for the audit-findings section, and let the helper backfill the newest
+            # verdict so all four open-version surfaces agree.
+            qual_state, _ = await resolve_open_version_qualification_state(
+                session,
                 open_row,
                 project_row,
                 audit_child=latest_audit,

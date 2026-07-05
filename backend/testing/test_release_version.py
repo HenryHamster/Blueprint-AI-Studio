@@ -26,6 +26,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
+from app import strategic_spawning as ss
 from app.models import Project, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
@@ -2222,6 +2223,99 @@ class TestQualificationStateVocab:
             "protection_blocked_review",
         }
         assert hint_states <= rv.QUALIFICATION_STATE_VOCAB
+
+    def test_status_to_expected_states_map_covers_all_classifier_derivations(self):
+        """_QUAL_STATUS_STATE_MAP in strategic_spawning mirrors every state that
+        summarize_qualification_state can return for each raw status it covers.
+
+        Drift scenario: a new state is added under an existing status in the
+        classifier (e.g. a new "pending" sub-state) without updating the map.
+        Every strategic payload then flags a false status_state_mismatch conflict.
+        This test exercises all reachable branches for each mapped status and
+        asserts:
+          (a) each returned state is declared in _QUAL_STATUS_STATE_MAP[status], and
+          (b) every declared state in the map is reachable by at least one input
+              (no dead entries silently diverging from the classifier).
+        """
+        # Representative inputs that trigger every branch for each mapped status.
+        # Each entry is (raw_status, call_kwargs).
+        _pending_inputs = [
+            # qualifying — bare pending, no promotion sub-key
+            ({"status": "pending"}, {}),
+            # audit_crashed — pending with a terminal-failed audit child and no report
+            (
+                {"status": "pending"},
+                {"audit_child": {"task_status": "FAILED", "report": None}},
+            ),
+            # promotion_check_wait — managed_check_wait promotion
+            (
+                {"status": "pending", "promotion_pending": {"managed_check_wait": True}},
+                {},
+            ),
+            # promotion_in_flight — normal (non-managed) promotion PR open
+            (
+                {"status": "pending", "promotion_pending": {"auto_merge_enabled": True}},
+                {},
+            ),
+        ]
+        _promotion_failed_inputs = [
+            # promotion_failed (generic fallback)
+            ({"status": "promotion_failed"}, {}),
+            # required_check_failed — specific error sub-reason
+            ({"status": "promotion_failed", "error": "required_check_failed"}, {}),
+            # protection_blocked_review — specific error sub-reason
+            ({"status": "promotion_failed", "error": "protection_blocked_review"}, {}),
+        ]
+        _promoted_inputs = [
+            # promoted — no serving info (bare)
+            ({"status": "promoted"}, {}),
+            # promoted — serving confirmed
+            ({"status": "promoted"}, {"serving_status": "serving_confirmed"}),
+            # promoted_unconfirmed
+            ({"status": "promoted"}, {"serving_status": "unconfirmed"}),
+            # promotion_deploy_failed
+            ({"status": "promoted"}, {"serving_status": "deploy_failed"}),
+            # promotion_confirmation_timed_out
+            ({"status": "promoted"}, {"serving_status": "confirmation_timed_out"}),
+        ]
+        inputs_by_status = {
+            "pending": _pending_inputs,
+            "promotion_failed": _promotion_failed_inputs,
+            "promoted": _promoted_inputs,
+        }
+
+        map_under_test = ss._QUAL_STATUS_STATE_MAP
+        # Verify the map exists and covers exactly the statuses we have inputs for.
+        assert set(map_under_test.keys()) == set(inputs_by_status.keys()), (
+            "_QUAL_STATUS_STATE_MAP keys diverged from the inputs_by_status fixture — "
+            "update this test when adding or removing a top-level status from the map"
+        )
+
+        for raw_status, inputs in inputs_by_status.items():
+            declared = map_under_test[raw_status]
+            observed: set[str] = set()
+            for verdict, kwargs in inputs:
+                result = rv.summarize_qualification_state(verdict, **kwargs)
+                assert result is not None, (
+                    f"summarize_qualification_state returned None for status={raw_status!r}, "
+                    f"verdict={verdict!r}, kwargs={kwargs!r} — expected a non-None result"
+                )
+                state = result.get("state")
+                assert state in declared, (
+                    f"summarize_qualification_state returned state={state!r} for "
+                    f"status={raw_status!r} which is NOT in _QUAL_STATUS_STATE_MAP[{raw_status!r}]="
+                    f"{declared!r}. Add the new state to the map or fix the classifier."
+                )
+                observed.add(state)
+
+            # Every declared state must be reachable — dead entries in the map
+            # hide future drift.
+            unreachable = declared - observed
+            assert not unreachable, (
+                f"_QUAL_STATUS_STATE_MAP[{raw_status!r}] declares states that no input "
+                f"reached: {unreachable!r}. Either add inputs that exercise them or "
+                f"remove dead entries from the map."
+            )
 
 
 # ===========================================================================

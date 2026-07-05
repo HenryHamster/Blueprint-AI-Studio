@@ -1415,6 +1415,36 @@ _RECON_LIST_CAP = 12
 _RECENT_MERGED_TITLES_CAP = 10
 # Char cap for any direction/gap/capability label echoed into the block.
 _RECON_LABEL_MAXLEN = 120
+# Maps raw last_qualification.status values to the set of canonical
+# summarize_qualification_state states that legitimately arise under them.
+# Used by the status_state_mismatch conflict check so a new state added to the
+# classifier under an existing status is caught by tests rather than silently
+# producing false conflicts in every strategic payload.
+_QUAL_STATUS_STATE_MAP: dict[str, frozenset[str]] = {
+    "pending": frozenset(
+        {
+            "qualifying",
+            "promotion_in_flight",
+            "promotion_check_wait",
+            "audit_crashed",
+        }
+    ),
+    "promotion_failed": frozenset(
+        {
+            "promotion_failed",
+            "required_check_failed",
+            "protection_blocked_review",
+        }
+    ),
+    "promoted": frozenset(
+        {
+            "promoted",
+            "promoted_unconfirmed",
+            "promotion_deploy_failed",
+            "promotion_confirmation_timed_out",
+        }
+    ),
+}
 # Name-length threshold for the long-name hygiene signal in prune candidates.
 # Capability/gap names longer than this are flagged as advisory cleanup targets.
 _CAPABILITY_LONG_NAME_THRESHOLD = 80
@@ -1938,28 +1968,7 @@ def _build_cycle_start_reconciliation(
                 and derived_state is not None
                 and raw_status != derived_state
             ):
-                # Map status to expected states to detect genuine disagreements
-                # (not all status/state pairs are incompatible)
-                status_to_expected_states = {
-                    "pending": {
-                        "qualifying",
-                        "promotion_in_flight",
-                        "promotion_check_wait",
-                        "audit_crashed",
-                    },
-                    "promotion_failed": {
-                        "promotion_failed",
-                        "required_check_failed",
-                        "protection_blocked_review",
-                    },
-                    "promoted": {
-                        "promoted",
-                        "promoted_unconfirmed",
-                        "promotion_deploy_failed",
-                        "promotion_confirmation_timed_out",
-                    },
-                }
-                expected_states = status_to_expected_states.get(raw_status, {})
+                expected_states = _QUAL_STATUS_STATE_MAP.get(raw_status, frozenset())
                 if derived_state not in expected_states:
                     qualification_surface_conflicts.append(
                         {
@@ -6741,33 +6750,51 @@ async def _spawn_strategic_review(
                 _tasks_merged = await count_merged_since(
                     session, project.id, _open_version.opened_at
                 )
-                # Resolve the open version's audit child so a crashed audit
-                # (terminal-failed, no report) reconciles the qualification_state
-                # to ``audit_crashed`` instead of telling the strategic agent to
-                # wait on a dead audit (it would otherwise burn a cycle). Same
-                # version-scoped evidence the operator panel reads. Best-effort.
-                _audit_child = None
-                try:
-                    from app.release_qualifier_audit import (
-                        resolve_lifecycle_audit_evidence,
-                    )
+                # Resolve the open version's effective qualification_state through
+                # the shared async seam so this payload applies ALL THREE
+                # reconciliation enrichments — the serving aggregate, the
+                # version-scoped audit child (so a crashed audit reconciles to
+                # ``audit_crashed`` instead of telling the strategist to wait on a
+                # dead audit and burn a cycle), AND the newest finalized verdict
+                # (so a stale ``pending`` + ``promotion_pending`` record does not
+                # read ``promotion_in_flight`` when the promotion already
+                # resolved). Previously to_phase_block threaded only the audit
+                # child and never applied the finalized-verdict substitution, so
+                # this surface disagreed with the agent fetch verb in the
+                # stale-pending window. The helper keeps audit resolution
+                # best-effort internally so a failed resolve never blocks assembly.
+                from app.qualification_state_resolver import (
+                    resolve_open_version_qualification_state,
+                )
 
-                    _audit_evidence = await resolve_lifecycle_audit_evidence(
-                        session, _open_version
-                    )
-                    _audit_child = _audit_evidence["latest_audit"]
-                except Exception:
-                    logger.exception(
-                        "[STRATEGIC] audit-child resolution failed; continuing"
+                (
+                    _open_qual_state,
+                    _open_qual_disagreement,
+                ) = await resolve_open_version_qualification_state(
+                    session,
+                    _open_version,
+                    project,
+                    serving=(_open_aggregate, _open_artifacts),
+                )
+                _phase_block = to_phase_block(
+                    _open_version,
+                    aggregate_serving_status=_open_aggregate["serving_status"],
+                    aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
+                    artifact_evidence=_open_artifacts,
+                )
+                # Override the block's own (audit/verdict-unaware)
+                # qualification_state with the fully-reconciled state, and surface
+                # any verdict disagreement explicitly so the reconciliation is
+                # visible rather than requiring manual cross-referencing. Every
+                # other to_phase_block field (last_qualification, serving_status,
+                # promotion_readiness, etc.) is preserved untouched.
+                _phase_block["qualification_state"] = _open_qual_state
+                if _open_qual_disagreement is not None:
+                    _phase_block["qualification_state_disagreement"] = (
+                        _open_qual_disagreement
                     )
                 _version_phase_block = {
-                    **to_phase_block(
-                        _open_version,
-                        audit_child=_audit_child,
-                        aggregate_serving_status=_open_aggregate["serving_status"],
-                        aggregate_deploy_failure_reason=_open_aggregate["reason_code"],
-                        artifact_evidence=_open_artifacts,
-                    ),
+                    **_phase_block,
                     "tasks_merged_this_version": _tasks_merged,
                     "qualification_attempts": _open_version.qualification_attempts,
                     # Signals the strategist to author the objective this cycle.

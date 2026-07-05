@@ -6939,6 +6939,155 @@ async def test_version_phase_includes_promotion_readiness(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_qualification_state_reconciles_finalized_verdict(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload's version_phase applies the finalized-verdict
+    substitution (unified with the other open-version surfaces): a stale
+    ``pending`` + ``promotion_pending`` record with an already-resolved verdict
+    reads the terminal status (NOT ``promotion_in_flight``) and surfaces the
+    verdict disagreement explicitly."""
+    from app.models import QualificationVerdict, ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+    await _ensure_verdict_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "e" * 40
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha=sha,
+            confidence=0.9,
+            terminal_status="promoted",
+            would_promote=True,
+            promotion_enabled=False,
+            finalized_at=now,
+            audit_findings=[{"severity": "LOW", "summary": "nit"}],
+        )
+    )
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha,
+        "confidence": 0.9,
+        "promotion_pending": {"pr_number": 7, "pr_url": "https://x/pull/7"},
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+
+    qs = vp.get("qualification_state")
+    assert qs is not None, "qualification_state must be present"
+    assert qs["state"] != "promotion_in_flight", (
+        f"finalized verdict must supersede the stale promotion_pending: {qs}"
+    )
+    assert qs["state"] == "promoted", qs
+    dis = vp.get("qualification_state_disagreement")
+    assert dis is not None, (
+        "strategic payload must surface the finalized-verdict disagreement"
+    )
+    assert dis["last_qualification_status"] == "pending"
+    assert dis["verdict_terminal_status"] == "promoted"
+
+
+@pytest.mark.asyncio
+async def test_version_phase_qualification_state_reconciles_crashed_audit(
+    db_session, mocker, _lts_split_active
+):
+    """The strategic payload's version_phase applies the audit-crash reconciliation:
+    a bare ``pending`` record whose version-scoped audit child crashed
+    (terminal-failed, no report) reads ``audit_crashed`` instead of telling the
+    strategist to wait on a dead audit."""
+    from app.models import ReleaseVersion
+    from sqlalchemy.orm.attributes import flag_modified
+
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow_naive()
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=2,
+        phase="stabilize",
+        status="open",
+        opened_at=now,
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    sha = "f" * 40
+    version.last_qualification = {"status": "pending", "candidate_sha": sha}
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    # Version-scoped release_audit task pinned to the evaluated candidate, FAILED
+    # with no report artifact => a crashed audit child.
+    db_session.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "release_audit"}],
+            vm_instance_id="agent-vm-audit-crash-strat",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(version.id), "candidate_sha": sha},
+        )
+    )
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    vp = tasks[0].payloads[0].get("version_phase")
+    assert vp is not None, "version_phase block should be present"
+
+    qs = vp.get("qualification_state")
+    assert qs is not None and qs["state"] == "audit_crashed", qs
+
+
+@pytest.mark.asyncio
 async def test_version_phase_includes_recent_versions(
     db_session, mocker, _lts_split_active
 ):

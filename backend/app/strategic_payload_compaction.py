@@ -408,6 +408,15 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     qs = _compact_qualification_state(block.get("qualification_state"), floor=floor)
     if qs:
         out["qualification_state"] = qs
+    # Small scalar dict {last_qualification_status, verdict_terminal_status}
+    # emitted when a finalized verdict superseded a stale pending record. Kept so
+    # the finalized-verdict disagreement survives packing and stays consistent
+    # with the agent fetch verb's ``qualification_state_disagreement`` field.
+    disagreement = _compact_scalar_mapping(
+        block.get("qualification_state_disagreement"), text_cap=text_cap
+    )
+    if disagreement:
+        out["qualification_state_disagreement"] = disagreement
     artifacts = _compact_release_artifacts(block.get("artifacts"))
     if artifacts:
         out["artifacts"] = artifacts

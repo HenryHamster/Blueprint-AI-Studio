@@ -22,16 +22,40 @@ exactly the windows that matter. This module houses the shared primitives so
 every surface layers the enrichments in one fixed order and calls the single
 :func:`app.release_version.summarize_qualification_state` classifier.
 
-Everything here is pure / synchronous: the ``serving`` tuple and ``audit_child``
-envelope are resolved by the caller (they need a DB session) and threaded in.
+The classifier primitives (:func:`apply_verdict_substitution`,
+:func:`resolve_effective_qualification_state`) are pure / synchronous: the
+``serving`` tuple and ``audit_child`` envelope are resolved by the caller (they
+need a DB session) and threaded in.
+
+This module ALSO exposes two async DB-touching helpers,
+:func:`resolve_newest_qualification_verdict` and
+:func:`resolve_open_version_qualification_state`. The latter is the single seam
+every OPEN-version read surface routes through: given a session + open version,
+it GUARANTEES all three enrichments (serving aggregate, audit child, finalized
+verdict) are applied in the same fixed order so the surfaces cannot silently
+diverge. Callers may thread in enrichments they already resolved for other
+response fields to avoid a redundant query, but the helper backfills any they
+did not so the guarantee holds regardless of caller.
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Tuple, TYPE_CHECKING
 
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models import QualificationVerdict
+
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from app.models import QualificationVerdict, ReleaseVersion, Project
+    from app.models import ReleaseVersion, Project
+
+logger = logging.getLogger("backend.app.qualification_state_resolver")
+
+# Sentinel distinguishing "caller did not resolve this enrichment" (backfill it)
+# from "caller resolved it and it is genuinely ``None``" (respect the ``None``).
+_UNSET: Any = object()
 
 
 # Verdict ``terminal_status`` values that represent a FINALIZED promotion
@@ -130,3 +154,94 @@ def resolve_effective_qualification_state(
         artifact_evidence=artifacts,
     )
     return state, disagreement
+
+
+async def resolve_newest_qualification_verdict(
+    session: AsyncSession,
+    version: ReleaseVersion,
+) -> QualificationVerdict | None:
+    """Return the newest ``QualificationVerdict`` row for ``version``.
+
+    This is the single canonical newest-verdict query used for finalized-verdict
+    substitution across every open-version read surface: scoped to the version
+    (``release_version_id == version.id``), ordered newest-first, limit 1, with
+    NO ``audit_findings`` filter (a finalized promotion verdict — e.g. an
+    ``infra_failure`` or ``promotion_failed`` outcome — may legitimately carry no
+    findings, and the substitution only cares about ``terminal_status``).
+    Reusing this one helper keeps the surfaces from re-inlining subtly-different
+    SELECTs.
+    """
+    return (
+        (
+            await session.execute(
+                select(QualificationVerdict)
+                .where(QualificationVerdict.release_version_id == version.id)
+                .order_by(QualificationVerdict.created_at.desc())
+                .limit(1)
+            )
+        )
+        .scalars()
+        .first()
+    )
+
+
+async def resolve_open_version_qualification_state(
+    session: AsyncSession,
+    version: ReleaseVersion,
+    project: Project | None = None,
+    *,
+    serving: Tuple[dict[str, Any], list[dict[str, Any]]] | None = None,
+    audit_child: Any = _UNSET,
+    latest_verdict: Any = _UNSET,
+) -> Tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Resolve an OPEN version's ``qualification_state`` with ALL enrichments.
+
+    The single async seam every open-version read surface (strategic payload,
+    agent fetch verb, admin lifecycle endpoint, system-state snapshot) routes
+    through, so they cannot silently apply different enrichment subsets and tell
+    contradictory stories in the stale-pending / audit-crashed windows.
+
+    Returns ``(qualification_state, disagreement)`` — the
+    :func:`resolve_effective_qualification_state` output — with all three
+    reconciliation enrichments GUARANTEED applied in the fixed order:
+
+    * ``serving`` — a pre-resolved ``(aggregate, artifacts)`` tuple (from
+      :func:`app.release_artifacts.version_serving_summary`); ``None`` resolves
+      it downstream. This is pure over already-loaded artifacts, so passing it is
+      an optimization, not a correctness requirement.
+    * ``audit_child`` — when left unset (``_UNSET``) the version-scoped audit
+      child is resolved here via
+      :func:`app.release_qualifier_audit.resolve_lifecycle_audit_evidence`
+      (best-effort: a failure logs and degrades to ``None`` so a broken audit
+      resolution never blocks payload/response assembly). Passing an explicit
+      value (including ``None``) skips the query.
+    * ``latest_verdict`` — when left unset the newest verdict is resolved via
+      :func:`resolve_newest_qualification_verdict`. Passing an explicit value
+      (including ``None``) skips the query so a caller that already loaded it can
+      avoid a second round-trip.
+    """
+    if audit_child is _UNSET:
+        audit_child = None
+        try:
+            from app.release_qualifier_audit import resolve_lifecycle_audit_evidence
+
+            evidence = await resolve_lifecycle_audit_evidence(session, version)
+            audit_child = evidence.get("latest_audit")
+        except Exception:
+            logger.exception(
+                "[QUAL_STATE] audit-child resolution failed for version %s; "
+                "resolving qualification_state without audit-crash reconciliation",
+                getattr(version, "id", None),
+            )
+            audit_child = None
+
+    if latest_verdict is _UNSET:
+        latest_verdict = await resolve_newest_qualification_verdict(session, version)
+
+    return resolve_effective_qualification_state(
+        version,
+        project,
+        latest_verdict=latest_verdict,
+        audit_child=audit_child,
+        serving=serving,
+    )

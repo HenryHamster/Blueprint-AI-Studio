@@ -18,6 +18,7 @@ from app.models import (
     AuditFindingResolution,
     MessageType,
     Project,
+    ProjectMember,
     ProjectMessage,
     QualificationVerdict,
     ReleaseDeployArtifact,
@@ -3833,6 +3834,231 @@ async def test_agent_fetch_version_phase_qualification_state_not_in_flight_when_
 
 
 # ---------------------------------------------------------------------------
+# Cross-surface agreement: every OPEN-version read surface must apply the SAME
+# three reconciliation enrichments (serving aggregate + version-scoped audit
+# child + newest finalized verdict) so they report an identical
+# qualification_state in the stale-pending and audit-crashed windows and NO false
+# disagreement when the two sources genuinely agree.
+# ---------------------------------------------------------------------------
+
+
+async def _open_version_qualification_states(client, db_session, project, task, version):
+    """Collect the open version's ``qualification_state`` from all four surfaces.
+
+    Each surface is driven through its real production entry point (the agent
+    fetch verb and the admin lifecycle endpoint over HTTP, the system-state
+    snapshot via ``compute_system_state``), and the strategic payload via the
+    exact ``resolve_open_version_qualification_state`` + ``to_phase_block``
+    sequence ``strategic_spawning._spawn_strategic_review`` runs for the open
+    version. This catches any surface that stops routing through the unified
+    enrichment helper. Returns ``(states, disagreements)`` keyed by surface.
+    """
+    from unittest.mock import AsyncMock, patch
+
+    from app.system_state import compute_system_state
+    from app.release_artifacts import version_serving_summary
+    from app.release_version import current_open_version, to_phase_block
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+    )
+
+    # 1. Agent fetch verb — real HTTP endpoint.
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    agent_current = res.json()["data"]["current_version"]
+
+    # 2. Admin lifecycle endpoint — real HTTP endpoint. Patch only the
+    #    promotion-readiness compute (keeps the read off GitHub); the audit-child
+    #    resolution is left REAL so the audit-crash reconciliation actually runs.
+    with patch(
+        "app.release_qualifier.compute_promotion_readiness",
+        new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+    ):
+        admin_res = await client.get(
+            f"/api/admin/projects/{project.id}/version-lifecycle"
+        )
+    assert admin_res.status_code == 200, admin_res.text
+    admin_current = admin_res.json()["current_version"]
+
+    # 3. System-state snapshot — real function.
+    snap = await compute_system_state(db_session, project.id)
+
+    # 4. Strategic payload version_phase block — reproduce the exact open-version
+    #    sequence _spawn_strategic_review runs (shared resolver -> to_phase_block,
+    #    then override qualification_state with the fully-reconciled state).
+    loaded = await current_open_version(db_session, project.id, include_artifacts=True)
+    agg, arts = version_serving_summary(loaded, project)
+    strat_state, strat_disagreement = await resolve_open_version_qualification_state(
+        db_session, loaded, project, serving=(agg, arts)
+    )
+    strat_block = to_phase_block(
+        loaded,
+        aggregate_serving_status=agg["serving_status"],
+        aggregate_deploy_failure_reason=agg["reason_code"],
+        artifact_evidence=arts,
+    )
+    strat_block["qualification_state"] = strat_state
+
+    states = {
+        "agent_fetch": agent_current["qualification_state"],
+        "admin_lifecycle": admin_current["qualification_state"],
+        "system_state": snap.version.qualification_state,
+        "strategic": strat_block["qualification_state"],
+    }
+    disagreements = {
+        "agent_fetch": agent_current.get("qualification_state_disagreement"),
+        "strategic": strat_disagreement,
+    }
+    return states, disagreements
+
+
+def _surfaces_identical(states: dict) -> bool:
+    """True when every surface's qualification_state dict is byte-identical.
+
+    Compared via a canonical JSON form so nested lists (e.g. ``artifacts``) don't
+    trip an unhashable-set comparison. For the windows under test the state dicts
+    carry no time-derived fields, so identity is deterministic.
+    """
+    import json
+
+    canonical = {
+        json.dumps(s, sort_keys=True, default=str) for s in states.values()
+    }
+    return len(canonical) == 1
+
+
+async def _make_open_version_project(db_session, *, vm):
+    """Open version + task + a ProjectMember row so the admin endpoint authorizes."""
+    project, task, version = await _make_project_with_version(db_session, vm=vm)
+    # The admin version-lifecycle endpoint calls _get_user_project_with_role; the
+    # conftest client authenticates as user_id="test-user-123", so it must be a
+    # member of the project under test.
+    db_session.add(
+        ProjectMember(project_id=project.id, user_id="test-user-123", role="owner")
+    )
+    await db_session.commit()
+    return project, task, version
+
+
+@pytest.mark.asyncio
+async def test_open_version_qualification_state_agrees_across_surfaces(
+    client: AsyncClient, db_session
+):
+    """The strategic payload, agent fetch verb, admin lifecycle endpoint, and
+    system-state snapshot must report an IDENTICAL open-version qualification_state
+    in the stale-pending and audit-crashed windows, and surface NO false
+    disagreement when the two sources genuinely agree."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    # --- (a) Stale-pending window ---------------------------------------------
+    # last_qualification is a transient pending+promotion_pending record, but a
+    # finalized verdict (terminal_status=promoted) has already resolved. Every
+    # surface must adopt the resolved outcome (NOT promotion_in_flight) and emit an
+    # identical finalized-verdict disagreement.
+    p1, t1, v1 = await _make_open_version_project(db_session, vm="agent-vm-xsurf-sp")
+    sha1 = "a" * 40
+    db_session.add(
+        QualificationVerdict(
+            id=uuid.uuid4(),
+            project_id=p1.id,
+            release_version_id=v1.id,
+            candidate_sha=sha1,
+            confidence=0.9,
+            sub_scores={"audit": 0.95},
+            terminal_status="promoted",
+            finalized_at=datetime(2026, 6, 20, 14, 0, 0),
+            audit_findings=[{"severity": "LOW", "summary": "nit"}],
+        )
+    )
+    v1.last_qualification = {
+        "status": "pending",
+        "candidate_sha": sha1,
+        "confidence": 0.9,
+        "promotion_pending": {"pr_number": 7, "pr_url": "https://x/pull/7"},
+    }
+    flag_modified(v1, "last_qualification")
+    db_session.add(v1)
+    await db_session.commit()
+
+    states, disagreements = await _open_version_qualification_states(
+        client, db_session, p1, t1, v1
+    )
+    assert _surfaces_identical(states), (
+        f"surfaces disagree in stale-pending window: {states}"
+    )
+    for surface, state in states.items():
+        assert state is not None, surface
+        # The finalized verdict (terminal_status=promoted) supersedes the stale
+        # promotion_pending: the surface must NOT still read promotion_in_flight.
+        assert state["state"] != "promotion_in_flight", (
+            f"{surface} still reads promotion_in_flight despite a finalized verdict: {state}"
+        )
+        assert state["state"].startswith("promoted") or state["state"] == "promotion_confirmation_timed_out", (
+            surface,
+            state,
+        )
+    # The finalized-verdict disagreement is populated consistently on the surfaces
+    # that carry the field.
+    for surface, dis in disagreements.items():
+        assert dis is not None, f"{surface} dropped the verdict disagreement"
+        assert dis["last_qualification_status"] == "pending"
+        assert dis["verdict_terminal_status"] == "promoted"
+
+    # --- (b) Audit-crashed window ---------------------------------------------
+    # last_qualification is bare pending (no promotion_pending) but the version's
+    # audit child crashed (terminal-failed, no report). Every surface must
+    # reconcile to audit_crashed rather than a misleading "qualifying".
+    p2, t2, v2 = await _make_open_version_project(db_session, vm="agent-vm-xsurf-ac")
+    sha2 = "b" * 40
+    v2.last_qualification = {"status": "pending", "candidate_sha": sha2}
+    flag_modified(v2, "last_qualification")
+    db_session.add(v2)
+    # Version-scoped release_audit task pinned to the evaluated candidate, FAILED
+    # with no report artifact => crashed audit.
+    db_session.add(
+        Task(
+            project_id=p2.id,
+            payloads=[{"type": "release_audit"}],
+            vm_instance_id="agent-vm-audit-crash",
+            status=TaskStatus.FAILED,
+            context={"release_version_id": str(v2.id), "candidate_sha": sha2},
+        )
+    )
+    await db_session.commit()
+
+    states2, _ = await _open_version_qualification_states(client, db_session, p2, t2, v2)
+    assert _surfaces_identical(states2), (
+        f"surfaces disagree in audit-crashed window: {states2}"
+    )
+    for surface, state in states2.items():
+        assert state is not None and state["state"] == "audit_crashed", (surface, state)
+
+    # --- (c) Healthy window: no false disagreement ----------------------------
+    # A normal qualifying open version — bare pending, no finalized verdict, no
+    # crashed audit — must agree on "qualifying" and surface NO disagreement.
+    p3, t3, v3 = await _make_open_version_project(db_session, vm="agent-vm-xsurf-ok")
+    v3.last_qualification = {"status": "pending", "candidate_sha": "c" * 40}
+    flag_modified(v3, "last_qualification")
+    db_session.add(v3)
+    await db_session.commit()
+
+    states3, disagreements3 = await _open_version_qualification_states(
+        client, db_session, p3, t3, v3
+    )
+    assert _surfaces_identical(states3), (
+        f"surfaces disagree in healthy window: {states3}"
+    )
+    for surface, state in states3.items():
+        assert state is not None and state["state"] == "qualifying", (surface, state)
+    for surface, dis in disagreements3.items():
+        assert dis is None, f"{surface} raised a FALSE disagreement when sources agree: {dis}"
+
+
+# ---------------------------------------------------------------------------
 # Shared effective-qualification-state resolver primitives
 #
 # The agent fetch verb (agent_fetch_qualification) and the version-phase surface
@@ -4269,8 +4495,10 @@ async def test_fetch_ci_compliance_rejects_cross_project(
 async def test_agent_fetch_completion_debt_returns_not_available_without_module(
     client: AsyncClient, db_session
 ):
-    """GET /api/agent/projects/{id}/completion-debt returns not_available when
-    the completion_debt module is not yet deployed (common before ledger lands)."""
+    """GET /api/agent/projects/{id}/completion-debt returns a well-formed success
+    payload for a project with no debt. With the completion_debt module deployed
+    the endpoint returns the empty ledger snapshot ``{"items": [], "total_open": 0}``;
+    if the module were absent it falls back to ``data=[]`` (source=not_available)."""
     project, task = await _make_project_task(db_session, vm="agent-vm-cdebtnav")
     token = create_agent_token(str(task.id), "agent-vm-cdebtnav")
     res = await client.get(
@@ -4280,8 +4508,14 @@ async def test_agent_fetch_completion_debt_returns_not_available_without_module(
     assert res.status_code == 200, res.text
     body = res.json()
     assert body["status"] == "success"
-    # Module not deployed yet → not_available fallback or empty list
-    assert isinstance(body["data"], list)
+    # Deployed module → structured snapshot dict; absent module → not_available list.
+    data = body["data"]
+    if isinstance(data, dict):
+        assert isinstance(data["items"], list)
+        assert isinstance(data["total_open"], int)
+    else:
+        assert isinstance(data, list)
+        assert body.get("source") == "not_available"
 
 
 @pytest.mark.asyncio

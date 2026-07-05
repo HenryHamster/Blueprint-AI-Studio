@@ -114,7 +114,9 @@ async def compute_system_state(
     from app.time_utils import _utcnow
     from app import release_version as rv
     from app.release_artifacts import version_serving_summary as _version_serving_summary
-    from app.qualification_state_resolver import resolve_effective_qualification_state
+    from app.qualification_state_resolver import (
+        resolve_open_version_qualification_state,
+    )
 
     now = _utcnow()
 
@@ -211,9 +213,15 @@ async def compute_system_state(
             # Pass the AGGREGATE serving status — never the raw scalar.
             # summarize_qualification_state uses aggregate_serving_status when
             # artifact_evidence is provided, so the read path stays consistent.
-            # Routed through the shared resolver so every read surface layers the
-            # same enrichments in the same order.
-            qual_state, _ = resolve_effective_qualification_state(
+            # Routed through the shared OPEN-version resolver so this snapshot
+            # applies the SAME three enrichments (serving aggregate + version-
+            # scoped audit child + finalized verdict) as the strategic payload,
+            # the agent fetch verb, and the admin lifecycle endpoint — otherwise
+            # the snapshot alone told a ``qualifying`` story in the stale-pending
+            # and audit-crashed windows while the others had resolved. The open
+            # version is the only one that needs the full set here.
+            qual_state, _ = await resolve_open_version_qualification_state(
+                session,
                 version,
                 project,
                 serving=(agg_dict, evidence_list),

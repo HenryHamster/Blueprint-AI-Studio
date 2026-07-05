@@ -160,6 +160,7 @@ def _compact_version_lifecycle(
     project: Project,
     *,
     latest_verdict: "QualificationVerdict | None" = None,
+    resolved_qualification: "tuple[dict[str, Any] | None, dict[str, Any] | None] | None" = None,
 ) -> dict[str, Any]:
     from app.qualification_state_resolver import resolve_effective_qualification_state
     from app.release_artifacts import version_serving_summary
@@ -174,12 +175,21 @@ def _compact_version_lifecycle(
     # Derive the effective qualification_state through the shared resolver so the
     # finalized-verdict substitution (transient promotion_pending superseded by a
     # finalized verdict row) is applied identically across every read surface.
-    qualification_state, verdict_disagreement = resolve_effective_qualification_state(
-        version,
-        project,
-        latest_verdict=latest_verdict,
-        serving=(aggregate_serving, artifacts),
-    )
+    # For the OPEN version the caller pre-resolves the state through the async
+    # ``resolve_open_version_qualification_state`` seam (which ALSO applies the
+    # version-scoped audit-crash reconciliation the sync path here cannot reach
+    # without a DB query) and threads it in via ``resolved_qualification`` so the
+    # open version agrees with the strategic payload / admin / system-state
+    # surfaces. Closed rows keep the cheap sync path (verdict substitution only).
+    if resolved_qualification is not None:
+        qualification_state, verdict_disagreement = resolved_qualification
+    else:
+        qualification_state, verdict_disagreement = resolve_effective_qualification_state(
+            version,
+            project,
+            latest_verdict=latest_verdict,
+            serving=(aggregate_serving, artifacts),
+        )
 
     out = {
         "id": str(version.id),
@@ -772,26 +782,28 @@ async def agent_fetch_version_phase(
                 project_id,
             )
 
-    open_version_verdict: QualificationVerdict | None = None
+    # Resolve the OPEN version's qualification_state through the shared async
+    # seam so it applies ALL THREE reconciliation enrichments (serving aggregate,
+    # version-scoped audit child, and the newest finalized verdict) in the same
+    # fixed order as the strategic payload, admin lifecycle endpoint, and
+    # system-state snapshot. Previously this surface passed only the finalized
+    # verdict (no audit-crash reconciliation), so it told a ``qualifying`` story
+    # in the audit-crashed window while the operator panel already read
+    # ``audit_crashed``. The helper resolves the canonical newest verdict itself.
+    _open_resolved_qual: tuple[dict | None, dict | None] | None = None
     if open_row is not None:
-        open_version_verdict = (
-            (
-                await session.execute(
-                    select(QualificationVerdict)
-                    .where(
-                        QualificationVerdict.release_version_id == open_row.id,
-                        QualificationVerdict.audit_findings.is_not(None),
-                    )
-                    .order_by(QualificationVerdict.created_at.desc())
-                    .limit(1)
-                )
-            )
-            .scalars()
-            .first()
+        from app.qualification_state_resolver import (  # noqa: PLC0415
+            resolve_open_version_qualification_state,
+        )
+
+        _open_resolved_qual = await resolve_open_version_qualification_state(
+            session, open_row, project
         )
 
     _current_version_data = (
-        _compact_version_lifecycle(open_row, project, latest_verdict=open_version_verdict)
+        _compact_version_lifecycle(
+            open_row, project, resolved_qualification=_open_resolved_qual
+        )
         if open_row is not None
         else None
     )
@@ -1080,6 +1092,13 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "payload_staleness": None, "deployment_state": None,
     "operator_overrides": None, "missing_capability_demand": None,
     "available_capabilities": None, "local_runner_status": None,
+    # Tiny resident/autonomous session cadence scalars — runtime config, no fetch path
+    "strategic_session_idle_tick_seconds": None,
+    "strategic_session_min_tick_seconds": None,
+    "strategic_session_max_ops_per_turn": None,
+    "strategic_session_message_poll_seconds": None,
+    "strategic_session_turn_timeout_seconds": None,
+    "strategic_session_autonomous_turn_timeout_seconds": None,
     # Medium — no recovery (require complex async or ephemeral session data)
     "conversation_thread": None,
     "recent_interventions": None,   # requires GitHub API fan-out
