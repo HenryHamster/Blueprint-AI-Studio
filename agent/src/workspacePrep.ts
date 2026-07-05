@@ -33,6 +33,24 @@ import { sanitize } from './utils/sanitize.js';
  * setupWorkspace in index.ts). Returns the path only when the mirror actually
  * exists on disk so callers can append `--reference-if-able` safely.
  */
+/**
+ * List the top-level directory names of a prepared workspace — the
+ * project-shape-agnostic seed for the resident strategist's `code:<dir>`
+ * examination surfaces (no hardcoded project types). Skips dotfiles/`.git` and
+ * non-directories; returns [] on any fs error so a scan failure at session start
+ * never breaks the resident loop.
+ */
+export function listWorkspaceTopDirs(workspace: string): string[] {
+  try {
+    return fs.readdirSync(workspace, { withFileTypes: true })
+      .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+      .map(e => e.name)
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
 export function resolveReferenceRepo(repoUrl: string): string | null {
   let pathname: string;
   try {

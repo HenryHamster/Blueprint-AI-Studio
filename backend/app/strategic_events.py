@@ -73,15 +73,17 @@ _STRATEGIC_SESSION_KINDS = frozenset(
 )
 
 # Optional lifecycle ``status`` on a ``strategic_session`` delta: ``responding``
-# marks the start of a turn the operator is waiting on (drives the "Workday's on
-# it" working indicator), ``done`` marks its end (clears the ephemeral activity
-# strip). Absent on ordinary text/activity deltas. NEVER persisted — a purely
-# live signal, like every other field on this event.
+# marks the start of an OPERATOR turn (drives the "Workday's on it" indicator),
+# ``working`` marks the start of an AUTONOMOUS turn (advancing/watching indicator),
+# ``done`` marks the end of any turn (clears the ephemeral activity strip). Absent
+# on ordinary text/activity deltas. NEVER persisted — purely a live signal.
 STRATEGIC_SESSION_STATUS_RESPONDING = "responding"
+STRATEGIC_SESSION_STATUS_WORKING = "working"
 STRATEGIC_SESSION_STATUS_DONE = "done"
 _STRATEGIC_SESSION_STATUSES = frozenset(
     {
         STRATEGIC_SESSION_STATUS_RESPONDING,
+        STRATEGIC_SESSION_STATUS_WORKING,
         STRATEGIC_SESSION_STATUS_DONE,
     }
 )

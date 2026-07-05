@@ -1044,6 +1044,27 @@ runtime_config: Dict = {
     "strategic_session_turn_timeout_seconds": int(
         os.getenv("STRATEGIC_SESSION_TURN_TIMEOUT_SECONDS", "120")
     ),
+    # Floor-tick cadence (seconds): the maximum quiet gap between autonomous
+    # resident ticks even when no world-state change is observed, so the session
+    # reviews periodically and never goes fully dark. Read by the agent's
+    # state-gated pacing (residentConfig); absent => agent floor-tick default.
+    "strategic_session_min_tick_seconds": int(
+        os.getenv("STRATEGIC_SESSION_MIN_TICK_SECONDS", "600")
+    ),
+    # Soft cap (count) on how many independent applied strategic ops the
+    # autonomous work-unit prompt should batch into a single turn. Advisory: a
+    # prompt hint only — the hard per-op server-side spawn/retire gates are
+    # unchanged. Absent => agent default.
+    "strategic_session_max_ops_per_turn": int(
+        os.getenv("STRATEGIC_SESSION_MAX_OPS_PER_TURN", "3")
+    ),
+    # Deep-turn stall budget (seconds) for an AUTONOMOUS resident turn, so a long
+    # single read/verify step is not killed mid-thought. Distinct from the
+    # interactive per-turn timeout (kept short for operator responsiveness); the
+    # 15-min absolute hard ceiling is unchanged. Absent => agent default.
+    "strategic_session_autonomous_turn_timeout_seconds": int(
+        os.getenv("STRATEGIC_SESSION_AUTONOMOUS_TURN_TIMEOUT_SECONDS", "300")
+    ),
     # Hard cap (seconds) on how long a resident strategic session may run
     # UNATTENDED before it is wound down — the outer bound on autonomous
     # operation with no operator interaction. Distinct from the continuation
@@ -1643,6 +1664,9 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "strategic_local_hold_timeout_seconds",
                     "strategic_session_idle_tick_seconds",
                     "strategic_session_turn_timeout_seconds",
+                    "strategic_session_min_tick_seconds",
+                    "strategic_session_max_ops_per_turn",
+                    "strategic_session_autonomous_turn_timeout_seconds",
                     "strategic_session_max_unattended_seconds",
                     "resident_session_heartbeat_stale_seconds",
                 ):

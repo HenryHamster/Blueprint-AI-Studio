@@ -78,8 +78,11 @@ export interface ResidentSessionEvent {
 }
 
 export interface ResidentSession {
-  /** Write one user turn; resolves on the turn's top-level `result` (or interrupt/close). */
-  sendTurn(text: string): Promise<ResidentTurnResult>;
+  /** Write one user turn; resolves on the turn's top-level `result` (or interrupt/close).
+   *  `opts.stallTimeoutMs` overrides the per-active-turn stall budget for THIS turn
+   *  only (autonomous turns get a deeper budget so a long read/verify step isn't
+   *  killed mid-thought); the absolute hard ceiling and interrupt ladder are unchanged. */
+  sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult>;
   /** Cooperatively pre-empt the in-flight turn (control_request, SIGINT fallback). */
   interrupt(): void;
   /** Subscribe to parsed stream events (text deltas, tool_use, errors). */
@@ -132,6 +135,8 @@ interface ActiveTurn {
   timedOut: boolean;
   hardTimedOut: boolean;
   sawDeltaThisMessage: boolean;
+  /** per-active-turn stall budget for THIS turn (may override the session default). */
+  stallTimeoutMs: number;
   stallTimer: NodeJS.Timeout | null;
   forceTimer: NodeJS.Timeout | null;
   hardTimer: NodeJS.Timeout | null;
@@ -256,7 +261,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     if (t.stallTimer) clearTimeout(t.stallTimer);
     t.stallTimer = setTimeout(() => {
       if (activeTurn !== t) return;
-      log(`[resident] turn stall — no output for >${turnTimeoutMs / 1000}s; interrupting`);
+      log(`[resident] turn stall — no output for >${t.stallTimeoutMs / 1000}s; interrupting`);
       t.timedOut = true;
       interrupt();
       // If the interrupt does not produce a terminal result, force-settle so the
@@ -271,7 +276,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           }
         }, RESIDENT_TURN_FORCE_SETTLE_MS);
       }
-    }, turnTimeoutMs);
+    }, t.stallTimeoutMs);
   };
 
   // ABSOLUTE per-turn deadline. Armed once at turn dispatch and NEVER reset by
@@ -489,7 +494,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     resolveIdleWaiters();
   }
 
-  function sendTurn(text: string): Promise<ResidentTurnResult> {
+  function sendTurn(text: string, opts?: { stallTimeoutMs?: number }): Promise<ResidentTurnResult> {
     if (!alive || closed) {
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
@@ -501,12 +506,20 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       return Promise.reject(new Error('resident sendTurn called while a turn is already active'));
     }
     armIdleCeiling();
+    // A per-turn stall override lets autonomous turns read/verify deeply without
+    // the stall watchdog clipping them, while operator turns keep the responsive
+    // default. Clamped to the session default floor so an override can only make
+    // the budget DEEPER, never shorter than the responsive baseline.
+    const stallTimeoutMs = typeof opts?.stallTimeoutMs === 'number' && Number.isFinite(opts.stallTimeoutMs)
+      ? Math.max(turnTimeoutMs, opts.stallTimeoutMs)
+      : turnTimeoutMs;
     return new Promise<ResidentTurnResult>((resolve) => {
       const turn: ActiveTurn = {
         resolve, resultText: '', accumulated: '', streamedText: false,
         sawToolUse: false, appliedStrategicOp: false, sentOperatorMessage: false,
         pendingMessageSendIds: new Set<string>(),
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
+        stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
       };
       activeTurn = turn;

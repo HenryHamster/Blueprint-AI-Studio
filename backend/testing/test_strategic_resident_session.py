@@ -770,15 +770,25 @@ async def test_heartbeat_endpoint_agent_token(
     )
     assert res.status_code == 200, res.text
     body = res.json()
+    # The lease-view keys are always present; the resident-pacing substrate adds
+    # the additive, read-only work-state signal (older agents ignore it).
     assert set(body.keys()) == {
         "authority_held",
         "leased_until",
         "stop_requested",
         "status",
+        "work_state_rev",
+        "work_state_summary",
     }
     assert body["authority_held"] is True
     assert body["stop_requested"] is False
     assert body["status"] == "active"
+    # work_state_summary is always a dict with the three advisory count keys.
+    assert set(body["work_state_summary"].keys()) == {
+        "in_flight",
+        "terminal_since",
+        "new_operator_messages",
+    }
 
 
 @pytest.mark.asyncio
@@ -1868,6 +1878,163 @@ async def test_heartbeat_liveness_only_does_not_extend_lease(db_session):
     )
     assert r3["leased_until"] is not None
     assert r3["leased_until"] >= lease1
+
+
+# ---------------------------------------------------------------------------
+# Resident pacing substrate — the heartbeat carries an additive, READ-ONLY
+# work-state signal (``work_state_rev`` + ``work_state_summary``) for the
+# agent's state-gated pacing. It must be present, monotonic over strategist-
+# relevant change sources, and must NOT extend the lease.
+# ---------------------------------------------------------------------------
+
+
+async def _make_operator_message(db_session, project, *, content="hi", created_at=None):
+    """Insert an operator-authored (from_type='user') open ProjectMessage."""
+    msg = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        content=content,
+        status="open",
+    )
+    db_session.add(msg)
+    await db_session.commit()
+    await db_session.refresh(msg)
+    if created_at is not None:
+        msg.created_at = created_at
+        db_session.add(msg)
+        await db_session.commit()
+        await db_session.refresh(msg)
+    return msg
+
+
+async def _make_strategic_agent_task(
+    db_session, project, *, status=TaskStatus.IN_PROGRESS, updated_at=None
+):
+    """Insert a STRATEGIC_AGENT-created (strategist-spawned) task."""
+    task = Task(
+        project_id=project.id,
+        title="spawned by strategist",
+        payloads=[{"type": "research"}],
+        status=status,
+        created_by="STRATEGIC_AGENT",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    if updated_at is not None:
+        task.updated_at = updated_at
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_reports_work_state_fields(db_session):
+    """The heartbeat response carries ``work_state_rev`` (max ISO stamp over
+    strategist-relevant sources) and a ``work_state_summary`` dict with the three
+    advisory count keys the agent's tick context consumes."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Establish concrete strategist-relevant world state: one in-flight spawned
+    # task and one open operator message.
+    await _make_strategic_agent_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    await _make_operator_message(db_session, project)
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+
+    # rev present and ISO-8601-ish (has a date/time separator).
+    assert result["work_state_rev"] is not None
+    assert "T" in result["work_state_rev"]
+
+    summary = result["work_state_summary"]
+    assert set(summary.keys()) == {"in_flight", "terminal_since", "new_operator_messages"}
+    assert summary["in_flight"] == 1  # our one IN_PROGRESS STRATEGIC_AGENT task
+    assert summary["new_operator_messages"] == 1  # our one open operator message
+    assert summary["terminal_since"] == 0  # no terminal strategist tasks yet
+    assert all(isinstance(v, int) for v in summary.values())
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_rev_is_monotonic(db_session):
+    """A newer strategist-relevant change (a later operator message) advances
+    ``work_state_rev``; the marker never moves backward."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    base = _utcnow()
+    await _make_operator_message(
+        db_session, project, created_at=base - timedelta(minutes=5)
+    )
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev1 = r1["work_state_rev"]
+    assert rev1 is not None
+
+    # A newer operator message must strictly advance the rev.
+    await _make_operator_message(
+        db_session, project, created_at=base + timedelta(minutes=5)
+    )
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev2 = r2["work_state_rev"]
+    assert rev2 is not None
+    assert rev2 > rev1  # ISO-8601 same-format strings compare monotonically
+    assert r2["work_state_summary"]["new_operator_messages"] == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_does_not_extend_lease(db_session):
+    """Surfacing the work-state signal is read-only: a liveness-only (progress=
+    False) heartbeat that computes a non-null work_state_rev still PRESERVES the
+    existing lease — the dead-man's switch is never extended by the new fields."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    # Strategist-relevant activity so work_state_rev is genuinely populated.
+    await _make_strategic_agent_task(db_session, project, status=TaskStatus.IN_PROGRESS)
+    await _make_operator_message(db_session, project)
+
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    lease1 = r1["leased_until"]
+    assert lease1 is not None
+    assert r1["work_state_rev"] is not None
+
+    # Liveness-only heartbeat: work-state computed + returned, but lease unmoved.
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    assert r2["authority_held"] is True
+    assert r2["leased_until"] == lease1  # NOT extended by the work-state read
+    assert r2["work_state_rev"] is not None
 
 
 # ---------------------------------------------------------------------------

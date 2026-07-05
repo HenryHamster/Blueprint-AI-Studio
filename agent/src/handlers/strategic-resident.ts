@@ -3,7 +3,7 @@ import {
   WORKSPACE, strVal, sanitize, sendLog, sendWsFrame,
   apiGet, apiPost, persistAndPostStatus, resolveBaseBranch,
 } from '../index.js';
-import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
   buildContextPrefix, configureAgentPermissions,
   writePlaybookHelper, writeMessagesHelper,
@@ -27,10 +27,13 @@ import {
   buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
-  buildPriorDecisionsText, buildRetiredContextText,
+  buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
+  buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads,
+  shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
-  type StreamFrameKind, type StreamFrameStatus,
+  type StreamFrameKind, type StreamFrameStatus, type ExamRecord,
 } from './strategic-resident-lib.js';
+import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
 // Coalesce streamed assistant deltas to at most ~10 WebSocket frames/sec so the
 // live transcript stays well under the backend's 20 msg/s close threshold
@@ -40,6 +43,7 @@ const STREAM_FLUSH_MS = 100;
 // Consecutive per-turn stalls (the turn's stall watchdog fired) after which the
 // session is considered wedged and stopped as FAILED rather than spun forever.
 const MAX_CONSECUTIVE_STALLS = 3;
+
 
 /** The `kind` vocabulary the backend `strategic_session` delta accepts
  *  (strategic_events.py `_STRATEGIC_SESSION_KINDS`) — reused from the lib so the
@@ -165,8 +169,14 @@ export class SessionStreamer {
     this.scheduleDrain();
   }
 
-  /** Mark the END of an operator turn — clears the UI activity strip. Ordered
-   *  after all of the turn's text/activity frames (the queue drains in order). */
+  /** Mark the START of an autonomous turn — drives the UI "Workday: advancing" state. */
+  working(): void {
+    this.queue.pushFrame('status', '[strategic-session] working', 'working');
+    this.scheduleDrain();
+  }
+
+  /** Mark the END of any turn — clears the UI activity strip. Ordered after all of
+   *  the turn's text/activity frames (the queue drains in order). */
   done(): void {
     this.queue.pushFrame('status', '[strategic-session] done', 'done');
     this.scheduleDrain();
@@ -275,6 +285,8 @@ export async function handleStrategicResident(
     ? payload.open_messages as Array<Record<string, unknown>> : [];
   const retiredDirections = Array.isArray(payload.retired_directions_summary)
     ? payload.retired_directions_summary as Array<Record<string, unknown>> : [];
+  const stagedDirections = Array.isArray(payload.staged_directions)
+    ? payload.staged_directions as Array<Record<string, unknown>> : [];
   const previousDecisionOutcomes = payload.previous_decision_outcomes
     && typeof payload.previous_decision_outcomes === 'object'
     ? payload.previous_decision_outcomes as Record<string, unknown>
@@ -286,11 +298,13 @@ export async function handleStrategicResident(
     problemModelJson,
     runningUpdate: typeof payload.running_update === 'string' ? payload.running_update : '',
     directionsText: buildDirSummaryText(directionsSummary, authoritativeActive),
+    stagedDirectionsText: buildStagedDirectionsText(stagedDirections),
     retiredDirectionsText: buildRetiredContextText(retiredDirections),
     previousDecisionOutcomesText: buildPriorDecisionsText(previousDecisionOutcomes),
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
     sessionId,
+    fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
   });
 
   const cfg = residentConfig(payload);
@@ -298,6 +312,34 @@ export async function handleStrategicResident(
   // Bounded set of message ids already handled — with `created_at >= since` poll
   // semantics the boundary message re-appears each poll and is dropped here.
   const seen = new BoundedSeenSet();
+
+  // ── Evidence-gated autonomous tick: examination ledger + rotating focus ──────
+  // Code-owned cross-tick memory the model cannot be trusted to keep. The catalog
+  // enumerates the project's examinable surfaces (directions, diagnostic fetch
+  // verbs, messages/knowledge/problem-model/design-doc, and code:<top-level-dir>
+  // seeded by scanning the full-clone workspace — project-shape-agnostic). Each
+  // tick focuses a rotating slice (never-examined first, then LRU); the parsed
+  // TICK-VERDICT records what was examined so an idle claim can never be a global
+  // "nothing to do" and can never rest on unexamined surfaces. No quotas exist.
+  const surfaceCatalog = buildSurfaceCatalog(payload, listWorkspaceTopDirs(WORKSPACE));
+  const examRecords: ExamRecord[] = [];
+  let examTick = 0;
+  // Set after an unevidenced idle claim (CLEAR with no tool use, or a missing/
+  // garbled marker): the next tick opens with an examine-before-CLEAR correction.
+  let correctiveNextTick = false;
+  // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
+  let previousTurnAgendaContinue = false;
+  // An operator turn just completed → run an autonomous turn to act on it.
+  let operatorTurnJustCompleted = false;
+  // Pacing state for shouldRunAutonomousTurn: 0 = never run (floor fires first).
+  let lastAutonomousTurnAt = 0;
+  let lastAutonomousWorkStateRev: string | null = null;
+  // Latest work_state_rev observed on a heartbeat (undefined until the backend
+  // that populates it lands — absence degrades to floor-tick pacing).
+  let currentWorkStateRev: string | null = null;
+  // Pacing for the "watching" ephemeral status line emitted while gated-idle so
+  // deliberate quiet looks different from a dark/crashed session.
+  let lastWatchingEmitAt = 0;
 
   // ── Session + streaming wiring ──────────────────────────────────────────────
   const streamer = new SessionStreamer(ws, sessionId, taskId);
@@ -342,14 +384,21 @@ export async function handleStrategicResident(
     const full = firstTurnSent ? text : `${bootstrapPrompt}\n\n---\n\n${text}`;
     firstTurnSent = true;
     statusRef.value = operator ? 'Responding to operator...' : 'Advancing project (autonomous)...';
-    // An operator turn is what the operator is waiting on: bracket it with a
-    // `responding` frame (drives the live working indicator) and a `done` frame
-    // (clears the ephemeral activity strip). Autonomous turns stream activity but
-    // carry no responding/done so they don't flash the operator's working state.
-    if (operator) streamer.responding();
-    const r = await session.sendTurn(full);
+    // Bracket BOTH operator and autonomous turns with lifecycle frames so the UI
+    // can distinguish in-flight activity from deliberate quiet:
+    //   - operator turns: responding … done  (drives "Workday's on it" indicator)
+    //   - autonomous turns: working … done   (drives "Workday: advancing" treatment)
+    // done always clears the ephemeral activity strip.
+    if (operator) {
+      streamer.responding();
+    } else {
+      streamer.working();
+    }
+    // Autonomous turns get a deeper per-turn stall budget so a long read/verify
+    // step isn't killed mid-thought; operator turns keep the responsive default.
+    const r = await session.sendTurn(full, operator ? undefined : { stallTimeoutMs: cfg.autonomousTurnTimeoutMs });
     streamer.flush();
-    if (operator) streamer.done();
+    streamer.done();
     return r;
   };
 
@@ -428,6 +477,9 @@ export async function handleStrategicResident(
       }) as SessionHeartbeatResponse;
       // Fold the lease state so the loop's autonomous gate tracks the backend.
       authorityHeld = nextAuthorityHeld(authorityHeld, resp);
+      // Track the work-state revision (when the backend ships it) so state-gated
+      // pacing can fire on a real world change; absence leaves it null (floor tick).
+      if (typeof resp.work_state_rev === 'string') currentWorkStateRev = resp.work_state_rev;
       return resp;
     } catch (e) {
       const msg = String(e);
@@ -522,6 +574,8 @@ export async function handleStrategicResident(
         const hb = await heartbeat(true); // operator interaction always renews the lease
         if (hb?.stop_requested) break;
         if (r.processGone) { stopReason = 'session_process_exited'; break; }
+        // A just-finished operator turn arms one autonomous follow-through tick.
+        operatorTurnJustCompleted = true;
         continue;
       }
 
@@ -545,20 +599,91 @@ export async function handleStrategicResident(
         continue;
       }
 
-      // 2. Autonomous path: a bounded self-prompt, interruptible by the fast path.
-      const turnPromise = runTurn(buildAutonomousPrompt(), false);
+      // 2. Autonomous path: state-gated so ticks fire on real signals rather than
+      // loop speed. Run when the world moved (heartbeat work_state_rev differs
+      // from the rev at the last turn), the agent declared more work
+      // (AGENDA-CONTINUE), an operator turn just completed, or the floor tick
+      // elapsed. Otherwise wait like passive mode — no self-prompt against
+      // unchanged state.
+      if (!shouldRunAutonomousTurn({
+        currentWorkStateRev,
+        lastTurnWorkStateRev: lastAutonomousWorkStateRev,
+        previousTurnAgendaContinue,
+        operatorTurnJustCompleted,
+        msSinceLastAutonomousTurn: lastAutonomousTurnAt === 0
+          ? Number.POSITIVE_INFINITY : Date.now() - lastAutonomousTurnAt,
+        floorTickMs: cfg.minTickMs,
+      })) {
+        if (livenessHeartbeatDue()) {
+          const hb = await livenessHeartbeat();
+          if (hb?.stop_requested) break;
+          // Emit an ephemeral "watching" line at the liveness-heartbeat cadence so
+          // deliberate gated-idle is visibly different from a dark/crashed session.
+          const msSinceWatching = Date.now() - lastWatchingEmitAt;
+          if (msSinceWatching >= cfg.idleTickMs * 2) {
+            const rawInFlight = hb?.work_state_summary?.in_flight;
+            const inFlight = typeof rawInFlight === 'number' ? rawInFlight : null;
+            const msUntilFloor = lastAutonomousTurnAt === 0
+              ? 0
+              : Math.max(0, cfg.minTickMs - (Date.now() - lastAutonomousTurnAt));
+            const nextReview = msUntilFloor < 60_000
+              ? 'soon'
+              : `~${Math.round(msUntilFloor / 60_000)}min`;
+            const taskNote = inFlight !== null ? `${inFlight} task${inFlight === 1 ? '' : 's'} in flight; ` : '';
+            streamer.status(`watching — ${taskNote}next review ${nextReview} or on state change`);
+            lastWatchingEmitAt = Date.now();
+          }
+        }
+        await sleep(cfg.messagePollMs);
+        continue;
+      }
+
+      // Build the dynamic, ledger-driven self-prompt: rotating focus
+      // (never-examined first, then LRU), recent records so the turn goes
+      // somewhere new/deeper, open FOUND leads to restate, and a corrective flag
+      // set after an unevidenced idle claim.
+      examTick += 1;
+      operatorTurnJustCompleted = false;
+      const focus = nextFocus(surfaceCatalog, examRecords, FOCUS_LIST_SIZE);
+      const recentRecords = examRecords.slice(-6);
+      const openFound = openFoundLeads(examRecords);
+      const corrective = correctiveNextTick;
+      lastAutonomousTurnAt = Date.now();
+      lastAutonomousWorkStateRev = currentWorkStateRev;
+      const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn), false);
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
 
       // Await the (possibly interrupted) autonomous turn, then renew the lease
       // ONLY if a strategic op was applied (progress) AND we still hold authority
       // — never renew a lease that lapsed mid-turn (watch === 'suspend'), and
-      // never renew on bare work.
+      // never renew on bare examination (looking never renews freshness — the
+      // dead-man's switch stays progress-gated).
       const r = await turnPromise;
       if (turnWedgedSession(r)) break;
       const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
       if (hb?.stop_requested || watch.kind === 'stop') break;
       if (r.processGone) { stopReason = 'session_process_exited'; break; }
+
+      // Update the examination ledger from the turn's TICK-VERDICT. A CLEAR on a
+      // zero-tool turn is physically unevidenced; a missing/garbled marker is a
+      // contract violation — both are recorded `unevidenced`, set the corrective
+      // flag, and surface a status frame, never failing the session.
+      const upd = classifyTickOutcome({
+        resultText: r.resultText,
+        sawToolUse: r.sawToolUse,
+        focus,
+        atTick: examTick,
+        at: new Date().toISOString(),
+      });
+      examRecords.push(upd.record);
+      if (examRecords.length > EXAM_RECORDS_CAP) {
+        examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
+      }
+      correctiveNextTick = upd.corrective;
+      previousTurnAgendaContinue = upd.agendaContinue;
+      if (upd.statusNote) streamer.status(upd.statusNote);
+
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;
 
@@ -571,13 +696,16 @@ export async function handleStrategicResident(
         const hb2 = await heartbeat(true);
         if (hb2?.stop_requested) break;
         if (or.processGone) { stopReason = 'session_process_exited'; break; }
+        operatorTurnJustCompleted = true;
         continue;
       }
 
-      // Nothing applied and nothing done → pace so we don't hot-loop the API, but
-      // at the fast message-poll cadence so a just-arrived operator message is
-      // picked up promptly on the next iteration.
-      if (!r.appliedStrategicOp && !r.sawToolUse) {
+      // Non-advancing turn (no strategic op applied) → pace so we don't hot-loop
+      // the API, at the fast message-poll cadence so a just-arrived operator
+      // message is still picked up promptly. Extended from the old zero-tool
+      // condition to ALL non-advancing turns: an examination tick uses tools but
+      // applies no op and must still pace.
+      if (!r.appliedStrategicOp) {
         await sleep(cfg.messagePollMs);
       }
     }

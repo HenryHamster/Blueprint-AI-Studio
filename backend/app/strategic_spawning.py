@@ -3542,6 +3542,18 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # experiments that would fall back to billable cloud GPU (or be held
     # indefinitely when require_local_runner is set).
     "local_runner_status": {"priority": "medium", "exempt": True},
+    # Resident-session pacing knobs surfaced from _runtime_config onto the
+    # resident_minimal payload so the agent's residentConfig() reads live,
+    # operator-tunable values instead of falling back to hardcoded defaults.
+    # Critical tier, tiny scalars the packer ships verbatim (never trimmed) so
+    # pacing is never silently dropped under budget pressure. The agent reads
+    # each optionally and degrades to its own default when a key is absent.
+    "strategic_session_idle_tick_seconds": {"priority": "critical"},
+    "strategic_session_turn_timeout_seconds": {"priority": "critical"},
+    "strategic_session_message_poll_seconds": {"priority": "critical"},
+    "strategic_session_min_tick_seconds": {"priority": "critical"},
+    "strategic_session_max_ops_per_turn": {"priority": "critical"},
+    "strategic_session_autonomous_turn_timeout_seconds": {"priority": "critical"},
     # Persisted integrity-conflict trend over the last 10 completed cycles.
     # Three scalars (stamped_cycles, consecutive_clean_cycles) + last_counts
     # dict. Low priority, exempt: absent until the first stamped cycle lands and
@@ -6343,6 +6355,34 @@ async def _spawn_strategic_review(
         _res_retired_summary = _build_retired_directions_summary(project)
         _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
+        # Ship the resident-session pacing knobs from _runtime_config onto the
+        # payload so the agent's residentConfig() reads LIVE, operator-tunable
+        # values instead of falling back to hardcoded defaults. All six knobs are
+        # wired end-to-end: idle_tick, turn_timeout, and message_poll (existing);
+        # min_tick, max_ops_per_turn, and autonomous_turn_timeout (new).
+        # All are tiny critical-tier scalars (never trimmed).
+        _res_pacing_knobs = {
+            "strategic_session_idle_tick_seconds": int(
+                _runtime_config.get("strategic_session_idle_tick_seconds", 5)
+            ),
+            "strategic_session_turn_timeout_seconds": int(
+                _runtime_config.get("strategic_session_turn_timeout_seconds", 120)
+            ),
+            "strategic_session_message_poll_seconds": float(
+                _runtime_config.get("strategic_session_message_poll_seconds", 1.5)
+            ),
+            "strategic_session_min_tick_seconds": int(
+                _runtime_config.get("strategic_session_min_tick_seconds", 600)
+            ),
+            "strategic_session_max_ops_per_turn": int(
+                _runtime_config.get("strategic_session_max_ops_per_turn", 3)
+            ),
+            "strategic_session_autonomous_turn_timeout_seconds": int(
+                _runtime_config.get(
+                    "strategic_session_autonomous_turn_timeout_seconds", 300
+                )
+            ),
+        }
         minimal_payload = validate_internal_payload(
             pack_under_budget(
                 {
@@ -6375,6 +6415,8 @@ async def _spawn_strategic_review(
                     "open_messages": _res_open_messages,
                     **({"model": review_model} if review_model else {}),
                     **({"effort": review_effort} if review_effort else {}),
+                    # Live, operator-tunable resident-session pacing knobs.
+                    **_res_pacing_knobs,
                 },
                 _STRATEGIC_REVIEW_SCHEMA,
             ),

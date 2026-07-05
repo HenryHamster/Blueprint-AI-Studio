@@ -3170,6 +3170,22 @@
       "workbench_resource": null
     },
     {
+      "callee": "emit_strategic_updated",
+      "canonical_callee": "emit_strategic_updated",
+      "classification": "strategic_v1_helper",
+      "event": "strategic_updated",
+      "event_expression": null,
+      "event_is_literal": true,
+      "lineno": 1330,
+      "notes": "",
+      "occurrence": 1,
+      "payload_arg_kind": "none",
+      "scope": "resurrect_direction_endpoint",
+      "source_path": "backend/app/routers/directions.py",
+      "workbench_action": null,
+      "workbench_resource": null
+    },
+    {
       "callee": "broadcast_to_project",
       "canonical_callee": "broadcast_to_project",
       "classification": "message_v1_payload",
@@ -4202,7 +4218,7 @@
     "message_v1_payload": 12,
     "raw_websocket_control": 3,
     "strategic_v1_emitter": 4,
-    "strategic_v1_helper": 19,
+    "strategic_v1_helper": 20,
     "transport": 5,
     "workbench_v1_emitter": 1,
     "workbench_v1_helper": 10

@@ -6,8 +6,14 @@ import {
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
   buildPriorDecisionsText,
   buildRetiredContextText,
+  buildStagedDirectionsText,
   MESSAGE_POLL_LIMIT,
+  buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
+  openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
+  AUTONOMOUS_FLOOR_TICK_MS,
+  type ExamSurface, type ExamRecord,
 } from './strategic-resident-lib.js';
+import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
 
 describe('residentConfig', () => {
   it('uses contract defaults when the payload omits the knobs', () => {
@@ -16,6 +22,9 @@ describe('residentConfig', () => {
     expect(c.messagePollMs).toBe(1500); // fast operator pickup default (1.5s)
     expect(c.turnTimeoutMs).toBe(120_000);
     expect(c.autonomousEnabled).toBe(true);
+    expect(c.minTickMs).toBe(600_000);
+    expect(c.autonomousTurnTimeoutMs).toBe(300_000);
+    expect(c.maxOpsPerTurn).toBe(3);
   });
 
   it('reads the payload knobs (seconds → ms)', () => {
@@ -23,10 +32,16 @@ describe('residentConfig', () => {
       strategic_session_idle_tick_seconds: 3,
       strategic_session_message_poll_seconds: 1,
       strategic_session_turn_timeout_seconds: 90,
+      strategic_session_min_tick_seconds: 120,
+      strategic_session_autonomous_turn_timeout_seconds: 180,
+      strategic_session_max_ops_per_turn: 5,
     });
     expect(c.idleTickMs).toBe(3000);
     expect(c.messagePollMs).toBe(1000);
     expect(c.turnTimeoutMs).toBe(90_000);
+    expect(c.minTickMs).toBe(120_000);
+    expect(c.autonomousTurnTimeoutMs).toBe(180_000);
+    expect(c.maxOpsPerTurn).toBe(5);
   });
 
   it('clamps to safe minimums', () => {
@@ -34,11 +49,15 @@ describe('residentConfig', () => {
       strategic_session_idle_tick_seconds: 0,
       strategic_session_message_poll_seconds: 0,
       strategic_session_turn_timeout_seconds: 1,
+      strategic_session_autonomous_turn_timeout_seconds: 1,
+      strategic_session_max_ops_per_turn: 0,
     });
     expect(c.idleTickMs).toBe(1000);
     // Floored at 750ms, but never slower than the idle tick (1000ms here).
     expect(c.messagePollMs).toBe(750);
     expect(c.turnTimeoutMs).toBe(15_000);
+    expect(c.autonomousTurnTimeoutMs).toBe(15_000);
+    expect(c.maxOpsPerTurn).toBe(1); // clamped to minimum 1
   });
 
   it('never polls slower than the idle heartbeat tick', () => {
@@ -48,6 +67,15 @@ describe('residentConfig', () => {
     });
     expect(c.idleTickMs).toBe(1000);
     expect(c.messagePollMs).toBe(1000); // clamped down to the idle tick
+  });
+
+  it('minTickMs is never below the idle tick', () => {
+    const c = residentConfig({
+      strategic_session_idle_tick_seconds: 30,
+      strategic_session_min_tick_seconds: 5,
+    });
+    // min_tick (5s) is below idle_tick (30s) — clamp to idle_tick
+    expect(c.minTickMs).toBe(30_000);
   });
 
   it('disables autonomous work in monitor mode', () => {
@@ -200,11 +228,13 @@ describe('buildBootstrapPrompt', () => {
     problemModelJson: '{"gaps":[]}',
     runningUpdate: 'all good',
     directionsText: '- d1 active',
+    stagedDirectionsText: '',
     retiredDirectionsText: '',
     previousDecisionOutcomesText: '',
     visionJson: '{"v":1}',
     openMessagesText: 'msg1',
     sessionId: 'ss-1',
+    fetchGuidanceText: '',
   };
 
   it('includes the role framing, tools, and grounding sections', () => {
@@ -216,6 +246,16 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('all good');
     expect(p).toContain('- d1 active');
     expect(p).toContain('CTX');
+  });
+
+  it('includes canonical fetch guidance when provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      fetchGuidanceText: buildFetchGuidance(STRATEGIC_FETCH_VERBS),
+    });
+    expect(p).toContain('MID-RUN FETCH (./fetch)');
+    expect(p).toContain('`./fetch task <task_id>`');
+    expect(p).toContain('`./fetch tasks`');
   });
 
   it('renders an empty-problem-model note when none is present', () => {
@@ -244,10 +284,32 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('## Vision');
     expect(p).not.toContain('Recently retired / completed directions');
     expect(p).not.toContain('Prior-cycle decision outcomes');
+    expect(p).not.toContain('Already-staged (next-version) directions');
   });
 });
 
 describe('retired/prior-context renderers', () => {
+  it('renders compact staged-direction lines and omits empty input', () => {
+    expect(buildStagedDirectionsText([])).toBe('');
+    expect(buildStagedDirectionsText(undefined)).toBe('');
+    const rendered = buildStagedDirectionsText([
+      {
+        id: 'd-stage',
+        text: 'Stage this work',
+        priority: 'high',
+        staged_for_version: 12,
+        staged_at: '2026-06-01T12:00:00Z',
+        staged_age_days: 30,
+      },
+    ]);
+    expect(rendered).not.toContain('## Already-staged (next-version) directions');
+    expect(rendered).toContain('Stage this work (id: d-stage)');
+    expect(rendered).toContain('priority=high');
+    expect(rendered).toContain('staged_for_version=12');
+    expect(rendered).toContain('staged_at=2026-06-01T12:00:00Z');
+    expect(rendered).toContain('staged_age_days=30');
+  });
+
   it('renders compact retired-direction lines and omits empty input', () => {
     expect(buildRetiredContextText([])).toBe('');
     expect(buildRetiredContextText(undefined)).toBe('');
@@ -321,25 +383,310 @@ describe('retired/prior-context renderers', () => {
       problemModelJson: '{}',
       runningUpdate: 'ok',
       directionsText: '- d1',
+      stagedDirectionsText: buildStagedDirectionsText([
+        { id: 'd-stage', text: 'Stage this work', priority: 'medium', staged_for_version: 7 },
+      ]),
       retiredDirectionsText: retiredText,
       previousDecisionOutcomesText: priorText,
       visionJson: '',
       openMessagesText: '',
+      fetchGuidanceText: '',
       sessionId: 'ss-x',
     });
     const retiredMatches = (p.match(/## Recently retired \/ completed directions/g) ?? []).length;
     const priorMatches = (p.match(/## Prior-cycle decision outcomes/g) ?? []).length;
+    const stagedMatches = (p.match(/## Already-staged \(next-version\) directions/g) ?? []).length;
     expect(retiredMatches).toBe(1);
     expect(priorMatches).toBe(1);
+    expect(stagedMatches).toBe(1);
   });
 });
 
-describe('buildAutonomousPrompt', () => {
-  it('is a bounded single-step self-prompt', () => {
-    const p = buildAutonomousPrompt();
-    expect(p).toContain('ONE small');
-    expect(p).toContain('STOP');
-    expect(p).toContain('./strategic');
+describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
+  const focus: ExamSurface[] = [
+    { key: 'direction:d-1', kind: 'direction', label: 'direction d-1', hint: './fetch direction d-1' },
+    { key: 'code:backend', kind: 'code', label: 'code/backend', hint: 'read a module under backend/' },
+  ];
+
+  it('renders the work-unit contract and the TICK-VERDICT vocabulary', () => {
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    // Work-unit contract, not "ONE small step".
+    expect(p).toContain('ONE meaningful unit of progress');
+    expect(p).not.toContain('ONE small');
+    // All three verdicts are in the contract; the old global escape is gone.
+    expect(p).toContain('TICK-VERDICT: ADVANCED');
+    expect(p).toContain('TICK-VERDICT: FOUND');
+    expect(p).toContain('TICK-VERDICT: CLEAR');
+    expect(p).toContain('there is no global');
+    // Rotating focus surfaces are listed.
+    expect(p).toContain('direction:d-1');
+    expect(p).toContain('code:backend');
+    // Delta signals can never justify CLEAR.
+    expect(p).toContain('can NEVER justify a CLEAR');
+    // No unsolicited durable operator messages; status → set-running-update.
+    expect(p).toContain('do NOT send unsolicited durable messages');
+    expect(p).toContain('set-running-update');
+    // Standing agenda continuation marker.
+    expect(p).toContain('AGENDA-CONTINUE');
+  });
+
+  it('opens with the corrective examine-before-CLEAR instruction when flagged', () => {
+    const p = buildAutonomousPrompt(focus, [], [], true);
+    expect(p).toContain('CORRECTION');
+    expect(p).toContain('examined nothing');
+    expect(p).toContain('direction:d-1'); // the stalest surface to examine
+  });
+
+  it('restates recent records and open FOUND leads', () => {
+    const recent: ExamRecord[] = [
+      { surfaceKey: 'qualification', atTick: 1, at: 't', verdict: 'clear', note: 'no actionable findings' },
+    ];
+    const found: ExamRecord[] = [
+      { surfaceKey: 'code:backend', atTick: 2, at: 't', verdict: 'found', note: 'hardcoded model id' },
+    ];
+    const p = buildAutonomousPrompt(focus, recent, found, false);
+    expect(p).toContain('Recently examined');
+    expect(p).toContain('qualification [clear]');
+    expect(p).toContain('Open leads');
+    expect(p).toContain('code:backend: hardcoded model id');
+  });
+});
+
+describe('buildSurfaceCatalog', () => {
+  it('derives direction, diagnostic-fetch, standing, and code:<dir> surfaces', () => {
+    const catalog = buildSurfaceCatalog(
+      { directions_summary: [
+        { id: 'd-1', text: 'first direction' },
+        { id: 'd-2', text: 'second' },
+        { text: 'no-id — skipped' },
+      ] },
+      ['backend', 'agent', 'admin-ui'],
+    );
+    const keys = catalog.map(s => s.key);
+    expect(keys).toContain('direction:d-1');
+    expect(keys).toContain('direction:d-2');
+    expect(keys).not.toContain('direction:'); // the id-less direction is skipped
+    // Diagnostic fetch surfaces from the STRATEGIC_FETCH_VERBS subset.
+    expect(keys).toContain('qualification');
+    expect(keys).toContain('ci-compliance');
+    // Standing surfaces.
+    expect(keys).toContain('messages:recent');
+    expect(keys).toContain('knowledge:recent');
+    expect(keys).toContain('problem-model');
+    expect(keys).toContain('design-doc');
+    // Code surfaces seeded from the workspace top-level dirs (project-agnostic).
+    expect(keys).toContain('code:backend');
+    expect(keys).toContain('code:agent');
+    expect(keys).toContain('code:admin-ui');
+    // A direction surface carries a fetch hint naming its id.
+    const d1 = catalog.find(s => s.key === 'direction:d-1');
+    expect(d1?.kind).toBe('direction');
+    expect(d1?.hint).toContain('./fetch direction d-1');
+  });
+
+  it('is tolerant of a missing directions_summary and empty workspace dirs', () => {
+    const catalog = buildSurfaceCatalog({}, []);
+    expect(catalog.some(s => s.key === 'qualification')).toBe(true);
+    expect(catalog.some(s => s.kind === 'code')).toBe(false);
+    expect(catalog.some(s => s.kind === 'direction')).toBe(false);
+  });
+
+  it('tracks the payload: new directions enter, dropped ones are absent', () => {
+    const before = buildSurfaceCatalog({ directions_summary: [{ id: 'd-1' }] }, []);
+    expect(before.map(s => s.key)).toContain('direction:d-1');
+    const after = buildSurfaceCatalog({ directions_summary: [{ id: 'd-2' }] }, []);
+    expect(after.map(s => s.key)).toContain('direction:d-2');
+    expect(after.map(s => s.key)).not.toContain('direction:d-1'); // retired → pruned
+  });
+});
+
+describe('nextFocus (never-examined first, then LRU)', () => {
+  const catalog: ExamSurface[] = [
+    { key: 'a', kind: 'fetch', label: 'a', hint: 'ha' },
+    { key: 'b', kind: 'fetch', label: 'b', hint: 'hb' },
+    { key: 'c', kind: 'fetch', label: 'c', hint: 'hc' },
+    { key: 'd', kind: 'fetch', label: 'd', hint: 'hd' },
+  ];
+
+  it('returns never-examined surfaces first, in catalog order', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'a', atTick: 1, at: 't', verdict: 'clear', note: '' },
+    ];
+    // b, c, d never examined → first (catalog order); a is examined → last.
+    expect(nextFocus(catalog, records, 4).map(s => s.key)).toEqual(['b', 'c', 'd', 'a']);
+  });
+
+  it('orders examined surfaces least-recently-first (LRU)', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'a', atTick: 5, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'b', atTick: 2, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'c', atTick: 9, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'd', atTick: 1, at: 't', verdict: 'clear', note: '' },
+    ];
+    // All examined → pure LRU by max atTick: d(1) < b(2) < a(5) < c(9).
+    expect(nextFocus(catalog, records, 4).map(s => s.key)).toEqual(['d', 'b', 'a', 'c']);
+  });
+
+  it('uses the MAX atTick per surface and honors n', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'a', atTick: 1, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'a', atTick: 8, at: 't', verdict: 'found', note: '' }, // a's recency = 8
+      { surfaceKey: 'b', atTick: 3, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'c', atTick: 4, at: 't', verdict: 'clear', note: '' },
+      { surfaceKey: 'd', atTick: 5, at: 't', verdict: 'clear', note: '' },
+    ];
+    // b(3) < c(4) < d(5) < a(8); n=2 → the two stalest.
+    expect(nextFocus(catalog, records, 2).map(s => s.key)).toEqual(['b', 'c']);
+  });
+
+  it('ignores records for surfaces no longer in the catalog', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'gone', atTick: 99, at: 't', verdict: 'clear', note: '' },
+    ];
+    // Every catalog surface is still never-examined despite the stale record.
+    expect(nextFocus(catalog, records, 4).map(s => s.key)).toEqual(['a', 'b', 'c', 'd']);
+  });
+});
+
+describe('parseTickVerdict', () => {
+  it('parses ADVANCED (no surface key)', () => {
+    expect(parseTickVerdict('did stuff\nTICK-VERDICT: ADVANCED — spawned a plan task for d-1'))
+      .toEqual({ verdict: 'advanced', surfaceKey: '', note: 'spawned a plan task for d-1' });
+  });
+
+  it('parses FOUND <surface> — note without splitting a hyphenated key', () => {
+    expect(parseTickVerdict('TICK-VERDICT: FOUND direction:d-21efb120 — churn is high, needs review'))
+      .toEqual({ verdict: 'found', surfaceKey: 'direction:d-21efb120', note: 'churn is high, needs review' });
+  });
+
+  it('parses CLEAR <surface> — note', () => {
+    expect(parseTickVerdict('TICK-VERDICT: CLEAR code:backend — read orchestrator.py, nothing actionable'))
+      .toEqual({ verdict: 'clear', surfaceKey: 'code:backend', note: 'read orchestrator.py, nothing actionable' });
+  });
+
+  it('uses the LAST marker and is case-insensitive', () => {
+    const text = 'tick-verdict: clear a — early\nmore\nTICK-VERDICT: FOUND b — later';
+    expect(parseTickVerdict(text)).toEqual({ verdict: 'found', surfaceKey: 'b', note: 'later' });
+  });
+
+  it('handles a FOUND/CLEAR with a space separator (no dash)', () => {
+    expect(parseTickVerdict('TICK-VERDICT: CLEAR qualification no findings'))
+      .toEqual({ verdict: 'clear', surfaceKey: 'qualification', note: 'no findings' });
+  });
+
+  it('returns null for a missing or garbled marker', () => {
+    expect(parseTickVerdict('just some prose, no marker at all')).toBeNull();
+    expect(parseTickVerdict('TICK-VERDICT: MAYBE something')).toBeNull();
+    expect(parseTickVerdict('')).toBeNull();
+    // @ts-expect-error — defensive: non-string input degrades to null.
+    expect(parseTickVerdict(null)).toBeNull();
+  });
+});
+
+describe('parseAgendaContinue', () => {
+  it('detects a literal AGENDA-CONTINUE line', () => {
+    expect(parseAgendaContinue('did work\nAGENDA-CONTINUE\nTICK-VERDICT: ADVANCED — x')).toBe(true);
+    expect(parseAgendaContinue('no more to do here')).toBe(false);
+  });
+});
+
+describe('openFoundLeads', () => {
+  it('keeps FOUND surfaces whose latest record is still FOUND', () => {
+    const records: ExamRecord[] = [
+      { surfaceKey: 'a', atTick: 1, at: 't', verdict: 'found', note: 'lead-a' },
+      { surfaceKey: 'b', atTick: 2, at: 't', verdict: 'found', note: 'lead-b' },
+      { surfaceKey: 'a', atTick: 3, at: 't', verdict: 'advanced', note: 'acted on a' }, // closes a
+    ];
+    expect(openFoundLeads(records).map(r => r.surfaceKey)).toEqual(['b']);
+  });
+});
+
+describe('classifyTickOutcome (unevidenced / corrective path)', () => {
+  const focus: ExamSurface[] = [
+    { key: 'code:backend', kind: 'code', label: 'code/backend', hint: 'read backend' },
+  ];
+
+  it('records an evidenced CLEAR and does NOT set corrective', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'TICK-VERDICT: CLEAR code:backend — read orchestrator.py, nothing actionable',
+      sawToolUse: true, focus, atTick: 4, at: 'ts',
+    });
+    expect(upd.record.verdict).toBe('clear');
+    expect(upd.record.surfaceKey).toBe('code:backend');
+    expect(upd.corrective).toBe(false);
+    expect(upd.statusNote).toBeUndefined();
+  });
+
+  it('records a CLEAR-with-no-tool-use as unevidenced and sets corrective', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'TICK-VERDICT: CLEAR code:backend — looks fine',
+      sawToolUse: false, focus, atTick: 5, at: 'ts',
+    });
+    expect(upd.record.verdict).toBe('unevidenced');
+    expect(upd.corrective).toBe(true);
+    expect(upd.statusNote).toContain('examined nothing');
+  });
+
+  it('records a missing/garbled marker as unevidenced and sets corrective', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'I looked around and everything seems fine.',
+      sawToolUse: true, focus, atTick: 6, at: 'ts',
+    });
+    expect(upd.record.verdict).toBe('unevidenced');
+    expect(upd.record.surfaceKey).toBe('code:backend'); // falls back to stalest focus
+    expect(upd.corrective).toBe(true);
+    expect(upd.statusNote).toContain('without a valid TICK-VERDICT');
+  });
+
+  it('records ADVANCED against the stalest focus surface and carries AGENDA-CONTINUE', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'AGENDA-CONTINUE\nTICK-VERDICT: ADVANCED — spawned a plan task',
+      sawToolUse: true, focus, atTick: 7, at: 'ts',
+    });
+    expect(upd.record.verdict).toBe('advanced');
+    expect(upd.record.surfaceKey).toBe('code:backend');
+    expect(upd.corrective).toBe(false);
+    expect(upd.agendaContinue).toBe(true);
+  });
+});
+
+describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
+  const base = {
+    currentWorkStateRev: undefined as string | null | undefined,
+    lastTurnWorkStateRev: null as string | null,
+    previousTurnAgendaContinue: false,
+    operatorTurnJustCompleted: false,
+    msSinceLastAutonomousTurn: 0,
+    floorTickMs: AUTONOMOUS_FLOOR_TICK_MS,
+  };
+
+  it('fires when an operator turn just completed', () => {
+    expect(shouldRunAutonomousTurn({ ...base, operatorTurnJustCompleted: true })).toBe(true);
+  });
+
+  it('fires when the previous turn ended AGENDA-CONTINUE', () => {
+    expect(shouldRunAutonomousTurn({ ...base, previousTurnAgendaContinue: true })).toBe(true);
+  });
+
+  it('fires when work_state_rev differs from the rev at the last turn', () => {
+    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: 'r2', lastTurnWorkStateRev: 'r1' })).toBe(true);
+    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: 'r1', lastTurnWorkStateRev: 'r1' })).toBe(false);
+  });
+
+  it('fires when the floor tick has elapsed', () => {
+    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS })).toBe(true);
+    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS - 1 })).toBe(false);
+  });
+
+  it('degrades to floor-tick pacing when work_state_rev is absent (older backend)', () => {
+    // No rev signal + floor not elapsed + no other trigger → do NOT fire.
+    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: 10 })).toBe(false);
+    // ...but the floor tick still fires it.
+    expect(shouldRunAutonomousTurn({ ...base, currentWorkStateRev: undefined, msSinceLastAutonomousTurn: AUTONOMOUS_FLOOR_TICK_MS })).toBe(true);
+  });
+
+  it('runs the first-ever tick (Infinity since last) via the floor', () => {
+    expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: Number.POSITIVE_INFINITY })).toBe(true);
   });
 });
 

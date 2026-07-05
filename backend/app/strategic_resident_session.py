@@ -33,7 +33,7 @@ session seam both depend on.
 
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -45,7 +45,15 @@ from sqlmodel import select
 
 from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
-from app.models import Project, ProjectMessage, Task, TaskStatus, _utcnow
+from app.models import (
+    TASK_OUTCOME_TERMINAL_STATUSES,
+    Project,
+    ProjectMessage,
+    StrategicCycle,
+    Task,
+    TaskStatus,
+    _utcnow,
+)
 from app.routers.agent import verify_agent_token
 from app.routers.agent_strategic_fetch import _resolve_agent_project
 from app.shared_state import limiter, runtime_config
@@ -119,6 +127,16 @@ _RESIDENT_START_CLAIM_STALE_SECONDS = 300  # 5 min
 # interaction for the unattended cap (operator messages are stored as ``user``;
 # ``operator`` is included defensively).
 _OPERATOR_MESSAGE_FROM_TYPES = ("user", "operator")
+
+# created_by value stamped on tasks the strategist spawns (mirrors
+# ``agent_tasks._STRATEGIC_AGENT_CREATED_BY`` / admin_agent_ops). Used to scope
+# the heartbeat's work-state signal to the strategist's OWN in-flight work.
+_STRATEGIC_AGENT_CREATED_BY = "STRATEGIC_AGENT"
+
+# Rolling window (seconds) over which a STRATEGIC_AGENT task that reached a
+# terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
+# "how many of my spawned tasks just landed." Advisory only.
+_WORK_STATE_TERMINAL_WINDOW_SECONDS = 3600
 
 # The resident task must be one of these (non-terminal) statuses to host / keep
 # hosting a session. Mirrors ``strategic_state_read_model._LIVE_STRATEGIC_TASK_STATUSES``.
@@ -343,6 +361,104 @@ async def _latest_operator_interaction_at(
             )
         )
     ).scalar_one_or_none()
+
+
+async def _compute_resident_work_state(
+    session: AsyncSession, project_id: uuid.UUID
+) -> tuple[str | None, dict[str, int]]:
+    """READ-ONLY snapshot of strategist-relevant world state for the heartbeat.
+
+    Returns ``(work_state_rev, work_state_summary)``:
+
+    * ``work_state_rev`` — a monotonic marker: the newest ISO-8601 timestamp
+      across the change sources the strategist cares about — STRATEGIC_AGENT-
+      created tasks' latest status transition (``Task.updated_at`` advances on
+      every transition via ``onupdate``), operator-authored ``ProjectMessage``
+      arrivals, and ``StrategicCycle`` mutation stamps. The agent compares this
+      against the rev it recorded at its last autonomous turn to decide whether
+      the world moved. ``None`` when the project has no such activity yet, in
+      which case an older agent degrades to floor-tick pacing.
+    * ``work_state_summary`` — advisory ``{in_flight, terminal_since,
+      new_operator_messages}`` counts feeding the agent's tick context.
+
+    This is DELIBERATELY cheap (a handful of indexed ``max()``/``count()``
+    aggregates) and STRICTLY read-only: it never reads or mutates the lease,
+    the continuation freshness marker, or the session blob, so surfacing it on
+    the heartbeat cannot extend the dead-man's switch (contract pinned by
+    ``test_heartbeat_liveness_only_does_not_extend_lease``).
+    """
+    # work_state_rev: max() over the strategist-relevant change sources.
+    task_max = (
+        await session.execute(
+            select(func.max(Task.updated_at)).where(
+                Task.project_id == project_id,
+                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
+            )
+        )
+    ).scalar_one_or_none()
+    msg_max = (
+        await session.execute(
+            select(func.max(ProjectMessage.created_at)).where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+            )
+        )
+    ).scalar_one_or_none()
+    cycle_max = (
+        await session.execute(
+            select(func.max(StrategicCycle.updated_at)).where(
+                StrategicCycle.project_id == project_id,
+            )
+        )
+    ).scalar_one_or_none()
+    stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
+    work_state_rev = max(stamps).isoformat() if stamps else None
+
+    # work_state_summary: advisory counts for the agent's tick context.
+    _terminal = tuple(TASK_OUTCOME_TERMINAL_STATUSES)
+    in_flight = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.archived.is_(False),
+                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
+                Task.status.notin_(_terminal),
+            )
+        )
+    ).scalar() or 0
+    terminal_cutoff = _utcnow() - timedelta(
+        seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS
+    )
+    terminal_since = (
+        await session.execute(
+            select(func.count())
+            .select_from(Task)
+            .where(
+                Task.project_id == project_id,
+                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
+                Task.status.in_(_terminal),
+                Task.updated_at >= terminal_cutoff,
+            )
+        )
+    ).scalar() or 0
+    new_operator_messages = (
+        await session.execute(
+            select(func.count())
+            .select_from(ProjectMessage)
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                ProjectMessage.status == "open",
+            )
+        )
+    ).scalar() or 0
+    return work_state_rev, {
+        "in_flight": int(in_flight),
+        "terminal_since": int(terminal_since),
+        "new_operator_messages": int(new_operator_messages),
+    }
 
 
 async def _release_start_claim(
@@ -1499,6 +1615,16 @@ async def renew_resident_session_lease(
     now = _utcnow()
     now_iso = now.isoformat()
 
+    # READ-ONLY work-state signal for the agent's state-gated pacing. Computed
+    # once, up front, from cheap aggregate queries; additive to every return
+    # branch below. It NEVER touches lease/freshness/session state, so it cannot
+    # extend the dead-man's switch (pinned by
+    # test_heartbeat_liveness_only_does_not_extend_lease). Older agents ignore
+    # the extra fields.
+    work_state_rev, work_state_summary = await _compute_resident_work_state(
+        session, project.id
+    )
+
     # Stop-requested / ended (pre-lock snapshot): do NOT renew — let the lease
     # lapse so the cadence can reclaim, and signal the agent to wind down.
     if stop_requested or status == STATUS_ENDED:
@@ -1510,6 +1636,8 @@ async def renew_resident_session_lease(
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": status,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
         }
 
     # Unattended cap: compare now against the last operator interaction, taking
@@ -1670,6 +1798,8 @@ async def renew_resident_session_lease(
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
         }
     if holder["capped"] or holder["lapsed"]:
         # Finding 1: the unattended cap was exceeded, or the lease genuinely
@@ -1682,6 +1812,8 @@ async def renew_resident_session_lease(
             "leased_until": cont.get("expires_at"),
             "stop_requested": True,
             "status": refreshed.get("status") or STATUS_ENDED,
+            "work_state_rev": work_state_rev,
+            "work_state_summary": work_state_summary,
         }
     return {
         "authority_held": bool(cont.get("fresh"))
@@ -1690,6 +1822,8 @@ async def renew_resident_session_lease(
         "leased_until": cont.get("expires_at"),
         "stop_requested": refreshed_stop,
         "status": refreshed.get("status") or STATUS_ACTIVE,
+        "work_state_rev": work_state_rev,
+        "work_state_summary": work_state_summary,
     }
 
 

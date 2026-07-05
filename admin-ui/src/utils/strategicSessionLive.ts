@@ -30,8 +30,10 @@ export interface StrategicActivityItem {
 export interface StrategicLiveActivity {
   /** The most recent activity one-liners for the current in-flight turn. */
   items: StrategicActivityItem[];
-  /** The latest lifecycle marker seen for the current turn (or null). */
-  latestLifecycle: 'responding' | 'done' | null;
+  /** The latest lifecycle marker seen for the current turn (or null).
+   *  `responding` = operator turn in flight; `working` = autonomous turn in
+   *  flight; `done` = turn ended (strip cleared); `null` = no lifecycle seen. */
+  latestLifecycle: 'responding' | 'working' | 'done' | null;
 }
 
 // Activity kinds mirror strategic_events.py `_STRATEGIC_SESSION_KINDS`.
@@ -139,10 +141,10 @@ export function computeStrategicSessionActivity(
   const watermark = strategicReplyWatermark(conversationMessages);
   const visible = visibleSessionDeltas(deltas, latestSessionId, watermark);
 
-  let latestLifecycle: 'responding' | 'done' | null = null;
+  let latestLifecycle: 'responding' | 'working' | 'done' | null = null;
   let lastDoneSeq = Number.NEGATIVE_INFINITY;
   for (const d of visible) {
-    if (d.status === 'responding' || d.status === 'done') latestLifecycle = d.status;
+    if (d.status === 'responding' || d.status === 'working' || d.status === 'done') latestLifecycle = d.status;
     if (d.status === 'done') {
       const s = d.seq ?? d.id;
       if (s > lastDoneSeq) lastDoneSeq = s;

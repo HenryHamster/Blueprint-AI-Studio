@@ -848,11 +848,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       : { items: [], latestLifecycle: null } as StrategicLiveActivity),
     [conversationMode, strategicSessionTranscript, conversationMessages],
   );
-  // The chat is "working on a reply" while a turn is pending (optimistic send not
-  // yet answered) OR the resident agent has streamed a `responding`/activity
-  // frame. The strip clears the instant the turn is done (below).
+  // The activity strip is visible while any resident turn is in flight: operator
+  // turns (responding) or autonomous turns (working), but not after done.
+  // `workingSince` covers the optimistic-send period before the first lifecycle
+  // frame lands. `responding` drives the operator-waiting indicator; `working`
+  // drives the autonomous-advancing indicator — both show the strip.
   const strategicTurnWorking = conversationMode && (
-    workingSince != null || liveActivity.latestLifecycle === 'responding'
+    workingSince != null
+    || liveActivity.latestLifecycle === 'responding'
+    || liveActivity.latestLifecycle === 'working'
   ) && liveActivity.latestLifecycle !== 'done';
   // Render the operator's optimistic bubble until the durable copy lands — dedup
   // against any already-present user message with the same content so there is

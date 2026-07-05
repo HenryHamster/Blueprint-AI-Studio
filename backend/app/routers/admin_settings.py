@@ -173,6 +173,9 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "strategic_local_hold_timeout_seconds",
         "strategic_session_idle_tick_seconds",
         "strategic_session_turn_timeout_seconds",
+        "strategic_session_min_tick_seconds",
+        "strategic_session_max_ops_per_turn",
+        "strategic_session_autonomous_turn_timeout_seconds",
         "strategic_session_max_unattended_seconds",
         "resident_session_heartbeat_stale_seconds",
         "task_type_categories",
@@ -494,6 +497,15 @@ async def get_settings(
         ),
         "strategic_session_turn_timeout_seconds": _runtime_config.get(
             "strategic_session_turn_timeout_seconds", 120
+        ),
+        "strategic_session_min_tick_seconds": _runtime_config.get(
+            "strategic_session_min_tick_seconds", 600
+        ),
+        "strategic_session_max_ops_per_turn": _runtime_config.get(
+            "strategic_session_max_ops_per_turn", 3
+        ),
+        "strategic_session_autonomous_turn_timeout_seconds": _runtime_config.get(
+            "strategic_session_autonomous_turn_timeout_seconds", 300
         ),
         "strategic_session_max_unattended_seconds": _runtime_config.get(
             "strategic_session_max_unattended_seconds", 14400
@@ -1215,6 +1227,16 @@ async def _apply_settings(
         ("strategic_local_hold_timeout_seconds", 60, 7_200),
         ("strategic_session_idle_tick_seconds", 1, 300),
         ("strategic_session_turn_timeout_seconds", 10, 3_600),
+        # Floor-tick cadence: >=60s (never busy-loop) and <=3600s (review at
+        # least hourly). The design default 600s sits well under the 25-min
+        # continuation TTL so the session reviews before the lease can lapse.
+        ("strategic_session_min_tick_seconds", 60, 3_600),
+        # Soft per-turn op cap: 1..20. Advisory prompt hint only; the hard
+        # per-op spawn/retire gates are unaffected.
+        ("strategic_session_max_ops_per_turn", 1, 20),
+        # Deep-turn stall budget for autonomous turns: 30..3600s, all under the
+        # 15-min absolute hard ceiling enforced agent-side.
+        ("strategic_session_autonomous_turn_timeout_seconds", 30, 3_600),
         ("strategic_session_max_unattended_seconds", 60, 28_800),
         ("resident_session_heartbeat_stale_seconds", 60, 7_200),
     ):
@@ -3300,6 +3322,17 @@ async def _apply_settings(
                     "strategic_session_turn_timeout_seconds": int(
                         _runtime_config.get(
                             "strategic_session_turn_timeout_seconds", 120
+                        )
+                    ),
+                    "strategic_session_min_tick_seconds": int(
+                        _runtime_config.get("strategic_session_min_tick_seconds", 600)
+                    ),
+                    "strategic_session_max_ops_per_turn": int(
+                        _runtime_config.get("strategic_session_max_ops_per_turn", 3)
+                    ),
+                    "strategic_session_autonomous_turn_timeout_seconds": int(
+                        _runtime_config.get(
+                            "strategic_session_autonomous_turn_timeout_seconds", 300
                         )
                     ),
                     "strategic_session_max_unattended_seconds": int(
