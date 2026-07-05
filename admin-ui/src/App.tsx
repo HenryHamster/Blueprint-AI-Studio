@@ -651,13 +651,15 @@ export default function App() {
     return [...base, ...extra];
   }, [s.columnPrefs]);
 
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const columnMap = useMemo(() => new Map<string, typeof COLUMNS[number]>(COLUMNS.map(c => [c.id, c])), []);
   const visibleColumns = useMemo(() => {
     return effectiveColumnPrefs
       .filter(pref => pref.visible)
-      .map(pref => COLUMNS.find(c => c.id === pref.id))
+      .map(pref => columnMap.get(pref.id))
       .filter((c): c is typeof COLUMNS[number] => !!c)
       .filter(col => col.includes.some(status => ACTIVE_TASK_STATUS_FILTER.includes(status)));
-  }, [effectiveColumnPrefs]);
+  }, [effectiveColumnPrefs, columnMap]);
 
   const stuckTaskIds = useMemo(() => new Set((s.diagnostics?.stuck_tasks ?? []).filter((st: { task_id: string; stuck_for_seconds: number }) => st.stuck_for_seconds >= s.stuckMinSeconds).map((st: { task_id: string }) => st.task_id)), [s.diagnostics, s.stuckMinSeconds]);
   const dateRangeCutoffs: Record<string, number> = { '1h': 3600000, '6h': 21600000, '24h': 86400000, '7d': 604800000 };
@@ -718,11 +720,22 @@ export default function App() {
   }, [addTaskLookupToast, handleOpenTaskDetails, taskLookupTasks]);
 
   const hasActiveFilters = s.tasks.length > 0 && (filteredTasks.length < s.tasks.length || s.failureClassFilter.length > 0);
-  const visibleActiveTasks = useMemo(() => filteredTasks.filter(t => ACTIVE_PIPELINE_STATUSES.has(t.status)), [filteredTasks]);
-  const visibleQueuedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'QUEUED'), [filteredTasks]);
-  const visibleBlockedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'BLOCKED'), [filteredTasks]);
-  const visibleFailedTasks = useMemo(() => filteredTasks.filter(t => t.status === 'FAILED'), [filteredTasks]);
-  const visibleTerminalTasks = useMemo(() => filteredTasks.filter(t => TERMINAL_STATUSES.has(t.status)), [filteredTasks]);
+  const { visibleActiveTasks, visibleQueuedTasks, visibleBlockedTasks, visibleFailedTasks, visibleTerminalTasks } = useMemo(() => {
+    const active: typeof filteredTasks = [];
+    const queued: typeof filteredTasks = [];
+    const blocked: typeof filteredTasks = [];
+    const failed: typeof filteredTasks = [];
+    const terminal: typeof filteredTasks = [];
+    for (const t of filteredTasks) {
+      if (ACTIVE_PIPELINE_STATUSES.has(t.status)) active.push(t);
+      if (t.status === 'QUEUED') queued.push(t);
+      if (t.status === 'BLOCKED') blocked.push(t);
+      if (t.status === 'FAILED') failed.push(t);
+      if (TERMINAL_STATUSES.has(t.status)) terminal.push(t);
+    }
+    return { visibleActiveTasks: active, visibleQueuedTasks: queued, visibleBlockedTasks: blocked, visibleFailedTasks: failed, visibleTerminalTasks: terminal };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filteredTasks]);
   const backendPipelineAttentionItems = useMemo(() => {
     const byTaskId = new Map<string, StrategicStateAttentionItem>();
     (strategicReadModel.data?.attention?.items ?? []).forEach(item => {

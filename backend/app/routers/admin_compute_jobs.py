@@ -15,6 +15,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.admin import _get_user_project_with_role
@@ -125,7 +126,13 @@ async def _build_compute_job_payload(
     task_meta: Dict[uuid.UUID, tuple[str | None, str | None, Any, Any, Any]] = {}
     if task_ids:
         rows = (
-            (await session.execute(select(Task).where(Task.id.in_(task_ids))))
+            (
+                await session.execute(
+                    select(Task)
+                    .options(load_only(Task.id, Task.payloads, Task.title, Task.plan_output, Task.context, raiseload=True))
+                    .where(Task.id.in_(task_ids))
+                )
+            )
             .scalars()
             .all()
         )
@@ -431,6 +438,7 @@ async def get_project_awaiting_local_runner_holds(
                 select(Task)
                 .where(*local_runner_hold_task_filters(project_id))
                 .order_by(Task.created_at.desc())
+                .limit(500)
             )
         )
         .scalars()

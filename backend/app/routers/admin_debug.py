@@ -686,6 +686,7 @@ async def get_autonomy_debug(
     # actually hit, which was misleading the autonomy-debug UI.
     busy_tasks_result = await session.execute(
         select(Task)
+        .options(load_only(Task.id, Task.payloads, Task.status, raiseload=True))
         .where(
             Task.project_id == project_id,
             Task.status.in_(

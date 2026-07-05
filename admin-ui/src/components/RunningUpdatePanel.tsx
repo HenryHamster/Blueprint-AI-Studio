@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useCallback, useState } from 'react';
 import { Check, Clock, FileText, Pencil, ShieldCheck, X } from 'lucide-react';
 import { apiFetch } from '../api';
 import { timeAgo } from '../utils/time';
@@ -45,7 +45,7 @@ export default function RunningUpdatePanel({
     setDraft('');
   }
 
-  async function handleSave() {
+  const handleSave = useCallback(async () => {
     if (saving) return;
     setSaving(true);
     try {
@@ -78,9 +78,9 @@ export default function RunningUpdatePanel({
     } finally {
       setSaving(false);
     }
-  }
+  }, [projectId, draft, document, saving, addToast, onEdited]);
 
-  async function handleAcknowledge() {
+  const handleAcknowledge = useCallback(async () => {
     if (acknowledging) return;
     setAcknowledging(true);
     try {
@@ -100,7 +100,7 @@ export default function RunningUpdatePanel({
     } finally {
       setAcknowledging(false);
     }
-  }
+  }, [projectId, acknowledging, addToast, onAcknowledged]);
 
   return (
     <div className="flex flex-col h-full">

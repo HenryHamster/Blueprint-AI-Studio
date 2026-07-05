@@ -159,14 +159,34 @@ async def _collect_terminal_infra_child_events(
         for row in existing
         if row.get("failed_task_id") is not None
     }
+
+    # Collect valid UUIDs not yet in seen_failed_ids, then batch-fetch in one
+    # query instead of one session.get per leg.
+    valid_uuids: list[uuid.UUID] = []
+    for leg, task_id in terminal_ids:
+        if task_id in seen_failed_ids:
+            continue
+        try:
+            valid_uuids.append(uuid.UUID(task_id))
+        except (TypeError, ValueError):
+            continue
+
+    tasks_by_id: dict[uuid.UUID, Task] = {}
+    if valid_uuids:
+        rows = (
+            await session.execute(select(Task).where(Task.id.in_(valid_uuids)))
+        ).scalars().all()
+        tasks_by_id = {t.id: t for t in rows}
+
     terminal_events: list[dict[str, Any]] = []
     for leg, task_id in terminal_ids:
         if task_id in seen_failed_ids:
             continue
         try:
-            task = await session.get(Task, uuid.UUID(task_id))
+            task_uuid = uuid.UUID(task_id)
         except (TypeError, ValueError):
             continue
+        task = tasks_by_id.get(task_uuid)
         if task is None or task.status not in (
             TaskStatus.FAILED,
             TaskStatus.CANCELLED,

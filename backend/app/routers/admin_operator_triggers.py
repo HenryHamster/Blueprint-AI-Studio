@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func as _func
 from sqlalchemy.exc import IntegrityError, InvalidRequestError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 from sqlmodel import select
 from typing import List, Literal
 import uuid
@@ -171,7 +172,9 @@ async def trigger_self_audit(
     active_tasks = (
         (
             await session.execute(
-                select(Task).where(
+                select(Task)
+                .options(load_only(Task.id, Task.status, Task.payloads, raiseload=True))
+                .where(
                     Task.project_id == project.id,
                     Task.status.in_(active_statuses),
                 )

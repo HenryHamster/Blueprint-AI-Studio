@@ -1,6 +1,8 @@
 """Direction management endpoints for project autonomous improvement steering."""
 
+import json
 import uuid
+import hashlib
 import logging
 from math import ceil
 from datetime import datetime
@@ -64,6 +66,34 @@ router = APIRouter(
 DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
+
+# Module-level cache for per-direction metric enrichment. The four computation
+# functions (_compute_direction_quality_score, _compute_lifetime_generalized_outcome_state,
+# _compute_churn_metrics, _compute_lifetime_burn_metrics) are pure given the direction
+# dict contents. On a 10s poll cadence with 20+ directions this avoids 80+ Python function
+# calls per tick when direction data hasn't changed.
+_DIRECTION_METRIC_CACHE: dict[tuple, dict] = {}
+_DIRECTION_METRIC_CACHE_MAX = 512
+
+
+def _direction_metric_cache_key(d: dict) -> tuple:
+    """Stable cache key covering all fields read by the four metric functions.
+
+    Hashes the full history list so in-place mutations (e.g. stranded_prs_merged
+    incremented on a non-last entry by _apply_stranded_discount) are detected even
+    when len(history) and history[-1] remain unchanged.  Also includes the
+    direction_churn_window_cycles config value because _compute_churn_metrics slices
+    the window by that setting.
+    """
+    from app.shared_state import runtime_config as _runtime_config
+
+    history = d.get("research_history") or []
+    history_hash = hashlib.sha1(
+        json.dumps(history, sort_keys=True, default=str).encode()
+    ).hexdigest()[:16]
+    agg = json.dumps(d.get("history_aggregate") or {}, sort_keys=True, default=str)
+    churn_window = int(_runtime_config.get("direction_churn_window_cycles", 5) or 5)
+    return (str(d.get("id", "")), history_hash, agg, churn_window)
 
 
 def _log_gap_staffing_reconcile_result(
@@ -247,8 +277,29 @@ async def get_directions(
         refractory_until = refractory_info["refractory_until"]
         refractory_reason = refractory_info["refractory_reason"]
         refractory_remaining_minutes = refractory_info["refractory_remaining_minutes"]
-        generalized_state = _compute_lifetime_generalized_outcome_state(d)
-        raw_churn = _compute_churn_metrics(d)
+
+        cache_key = _direction_metric_cache_key(d)
+        cached = _DIRECTION_METRIC_CACHE.get(cache_key)
+        if cached is None:
+            generalized_state = _compute_lifetime_generalized_outcome_state(d)
+            raw_churn = _compute_churn_metrics(d)
+            raw_lifetime = _compute_lifetime_burn_metrics(d)
+            cached = {
+                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
+                "quality_score": round(_compute_direction_quality_score(d), 3),
+                "generalized_state": generalized_state,
+                "raw_churn": raw_churn,
+                "raw_lifetime": raw_lifetime,
+            }
+            if len(_DIRECTION_METRIC_CACHE) >= _DIRECTION_METRIC_CACHE_MAX:
+                # Evict oldest half when the cache is full to bound memory growth.
+                evict = list(_DIRECTION_METRIC_CACHE.keys())[: _DIRECTION_METRIC_CACHE_MAX // 2]
+                for k in evict:
+                    _DIRECTION_METRIC_CACHE.pop(k, None)
+            _DIRECTION_METRIC_CACHE[cache_key] = cached
+
+        generalized_state = cached["generalized_state"]
+        raw_churn = cached["raw_churn"]
         churn_metrics = (
             {
                 **raw_churn,
@@ -258,7 +309,7 @@ async def get_directions(
             if raw_churn is not None
             else None
         )
-        raw_lifetime = _compute_lifetime_burn_metrics(d)
+        raw_lifetime = cached["raw_lifetime"]
         lifetime_burn_metrics = (
             {
                 **raw_lifetime,
@@ -271,8 +322,8 @@ async def get_directions(
         enriched.append(
             {
                 **d,
-                "merges_per_cycle": _compute_direction_merges_per_cycle(d),
-                "quality_score": round(_compute_direction_quality_score(d), 3),
+                "merges_per_cycle": cached["merges_per_cycle"],
+                "quality_score": cached["quality_score"],
                 "generalized_successes": generalized_state["generalized_successes"],
                 "generalized_health_rate": generalized_state["generalized_health_rate"],
                 "outcome_kind_breakdown": generalized_state["outcome_kind_breakdown"],
@@ -1403,6 +1454,33 @@ async def create_direction_research_task(
             ),
         )
 
+    # Semi-modern fast path: tasks that carry current_direction_id but predate
+    # the idempotency-key stamp (and so weren't caught above).  An existence
+    # check with LIMIT 1 avoids scanning unrelated active research tasks.
+    semi_modern_dup = (
+        await session.execute(
+            select(Task.id, Task.status)
+            .where(
+                Task.project_id == project.id,
+                Task.status.in_(active_statuses),
+                Task.payloads[0]["type"].as_string() == "research",
+                Task.payloads[0]["current_direction_id"].as_string() == direction_id,
+            )
+            .limit(1)
+        )
+    ).first()
+    if semi_modern_dup is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Research is already in progress on this direction "
+                f"(task {str(semi_modern_dup.id)[:8]}, status {semi_modern_dup.status}). "
+                "Cancel it before starting another."
+            ),
+        )
+
+    # Legacy fallback: very old tasks that stored the direction in the
+    # 'directions' payload array rather than a top-level current_direction_id.
     active_research = (
         (
             await session.execute(

@@ -29767,6 +29767,119 @@ class TestComputeGoalCoverageDrift:
 
 
 # ===========================================================================
+# _collect_terminal_infra_child_events — batch-fetch fix (perf)
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_infra_child_events_batch_fetches_tasks(db_session):
+    """_collect_terminal_infra_child_events must fetch all terminal task IDs in
+    one batch SELECT instead of one session.get per leg, and must correctly
+    filter by seen_failed_ids and task status."""
+    from app.release_qualifier_audit import _collect_terminal_infra_child_events
+
+    project = Project(
+        name="Audit-batch-test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create a FAILED audit task and a CANCELLED smoketest task.
+    audit_task = Task(
+        project_id=project.id,
+        title="Audit task",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    smoke_task = Task(
+        project_id=project.id,
+        title="Smoketest task",
+        payloads=[{"type": "smoketest"}],
+        status=TaskStatus.CANCELLED,
+        created_by="ORCHESTRATOR",
+    )
+    # A task in a non-terminal status that must NOT appear in output.
+    running_task = Task(
+        project_id=project.id,
+        title="Running audit",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add_all([audit_task, smoke_task, running_task])
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+    await db_session.refresh(smoke_task)
+    await db_session.refresh(running_task)
+
+    qual = {
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": str(smoke_task.id),
+        "infra_failure_child_events": [],
+    }
+
+    result = await _collect_terminal_infra_child_events(
+        db_session, qual, infra_error="audit_failed"
+    )
+
+    # Both terminal tasks must appear; the in-progress task must be absent.
+    legs = {e["leg"] for e in result}
+    assert "audit" in legs
+    assert "smoketest" in legs
+    assert len(result) == 2
+
+    # Running task must not be included (non-terminal status).
+    task_ids_in_result = {str(e.get("failed_task_id")) for e in result}
+    assert str(running_task.id) not in task_ids_in_result
+
+
+@pytest.mark.asyncio
+async def test_collect_terminal_infra_child_events_skips_seen_failed(db_session):
+    """Tasks already in seen_failed_ids must not appear in the output."""
+    from app.release_qualifier_audit import _collect_terminal_infra_child_events
+
+    project = Project(
+        name="Audit-seen-test",
+        user_id="test-user",
+        github_owner="acme",
+        github_repo="widget",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        title="Already-recorded audit",
+        payloads=[{"type": "release_qualifier_audit"}],
+        status=TaskStatus.FAILED,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    qual = {
+        "audit_task_id": str(task.id),
+        # Pretend this task was already recorded.
+        "infra_failure_child_events": [{"leg": "audit", "failed_task_id": str(task.id)}],
+    }
+
+    result = await _collect_terminal_infra_child_events(
+        db_session, qual, infra_error="audit_failed"
+    )
+
+    # The existing entry must be preserved; no duplicate must appear.
+    assert len(result) == 1
+    assert result[0]["failed_task_id"] == str(task.id)
+
+
+# ===========================================================================
 # Completion-debt block in qualification verdicts
 # ===========================================================================
 

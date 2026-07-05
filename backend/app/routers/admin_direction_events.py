@@ -9,6 +9,7 @@ import logging
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -55,20 +56,14 @@ async def list_direction_events(
         )
     ).scalar_one_or_none()
 
-    total_events = (
-        (
-            await session.execute(
-                select(DirectionEvent).where(
-                    DirectionEvent.project_id == project_id,
-                    DirectionEvent.direction_key == direction_key,
-                )
-            )
+    event_count = await session.scalar(
+        select(func.count()).select_from(DirectionEvent).where(
+            DirectionEvent.project_id == project_id,
+            DirectionEvent.direction_key == direction_key,
         )
-        .scalars()
-        .all()
     )
 
-    if direction_row is None and not total_events:
+    if direction_row is None and not event_count:
         raise HTTPException(status_code=404, detail=f"Direction '{direction_key}' not found")
 
     # Paginated fetch, newest first.
@@ -107,7 +102,7 @@ async def list_direction_events(
     return {
         "direction_key": direction_key,
         "project_id": str(project_id),
-        "total": len(total_events),
+        "total": event_count or 0,
         "offset": offset,
         "limit": limit,
         "events": events,

@@ -3360,11 +3360,13 @@ class TestAutonomousMode:
 
         assert resp.status_code == 200, resp.text
         body = resp.json()
-        assert body["counts"][direction_id] == 5
+        # The task with direction_id only in plan_output is not counted: the endpoint
+        # skips plan_output for performance (task_primary_direction_ids_shallow).
+        assert body["counts"][direction_id] == 4
         assert "d-not-current" not in body["counts"]
         assert body["counts_by_type"][direction_id]["create"] == 1
         assert body["counts_by_type"][direction_id]["research"] == 2
-        assert body["counts_by_type"][direction_id]["plan"] == 2
+        assert body["counts_by_type"][direction_id]["plan"] == 1
 
     @pytest.mark.asyncio
     async def test_directions_lite_mode_omits_heavy_fields(
@@ -6762,6 +6764,31 @@ class TestMessagesWorkbenchState:
         marker = (project.vision or {})[STRATEGIC_LOCAL_CONTINUATION_KEY]
         assert marker["active"] is True
         assert "preferred_runner_id" not in marker
+
+    @pytest.mark.asyncio
+    async def test_list_runners_returns_all_by_default(
+        self, client: AsyncClient, db_session
+    ):
+        project = await _make_project(db_session)
+        runners = [
+            LocalRunner(
+                project_id=project.id,
+                token_hash=f"{i:064x}",
+                hostname=f"runner-{i:03d}",
+                status="active",
+                created_at=_utcnow() - timedelta(seconds=i),
+            )
+            for i in range(205)
+        ]
+        db_session.add_all(runners)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/runners")
+        assert resp.status_code == 200
+        listed = resp.json()
+        assert len(listed) == 205
+        assert listed[0]["hostname"] == "runner-000"
+        assert listed[-1]["hostname"] == "runner-204"
 
     @pytest.mark.asyncio
     async def test_leaving_continuous_mode_clears_local_continuation_marker(

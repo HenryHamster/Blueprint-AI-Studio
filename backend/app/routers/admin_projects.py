@@ -41,7 +41,7 @@ from app.ci_resolution import (
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.problem_model import compute_model_size_signal, ProblemModel
 from app.capability_trial_verdict import get_trial_verdicts
-from app.task_direction_refs import task_primary_direction_ids
+from app.task_direction_refs import task_primary_direction_ids_shallow
 from app.onboarding_proof import build_onboarding_proof_block
 
 router = APIRouter(
@@ -1283,7 +1283,6 @@ async def get_direction_task_counts(
                 Task.status,
                 Task.payloads,
                 Task.context,
-                Task.plan_output,
                 Task.title,
                 Task.latest_status_message,
                 raiseload=True,
@@ -1298,7 +1297,7 @@ async def get_direction_task_counts(
     active_tasks: Dict[str, list[dict]] = {}
     for task in tasks:
         payload = task.first_payload
-        dir_ids = task_primary_direction_ids(task)
+        dir_ids = task_primary_direction_ids_shallow(task)
         if not dir_ids:
             continue
         task_type = payload.get("type") or "unknown"

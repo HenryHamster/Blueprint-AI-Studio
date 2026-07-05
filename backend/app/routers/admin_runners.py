@@ -11,7 +11,7 @@ import logging
 import uuid
 from typing import Any, Dict, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -370,6 +370,8 @@ async def register_runner(
 @router.get("/projects/{project_id}/runners")
 async def list_runners(
     project_id: uuid.UUID,
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(get_current_user),
 ) -> List[Dict[str, Any]]:
@@ -377,7 +379,7 @@ async def list_runners(
     await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "viewer"
     )
-    result = await session.execute(
+    query = (
         select(LocalRunner)
         .where(
             LocalRunner.project_id == project_id,
@@ -385,6 +387,9 @@ async def list_runners(
         )
         .order_by(LocalRunner.created_at.desc())
     )
+    if limit is not None:
+        query = query.limit(limit).offset(offset)
+    result = await session.execute(query)
     return [_runner_view(r) for r in result.scalars().all()]
 
 

@@ -1389,6 +1389,92 @@ async def test_manual_research_409_when_concurrent_spawn_holds_claim(
     assert len(result.scalars().all()) == 1
 
 
+@pytest.mark.asyncio
+async def test_manual_research_409_semi_modern_current_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """Semi-modern fast path: a task that carries current_direction_id but no
+    idempotency key (predates the claim-key stamp) must still be detected as
+    an in-flight duplicate and return 409."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Semi-modern in flight")
+    direction_id = direction["id"]
+
+    semi_modern = Task(
+        project_id=uuid.UUID(project_id),
+        title="Research: semi-modern in flight",
+        # Has current_direction_id but no idempotency_key.
+        payloads=[
+            {
+                "type": "research",
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(semi_modern)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 409, resp.text
+    assert "in progress" in resp.text.lower()
+
+    # A different direction is unaffected.
+    other = await _add_direction(client, project_id, text="Other direction")
+    resp2 = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{other['id']}/research"
+    )
+    assert resp2.status_code == 200, resp2.text
+
+
+@pytest.mark.asyncio
+async def test_manual_research_ignores_non_research_current_direction_id(
+    client: AsyncClient, db_session, mocker
+):
+    """An active task from another workflow may still carry current_direction_id,
+    but it must not block research unless it is itself a research task."""
+    project_id = await _deploy_project(client, mocker)
+    direction = await _add_direction(client, project_id, text="Non-research payload")
+    direction_id = direction["id"]
+
+    blocker = Task(
+        project_id=uuid.UUID(project_id),
+        title="Create task with direction attribution",
+        payloads=[
+            {
+                "type": "create",
+                "current_direction_id": direction_id,
+                "base_branch": "main",
+            }
+        ],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
+    )
+    db_session.add(blocker)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}/research"
+    )
+    assert resp.status_code == 200, resp.text
+
+    created = await db_session.execute(
+        select(Task).where(
+            Task.project_id == uuid.UUID(project_id),
+            Task.status == TaskStatus.QUEUED,
+        )
+    )
+    assert any(
+        task.idempotency_key is not None for task in created.scalars().all()
+    )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 2. Cooldown Filter (_spawn_research_task)
 # ─────────────────────────────────────────────────────────────────────────────

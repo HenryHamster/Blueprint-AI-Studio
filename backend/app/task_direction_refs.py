@@ -165,6 +165,17 @@ def task_primary_direction_ids(task: Task) -> list[str]:
     return ids
 
 
+def task_primary_direction_ids_shallow(task: Task) -> list[str]:
+    """Like task_primary_direction_ids but skips plan_output (for cheap queries).
+
+    Safe to call when plan_output is not loaded; uses only context and payloads.
+    """
+    context_ids = _direct_direction_ids(task.context, _PRIMARY_CONTEXT_DIRECTION_KEYS)
+    if context_ids:
+        return context_ids
+    return _payload_direction_ids(task.payloads, include_related=False)
+
+
 def first_task_direction_id(task: Task) -> str | None:
     ids = task_primary_direction_ids(task)
     return ids[0] if ids else None

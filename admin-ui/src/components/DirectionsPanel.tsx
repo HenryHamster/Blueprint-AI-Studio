@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo, useCallback } from 'react';
 import { ChevronDown, Plus, ToggleLeft, ToggleRight, X } from 'lucide-react';
 import DesignDocViewer from './DesignDocViewer';
 import ProblemModelViewer from './ProblemModelViewer';
@@ -255,10 +255,12 @@ export function DirectionsPanel({
     setCollapsed(prev => ({ ...prev, [key]: !prev[key] }));
   }
 
-  const categoryFilterFn = (d: Direction) =>
-    categoryFilter === 'all' || d.category === categoryFilter;
+  const categoryFilterFn = useCallback(
+    (d: Direction) => categoryFilter === 'all' || d.category === categoryFilter,
+    [categoryFilter]
+  );
 
-  const grouped = STATUS_GROUPS.map(({ key, label }) => ({
+  const grouped = useMemo(() => STATUS_GROUPS.map(({ key, label }) => ({
     key,
     label,
     items: key === 'active'
@@ -267,10 +269,16 @@ export function DirectionsPanel({
           .filter(d => d.status === key)
           .filter(categoryFilterFn)
           .sort((a, b) => priorityOrder[a.priority] - priorityOrder[b.priority]),
-  }));
+  })), [data.directions, categoryFilterFn]);
 
-  const proposedCount = data.directions.filter(d => d.status === 'proposed').length;
-  const activeItems = (grouped.find(g => g.key === 'active') ?? { items: [] }).items;
+  const proposedCount = useMemo(
+    () => data.directions.filter(d => d.status === 'proposed').length,
+    [data.directions]
+  );
+  const activeItems = useMemo(
+    () => (grouped.find(g => g.key === 'active') ?? { items: [] }).items,
+    [grouped]
+  );
 
   return (
       <div className="flex-1 overflow-hidden flex flex-col bg-neutral-950">

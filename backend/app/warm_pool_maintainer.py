@@ -1407,13 +1407,50 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
         .all()
     )
 
+    # Batch-fetch all bound tasks in one query instead of one session.get per
+    # lane.  We expunge them immediately after loading so that a rollback in the
+    # per-lane exception handler does not expire the already-loaded attribute
+    # values (stale-ORM-after-rollback -> MissingGreenlet; see the reaper sweep
+    # comment at ~line 2042 for the pattern).  The loop only reads scalar
+    # attributes that were eagerly loaded here, so detached access is safe.
+    lane_task_ids = [
+        lane.current_task_id
+        for lane in active_lanes
+        if lane.current_task_id is not None
+    ]
+    tasks_by_id: dict[uuid.UUID, Task] = {}
+    if lane_task_ids:
+        from sqlalchemy.orm import load_only as _load_only
+
+        task_rows = (
+            await session.execute(
+                select(Task)
+                .where(Task.id.in_(lane_task_ids))
+                .options(
+                    _load_only(
+                        Task.id,
+                        Task.status,
+                        Task.payloads,
+                        Task.context,
+                        Task.project_id,
+                        Task.parent_task_id,
+                        Task.priority,
+                        raiseload=True,
+                    )
+                )
+            )
+        ).scalars().all()
+        for t in task_rows:
+            session.expunge(t)
+            tasks_by_id[t.id] = t
+
     for lane in active_lanes:
         task = None
         stranded = False
         if lane.current_task_id is None:
             stranded = True
         else:
-            task = await session.get(Task, lane.current_task_id)
+            task = tasks_by_id.get(lane.current_task_id)
             if task is None or task.status in _LANE_TERMINAL_TASK_STATUSES:
                 stranded = True
         if not stranded:

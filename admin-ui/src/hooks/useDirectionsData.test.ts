@@ -188,4 +188,54 @@ describe('useDirectionsData lite refresh', () => {
     expect(result.current.loading).toBe(false);
     expect(result.current.directions).toHaveLength(1);
   });
+
+  it('preserves unchanged object identities during lite refresh', async () => {
+    mockApiFetch.mockImplementation((url: string) => {
+      if (url.includes('/directions/task-counts')) {
+        return okResponse({ counts: { d1: 2 }, active_tasks: { d1: [{ id: 't1', status: 'running', title: 'Work item' }] } });
+      }
+      if (url.includes('/directions')) {
+        return okResponse({
+          directions: [{
+            id: 'd1',
+            text: 'Keep stable',
+            priority: 'medium',
+            status: 'active',
+            added_at: '2024-01-01T00:00:00Z',
+            category: 'product',
+          }],
+          autonomous_enabled: false,
+          design_doc: {},
+          problem_model: {},
+          problem_model_size_health: null,
+          running_update: null,
+          running_update_acknowledged_at: null,
+          running_update_reconciliation: null,
+        });
+      }
+      return okResponse({});
+    });
+
+    const { result } = renderHook(() =>
+      useDirectionsData({ selectedProjectId: 'proj-1', addToast: vi.fn() }),
+    );
+
+    await waitFor(() => {
+      expect(result.current.directions).toHaveLength(1);
+    });
+
+    const initialDirections = result.current.directions;
+    const initialDirection = result.current.directions[0];
+    const initialTaskCounts = result.current.taskCounts;
+    const initialActiveTasks = result.current.activeTasks;
+
+    await act(async () => {
+      await result.current.fetchDirections({ lite: true });
+    });
+
+    expect(result.current.directions).toBe(initialDirections);
+    expect(result.current.directions[0]).toBe(initialDirection);
+    expect(result.current.taskCounts).toBe(initialTaskCounts);
+    expect(result.current.activeTasks).toBe(initialActiveTasks);
+  });
 });

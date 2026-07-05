@@ -3507,6 +3507,7 @@ class KnowledgeDocument(SQLModel, table=True):
         Index("ix_knowledge_document_origin_challenge_state", "origin_challenge_state"),
         Index("ix_knowledge_document_origin_finding_hash", "origin_finding_hash"),
         Index("ix_knowledge_document_sweep_id", "sweep_id"),
+        Index("ix_knowledge_document_project_direction", "project_id", "direction_id"),
     )
 
 
@@ -3670,6 +3671,13 @@ class Direction(SQLModel, table=True):
         ),
         # Hot path: list a project's directions, often filtered by status.
         Index("ix_direction_project_status", "project_id", "status"),
+        # Reaper sweeps filter cross-project on status='staged' alone;
+        # the composite index above cannot be used for a leading-column miss.
+        Index(
+            "ix_direction_status_staged",
+            "status",
+            postgresql_where=text("status = 'staged'"),
+        ),
     )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
@@ -3761,7 +3769,7 @@ class DirectionEvent(SQLModel, table=True):
 
     __tablename__ = "direction_event"
     __table_args__ = (
-        Index("ix_direction_event_project_key", "project_id", "direction_key"),
+        Index("ix_direction_event_project_key", "project_id", "direction_key", "recorded_at"),
     )
 
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)

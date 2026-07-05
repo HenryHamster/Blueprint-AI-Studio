@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Components } from 'react-markdown';
@@ -25,10 +26,12 @@ const mdComponents: Components = {
   hr: (props) => <hr className="border-neutral-800 my-3" {...props} />,
 };
 
-export function MarkdownContent({ content }: { content: string }) {
+function MarkdownContentImpl({ content }: { content: string }) {
   return (
     <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
       {content}
     </ReactMarkdown>
   );
 }
+
+export const MarkdownContent = memo(MarkdownContentImpl);
