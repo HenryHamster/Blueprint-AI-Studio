@@ -315,7 +315,7 @@ export function getTaskTypeHints(buildConfig?: BuildConfig, promotionTarget?: st
   return hints;
 }
 
-export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER).';
+export const DEFAULT_TOOL_GUIDANCE = 'Tool guidance: Use Grep/Glob for code search (not Bash grep/find), Read for file contents, Agent tool for parallel exploration of multiple areas. Use TodoWrite to track multi-step work. Use WebFetch to look up API documentation, library references, or framework guides when working with unfamiliar code. Use WebSearch to find solutions for specific error messages or unusual patterns. Use ./symbols <name> to find where a function or class is defined (returns file path, line, and kind). If you discover bugs, architectural issues, or improvement ideas, use ./note to leave annotations: ./note comment "msg" --page <page>, ./note issue "msg" --severity high, ./note vision "msg". If you hit a barrier, have a question for the project owner, or want to flag something important, use ./messages send \'your message\' (types: NOTE, QUESTION, FEEDBACK, BUG_REPORT, BLOCKER) or ./messages send --stdin for quote-safe multiline text.';
 
 // Shared parenthetical for every read-only handler that instructs the agent to
 // write a /tmp output file. The Write/Edit tools are stripped for read-only
@@ -486,6 +486,7 @@ fails too. Decision rule:
 
 2. **Out-of-scope and my task can ship without it?** → **Report and
    skip.** Don't side-quest. Use \`./messages send "<content>" NOTE\`
+   or \`./messages send --stdin NOTE\` for quote-heavy prose
    (types: \`NOTE\` | \`BUG_REPORT\` | \`BLOCKER\`). Include: file paths,
    rough count, effort estimate, whether anything blocks you.
 
@@ -665,7 +666,8 @@ export function writeMessagesHelper(taskIdRaw: string, workspace: string = WORKS
   const helperScript = `#!/bin/bash
 # Message tool — send messages to the project owner or resolve open messages
 # Usage:
-#   ./messages send '<content>'                    # send a NOTE message
+#   ./messages send '<content>'                    # send a NOTE message (inline form)
+#   ./messages send --stdin [type]                 # quote-safe form; read content from stdin (pipe or heredoc), defaults to NOTE
 #   ./messages send '<content>' QUESTION           # send with specific type (NOTE|QUESTION|FEEDBACK|BUG_REPORT|BLOCKER)
 #   ./messages resolve <ref> '<resolution>'        # resolve an open message; <ref> may be a
 #                                                  #   short ref (first 8+ hex chars of the
@@ -738,8 +740,14 @@ _post_strategic() {
 }
 
 if [ "$OP" = "send" ]; then
-  CONTENT="\${2:?send requires '<content>'}"
-  MSG_TYPE="\${3:-NOTE}"
+  if [ "\${2:-}" = "--stdin" ]; then
+    MSG_TYPE="\${3:-NOTE}"
+    CONTENT="$(cat)"
+  else
+    CONTENT="\${2:?send requires '<content>'}"
+    MSG_TYPE="\${3:-NOTE}"
+  fi
+  [ -n "$CONTENT" ] || { echo "Error: send requires message content" >&2; exit 1; }
   IDEM_KEY=$(printf '%s' "\${TASK}:\${MSG_TYPE}:\${CONTENT}" | sha256sum | awk '{print $1}')
   jq -n --arg tid "$TASK" --arg t "$MSG_TYPE" --arg c "$CONTENT" --arg k "$IDEM_KEY" \\
     '{task_id: $tid, op: "create_message", data: {type: $t, content: $c, idempotency_key: $k}}' | \\

@@ -5,11 +5,13 @@ import {
   fetchEvergreenFillSettings,
   patchEvergreenFillSettings,
   patchStructuralHealthSettings,
+  patchMetricsIntegritySettings,
   apiFetch,
   type EvergreenFillSettings,
 } from '../api';
 import { EvergreenFillObservabilityPanel } from './EvergreenFillObservabilityPanel';
 import { StructuralHealthObservabilityPanel } from './StructuralHealthObservabilityPanel';
+import { MetricsIntegrityObservabilityPanel } from './MetricsIntegrityObservabilityPanel';
 import { EvergreenBacklogPanel } from './EvergreenBacklogPanel';
 
 interface SettingsOrchestratorSectionProps {
@@ -179,6 +181,9 @@ export function SettingsOrchestratorSection({
   // Structural health audit mode — fetched directly and patched on change.
   const [auditMode, setAuditMode] = useState<string>('off');
 
+  // Metrics integrity sweep mode — fetched via settings and patched on change.
+  const [sweepMode, setSweepMode] = useState<string>('off');
+
   const loadFillSettings = useCallback(async () => {
     try {
       const s = await fetchEvergreenFillSettings();
@@ -200,6 +205,8 @@ export function SettingsOrchestratorSection({
         const data = await res.json();
         const mode = data?.structural_health_audit_mode ?? 'off';
         setAuditMode(String(mode));
+        const sweep = data?.metrics_integrity_sweep_mode ?? 'off';
+        setSweepMode(String(sweep));
       }
     } catch {
       // silently ignore — defaults remain
@@ -222,6 +229,15 @@ export function SettingsOrchestratorSection({
     try {
       await patchStructuralHealthSettings({ structural_health_audit_mode: mode });
       setAuditMode(mode);
+    } catch {
+      // on error, keep current mode
+    }
+  }, []);
+
+  const patchSweepMode = useCallback(async (mode: string) => {
+    try {
+      await patchMetricsIntegritySettings({ metrics_integrity_sweep_mode: mode });
+      setSweepMode(mode);
     } catch {
       // on error, keep current mode
     }
@@ -762,6 +778,9 @@ export function SettingsOrchestratorSection({
 
       {/* Structural Health Observability */}
       <StructuralHealthObservabilityPanel auditMode={auditMode} onAuditModeChange={patchAuditMode} />
+
+      {/* Metrics Integrity Observability */}
+      <MetricsIntegrityObservabilityPanel sweepMode={sweepMode} onSweepModeChange={patchSweepMode} />
 
       {/* Evergreen Backlog (project-scoped) */}
       <EvergreenBacklogPanel projectId={selectedProjectId} />

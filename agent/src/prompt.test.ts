@@ -4242,6 +4242,7 @@ describe('cross-cutting guidance-block fingerprints — structural invariants fo
 
   it('DEFAULT_TOOL_GUIDANCE contains fingerprint used by handler structural tests', () => {
     expect(DEFAULT_TOOL_GUIDANCE).toContain('Use Grep/Glob for code search');
+    expect(DEFAULT_TOOL_GUIDANCE).toContain('./messages send --stdin');
   });
 
   it('CODE_CHANGE_HELPER_GUIDANCE contains fingerprint used by handler structural tests', () => {
@@ -4883,6 +4884,7 @@ describe('writeMessagesHelper', () => {
     writeMessagesHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toBeDefined();
+    expect(script).toContain('./messages send --stdin [type]');
     expect(script).toContain('_post_strategic()');
     expect(script).toContain('if ! response=$(printf \'%s\' "$payload" | curl $CURL_OPTS -X POST "$API/api/agent/strategic"');
     expect(script).toContain("-w '\\n%{http_code}'");
@@ -4909,6 +4911,7 @@ describe('writeMessagesHelper', () => {
     expect(script).toContain('_load_agent_token()');
     expect(script).toContain('TOKEN=$(cat "${AGENT_TOKEN_FILE}" 2>/dev/null)');
     expect(script).not.toContain('TOKEN="${AGENT_API_TOKEN:?AGENT_API_TOKEN not set}"');
+    expect(script).toContain('CONTENT="$(cat)"');
     // The JSON body is captured from stdin ONCE so the 401 path can re-send it.
     expect(script).toContain('payload=$(cat)');
     expect(script).toContain('_load_agent_token || return 1');

@@ -758,11 +758,35 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                           ? <span className="text-neutral-600 italic">smoke disabled</span>
                           : <span>smoke {Math.round(cv.last_qualification.sub_scores.smoketest * 100)}%</span>
                         }
+                        {cv.last_qualification.sub_scores.debt_pressure != null && (
+                          cv.last_qualification.completion_debt?.total_open === 0
+                            ? <span className="text-emerald-600">debt: none</span>
+                            : <span className={cv.last_qualification.completion_debt != null && cv.last_qualification.completion_debt.total_open > 0 ? 'text-amber-400' : undefined}>
+                                debt: {cv.last_qualification.completion_debt?.total_open ?? '?'} open
+                              </span>
+                        )}
                       </>
                     )}
                     {cv.last_qualification.ci_resolution && (
                       <CiBadge ci={cv.last_qualification.ci_resolution} />
                     )}
+                  </div>
+                )}
+                {cv.last_qualification.completion_debt != null && cv.last_qualification.completion_debt.total_open > 0 && (
+                  <div className="text-ui-sm text-neutral-500 pl-2 border-l border-neutral-700/40 space-y-0.5" data-testid="debt-items-list">
+                    <span className="text-neutral-400">
+                      {cv.last_qualification.completion_debt.total_open} open debt{cv.last_qualification.completion_debt.total_open !== 1 ? 's' : ''} at qualification time
+                      {cv.last_qualification.completion_debt.total_open > cv.last_qualification.completion_debt.items.length && (
+                        <span className="text-neutral-600"> (showing {cv.last_qualification.completion_debt.items.length} oldest)</span>
+                      )}
+                    </span>
+                    {cv.last_qualification.completion_debt.items.map(item => (
+                      <div key={item.id} className="flex gap-x-2 text-neutral-500">
+                        <span className="font-mono text-ui-xs text-neutral-600">{item.kind}</span>
+                        <span className="truncate">{item.title}</span>
+                        {item.age_days != null && <span className="text-neutral-600 shrink-0">{item.age_days}d</span>}
+                      </div>
+                    ))}
                   </div>
                 )}
                 {cv.last_qualification.blocker && (
@@ -954,7 +978,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                     <span className={`font-mono font-semibold ${v.would_promote ? 'text-emerald-400' : 'text-amber-400'}`}>{v.confidence != null ? `${Math.round(v.confidence * 100)}%` : '—'}</span>
                     <span className={QUAL_VERDICT_COLOR[v.terminal_status ?? ''] ?? 'text-neutral-400'}>{v.terminal_status?.replace(/_/g, '-') ?? '?'}</span>
                     {v.promotion_enabled && <span className="text-ui-xs font-mono text-emerald-600">LIVE</span>}
-                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}</span>}
+                    {v.sub_scores && <span className="text-neutral-600 font-mono text-ui-xs">a:{Math.round(v.sub_scores.audit * 100)} e:{Math.round(v.sub_scores.test_erosion * 100)}{v.smoketest_enabled === false ? ' s:—' : ` s:${Math.round(v.sub_scores.smoketest * 100)}`}{v.sub_scores.debt_pressure != null ? ` d:${v.completion_debt?.total_open ?? '?'}open` : ''}</span>}
                     {v.sub_scores?.ci_resolution && <CiBadge ci={v.sub_scores.ci_resolution} />}
                     {v.blocker && <span className="text-red-400 truncate max-w-[120px]" title={v.blocker}>{v.blocker}</span>}
                     {v.terminal_status === 'promoted' && (

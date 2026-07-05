@@ -7,6 +7,7 @@ import pytest
 
 from app.models import (
     TaskStatus,
+    QualificationVerdict,
     ReleaseVersion,
 )
 from app.digest_metrics import (
@@ -2572,15 +2573,20 @@ async def test_release_qualifier_infra_metrics_no_versions(db_session):
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_counts_by_error_category(db_session):
-    """Rows with distinct infra_failure error codes increment the correct buckets."""
+    """Verdict rows with distinct infra_failure error codes increment correct buckets."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
     now = _utcnow()
     window_start = now - timedelta(hours=24)
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    finalized_at = now - timedelta(hours=1)
 
     error_cases = [
         "audit_report_missing",
@@ -2588,19 +2594,16 @@ async def test_release_qualifier_infra_metrics_counts_by_error_category(db_sessi
         "smoketest_report_missing",
         "audit_task_failed_other",  # unknown bucket — counts in total only
     ]
-    for i, error in enumerate(error_cases):
-        v = ReleaseVersion(
-            project_id=project.id,
-            version_number=i + 1,
-            phase="stabilize",
-            last_qualification={
-                "status": "infra_failure",
-                "error": error,
-                "consecutive_infra_errors": 1,
-                "finalized_at": finalized_at,
-            },
+    for error in error_cases:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": {"error": error, "consecutive_infra_errors": 1}},
+            )
         )
-        db_session.add(v)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2623,35 +2626,26 @@ async def test_release_qualifier_infra_metrics_counts_repeat_signatures(db_sessi
     await db_session.commit()
     await db_session.refresh(project)
 
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
     now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
-    rows = [
-        {
-            "same_error_as_prior": True,
-            "same_error_different_candidate": True,
-        },
-        {
-            "same_infra_failure_as_previous": True,
-            "same_infra_failure_different_candidate": False,
-        },
-        {
-            "same_error_as_prior": False,
-            "same_error_different_candidate": False,
-        },
+    finalized_at = now - timedelta(hours=1)
+    infra_evidences = [
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 1, "same_error_as_prior": True, "same_error_different_candidate": True},
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 2, "same_error_as_prior": True, "same_error_different_candidate": False},
+        {"error": "audit_infra_respawn_cap_exceeded", "consecutive_infra_errors": 3, "same_error_as_prior": False, "same_error_different_candidate": False},
     ]
-    for i, evidence in enumerate(rows):
+    for evidence in infra_evidences:
         db_session.add(
-            ReleaseVersion(
+            QualificationVerdict(
                 project_id=project.id,
-                version_number=i + 1,
-                phase="stabilize",
-                last_qualification={
-                    "status": "infra_failure",
-                    "error": "audit_infra_respawn_cap_exceeded",
-                    "consecutive_infra_errors": i + 1,
-                    "finalized_at": finalized_at,
-                    **evidence,
-                },
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": evidence},
             )
         )
     await db_session.commit()
@@ -2674,22 +2668,24 @@ async def test_release_qualifier_infra_metrics_streak_max(db_session):
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    for i, streak in enumerate([2, 4, 1]):
-        v = ReleaseVersion(
-            project_id=project.id,
-            version_number=i + 1,
-            phase="stabilize",
-            last_qualification={
-                "status": "infra_failure",
-                "error": "audit_report_missing",
-                "consecutive_infra_errors": streak,
-                "finalized_at": finalized_at,
-            },
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=1)
+
+    for streak in [2, 4, 1]:
+        db_session.add(
+            QualificationVerdict(
+                project_id=project.id,
+                release_version_id=version.id,
+                terminal_status="infra_failure",
+                finalized_at=finalized_at,
+                sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": streak}},
+            )
         )
-        db_session.add(v)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2702,40 +2698,39 @@ async def test_release_qualifier_infra_metrics_streak_max(db_session):
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_excludes_outside_window(db_session):
-    """Rows finalized before window_start are not counted."""
+    """Verdict rows finalized before window_start are not counted."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    old_finalized_at = (now - timedelta(hours=48)).isoformat()
-    recent_finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="stabilize")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    old_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=1,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "audit_report_missing",
-            "consecutive_infra_errors": 3,
-            "finalized_at": old_finalized_at,
-        },
+    now = _utcnow()
+    old_finalized_at = now - timedelta(hours=48)
+    recent_finalized_at = now - timedelta(hours=1)
+
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=old_finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 3}},
+        )
     )
-    recent_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=2,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "smoketest_report_missing",
-            "consecutive_infra_errors": 1,
-            "finalized_at": recent_finalized_at,
-        },
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=recent_finalized_at,
+            sub_scores={"infra_failure": {"error": "smoketest_report_missing", "consecutive_infra_errors": 1}},
+        )
     )
-    db_session.add(old_version)
-    db_session.add(recent_version)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2751,46 +2746,40 @@ async def test_release_qualifier_infra_metrics_excludes_outside_window(db_sessio
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
-    """qualifier_runs_total counts all finalized quals, not just infra_failure ones."""
+    """qualifier_runs_total counts all finalized verdict rows, not just infra_failure ones."""
     project = make_project()
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
 
-    now = _utcnow()
-    finalized_at = (now - timedelta(hours=1)).isoformat()
+    version = ReleaseVersion(project_id=project.id, version_number=1, phase="promote")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
 
-    # One infra_failure and one successful promotion
-    infra_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=1,
-        phase="stabilize",
-        last_qualification={
-            "status": "infra_failure",
-            "error": "audit_report_missing",
-            "consecutive_infra_errors": 1,
-            "finalized_at": finalized_at,
-        },
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=1)
+
+    # One infra_failure verdict
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 1}},
+        )
     )
-    promoted_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=2,
-        phase="promote",
-        last_qualification={
-            "status": "promoted",
-            "finalized_at": finalized_at,
-        },
+    # One promoted verdict — counts in total but not infra
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="promoted",
+            finalized_at=finalized_at,
+            sub_scores=None,
+        )
     )
-    # Version with no qualification at all — should not count
-    unqual_version = ReleaseVersion(
-        project_id=project.id,
-        version_number=3,
-        phase="build",
-        last_qualification=None,
-    )
-    db_session.add(infra_version)
-    db_session.add(promoted_version)
-    db_session.add(unqual_version)
     await db_session.commit()
 
     result = await compute_release_qualifier_infra_metrics(
@@ -2800,6 +2789,89 @@ async def test_release_qualifier_infra_metrics_qualifier_runs_total(db_session):
     )
     assert result["qualifier_runs_total"] == 2
     assert result["release_infra_failure_total"] == 1
+
+
+@pytest.mark.asyncio
+async def test_release_qualifier_infra_metrics_count_historical_verdict_rows_after_requalification(
+    db_session,
+):
+    """Infra attempts preserved as verdict rows are counted even after a later
+    successful requalification overwrites last_qualification.
+
+    This is the core regression test for the bug: ReleaseVersion.last_qualification
+    is mutable and holds only the latest verdict. QualificationVerdict rows are
+    immutable; each run appends one. After a successful re-qualification the infra
+    rows must still be visible to the infra-metrics counter.
+    """
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    now = _utcnow()
+    finalized_at = now - timedelta(hours=2)
+
+    # Single version that had two infra failures and then a successful promotion.
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        phase="promote",
+        # last_qualification reflects only the final promoted state —
+        # the two prior infra failures are gone from here.
+        last_qualification={
+            "status": "promoted",
+            "finalized_at": (now - timedelta(hours=1)).isoformat(),
+        },
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Infra attempt 1 — audit_report_missing
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 1, "same_error_as_prior": False, "same_error_different_candidate": False}},
+        )
+    )
+    # Infra attempt 2 — same error, same candidate
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="infra_failure",
+            finalized_at=finalized_at,
+            sub_scores={"infra_failure": {"error": "audit_report_missing", "consecutive_infra_errors": 2, "same_error_as_prior": True, "same_error_different_candidate": False}},
+        )
+    )
+    # Successful promotion verdict — overwrites last_qualification in production
+    db_session.add(
+        QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            terminal_status="promoted",
+            finalized_at=now - timedelta(hours=1),
+            sub_scores=None,
+        )
+    )
+    await db_session.commit()
+
+    result = await compute_release_qualifier_infra_metrics(
+        db_session,
+        project_id=project.id,
+        window_start=now - timedelta(hours=24),
+    )
+    # All 3 verdict rows (2 infra + 1 promoted) count toward total runs.
+    assert result["qualifier_runs_total"] == 3
+    # Both infra verdicts are counted even though last_qualification only shows promoted.
+    assert result["release_infra_failure_total"] == 2
+    assert result["audit_report_missing_count"] == 2
+    # The second infra attempt had same_error_as_prior=True.
+    assert result["release_infra_failure_repeat_signature_total"] == 1
+    assert result["release_infra_failure_streak_max"] == 2
 
 
 class TestDigestMetricsModuleSeams:

@@ -903,6 +903,125 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
 }
 
 
+def _apply_evicted_generalized_and_acceptance_deltas(
+    agg: dict, snap: dict, entry: dict
+) -> None:
+    """Heal the acceptance-verified + generalized aggregate keys on a late recompute.
+
+    Companion to the primitive ``_DELTA_FIELDS`` loop in
+    :func:`_apply_direction_outcomes`: when a late recompute runs on an evicted
+    cycle, this applies deltas for the aggregate keys that
+    :func:`~app.direction_metrics._fold_evicted_into_aggregate` credits but the
+    primitive delta list omits — ``total_acceptance_verified_merged``,
+    ``total_acceptance_verified_write_merged`` (both gated on
+    ``acceptance_merged_write_total`` presence in the fresh ``entry``, mirroring
+    the fold's condition so a cycle that lost acceptance-awareness is handled
+    consistently), ``total_generalized_successes``,
+    ``total_generalized_terminal_outcomes``, and the nested
+    ``outcome_kind_breakdown``.
+
+    Reuses the same direction_metrics helpers the fold uses so the delta and the
+    fold cannot drift. LEGACY BACKFILL: snapshots persisted before these baselines
+    existed lack the new keys; each missing baseline is seeded from the SAME
+    fallback the fold used BEFORE the delta is taken (see per-field comments), so
+    no legacy cycle is double-counted or dropped to zero.
+    """
+    from app.direction_metrics import (  # noqa: PLC0415
+        _OUTCOME_KIND_STATUSES,
+        _copy_outcome_kind_breakdown,
+        _entry_generalized_successes,
+        _entry_generalized_terminal_outcomes,
+        _fallback_outcome_kind_breakdown,
+    )
+
+    _fresh_acceptance_aware = "acceptance_merged_write_total" in entry
+    # --- Acceptance-verified merged base ---
+    # Fresh contribution mirrors the fold: verified_merged_count credited only when
+    # the cycle is acceptance-aware. A legacy snapshot without the stored baseline
+    # falls back to verified_merged_count(snap) (reconstructed from the snapshot's
+    # verified_prs_merged), consistent with the value the fold credited at eviction.
+    _fresh_acc_verified = verified_merged_count(entry) if _fresh_acceptance_aware else 0
+    _snap_acc_verified = int(
+        snap.get("acceptance_verified_merged", verified_merged_count(snap)) or 0
+    )
+    _delta = _fresh_acc_verified - _snap_acc_verified
+    if _delta:
+        agg["total_acceptance_verified_merged"] = (
+            int(agg.get("total_acceptance_verified_merged") or 0) + _delta
+        )
+    # --- Verified WRITE slice ---
+    # The write-verified count cannot be reconstructed from a legacy snapshot's
+    # stored primitives, so when the baseline is absent it is seeded to the fresh
+    # value (delta 0): the folded eviction-time value is retained rather than
+    # double-counted, and the snapshot rewrite re-syncs it for future recomputes.
+    _fresh_acc_verified_write = (
+        int(entry.get("acceptance_verified_write_merged") or 0)
+        if _fresh_acceptance_aware
+        else 0
+    )
+    _snap_acc_verified_write = int(
+        snap.get("acceptance_verified_write_merged", _fresh_acc_verified_write) or 0
+    )
+    _delta = _fresh_acc_verified_write - _snap_acc_verified_write
+    if _delta:
+        agg["total_acceptance_verified_write_merged"] = (
+            int(agg.get("total_acceptance_verified_write_merged") or 0) + _delta
+        )
+    # --- Generalized successes / terminal outcomes ---
+    # The per-cycle generalized contribution is NOT reconstructable from the sparse
+    # snapshot (it includes read-only tasks, failed tasks, etc. — not just merges).
+    # For a legacy snapshot (new keys absent), seed to the FRESH value so the delta
+    # is 0: the fold already credited the rich eviction-time values into the aggregate,
+    # so we retain those rather than re-adding. This mirrors the acceptance_verified_write
+    # treatment above and avoids the double-count when terminal > prs_merged.
+    _fresh_gen_succ = _entry_generalized_successes(entry)
+    _snap_gen_succ = int(snap.get("generalized_successes", _fresh_gen_succ) or 0)
+    _delta = _fresh_gen_succ - _snap_gen_succ
+    if _delta:
+        agg["total_generalized_successes"] = (
+            int(agg.get("total_generalized_successes") or 0) + _delta
+        )
+    _fresh_gen_term = _entry_generalized_terminal_outcomes(entry)
+    _snap_gen_term = int(snap.get("generalized_terminal_outcomes", _fresh_gen_term) or 0)
+    _delta = _fresh_gen_term - _snap_gen_term
+    if _delta:
+        agg["total_generalized_terminal_outcomes"] = (
+            int(agg.get("total_generalized_terminal_outcomes") or 0) + _delta
+        )
+    # --- Nested outcome_kind_breakdown ---
+    # Delta per kind and per status; clamp each bucket status independently at 0 so
+    # a negative delta can never push one bucket negative and corrupt the others.
+    _fresh_bd = _copy_outcome_kind_breakdown(
+        entry.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(entry)
+    )
+    _snap_bd_raw = snap.get("outcome_kind_breakdown")
+    if isinstance(_snap_bd_raw, dict):
+        _snap_bd = _copy_outcome_kind_breakdown(_snap_bd_raw)
+    else:
+        # Legacy snapshot without the breakdown: seed to the fresh value so the
+        # delta is 0 per bucket (retain the already-folded eviction-time credit).
+        _snap_bd = _copy_outcome_kind_breakdown(_fresh_bd)
+    _agg_bd = agg.get("outcome_kind_breakdown")
+    if not isinstance(_agg_bd, dict):
+        _agg_bd = {}
+    for _kind in set(_fresh_bd) | set(_snap_bd):
+        _fresh_counts = _fresh_bd.get(_kind) or {}
+        _snap_counts = _snap_bd.get(_kind) or {}
+        _bucket = _agg_bd.get(_kind)
+        if not isinstance(_bucket, dict):
+            _bucket = {"success": 0, "neutral": 0, "failure": 0}
+            _agg_bd[_kind] = _bucket
+        for _status in _OUTCOME_KIND_STATUSES:
+            _status_delta = int(_fresh_counts.get(_status, 0) or 0) - int(
+                _snap_counts.get(_status, 0) or 0
+            )
+            if _status_delta:
+                _bucket[_status] = max(
+                    0, int(_bucket.get(_status, 0) or 0) + _status_delta
+                )
+    agg["outcome_kind_breakdown"] = _agg_bd
+
+
 async def _update_direction_research_outcomes(
     project_id: uuid.UUID,
     direction_id: str,
@@ -2297,8 +2416,22 @@ async def _update_direction_research_outcomes(
                 _delta = _new_val - _snap_val
                 if _delta != 0:
                     _agg[_agg_key] = int(_agg.get(_agg_key) or 0) + _delta
-            # Update snapshot to current values for idempotency on future recomputes.
-            _snaps[research_task_id] = {k: int(entry.get(k) or 0) for k, _ in _DELTA_FIELDS}
+            # ALSO heal the acceptance-verified + generalized aggregate keys that the
+            # fold credits but the primitive _DELTA_FIELDS list omits — otherwise a
+            # late merge on an evicted cycle leaves total_acceptance_verified_merged,
+            # total_acceptance_verified_write_merged, total_generalized_successes,
+            # total_generalized_terminal_outcomes, and outcome_kind_breakdown frozen
+            # at their eviction-time values, silently diverging the proof-weighted
+            # scoring / digest / strategist surfaces from ground truth.
+            _apply_evicted_generalized_and_acceptance_deltas(_agg, _snap, entry)
+            # Update snapshot to the new baseline (all keys, via the shared builder so
+            # it stays byte-identical to the two snapshot-writing sites) for
+            # idempotency on future recomputes.
+            from app.direction_metrics import (  # noqa: PLC0415
+                build_evicted_cycle_snapshot,
+            )
+
+            _snaps[research_task_id] = build_evicted_cycle_snapshot(entry)
             _agg["_evicted_cycle_snapshots"] = _snaps
             target_d["history_aggregate"] = _agg
             return

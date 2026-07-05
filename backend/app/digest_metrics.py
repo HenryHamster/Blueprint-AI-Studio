@@ -26,11 +26,11 @@ from app.landed_signal import has_landed_signal, merge_verification_status
 from app.models import (
     Alert,
     Project,
+    QualificationVerdict,
     Task,
     TaskStatus,
     TaskWakeRegistration,
     WakeDeliveryState,
-    ReleaseVersion,
     get_task_total_vm_cost_usd,
 )
 from app.time_utils import _coerce_naive_utc, _utcnow
@@ -4061,8 +4061,10 @@ async def compute_release_qualifier_infra_metrics(
 ) -> Dict[str, Any]:
     """Aggregate release-qualifier audit-pipeline infra failure counters.
 
-    Scans ReleaseVersion.last_qualification JSONB (one record per version,
-    latest qualification only) and returns infra counters over the digest window.
+    Scans the immutable QualificationVerdict table (one row per finalized
+    attempt) and returns infra counters over the digest window.  Using verdict
+    history rather than ReleaseVersion.last_qualification means earlier infra
+    attempts are not silently dropped when a later re-qualification succeeds.
     Returns zeroed counters when no qualifying rows exist.
 
     Counters:
@@ -4075,14 +4077,14 @@ async def compute_release_qualifier_infra_metrics(
       release_infra_failure_repeat_signature_total — infra failures matching prior signature
       release_infra_failure_repeat_different_candidate_total — repeat signature on new candidate
     """
-    stmt = select(ReleaseVersion)
+    stmt = select(QualificationVerdict).where(
+        QualificationVerdict.finalized_at >= window_start
+    )
     if project_id:
-        stmt = stmt.where(ReleaseVersion.project_id == project_id)
+        stmt = stmt.where(QualificationVerdict.project_id == project_id)
 
-    result = await session.execute(stmt.limit(10000))
-    versions = result.scalars().all()
-
-    window_iso = window_start.isoformat()
+    result = await session.execute(stmt)
+    verdicts = result.scalars().all()
 
     qualifier_runs_total = 0
     release_infra_failure_total = 0
@@ -4093,33 +4095,24 @@ async def compute_release_qualifier_infra_metrics(
     release_infra_failure_repeat_signature_total = 0
     release_infra_failure_repeat_different_candidate_total = 0
 
-    for version in versions:
-        qual = version.last_qualification
-        if not isinstance(qual, dict):
-            continue
-        finalized_at = qual.get("finalized_at")
-        if not finalized_at or finalized_at < window_iso:
-            continue
+    for verdict in verdicts:
         qualifier_runs_total += 1
-        if qual.get("status") != "infra_failure":
+        if verdict.terminal_status != "infra_failure":
             continue
         release_infra_failure_total += 1
-        if qual.get("same_error_as_prior") or qual.get(
-            "same_infra_failure_as_previous"
-        ):
+        infra = (verdict.sub_scores or {}).get("infra_failure") or {}
+        if infra.get("same_error_as_prior"):
             release_infra_failure_repeat_signature_total += 1
-        if qual.get("same_error_different_candidate") or qual.get(
-            "same_infra_failure_different_candidate"
-        ):
+        if infra.get("same_error_different_candidate"):
             release_infra_failure_repeat_different_candidate_total += 1
-        error = qual.get("error") or ""
+        error = infra.get("error") or ""
         if error == "audit_report_missing":
             audit_report_missing_count += 1
         elif error == "audit_report_parseable_but_unscoreable":
             audit_report_parseable_but_unscoreable_count += 1
         elif error == "smoketest_report_missing":
             smoketest_report_missing_count += 1
-        streak = int(qual.get("consecutive_infra_errors") or 0)
+        streak = int(infra.get("consecutive_infra_errors") or 0)
         if streak > release_infra_failure_streak_max:
             release_infra_failure_streak_max = streak
 

@@ -40,6 +40,7 @@ function relativeAge(isoDate: string): string {
 
 export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanelProps) {
   const [entries, setEntries] = useState<CompletionDebtEntry[]>([]);
+  const [totalCount, setTotalCount] = useState<number>(0);
   const [loading, setLoading] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('open');
   const [dismissingId, setDismissingId] = useState<string | null>(null);
@@ -57,7 +58,10 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
         projectId,
         statusFilter === 'all' ? {} : { status: statusFilter },
       );
-      if (!ctrl.signal.aborted) setEntries(result.entries);
+      if (!ctrl.signal.aborted) {
+        setEntries(result.entries);
+        setTotalCount(result.total_count);
+      }
     } catch {
       if (!ctrl.signal.aborted) {
         addToast('Failed to load completion debts', 'error');
@@ -105,12 +109,10 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
     }
   };
 
-  const openCount = entries.filter(e => e.status === 'open').length;
-
   return (
     <WorkbenchPanel
       title="Completion Debt"
-      meta={statusFilter === 'open' ? (openCount > 0 ? `${openCount} open` : 'none open') : undefined}
+      meta={statusFilter === 'open' ? (totalCount > 0 ? `${totalCount} open` : 'none open') : undefined}
     >
       <div className="flex flex-col gap-2">
         <div className="flex flex-wrap gap-1">
@@ -139,6 +141,12 @@ export function CompletionDebtPanel({ projectId, addToast }: CompletionDebtPanel
             {loading ? '…' : 'Refresh'}
           </button>
         </div>
+
+        {entries.length > 0 && entries.length < totalCount && (
+          <p className="text-ui-xs text-neutral-500">
+            Showing {entries.length} of {totalCount}
+          </p>
+        )}
 
         {entries.length === 0 ? (
           <p className="py-4 text-center text-ui-sm text-neutral-500">

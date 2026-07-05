@@ -8,7 +8,7 @@ from typing import Dict, Any, List, Tuple
 from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import func, text, or_
+from sqlalchemy import DateTime, case, cast, func, text, or_
 from sqlalchemy.orm import load_only
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
@@ -332,6 +332,34 @@ def _task_completed_at(task: Task) -> datetime:
     return _derive_completed_at(task)
 
 
+def _task_completed_at_sql(*, dialect_name: str):
+    """SQL expression mirroring _derive_completed_at for windowed scans."""
+
+    if dialect_name == "postgresql":
+        projected_completed_at = Task.status_log[-1]["t"].astext
+        return cast(
+            case(
+                (
+                    projected_completed_at.op("~")(
+                        r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+                    ),
+                    cast(projected_completed_at, DateTime()),
+                ),
+                else_=Task.created_at,
+            ),
+            DateTime(),
+        )
+
+    return cast(
+        func.coalesce(
+            Task.completed_at,
+            func.datetime(func.json_extract(Task.status_log, "$[#-1].t")),
+            Task.created_at,
+        ),
+        DateTime(),
+    )
+
+
 def _percentile(values: List[float], fraction: float) -> float:
     ordered = sorted(values)
     return (
@@ -644,12 +672,14 @@ async def get_spend_burn_rate(
     Queries completed tasks over ``window_days`` to compute a rolling daily
     average and a 30-day projection so operators can track spend trajectory.
     """
+    dialect_name = resolve_dialect_name(session)
     cutoff = _utcnow() - timedelta(days=window_days)
+    terminal_at_sql = _task_completed_at_sql(dialect_name=dialect_name)
     filters = [
         Task.status.in_(
             [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED]
         ),
-        Task.created_at >= cutoff,
+        terminal_at_sql >= cutoff,
     ]
     if project_id is not None:
         filters.append(Task.project_id == project_id)
@@ -673,7 +703,7 @@ async def get_spend_burn_rate(
                     )
                 )
                 .where(*filters)
-                .order_by(Task.created_at.desc())
+                .order_by(terminal_at_sql.desc(), Task.created_at.desc())
                 .limit(20000)
             )
         )
@@ -684,6 +714,8 @@ async def get_spend_burn_rate(
     total_cost = 0.0
     task_count = 0
     for task in tasks:
+        if _task_completed_at(task) < cutoff:
+            continue
         cost = get_task_total_vm_cost_usd_or_none(task)
         if cost is None:
             continue

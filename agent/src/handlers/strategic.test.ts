@@ -134,6 +134,7 @@ const {
     'recordLlmTokens',
     'recordNumTurns',
     'recordToolUse',
+    'recordToolResultBytes',
     'refreshRuntimeState',
     'registerSizeCapMergeDriver',
     'replayLogBufferRateLimited',
@@ -165,6 +166,7 @@ const {
   WORKSPACE_PREP_EXPORT_NAMES: [
     'getLastWorkspacePrepOutcome',
     'prepareWorkspaceForRole',
+    'listWorkspaceTopDirs',
     'resetWorkspacePrepOutcome',
     'resolveReferenceRepo',
   ],
@@ -241,6 +243,7 @@ const {
   STRATEGIC_SECTIONS_EXPORT_NAMES: [
     'buildCapabilityVerificationSection',
     'buildCiComplianceSection',
+    'buildCompletionDebtSection',
     'buildClockAndRecentWorkSection',
     'buildConversationThreadSection',
     'buildCycleStartReconciliationSection',
@@ -275,10 +278,12 @@ const {
     'recordLlmCallStart',
     'recordLlmTokens',
     'recordNumTurns',
+    'recordToolResultBytes',
     'recordViewportScreenshotDownload',
     'resetFormatComplianceTelemetry',
     'resetLlmTelemetry',
     'setCurrentPromptFingerprint',
+    'setPromptSizeTelemetry',
   ],
 }));
 
@@ -1016,6 +1021,7 @@ describe('handleStrategic executor prompt: atomic staged create-direction', () =
     expect(executorPrompt).toBeDefined();
     expect(executorPrompt).toContain('"staged": true');
     expect(executorPrompt).toContain('one atomic op');
+    expect(executorPrompt).toContain('./messages send --stdin <<\'EOF\'');
     // Steers AWAY from the old create-then-stage sequence for new ideas.
     expect(executorPrompt).toContain('Do NOT create-then-stage');
   });

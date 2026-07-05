@@ -48,7 +48,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Awaitable, Callable, Deque, Dict, List
 
-from sqlmodel import select
+from sqlmodel import or_, select
 
 from app.time_utils import _utcnow
 
@@ -822,7 +822,15 @@ async def check_noncode_outcome_window_accounting(
             select(Task)
             .where(
                 Task.status.in_(terminal),
-                Task.created_at >= load_cutoff,
+                # Load a bounded superset by created_at or by a terminal-time
+                # column source that can still land inside the window. Rows
+                # with completed_at missing are kept so _derive_completed_at can
+                # fall back to the terminal status_log timestamp.
+                or_(
+                    Task.created_at >= load_cutoff,
+                    Task.completed_at >= window_start,
+                    Task.completed_at.is_(None),
+                ),
             )
             .order_by(Task.created_at.desc())
             .limit(ctx.sample_limit + 1)

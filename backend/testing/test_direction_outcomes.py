@@ -7921,6 +7921,465 @@ async def test_post_eviction_delta_is_idempotent(db_session: AsyncSession):
     assert agg.get("total_prs_merged") == 2
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-eviction healing of acceptance-verified + generalized aggregates.
+# The primitive _DELTA_FIELDS loop only patched merge counters; these tests pin
+# that a late recompute ALSO heals total_acceptance_verified_merged,
+# total_acceptance_verified_write_merged, total_generalized_successes,
+# total_generalized_terminal_outcomes, and outcome_kind_breakdown.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+async def _add_evicted_merged_write_children(
+    db_session: AsyncSession,
+    research_task_id_uuid: uuid.UUID,
+    project_id: uuid.UUID,
+    direction_id: str,
+    research_task_id: str,
+) -> Task:
+    """Create the original + one late-landing merged WRITE child; return the new one.
+
+    Both use the default 'create' (WRITE) payload, are landed, and carry no
+    acceptance verdict — so each counts as an acceptance-verified write merge and
+    a generalized code_merge success.
+    """
+    _ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "direction_id": direction_id,
+        "research_task_id": research_task_id,
+    }
+    await _create_child_task(
+        db_session,
+        research_task_id_uuid,
+        project_id,
+        status=TaskStatus.COMPLETED,
+        context=dict(_ctx),
+        title="old-merged",
+    )
+    new_merged = await _create_child_task(
+        db_session,
+        research_task_id_uuid,
+        project_id,
+        status=TaskStatus.COMPLETED,
+        context=dict(_ctx),
+        title="new-merged",
+    )
+    await db_session.flush()
+    return new_merged
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_late_recompute_updates_acceptance_and_generalized_aggregates(
+    db_session: AsyncSession,
+):
+    """A late merge on an evicted cycle heals the acceptance-verified + generalized
+    aggregate totals — not just the primitive merge counters.
+
+    Acceptance evidence gate: this test exercises real production code
+    (direction_outcomes._update_direction_research_outcomes via
+    refresh_direction_outcomes_after_merge) against real DB child tasks — no mocks.
+    The evicted cycle recorded 1 acceptance-verified write merge and 1 generalized
+    success; after a second write PR lands late, every acceptance-verified and
+    generalized aggregate key must move to the new total of 2, mirroring what the
+    eviction fold would have credited had the cycle still been live. Before the fix
+    these keys stayed frozen at 1 while total_prs_merged advanced to 2.
+    """
+    direction_id = "d-post-eviction-generalized"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Modern eviction snapshot: 1 acceptance-verified write merge, 1 generalized success.
+    initial_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "verified_autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 1,
+        "acceptance_verified_merged": 1,
+        "acceptance_verified_write_merged": 1,
+        "generalized_successes": 1,
+        "generalized_terminal_outcomes": 1,
+        "outcome_kind_breakdown": {
+            "code_merge": {"success": 1, "neutral": 0, "failure": 0}
+        },
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_verified_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 1,
+                "total_acceptance_verified_merged": 1,
+                "total_acceptance_verified_write_merged": 1,
+                "total_generalized_successes": 1,
+                "total_generalized_terminal_outcomes": 1,
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 1, "neutral": 0, "failure": 0}
+                },
+            },
+        )
+    ]
+    await db_session.flush()
+
+    new_merged = await _add_evicted_merged_write_children(
+        db_session, research_task.id, project.id, direction_id, research_task_id
+    )
+
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    agg = d.get("history_aggregate") or {}
+
+    # Primitive counters (regression guard): 1 -> 2.
+    assert agg.get("total_prs_merged") == 2
+    assert agg.get("total_verified_prs_merged") == 2
+    # Acceptance-verified totals must heal, not stay frozen at eviction value 1.
+    assert agg.get("total_acceptance_verified_merged") == 2, (
+        "acceptance-verified merged stale: "
+        f"{agg.get('total_acceptance_verified_merged')}"
+    )
+    assert agg.get("total_acceptance_verified_write_merged") == 2, (
+        "acceptance-verified write merged stale: "
+        f"{agg.get('total_acceptance_verified_write_merged')}"
+    )
+    # Generalized totals must heal.
+    assert agg.get("total_generalized_successes") == 2
+    assert agg.get("total_generalized_terminal_outcomes") == 2
+    # Nested breakdown must heal per kind/status.
+    breakdown = agg.get("outcome_kind_breakdown") or {}
+    total_success = sum(
+        int((c or {}).get("success", 0) or 0) for c in breakdown.values()
+    )
+    assert total_success == 2, f"breakdown success stale: {breakdown}"
+    # Snapshot re-synced to the new baseline for idempotency.
+    snap_after = (agg.get("_evicted_cycle_snapshots") or {}).get(research_task_id)
+    assert snap_after is not None
+    assert snap_after.get("acceptance_verified_merged") == 2
+    assert snap_after.get("generalized_successes") == 2
+    # research_history stays empty (evicted, not re-inserted).
+    assert d.get("research_history") == []
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_legacy_snapshot_no_double_count(db_session: AsyncSession):
+    """Legacy eviction snapshot missing the new baselines must not double-count.
+
+    The fold already credited the pre-eviction contribution into
+    total_acceptance_verified_merged / total_generalized_successes.  The legacy
+    snapshot lacks per-cycle generalized baselines, so those keys are seeded to
+    the FRESH value (delta 0) — the folded credit is retained rather than
+    re-added.  acceptance_verified_merged CAN be computed from the stored
+    verified_prs_merged primitive, so it still applies the genuine +1 delta (2).
+    generalized_successes / terminal_outcomes / breakdown all stay at 1 (the
+    folded value) because delta = fresh − fresh = 0 for a missing legacy key.
+    """
+    direction_id = "d-post-eviction-legacy"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # LEGACY snapshot: only the original 11 primitive keys, none of the new
+    # acceptance-verified / generalized baselines.
+    legacy_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 1,
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=legacy_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 1,
+                # Fold-credited pre-eviction contribution (baseline the delta must
+                # subtract via its legacy fallback, not re-add).
+                "total_acceptance_verified_merged": 1,
+                "total_acceptance_verified_write_merged": 1,
+                "total_generalized_successes": 1,
+                "total_generalized_terminal_outcomes": 1,
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 1, "neutral": 0, "failure": 0}
+                },
+            },
+        )
+    ]
+    await db_session.flush()
+
+    new_merged = await _add_evicted_merged_write_children(
+        db_session, research_task.id, project.id, direction_id, research_task_id
+    )
+
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await db_session.refresh(project)
+
+    agg = project.directions[0].get("history_aggregate") or {}
+    # acceptance_verified_merged: reconstructed from verified_prs_merged stored in
+    # the legacy snapshot -> genuine +1 delta -> total 2 (NOT 3).
+    assert agg.get("total_acceptance_verified_merged") == 2, (
+        f"wrong acceptance-verified: {agg.get('total_acceptance_verified_merged')}"
+    )
+    # generalized_successes/terminal/breakdown: legacy key absent -> seed=fresh ->
+    # delta=0 -> folded value retained at 1 (NOT 2 or 3).
+    assert agg.get("total_generalized_successes") == 1, (
+        f"generalized_successes should be frozen at folded value: {agg.get('total_generalized_successes')}"
+    )
+    assert agg.get("total_generalized_terminal_outcomes") == 1, (
+        f"generalized_terminal_outcomes should be frozen at folded value: {agg.get('total_generalized_terminal_outcomes')}"
+    )
+    breakdown = agg.get("outcome_kind_breakdown") or {}
+    total_success = sum(
+        int((c or {}).get("success", 0) or 0) for c in breakdown.values()
+    )
+    assert total_success == 1, f"breakdown should be frozen at folded value: {breakdown}"
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_legacy_snapshot_no_double_count_terminal_exceeds_prs(
+    db_session: AsyncSession,
+):
+    """Legacy snapshot where terminal > prs_merged must NOT double-count generalized.
+
+    Real scenario: cycle has 1 merged PR + 3 successful research tasks -> the fold
+    credited total_generalized_successes = 4.  The legacy snapshot stores only
+    prs_merged=1.  With the old (broken) fallback, a late-merge recompute would
+    compute delta = fresh(5) - prs_merged(1) = 4 and push the total to 8.  The fix
+    seeds the missing generalized baseline to the FRESH value so delta = 0; the
+    folded 4 is retained.  (acceptance_verified_merged still applies its genuine
+    +1 via verified_prs_merged.)
+    """
+    direction_id = "d-post-eviction-legacy-rich"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Legacy snapshot: only primitives, no generalized keys.
+    legacy_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 1,
+    }
+    # Fold credited 4 generalized successes: 1 code_merge + 3 research_quality.
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=legacy_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 1,
+                "total_acceptance_verified_merged": 1,
+                "total_acceptance_verified_write_merged": 1,
+                # Fold credited 4 (1 merge + 3 research successes).
+                "total_generalized_successes": 4,
+                "total_generalized_terminal_outcomes": 4,
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 1, "neutral": 0, "failure": 0},
+                    "research_quality": {"success": 3, "neutral": 0, "failure": 0},
+                },
+            },
+        )
+    ]
+    await db_session.flush()
+
+    # One pre-existing merged write child (the one that was folded into the snapshot).
+    _ctx_merge = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "direction_id": direction_id,
+        "research_task_id": research_task_id,
+    }
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context=dict(_ctx_merge),
+        title="old-merged",
+    )
+    # Three successful research children (read-only, generalized successes but no merge).
+    for i in range(3):
+        await _create_child_task(
+            db_session,
+            research_task.id,
+            project.id,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={
+                "direction_id": direction_id,
+                "research_task_id": research_task_id,
+                "research_surviving_findings": 1,
+            },
+            title=f"research-success-{i}",
+        )
+    # Late-landing merged write PR (the new merge that triggers the recompute).
+    new_merged = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context=dict(_ctx_merge),
+        title="new-merged-late",
+    )
+    await db_session.flush()
+
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await db_session.refresh(project)
+
+    agg = project.directions[0].get("history_aggregate") or {}
+
+    # acceptance_verified_merged: genuine +1 via verified_prs_merged stored in snap.
+    assert agg.get("total_acceptance_verified_merged") == 2, (
+        f"acceptance_verified_merged wrong: {agg.get('total_acceptance_verified_merged')}"
+    )
+    # generalized keys: legacy snap missing -> seed=fresh(5) -> delta=0 -> frozen at 4.
+    # Crucially NOT 8 (= 4 + (5-1) with old broken fallback).
+    assert agg.get("total_generalized_successes") == 4, (
+        f"generalized_successes double-counted (want 4 not 8): {agg.get('total_generalized_successes')}"
+    )
+    assert agg.get("total_generalized_terminal_outcomes") == 4, (
+        f"generalized_terminal_outcomes double-counted: {agg.get('total_generalized_terminal_outcomes')}"
+    )
+    breakdown = agg.get("outcome_kind_breakdown") or {}
+    total_success = sum(
+        int((c or {}).get("success", 0) or 0) for c in breakdown.values()
+    )
+    assert total_success == 4, (
+        f"breakdown double-counted (want 4 not 8): {breakdown}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_acceptance_generalized_deltas_idempotent(
+    db_session: AsyncSession,
+):
+    """Running the late recompute twice yields the same acceptance/generalized totals."""
+    direction_id = "d-post-eviction-gen-idempotent"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    initial_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "verified_autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 1,
+        "acceptance_verified_merged": 1,
+        "acceptance_verified_write_merged": 1,
+        "generalized_successes": 1,
+        "generalized_terminal_outcomes": 1,
+        "outcome_kind_breakdown": {
+            "code_merge": {"success": 1, "neutral": 0, "failure": 0}
+        },
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_verified_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 1,
+                "total_acceptance_verified_merged": 1,
+                "total_acceptance_verified_write_merged": 1,
+                "total_generalized_successes": 1,
+                "total_generalized_terminal_outcomes": 1,
+                "outcome_kind_breakdown": {
+                    "code_merge": {"success": 1, "neutral": 0, "failure": 0}
+                },
+            },
+        )
+    ]
+    await db_session.flush()
+
+    new_merged = await _add_evicted_merged_write_children(
+        db_session, research_task.id, project.id, direction_id, research_task_id
+    )
+
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await db_session.refresh(project)
+
+    agg = project.directions[0].get("history_aggregate") or {}
+    # Second call must not add extra credit to any healed aggregate key.
+    assert agg.get("total_acceptance_verified_merged") == 2
+    assert agg.get("total_acceptance_verified_write_merged") == 2
+    assert agg.get("total_generalized_successes") == 2
+    assert agg.get("total_generalized_terminal_outcomes") == 2
+    breakdown = agg.get("outcome_kind_breakdown") or {}
+    total_success = sum(
+        int((c or {}).get("success", 0) or 0) for c in breakdown.values()
+    )
+    assert total_success == 2
+
+
 @pytest.mark.asyncio
 async def test_stranded_discount_routes_to_aggregate_when_evicted(
     db_session: AsyncSession,

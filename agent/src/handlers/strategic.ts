@@ -928,7 +928,7 @@ Only escalate when you literally cannot proceed without the user:
 - Ambiguous user intent where the wrong call wastes cycles
 - External blockers outside the system's control
 
-Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
+Use \`./strategic pending-confirm\` for those — it's the structured channel for blocking asks. Use \`./messages send\` for general conversation or observations, and \`./messages send --stdin\` for quote-heavy or multiline replies. NEVER \`./messages send\` to ask "should I do X?" for coding decisions — those you make.
 
 If a direction is dead, retire it. If there's an obvious gap, open it. If a user asked for something, create a direction with a source citation on the gap.
 
@@ -1073,6 +1073,9 @@ ${renderStrategicFetchVerbHelpLines().join('\n')}
 # NOT need to recover the full UUID out-of-band.
 ./messages resolve <ref> 'How it was addressed'
 ./messages send 'Observation or note to the user'
+./messages send --stdin <<'EOF'
+Observation or note to the user
+EOF
 \`\`\`
 
 # Existing directions (for update/retire operations)

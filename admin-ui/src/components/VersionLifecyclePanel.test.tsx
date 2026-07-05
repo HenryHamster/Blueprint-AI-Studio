@@ -4089,4 +4089,173 @@ describe('VersionLifecyclePanel', () => {
       expect(api.linkCriteriaToDirection).not.toHaveBeenCalled();
     });
   });
+
+  describe('completion-debt lane in qualification sub-scores', () => {
+    function makeQualWithDebt(debtOverrides: Partial<api.CompletionDebtQualSnapshot> = {}, debtPressure = 0.8): api.VersionQualification {
+      return makeQualification({
+        sub_scores: {
+          audit: 0.9,
+          test_erosion: 0.85,
+          smoketest: 0.95,
+          debt_pressure: debtPressure,
+        },
+        completion_debt: {
+          total_open: 2,
+          items: [
+            { id: 'd-1', kind: 'default_off_merge', title: 'Feature flag X', description: 'desc', created_at: '2026-01-01T00:00:00Z', age_days: 10 },
+            { id: 'd-2', kind: 'observe_mode', title: 'Observe knob Y', description: 'desc', created_at: '2026-01-02T00:00:00Z', age_days: 5 },
+          ],
+          ...debtOverrides,
+        },
+      });
+    }
+
+    it('renders debt lane and items when debt_pressure and completion_debt are present', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualWithDebt() }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText(/debt: 2 open/)).toBeInTheDocument();
+      expect(screen.getByTestId('debt-items-list')).toBeInTheDocument();
+      expect(screen.getByText('Feature flag X')).toBeInTheDocument();
+      expect(screen.getByText('Observe knob Y')).toBeInTheDocument();
+    });
+
+    it('omits debt lane when debt_pressure is absent (legacy row)', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualification({
+            sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95 },
+          }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByText(/debt:/)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('debt-items-list')).not.toBeInTheDocument();
+    });
+
+    it('omits debt lane when last_qualification is null', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: null }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.queryByText(/debt:/)).not.toBeInTheDocument();
+    });
+
+    it('renders clean zero-debt state when total_open is 0', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualification({
+            sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95, debt_pressure: 1.0 },
+            completion_debt: { total_open: 0, items: [] },
+          }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText('debt: none')).toBeInTheDocument();
+      expect(screen.queryByTestId('debt-items-list')).not.toBeInTheDocument();
+    });
+
+    it('shows truncation note when total_open exceeds items length', () => {
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ last_qualification: makeQualWithDebt({ total_open: 5 }) }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      expect(screen.getByText(/showing 2 oldest/)).toBeInTheDocument();
+    });
+
+    it('renders debt segment in verdict history row when debt_pressure present', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [{
+          id: 'v-1',
+          release_version_id: 'r-1',
+          candidate_sha: 'abc1234',
+          confidence: 0.85,
+          sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95, debt_pressure: 0.8 },
+          completion_debt: { total_open: 3, items: [] },
+          blocker: null,
+          audit_missing_reason: null,
+          would_promote: false,
+          promotion_enabled: false,
+          terminal_status: 'not_promoted',
+          threshold: 0.9,
+          started_at: null,
+          finalized_at: '2026-01-01T00:00:00Z',
+          created_at: '2026-01-01T00:00:00Z',
+        }],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ phase: 'stabilize' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('verdict-history')).toBeInTheDocument();
+      });
+      expect(screen.getByText(/d:3open/)).toBeInTheDocument();
+    });
+
+    it('omits debt segment in verdict history when debt_pressure absent', async () => {
+      vi.mocked(api.fetchQualificationVerdicts).mockResolvedValue({
+        verdicts: [{
+          id: 'v-1',
+          release_version_id: 'r-1',
+          candidate_sha: 'abc1234',
+          confidence: 0.85,
+          sub_scores: { audit: 0.9, test_erosion: 0.85, smoketest: 0.95 },
+          blocker: null,
+          audit_missing_reason: null,
+          would_promote: false,
+          promotion_enabled: false,
+          terminal_status: 'not_promoted',
+          threshold: 0.9,
+          started_at: null,
+          finalized_at: '2026-01-01T00:00:00Z',
+          created_at: '2026-01-01T00:00:00Z',
+        }],
+        total: 1,
+      });
+
+      render(
+        <VersionLifecyclePanel
+          data={makeVersionLifecycleResponse({ current_version: makeCurrentVersion({ phase: 'stabilize' }) })}
+          loading={false}
+          projectId="proj-1"
+          onRefresh={mockRefresh}
+        />
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTestId('verdict-history')).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/d:\d+open/)).not.toBeInTheDocument();
+    });
+  });
 });

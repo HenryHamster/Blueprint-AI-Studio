@@ -221,6 +221,17 @@ async def _query_completion_debts(
 
 async def _count_open_completion_debts(session: Any, project_id: Any) -> int:
     """Return the total count of open debt rows visible to this project."""
+    return await count_completion_debts(session, project_id=project_id, status=STATUS_OPEN)
+
+
+async def count_completion_debts(
+    session: Any,
+    *,
+    project_id: Any,
+    status: str | None = None,
+    kind: str | None = None,
+) -> int:
+    """Return the total count of debt rows matching the given filters."""
     from app.models import CompletionDebtEntry
     from sqlalchemy import func, or_
 
@@ -233,7 +244,6 @@ async def _count_open_completion_debts(session: Any, project_id: Any) -> int:
                     CompletionDebtEntry.project_id == project_id,
                     CompletionDebtEntry.project_id.is_(None),
                 ),
-                CompletionDebtEntry.status == STATUS_OPEN,
             )
         )
     else:
@@ -242,9 +252,12 @@ async def _count_open_completion_debts(session: Any, project_id: Any) -> int:
             .select_from(CompletionDebtEntry)
             .where(
                 CompletionDebtEntry.project_id.is_(None),
-                CompletionDebtEntry.status == STATUS_OPEN,
             )
         )
+    if status is not None:
+        q = q.where(CompletionDebtEntry.status == status)
+    if kind is not None:
+        q = q.where(CompletionDebtEntry.kind == kind)
     return (await session.execute(q)).scalar_one()
 
 

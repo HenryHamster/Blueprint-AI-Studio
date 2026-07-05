@@ -25730,6 +25730,63 @@ class TestCompletionDebtAdmin:
         assert resolved["entry"]["status"] == "resolved"
         assert resolved["entry"]["resolved_at"] is not None
 
+    @pytest.mark.asyncio
+    async def test_completion_debt_list_returns_total_count_and_has_more(
+        self, client: AsyncClient, db_session
+    ):
+        """total_count reflects the true DB count even when entries are capped by limit."""
+        from app.models import CompletionDebtEntry
+
+        project = await _make_project(db_session)
+
+        # Create 5 open + 2 dismissed entries
+        for i in range(5):
+            db_session.add(
+                CompletionDebtEntry(
+                    project_id=project.id,
+                    kind="dormant_knob",
+                    title=f"Open knob {i}",
+                )
+            )
+        for i in range(2):
+            db_session.add(
+                CompletionDebtEntry(
+                    project_id=project.id,
+                    kind="capability_trial",
+                    title=f"Dismissed trial {i}",
+                    status="dismissed",
+                    resolution_reason="done",
+                )
+            )
+        await db_session.commit()
+
+        # With limit=2 and status=open, total_count must reflect all 5 open rows
+        resp = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?status=open&limit=2"
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "total_count" in data, "response must include total_count"
+        assert data["count"] == 2, "count should equal number of returned entries"
+        assert data["total_count"] == 5, "total_count must reflect all open rows in the DB"
+        assert data["total_count"] > data["count"], "total_count must exceed count when truncated"
+
+        # With no status filter, total_count should include open+dismissed (7 total)
+        resp_all = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?limit=1"
+        )
+        assert resp_all.status_code == 200
+        data_all = resp_all.json()
+        assert data_all["total_count"] == 7
+        assert data_all["count"] == 1
+
+        # With status=dismissed, total_count should be 2
+        resp_dismissed = await client.get(
+            f"/api/admin/projects/{project.id}/completion-debts?status=dismissed"
+        )
+        assert resp_dismissed.status_code == 200
+        assert resp_dismissed.json()["total_count"] == 2
+
 
 class TestStrategistDisposeCompletionDebt:
     """Strategic ops: dispose_completion_debt + debt_id linkage on spawn."""

@@ -3850,3 +3850,175 @@ class TestSpendBurnRate:
         assert body["window_cost_usd"] == 0.0
         assert body["daily_spend_usd"] == 0.0
         assert body["monthly_forecast_usd"] == 0.0
+
+    @pytest.mark.asyncio
+    async def test_spend_burn_rate_counts_task_completed_inside_window_when_created_before_window(
+        self, client: AsyncClient, db_session
+    ):
+        """A task created before the window but completed inside it is counted.
+
+        Long-running tasks start before the reporting cutoff but finish within
+        the window.  The burn-rate endpoint must filter by completion time, not
+        creation time, so these tasks are included in window_cost_usd and
+        task_count.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        window_days = 7
+
+        # Task created 10 days ago (outside window) but completed 2 days ago (inside window).
+        created_at = now - timedelta(days=10)
+        completed_at = now - timedelta(days=2)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="long-running-task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=created_at,
+                created_at=created_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=created_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        # Excluded control: task created AND completed well outside the window.
+        outside_at = now - timedelta(days=20)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="fully-outside-task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=outside_at,
+                created_at=outside_at,
+                status_log=[{"s": "COMPLETED", "t": outside_at.isoformat()}],
+                vm_provisioned_at=outside_at,
+                vm_stopped_at=outside_at + timedelta(hours=1),
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days={window_days}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Only the long-running task (completed inside window) should be counted.
+        assert body["task_count"] == 1, (
+            f"Expected task_count=1 (long-running task completed inside window), got {body['task_count']}"
+        )
+        assert body["window_cost_usd"] > 0.0, "Expected positive cost for long-running task"
+        # Verify derived fields are internally consistent (rounding tolerance=0.10
+        # because daily_spend_usd and monthly_forecast_usd are each rounded to 2dp
+        # independently, so monthly can drift from daily*30 by up to ~0.15).
+        assert body["daily_spend_usd"] == pytest.approx(
+            body["window_cost_usd"] / window_days, abs=0.10
+        )
+        assert body["monthly_forecast_usd"] == pytest.approx(
+            body["daily_spend_usd"] * 30, abs=0.10
+        )
+
+    @pytest.mark.asyncio
+    async def test_spend_burn_rate_counts_task_created_before_widened_window(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks created before the widened SQL bound still count if they finish in-window."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        window_days = 7
+        created_at = now - timedelta(days=20)
+        completed_at = now - timedelta(days=1)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="very-long-running-task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=created_at,
+                created_at=created_at,
+                status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+                vm_provisioned_at=created_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days={window_days}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["window_cost_usd"] > 0.0
+
+    @pytest.mark.asyncio
+    async def test_spend_burn_rate_in_window_task_survives_null_completed_at_crowd(
+        self, client: AsyncClient, db_session
+    ):
+        """A task completed inside the window is not dropped behind 20k null-completed rows."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        window_days = 7
+        target_created_at = now - timedelta(days=10)
+        target_completed_at = now - timedelta(days=2)
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="target-task",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=target_created_at,
+                created_at=target_created_at,
+                status_log=[{"s": "COMPLETED", "t": target_completed_at.isoformat()}],
+                vm_provisioned_at=target_created_at,
+                vm_stopped_at=target_completed_at,
+                vm_spot=False,
+            )
+        )
+
+        crowd_terminal_at = now - timedelta(days=20)
+        crowd_created_at = now - timedelta(days=1)
+        db_session.add_all(
+            [
+                make_task(
+                    project_id=project.id,
+                    title=f"crowd-{idx}",
+                    status=TaskStatus.COMPLETED,
+                    created_by="ORCHESTRATOR",
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    started_at=crowd_created_at,
+                    created_at=crowd_created_at,
+                    status_log=[{"s": "COMPLETED", "t": crowd_terminal_at.isoformat()}],
+                    vm_provisioned_at=crowd_created_at,
+                    vm_stopped_at=crowd_terminal_at + timedelta(hours=1),
+                    vm_spot=False,
+                )
+                for idx in range(20000)
+            ]
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/spend-burn-rate?project_id={project.id}&window_days={window_days}"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["task_count"] == 1
+        assert body["window_cost_usd"] > 0.0

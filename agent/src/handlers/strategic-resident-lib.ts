@@ -407,10 +407,11 @@ conversation with the operator in memory. You operate at two speeds:
 - **Interactive (operator chat):** when the operator sends a message, answer it
   directly and conversationally, take a quick action if they ask, and keep it
   tight. First priority is always a live operator message. You MUST post your
-  conversational answer to the operator with \`./messages send '<answer>'\` — the
-  live stream is a transcript, but the durable chat reply the operator reads is
-  the message you send. Every reply to an operator message REQUIRES a
-  \`./messages send\`; do not answer only in the stream.
+  conversational answer to the operator with \`./messages send '<answer>'\` or,
+  for apostrophe-heavy or multiline replies, \`./messages send --stdin\` with a
+  heredoc or pipe. The live stream is a transcript, but the durable chat reply
+  the operator reads is the message you send. Every reply to an operator
+  message REQUIRES a \`./messages send\`; do not answer only in the stream.
 - **Autonomous (between messages):** when no operator input is pending you are
   handed a turn to advance the project. Complete ONE meaningful unit of progress —
   refine the problem model, open/refine/retire a direction, spawn needed work,
@@ -433,8 +434,9 @@ ends only when the operator stops it.
 - \`./fetch <kind> <id>\` — pull full detail when context was trimmed. The
   canonical verb list and per-verb guidance are below.
 - \`./design-doc <get|list|set|delete> <key>\` — read/update design-doc sections.
-- \`./messages send '<text>'\` / \`./messages resolve <ref> '<how>'\` — talk to the
-  operator and close addressed messages.
+- \`./messages send '<text>'\` / \`./messages send --stdin\` / \`./messages resolve <ref> '<how>'\` — talk to the
+  operator and close addressed messages. Use \`--stdin\` for apostrophe-heavy or
+  multiline replies.
 
 ${ctx.fetchGuidanceText?.trim() ? `${ctx.fetchGuidanceText.trim()}\n\n` : ''}
 

@@ -4644,7 +4644,7 @@ async def admin_list_completion_debts(
     current_user: dict = Depends(require_admin),
 ):
     """List completion-debt entries for a project with optional filters."""
-    from app.completion_debt import debt_to_dict, list_completion_debts
+    from app.completion_debt import count_completion_debts, debt_to_dict, list_completion_debts
 
     project = await session.get(Project, project_id)
     if not project:
@@ -4662,7 +4662,13 @@ async def admin_list_completion_debts(
         limit=min(limit, 200),
         offset=offset,
     )
-    return {"entries": [debt_to_dict(e) for e in entries], "count": len(entries)}
+    total_count = await count_completion_debts(
+        session,
+        project_id=project_id,
+        status=status,
+        kind=kind,
+    )
+    return {"entries": [debt_to_dict(e) for e in entries], "count": len(entries), "total_count": total_count}
 
 
 class _DismissDebtRequest(BaseModel):

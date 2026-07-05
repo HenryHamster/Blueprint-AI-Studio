@@ -1,6 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { SettingsOrchestratorSection } from './SettingsOrchestratorSection';
+import {
+  fetchMetricsIntegrityObservability,
+  patchMetricsIntegritySettings,
+} from '../api';
 
 vi.mock('../api', () => ({
   fetchEvergreenFillSettings: vi.fn().mockResolvedValue({
@@ -14,10 +19,12 @@ vi.mock('../api', () => ({
   }),
   patchEvergreenFillSettings: vi.fn().mockResolvedValue(undefined),
   patchStructuralHealthSettings: vi.fn().mockResolvedValue(undefined),
+  patchMetricsIntegritySettings: vi.fn().mockResolvedValue(undefined),
   apiFetch: vi.fn().mockResolvedValue({
     ok: true,
     json: vi.fn().mockResolvedValue({
       structural_health_audit_mode: 'off',
+      metrics_integrity_sweep_mode: 'off',
     }),
   }),
   fetchEvergreenFillObservability: vi.fn().mockResolvedValue({
@@ -28,6 +35,17 @@ vi.mock('../api', () => ({
   }),
   fetchEvergreenBacklog: vi.fn().mockResolvedValue({ items: [] }),
   fetchEvergreenBacklogSummary: vi.fn().mockResolvedValue({}),
+  fetchMetricsIntegrityObservability: vi.fn().mockResolvedValue({
+    ticks: 0,
+    checks_run: 0,
+    flags_total: 0,
+    errors_total: 0,
+    enrolled_total: 0,
+    last_tick_at: null,
+    last_tick: null,
+    recent_ticks: [],
+    recent_flags: [],
+  }),
 }));
 
 beforeEach(() => {
@@ -92,6 +110,72 @@ describe('SettingsOrchestratorSection', () => {
     // Panel should be rendered
     const panel = screen.getByTestId('structural-health-observability-panel');
     expect(panel).toBeTruthy();
+  });
+
+  it('renders_metrics_integrity_observability_panel', () => {
+    render(<SettingsOrchestratorSection {...baseProps} />);
+    const panel = screen.getByTestId('metrics-integrity-observability-panel');
+    expect(panel).toBeTruthy();
+    expect(panel.textContent).toContain('Metrics Integrity Observability');
+  });
+
+  it('renders metrics integrity results and recent flags from the poller payload', async () => {
+    vi.mocked(fetchMetricsIntegrityObservability).mockResolvedValueOnce({
+      ticks: 7,
+      checks_run: 19,
+      flags_total: 2,
+      errors_total: 1,
+      enrolled_total: 3,
+      last_tick_at: '2026-07-05T12:00:00Z',
+      last_tick: null,
+      recent_ticks: [],
+      recent_flags: [
+        { check_id: 'check-a', metric: 'cpu', expected: '< 0.8', found: '0.92' },
+        { check_id: 'check-b', metric: 'memory', expected: '< 0.7', found: '0.81' },
+      ],
+    });
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const panel = screen.getByTestId('metrics-integrity-observability-panel');
+    expect(await within(panel).findByText('7 ticks · 2 flags')).toBeInTheDocument();
+    expect(within(panel).getByText('Checks Run').parentElement).toHaveTextContent('19');
+    expect(within(panel).getByText('Errors Total').parentElement).toHaveTextContent('1');
+    expect(within(panel).getByText('check-b')).toBeInTheDocument();
+    expect(within(panel).getByText('memory')).toBeInTheDocument();
+    expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
+  });
+
+  it('renders the empty-state message when the metrics poller has no ticks or flags', async () => {
+    vi.mocked(fetchMetricsIntegrityObservability).mockResolvedValueOnce({
+      ticks: 0,
+      checks_run: 0,
+      flags_total: 0,
+      errors_total: 0,
+      enrolled_total: 0,
+      last_tick_at: null,
+      last_tick: null,
+      recent_ticks: [],
+      recent_flags: [],
+    });
+
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const panel = screen.getByTestId('metrics-integrity-observability-panel');
+    expect(await within(panel).findByText('No metrics integrity sweep ticks recorded yet.')).toBeInTheDocument();
+    expect(within(panel).queryByText('No drift flags recorded in recent ticks.')).not.toBeInTheDocument();
+  });
+
+  it('patches the metrics integrity sweep mode when a mode button is clicked', async () => {
+    const user = userEvent.setup();
+    render(<SettingsOrchestratorSection {...baseProps} />);
+
+    const panel = screen.getByTestId('metrics-integrity-observability-panel');
+    await user.click(within(panel).getByRole('button', { name: 'enforce' }));
+
+    await waitFor(() => {
+      expect(patchMetricsIntegritySettings).toHaveBeenCalledWith({ metrics_integrity_sweep_mode: 'enforce' });
+    });
   });
 
   it('calls onUpdateMaxVMs when max VMs input is blurred with a valid value', () => {

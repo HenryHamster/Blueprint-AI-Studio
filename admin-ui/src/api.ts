@@ -2061,6 +2061,21 @@ export interface VersionQualificationSubScores {
   test_erosion: number;
   smoketest: number;
   ci_resolution?: CiResolution | null;
+  debt_pressure?: number | null;
+}
+
+export interface CompletionDebtQualItem {
+  id: string;
+  kind: string;
+  title: string;
+  description: string;
+  created_at: string | null;
+  age_days: number | null;
+}
+
+export interface CompletionDebtQualSnapshot {
+  items: CompletionDebtQualItem[];
+  total_open: number;
 }
 
 export type QualificationStatus =
@@ -2166,6 +2181,7 @@ export interface VersionQualification {
   promotion_error_detail?: string | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
+  completion_debt?: CompletionDebtQualSnapshot | null;
 }
 
 /** Single resolved serving block — the canonical answer to "is this version live?"
@@ -2912,6 +2928,7 @@ export interface QualificationVerdictRecord {
   promotion_error_detail?: string | null;
   goal_alignment?: GoalAlignment | null;
   blind_merge_grade?: BlindMergeGrade | null;
+  completion_debt?: CompletionDebtQualSnapshot | null;
 }
 
 export interface QualificationVerdictsInfraContext {
@@ -4306,6 +4323,38 @@ export async function patchStructuralHealthSettings(patch: { structural_health_a
   }
 }
 
+export interface MetricsIntegrityObservabilityResponse {
+  ticks: number;
+  checks_run: number;
+  flags_total: number;
+  errors_total: number;
+  enrolled_total: number;
+  last_tick_at: string | null;
+  last_tick: Record<string, unknown> | null;
+  recent_ticks: Record<string, unknown>[];
+  recent_flags: Record<string, unknown>[];
+}
+
+export async function fetchMetricsIntegrityObservability(
+  signal?: AbortSignal,
+): Promise<MetricsIntegrityObservabilityResponse> {
+  const res = await apiFetch('/api/admin/evergreen/metrics-integrity-observability', undefined, 2, 30000, signal);
+  if (!res.ok) throw new Error(`Failed to fetch metrics integrity observability: ${res.status}`);
+  return res.json();
+}
+
+export async function patchMetricsIntegritySettings(patch: { metrics_integrity_sweep_mode?: string }): Promise<void> {
+  const res = await apiFetch('/api/admin/settings', {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    const msg = data?.detail || `Failed to update metrics integrity settings: ${res.status}`;
+    throw new Error(typeof msg === 'string' ? msg : `Failed to update metrics integrity settings: ${res.status}`);
+  }
+}
+
 export async function declareCapabilityVerdict(
   projectId: string,
   capName: string,
@@ -4520,7 +4569,7 @@ export interface CompletionDebtEntry {
 export async function fetchCompletionDebts(
   projectId: string,
   filters?: { status?: string; kind?: string },
-): Promise<{ entries: CompletionDebtEntry[]; count: number }> {
+): Promise<{ entries: CompletionDebtEntry[]; count: number; total_count: number }> {
   const params = new URLSearchParams();
   if (filters?.status) params.set('status', filters.status);
   if (filters?.kind) params.set('kind', filters.kind);

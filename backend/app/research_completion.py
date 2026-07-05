@@ -48,6 +48,7 @@ from app.direction_metrics import (  # noqa: F401 — re-exported for callers/te
     _HISTORY_AGG_DEFAULTS,
     _DECOMP_AGG_DEFAULTS,
     _fold_evicted_into_aggregate,
+    build_evicted_cycle_snapshot,
     _compute_momentum_factor,
     _compute_acceptance_rate,
     _compute_productivity_score,
@@ -6188,54 +6189,7 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             for _ev in new_history[:-10]:
                 _tid = _ev.get("task_id")
                 if _tid:
-                    _evicted_snaps[str(_tid)] = {
-                        "prs_merged": int(_ev.get("prs_merged") or 0),
-                        "verified_prs_merged": int(
-                            _ev.get(
-                                "verified_prs_merged",
-                                _ev.get("prs_merged", 0),
-                            )
-                            or 0
-                        ),
-                        "autonomous_prs_merged": int(
-                            _ev.get(
-                                "autonomous_prs_merged",
-                                _ev.get("prs_merged", 0),
-                            )
-                            or 0
-                        ),
-                        "verified_autonomous_prs_merged": int(
-                            _ev.get(
-                                "verified_autonomous_prs_merged",
-                                _ev.get(
-                                    "autonomous_prs_merged",
-                                    _ev.get("prs_merged", 0),
-                                ),
-                            )
-                            or 0
-                        ),
-                        "assisted_prs_merged": int(
-                            _ev.get("assisted_prs_merged") or 0
-                        ),
-                        "reachable_prs_merged": int(
-                            _ev.get("reachable_prs_merged") or 0
-                        ),
-                        "stranded_prs_merged": int(
-                            _ev.get("stranded_prs_merged") or 0
-                        ),
-                        "acceptance_proven_merged": int(
-                            _ev.get("acceptance_proven_merged") or 0
-                        ),
-                        "acceptance_consumed_merged": int(
-                            _ev.get("acceptance_consumed_merged") or 0
-                        ),
-                        "acceptance_declared_merged": int(
-                            _ev.get("acceptance_declared_merged") or 0
-                        ),
-                        "acceptance_merged_write_total": int(
-                            _ev.get("acceptance_merged_write_total") or 0
-                        ),
-                    }
+                    _evicted_snaps[str(_tid)] = build_evicted_cycle_snapshot(_ev)
         target["research_history"] = new_history[-10:]
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = productive

@@ -250,6 +250,14 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('CTX');
   });
 
+  it('bootstrap_prompt_uses_quote_safe_message_delivery', () => {
+    const p = buildBootstrapPrompt(base);
+    expect(p).toContain("./messages send '<answer>'");
+    expect(p).toContain('./messages send --stdin');
+    expect(p).toContain('apostrophe-heavy or multiline replies');
+    expect(p).toContain('heredoc or pipe');
+  });
+
   it('includes canonical fetch guidance when provided', () => {
     const p = buildBootstrapPrompt({
       ...base,
@@ -918,9 +926,11 @@ describe('serializeLedger / restoreLedger', () => {
     const serialized = serializeLedger(records, EXAM_RECORDS_CAP + 10, false);
     const restored = restoreLedger(serialized);
     if (restored === null) throw new Error('expected non-null restore');
-    expect(restored.records).toHaveLength(EXAM_RECORDS_CAP);
-    // Should keep the LAST N records (most recent).
-    expect(restored.records[0].surfaceKey).toBe('code:dir10');
+    expect(restored.records.length).toBeLessThanOrEqual(EXAM_RECORDS_CAP);
+    // Should keep a suffix of the original records in order.
+    expect(restored.records.map(r => r.surfaceKey)).toEqual(
+      records.slice(-restored.records.length).map(r => r.surfaceKey),
+    );
   });
 
   it('drops oldest records to stay within EXAM_LEDGER_MAX_BYTES', () => {

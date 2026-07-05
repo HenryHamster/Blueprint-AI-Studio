@@ -412,6 +412,68 @@ async def test_noncode_window_flags_misclassified_task(db):
 
 
 @pytest.mark.asyncio
+async def test_noncode_window_flags_long_running_task_created_before_load_cutoff(db):
+    """A task created before load_cutoff but completed inside the window must
+    be loaded and flagged as mis-windowed (the regression for the OR-widened
+    WHERE clause fix)."""
+    project = await _project(db)
+    now = _utcnow()
+    # created_at is beyond the old load_cutoff (2*window_days = 28 days ago),
+    # so the previous created_at-only query would miss it entirely.
+    very_old_created = now - timedelta(days=2 * 14 + 5)  # 33 days ago
+    completed_inside_window = now - timedelta(days=1)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_at=very_old_created,
+        completed_at=completed_inside_window,
+        status_log=[{"t": completed_inside_window.isoformat(), "s": "COMPLETED"}],
+        context={},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_noncode_outcome_window_accounting(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    assert flagged[0].delta == 1
+
+
+@pytest.mark.asyncio
+async def test_noncode_window_flags_task_with_missing_completed_at_and_terminal_status_log(db):
+    """Rows with missing completed_at still count if status_log shows an in-window terminal time."""
+    project = await _project(db)
+    now = _utcnow()
+    very_old_created = now - timedelta(days=33)
+    terminal_at = now - timedelta(days=1)
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+        created_at=very_old_created,
+        completed_at=None,
+        status_log=[{"t": terminal_at.isoformat(), "s": "COMPLETED"}],
+        context={},
+    )
+    db.add(t)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_noncode_outcome_window_accounting(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    assert flagged[0].delta == 1
+
+
+@pytest.mark.asyncio
 async def test_noncode_window_inconclusive_when_over_sample_limit(db):
     project = await _project(db)
     now = _utcnow()
