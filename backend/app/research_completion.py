@@ -94,8 +94,7 @@ from app.capability_registry import (
     registry_capability_vocabulary,
 )
 from app.payload_schemas import (
-    parse_acceptance_evidence,
-    read_acceptance_evidence,
+    normalize_acceptance_evidence,
     validate_internal_payload,
 )
 from app.playbook_learning import (
@@ -4490,6 +4489,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             if _recent:
                 full_prompt = full_prompt + "\n\n" + _recent
 
+        _payload_acceptance_evidence, _context_acceptance_evidence = (
+            normalize_acceptance_evidence(finding.get("acceptance_evidence"))
+        )
+
         if task_type == "compute_experiment":
             # Build + validate the compute_experiment payload from the launch
             # contract authored above (already validated non-empty command /
@@ -4498,17 +4501,6 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # handler+metric gate read budget/deadline kills as intentional
             # terminal outcomes unchanged.
             _cc = _compute_contract or {}
-            # Forward-carry the finding's declared acceptance_evidence using the
-            # same lenient pre-validation pattern used by the else-branch below.
-            # A malformed LLM-authored declaration must NOT abort the completion.
-            _ce_finding_acceptance_evidence = finding.get("acceptance_evidence")
-            if _ce_finding_acceptance_evidence is not None and (
-                read_acceptance_evidence(
-                    {"acceptance_evidence": _ce_finding_acceptance_evidence}
-                )
-                is None
-            ):
-                _ce_finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": "compute_experiment",
@@ -4551,30 +4543,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"model": finding_model} if finding_model else {}),
                     **({"effort": finding_effort} if finding_effort else {}),
                     **(
-                        {"acceptance_evidence": _ce_finding_acceptance_evidence}
-                        if _ce_finding_acceptance_evidence
+                        {"acceptance_evidence": _payload_acceptance_evidence}
+                        if _payload_acceptance_evidence
                         else {}
                     ),
                 },
                 "research_completion:finding:compute_experiment",
             )
         else:
-            # Forward-carry the finding's declared acceptance_evidence (the
-            # evidence that will prove its claim true) onto the spawned child
-            # payload — distinct from the backward verification_basis. Pre-validate
-            # leniently: an LLM-generated finding declaration is untrusted, and a
-            # malformed one passed into the strict validate_internal_payload below
-            # would raise ValueError, aborting _handle_research_completion and
-            # losing ALL findings in this completion. Degrade a malformed
-            # declaration to 'no declaration' (key omitted) instead.
-            _finding_acceptance_evidence = finding.get("acceptance_evidence")
-            if _finding_acceptance_evidence is not None and (
-                read_acceptance_evidence(
-                    {"acceptance_evidence": _finding_acceptance_evidence}
-                )
-                is None
-            ):
-                _finding_acceptance_evidence = None
             finding_payload = validate_internal_payload(
                 {
                     "type": task_type,
@@ -4584,8 +4560,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     **({"effort": finding_effort} if finding_effort else {}),
                     **({"prompt_suffix": _combined_suffix} if _combined_suffix else {}),
                     **(
-                        {"acceptance_evidence": _finding_acceptance_evidence}
-                        if _finding_acceptance_evidence
+                        {"acceptance_evidence": _payload_acceptance_evidence}
+                        if _payload_acceptance_evidence
                         else {}
                     ),
                     # Additive, optional shared-vocabulary field: the canonical
@@ -4610,12 +4586,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         # Optional plan-time acceptance-evidence contract. Read it straight off
         # the surviving ``finding`` dict (NOT routed through the
         # depends_on_indices remap), so it survives batch-cap truncation and
-        # dedup for every finding that survives. Validated via the shared helper:
-        # an absent or malformed declaration yields None and the child context is
-        # byte-for-byte unchanged from today.
-        _acceptance_evidence = parse_acceptance_evidence(
-            finding.get("acceptance_evidence")
-        )
+        # dedup for every finding that survives. Validated via the shared bridge:
+        # an absent or malformed declaration yields None on each side and the
+        # child context/payload stay byte-for-byte unchanged from today.
+        _acceptance_evidence = _context_acceptance_evidence
         _finding_lineage = {
             str(v).strip().lower()
             for v in (

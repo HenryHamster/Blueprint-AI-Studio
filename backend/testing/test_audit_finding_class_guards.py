@@ -6,7 +6,7 @@ The goal: every finding class that recurred in v22 or earlier is covered by a
 guard that fails on reintroduction, making the 2026-07-04 acceptance criterion
 verifiable in a single module.
 
-Four classes are addressed:
+Five classes are addressed:
 
 1. **Module file-density caps** — already guarded via
    ``backend/testing/test_invariants.py`` (``TestBackendModuleSizeGuardrails``)
@@ -26,6 +26,11 @@ Four classes are addressed:
 4. **.test_durations staleness** — ``backend/.test_durations`` was tracked in
    git and recurred as a low-severity staleness finding. ``TestTestDurationsNotTracked``
    asserts it is listed in ``.gitignore`` and is not tracked in git.
+
+5. **Stale documentation references** — long-lived documentation in /docs/ and
+   /docs/plans/ must not reference removed code paths or UI components.
+   ``TestLongLivedDocsDoNotReferenceRemovedCodePaths`` scans .md files and
+   verifies none contain references to components in the removed-code registry.
 
 Safe to run standalone (``pytest --standalone --no-postgres``): no DB imports.
 """
@@ -377,4 +382,91 @@ class TestTestDurationsNotTracked:
             "backend/.test_durations is tracked in git. "
             "Remove it with: git rm --cached backend/.test_durations\n"
             "Then commit the change to stop the staleness finding from recurring."
+        )
+
+
+# ---------------------------------------------------------------------------
+# 5. Stale documentation references — docs must not reference removed code
+# ---------------------------------------------------------------------------
+
+
+class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
+    """Long-lived documentation (design docs, plan documents, reference guides)
+    must not reference code paths or UI components that have been removed.
+
+    Removed items are registered in backend/app/removed_code_references.py.
+    This test scans all .md files in docs/ and docs/plans/ to ensure none
+    contain references to removed components, preventing future implementers
+    from following stale guidance.
+
+    Skipped only when the repo root is unavailable (CI backend-only Docker
+    context that doesn't have the docs/ directory mounted).
+    """
+
+    def test_long_lived_docs_do_not_reference_removed_code_paths(self):
+        """Scan docs/ and docs/plans/ for references to removed code items."""
+        # Import the removed_code_references module to verify it exists
+        # and contains the registry. This exercises the production code that
+        # the test guards.
+        try:
+            from app.removed_code_references import (
+                get_removed_references,
+            )
+        except ImportError as e:
+            pytest.fail(
+                f"Cannot import removed_code_references module: {e}\n"
+                "The production module backend/app/removed_code_references.py "
+                "must define get_removed_references()."
+            )
+
+        # Get the registry
+        removed_refs = get_removed_references()
+        if not removed_refs:
+            pytest.skip(
+                "No removed code references are registered. "
+                "This test is a no-op when the registry is empty."
+            )
+
+        # Scan documentation directories
+        docs_root = _REPO_ROOT / "docs"
+        if not docs_root.is_dir():
+            pytest.skip(
+                "docs/ directory not available in this test environment "
+                "(CI docker context may not mount the docs directory)"
+            )
+
+        # Collect all .md files in docs/ and docs/plans/
+        doc_files: list[Path] = []
+        for pattern in ["*.md", "plans/*.md"]:
+            doc_files.extend(docs_root.glob(pattern))
+
+        if not doc_files:
+            pytest.skip(
+                "No .md files found in docs/ or docs/plans/. "
+                "Cannot verify removed code references."
+            )
+
+        # Scan each doc file for references to removed code
+        violations: list[str] = []
+        for doc_path in doc_files:
+            try:
+                text = doc_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+
+            rel_path = doc_path.relative_to(_REPO_ROOT)
+            for removed_ref in removed_refs:
+                for pattern in removed_ref.patterns:
+                    if pattern in text:
+                        violations.append(
+                            f"{rel_path}: contains '{pattern}' "
+                            f"({removed_ref.name}; {removed_ref.rationale})"
+                        )
+
+        assert not violations, (
+            "Documentation contains references to removed code paths or components. "
+            "Remove or update these references:\n"
+            + "\n".join(f"  - {v}" for v in sorted(violations))
+            + "\n\nSee backend/app/removed_code_references.py for the registry "
+            "of removed items."
         )

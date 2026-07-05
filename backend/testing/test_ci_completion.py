@@ -1942,6 +1942,108 @@ async def test_integration_landing_triggers_build_config_refresh(db_session, moc
 
 
 @pytest.mark.asyncio
+async def test_criterion_evidence_persisted_via_attempt_merge_proven_verdict_covers_criterion(
+    db_session, mocker
+):
+    """Direct CI merge with criterion_ids records proven task_merge evidence.
+
+    The direct merge path (_attempt_merge_with_retry_and_escalation) now records
+    CriterionEvidence for each criterion the task carries when the merge succeeds.
+    The evidence must be recorded with proven=True so the criterion coverage
+    transitions from 'uncovered' to 'covered' (not just 'partial').
+
+    This pins the direct merge path to the same proven-evidence standard that
+    the rollup path enforces, ensuring v22 criteria do not depend on one
+    merge topology.
+    """
+    from app.acceptance_criteria import (
+        compute_criterion_coverage,
+        create_criterion,
+        get_evidence_for_criterion,
+    )
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    # Create project with release version and criterion
+    project = Project(name="Criterion merge test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create an acceptance criterion
+    criterion = await create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Direct merge must record proven evidence",
+        created_by="strategist",
+    )
+
+    # Create the original task (what carries the criterion)
+    orig_task = Task(
+        project_id=project.id,
+        title="Original task with criterion",
+        payloads=[{"type": "research", "prompt": "test"}],
+        context={},
+        criterion_ids=[criterion.criterion_key],  # Task carries the criterion
+        vm_instance_id=f"agent-vm-orig-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # Create the CI parking task that will merge and record evidence
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Trigger the merge
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # Refresh the original task to read the committed state from the dedicated _orig_session
+    await db_session.refresh(orig_task)
+
+    # Verify evidence was recorded with proven=True
+    evidence = await get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) > 0, "Evidence should be recorded after merge"
+
+    # Find the task_merge evidence entry
+    task_merge_evidence = [e for e in evidence if e.source_kind == "task_merge"]
+    assert len(task_merge_evidence) > 0, "task_merge evidence should be recorded"
+    assert task_merge_evidence[0].detail.get("proven") is True, (
+        "task_merge evidence must have proven=True to satisfy criterion coverage"
+    )
+
+    # Verify coverage transitions to 'covered' due to the proven evidence
+    coverage = compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Coverage should be 'covered' with proven task_merge evidence, got '{coverage}'"
+    )
+
+
+@pytest.mark.asyncio
 async def test_orig_task_with_promotion_target_merge_withholds_pr_merged(
     db_session, mocker
 ):
@@ -4959,4 +5061,12 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
     task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
     assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
     assert task_merge_ev[0].source_id == str(orig_task.id)
-    assert task_merge_ev[0].detail == {"pr": 99}
+    # Evidence must include proven=True so the criterion coverage transitions to 'covered'
+    assert task_merge_ev[0].detail == {"pr": 99, "proven": True}, (
+        "task_merge evidence must have proven=True to satisfy criterion coverage"
+    )
+    # Verify coverage is 'covered' due to the proven evidence
+    coverage = ac.compute_criterion_coverage(evidence)
+    assert coverage == "covered", (
+        f"Coverage should be 'covered' with proven task_merge evidence, got '{coverage}'"
+    )

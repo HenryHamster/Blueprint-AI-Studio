@@ -8381,6 +8381,10 @@ class TestComputeExperimentSpawn:
         )
         assert evidence["kind"] == "downstream_artifact"
         assert evidence["artifact_id"] == "benchmark-result-bundle"
+        assert child.context["acceptance_evidence"] == {
+            "kind": "artifact",
+            "descriptor": "benchmark-result-bundle",
+        }
 
     @_pytest.mark.asyncio
     async def test_compute_experiment_sweep_id_propagated(self, db_session, mocker):
@@ -8460,6 +8464,7 @@ class TestComputeExperimentSpawn:
             "malformed acceptance_evidence must degrade to omitted, "
             f"got {payload.get('acceptance_evidence')!r}"
         )
+        assert "acceptance_evidence" not in (children[0].context or {})
 
 
 @_pytest.mark.asyncio
@@ -8634,7 +8639,7 @@ class TestAcceptanceEvidencePropagation:
         return children, task
 
     @_pytest.mark.asyncio
-    async def test_finding_acceptance_evidence_lands_on_child_payload(
+    async def test_finding_acceptance_evidence_populates_both_payload_and_context(
         self, db_session, mocker
     ):
         from test_autonomous_research import _make_finding
@@ -8654,6 +8659,10 @@ class TestAcceptanceEvidencePropagation:
         assert evidence is not None, "acceptance_evidence missing from child payload"
         assert evidence["kind"] == "observable_behavior"
         assert "promotion is in flight" in evidence["description"]
+        assert child.context["acceptance_evidence"] == {
+            "kind": "behavior",
+            "descriptor": "the endpoint returns 409 when promotion is in flight",
+        }
 
     @_pytest.mark.asyncio
     async def test_finding_without_acceptance_evidence_spawns_unchanged(
@@ -8702,6 +8711,7 @@ class TestAcceptanceEvidencePropagation:
             "malformed acceptance_evidence must degrade to omitted, got "
             f"{child.first_payload.get('acceptance_evidence')!r}"
         )
+        assert "acceptance_evidence" not in (child.context or {})
 
     @_pytest.mark.asyncio
     async def test_finding_acceptance_evidence_propagates_to_child_context(
@@ -8711,18 +8721,20 @@ class TestAcceptanceEvidencePropagation:
 
         finding = _make_finding(title="Declared proof", direction_id="d-ae-ctx01")
         finding["acceptance_evidence"] = {
-            "kind": "test",
-            "descriptor": "seam test exercises new path end-to-end",
-            "selector": "testing/test_foo.py::test_bar",
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
         }
         children, _task = await self._spawn_from_findings(
             db_session, mocker, direction_id="d-ae-ctx01", findings=[finding]
         )
         child = next(c for c in children if c.title == "Declared proof")
         assert child.context["acceptance_evidence"] == {
-            "kind": "test",
-            "descriptor": "seam test exercises new path end-to-end",
-            "selector": "testing/test_foo.py::test_bar",
+            "kind": "behavior",
+            "descriptor": "endpoint scopes audit to the open candidate",
+        }
+        assert child.first_payload["acceptance_evidence"] == {
+            "kind": "observable_behavior",
+            "description": "endpoint scopes audit to the open candidate",
         }
 
     @_pytest.mark.asyncio
@@ -8819,6 +8831,7 @@ class TestAcceptanceEvidencePropagation:
         )
         child = next(c for c in children if c.title == "Bad proof")
         assert "acceptance_evidence" not in (child.context or {})
+        assert "acceptance_evidence" not in child.first_payload
 
     @_pytest.mark.asyncio
     async def test_acceptance_evidence_survives_batch_cap_truncation(
@@ -8859,6 +8872,10 @@ class TestAcceptanceEvidencePropagation:
         assert survivor_child.context["acceptance_evidence"] == {
             "kind": "behavior",
             "descriptor": "endpoint scopes audit to the open candidate",
+        }
+        assert survivor_child.first_payload["acceptance_evidence"] == {
+            "kind": "observable_behavior",
+            "description": "endpoint scopes audit to the open candidate",
         }
 
 

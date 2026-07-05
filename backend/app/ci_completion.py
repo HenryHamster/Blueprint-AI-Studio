@@ -674,7 +674,7 @@ async def _attempt_merge_with_retry_and_escalation(
                                                 project_id=orig.project_id,
                                                 source_kind="task_merge",
                                                 source_id=str(orig.id),
-                                                detail={"pr": ci_pr_number},
+                                                detail={"pr": ci_pr_number, "proven": True},
                                             )
                             except Exception:
                                 logger.warning(
