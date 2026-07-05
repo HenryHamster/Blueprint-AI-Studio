@@ -6081,6 +6081,53 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             target["history_aggregate"] = _fold_evicted_into_aggregate(
                 target.get("history_aggregate"), new_history[:-10]
             )
+            # Store compact per-cycle snapshots so post-eviction patch paths
+            # (post-merge recompute, stranded-PR discount) can apply deltas to the
+            # aggregate rather than silently no-oping when the live entry is gone.
+            _evicted_snaps = target["history_aggregate"].setdefault(
+                "_evicted_cycle_snapshots", {}
+            )
+            for _ev in new_history[:-10]:
+                _tid = _ev.get("task_id")
+                if _tid:
+                    _evicted_snaps[str(_tid)] = {
+                        "prs_merged": int(_ev.get("prs_merged") or 0),
+                        "verified_prs_merged": int(
+                            _ev.get(
+                                "verified_prs_merged",
+                                _ev.get("prs_merged", 0),
+                            )
+                            or 0
+                        ),
+                        "autonomous_prs_merged": int(
+                            _ev.get(
+                                "autonomous_prs_merged",
+                                _ev.get("prs_merged", 0),
+                            )
+                            or 0
+                        ),
+                        "assisted_prs_merged": int(
+                            _ev.get("assisted_prs_merged") or 0
+                        ),
+                        "reachable_prs_merged": int(
+                            _ev.get("reachable_prs_merged") or 0
+                        ),
+                        "stranded_prs_merged": int(
+                            _ev.get("stranded_prs_merged") or 0
+                        ),
+                        "acceptance_proven_merged": int(
+                            _ev.get("acceptance_proven_merged") or 0
+                        ),
+                        "acceptance_consumed_merged": int(
+                            _ev.get("acceptance_consumed_merged") or 0
+                        ),
+                        "acceptance_declared_merged": int(
+                            _ev.get("acceptance_declared_merged") or 0
+                        ),
+                        "acceptance_merged_write_total": int(
+                            _ev.get("acceptance_merged_write_total") or 0
+                        ),
+                    }
         target["research_history"] = new_history[-10:]
         target["last_researched_at"] = now_iso
         target["last_cycle_productive"] = productive

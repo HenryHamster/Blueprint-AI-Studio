@@ -7314,3 +7314,557 @@ async def test_reachable_prs_merged_invariant_guard(db_session: AsyncSession):
     # Legacy entry (field absent): guard skips reachable check, no spurious violation.
     legacy = {"prs_merged": 5}
     assert acceptance_metric_invariant_violations(legacy) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Post-eviction delta tests (acceptance evidence: test_post_eviction_deltas_land_in_history_aggregate)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _make_direction_with_evicted_snapshot(
+    direction_id: str,
+    research_task_id: str,
+    snap: dict,
+    aggregate: dict | None = None,
+) -> dict:
+    """Build a direction whose cycle was evicted into history_aggregate with a stored snapshot."""
+    agg = dict(aggregate or {})
+    agg.setdefault("total_prs_merged", 0)
+    agg.setdefault("total_verified_prs_merged", 0)
+    agg.setdefault("total_autonomous_prs_merged", 0)
+    agg.setdefault("total_assisted_prs_merged", 0)
+    agg.setdefault("total_reachable_prs_merged", 0)
+    agg.setdefault("total_stranded_prs_merged", 0)
+    agg.setdefault("total_acceptance_proven_merged", 0)
+    agg.setdefault("total_acceptance_consumed_merged", 0)
+    agg.setdefault("total_acceptance_declared_merged", 0)
+    agg.setdefault("total_acceptance_merged_write_total", 0)
+    agg.setdefault("_evicted_cycle_snapshots", {})
+    agg["_evicted_cycle_snapshots"][research_task_id] = snap
+    return {
+        "id": direction_id,
+        "text": "Improve test coverage",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "research_history": [],  # evicted — not in live history
+        "history_aggregate": agg,
+    }
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_deltas_land_in_history_aggregate(
+    db_session: AsyncSession,
+):
+    """A new merge on an evicted cycle increments the corresponding aggregate totals.
+
+    Acceptance evidence gate: this test exercises real production code in
+    direction_outcomes._update_direction_research_outcomes via
+    refresh_direction_outcomes_after_merge. The direction entry is absent from
+    research_history (evicted), but a per-cycle snapshot exists in
+    history_aggregate._evicted_cycle_snapshots. After a child task merges, the
+    recompute must apply the delta (new_prs_merged - snapshot_prs_merged) to
+    total_prs_merged without touching the live research_history list.
+    """
+    direction_id = "d-post-eviction-delta"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Simulate a cycle that was evicted: snapshot records 1 merged PR.
+    initial_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 0,
+    }
+    # Aggregate already credited the snapshot values at eviction time.
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 0,
+            },
+        )
+    ]
+    await db_session.flush()
+
+    # The previously-merged child from the eviction snapshot.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="old-merged",
+    )
+    # A NEW child that merges after eviction.
+    new_merged = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="new-merged",
+    )
+    await db_session.flush()
+
+    # refresh_direction_outcomes_after_merge triggers the recompute for the merged task.
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await db_session.refresh(project)
+
+    d = project.directions[0]
+    agg = d.get("history_aggregate") or {}
+
+    # Delta: new recompute finds 2 merged (old + new); snapshot had 1 → delta = +1.
+    assert agg.get("total_prs_merged") == 2, (
+        f"expected total_prs_merged=2 after delta, got {agg.get('total_prs_merged')}"
+    )
+    assert agg.get("total_verified_prs_merged") == 2
+    assert agg.get("total_reachable_prs_merged") == 2
+    # Snapshot must be updated to current values for future idempotency.
+    snap_after = (agg.get("_evicted_cycle_snapshots") or {}).get(research_task_id)
+    assert snap_after is not None
+    assert snap_after.get("prs_merged") == 2
+    # research_history must remain empty (evicted, not re-inserted).
+    assert d.get("research_history") == []
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_delta_is_idempotent(db_session: AsyncSession):
+    """Calling refresh_direction_outcomes_after_merge twice for the same merge produces no extra delta."""
+    direction_id = "d-post-eviction-idempotent"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    initial_snap = {
+        "prs_merged": 1,
+        "verified_prs_merged": 1,
+        "autonomous_prs_merged": 1,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 0,
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 1,
+                "total_verified_prs_merged": 1,
+                "total_autonomous_prs_merged": 1,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 0,
+            },
+        )
+    ]
+    await db_session.flush()
+
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="old-merged",
+    )
+    new_merged = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="new-merged",
+    )
+    await db_session.flush()
+
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+    await refresh_direction_outcomes_after_merge(new_merged, db_session)
+
+    await db_session.refresh(project)
+    agg = project.directions[0].get("history_aggregate") or {}
+    # Second call must not double-count.
+    assert agg.get("total_prs_merged") == 2
+
+
+@pytest.mark.asyncio
+async def test_stranded_discount_routes_to_aggregate_when_evicted(
+    db_session: AsyncSession,
+):
+    """discount_stranded_pr_from_direction_credit routes to history_aggregate when cycle evicted.
+
+    Regression: when the research_history entry was evicted, _apply_stranded_discount
+    silently no-oped but still wrote the idempotency stamp, permanently losing the
+    correction. This test verifies the discount now reaches history_aggregate.
+    """
+    from app.direction_outcomes import (
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-stranded-evicted"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Snapshot records 2 merged (T1 and stranded-task before stranding was detected).
+    initial_snap = {
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "autonomous_prs_merged": 2,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 2,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 0,
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 2,
+                "total_verified_prs_merged": 2,
+                "total_autonomous_prs_merged": 2,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 2,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 0,
+            },
+        )
+    ]
+    await db_session.flush()
+
+    # Create the stranded task (previously counted as merged, now being retracted).
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="stranded",
+    )
+    await db_session.flush()
+
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
+    mark_stranded_non_landing(stranded_task, reason="not reachable from integration")
+    await db_session.flush()
+
+    await discount_stranded_pr_from_direction_credit(
+        stranded_task, db_session, had_pr_merged=had_pr_merged
+    )
+    await db_session.refresh(project)
+
+    agg = project.directions[0].get("history_aggregate") or {}
+    # Discount must have incremented total_stranded_prs_merged in the aggregate.
+    assert agg.get("total_stranded_prs_merged") == 1, (
+        f"expected total_stranded_prs_merged=1, got {agg.get('total_stranded_prs_merged')}"
+    )
+    # Idempotency stamp must be written since the discount was applied.
+    assert stranded_task.context.get("stranded_discount_applied") is True
+    # Snapshot must be updated so a future recompute delta correctly undoes this.
+    snap = (agg.get("_evicted_cycle_snapshots") or {}).get(research_task_id)
+    assert snap is not None
+    assert snap.get("stranded_prs_merged") == 1
+
+
+@pytest.mark.asyncio
+async def test_stranded_discount_evicted_idempotent(db_session: AsyncSession):
+    """Repeated discount calls for an evicted cycle do not over-subtract."""
+    from app.direction_outcomes import (
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-stranded-evicted-idem"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    initial_snap = {
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "autonomous_prs_merged": 2,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 2,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 0,
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={"total_stranded_prs_merged": 0},
+        )
+    ]
+    await db_session.flush()
+
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="stranded",
+    )
+    await db_session.flush()
+
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
+    mark_stranded_non_landing(stranded_task, reason="not reachable")
+    await db_session.flush()
+
+    for _ in range(3):
+        await discount_stranded_pr_from_direction_credit(
+            stranded_task, db_session, had_pr_merged=had_pr_merged
+        )
+    await db_session.refresh(project)
+    agg = project.directions[0].get("history_aggregate") or {}
+    assert agg.get("total_stranded_prs_merged") == 1
+
+
+@pytest.mark.asyncio
+async def test_post_eviction_recompute_then_stranded_then_new_merge(
+    db_session: AsyncSession,
+):
+    """Stranded discount + late merge both apply correctly after eviction.
+
+    Regression scenario:
+      1. Cycle evicted with prs_merged=2 (T1 reachable, T2 badge-only).
+      2. T2 is stranded — discount routes to aggregate: total_stranded=1, snapshot.stranded=1.
+      3. T3 merges — recompute: new prs_merged=2 (T1+T3, T2 excluded).
+         Delta vs snapshot: prs_merged 2-2=0 (no change); stranded 0-1=-1 (undo T2 stranding).
+      Final: total_prs=2, total_stranded=0 → credit_gate = 2 (T1 + T3 both valid).
+    """
+    from app.direction_outcomes import (
+        credit_gate_merged_count,
+        discount_stranded_pr_from_direction_credit,
+    )
+    from app.landed_signal import mark_stranded_non_landing
+
+    direction_id = "d-evict-strand-merge"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Eviction snapshot: T1 (reachable) + T2 (badge-only, not yet stranded) = 2 merged.
+    initial_snap = {
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "autonomous_prs_merged": 2,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 1,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 0,
+        "acceptance_consumed_merged": 0,
+        "acceptance_declared_merged": 0,
+        "acceptance_merged_write_total": 0,
+    }
+    project.directions = [
+        _make_direction_with_evicted_snapshot(
+            direction_id,
+            research_task_id,
+            snap=initial_snap,
+            aggregate={
+                "total_prs_merged": 2,
+                "total_verified_prs_merged": 2,
+                "total_autonomous_prs_merged": 2,
+                "total_assisted_prs_merged": 0,
+                "total_reachable_prs_merged": 1,
+                "total_stranded_prs_merged": 0,
+                "total_acceptance_proven_merged": 0,
+                "total_acceptance_consumed_merged": 0,
+                "total_acceptance_declared_merged": 0,
+                "total_acceptance_merged_write_total": 0,
+            },
+        )
+    ]
+    await db_session.flush()
+
+    # T1: reachable merged
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="T1-reachable",
+    )
+    # T2: badge-only (pr_merged=True but landed_on_integration not set).
+    stranded_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="T2-badge-only",
+    )
+    await db_session.flush()
+
+    # Step 2: T2 is confirmed stranded after eviction.
+    had_pr_merged = bool((stranded_task.context or {}).get("pr_merged"))
+    mark_stranded_non_landing(stranded_task, reason="not reachable")
+    await db_session.flush()
+    await discount_stranded_pr_from_direction_credit(
+        stranded_task, db_session, had_pr_merged=had_pr_merged
+    )
+    await db_session.refresh(project)
+    agg = project.directions[0].get("history_aggregate") or {}
+    assert agg.get("total_stranded_prs_merged") == 1
+    assert agg.get("total_prs_merged") == 2
+
+    # Step 3: T3 merges after eviction.
+    new_task = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="T3-new-merge",
+    )
+    await db_session.flush()
+    await refresh_direction_outcomes_after_merge(new_task, db_session)
+    await db_session.refresh(project)
+
+    agg = project.directions[0].get("history_aggregate") or {}
+    # Recompute sees T1+T3 (T2 excluded by landed_on_integration=False).
+    # Delta prs: 2-2=0 (snapshot was 2, new is also 2 = T1+T3).
+    # Delta stranded: 0-1=-1 (snapshot.stranded=1 after discount, new entry.stranded=0).
+    assert agg.get("total_prs_merged") == 2, (
+        f"expected 2, got {agg.get('total_prs_merged')}"
+    )
+    assert agg.get("total_stranded_prs_merged") == 0, (
+        f"expected 0 after recompute absorbed stranding, got {agg.get('total_stranded_prs_merged')}"
+    )
+
+    # credit_gate for the aggregate = total_verified - total_stranded
+    agg_entry_proxy = {
+        "prs_merged": agg.get("total_prs_merged", 0),
+        "verified_prs_merged": agg.get("total_verified_prs_merged", 0),
+        "stranded_prs_merged": agg.get("total_stranded_prs_merged", 0),
+    }
+    assert credit_gate_merged_count(agg_entry_proxy) == 2, (
+        "T1+T3 are both valid merges, T2 stranding absorbed into prs exclusion"
+    )
+
+
+@pytest.mark.asyncio
+async def test_post_merge_recompute_noop_when_no_snapshot(db_session: AsyncSession):
+    """refresh_direction_outcomes_after_merge silently returns when no snapshot exists."""
+    direction_id = "d-no-snapshot"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Direction with empty research_history and NO evicted snapshot.
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Test",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "research_history": [],
+            "history_aggregate": {"total_prs_merged": 5},
+        }
+    ]
+    await db_session.flush()
+
+    child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "direction_id": direction_id,
+            "research_task_id": research_task_id,
+        },
+        title="orphan-merge",
+    )
+    await db_session.flush()
+
+    # Must not raise or mutate aggregate.
+    await refresh_direction_outcomes_after_merge(child, db_session)
+    await db_session.refresh(project)
+    agg = project.directions[0].get("history_aggregate") or {}
+    assert agg.get("total_prs_merged") == 5, "no-snapshot path must not mutate aggregate"

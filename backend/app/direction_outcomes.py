@@ -866,8 +866,17 @@ async def _update_direction_research_outcomes(
         ),
         None,
     )
+    _evicted_snap: dict | None = None
     if entry_snap is None:
-        return
+        # Check whether this cycle was evicted into history_aggregate vs. genuinely absent.
+        _evicted_snap = (
+            (d.get("history_aggregate") or {}).get("_evicted_cycle_snapshots") or {}
+        ).get(research_task_id)
+        if _evicted_snap is None:
+            return
+        # Entry was evicted — continue computation so delta logic can apply
+        # incremental merge-count updates to history_aggregate via _apply_direction_outcomes.
+        entry_snap = {"task_id": research_task_id}
     # Work on a mutable copy; all stat writes accumulate here and are then
     # applied to the freshly-locked directions row inside with_directions_locked.
     entry = dict(entry_snap)
@@ -1100,6 +1109,8 @@ async def _update_direction_research_outcomes(
         if project is not None:
             session.expire(project, ["directions"])
 
+            _zero_child_evicted: list[bool] = [False]
+
             def _apply_zero_child_spawn_gate(dirs: list) -> None:
                 for fresh_d in dirs:
                     if fresh_d.get("id") != direction_id:
@@ -1108,13 +1119,29 @@ async def _update_direction_research_outcomes(
                     for idx, history_entry in enumerate(history):
                         if history_entry.get("task_id") == research_task_id:
                             history[idx] = entry
-                            break
+                            fresh_d["research_history"] = history
+                            return
+                    # Entry not found in live history — check if it was evicted.
+                    _agg = fresh_d.get("history_aggregate") or {}
+                    if (
+                        _agg.get("_evicted_cycle_snapshots") or {}
+                    ).get(research_task_id):
+                        _zero_child_evicted[0] = True
                     fresh_d["research_history"] = history
                     break
 
             await with_directions_locked(
                 session, project_id, _apply_zero_child_spawn_gate
             )
+            if _zero_child_evicted[0]:
+                import logging as _log_zero
+                _log_zero.getLogger(__name__).warning(
+                    "[DIRECTION] zero-child spawn-gate patch skipped for evicted cycle "
+                    "(research_task_id=%s, direction_id=%s): "
+                    "spawn-gate fields have no aggregate equivalent",
+                    research_task_id,
+                    direction_id,
+                )
             await session.commit()
         return
     # Set of child task IDs that ever opened a PR. The PULL_REQUEST Artifact is
@@ -2120,6 +2147,22 @@ async def _update_direction_research_outcomes(
     # each other's research_history entries via stale whole-array overwrites.
     session.expire(project, ["directions"])
 
+    # Aggregate-delta fields: (entry_key, aggregate_key) pairs that
+    # _fold_evicted_into_aggregate accumulates. Used by _apply_direction_outcomes
+    # to apply incremental deltas when the live entry was evicted.
+    _DELTA_FIELDS = (
+        ("prs_merged", "total_prs_merged"),
+        ("verified_prs_merged", "total_verified_prs_merged"),
+        ("autonomous_prs_merged", "total_autonomous_prs_merged"),
+        ("assisted_prs_merged", "total_assisted_prs_merged"),
+        ("reachable_prs_merged", "total_reachable_prs_merged"),
+        ("stranded_prs_merged", "total_stranded_prs_merged"),
+        ("acceptance_proven_merged", "total_acceptance_proven_merged"),
+        ("acceptance_consumed_merged", "total_acceptance_consumed_merged"),
+        ("acceptance_declared_merged", "total_acceptance_declared_merged"),
+        ("acceptance_merged_write_total", "total_acceptance_merged_write_total"),
+    )
+
     def _apply_direction_outcomes(dirs: list) -> None:
         target_d = next((x for x in dirs if x.get("id") == direction_id), None)
         if target_d is None:
@@ -2133,6 +2176,25 @@ async def _update_direction_research_outcomes(
             None,
         )
         if target_entry is None:
+            if _evicted_snap is None:
+                return
+            # Cycle was evicted — apply incremental merge-count deltas to history_aggregate
+            # so late merges and stranded corrections are not permanently lost.
+            _agg = target_d.get("history_aggregate") or {}
+            _snaps = _agg.get("_evicted_cycle_snapshots") or {}
+            _snap = _snaps.get(research_task_id)
+            if _snap is None:
+                return
+            for _entry_key, _agg_key in _DELTA_FIELDS:
+                _new_val = int(entry.get(_entry_key) or 0)
+                _snap_val = int(_snap.get(_entry_key) or 0)
+                _delta = _new_val - _snap_val
+                if _delta != 0:
+                    _agg[_agg_key] = int(_agg.get(_agg_key) or 0) + _delta
+            # Update snapshot to current values for idempotency on future recomputes.
+            _snaps[research_task_id] = {k: int(entry.get(k) or 0) for k, _ in _DELTA_FIELDS}
+            _agg["_evicted_cycle_snapshots"] = _snaps
+            target_d["history_aggregate"] = _agg
             return
         target_entry.update(entry)
         if new_context is not None:
@@ -2278,24 +2340,47 @@ async def discount_stranded_pr_from_direction_credit(
         # Idempotency guard: discount already applied on a prior cycle; skip.
         return
     try:
+        _discount_was_applied: list[bool] = [False]
 
         def _apply_stranded_discount(dirs: list) -> None:
             for d in dirs:
                 if d.get("id") != str(direction_id):
                     continue
                 history = list(d.get("research_history", []))
+                _found = False
                 for idx, h in enumerate(history):
                     if h.get("task_id") == str(research_task_id):
                         current = int(h.get("stranded_prs_merged") or 0)
                         history[idx] = {**h, "stranded_prs_merged": current + 1}
+                        _found = True
                         break
                 d["research_history"] = history
+                if not _found:
+                    # Cycle entry was evicted — route discount to history_aggregate directly
+                    # so the credit-gate correction is not silently lost.
+                    _agg = d.get("history_aggregate") or {}
+                    _agg.setdefault("total_stranded_prs_merged", 0)
+                    _agg["total_stranded_prs_merged"] += 1
+                    # Update the eviction snapshot so a future post-merge recompute
+                    # computes the correct delta (stranded→0 undoes this increment).
+                    _snaps = _agg.get("_evicted_cycle_snapshots") or {}
+                    _rid = str(research_task_id)
+                    if _rid in _snaps:
+                        _snap = _snaps[_rid]
+                        _snap["stranded_prs_merged"] = (
+                            int(_snap.get("stranded_prs_merged") or 0) + 1
+                        )
+                    d["history_aggregate"] = _agg
+                _discount_was_applied[0] = True
                 break
 
         await with_directions_locked(session, task.project_id, _apply_stranded_discount)
-        # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
-        task.context = {**ctx, "stranded_discount_applied": True}
-        await session.commit()
+        if _discount_was_applied[0]:
+            # Stamp the idempotency flag so repeated rollup-management cycles are no-ops.
+            # Only written when the discount was actually applied (live entry or evicted aggregate),
+            # not when the direction itself was not found.
+            task.context = {**ctx, "stranded_discount_applied": True}
+            await session.commit()
     except Exception as exc:  # noqa: BLE001 — best-effort; must not undo stranding
         logging.getLogger(__name__).warning(
             "[DIRECTION] stranded-PR credit discount failed for task %s: %r",
