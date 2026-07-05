@@ -3913,3 +3913,227 @@ async def test_link_direction_endpoint_triggers_backfill(client, db_session):
     )
     coverage = ac.compute_criterion_coverage(evidence)
     assert coverage == "covered", f"Expected 'covered' after backfill, got '{coverage}'"
+
+
+# ---------------------------------------------------------------------------
+# MergeEvidenceReason logging tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_no_criteria(db_session, caplog):
+    """record_task_merge_evidence emits no_criteria reason when criterion_ids is empty."""
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+
+    project = await _make_project(db_session, "LogNoCriteria")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={},
+        criterion_ids=[],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    assert any(MergeEvidenceReason.no_criteria in r.message for r in caplog.records), (
+        f"Expected no_criteria in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_verdict_not_proven(db_session, caplog):
+    """record_task_merge_evidence emits verdict_not_proven when verdict is not proven."""
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogVerdictNotProven")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Some criterion")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": False, "proven": False}},
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    assert any(MergeEvidenceReason.verdict_not_proven in r.message for r in caplog.records), (
+        f"Expected verdict_not_proven in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_no_open_version_reason(db_session, caplog):
+    """record_task_merge_evidence emits no_open_version when current_open_version returns None."""
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogNoOpenVersion")
+    # Deliberately do NOT create a ReleaseVersion — no open version exists.
+    criterion_key = "c-deadbeef"
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "reason": "green",
+            }
+        },
+        criterion_ids=[criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    assert any(MergeEvidenceReason.no_open_version in r.message for r in caplog.records), (
+        f"Expected no_open_version in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_no_active_criteria(db_session, caplog):
+    """record_task_merge_evidence emits no_active_criteria when all matching criteria are retracted."""
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogNoActiveCriteria")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Retracted crit")
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion.criterion_key,
+        reason="Obsolete",
+        retracted_by="test",
+    )
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test", "reason": "green"}
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    with caplog.at_level(logging.WARNING, logger="app.acceptance_criteria"):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert result == 0
+    assert any(MergeEvidenceReason.no_active_criteria in r.message for r in caplog.records), (
+        f"Expected no_active_criteria in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_all_evidence_already_present(db_session, caplog):
+    """record_task_merge_evidence emits all_evidence_already_present on idempotent second call."""
+    import logging
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogAllPresent")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Idempotent crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test", "reason": "green"}
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    first = await ac.record_task_merge_evidence(db_session, task, project.id)
+    assert first == 2  # task_merge + reachability
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="app.acceptance_criteria"):
+        second = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    assert second == 0
+    assert any(MergeEvidenceReason.all_evidence_already_present in r.message for r in caplog.records), (
+        f"Expected all_evidence_already_present in log; got: {[r.message for r in caplog.records]}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_record_task_merge_evidence_logs_direction_fetch_failed(db_session, caplog):
+    """record_task_merge_evidence logs direction_fetch_failed when direction fetch raises."""
+    import logging
+    from unittest.mock import patch
+    from app.acceptance_criteria import MergeEvidenceReason
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "LogDirectionFetchFailed")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(db_session, project.id, version.id, "Fallback crit")
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "test"}],
+        context={
+            "direction_id": "d-nonexistent",
+            CODE_ACCEPTANCE_VERDICT_KEY: {"satisfied": True, "proven": True, "kind": "named_test", "reason": "green"},
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Patch session.scalar to raise when called (simulates DB error on direction fetch)
+    original_scalar = db_session.scalar
+
+    call_count = 0
+
+    async def failing_scalar(stmt):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("simulated direction fetch failure")
+        return await original_scalar(stmt)
+
+    with caplog.at_level(logging.WARNING, logger="app.acceptance_criteria"), patch.object(db_session, "scalar", side_effect=failing_scalar):
+        result = await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    # Still records using task.criterion_ids fallback (1 criterion x 2 rows = 2)
+    assert result == 2
+    assert any(MergeEvidenceReason.direction_fetch_failed in r.message for r in caplog.records), (
+        f"Expected direction_fetch_failed in log; got: {[r.message for r in caplog.records]}"
+    )

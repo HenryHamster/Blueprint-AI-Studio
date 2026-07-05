@@ -46,7 +46,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Awaitable, Callable, Deque, Dict, List
+from typing import Any, Awaitable, Callable, Deque, Dict, List, cast
 
 from sqlmodel import or_, select
 
@@ -215,7 +215,7 @@ class _MetricsIntegrityObservability:
             "enrolled": enrolled,
             "flags": [r.as_dict() for r in flagged],
         }
-        self.last_tick_at = tick["at"]
+        self.last_tick_at = str(tick["at"])
         self.last_tick = tick
         self.recent_ticks.append(tick)
         for r in flagged:
@@ -554,6 +554,188 @@ async def check_landed_vs_reported_merges(ctx: SweepContext) -> List[CheckResult
 
 
 @register_check(
+    "criterion_merge_evidence_gap",
+    "Recompute landed, proven task coverage against active version acceptance "
+    "criteria and flag tasks that recorded no task_merge evidence.",
+)
+async def check_criterion_merge_evidence_gap(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a COMPLETED task that truly landed, has a proven code-
+    acceptance verdict, and maps to active criteria should also have a
+    recorded ``task_merge`` evidence row for those criteria.
+
+    The check is bounded in two dimensions:
+      * at most ``max_projects`` projects are scanned;
+      * within each project, at most ``sample_limit`` completed tasks are
+        considered.
+
+    A task is counted in ``self_reported`` when it satisfies all preconditions
+    but only in ``ground_truth`` when at least one mapped active criterion has
+    a proven ``task_merge`` evidence row for that task. The delta is the count
+    of silent recording failures in the sampled window.
+    """
+
+    from app.acceptance_criteria import (
+        get_criteria_for_version,
+        get_evidence_for_criterion,
+    )
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
+    from app.landed_signal import has_landed_signal
+    from app.models import Project, Task, TaskStatus
+    from app.release_version import current_open_version
+
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="criterion_merge_evidence_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_reported = False
+    for (project_id,) in projects:
+        pid = str(project_id)
+        open_version = await current_open_version(ctx.session, project_id)
+        if open_version is None:
+            results.append(
+                CheckResult(
+                    check="criterion_merge_evidence_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no open version",
+                )
+            )
+            continue
+
+        criteria = await get_criteria_for_version(ctx.session, open_version.id)
+        active_criteria = [c for c in criteria if c.status == "active"]
+        if not active_criteria:
+            results.append(
+                CheckResult(
+                    check="criterion_merge_evidence_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no active criteria on open version",
+                )
+            )
+            continue
+
+        active_keys = {c.criterion_key for c in active_criteria}
+        task_ids_with_task_merge_evidence: set[str] = set()
+        for criterion in active_criteria:
+            evidence = await get_evidence_for_criterion(ctx.session, criterion.id)
+            for row in evidence:
+                if (
+                    row.source_kind == "task_merge"
+                    and row.source_id
+                    and isinstance(row.detail, dict)
+                    and row.detail.get("proven") is True
+                ):
+                    task_ids_with_task_merge_evidence.add(str(row.source_id))
+
+        tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status == TaskStatus.COMPLETED,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        reported = 0
+        ground_truth = 0
+        missing_task_ids: List[str] = []
+        for task in tasks:
+            if not has_landed_signal(task):
+                continue
+            verdict = (task.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+            if not acceptance_is_proven(verdict):
+                continue
+            task_criterion_ids = [
+                criterion_key
+                for criterion_key in (task.criterion_ids or [])
+                if criterion_key in active_keys
+            ]
+            if not task_criterion_ids:
+                continue
+
+            reported += 1
+            task_id = str(task.id)
+            if task_id in task_ids_with_task_merge_evidence:
+                ground_truth += 1
+            else:
+                missing_task_ids.append(task_id)
+
+        if reported == 0:
+            results.append(
+                CheckResult(
+                    check="criterion_merge_evidence_gap",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no landed, proven tasks mapped to active criteria in sample",
+                )
+            )
+            continue
+
+        any_reported = True
+        if ground_truth < reported:
+            gap = reported - ground_truth
+            results.append(
+                CheckResult(
+                    check="criterion_merge_evidence_gap",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=reported,
+                    ground_truth=ground_truth,
+                    delta=gap,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{gap} landed, proven task(s) mapped to active criteria "
+                        "recorded no task_merge evidence"
+                        + (
+                            f" (e.g. task {missing_task_ids[0]})"
+                            if missing_task_ids
+                            else ""
+                        )
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="criterion_merge_evidence_gap",
+                    status=CheckStatus.OK,
+                    self_reported=reported,
+                    ground_truth=ground_truth,
+                    delta=0,
+                    subject=pid,
+                    detail="all sampled landed, proven tasks recorded task_merge evidence",
+                )
+            )
+
+    if not any_reported and not results:
+        return [
+            CheckResult(
+                check="criterion_merge_evidence_gap",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no qualifying tasks in sample window",
+            )
+        ]
+    return results
+
+
+@register_check(
     "playbook_confirmation_integrity",
     "Recompute playbook confirmation counters against the reference/followed "
     "ceilings and flag entries confirmed more often than they were ever shown.",
@@ -851,9 +1033,12 @@ async def check_noncode_outcome_window_accounting(
         ]
 
     def _created_naive(t: Task) -> datetime | None:
-        if t.created_at is None:
+        created_at = t.created_at
+        if created_at is None:
             return None
-        return t.created_at.replace(tzinfo=None) if t.created_at.tzinfo else t.created_at
+        if created_at.tzinfo is not None:
+            return cast(datetime, created_at.replace(tzinfo=None))
+        return cast(datetime, created_at)
 
     naive_in_window = 0
     terminal_in_window = 0

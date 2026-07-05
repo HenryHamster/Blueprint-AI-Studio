@@ -7,6 +7,7 @@ classifier and a version-level coverage summary query.
 
 from __future__ import annotations
 
+import enum
 import logging
 import secrets
 import uuid
@@ -41,6 +42,29 @@ _RETIRED_DIRECTION_STATUSES = frozenset(
 OPERATOR_AUTHORED_PROVENANCE: frozenset[str] = frozenset(
     {"operator", "user", "human"}
 )
+
+
+class MergeEvidenceReason(str, enum.Enum):
+    """Stable reason codes emitted by ``record_task_merge_evidence`` at every exit.
+
+    Each value maps to a distinct return-0 (or exception) path so operators can
+    diagnose from logs why a proven, criterion-mapped task recorded zero evidence.
+    """
+
+    no_criteria = "no_criteria"
+    """No criterion_ids on the task and no direction criterion_keys were found."""
+    verdict_not_proven = "verdict_not_proven"
+    """The task's acceptance verdict is absent or ``proven`` is not ``True``."""
+    no_open_version = "no_open_version"
+    """``current_open_version`` returned ``None`` — no open release version exists."""
+    no_active_criteria = "no_active_criteria"
+    """criterion_ids resolved to rows but all are inactive (retracted/superseded)."""
+    all_evidence_already_present = "all_evidence_already_present"
+    """All evidence rows already existed — idempotent duplicate skip."""
+    direction_fetch_failed = "direction_fetch_failed"
+    """Direction fetch raised — fell back to task.criterion_ids only."""
+    exception = "exception"
+    """An unexpected exception aborted evidence recording."""
 
 
 def is_operator_authored_criterion(created_by: str | None) -> bool:
@@ -383,19 +407,29 @@ async def record_task_merge_evidence(
 ) -> int:
     """Record task_merge evidence for each criterion a task carries, when proven.
 
-    No-op when both ``task.criterion_ids`` and the task's associated Direction's
-    ``criterion_keys`` are empty, or the task's acceptance verdict is absent or
-    not ``proven=True``.  When it does write, it stamps a proof-backed
-    ``task_merge`` row (``detail["proven"] = True``) per criterion, plus a
-    companion ``reachability`` row.  Coverage flips to ``covered`` on either
-    signal alone — a proven ``task_merge`` row is itself sufficient; the
-    companion ``reachability`` row is recorded for audit completeness.
+    No-op (returns 0) in the following cases — each is now reason-coded in
+    structured logs so operators can diagnose a zero-evidence outcome:
+
+    * ``no_criteria``  — both ``task.criterion_ids`` and the Direction's
+      ``criterion_keys`` are empty after the direction-fetch step.
+    * ``verdict_not_proven`` — the task's acceptance verdict is absent or
+      ``proven`` is not ``True``.
+    * ``no_open_version`` — ``current_open_version`` returned ``None`` (no open
+      release version exists).  **Previously undocumented.**
+    * ``no_active_criteria`` — all resolved criterion rows are inactive
+      (retracted/superseded), or every evidence row already existed (idempotent
+      duplicate skip); logged as ``all_evidence_already_present`` for the latter.
+    * ``exception`` — an unexpected error aborted recording.
+
+    When it does write, it stamps a proof-backed ``task_merge`` row
+    (``detail["proven"] = True``) per criterion, plus a companion
+    ``reachability`` row.  Coverage flips to ``covered`` on either signal alone.
 
     Direction criterion_keys are fetched via the ``direction_id`` stored in
     ``task.context`` at merge time, so criteria mapped to a direction *after*
     the task was spawned are also captured.  This fetch is best-effort: if the
-    Direction row is missing or the query fails, only ``task.criterion_ids`` is
-    used.
+    Direction row is missing or the query fails (``direction_fetch_failed``),
+    only ``task.criterion_ids`` is used.
 
     Best-effort: errors are logged and not re-raised so a failure here never
     blocks merge finalization.
@@ -425,18 +459,33 @@ async def record_task_merge_evidence(
         except Exception:
             logger.warning(
                 "record_task_merge_evidence: failed to fetch direction %s "
-                "for task %s; using task.criterion_ids only",
+                "for task %s; using task.criterion_ids only — reason=%s",
                 direction_id_key,
                 getattr(task, "id", None),
+                MergeEvidenceReason.direction_fetch_failed,
                 exc_info=True,
             )
 
     if not criterion_ids:
+        logger.info(
+            "record_task_merge_evidence: no criteria found — reason=%s task_id=%s project_id=%s",
+            MergeEvidenceReason.no_criteria,
+            getattr(task, "id", None),
+            project_id,
+        )
         return 0
     from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY, acceptance_is_proven
 
     verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not acceptance_is_proven(verdict):
+        logger.info(
+            "record_task_merge_evidence: verdict absent or not proven — reason=%s "
+            "task_id=%s project_id=%s criterion_count=%d",
+            MergeEvidenceReason.verdict_not_proven,
+            getattr(task, "id", None),
+            project_id,
+            len(criterion_ids),
+        )
         return 0
     # Extract provenance fields for the evidence detail dict so operators can
     # audit why a criterion counts as covered without resorting to SQL.
@@ -472,6 +521,14 @@ async def record_task_merge_evidence(
                 exc_info=True,
             )
         if _release_version_id is None:
+            logger.warning(
+                "record_task_merge_evidence: no open version — reason=%s "
+                "task_id=%s project_id=%s criterion_ids=%s",
+                MergeEvidenceReason.no_open_version,
+                getattr(task, "id", None),
+                project_id,
+                criterion_ids,
+            )
             return 0
         all_rows = await get_criteria_by_keys(
             session, project_id, criterion_ids, release_version_id=_release_version_id
@@ -479,6 +536,16 @@ async def record_task_merge_evidence(
         rows = [r for r in all_rows if r.status == "active"]
         task_id_str = str(getattr(task, "id", "") or "")
         recorded = 0
+        if not rows:
+            logger.warning(
+                "record_task_merge_evidence: no active criteria resolved — reason=%s "
+                "task_id=%s project_id=%s criterion_ids=%s",
+                MergeEvidenceReason.no_active_criteria,
+                getattr(task, "id", None),
+                project_id,
+                criterion_ids,
+            )
+            return 0
         # Batch-load all evidence for active criteria in one query to avoid N+1.
         active_criterion_ids = [row.id for row in rows]
         evidence_by_criterion: dict[uuid.UUID, set[tuple[str, str | None]]] = defaultdict(set)
@@ -513,11 +580,21 @@ async def record_task_merge_evidence(
                     detail={"proven": True},
                 )
                 recorded += 1
+        if recorded == 0:
+            logger.info(
+                "record_task_merge_evidence: all evidence rows already present — reason=%s "
+                "task_id=%s project_id=%s criterion_count=%d",
+                MergeEvidenceReason.all_evidence_already_present,
+                getattr(task, "id", None),
+                project_id,
+                len(rows),
+            )
         return recorded
     except Exception:
         logger.exception(
-            "record_task_merge_evidence: failed for task %s",
+            "record_task_merge_evidence: failed for task %s — reason=%s",
             getattr(task, "id", None),
+            MergeEvidenceReason.exception,
         )
         return 0
 

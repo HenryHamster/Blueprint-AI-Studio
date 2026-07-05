@@ -29,8 +29,10 @@ from app.metrics_integrity_sweep import (
 from app.models import (
     Artifact,
     ArtifactType,
+    CriterionEvidence,
     EvergreenBacklogItem,
     Project,
+    ReleaseVersion,
     Task,
     TaskStatus,
 )
@@ -107,6 +109,43 @@ async def _pr_task(db, project, *, landed: bool) -> Task:
     return t
 
 
+async def _open_version_with_criterion(db, project, *, text: str):
+    from app import acceptance_criteria as ac
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db.add(version)
+    await db.commit()
+    await db.refresh(version)
+    criterion = await ac.create_criterion(
+        db,
+        project_id=project.id,
+        release_version_id=version.id,
+        text=text,
+        created_by="strategist",
+    )
+    return version, criterion
+
+
+async def _completed_landed_proven_task(db, project, criterion_key: str) -> Task:
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={
+            "landed_on_integration": True,
+            "pr_merged": True,
+            CODE_ACCEPTANCE_VERDICT_KEY: {"proven": True},
+        },
+        criterion_ids=[criterion_key],
+    )
+    db.add(task)
+    await db.commit()
+    await db.refresh(task)
+    return task
+
+
 # --- Registry ---------------------------------------------------------------
 
 
@@ -114,6 +153,7 @@ def test_registry_contains_initial_checks():
     names = {c.name for c in registered_checks()}
     assert {
         "landed_vs_reported_merges",
+        "criterion_merge_evidence_gap",
         "playbook_confirmation_integrity",
         "noncode_outcome_window_accounting",
         "direction_acceptance_metric_invariant",
@@ -212,6 +252,84 @@ async def test_landed_vs_reported_skips_with_no_pr_tasks(db):
         sample_limit=200, window_days=14,
     )
     results = await mis.check_landed_vs_reported_merges(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: criterion_merge_evidence_gap -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_criterion_merge_evidence_gap_flags_missing_evidence(db):
+    project = await _project(db)
+    _, criterion = await _open_version_with_criterion(
+        db, project, text="Merged task should record evidence"
+    )
+    await _completed_landed_proven_task(db, project, criterion.criterion_key)
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_merge_evidence_gap(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.self_reported == 1
+    assert f.ground_truth == 0
+    assert f.delta == 1
+    assert "no task_merge evidence" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_criterion_merge_evidence_gap_ok_when_evidence_present(db):
+    project = await _project(db)
+    _, criterion = await _open_version_with_criterion(
+        db, project, text="Merged task should record evidence"
+    )
+    task = await _completed_landed_proven_task(db, project, criterion.criterion_key)
+    db.add(
+        CriterionEvidence(
+            project_id=project.id,
+            criterion_id=criterion.id,
+            source_kind="task_merge",
+            source_id=str(task.id),
+            detail={"proven": True},
+        )
+    )
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_merge_evidence_gap(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK and r.delta == 0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_criterion_merge_evidence_gap_skips_with_no_qualifying_tasks(db):
+    project = await _project(db)
+    _, criterion = await _open_version_with_criterion(
+        db, project, text="Merged task should record evidence"
+    )
+    db.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={"landed_on_integration": False, "pr_merged": False},
+            criterion_ids=[criterion.criterion_key],
+        )
+    )
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_criterion_merge_evidence_gap(ctx)
     assert len(results) == 1
     assert results[0].status == CheckStatus.SKIPPED
 
