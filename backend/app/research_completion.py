@@ -76,6 +76,7 @@ from app.finding_deduplication import (
 )
 from app.task_blocked import NEED_REF_MAX_LEN
 from app.task_evaluators import (
+    ADVERSARIAL_PARSE_CHALLENGER_FAILED,
     ADVERSARIAL_PARSE_NO_HASH_MATCHES,
     ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES,
     CHALLENGE_AGREES,
@@ -268,6 +269,9 @@ _ADVERSARIAL_WHOLESALE_RETRY_LIMIT = 1
 # so the total grader budget is: initial + at most one targeted + at most one wholesale.
 _ADVERSARIAL_TARGETED_RETRY_KEY = "_adversarial_targeted_retry_count"
 _ADVERSARIAL_TARGETED_RETRY_LIMIT = 1
+_ADVERSARIAL_INFRA_FAILURE_MODE_KEY = "adversarial_spawn_gate_infra_failure_mode"
+_ADVERSARIAL_INFRA_FAILURE_MODE_ENFORCE = "enforce"
+_ADVERSARIAL_INFRA_UNVERIFIED_VERDICT = "unverified"
 
 # Verification-basis tiers, ordered from highest evidence (the finding's claim
 # was checked against real code) to lowest (asserted/deduced). Defined once here
@@ -2331,6 +2335,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # Decision-quality breakdown of the inclusive survived/refuted buckets.
     _spawn_gate_explicit_pass_count = 0
     _spawn_gate_fail_open_count = 0
+    _spawn_gate_infra_fail_open_count = 0
     _spawn_gate_unresolved_count = 0
     _spawn_gate_refuted_reasons: list[str] = []
     _spawn_gate_manifest_excluded_count = 0
@@ -2378,6 +2383,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             and _wholesale_parse_outcome in ADVERSARIAL_WHOLESALE_NON_RESPONSE_OUTCOMES
         )
         _spawn_gate_healthy_cycle = not _wholesale_non_response
+        _spawn_gate_cause_category = (
+            _spawn_gate_cause.get("category")
+            if isinstance(_spawn_gate_cause, dict)
+            else None
+        )
+        _infra_non_response_cause = (
+            _spawn_gate_cause_category in GRADER_TIMEOUT_CAUSES
+            or _spawn_gate_cause_category in GRADER_TRANSIENT_INFRA_CAUSES
+            or _wholesale_parse_outcome == ADVERSARIAL_PARSE_CHALLENGER_FAILED
+        )
 
         def _spawn_gate_dir_entry(_direction_id: str) -> dict:
             return _spawn_gate_by_direction.setdefault(
@@ -2402,9 +2417,7 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             # Dispatch on the diagnosed non-response cause so the retry
             # strategy matches the failure mode rather than always doing the
             # same wholesale re-challenge.
-            _cause_category = (_adversarial_verdict_raw.get("cause") or {}).get(
-                "category"
-            ) or ""
+            _cause_category = _spawn_gate_cause_category or ""
             # _do_wholesale: True means fall through to the existing wholesale
             # retry logic.  The refusal path sets it False to skip retries.
             _do_wholesale = True
@@ -2612,21 +2625,38 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     task.context = _ctx
                     flag_modified(task, "context")
 
+        _infra_fail_open_unverified = bool(
+            _wholesale_non_response
+            and _infra_non_response_cause
+            and (task.context or {}).get("research_spawn_gate_wholesale_retry_exhausted")
+            and str(
+                _runtime_config.get(_ADVERSARIAL_INFRA_FAILURE_MODE_KEY, "observe")
+                or "observe"
+            )
+            .strip()
+            .lower()
+            != _ADVERSARIAL_INFRA_FAILURE_MODE_ENFORCE
+        )
+        _infra_fail_open_reason = (
+            "unverified: adversarial challenger infrastructure failed after "
+            "retry exhaustion"
+        )
+
         for _f in findings:
             _fhash = _fh(
                 str(_f.get("title", "")),
                 _canonical_finding_body(_f),
             )
             _verdict_obj = _adv_verdicts.get(_fhash)
+            _was_challenged = (
+                _fhash in _challenged_hashes_set
+                if _challenged_hashes_set
+                else _is_high_stakes_finding(_f)
+            )
             if _verdict_obj is None:
                 # Determine whether this finding was actually challenged.
                 # When _adversarial_challenged_hashes is stored, use it; otherwise
                 # fall back to high-stakes check (legacy / missing context).
-                _was_challenged = (
-                    _fhash in _challenged_hashes_set
-                    if _challenged_hashes_set
-                    else _is_high_stakes_finding(_f)
-                )
                 if not _was_challenged:
                     if _is_high_stakes_finding(_f):
                         # high-stakes findings must never bypass the gate
@@ -2677,6 +2707,18 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _explicit = (
                     explicit_value if isinstance(explicit_value, bool) else False
                 )
+            if (
+                _infra_fail_open_unverified
+                and _was_challenged
+                and not _explicit
+            ):
+                _passed = True
+                _reason = _infra_fail_open_reason
+                _f["_adversarial_unverified"] = True
+                _f["_adversarial_unverified_reason"] = _reason
+                _f["_adversarial_unverified_parse_outcome"] = _wholesale_parse_outcome
+                if _spawn_gate_cause:
+                    _f["_adversarial_unverified_cause"] = _spawn_gate_cause
             if not _passed:
                 _f["_adversarial_verdict"] = "fail"
                 if not _explicit:
@@ -2754,9 +2796,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     _dir_entry["survived_count"] += 1
             elif _passed and not _explicit:
                 _spawn_gate_fail_open_count += 1
+                if _f.get("_adversarial_unverified"):
+                    _spawn_gate_infra_fail_open_count += 1
                 if _direction_id:
                     _dir_entry["fail_open_count"] += 1
                     _dir_entry["survived_count"] += 1
+                    if _f.get("_adversarial_unverified"):
+                        _dir_entry["infra_fail_open_count"] = (
+                            int(_dir_entry.get("infra_fail_open_count") or 0) + 1
+                        )
             elif not _passed and not _explicit:
                 _spawn_gate_unresolved_count += 1
                 if _direction_id:
@@ -4834,9 +4882,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             _adversarial_verdict_raw is not None and _is_high_stakes_finding(finding)
         )
         _spawn_gate_verdict = (
-            "pass"
-            if _spawn_gate_challenged and finding.get("_adversarial_verdict") != "fail"
-            else None
+            _ADVERSARIAL_INFRA_UNVERIFIED_VERDICT
+            if _spawn_gate_challenged and finding.get("_adversarial_unverified")
+            else (
+                "pass"
+                if _spawn_gate_challenged
+                and finding.get("_adversarial_verdict") != "fail"
+                else None
+            )
         )
         new_task.context = {
             **(new_task.context or {}),
@@ -4849,6 +4902,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
             else None,
             "research_spawn_gate_explicit": (
                 finding.get("_adversarial_verdict_explicit")
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_unverified": (
+                bool(finding.get("_adversarial_unverified"))
+                if _spawn_gate_challenged
+                else None
+            ),
+            "research_spawn_gate_unverified_reason": (
+                finding.get("_adversarial_unverified_reason") or None
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_cause": (
+                finding.get("_adversarial_unverified_cause") or None
+            )
+            if _spawn_gate_challenged
+            else None,
+            "research_spawn_gate_parse_outcome": (
+                finding.get("_adversarial_unverified_parse_outcome") or None
             )
             if _spawn_gate_challenged
             else None,
@@ -4905,7 +4978,16 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # missing-verdict deferral to its challenger task without opening each one.
     _adv_diagnostic = (task.context or {}).get("adversarial_gate_diagnostic") or {}
     _adv_challenger_id = (
-        str(_adv_diagnostic.get("challenger_task_id") or "").strip() or None
+        str(
+            _adv_diagnostic.get("challenger_task_id")
+            or (
+                _adversarial_verdict_raw.get("grader_task_id")
+                if isinstance(_adversarial_verdict_raw, dict)
+                else None
+            )
+            or ""
+        ).strip()
+        or None
     )
     # Machine-readable cause (taxonomy class / refusal / format-miss + optional
     # stale-image tag) for the grader non-response, lifted from the resolution-
@@ -4913,6 +4995,10 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the challenger task. Observability only.
     _adv_cause = (
         _adv_diagnostic.get("cause") if isinstance(_adv_diagnostic, dict) else None
+    ) or (
+        _adversarial_verdict_raw.get("cause")
+        if isinstance(_adversarial_verdict_raw, dict)
+        else None
     )
     for _adf in _adversarial_gate_deferred:
         _adf_stamped = _stamp_deferral(_adf, "adversarial_gate")
@@ -5151,6 +5237,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                 _spawn_gate_explicit_pass_count
             )
             ctx["research_spawn_gate_fail_open_count"] = _spawn_gate_fail_open_count
+            ctx["research_spawn_gate_infra_fail_open_count"] = (
+                _spawn_gate_infra_fail_open_count
+            )
             ctx["research_spawn_gate_unresolved_count"] = _spawn_gate_unresolved_count
             if _spawn_gate_refuted_reasons:
                 ctx["research_spawn_gate_refuted_reasons"] = _spawn_gate_refuted_reasons

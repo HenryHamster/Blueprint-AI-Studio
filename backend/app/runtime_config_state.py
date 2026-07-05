@@ -297,6 +297,13 @@ runtime_config: Dict = {
         "ADVERSARIAL_SPAWN_GATE_ENABLED", "true"
     ).lower()
     not in ("0", "false", "no"),
+    # Observe/enforce rollback for exhausted adversarial-grader infrastructure
+    # failures. "observe" (default) lets the high-stakes finding spawn with an
+    # auditable unverified flag when the challenger infra failed after retries;
+    # "enforce" restores strict fail-closed behavior.
+    "adversarial_spawn_gate_infra_failure_mode": os.getenv(
+        "ADVERSARIAL_SPAWN_GATE_INFRA_FAILURE_MODE", "observe"
+    ).lower(),
     # Long-EVALUATING parents stop blocking new research on the same direction
     # once their pipeline-side merge cycle exceeds this threshold. Set above
     # the typical PR lifecycle (CI + review + fix + re-review + merge) so new
@@ -1785,6 +1792,17 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "adversarial_spawn_gate_enabled",
                         bool(config_json["adversarial_spawn_gate_enabled"]),
                     )
+                if "adversarial_spawn_gate_infra_failure_mode" in config_json:
+                    raw_mode = (
+                        str(
+                            config_json["adversarial_spawn_gate_infra_failure_mode"]
+                            or ""
+                        )
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("observe", "enforce"):
+                        _set("adversarial_spawn_gate_infra_failure_mode", raw_mode)
                 if "warm_retarget_enabled" in config_json:
                     _set(
                         "warm_retarget_enabled",

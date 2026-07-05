@@ -214,6 +214,47 @@ async def _seed_completion_debt_inventory():
         )
 
 
+async def _seed_completion_debt_design_doc():
+    """Seed the completion-debt design-doc section for all projects.
+
+    Best-effort and idempotent: a seed failure on one project must never block
+    startup or other projects. Repeated startup calls never duplicate or churn
+    code-authored sections.
+    """
+    try:
+        from app.completion_debt import seed_completion_debt_design_doc_section
+
+        async with AsyncSessionLocal() as seed_session:
+            project_ids = (
+                (await seed_session.execute(select(Project.id))).scalars().all()
+            )
+            seeded = 0
+            for project_id in project_ids:
+                try:
+                    if await seed_completion_debt_design_doc_section(
+                        seed_session, project_id
+                    ):
+                        seeded += 1
+                        await seed_session.commit()
+                except Exception:  # noqa: BLE001
+                    await seed_session.rollback()
+                    logger.warning(
+                        "[STARTUP] completion-debt design-doc seed failed for project %s (non-fatal)",
+                        project_id,
+                        exc_info=True,
+                    )
+            if seeded:
+                logger.info(
+                    "[STARTUP] Seeded completion-debt design-doc section for %d project(s)",
+                    seeded,
+                )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[STARTUP] completion-debt design-doc seed failed (non-fatal)",
+            exc_info=True,
+        )
+
+
 async def _leader_lock_keepalive_tick(leader_conn) -> str:
     """Run one leader-lock keepalive iteration and report the outcome.
 
@@ -449,6 +490,10 @@ async def lifespan(app):
     # Seed the completion-debt ledger from the standing HEAD dormant-state
     # inventory (idempotent: dedupe_key upserts, so restarts never duplicate).
     await _seed_completion_debt_inventory()
+
+    # Seed the completion-debt design-doc section for all projects (idempotent:
+    # absent sections are seeded, existing sections only refresh code fields).
+    await _seed_completion_debt_design_doc()
 
     # Log the resolved deploy-level identity so operators can confirm that
     # deploy-level serving confirmation (backend_revision, agent_image) is

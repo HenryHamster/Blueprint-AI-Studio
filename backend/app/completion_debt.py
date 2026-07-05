@@ -663,3 +663,93 @@ async def aseed_completion_debt_inventory(session: Any) -> int:
         if await arecord_completion_debt(session, **item):
             created += 1
     return created
+
+
+def _build_completion_debt_design_doc_section() -> dict:
+    """Build the completion-debt-ledger system description for the design doc.
+
+    Returns a dict suitable for insertion into ``design_doc["systems/completion-debt-ledger"]``.
+    """
+    return {
+        "summary": "Durable ledger that makes merged-but-unfinished work first-class, recording obligations created by dormant knobs, capability trials, no-CI merges, and retirement residuals.",
+        "status": "active",
+        "debt_kinds": [
+            KIND_DORMANT_KNOB,
+            KIND_CAPABILITY_TRIAL,
+            KIND_NO_CI_GATE,
+            KIND_RETIREMENT_RESIDUAL,
+            KIND_SEED_INVENTORY,
+        ],
+        "recorders": {
+            "dormant_knob": "backend/app/runtime_config_state.py",
+            "capability_trial": "backend/app/capability_trial_verdict.py",
+            "no_ci_gate": "backend/app/ci_resolution.py",
+            "retirement_residual": "backend/app/strategic_completion.py",
+            "seed_inventory": "backend/app/completion_debt.py",
+        },
+        "reconciliation_surfaces": [
+            "knob graduation via admin settings endpoint resolves dormant-knob debt",
+            "decided capability verdicts resolve capability-trial debt",
+        ],
+        "strategist_surface": "open_completion_debt payload section / ./fetch completion-debt verb",
+        "admin_surface": "PATCH /api/admin/completion-debt endpoints (list, dismiss, resolve)",
+        "module": "backend/app/completion_debt.py",
+    }
+
+
+async def seed_completion_debt_design_doc_section(session: Any, project_id: Any) -> bool:
+    """Seed the design-doc section for completion-debt ledger (idempotent per project).
+
+    Writes to ``project.design_doc["systems/completion-debt-ledger"]`` if absent,
+    and refreshes code-owned fields (summary, status, debt_kinds, etc.) without
+    clobbering operator- or strategist-authored additions.
+
+    Returns ``True`` if a new section was written or code fields were refreshed,
+    ``False`` if the section already exists with current code state.
+    """
+    if session is None or project_id is None:
+        return False
+
+    from app.task_locking import with_design_doc_locked
+
+    section_key = "systems/completion-debt-ledger"
+    new_section = _build_completion_debt_design_doc_section()
+    changed = [False]  # Use list to allow modification in nested function
+
+    def _mutate(doc: dict) -> None:
+        now = _utcnow().isoformat()
+        existing = doc.get(section_key)
+        if existing is None:
+            # No section yet — seed it as code-authored.
+            doc[section_key] = {**new_section, "_authored_by": "code"}
+            changed[0] = True
+        else:
+            # Section exists — start with existing (preserves operator/strategist keys).
+            # Then refresh code-owned fields only (those present in new_section).
+            refreshed = dict(existing)
+            for key, value in new_section.items():
+                if refreshed.get(key) != value:
+                    refreshed[key] = value
+                    changed[0] = True
+            # Mark authorship if missing.
+            if "_authored_by" not in refreshed:
+                refreshed["_authored_by"] = "code"
+            doc[section_key] = refreshed
+
+        # Update _meta if section changed.
+        if changed[0]:
+            meta = dict(doc.get("_meta") or {"revision": 0})
+            meta["revision"] = meta.get("revision", 0) + 1
+            meta["last_updated"] = now
+            doc["_meta"] = meta
+
+    try:
+        await with_design_doc_locked(session, project_id, _mutate, skip_locked=True)
+        return changed[0]
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "[COMPLETION_DEBT] failed to seed design-doc section for project %s",
+            project_id,
+            exc_info=True,
+        )
+        return False

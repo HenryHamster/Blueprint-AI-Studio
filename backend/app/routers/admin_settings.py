@@ -87,6 +87,7 @@ def _reject_unknown_task_types(
 _KNOWN_SETTINGS_KEYS = frozenset(
     {
         "agent_prompt_suffixes",
+        "adversarial_spawn_gate_infra_failure_mode",
         "architecture_review_frequency",
         "auto_archive_enabled",
         "auto_archive_interval_minutes",
@@ -412,6 +413,11 @@ async def get_settings(
         ),
         "completion_debt_weight_mode": str(
             _runtime_config.get("completion_debt_weight_mode", "observe")
+        ),
+        "adversarial_spawn_gate_infra_failure_mode": str(
+            _runtime_config.get(
+                "adversarial_spawn_gate_infra_failure_mode", "observe"
+            )
         ),
         "max_concurrent_auto_remediations": _runtime_config.get(
             "max_concurrent_auto_remediations", 2
@@ -1009,6 +1015,21 @@ async def _apply_settings(
         # dormant-knob completion-debt row (mirrors evergreen_fill_mode).
         if val == "enforce":
             _debt_keys_to_resolve.append("dormant_knob:completion_debt_weight_mode")
+    if "adversarial_spawn_gate_infra_failure_mode" in payload:
+        val = (
+            str(payload["adversarial_spawn_gate_infra_failure_mode"] or "")
+            .strip()
+            .lower()
+        )
+        if val not in ("observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "adversarial_spawn_gate_infra_failure_mode must be one of: "
+                    "observe, enforce"
+                ),
+            )
+        _runtime_config["adversarial_spawn_gate_infra_failure_mode"] = val
     if "structural_health_audit_interval_minutes" in payload:
         try:
             val = int(payload["structural_health_audit_interval_minutes"])
@@ -3389,6 +3410,11 @@ async def _apply_settings(
                     # operator's enforce graduation survives a Cloud Run restart.
                     "completion_debt_weight_mode": str(
                         _runtime_config.get("completion_debt_weight_mode", "observe")
+                    ),
+                    "adversarial_spawn_gate_infra_failure_mode": str(
+                        _runtime_config.get(
+                            "adversarial_spawn_gate_infra_failure_mode", "observe"
+                        )
                     ),
                     # Persist the Cloud Run task-type allowlist so an operator
                     # configuration survives a Cloud Run restart. runtime_config_state.

@@ -760,6 +760,103 @@ def test_completion_debt_weight_mode_seeds_dormant_debt(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_seed_writes_completion_debt_design_doc_section(db_session):
+    """Verify the design-doc section is seeded when absent and is idempotent.
+
+    Regression test for named_test acceptance requirement: the section must be
+    written to design_doc and re-seeding must not duplicate or churn fields.
+    """
+    from app.completion_debt import seed_completion_debt_design_doc_section
+
+    project = Project(name="test-seed-doc", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First seed should write the section.
+    result_first = await seed_completion_debt_design_doc_section(db_session, project.id)
+    await db_session.commit()
+
+    assert result_first is True, "first seed should return True (section written)"
+
+    # Refresh project to read the updated design_doc.
+    db_session.expire(project, ["design_doc"])
+    await db_session.refresh(project)
+
+    doc = project.design_doc or {}
+    section_key = "systems/completion-debt-ledger"
+    assert section_key in doc, f"section '{section_key}' must exist in design_doc"
+
+    section = doc[section_key]
+    assert isinstance(section, dict), "section must be a dict"
+    assert section.get("summary") is not None, "section must have a summary"
+    assert section.get("status") == "active", "section status must be 'active'"
+    assert "debt_kinds" in section, "section must list debt_kinds"
+    assert cd.KIND_DORMANT_KNOB in section["debt_kinds"], (
+        "dormant_knob must be in debt_kinds"
+    )
+    assert cd.KIND_CAPABILITY_TRIAL in section["debt_kinds"], (
+        "capability_trial must be in debt_kinds"
+    )
+    assert cd.KIND_NO_CI_GATE in section["debt_kinds"], "no_ci_gate must be in debt_kinds"
+    assert cd.KIND_RETIREMENT_RESIDUAL in section["debt_kinds"], (
+        "retirement_residual must be in debt_kinds"
+    )
+    assert cd.KIND_SEED_INVENTORY in section["debt_kinds"], (
+        "seed_inventory must be in debt_kinds"
+    )
+    assert "recorders" in section, "section must list recorder surfaces"
+    assert "reconciliation_surfaces" in section, "section must list reconciliation surfaces"
+    assert "strategist_surface" in section, "section must document strategist surface"
+    assert "admin_surface" in section, "section must document admin surface"
+    assert "module" in section, "section must list the source module"
+
+    # Re-seeding should be idempotent (no churn, no duplication).
+    result_second = await seed_completion_debt_design_doc_section(db_session, project.id)
+    await db_session.commit()
+
+    assert result_second is False, "second seed should return False (no changes)"
+
+    # Refresh again and verify the section is unchanged.
+    db_session.expire(project, ["design_doc"])
+    await db_session.refresh(project)
+    doc_after_reseed = project.design_doc or {}
+    assert doc_after_reseed.get(section_key) == section, (
+        "re-seeding must not churn or modify the section"
+    )
+
+    # Verify that operator-authored additions are not clobbered.
+    # Manually add an operator field via a fresh DB read, then re-seed.
+    # Need to use with_design_doc_locked to properly track changes to JSONB.
+    from app.task_locking import with_design_doc_locked
+
+    def _add_operator_note(doc):
+        doc[section_key]["operator_note"] = "This is an operator-added note"
+
+    await with_design_doc_locked(db_session, project.id, _add_operator_note, skip_locked=False)
+    await db_session.commit()
+
+    # Re-seed again — the operator_note should remain.
+    await seed_completion_debt_design_doc_section(db_session, project.id)
+    await db_session.commit()
+
+    db_session.expire(project, ["design_doc"])
+    await db_session.refresh(project)
+    doc_after_op = project.design_doc or {}
+    section_after_op = doc_after_op.get(section_key, {})
+    assert section_after_op.get("operator_note") == "This is an operator-added note", (
+        "re-seeding must preserve operator-authored additions"
+    )
+    assert section_after_op.get("summary") is not None, (
+        "re-seeding must refresh code-authored fields (summary)"
+    )
+    # The code fields should have been refreshed (result_third should be False if no code change
+    # between this test run and the previous, but it could be True if code fields changed).
+    # We just verify the section still has the expected structure.
+    assert "debt_kinds" in section_after_op, "section must still have debt_kinds after re-seed"
+
+
+@pytest.mark.asyncio
 async def test_completion_debt_weight_mode_graduation_resolves_debt(db_session):
     """Graduating completion_debt_weight_mode to 'enforce' via _apply_settings
     resolves its standing dormant-knob completion-debt row."""

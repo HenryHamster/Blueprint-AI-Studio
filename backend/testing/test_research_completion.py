@@ -10382,6 +10382,10 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         "app.research_completion._parse_research_findings",
         return_value=[hs],
     )
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "observe"},
+    )
 
     await _handle_research_completion(task, "", db_session)
     await db_session.refresh(task)
@@ -10524,20 +10528,21 @@ async def test_adversarial_gate_real_failed_sidecar_defers_without_spawning(
         .scalars()
         .all()
     )
-    assert children == [], "retry-exhausted finding must not spawn"
-
-    # After both targeted and wholesale retries are exhausted, the failed finding
-    # must appear in deferred_findings for the next cycle.
-    deferred = (task.context or {}).get("deferred_findings", [])
-    assert any(d.get("title") == hs["title"] for d in deferred), (
-        "failed finding must be in deferred_findings"
+    assert len(children) == 1, (
+        "retry-exhausted challenger infra failure must spawn as unverified by default"
     )
+    child_ctx = children[0].context or {}
+    assert child_ctx.get("research_spawn_gate_verdict") == "unverified"
+    assert child_ctx.get("research_spawn_gate_unverified") is True
+    assert child_ctx.get("research_spawn_gate_parse_outcome") == "challenger_failed"
+
+    # After both targeted and wholesale retries are exhausted, an infrastructure
+    # failure is fail-open by default and must not decay as an adversarial deferral.
+    deferred = (task.context or {}).get("deferred_findings", [])
+    assert not any(d.get("title") == hs["title"] for d in deferred)
     assert task.context.get("research_spawn_gate_wholesale_retry_exhausted") is True
-    # _adversarial_verdict must be stripped from the deferred entry.
-    for d in deferred:
-        assert "_adversarial_verdict" not in d, (
-            "_adversarial_verdict must be cleared on deferral"
-        )
+    assert task.context.get("research_spawn_gate_refuted_count") == 0
+    assert task.context.get("research_spawn_gate_infra_fail_open_count") == 1
 
 
 @_pytest.mark.asyncio
@@ -10908,6 +10913,163 @@ async def test_adversarial_fail_closed_no_child_on_absent_hash(db_session, mocke
     assert task.context.get("research_spawn_gate_parse_outcome") == "no_hash_matches"
     scoped = task.context.get("research_spawn_gate_by_direction") or {}
     assert scoped[direction["id"]]["wholesale_retry_exhausted"] is True
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_infra_failure_fails_open_with_flag(
+    db_session, mocker
+):
+    """Retry-exhausted challenger infra failures spawn as unverified, not refuted."""
+    from app.failure_classification import EXTERNAL_API
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-infra-open"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "observe"},
+    )
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Infra-failed challenger finding")
+    fhash = _finding_hash(
+        hs["title"], hs.get("description", "") or hs.get("prompt", "")
+    )
+
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},
+            "grader_task_id": "test-grader-infra-open",
+            "parse_outcome": "challenger_failed",
+            "cause": {
+                "category": EXTERNAL_API,
+                "parse_outcome": "challenger_failed",
+                "source": "test",
+            },
+        },
+        "_adversarial_challenged_hashes": [fhash],
+        "_adversarial_wholesale_retry_count": 1,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[hs])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child_ctx = children[0].context or {}
+    assert child_ctx.get("research_spawn_gate_challenged") is True
+    assert child_ctx.get("research_spawn_gate_verdict") == "unverified"
+    assert child_ctx.get("research_spawn_gate_explicit") is False
+    assert child_ctx.get("research_spawn_gate_unverified") is True
+    assert child_ctx.get("research_spawn_gate_parse_outcome") == "challenger_failed"
+    assert child_ctx.get("research_spawn_gate_cause", {}).get("category") == EXTERNAL_API
+    assert "infrastructure failed" in (
+        child_ctx.get("research_spawn_gate_unverified_reason") or ""
+    )
+
+    ctx = task.context or {}
+    assert ctx.get("research_spawn_gate_wholesale_retry_exhausted") is True
+    assert ctx.get("research_spawn_gate_challenged_count") == 1
+    assert ctx.get("research_spawn_gate_refuted_count") == 0
+    assert ctx.get("research_spawn_gate_survived_count") == 1
+    assert ctx.get("research_spawn_gate_explicit_pass_count") == 0
+    assert ctx.get("research_spawn_gate_fail_open_count") == 1
+    assert ctx.get("research_spawn_gate_infra_fail_open_count") == 1
+    assert ctx.get("research_spawn_gate_unresolved_count") == 0
+    assert not any(
+        d.get("title") == hs["title"] for d in ctx.get("deferred_findings", [])
+    )
+
+
+@_pytest.mark.asyncio
+async def test_adversarial_gate_infra_failure_enforce_mode_fails_closed(
+    db_session, mocker
+):
+    """The infra-fail-open mode is reversible: enforce restores fail-closed."""
+    from app.failure_classification import EXTERNAL_API
+    from app.research_completion import _finding_hash
+    from test_autonomous_research import _patch_research_externals
+
+    _project, direction, task = await _grader_project_and_task(
+        db_session, "d-adv-infra-enforce"
+    )
+    _patch_research_externals(mocker)
+    mocker.patch.dict(
+        "app.shared_state.runtime_config",
+        {"adversarial_spawn_gate_infra_failure_mode": "enforce"},
+    )
+    mocker.patch(
+        "app.research_completion._is_high_stakes_finding",
+        side_effect=lambda f: f.get("risk") == "high",
+    )
+
+    hs = _high_stakes_finding(direction["id"], "Strict infra-failed finding")
+    fhash = _finding_hash(
+        hs["title"], hs.get("description", "") or hs.get("prompt", "")
+    )
+    task.plan_output = [hs]
+    task.status = TaskStatus.COMPLETED
+    task.context = {
+        **(task.context or {}),
+        ADVERSARIAL_GATE_VERDICT_KEY: {
+            "finding_verdicts": {},
+            "grader_task_id": "test-grader-infra-enforce",
+            "parse_outcome": "challenger_failed",
+            "cause": {
+                "category": EXTERNAL_API,
+                "parse_outcome": "challenger_failed",
+                "source": "test",
+            },
+        },
+        "_adversarial_challenged_hashes": [fhash],
+        "_adversarial_wholesale_retry_count": 1,
+    }
+    db_session.add(task)
+    await db_session.commit()
+
+    mocker.patch("app.research_completion._parse_research_findings", return_value=[hs])
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert children == []
+    deferred = (task.context or {}).get("deferred_findings", [])
+    matching = [d for d in deferred if d.get("title") == hs["title"]]
+    assert len(matching) == 1
+    assert matching[0].get("adversarial_gate_reason") == "challenger_failed"
+    assert matching[0].get("adversarial_gate_cause", {}).get("category") == EXTERNAL_API
+    assert task.context.get("research_spawn_gate_refuted_count") == 1
+    assert task.context.get("research_spawn_gate_infra_fail_open_count") == 0
 
 
 @_pytest.mark.asyncio
