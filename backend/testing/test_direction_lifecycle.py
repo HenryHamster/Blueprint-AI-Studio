@@ -3967,6 +3967,75 @@ async def test_designated_retire_pass_consumes_pending_flag(db_session, mocker):
     assert "d-pending-burn" in gap["past_moves"]
 
 
+@pytest.mark.asyncio
+async def test_designated_retire_coherence_guard_skips_already_terminal(
+    db_session, mocker
+):
+    """Coherence guard prevents double-retirement when a direction is already terminal.
+
+    If a direction reaches a terminal status via another path (e.g. operator PATCH
+    sets status=completed) while auto_retire_pending=True is still set, the
+    designated-retire pass must skip the retirement logic (clear the flag only)
+    rather than overwriting auto_completed_reason and firing a duplicate
+    Alert + milestone notification.
+    """
+    mock_notify = mocker.patch(
+        "app.notification_dispatch.post_direction_milestone_message",
+        new_callable=AsyncMock,
+    )
+
+    now = datetime.utcnow()
+    # Direction that was retired by another path (operator PATCH) while the
+    # auto_retire_pending flag was still set. The coherence guard must detect
+    # the terminal status and clear the flag without re-executing retirement.
+    direction = {
+        "id": "d-already-terminal",
+        "text": "Direction already completed by another path",
+        "status": "completed",
+        "auto_completed": True,
+        "auto_completed_reason": "operator-patch: manually completed",
+        "completed_at": (now - timedelta(minutes=5)).isoformat(),
+        # Flag set before the operator completed this direction; should be cleared
+        # without triggering a second retirement.
+        "auto_retire_pending": True,
+        "auto_retire_pending_reason": "lifetime_burn",
+        "auto_retire_pending_at": (now - timedelta(hours=1)).isoformat(),
+        "lifetime_burn_pause_count": 2,
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    project = Project(
+        name="Coherence Guard Test",
+        user_id="u-coherence",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    await _process_direction_lifecycle(
+        project, db_session, busy_direction_ids=set(), now=now
+    )
+    await db_session.refresh(project)
+
+    # The direction is pruned (status=completed → pruned in the sweep).
+    remaining_ids = {d["id"] for d in (project.directions or [])}
+    assert "d-already-terminal" not in remaining_ids, (
+        "already-terminal direction must be pruned from project.directions"
+    )
+    # The coherence guard must have prevented a second retirement notification.
+    mock_notify.assert_not_called(), (
+        "post_direction_milestone_message must NOT be called for an already-terminal direction "
+        "(coherence guard should skip the retirement logic and clear the flag only)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # reactivate_paused_direction: the shared paused→active seam
 # ---------------------------------------------------------------------------
@@ -3990,6 +4059,13 @@ def _auto_paused_direction() -> dict:
         "remediation_attempts": 3,
         "churn_family_pause_count": 1,
         "lifetime_burn_pause_count": 2,
+        # Simulate a direction that was flagged for auto-retirement while paused.
+        # _clear_direction_reactivation_state must strip these three keys so an
+        # operator reactivation is not silently overridden by the designated-retire
+        # pass on the next lifecycle tick (the d-21efb120 incident class).
+        "auto_retire_pending": True,
+        "auto_retire_pending_reason": "lifetime_burn",
+        "auto_retire_pending_at": "2026-01-01T01:00:00",
         "research_history": [],
     }
 
@@ -4015,6 +4091,11 @@ def test_reactivate_auto_paused_stamps_grace_and_clears_residue():
     # Counters that must survive a reactivation are untouched
     assert d["churn_family_pause_count"] == 1
     assert d["lifetime_burn_pause_count"] == 2
+    # Pending auto-retirement must be cancelled on reactivation: without this the
+    # designated-retire pass would silently override the operator's intent on the
+    # very next lifecycle tick (the d-21efb120 incident class).
+    for key in ("auto_retire_pending", "auto_retire_pending_reason", "auto_retire_pending_at"):
+        assert key not in d, f"{key} must be cleared on reactivation to cancel pending retire"
 
 
 def test_reactivate_user_paused_blocked_when_not_allowed():
@@ -4134,8 +4215,10 @@ async def test_resurrected_direction_survives_next_lifecycle_tick(db_session, mo
         }
         for i in range(5, 0, -1)
     ]
-    # A terminally auto-retired direction with primed ladder counters — the exact
-    # broken end-state a raw status flip would leave behind.
+    # A terminally auto-retired direction with primed ladder counters AND a
+    # pending auto-retire flag — the exact snapshot state a DirectionEvent row
+    # may carry when the direction was snapshotted while the flag was set before
+    # it was pruned.
     direction = {
         "id": "d-resurrected-survives",
         "text": "Wrongly auto-retired direction being brought back",
@@ -4143,6 +4226,12 @@ async def test_resurrected_direction_survives_next_lifecycle_tick(db_session, mo
         "auto_completed": True,
         "auto_completed_reason": "Auto-retired: zombie direction",
         "completed_at": now.isoformat(),
+        # auto_retire_pending* carried into a snapshot while flagged; resurrection
+        # must strip these so the designated-retire pass doesn't re-retire the
+        # freshly-resurrected direction on the very next tick.
+        "auto_retire_pending": True,
+        "auto_retire_pending_reason": "lifetime_burn",
+        "auto_retire_pending_at": (now - timedelta(hours=1)).isoformat(),
         "churn_family_pause_count": 2,
         "lifetime_burn_pause_count": 2,
         "code_failure_pause_count": 0,
@@ -4165,6 +4254,13 @@ async def test_resurrected_direction_survives_next_lifecycle_tick(db_session, mo
     assert "completed_at" not in direction
     assert direction.get("auto_recovered_at") is not None
     assert direction.get("resurrected_at") is not None
+    # Pending auto-retirement must be stripped so the designated-retire pass
+    # cannot re-retire on the next tick, bypassing the grace period.
+    assert "auto_retire_pending" not in direction, (
+        "auto_retire_pending must be stripped by resurrect_direction"
+    )
+    assert "auto_retire_pending_reason" not in direction
+    assert "auto_retire_pending_at" not in direction
 
     project = await _make_cost_project(db_session, direction)
 

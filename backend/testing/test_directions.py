@@ -10664,3 +10664,58 @@ async def test_resurrect_direction_404_when_no_snapshot(
     )
     assert resp.status_code == 404, resp.text
     assert "snapshot" in resp.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_resurrect_snapshot_with_non_terminal_status_returns_409(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrection from a non-resurrectable snapshot (e.g. 'rejected') returns 409.
+
+    A snapshot captured while the direction was in a non-terminal, non-resurrectable
+    state (status not in {completed, expired, superseded} and auto_completed unset)
+    must be rejected by the endpoint with a 409, not silently reinserted as active.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.directions_repo import sync_directions
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    # A 'rejected' direction (strategic proposal rejected — not auto-completed, not
+    # in a resurrectable terminal status). This is the state that reaches terminal
+    # via a non-retirement path, and _is_terminal_direction returns False for it.
+    rejected_direction = {
+        "id": "d-rejected-snap",
+        "text": "A rejected strategic proposal",
+        "status": "rejected",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "research_history": [],
+    }
+
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = []
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Write the direction into the event trail then prune it, so a snapshot
+    # exists for d-rejected-snap with status='rejected'.
+    await sync_directions(db_session, pid, [rejected_direction])
+    await db_session.commit()
+    await sync_directions(db_session, pid, [])  # prune -> emits pruned snapshot event
+    await db_session.commit()
+
+    # Resurrect endpoint must reject: snapshot status='rejected' is not resurrectable.
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-rejected-snap/resurrect",
+        json={"rationale": "trying to resurrect a rejected direction"},
+    )
+    assert resp.status_code == 409, resp.text
+    assert "terminal" in resp.json()["error"]["message"].lower(), (
+        f"Expected 'terminal' in error message, got: {resp.json()['error']['message']!r}"
+    )

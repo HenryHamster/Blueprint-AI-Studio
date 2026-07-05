@@ -1239,8 +1239,22 @@ async def resurrect_direction_endpoint(
                         "never recorded in the direction event trail"
                     ),
                 )
-            target = dict(snapshot)
-            target["id"] = direction_id
+            snapshot_candidate = dict(snapshot)
+            snapshot_candidate["id"] = direction_id
+            # Apply the same terminal-status guard as the live-direction branch:
+            # a snapshot may have been taken while the direction was 'rejected'
+            # or in some other non-resurrectable state, and the prune that removed
+            # the live record doesn't change that constraint.
+            if not _is_terminal_direction(snapshot_candidate):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Snapshot direction is not in a resurrectable terminal state "
+                        f"(status={snapshot_candidate.get('status')!r}); resurrection "
+                        "only applies to a completed/expired/superseded direction"
+                    ),
+                )
+            target = snapshot_candidate
             reinsert = True
 
         # Active-direction cap (evaluated inside the lock against live data).

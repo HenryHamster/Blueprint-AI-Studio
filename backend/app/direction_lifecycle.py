@@ -126,6 +126,12 @@ def _clear_direction_reactivation_state(direction: dict) -> None:
         "last_researched_at",
         "staged_activated_at",
         "staged_for_version",
+        # Cancel any pending auto-retirement: operator reactivation / resurrection
+        # must not be silently overridden by the designated retire pass on the
+        # very next lifecycle tick (the d-21efb120 incident class).
+        "auto_retire_pending",
+        "auto_retire_pending_reason",
+        "auto_retire_pending_at",
     ):
         direction.pop(key, None)
     direction["remediation_attempts"] = 0
@@ -191,10 +197,17 @@ _AUTO_RETIRE_LADDER_EVIDENCE = (
     "lifetime_burn_pause_evidence",
 )
 # Terminal residue stamped by the auto-retire ladder / lifetime-burn retire path.
+# auto_retire_pending* are included here so a direction resurrected from a
+# DirectionEvent snapshot (which may have been snapshotted while the flag was
+# set) does not carry the pending-retire into its new life and get re-retired on
+# the very next designated-retire pass.
 _TERMINAL_RESIDUE_KEYS = (
     "auto_completed",
     "auto_completed_reason",
     "completed_at",
+    "auto_retire_pending",
+    "auto_retire_pending_reason",
+    "auto_retire_pending_at",
 )
 # Cap on the audit-note rationale so a resurrected direction can't bloat the
 # directions JSONB with an unbounded operator string.
@@ -765,6 +778,27 @@ async def _process_direction_lifecycle_locked(
             continue
         _retire_did = _d.get("id")
         _retire_reason = _d.get("auto_retire_pending_reason", "")
+        # Coherence guard: skip (and clear) the flag when the direction is no
+        # longer in the state that produced it.  This collapses two failure modes:
+        # (a) operator reactivated the direction between the flag tick and this
+        #     consume tick — auto_retire_pending was already cleared by
+        #     _clear_direction_reactivation_state, so this branch is dead for
+        #     that path, but a belt-and-suspenders status check catches any gap;
+        # (b) the direction reached terminal status via another path (e.g.
+        #     operator PATCH completed_at, zombie-retire in the same tick) while
+        #     the flag was still set — retiring a second time would overwrite
+        #     auto_completed_reason and fire duplicate Alert + milestone calls.
+        _current_status = _d.get("status")
+        if _current_status not in ("active", "paused", "proposed", "staged"):
+            logger.info(
+                f"[LIFECYCLE] Skipping designated retire for direction {_retire_did}: "
+                f"status={_current_status!r} is already terminal; clearing flag"
+            )
+            _d.pop("auto_retire_pending", None)
+            _d.pop("auto_retire_pending_reason", None)
+            _d.pop("auto_retire_pending_at", None)
+            directions_modified = True
+            continue
         if _retire_reason == "lifetime_burn":
             _lb_count = _d.get("lifetime_burn_pause_count", _MAX_LIFETIME_BURN_PAUSE_CYCLES)
             await _retire_lifetime_burn(_d, _retire_did, _lb_count)
