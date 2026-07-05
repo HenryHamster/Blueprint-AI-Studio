@@ -164,10 +164,11 @@ async def test_run_precompute_tick_primes_global_and_projects(monkeypatch):
     async def _session_factory():
         yield object()  # computes are stubbed; L2 writes fail-open on the stub
 
-    refreshed = await run_precompute_tick(_session_factory)
+    result = await run_precompute_tick(_session_factory)
 
     # global + 2 projects, for EACH of digest and health = 6.
-    assert refreshed == 6
+    assert result.refreshed == 6
+    assert result.partial is False
     cache = get_precompute_cache()
     assert cache.get_fresh(24, None, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, proj_a, max_age_seconds=300.0) is not None
@@ -209,12 +210,13 @@ async def test_run_precompute_tick_survives_per_key_failure(monkeypatch):
     async def _session_factory():
         yield object()
 
-    refreshed = await run_precompute_tick(_session_factory)
+    result = await run_precompute_tick(_session_factory)
 
     cache = get_precompute_cache()
     hcache = get_health_precompute_cache()
     # For each kind: global + good succeeded; bad failed. 2 kinds x 2 = 4.
-    assert refreshed == 4
+    assert result.refreshed == 4
+    assert result.partial is False
     assert cache.get_fresh(24, None, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, good, max_age_seconds=300.0) is not None
     assert cache.get_fresh(24, bad, max_age_seconds=300.0) is None
@@ -538,7 +540,7 @@ async def test_overlap_guard_skips_tick_when_in_progress(monkeypatch):
 
     async def _mock_tick(sf):
         tick_calls.append(True)
-        return 0
+        return dp.TickResult(refreshed=0, partial=False)
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
     monkeypatch.setattr(dp, "run_precompute_tick", _mock_tick)
@@ -554,3 +556,232 @@ async def test_overlap_guard_skips_tick_when_in_progress(monkeypatch):
     assert tick_calls == [], (
         "run_precompute_tick must not be called when overlap guard is active"
     )
+
+
+# ---------------------------------------------------------------------------
+# WI-2: cooperative elapsed-time budget (precompute must never cancel its own
+# in-flight query). Regression guard for the ~44/hr "[DB] Invalidated pool
+# connection after CancelledError" bleed that was 1:1 with each tick overrun.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_tick_over_budget_returns_partial_and_never_cancels_query(monkeypatch):
+    """A tick whose cumulative work exceeds the cooperative budget stops BETWEEN
+    units and returns a partial result — it never wraps a query in a cancelling
+    timeout, so an in-flight ``session.execute`` runs to completion and the
+    session is never invalidated (the WI-2 CancelledError bleed).
+
+    The globals are primed first and unconditionally; the two global units here
+    "spend" 40s of simulated wall time (> the 35s budget), so the per-project
+    loop must not start and the round-robin offset must not advance.
+    """
+    import asyncio
+    import uuid
+
+    import app.digest_precompute as dp
+
+    get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
+
+    projects = [uuid.uuid4() for _ in range(5)]
+
+    # Simulated monotonic clock the tick reads via dp.time.monotonic. Each
+    # per-unit compute advances it 20s, so after the two global units (40s) the
+    # 35s cooperative budget is already exceeded before any per-project work.
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(dp.time, "monotonic", lambda: clock["t"])
+
+    executed: list[bool] = []
+
+    class _FakeSession:
+        async def execute(self, *a, **k):
+            # A real in-flight query — the fix must never cancel this.
+            await asyncio.sleep(0)
+            executed.append(True)
+            return None
+
+        async def commit(self):
+            return None
+
+        async def rollback(self):
+            return None
+
+        async def merge(self, *a, **k):
+            return None
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield _FakeSession()
+
+    async def _slow_compute(*, hours, project_id, session, _statement_timeout_secs=30):
+        await session.execute("SELECT 1")  # in-flight query — must complete
+        clock["t"] += 20.0
+        return {
+            "generated_at": "t",
+            "completed_count": 0,
+            "_pid": str(project_id) if project_id else None,
+        }
+
+    async def _slow_health(*, project_id, lookback_hours, session):
+        await session.execute("SELECT 1")
+        clock["t"] += 20.0
+        return {"generated_at": "t"}
+
+    monkeypatch.setattr(_admin_digest, "_compute_digest", _slow_compute)
+    monkeypatch.setattr(_admin_health, "_compute_health_overview", _slow_health)
+    monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=projects))
+    monkeypatch.setattr(dp, "_project_tick_offset", 0)
+
+    # No CancelledError / TimeoutError may propagate; the tick returns cleanly.
+    result = await run_precompute_tick(_session_factory)
+
+    assert result.partial is True
+    # Only the two global units ran; the per-project loop was skipped.
+    assert result.refreshed == 2
+    # The in-flight queries completed — none was cancelled mid-execute.
+    assert executed == [True, True]
+    # Globals are primed; no project key was primed this tick.
+    assert get_precompute_cache().get_fresh(24, None, max_age_seconds=300.0) is not None
+    assert get_health_precompute_cache().get_fresh(24, None, max_age_seconds=300.0) is not None
+    assert (
+        get_precompute_cache().get_fresh(24, projects[0], max_age_seconds=300.0) is None
+    )
+    # The round-robin offset did NOT advance past unprimed projects: the next
+    # tick resumes at project 0.
+    assert dp._project_tick_offset == 0
+
+
+@pytest.mark.asyncio
+async def test_tick_within_budget_primes_all_and_prunes(monkeypatch):
+    """A tick that stays within budget is NOT partial and still runs the L2
+    prune (the cooperative cutoff is only reached on overrun)."""
+    import uuid
+
+    import app.digest_precompute as dp
+
+    get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
+
+    projects = [uuid.uuid4() for _ in range(2)]
+    prune_calls: list[bool] = []
+
+    async def _fast_compute(*, hours, project_id, session, _statement_timeout_secs=30):
+        return {"generated_at": "t", "completed_count": 0}
+
+    async def _fast_health(*, project_id, lookback_hours, session):
+        return {"generated_at": "t"}
+
+    async def _spy_cleanup(session, *, older_than_seconds):
+        prune_calls.append(True)
+        return 0
+
+    monkeypatch.setattr(_admin_digest, "_compute_digest", _fast_compute)
+    monkeypatch.setattr(_admin_health, "_compute_health_overview", _fast_health)
+    monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=projects))
+    monkeypatch.setattr(dp, "cleanup_stale_shared", _spy_cleanup)
+    monkeypatch.setattr(dp, "_project_tick_offset", 0)
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield object()
+
+    # A comfortably large budget so nothing truncates.
+    result = await run_precompute_tick(_session_factory, budget_seconds=1000.0)
+
+    assert result.partial is False
+    assert result.refreshed == 6  # global + 2 projects, x2 kinds
+    assert prune_calls == [True], "L2 prune must run on a non-partial tick"
+
+
+@pytest.mark.asyncio
+async def test_partial_tick_skips_l2_prune(monkeypatch):
+    """A budget-truncated (partial) tick skips the L2 prune — deferring the
+    occasional sweep one tick keeps the cooperative wall-time bound honest."""
+    import uuid
+
+    import app.digest_precompute as dp
+
+    get_precompute_cache().clear()
+    get_health_precompute_cache().clear()
+
+    projects = [uuid.uuid4() for _ in range(5)]
+    prune_calls: list[bool] = []
+
+    clock = {"t": 500.0}
+    monkeypatch.setattr(dp.time, "monotonic", lambda: clock["t"])
+
+    async def _slow_compute(*, hours, project_id, session, _statement_timeout_secs=30):
+        clock["t"] += 20.0
+        return {"generated_at": "t", "completed_count": 0}
+
+    async def _slow_health(*, project_id, lookback_hours, session):
+        clock["t"] += 20.0
+        return {"generated_at": "t"}
+
+    async def _spy_cleanup(session, *, older_than_seconds):
+        prune_calls.append(True)
+        return 0
+
+    monkeypatch.setattr(_admin_digest, "_compute_digest", _slow_compute)
+    monkeypatch.setattr(_admin_health, "_compute_health_overview", _slow_health)
+    monkeypatch.setattr(dp, "_active_project_ids", AsyncMock(return_value=projects))
+    monkeypatch.setattr(dp, "cleanup_stale_shared", _spy_cleanup)
+    monkeypatch.setattr(dp, "_project_tick_offset", 0)
+
+    @asynccontextmanager
+    async def _session_factory():
+        yield object()
+
+    result = await run_precompute_tick(_session_factory)
+
+    assert result.partial is True
+    assert prune_calls == [], "L2 prune must be skipped on a partial (over-budget) tick"
+
+
+def test_hard_timeout_is_a_generous_multiple_of_cooperative_budget():
+    """The last-resort hard timeout must stay a generous multiple (>= 3x) of the
+    cooperative budget so it effectively never fires mid-query — the WI-2
+    invariant that keeps the query-cancelling path a rare-wedge safety, not the
+    every-tick path."""
+    import app.digest_precompute as dp
+
+    assert (
+        dp.PRECOMPUTE_TICK_HARD_TIMEOUT_SECONDS >= 3 * dp.PRECOMPUTE_TICK_BUDGET_SECONDS
+    )
+
+
+@pytest.mark.asyncio
+async def test_service_handles_partial_tick_without_error(monkeypatch):
+    """digest_precompute_service consumes a TickResult and treats a partial tick
+    (cooperative budget hit) as a normal outcome — it must not raise and must
+    clear the overlap guard so the next interval can run."""
+    import asyncio
+
+    import app.digest_precompute as dp
+
+    tick_calls: list[bool] = []
+    _call_n = {"n": 0}
+
+    async def _fast_sleep(_t):
+        _call_n["n"] += 1
+        if _call_n["n"] >= 2:
+            raise asyncio.CancelledError
+
+    async def _partial_tick(sf):
+        tick_calls.append(True)
+        return dp.TickResult(refreshed=2, partial=True)
+
+    monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
+    monkeypatch.setattr(dp, "run_precompute_tick", _partial_tick)
+    monkeypatch.setattr(dp, "_tick_in_progress", False)
+
+    try:
+        await dp.digest_precompute_service()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        dp._tick_in_progress = False
+
+    assert tick_calls == [True], "the tick must run once before shutdown"
+    assert dp._tick_in_progress is False, "overlap guard must be cleared after a partial tick"
