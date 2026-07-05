@@ -30,6 +30,7 @@ import {
   buildPriorDecisionsText, buildRetiredContextText, buildStagedDirectionsText,
   buildSurfaceCatalog, nextFocus, classifyTickOutcome, openFoundLeads,
   shouldRunAutonomousTurn, EXAM_RECORDS_CAP, FOCUS_LIST_SIZE,
+  serializeLedger, restoreLedger, refreshSurfaceCatalog,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord,
 } from './strategic-resident-lib.js';
@@ -321,12 +322,17 @@ export async function handleStrategicResident(
   // tick focuses a rotating slice (never-examined first, then LRU); the parsed
   // TICK-VERDICT records what was examined so an idle claim can never be a global
   // "nothing to do" and can never rest on unexamined surfaces. No quotas exist.
-  const surfaceCatalog = buildSurfaceCatalog(payload, listWorkspaceTopDirs(WORKSPACE));
-  const examRecords: ExamRecord[] = [];
-  let examTick = 0;
+  let surfaceCatalog = buildSurfaceCatalog(payload, listWorkspaceTopDirs(WORKSPACE));
+  // Restore the exam ledger from the persisted context (written by the heartbeat
+  // note round-trip). A clean restart continues rotation rather than wiping it.
+  const restoredLedger = restoreLedger(
+    typeof ctx._exam_ledger === 'string' ? ctx._exam_ledger : undefined,
+  );
+  const examRecords: ExamRecord[] = restoredLedger?.records ?? [];
+  let examTick = restoredLedger?.tick ?? 0;
   // Set after an unevidenced idle claim (CLEAR with no tool use, or a missing/
   // garbled marker): the next tick opens with an examine-before-CLEAR correction.
-  let correctiveNextTick = false;
+  let correctiveNextTick = restoredLedger?.corrective ?? false;
   // The previous autonomous turn ended AGENDA-CONTINUE → re-tick promptly.
   let previousTurnAgendaContinue = false;
   // An operator turn just completed → run an autonomous turn to act on it.
@@ -471,15 +477,23 @@ export async function handleStrategicResident(
     // ceiling so a chat-only / monitor session (which issues no turns to reset
     // it) never self-terminates while the loop keeps polling.
     session.touch();
+    // Serialize the current exam ledger into the note so the backend persists it;
+    // a restart will restore it from task.context._exam_ledger.
+    const note = serializeLedger(examRecords, examTick, correctiveNextTick);
     try {
       const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, {
-        session_id: sessionId, task_id: taskId, progress,
+        session_id: sessionId, task_id: taskId, progress, note,
       }) as SessionHeartbeatResponse;
       // Fold the lease state so the loop's autonomous gate tracks the backend.
       authorityHeld = nextAuthorityHeld(authorityHeld, resp);
       // Track the work-state revision (when the backend ships it) so state-gated
       // pacing can fire on a real world change; absence leaves it null (floor tick).
       if (typeof resp.work_state_rev === 'string') currentWorkStateRev = resp.work_state_rev;
+      // Refresh the surface catalog from the backend's live direction list so
+      // newly created or retired directions enter/leave the rotation mid-session.
+      if (Array.isArray(resp.active_direction_ids)) {
+        surfaceCatalog = refreshSurfaceCatalog(surfaceCatalog, resp.active_direction_ids, payload);
+      }
       return resp;
     } catch (e) {
       const msg = String(e);
@@ -665,24 +679,28 @@ export async function handleStrategicResident(
       if (hb?.stop_requested || watch.kind === 'stop') break;
       if (r.processGone) { stopReason = 'session_process_exited'; break; }
 
-      // Update the examination ledger from the turn's TICK-VERDICT. A CLEAR on a
-      // zero-tool turn is physically unevidenced; a missing/garbled marker is a
-      // contract violation — both are recorded `unevidenced`, set the corrective
-      // flag, and surface a status frame, never failing the session.
-      const upd = classifyTickOutcome({
-        resultText: r.resultText,
-        sawToolUse: r.sawToolUse,
-        focus,
-        atTick: examTick,
-        at: new Date().toISOString(),
-      });
-      examRecords.push(upd.record);
-      if (examRecords.length > EXAM_RECORDS_CAP) {
-        examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
+      // Update the examination ledger from the turn's TICK-VERDICT only for
+      // COMPLETED turns. Interrupted turns (operator preemption via watch.kind
+      // === 'message', authority suspend via watch.kind === 'suspend', or stall
+      // watchdog) never emit a TICK-VERDICT marker, so classifying them would
+      // always produce a spurious `unevidenced` violation, a false corrective
+      // instruction, and misleading previousTurnAgendaContinue. Skip entirely.
+      if (!r.interrupted) {
+        const upd = classifyTickOutcome({
+          resultText: r.resultText,
+          sawToolUse: r.sawToolUse,
+          focus,
+          atTick: examTick,
+          at: new Date().toISOString(),
+        });
+        examRecords.push(upd.record);
+        if (examRecords.length > EXAM_RECORDS_CAP) {
+          examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
+        }
+        correctiveNextTick = upd.corrective;
+        previousTurnAgendaContinue = upd.agendaContinue;
+        if (upd.statusNote) streamer.status(upd.statusNote);
       }
-      correctiveNextTick = upd.corrective;
-      previousTurnAgendaContinue = upd.agendaContinue;
-      if (upd.statusNote) streamer.status(upd.statusNote);
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;

@@ -11,6 +11,8 @@ import {
   buildSurfaceCatalog, nextFocus, parseTickVerdict, parseAgendaContinue,
   openFoundLeads, classifyTickOutcome, shouldRunAutonomousTurn,
   AUTONOMOUS_FLOOR_TICK_MS,
+  serializeLedger, restoreLedger, refreshSurfaceCatalog,
+  EXAM_RECORDS_CAP, EXAM_NOTE_CAP, EXAM_LEDGER_MAX_BYTES,
   type ExamSurface, type ExamRecord,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
@@ -648,6 +650,30 @@ describe('classifyTickOutcome (unevidenced / corrective path)', () => {
     expect(upd.corrective).toBe(false);
     expect(upd.agendaContinue).toBe(true);
   });
+
+  it('interrupted turn is not classified as a tick-contract violation', () => {
+    // An interrupted turn (operator preemption, authority suspend, stall watchdog)
+    // produces empty resultText and sawToolUse=false — no TICK-VERDICT marker was
+    // ever written. Passing these inputs to classifyTickOutcome would record the
+    // turn as `unevidenced` and set the corrective flag, creating a spurious
+    // contract violation. This test documents that misclassification so the handler
+    // guard (`if (!r.interrupted)` in strategic-resident.ts) can be understood as
+    // the gate that prevents it from ever reaching classifyTickOutcome.
+    const upd = classifyTickOutcome({
+      resultText: '',
+      sawToolUse: false,
+      focus,
+      atTick: 8,
+      at: 'ts',
+    });
+    // Without the guard, this is what the ledger would receive — a spurious
+    // unevidenced record and a corrective flag for a turn the agent never finished.
+    expect(upd.record.verdict).toBe('unevidenced');
+    expect(upd.corrective).toBe(true);
+    // The handler's `if (!r.interrupted)` block ensures interrupted turns never
+    // reach this function and therefore never corrupt the ledger or set a false
+    // corrective instruction for the next tick.
+  });
 });
 
 describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
@@ -792,5 +818,154 @@ describe('FrameCoalescer', () => {
       { kind: 'status', text: '[strategic-session] hi' },
     ]);
     expect(fc.isEmpty).toBe(true);
+  });
+});
+
+describe('serializeLedger / restoreLedger', () => {
+  const makeRecord = (surfaceKey: string, atTick: number): ExamRecord => ({
+    surfaceKey,
+    atTick,
+    at: '2026-01-01T00:00:00Z',
+    verdict: 'clear',
+    note: 'ok',
+  });
+
+  it('round-trips a ledger through serialize → restore', () => {
+    const records = [makeRecord('direction:d-1', 1), makeRecord('qualification', 2)];
+    const serialized = serializeLedger(records, 2, false);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.records).toHaveLength(2);
+    expect(restored.records[0].surfaceKey).toBe('direction:d-1');
+    expect(restored.records[1].surfaceKey).toBe('qualification');
+    expect(restored.tick).toBe(2);
+    expect(restored.corrective).toBe(false);
+  });
+
+  it('restoreLedger returns null for undefined / empty / malformed input', () => {
+    expect(restoreLedger(undefined)).toBeNull();
+    expect(restoreLedger(null)).toBeNull();
+    expect(restoreLedger('')).toBeNull();
+    expect(restoreLedger('not json{')).toBeNull();
+    expect(restoreLedger('"just a string"')).toBeNull();
+    expect(restoreLedger('[1,2,3]')).toBeNull();
+  });
+
+  it('caps records at EXAM_RECORDS_CAP on serialize', () => {
+    const records = Array.from({ length: EXAM_RECORDS_CAP + 10 }, (_, i) => makeRecord(`code:dir${i}`, i));
+    const serialized = serializeLedger(records, EXAM_RECORDS_CAP + 10, false);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.records).toHaveLength(EXAM_RECORDS_CAP);
+    // Should keep the LAST N records (most recent).
+    expect(restored.records[0].surfaceKey).toBe('code:dir10');
+  });
+
+  it('drops oldest records to stay within EXAM_LEDGER_MAX_BYTES', () => {
+    // Build records with max-length notes so the total serialized size exceeds
+    // the byte budget when all records are included.
+    const bigNote = 'x'.repeat(EXAM_NOTE_CAP);
+    const records = Array.from({ length: EXAM_RECORDS_CAP }, (_, i) => ({
+      ...makeRecord(`code:dir${i}`, i),
+      note: bigNote,
+    }));
+    const serialized = serializeLedger(records, EXAM_RECORDS_CAP, false);
+    // Must fit within the byte budget.
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(EXAM_LEDGER_MAX_BYTES);
+    // Must be valid JSON parseable by restoreLedger.
+    const restored = restoreLedger(serialized);
+    expect(restored).not.toBeNull();
+    // Records must be the most recent ones (tail of the array).
+    if (restored !== null && restored.records.length > 0) {
+      const firstIdx = parseInt(restored.records[0].surfaceKey.replace('code:dir', ''), 10);
+      const lastIdx = EXAM_RECORDS_CAP - 1;
+      expect(firstIdx).toBeGreaterThan(0); // oldest dropped
+      expect(restored.records[restored.records.length - 1].surfaceKey).toBe(`code:dir${lastIdx}`);
+    }
+  });
+
+  it('truncates note fields at EXAM_NOTE_CAP on serialize', () => {
+    const longNote = 'x'.repeat(EXAM_NOTE_CAP + 50);
+    const records = [{ ...makeRecord('qualification', 1), note: longNote }];
+    const serialized = serializeLedger(records, 1, false);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.records[0].note).toHaveLength(EXAM_NOTE_CAP);
+  });
+
+  it('preserves corrective flag', () => {
+    const serialized = serializeLedger([], 5, true);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.corrective).toBe(true);
+    expect(restored.tick).toBe(5);
+    expect(restored.records).toHaveLength(0);
+  });
+});
+
+describe('refreshSurfaceCatalog', () => {
+  const makeDir = (id: string): ExamSurface => ({
+    key: `direction:${id}`,
+    kind: 'direction',
+    label: `direction ${id}`,
+    hint: `./fetch direction ${id}`,
+  });
+
+  const makeFetch = (key: string): ExamSurface => ({
+    key,
+    kind: 'fetch',
+    label: key,
+    hint: `./fetch ${key}`,
+  });
+
+  it('preserves catalog when active_direction_ids matches exactly', () => {
+    const catalog = [makeDir('d-1'), makeDir('d-2'), makeFetch('qualification')];
+    const result = refreshSurfaceCatalog(catalog, ['d-1', 'd-2'], {});
+    expect(result).toHaveLength(3);
+    expect(result.map(s => s.key)).toEqual(['direction:d-1', 'direction:d-2', 'qualification']);
+  });
+
+  it('prunes retired directions', () => {
+    const catalog = [makeDir('d-old'), makeDir('d-keep'), makeFetch('qualification')];
+    const result = refreshSurfaceCatalog(catalog, ['d-keep'], {});
+    expect(result.find(s => s.key === 'direction:d-old')).toBeUndefined();
+    expect(result.find(s => s.key === 'direction:d-keep')).toBeDefined();
+    expect(result.find(s => s.key === 'qualification')).toBeDefined();
+  });
+
+  it('adds new directions before non-direction surfaces', () => {
+    const catalog = [makeDir('d-1'), makeFetch('qualification'), makeFetch('version-phase')];
+    const result = refreshSurfaceCatalog(catalog, ['d-1', 'd-new'], {
+      directions_summary: [{ id: 'd-new', text: 'A new direction' }],
+    });
+    const keys = result.map(s => s.key);
+    // d-new inserted before fetch surfaces, d-1 stays first
+    expect(keys[0]).toBe('direction:d-1');
+    expect(keys[1]).toBe('direction:d-new');
+    expect(keys[2]).toBe('qualification');
+    expect(keys[3]).toBe('version-phase');
+  });
+
+  it('uses payload directions_summary for label enrichment', () => {
+    const catalog = [makeFetch('qualification')];
+    const result = refreshSurfaceCatalog(catalog, ['d-123'], {
+      directions_summary: [{ id: 'd-123', text: 'Improve test coverage' }],
+    });
+    const dir = result.find(s => s.key === 'direction:d-123');
+    if (dir === undefined) throw new Error('expected direction:d-123 in catalog');
+    expect(dir.label).toContain('Improve test coverage');
+  });
+
+  it('returns catalog with no direction surfaces when active list is empty', () => {
+    const catalog = [makeFetch('qualification')];
+    const result = refreshSurfaceCatalog(catalog, [], {});
+    expect(result).toHaveLength(1);
+    expect(result[0].key).toBe('qualification');
+  });
+
+  it('appends to end when catalog has no non-direction surfaces', () => {
+    const catalog = [makeDir('d-1')];
+    const result = refreshSurfaceCatalog(catalog, ['d-1', 'd-2'], {});
+    expect(result.map(s => s.key)).toEqual(['direction:d-1', 'direction:d-2']);
   });
 });

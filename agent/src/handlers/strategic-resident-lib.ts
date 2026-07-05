@@ -36,6 +36,13 @@ export interface SessionHeartbeatResponse {
   /** Optional compact counts feeding the tick context (in-flight tasks, terminal
    *  transitions since last look, new operator messages). Advisory only. */
   work_state_summary?: Record<string, unknown>;
+  /** Serialized exam-ledger echoed from the heartbeat note, or null. Agents
+   *  ignore this field; it is only used for roundtrip integrity checks. */
+  exam_ledger?: string | null;
+  /** Live direction keys (direction_key strings) in the project that are not
+   *  yet retired. Used to refresh the surface catalog between restarts so
+   *  new/retired directions enter/leave the rotation mid-session. */
+  active_direction_ids?: string[];
 }
 
 /**
@@ -618,7 +625,13 @@ export const FOCUS_LIST_SIZE = 3;
  *  this often. Deliberately under the continuation-lease TTL so a session never
  *  goes fully dark, and matches design doc 9f769438's 600s floor. */
 export const AUTONOMOUS_FLOOR_TICK_MS = 600_000;
-const EXAM_NOTE_CAP = 240;
+export const EXAM_NOTE_CAP = 240;
+/**
+ * Byte budget for the serialized exam ledger. Must stay below the backend's
+ * _EXAM_LEDGER_MAX_BYTES (20_000) so the stored value is always valid JSON.
+ * Set to 16_000 to leave headroom for the surrounding heartbeat note envelope.
+ */
+export const EXAM_LEDGER_MAX_BYTES = 16_000;
 
 // The diagnostic read verbs (a subset of STRATEGIC_FETCH_VERBS in
 // strategic-helpers.ts) that make good STANDING examination surfaces. Kept as a
@@ -939,4 +952,127 @@ export function buildAutonomousPrompt(
   );
 
   return lines.join('\n');
+}
+
+// ── Durable exam-ledger helpers ───────────────────────────────────────────────
+// The ledger lives only in process memory; these helpers serialize it as a
+// bounded JSON string for the heartbeat ``note`` field and restore it from
+// ``task.context._exam_ledger`` on startup, so a routine restart (deploy,
+// runner restart) does not wipe open FOUND leads or reset tick rotation.
+
+/**
+ * Serialize the exam ledger for the heartbeat note. Caps note fields at
+ * EXAM_NOTE_CAP, then drops oldest records until the JSON serialization fits
+ * within EXAM_LEDGER_MAX_BYTES so the backend never receives a truncated blob
+ * that would cause JSON.parse to throw on restart.
+ */
+export function serializeLedger(
+  records: ExamRecord[],
+  tick: number,
+  corrective: boolean,
+): string {
+  const truncated = records.slice(-EXAM_RECORDS_CAP).map(r => ({
+    ...r,
+    note: r.note.slice(0, EXAM_NOTE_CAP),
+  }));
+  // Drop oldest records until the serialized byte length fits the budget.
+  let start = 0;
+  while (start < truncated.length) {
+    const candidate = JSON.stringify({ records: truncated.slice(start), tick, corrective });
+    if (Buffer.byteLength(candidate, 'utf8') <= EXAM_LEDGER_MAX_BYTES) {
+      return candidate;
+    }
+    start++;
+  }
+  return JSON.stringify({ records: [], tick, corrective });
+}
+
+/**
+ * Restore the exam ledger from a persisted string (``task.context._exam_ledger``
+ * or the echoed ``exam_ledger`` heartbeat field). Returns null on any parse
+ * error so the caller falls back to a clean slate.
+ */
+export function restoreLedger(
+  value: string | undefined | null,
+): { records: ExamRecord[]; tick: number; corrective: boolean } | null {
+  if (!value || typeof value !== 'string') return null;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+    const p = parsed as Record<string, unknown>;
+    const rawRecords = Array.isArray(p.records) ? p.records : [];
+    const records: ExamRecord[] = rawRecords
+      .filter((r): r is Record<string, unknown> => r !== null && typeof r === 'object' && !Array.isArray(r))
+      .filter(r => typeof r.surfaceKey === 'string')
+      .slice(0, EXAM_RECORDS_CAP)
+      .map(r => ({
+        surfaceKey: String(r.surfaceKey),
+        atTick: typeof r.atTick === 'number' ? r.atTick : 0,
+        at: typeof r.at === 'string' ? r.at : '',
+        verdict: (['clear', 'found', 'advanced', 'unevidenced'].includes(String(r.verdict))
+          ? r.verdict : 'unevidenced') as ExamRecord['verdict'],
+        note: typeof r.note === 'string' ? r.note.slice(0, EXAM_NOTE_CAP) : '',
+      }));
+    const tick = typeof p.tick === 'number' && Number.isFinite(p.tick) ? p.tick : 0;
+    const corrective = typeof p.corrective === 'boolean' ? p.corrective : false;
+    return { records, tick, corrective };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refresh the surface catalog from a heartbeat's ``active_direction_ids``:
+ * add direction surfaces for newly active directions, prune surfaces for
+ * retired ones, and leave all non-direction surfaces (fetch verbs, code dirs,
+ * etc.) untouched. Preserves catalog ordering (directions first, then fetch,
+ * then code/knowledge/etc.).
+ */
+export function refreshSurfaceCatalog(
+  catalog: ExamSurface[],
+  activeDirectionIds: string[],
+  payload: Record<string, unknown>,
+): ExamSurface[] {
+  const activeSet = new Set(activeDirectionIds);
+
+  // Prune direction surfaces for retired/absent directions.
+  const pruned = catalog.filter(
+    s => s.kind !== 'direction' || activeSet.has(s.key.slice('direction:'.length)),
+  );
+
+  // Build label map from payload's directions_summary (best-effort enrichment).
+  const payloadDirs = Array.isArray(payload.directions_summary)
+    ? payload.directions_summary as Array<Record<string, unknown>> : [];
+  const payloadDirText = new Map<string, string>();
+  for (const d of payloadDirs) {
+    const id = typeof d.id === 'string' ? d.id : '';
+    const text = typeof d.text === 'string' ? d.text.trim().slice(0, 80) : '';
+    if (id) payloadDirText.set(id, text);
+  }
+
+  // Determine which direction keys are already in the (pruned) catalog.
+  const existingKeys = new Set(pruned.map(s => s.key));
+
+  // Build new direction surfaces in the order activeDirectionIds provides.
+  const newDirs: ExamSurface[] = [];
+  for (const id of activeDirectionIds) {
+    const key = `direction:${id}`;
+    if (!existingKeys.has(key)) {
+      const text = payloadDirText.get(id) ?? '';
+      newDirs.push({
+        key,
+        kind: 'direction',
+        label: text ? `direction ${id} — ${text}` : `direction ${id}`,
+        hint: `./fetch direction ${id} — judge its recent outcomes/churn; is it still productive or done?`,
+      });
+    }
+  }
+
+  if (newDirs.length === 0) return pruned;
+
+  // Insert new directions before the first non-direction surface to maintain
+  // the ordering buildSurfaceCatalog establishes (directions always first).
+  const firstNonDir = pruned.findIndex(s => s.kind !== 'direction');
+  if (firstNonDir === -1) return [...pruned, ...newDirs];
+  return [...pruned.slice(0, firstNonDir), ...newDirs, ...pruned.slice(firstNonDir)];
 }

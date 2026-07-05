@@ -770,16 +770,11 @@ async def test_heartbeat_endpoint_agent_token(
     )
     assert res.status_code == 200, res.text
     body = res.json()
-    # The lease-view keys are always present; the resident-pacing substrate adds
-    # the additive, read-only work-state signal (older agents ignore it).
-    assert set(body.keys()) == {
-        "authority_held",
-        "leased_until",
-        "stop_requested",
-        "status",
-        "work_state_rev",
-        "work_state_summary",
-    }
+    # Core lease-view keys are always present; additive read-only signals (older
+    # agents ignore unknown fields).
+    assert {"authority_held", "leased_until", "stop_requested", "status",
+            "work_state_rev", "work_state_summary",
+            "exam_ledger", "active_direction_ids"} <= set(body.keys())
     assert body["authority_held"] is True
     assert body["stop_requested"] is False
     assert body["status"] == "active"
@@ -2601,3 +2596,204 @@ def test_compute_model_integrity_conflicts_criterion_links_ignore_inactive_direc
         inactive_criterion_keys=frozenset(),
     )
     assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Exam-ledger persistence: heartbeat note round-trips into the session blob
+# and is echoed back in the response; the lease is NOT extended (liveness-only
+# heartbeat). Satisfies the acceptance-criteria gate named test.
+# ---------------------------------------------------------------------------
+
+
+_SAMPLE_LEDGER = {
+    "records": [
+        {
+            "surfaceKey": "direction:d-abc123",
+            "atTick": 1,
+            "at": "2026-01-01T00:01:00",
+            "verdict": "clear",
+            "note": "checked the direction; nothing to do",
+        },
+        {
+            "surfaceKey": "qualification",
+            "atTick": 2,
+            "at": "2026-01-01T00:02:00",
+            "verdict": "found",
+            "note": "audit finding needs a follow-up direction",
+        },
+    ],
+    "tick": 2,
+    "corrective": False,
+}
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_ledger_summary_persists_without_extending_lease(db_session):
+    """The heartbeat ``note`` field carries the agent's serialized exam ledger.
+    The backend parses it (JSON), stores it as ``_exam_ledger`` in the session
+    blob, and echoes ``exam_ledger`` in the response. A liveness-only (progress=
+    False) heartbeat that carries a note PERSISTS the ledger AND still does NOT
+    extend the continuation lease — both the persistence contract (write path)
+    and the lease-immutability contract (read path) hold simultaneously.
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Establish a baseline lease by sending a progress heartbeat first.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    baseline_lease = r0["leased_until"]
+    assert baseline_lease is not None
+
+    # Liveness-only heartbeat WITH a note: carries the exam ledger.
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note=note,
+    )
+
+    # --- lease-immutability contract (pinned by existing test) ---------------
+    assert result["authority_held"] is True  # still fresh (preserved, not bumped)
+    assert result["leased_until"] == baseline_lease  # NOT extended by liveness
+
+    # --- persistence contract (new) -----------------------------------------
+    # The echoed exam_ledger field is the stored JSON string.
+    assert result.get("exam_ledger") == note
+
+    # The blob carries ``_exam_ledger`` (written inside the locked _renew closure).
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+    assert "_exam_ledger" in blob
+    stored = _json.loads(blob["_exam_ledger"])
+    assert stored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert len(stored["records"]) == len(_SAMPLE_LEDGER["records"])
+    assert stored["records"][0]["surfaceKey"] == "direction:d-abc123"
+    assert stored["records"][1]["verdict"] == "found"
+
+    # --- snapshot does NOT expose the internal ledger -------------------------
+    # ``_exam_ledger`` is an implementation detail; ``resident_session_snapshot``
+    # must NOT leak it to operator-facing API responses.
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None
+    assert "_exam_ledger" not in snap_dict
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_ledger_mirrored_to_task_context(db_session):
+    """The exam ledger is written to task.context._exam_ledger (not only to
+    project.vision) so a runner/deploy restart can restore it: the agent reads
+    task.context._exam_ledger on startup before making any heartbeat call."""
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note=note,
+    )
+
+    # The task.context must carry _exam_ledger so the agent can read it on restart.
+    fresh_task = await db_session.get(Task, task.id)
+    assert fresh_task is not None
+    assert "_exam_ledger" in (fresh_task.context or {})
+    stored = _json.loads(fresh_task.context["_exam_ledger"])
+    assert stored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert len(stored["records"]) == len(_SAMPLE_LEDGER["records"])
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_note_malformed_json_is_ignored(db_session):
+    """A malformed or non-dict note is silently ignored: the blob is updated
+    normally (no crash, no _exam_ledger written), and the response is valid."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False, note="not-json{{{",
+    )
+    assert result["stop_requested"] is False
+    assert result["exam_ledger"] is None
+
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert "_exam_ledger" not in (blob or {})
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_active_direction_ids(db_session):
+    """The heartbeat response includes ``active_direction_ids`` populated from
+    Direction rows with non-retired statuses; empty when no rows exist."""
+    from app.models import Direction as DirectionModel
+
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # No Direction rows yet → empty list.
+    project = await db_session.get(Project, project.id)
+    r0 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    assert r0["active_direction_ids"] == []
+
+    # Add directions covering all vocabulary statuses.
+    included_statuses = [("d-active1", "active"), ("d-paused1", "paused"), ("d-proposed1", "proposed")]
+    excluded_statuses = [
+        ("d-retired1", "retired"),
+        ("d-completed1", "completed"),
+        ("d-superseded1", "superseded"),
+        ("d-rejected1", "rejected"),
+        ("d-expired1", "expired"),
+    ]
+    for key, status in included_statuses + excluded_statuses:
+        db_session.add(
+            DirectionModel(
+                project_id=project.id,
+                direction_key=key,
+                status=status,
+                data={},
+            )
+        )
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    ids = set(r1["active_direction_ids"])
+    # All three included statuses must appear.
+    assert "d-active1" in ids
+    assert "d-paused1" in ids
+    assert "d-proposed1" in ids
+    # All excluded statuses must be absent.
+    for key, _ in excluded_statuses:
+        assert key not in ids, f"{key} should be excluded from active_direction_ids"

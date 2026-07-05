@@ -31,6 +31,7 @@ The reaper carve-out for these tasks lives in ``reaper_orphan_classify.py``
 session seam both depend on.
 """
 
+import json
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -47,6 +48,7 @@ from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
 from app.models import (
     TASK_OUTCOME_TERMINAL_STATUSES,
+    Direction,
     Project,
     ProjectMessage,
     StrategicCycle,
@@ -132,6 +134,13 @@ _OPERATOR_MESSAGE_FROM_TYPES = ("user", "operator")
 # ``agent_tasks._STRATEGIC_AGENT_CREATED_BY`` / admin_agent_ops). Used to scope
 # the heartbeat's work-state signal to the strategist's OWN in-flight work.
 _STRATEGIC_AGENT_CREATED_BY = "STRATEGIC_AGENT"
+
+# Direction statuses that are "live" (not retired/terminal) for the surface
+# catalog — mirrors the directions_summary inclusion logic in strategic_spawning.
+_ACTIVE_DIRECTION_STATUSES = ("active", "paused", "proposed")
+
+# Maximum bytes stored for the agent's serialized exam-ledger (note field).
+_EXAM_LEDGER_MAX_BYTES = 20_000
 
 # Rolling window (seconds) over which a STRATEGIC_AGENT task that reached a
 # terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
@@ -1625,6 +1634,38 @@ async def renew_resident_session_lease(
         session, project.id
     )
 
+    # Parse the agent's serialized exam-ledger from the heartbeat note (JSON,
+    # guarded). When valid, the string is written into the session blob as
+    # ``_exam_ledger`` so a restart can restore the ledger instead of beginning
+    # from scratch. Best-effort: malformed or absent JSON is silently ignored.
+    exam_ledger_str: str | None = None
+    if isinstance(note, str) and note.strip():
+        try:
+            parsed_note = json.loads(note)
+            if isinstance(parsed_note, dict):
+                # Only store when the full JSON fits; truncating mid-value
+                # yields invalid JSON that causes JSON.parse to throw on restart.
+                if len(note.encode()) <= _EXAM_LEDGER_MAX_BYTES:
+                    exam_ledger_str = note
+        except Exception:
+            pass
+
+    # Cheap indexed read of live direction keys for the agent's surface-catalog
+    # refresh. Returns only non-retired directions so newly created or newly
+    # retired directions immediately enter/leave the rotation on the next tick.
+    active_direction_ids: list[str] = list(
+        (
+            await session.execute(
+                select(Direction.direction_key).where(
+                    Direction.project_id == project.id,
+                    Direction.status.in_(list(_ACTIVE_DIRECTION_STATUSES)),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
     # Stop-requested / ended (pre-lock snapshot): do NOT renew — let the lease
     # lapse so the cadence can reclaim, and signal the agent to wind down.
     if stop_requested or status == STATUS_ENDED:
@@ -1638,6 +1679,8 @@ async def renew_resident_session_lease(
             "status": status,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
 
     # Unattended cap: compare now against the last operator interaction, taking
@@ -1780,9 +1823,28 @@ async def renew_resident_session_lease(
             updated["last_progress_at"] = now_iso
         if op_reengaged and latest_msg_dt is not None:
             updated["last_operator_interaction_at"] = latest_msg_dt.isoformat()
+        # Persist the agent's serialized exam-ledger so it survives a restart.
+        # ``_exam_ledger`` is NOT exposed by ``resident_session_snapshot``; it is
+        # an opaque blob the agent reads back via ``task.context`` on startup.
+        if exam_ledger_str is not None:
+            updated["_exam_ledger"] = exam_ledger_str
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
+    # Mirror the exam ledger into task.context so a runner restart can read it
+    # back via task.context._exam_ledger on startup (the agent reads that path;
+    # project.vision is not visible to the agent at pull time).
+    if exam_ledger_str is not None:
+        try:
+            ledger_task = await session.get(Task, uuid.UUID(task_id))
+            if ledger_task is not None:
+                ctx = dict(ledger_task.context or {})
+                ctx["_exam_ledger"] = exam_ledger_str
+                ledger_task.context = ctx
+                flag_modified(ledger_task, "context")
+                session.add(ledger_task)
+        except (ValueError, TypeError):
+            pass
     await session.commit()
     await session.refresh(project)
 
@@ -1800,6 +1862,8 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
     if holder["capped"] or holder["lapsed"]:
         # Finding 1: the unattended cap was exceeded, or the lease genuinely
@@ -1814,6 +1878,8 @@ async def renew_resident_session_lease(
             "status": refreshed.get("status") or STATUS_ENDED,
             "work_state_rev": work_state_rev,
             "work_state_summary": work_state_summary,
+            "exam_ledger": None,
+            "active_direction_ids": active_direction_ids,
         }
     return {
         "authority_held": bool(cont.get("fresh"))
@@ -1824,6 +1890,8 @@ async def renew_resident_session_lease(
         "status": refreshed.get("status") or STATUS_ACTIVE,
         "work_state_rev": work_state_rev,
         "work_state_summary": work_state_summary,
+        "exam_ledger": exam_ledger_str,
+        "active_direction_ids": active_direction_ids,
     }
 
 
