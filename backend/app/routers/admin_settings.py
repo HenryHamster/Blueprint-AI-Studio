@@ -203,6 +203,8 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "diagnostics_after_edit_enabled",
         "improvement_lanes_enabled",
         "review_fix_lane_pilot_enabled",
+        "direction_gap_respawn_block_mode",
+        "direction_gap_respawn_cooldown_days",
     }
 )
 
@@ -683,6 +685,12 @@ async def get_settings(
         "max_plan_accounts": max_plan_accounts,
         "cloud_run_task_type_allowlist": sorted(
             _runtime_config.get("cloud_run_task_type_allowlist") or []
+        ),
+        "direction_gap_respawn_block_mode": str(
+            _runtime_config.get("direction_gap_respawn_block_mode", "observe") or "observe"
+        ),
+        "direction_gap_respawn_cooldown_days": float(
+            _runtime_config.get("direction_gap_respawn_cooldown_days", 14) or 14
         ),
     }
 
@@ -1773,6 +1781,32 @@ async def _apply_settings(
                     },
                 )
         _runtime_config["review_fix_lane_pilot_enabled"] = val
+    if "direction_gap_respawn_block_mode" in payload:
+        val = (
+            str(payload["direction_gap_respawn_block_mode"] or "").strip().lower()
+        )
+        if val not in ("observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "direction_gap_respawn_block_mode must be one of: observe, enforce"
+                ),
+            )
+        _runtime_config["direction_gap_respawn_block_mode"] = val
+    if "direction_gap_respawn_cooldown_days" in payload:
+        try:
+            fval = float(payload["direction_gap_respawn_cooldown_days"])
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_gap_respawn_cooldown_days must be a number",
+            )
+        if not (1.0 <= fval <= 365.0):
+            raise HTTPException(
+                status_code=400,
+                detail="direction_gap_respawn_cooldown_days must be between 1 and 365",
+            )
+        _runtime_config["direction_gap_respawn_cooldown_days"] = fval
     if "drift_stall_min_claims" in payload:
         try:
             val = int(payload["drift_stall_min_claims"])
@@ -3133,6 +3167,16 @@ async def _apply_settings(
                         _runtime_config.get(
                             "resident_session_heartbeat_stale_seconds", 1500
                         )
+                    ),
+                    "direction_gap_respawn_block_mode": str(
+                        _runtime_config.get(
+                            "direction_gap_respawn_block_mode", "observe"
+                        )
+                        or "observe"
+                    ),
+                    "direction_gap_respawn_cooldown_days": float(
+                        _runtime_config.get("direction_gap_respawn_cooldown_days", 14)
+                        or 14
                     ),
                 }
                 if "direction_refractory_minutes" not in _runtime_config:

@@ -9048,6 +9048,145 @@ class TestEvergreenFillSettingsPersist:
         )
 
 
+class TestDirectionGapRespawnSettings:
+    """direction_gap_respawn_block_mode and direction_gap_respawn_cooldown_days
+    are registered in the settings allowlist, exposed by GET /settings with
+    correct defaults, validated on PATCH, and persisted + restored via
+    sync_runtime_config_from_state."""
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_settings_appear_in_get_with_defaults(
+        self, client: AsyncClient
+    ):
+        """GET /settings includes both keys with the expected defaults."""
+        body = (await client.get("/api/admin/settings")).json()
+        assert "direction_gap_respawn_block_mode" in body
+        assert "direction_gap_respawn_cooldown_days" in body
+        assert body["direction_gap_respawn_block_mode"] == "observe"
+        assert body["direction_gap_respawn_cooldown_days"] == 14
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_block_mode_roundtrip(self, client: AsyncClient):
+        """Valid block-mode values are accepted and reflected in GET."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_block_mode": "enforce"},
+        )
+        assert resp.status_code == 200, resp.text
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_gap_respawn_block_mode"] == "enforce"
+
+        # Restore to observe
+        resp2 = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_block_mode": "observe"},
+        )
+        assert resp2.status_code == 200
+        body2 = (await client.get("/api/admin/settings")).json()
+        assert body2["direction_gap_respawn_block_mode"] == "observe"
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_block_mode_invalid_rejected(self, client: AsyncClient):
+        """Invalid block-mode strings are rejected with 400."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_block_mode": "advisory"},
+        )
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_cooldown_days_roundtrip(self, client: AsyncClient):
+        """Valid cooldown values (float, in 1..365) are accepted."""
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_cooldown_days": 30},
+        )
+        assert resp.status_code == 200, resp.text
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_gap_respawn_cooldown_days"] == 30.0
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_cooldown_days_out_of_range_rejected(
+        self, client: AsyncClient
+    ):
+        """Out-of-range cooldown values are rejected with 400."""
+        resp_low = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_cooldown_days": 0},
+        )
+        assert resp_low.status_code == 400
+
+        resp_high = await client.patch(
+            "/api/admin/settings",
+            json={"direction_gap_respawn_cooldown_days": 400},
+        )
+        assert resp_high.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_settings_persist_and_restore(
+        self, client: AsyncClient, db_session
+    ):
+        """Both keys persist to runtime_config_json and are restored by
+        sync_runtime_config_from_state so the values survive a restart."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        db_session.add(DeploymentState())
+        await db_session.commit()
+
+        resp = await client.patch(
+            "/api/admin/settings",
+            json={
+                "direction_gap_respawn_block_mode": "enforce",
+                "direction_gap_respawn_cooldown_days": 21,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        # Values appear in GET /settings
+        body = (await client.get("/api/admin/settings")).json()
+        assert body["direction_gap_respawn_block_mode"] == "enforce"
+        assert body["direction_gap_respawn_cooldown_days"] == 21.0
+
+        # Values are persisted to runtime_config_json
+        row = await db_session.get(DeploymentState, 1)
+        assert row is not None
+        assert row.runtime_config_json is not None
+        assert row.runtime_config_json["direction_gap_respawn_block_mode"] == "enforce"
+        assert row.runtime_config_json["direction_gap_respawn_cooldown_days"] == 21.0
+
+        # Simulate a restart by resetting in-memory values to defaults
+        _shared_state.runtime_config["direction_gap_respawn_block_mode"] = "observe"
+        _shared_state.runtime_config["direction_gap_respawn_cooldown_days"] = 14
+
+        await sync_runtime_config_from_state(row)
+
+        # Persisted values are restored
+        assert _shared_state.runtime_config["direction_gap_respawn_block_mode"] == "enforce"
+        assert _shared_state.runtime_config["direction_gap_respawn_cooldown_days"] == 21.0
+
+    @pytest.mark.asyncio
+    async def test_gap_respawn_block_mode_junk_ignored_in_sync(
+        self, client: AsyncClient, db_session
+    ):
+        """Junk mode value in runtime_config_json is ignored by
+        sync_runtime_config_from_state — the existing value survives."""
+        from app.models import DeploymentState
+        from app.runtime_config_state import sync_runtime_config_from_state
+        import app.shared_state as _shared_state
+
+        state = DeploymentState()
+        state.runtime_config_json = {"direction_gap_respawn_block_mode": "invalid_junk"}
+        db_session.add(state)
+        await db_session.commit()
+
+        _shared_state.runtime_config["direction_gap_respawn_block_mode"] = "observe"
+        await sync_runtime_config_from_state(state)
+        # Junk is ignored; original default survives
+        assert _shared_state.runtime_config["direction_gap_respawn_block_mode"] == "observe"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # dispatch_external_notification — webhook dispatch logic
 # ═══════════════════════════════════════════════════════════════════════════════

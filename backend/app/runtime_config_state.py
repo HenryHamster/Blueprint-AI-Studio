@@ -1059,6 +1059,17 @@ runtime_config: Dict = {
     "resident_session_heartbeat_stale_seconds": int(
         os.getenv("RESIDENT_SESSION_HEARTBEAT_STALE_SECONDS", "1500")
     ),
+    # Gap-scoped recently-retired direction block (direction_gap_respawn_block_mode).
+    # When a direction is proposed for a gap that already has a recently-retired
+    # direction, this mode controls whether the respawn is blocked:
+    #   observe  — record the match, never block (default).
+    #   enforce  — block same-gap re-spawns within the cooldown window.
+    # Registered here so operators can graduate from observe→enforce via
+    # PATCH /api/admin/settings without a redeploy.
+    "direction_gap_respawn_block_mode": "observe",
+    # Cooldown window (days) for the gap-respawn block. A retired direction blocks
+    # same-gap re-spawns for this many days after retirement. Default 14.
+    "direction_gap_respawn_cooldown_days": 14,
 }
 
 # Promotion-policy key set — the rubric controls that live in runtime_config.
@@ -1461,6 +1472,23 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         "evergreen_fill_deferred_memo_enrollment",
                         bool(config_json["evergreen_fill_deferred_memo_enrollment"]),
                     )
+                if "direction_gap_respawn_block_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["direction_gap_respawn_block_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("observe", "enforce"):
+                        _set("direction_gap_respawn_block_mode", raw_mode)
+                if "direction_gap_respawn_cooldown_days" in config_json:
+                    try:
+                        _cooldown = float(
+                            config_json["direction_gap_respawn_cooldown_days"]
+                        )
+                        if 1.0 <= _cooldown <= 365.0:
+                            _set("direction_gap_respawn_cooldown_days", _cooldown)
+                    except (TypeError, ValueError):
+                        pass
                 if "evergreen_fill_mode" in config_json:
                     raw_mode = (
                         str(config_json["evergreen_fill_mode"] or "").strip().lower()
