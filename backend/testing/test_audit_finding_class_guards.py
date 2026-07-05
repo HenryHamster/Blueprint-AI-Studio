@@ -69,14 +69,14 @@ class TestModuleSizeGuardsWired:
     """Assert that the module-size guardrail infrastructure is still in place.
 
     This class does NOT duplicate the cap assertions — those live in
-    ``TestBackendModuleSizeGuardrails`` / ``TestAgentModuleSizeGuardrails`` in
-    ``test_invariants.py``. Here we merely verify the data file and the test
-    class exist so a future refactor cannot silently hollow out the guardrail
-    while this consolidated module still reports green.
+    ``TestBackendModuleSizeGuardrails`` / ``TestAgentModuleSizeGuardrails`` /
+    ``TestFrontendSizeGuardrails`` in ``test_invariants.py``. Here we merely
+    verify the data file and the test classes exist so a future refactor cannot
+    silently hollow out the guardrail while this consolidated module still reports green.
     """
 
     def test_module_size_limits_json_exists(self):
-        """module_size_limits.json must exist with non-empty backend + agent sections."""
+        """module_size_limits.json must exist with non-empty backend, agent, and frontend sections."""
         import json
 
         limits_path = _THIS_DIR / "module_size_limits.json"
@@ -92,6 +92,11 @@ class TestModuleSizeGuardsWired:
         assert isinstance(data.get("agent"), dict) and data["agent"], (
             "module_size_limits.json must have a non-empty 'agent' section."
         )
+        assert isinstance(data.get("frontend"), dict) and data["frontend"], (
+            "module_size_limits.json must have a non-empty 'frontend' section. "
+            "The frontend ESLint size/no-oversized-file rule reads caps from this "
+            "section; removing it silently disables the frontend module-density guardrail."
+        )
 
     def test_test_invariants_has_backend_size_guardrail_class(self):
         """test_invariants.py must still contain the TestBackendModuleSizeGuardrails
@@ -106,6 +111,36 @@ class TestModuleSizeGuardsWired:
         assert "def test_module_within_limit" in content, (
             "test_module_within_limit is missing from TestBackendModuleSizeGuardrails. "
             "The parametrized size cap is no longer enforced."
+        )
+
+    def test_test_invariants_has_agent_size_guardrail_class(self):
+        """test_invariants.py must still contain the TestAgentModuleSizeGuardrails
+        class and its parametrized test method."""
+        inv_path = _THIS_DIR / "test_invariants.py"
+        assert inv_path.exists(), "test_invariants.py is missing."
+        content = inv_path.read_text()
+        assert "class TestAgentModuleSizeGuardrails" in content, (
+            "TestAgentModuleSizeGuardrails class is missing from test_invariants.py. "
+            "The agent module-size guardrail has been removed — restore it."
+        )
+        assert "def test_agent_module_within_limit" in content, (
+            "test_agent_module_within_limit is missing from TestAgentModuleSizeGuardrails. "
+            "The parametrized agent size cap is no longer enforced."
+        )
+
+    def test_test_invariants_has_frontend_size_guardrail_class(self):
+        """test_invariants.py must still contain the TestFrontendSizeGuardrails
+        class and its parametrized test method."""
+        inv_path = _THIS_DIR / "test_invariants.py"
+        assert inv_path.exists(), "test_invariants.py is missing."
+        content = inv_path.read_text()
+        assert "class TestFrontendSizeGuardrails" in content, (
+            "TestFrontendSizeGuardrails class is missing from test_invariants.py. "
+            "The frontend module-size guardrail has been removed — restore it."
+        )
+        assert "def test_frontend_within_limit" in content, (
+            "test_frontend_within_limit is missing from TestFrontendSizeGuardrails. "
+            "The parametrized frontend size cap is no longer enforced."
         )
 
     def test_test_invariants_has_migration_chain_guards(self):
@@ -501,6 +536,7 @@ class TestStandaloneRosterIncludesGuardModule:
             TestDroppedColumnResidualAbsent,
             TestTestDurationsNotTracked,
             TestLongLivedDocsDoNotReferenceRemovedCodePaths,
+            TestStandaloneRosterIncludesGuardModule,
         ]
         assert guard_classes, "Guard classes must be defined in this module"
 
