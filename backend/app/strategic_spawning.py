@@ -4549,11 +4549,13 @@ def _freshness_generated_at() -> str:
 def _build_freshness_shas_block(currency: dict) -> dict:
     """Build a normalized SHA-freshness dict from a resolved candidate-currency dict.
 
-    Takes the ``{"current": bool, "candidate_sha": str, "head_sha": str}`` dict
-    returned by ``_resolve_candidate_currency`` and returns an additive block that
-    exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
+    Takes a RESOLVED ``{"current": bool, "candidate_sha": str, "head_sha": str}``
+    dict returned by ``_resolve_candidate_currency`` and returns an additive block
+    that exposes payload_sha, active_candidate_sha, integration_head_sha, stale, and
     stale_reason.  payload_compiled_sha is kept for backward-compat with older
-    agent consumers that read it directly.
+    agent consumers that read it directly.  Only call this for a resolved
+    (fresh/stale) currency dict — unresolved states go through the unknown /
+    api-unreachable builders which never set ``stale``.
     """
     from datetime import datetime
 
@@ -4573,19 +4575,99 @@ def _build_freshness_shas_block(currency: dict) -> dict:
     }
 
 
-def _build_unknown_freshness_block() -> dict:
-    """Build a freshness block for when currency resolution was indeterminate.
+def _build_unknown_freshness_block(currency: dict | None = None) -> dict:
+    """Build a freshness block for GENUINE local indeterminacy.
 
     Returns a block with verdict='unknown' so consumers can distinguish an
     unresolved freshness check from a confirmed-fresh or confirmed-stale result.
+    Genuine indeterminacy means the local state could not produce a comparison:
+    no open version, no candidate SHA, unavailable repo credentials, or a branch
+    that does not exist.  Never sets ``stale`` — an unknown state is not stale.
+    When available, carries the ``reason`` and ``active_candidate_sha`` so the
+    agent can see WHY the check was indeterminate.
     """
     from datetime import datetime
 
-    return {
+    block: dict = {
         "verdict": "unknown",
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "generated_at": _freshness_generated_at(),
     }
+    if isinstance(currency, dict):
+        if isinstance(currency.get("reason"), str) and currency["reason"]:
+            block["reason"] = currency["reason"]
+        if isinstance(currency.get("candidate_sha"), str) and currency["candidate_sha"]:
+            block["active_candidate_sha"] = currency["candidate_sha"]
+    return block
+
+
+def _build_api_unreachable_freshness_block(currency: dict | None = None) -> dict:
+    """Build a freshness block for a TRANSIENT GitHub/API/transport failure.
+
+    Distinct from ``unknown``: the currency check could not complete because
+    GitHub was unreachable (5xx / rate-limit / transport / timeout) after a
+    bounded retry, NOT because the local state is genuinely indeterminate.  The
+    agent must treat this as a temporary API-reachability problem — the payload
+    is NOT known to be stale, so ``stale`` is never set.  Carries ``reason`` and
+    ``active_candidate_sha`` when available for diagnostics.
+    """
+    from datetime import datetime
+
+    block: dict = {
+        "verdict": "api_unreachable",
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at": _freshness_generated_at(),
+    }
+    if isinstance(currency, dict):
+        if isinstance(currency.get("reason"), str) and currency["reason"]:
+            block["reason"] = currency["reason"]
+        if isinstance(currency.get("candidate_sha"), str) and currency["candidate_sha"]:
+            block["active_candidate_sha"] = currency["candidate_sha"]
+    return block
+
+
+def _build_payload_staleness_block(currency: dict | None) -> dict:
+    """Dispatch a currency dict to the correct freshness block by verdict.
+
+    Resolved (fresh/stale) currency dicts produce a full SHA-freshness block;
+    ``api_unreachable`` produces the transient-failure block; everything else
+    (genuine local indeterminacy or a missing dict) produces the unknown block.
+    """
+    if not isinstance(currency, dict):
+        return _build_unknown_freshness_block()
+    # A resolved currency dict always carries a boolean ``current``.  Test this
+    # directly (rather than the newer ``resolved`` flag) so legacy callers/mocks
+    # that return the bare ``{"current", "candidate_sha", "head_sha"}`` shape are
+    # still recognised as resolved.
+    if isinstance(currency.get("current"), bool):
+        return _build_freshness_shas_block(currency)
+    if currency.get("verdict") == "api_unreachable":
+        return _build_api_unreachable_freshness_block(currency)
+    return _build_unknown_freshness_block(currency)
+
+
+def _currency_unknown(reason: str, *, candidate_sha: str | None = None) -> dict:
+    """Typed indeterminate-currency result (genuine local indeterminacy)."""
+    result: dict = {"verdict": "unknown", "resolved": False, "reason": reason}
+    if isinstance(candidate_sha, str) and candidate_sha:
+        result["candidate_sha"] = candidate_sha
+    return result
+
+
+def _currency_api_unreachable(reason: str, *, candidate_sha: str | None = None) -> dict:
+    """Typed transient-failure currency result (GitHub/API unreachable)."""
+    result: dict = {"verdict": "api_unreachable", "resolved": False, "reason": reason}
+    if isinstance(candidate_sha, str) and candidate_sha:
+        result["candidate_sha"] = candidate_sha
+    return result
+
+
+# Bounded retry for the transient GitHub path in _resolve_candidate_currency.
+# ``get_branch_sha`` already retries 5xx/rate-limit/transport failures inside
+# ``_github_request``; this is a thin outer bound so a single transient blip that
+# escapes that layer is retried once more before we classify api_unreachable.
+_CURRENCY_RETRY_ATTEMPTS = 2
+_CURRENCY_RETRY_DELAY_S = 0.75
 
 
 async def _resolve_candidate_currency(
@@ -4593,7 +4675,7 @@ async def _resolve_candidate_currency(
     project: Project,
     last_qual: dict,
     integration_branch: str,
-) -> dict | None:
+) -> dict:
     """Best-effort check: is a qualification's candidate commit still HEAD?
 
     The qualifier scores its audit findings against a pinned ``candidate_sha``
@@ -4601,39 +4683,100 @@ async def _resolve_candidate_currency(
     those very findings often land afterward.  Resolve the live integration
     branch HEAD and compare it to the qualification's candidate commit.
 
-    Returns ``{"current": bool, "candidate_sha": str, "head_sha": str}`` when
-    the comparison resolves, or ``None`` when it is indeterminate (no candidate
-    SHA on the record, GitHub unreachable, or the branch lookup failed).  Never
-    raises — a failure to resolve must never block the strategic payload build.
+    Always returns a typed dict with a ``verdict`` field; never raises — a
+    failure to resolve must never block the strategic payload build:
+
+    * ``{"verdict": "fresh"|"stale", "resolved": True, "current": bool,
+      "candidate_sha": str, "head_sha": str}`` when the comparison resolves.
+      The resolved shape keeps the legacy ``current``/``candidate_sha``/
+      ``head_sha`` keys for backward compatibility.
+    * ``{"verdict": "api_unreachable", "resolved": False, "reason": str, ...}``
+      when GitHub/transport failed transiently (5xx / rate-limit / timeout /
+      connect) after a bounded retry — a temporary reachability problem, NOT a
+      known-stale payload.
+    * ``{"verdict": "unknown", "resolved": False, "reason": str, ...}`` for
+      genuine local indeterminacy: no candidate SHA on the record, unavailable
+      repo credentials, or a branch that does not exist.
     """
+    import httpx
+    from fastapi import HTTPException
+
     candidate_sha = last_qual.get("candidate_sha")
     if not candidate_sha or not isinstance(candidate_sha, str):
-        return None
-    head_sha: str | None = None
+        return _currency_unknown("no_candidate_sha")
+
+    # Resolve repo credentials once.  A None result (or a resolver error) is
+    # genuine local indeterminacy — no transient GitHub call was even attempted.
     try:
-        from app import github as _github
         from app.release_qualifier import _resolve_github_with_session
 
         _resolved = await _resolve_github_with_session(session, project)
-        if _resolved is None:
-            return None
-        _gh_token, _gh_owner, _gh_repo = _resolved
-        head_sha = await _github.get_branch_sha(
-            _gh_token, _gh_owner, _gh_repo, integration_branch
-        )
     except Exception:
         logger.exception(
-            "[STRATEGIC] could not resolve integration branch HEAD for "
-            "candidate-currency check"
+            "[STRATEGIC] repo-credential resolution failed for candidate-currency check"
         )
-        return None
-    if not head_sha or not isinstance(head_sha, str):
-        return None
-    return {
-        "current": candidate_sha == head_sha,
-        "candidate_sha": candidate_sha,
-        "head_sha": head_sha,
-    }
+        return _currency_unknown("repo_credentials_error", candidate_sha=candidate_sha)
+    if _resolved is None:
+        return _currency_unknown(
+            "repo_credentials_unavailable", candidate_sha=candidate_sha
+        )
+    _gh_token, _gh_owner, _gh_repo = _resolved
+
+    from app import github as _github
+
+    last_transient_reason = "github_api_unreachable"
+    for _attempt in range(_CURRENCY_RETRY_ATTEMPTS):
+        try:
+            head_sha = await _github.get_branch_sha(
+                _gh_token, _gh_owner, _gh_repo, integration_branch
+            )
+        except HTTPException as exc:
+            status_code = getattr(exc, "status_code", None)
+            # A 404 means the integration branch genuinely does not exist — that
+            # is not a transient reachability problem and retrying cannot help.
+            if status_code == 404:
+                return _currency_unknown(
+                    "branch_not_found", candidate_sha=candidate_sha
+                )
+            last_transient_reason = (
+                f"github_http_{status_code}" if status_code else "github_http_error"
+            )
+        except httpx.HTTPError as exc:
+            # Transport-layer / timeout failure — transient by nature.
+            last_transient_reason = f"github_transport_{type(exc).__name__}"
+        except Exception:
+            # Unexpected failure (e.g. malformed payload): stay conservative and
+            # report genuine indeterminacy rather than claiming API-unreachable.
+            logger.exception(
+                "[STRATEGIC] could not resolve integration branch HEAD for "
+                "candidate-currency check"
+            )
+            return _currency_unknown("resolve_error", candidate_sha=candidate_sha)
+        else:
+            if not head_sha or not isinstance(head_sha, str):
+                return _currency_unknown(
+                    "head_sha_unavailable", candidate_sha=candidate_sha
+                )
+            is_current = candidate_sha == head_sha
+            return {
+                "verdict": "fresh" if is_current else "stale",
+                "resolved": True,
+                "current": is_current,
+                "candidate_sha": candidate_sha,
+                "head_sha": head_sha,
+            }
+        # Transient failure — retry once more within the bounded budget.
+        if _attempt < _CURRENCY_RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(_CURRENCY_RETRY_DELAY_S)
+
+    logger.warning(
+        "[STRATEGIC] candidate-currency check unreachable after %d attempt(s): %s",
+        _CURRENCY_RETRY_ATTEMPTS,
+        last_transient_reason,
+    )
+    return _currency_api_unreachable(
+        last_transient_reason, candidate_sha=candidate_sha
+    )
 
 
 def ci_compliance_qualify_gate(
@@ -6647,7 +6790,8 @@ async def _spawn_strategic_review(
             _currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
-            _candidate_behind = _currency is not None and not _currency["current"]
+            _currency_resolved = _currency.get("resolved") is True
+            _candidate_behind = _currency_resolved and not _currency["current"]
             if _version_phase_block is not None and _currency is not None:
                 _version_phase_block["last_qualification_candidate_currency"] = (
                     _currency
@@ -6749,7 +6893,7 @@ async def _spawn_strategic_review(
                     f"version_phase.last_qualification.audit_findings — and "
                     f"{_binding_desc}. Top findings: {_top}."
                 )
-                if _currency is None:
+                if not _currency_resolved:
                     _stabilize_hint += (
                         " (Could not confirm the candidate commit these findings "
                         "were scored against is still the integration-branch HEAD, "
@@ -6926,16 +7070,23 @@ async def _spawn_strategic_review(
             logger.exception(
                 "[STRATEGIC] fallback candidate-currency resolution failed; continuing"
             )
-    # Derive structured payload-staleness signal from the already-resolved
-    # _currency dict.  Exposes payload_compiled_sha, active_candidate_sha,
-    # integration_head_sha, and an explicit stale/current verdict at cycle start
-    # so the agent can detect stale-context before making portfolio decisions.
-    # Always present: 'unknown' verdict when GitHub was unreachable so the agent
-    # can never mistake an indeterminate freshness check for a confirmed-fresh one.
-    if _currency is not None:
-        _payload_staleness: dict = _build_freshness_shas_block(_currency)
-    else:
-        _payload_staleness = _build_unknown_freshness_block()
+        # Surface the typed currency block through version_phase on the fallback
+        # path too (the stabilize+carried-findings path already set it above), so
+        # an api_unreachable/stale/fresh verdict reaches buildVersionPhaseSection
+        # on every cycle that has an open version.
+        if (
+            _currency is not None
+            and _version_phase_block is not None
+            and "last_qualification_candidate_currency" not in _version_phase_block
+        ):
+            _version_phase_block["last_qualification_candidate_currency"] = _currency
+    # Derive structured payload-staleness signal from the resolved _currency dict.
+    # A resolved dict exposes payload_compiled_sha, active_candidate_sha,
+    # integration_head_sha, and an explicit stale/current verdict; an unresolved
+    # dict carries verdict='unknown' (genuine local indeterminacy) or
+    # 'api_unreachable' (transient GitHub failure) WITHOUT a stale flag, so the
+    # agent can never mistake either indeterminate state for confirmed-fresh.
+    _payload_staleness: dict = _build_payload_staleness_block(_currency)
     # Inject explicit list of failed approaches from retired directions so the
     # agent has a clear "do not re-propose" block in the prompt.
     _retired_summary = _build_retired_directions_summary(project)

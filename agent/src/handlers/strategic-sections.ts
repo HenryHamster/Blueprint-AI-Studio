@@ -1277,10 +1277,23 @@ export function buildPayloadStalenessSection(staleness: Record<string, unknown> 
 
   const lines: string[] = ['\n## Payload Currency (cycle-start check)'];
 
+  // Transient GitHub/API failure — the freshness check could not reach GitHub
+  // (5xx / rate-limit / transport / timeout) after a bounded retry. This is a
+  // TEMPORARY reachability problem, NOT evidence the payload is stale, so it must
+  // render distinctly from an indeterminate ('unknown') check and must NOT push
+  // the strategist to re-ground every load-bearing payload claim as stale.
+  if (staleness.verdict === 'api_unreachable') {
+    const checkedAt = typeof staleness.checked_at === 'string' ? staleness.checked_at : '';
+    const reason = typeof staleness.reason === 'string' && staleness.reason ? ` (${staleness.reason})` : '';
+    lines.push(`⚠ API UNREACHABLE — the freshness check could not reach GitHub at spawn time${reason} after a bounded retry.${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
+    lines.push('This is a TEMPORARY API-reachability problem, NOT evidence that this payload is stale. Do NOT re-ground every load-bearing payload claim as stale/unknown on this basis — treat the prior payload SHAs as last-known-good and re-check currency once GitHub is reachable.');
+    return lines.join('\n');
+  }
+
   // Unknown/indeterminate verdict — currency check could not be completed
   if (staleness.verdict === 'unknown') {
     const checkedAt = typeof staleness.checked_at === 'string' ? staleness.checked_at : '';
-    lines.push(`⚠ UNKNOWN — freshness check could not be completed at spawn time (GitHub API unreachable or candidate SHA unavailable).${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
+    lines.push(`⚠ UNKNOWN — freshness check could not be completed at spawn time (no candidate SHA, unavailable repo credentials, or the integration branch was not found).${checkedAt ? ` Checked at: ${checkedAt}.` : ''}`);
     lines.push('Treat this payload as potentially stale. Do NOT assume audit findings are scored against current HEAD until a fresh qualification confirms currency.');
     return lines.join('\n');
   }

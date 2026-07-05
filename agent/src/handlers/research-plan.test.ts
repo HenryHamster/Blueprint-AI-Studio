@@ -2417,6 +2417,58 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('CURRENT');
   });
 
+  it('renders candidate currency as API UNREACHABLE (not STALE) for verdict api_unreachable', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'api_unreachable',
+        resolved: false,
+        reason: 'github_http_502',
+        candidate_sha: 'candsha012345',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: API UNREACHABLE');
+    expect(result).toContain('github_http_502');
+    expect(result).toContain('candsha01234');
+    // Regression: a transient GitHub outage must NOT be framed as STALE.
+    expect(result).not.toContain('candidate currency: STALE');
+    expect(result).toContain('temporary reachability problem');
+  });
+
+  it('renders candidate currency as UNKNOWN (not STALE) for genuine indeterminacy', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'unknown',
+        resolved: false,
+        reason: 'repo_credentials_unavailable',
+        candidate_sha: 'candsha678901',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: UNKNOWN');
+    expect(result).toContain('Not confirmed stale');
+    expect(result).not.toContain('candidate currency: STALE');
+    expect(result).not.toContain('candidate currency: CURRENT');
+  });
+
+  it('renders STALE when verdict is stale even without a boolean current field', () => {
+    const result = buildVersionPhaseSection({
+      version_number: 5,
+      phase: 'stabilize',
+      last_qualification_candidate_currency: {
+        verdict: 'stale',
+        resolved: true,
+        current: false,
+        candidate_sha: 'oldsha1234567890',
+        head_sha: 'newsha9876543210',
+      },
+    });
+    expect(result).toContain('Qualification candidate currency: STALE');
+    expect(result).toContain('oldsha123456');
+  });
+
   it('omits candidate currency block when last_qualification_candidate_currency is absent', () => {
     const result = buildVersionPhaseSection({ version_number: 3, phase: 'stabilize' });
     expect(result).not.toContain('Qualification candidate currency');

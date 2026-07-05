@@ -4265,3 +4265,50 @@ async def test_candidate_currency_indeterminate_marker(
     assert cc is not None, "candidate_currency must be present when freshness is indeterminate"
     assert cc.get("verdict") == "unknown", "verdict must be 'unknown' when currency is indeterminate"
     _assert_generated_at_iso_utc(cc)
+
+
+@pytest.mark.asyncio
+async def test_candidate_currency_api_unreachable_distinct_from_unknown(
+    client: AsyncClient, db_session, mocker
+):
+    """A transient GitHub 5xx surfaces candidate_currency.verdict='api_unreachable'
+    on the agent fetch path — distinct from 'unknown' — without a stale flag, and
+    the endpoint still returns 200 (a GitHub outage must not break the fetch)."""
+    from unittest.mock import AsyncMock
+    from fastapi import HTTPException
+    from sqlalchemy.orm.attributes import flag_modified
+
+    candidate = "f" * 40
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-freshness-unreachable"
+    )
+    version.last_qualification = {"candidate_sha": candidate, "status": "not_promoted"}
+    flag_modified(version, "last_qualification")
+    await db_session.commit()
+
+    # Credentials resolve, but the live HEAD read hits a GitHub 5xx after retry.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=HTTPException(status_code=502, detail="5xx")),
+    )
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/version-phase",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+
+    cc = data.get("candidate_currency")
+    assert cc is not None, "candidate_currency must be present when GitHub is unreachable"
+    assert cc.get("verdict") == "api_unreachable"
+    assert cc.get("verdict") != "unknown"
+    assert cc.get("stale") is None, "stale must not be set on api_unreachable"
+    _assert_generated_at_iso_utc(cc)

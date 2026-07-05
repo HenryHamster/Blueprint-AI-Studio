@@ -7725,6 +7725,267 @@ async def test_spawn_strategic_review_payload_freshness_unknown_when_currency_in
     )
 
 
+def _patch_candidate_currency_raises(mocker, exc, *, resolved=("tok", "owner", "repo")):
+    """Mock the currency GitHub path so ``get_branch_sha`` raises ``exc``.
+
+    Credential resolution succeeds (a transient GitHub failure only happens
+    AFTER credentials resolve), and the bounded-retry sleep is neutralized so
+    the api_unreachable classification is exercised without wall-clock delay.
+    """
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=exc),
+    )
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+
+
+@pytest.mark.asyncio
+async def test_payload_staleness_api_unreachable_verdict_distinct_from_unknown(
+    db_session, mocker, _lts_split_active
+):
+    """A TRANSIENT GitHub failure (5xx) must surface payload_staleness.verdict=
+    'api_unreachable' — DISTINCT from the 'unknown' verdict used for genuine local
+    indeterminacy — after a bounded retry, and must NOT set ``stale``.
+
+    Regression: an API outage at spawn time must not be reported as a stale/unknown
+    payload, which would force the strategist to re-ground every load-bearing
+    payload claim.  The endpoint must never crash on the transient failure.
+    """
+    from fastapi import HTTPException
+
+    await _ensure_releaseversion_table(db_session)
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    candidate = "f" * 40
+    version = _make_stabilize_version_with_candidate(candidate)
+    version.project_id = project.id
+    db_session.add(version)
+    await db_session.commit()
+
+    _patch_spawning_deps(mocker)
+    # Credentials resolve, but the live branch-HEAD read hits a GitHub 5xx — a
+    # transient reachability failure, NOT genuine local indeterminacy.
+    _patch_candidate_currency_raises(
+        mocker,
+        HTTPException(status_code=502, detail="GitHub API error (HTTP 502)."),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    staleness = payload.get("payload_staleness")
+    assert staleness is not None, (
+        "payload_staleness must be present even when GitHub is unreachable"
+    )
+    assert staleness.get("verdict") == "api_unreachable", (
+        "a transient GitHub 5xx must produce verdict='api_unreachable', "
+        "distinct from the 'unknown' verdict used for genuine indeterminacy"
+    )
+    assert staleness.get("verdict") != "unknown", (
+        "api_unreachable must NOT collapse into the genuine-indeterminacy verdict"
+    )
+    # An unreachable API is NOT a known-stale payload — never set stale.
+    assert "stale" not in staleness or staleness.get("stale") is None, (
+        "stale must not be set on an api_unreachable block"
+    )
+    assert "checked_at" in staleness, "checked_at timestamp must be present"
+    _assert_generated_at_iso_utc(staleness)
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_currency_typed_verdicts(db_session, mocker):
+    """Unit coverage of the typed verdicts produced by _resolve_candidate_currency:
+    fresh / stale (resolved), api_unreachable (transient GitHub/transport), and
+    unknown (genuine local indeterminacy) each with the right shape."""
+    from fastapi import HTTPException
+    import httpx
+
+    from app.strategic_spawning import _resolve_candidate_currency
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    candidate = "a" * 40
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+
+    # Genuine indeterminacy: no candidate SHA on the record → unknown, no GitHub call.
+    res = await _resolve_candidate_currency(db_session, project, {}, "main")
+    assert res["verdict"] == "unknown"
+    assert res["resolved"] is False
+    assert res["reason"] == "no_candidate_sha"
+
+    # Genuine indeterminacy: candidate present but repo credentials unavailable.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=None),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "repo_credentials_unavailable"
+    assert res["candidate_sha"] == candidate
+
+    # Resolved fresh: candidate == HEAD.
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=candidate))
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "fresh"
+    assert res["resolved"] is True
+    assert res["current"] is True
+    assert res["head_sha"] == candidate
+
+    # Resolved stale: candidate != HEAD.
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value="b" * 40))
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "stale"
+    assert res["current"] is False
+
+    # Transient GitHub 5xx → api_unreachable, distinct from unknown.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=HTTPException(status_code=502, detail="5xx")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+    assert res["resolved"] is False
+    assert res["candidate_sha"] == candidate
+
+    # Transport error (timeout) → api_unreachable.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=httpx.ConnectError("boom")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+
+    # Branch genuinely not found (404) is NOT transient → unknown, not api_unreachable.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(side_effect=HTTPException(status_code=404, detail="not found")),
+    )
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "branch_not_found"
+
+
+@pytest.mark.asyncio
+async def test_resolve_candidate_currency_retries_transient_failure(db_session, mocker):
+    """The bounded retry must (a) make a SECOND ``get_branch_sha`` attempt after a
+    transient blip and resolve fresh/stale when that retry succeeds, and (b) make
+    exactly ``_CURRENCY_RETRY_ATTEMPTS`` attempts before classifying
+    api_unreachable.  These assertions on ``call_count`` FAIL if the function
+    only ever makes a single attempt — the core requested retry behavior."""
+    from fastapi import HTTPException
+
+    from app.strategic_spawning import (
+        _CURRENCY_RETRY_ATTEMPTS,
+        _resolve_candidate_currency,
+    )
+
+    # The retry must actually exercise more than one attempt for this to be a
+    # meaningful guard; the production default is 2.
+    assert _CURRENCY_RETRY_ATTEMPTS >= 2
+
+    project = _make_project(is_self_repo=True, vision={"purpose": "test purpose"})
+    candidate = "a" * 40
+    head = "b" * 40
+    # No wall-clock delay between the bounded retries.
+    mocker.patch("app.strategic_spawning._CURRENCY_RETRY_DELAY_S", 0)
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        new=AsyncMock(return_value=("tok", "owner", "repo")),
+    )
+
+    # (a) First attempt raises a transient 5xx, the retry succeeds with a HEAD
+    # that differs from the candidate → resolves to 'stale' (NOT api_unreachable),
+    # proving the transient failure was retried rather than classified.
+    transient_then_ok = AsyncMock(
+        side_effect=[HTTPException(status_code=502, detail="5xx"), head]
+    )
+    mocker.patch("app.github.get_branch_sha", new=transient_then_ok)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "stale", (
+        "a transient first attempt followed by a successful retry must resolve, "
+        "not classify api_unreachable"
+    )
+    assert res["resolved"] is True
+    assert res["head_sha"] == head
+    assert transient_then_ok.await_count == 2, (
+        "the transient first attempt must be retried a second time before resolving"
+    )
+
+    # (a') Same, but the retry succeeds with HEAD == candidate → 'fresh'.
+    transient_then_fresh = AsyncMock(
+        side_effect=[HTTPException(status_code=503, detail="5xx"), candidate]
+    )
+    mocker.patch("app.github.get_branch_sha", new=transient_then_fresh)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "fresh"
+    assert res["current"] is True
+    assert transient_then_fresh.await_count == 2
+
+    # (b) Every attempt fails transiently → api_unreachable only AFTER exhausting
+    # the full bounded budget of attempts.
+    always_transient = AsyncMock(
+        side_effect=HTTPException(status_code=502, detail="5xx")
+    )
+    mocker.patch("app.github.get_branch_sha", new=always_transient)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "api_unreachable"
+    assert always_transient.await_count == _CURRENCY_RETRY_ATTEMPTS, (
+        "api_unreachable must only be reported after the full bounded retry budget "
+        f"of {_CURRENCY_RETRY_ATTEMPTS} attempts is exhausted"
+    )
+
+    # (b') A 404 short-circuits — it is not transient, so it must NOT be retried.
+    not_found = AsyncMock(
+        side_effect=HTTPException(status_code=404, detail="not found")
+    )
+    mocker.patch("app.github.get_branch_sha", new=not_found)
+    res = await _resolve_candidate_currency(
+        db_session, project, {"candidate_sha": candidate}, "main"
+    )
+    assert res["verdict"] == "unknown"
+    assert res["reason"] == "branch_not_found"
+    assert not_found.await_count == 1, (
+        "a non-transient 404 must short-circuit without consuming a retry"
+    )
+
+
 @pytest.mark.asyncio
 async def test_payload_staleness_resolves_true_verdict_without_carried_findings(
     db_session, mocker, _lts_split_active

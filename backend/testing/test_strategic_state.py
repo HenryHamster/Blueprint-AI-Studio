@@ -6144,6 +6144,51 @@ async def test_strategic_state_sha_freshness_unknown_includes_checked_at(
 
 
 @pytest.mark.asyncio
+async def test_strategic_state_sha_freshness_api_unreachable_distinct_from_unknown(
+    client: AsyncClient, db_session, mocker
+):
+    """A transient GitHub failure surfaces sha_freshness.verdict='api_unreachable'
+    on the admin strategic-state read model — distinct from 'unknown' — without a
+    stale flag, and the endpoint still returns 200."""
+    project = await _make_project(db_session)
+    candidate = "abc1234" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=5,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": candidate, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=AsyncMock(
+            return_value={
+                "verdict": "api_unreachable",
+                "resolved": False,
+                "reason": "github_http_502",
+                "candidate_sha": candidate,
+            }
+        ),
+    )
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    assert freshness["verdict"] == "api_unreachable"
+    assert freshness["verdict"] != "unknown"
+    assert freshness.get("stale") is None, "stale must not be set on api_unreachable"
+    assert freshness.get("integration_branch") == "main"
+    _assert_generated_at_iso_utc(freshness)
+
+
+@pytest.mark.asyncio
 async def test_strategic_runtime_compute_job_preview_includes_experiment_outcome(
     client: AsyncClient, db_session
 ):

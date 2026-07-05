@@ -902,15 +902,27 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
   const lqCurrencyRaw = versionPhase.last_qualification_candidate_currency;
   if (lqCurrencyRaw && typeof lqCurrencyRaw === 'object' && !Array.isArray(lqCurrencyRaw)) {
     const lqc = lqCurrencyRaw as Record<string, unknown>;
-    const isCurrent = lqc.current === true;
+    const verdict = typeof lqc.verdict === 'string' ? lqc.verdict : null;
+    // Only a RESOLVED comparison can be stale: a boolean `current === false` or an
+    // explicit `verdict: 'stale'`. An api_unreachable / unknown verdict (no live
+    // comparison) must NOT be treated as stale — that would push the strategist to
+    // re-ground load-bearing findings on a transient GitHub outage alone.
+    const isResolved = typeof lqc.current === 'boolean';
+    const isCurrent = lqc.current === true || verdict === 'fresh';
+    const isStale = (isResolved && lqc.current === false) || verdict === 'stale';
     const candidateSha = typeof lqc.candidate_sha === 'string' && lqc.candidate_sha
       ? lqc.candidate_sha.slice(0, 12) : '?';
     const headSha = typeof lqc.head_sha === 'string' && lqc.head_sha
       ? lqc.head_sha.slice(0, 12) : '?';
-    if (isCurrent) {
+    if (verdict === 'api_unreachable') {
+      const reason = typeof lqc.reason === 'string' && lqc.reason ? ` (${lqc.reason})` : '';
+      parts.push(`Qualification candidate currency: API UNREACHABLE${reason} — could not reach GitHub to compare candidate \`${candidateSha}\` against integration HEAD after a bounded retry. This is a temporary reachability problem, NOT a stale-payload signal; do not re-ground findings as stale on this basis alone.`);
+    } else if (isStale) {
+      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+    } else if (isCurrent) {
       parts.push(`Qualification candidate currency: CURRENT — candidate \`${candidateSha}\` matches integration HEAD. Audit findings reflect live HEAD.`);
     } else {
-      parts.push(`Qualification candidate currency: STALE — last qualification candidate \`${candidateSha}\` is behind integration HEAD \`${headSha}\`. Audit findings were scored against an older commit; consider requesting a fresh qualification.`);
+      parts.push(`Qualification candidate currency: UNKNOWN — freshness could not be determined for candidate \`${candidateSha}\`. Not confirmed stale; a fresh qualification will resolve currency.`);
     }
   }
 

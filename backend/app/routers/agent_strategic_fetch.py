@@ -728,8 +728,7 @@ async def agent_fetch_version_phase(
     if open_row is not None:
         try:
             from app.strategic_spawning import (  # noqa: PLC0415
-                _build_freshness_shas_block,
-                _freshness_generated_at,
+                _build_payload_staleness_block,
                 _resolve_candidate_currency,
                 get_project_integration_branch,
             )
@@ -739,19 +738,18 @@ async def agent_fetch_version_phase(
             _raw_currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
-            if _raw_currency is not None:
-                candidate_currency = {
-                    **_raw_currency,
-                    **_build_freshness_shas_block(_raw_currency),
-                }
+            # Typed currency block: resolved (fresh/stale) merges the raw
+            # current/candidate_sha/head_sha keys with the freshness block for
+            # backward compat; api_unreachable and unknown carry their verdict and
+            # reason WITHOUT a stale flag so the agent distinguishes a transient
+            # GitHub outage from genuine indeterminacy.
+            _staleness = _build_payload_staleness_block(_raw_currency)
+            if isinstance(_raw_currency, dict) and isinstance(
+                _raw_currency.get("current"), bool
+            ):
+                candidate_currency = {**_raw_currency, **_staleness}
             else:
-                # Indeterminate: freshness could not be resolved (GitHub unreachable,
-                # no candidate SHA on record, etc.). Mark explicitly so agent knows
-                # the state is unknown, not current or stale.
-                candidate_currency = {
-                    "verdict": "unknown",
-                    "generated_at": _freshness_generated_at(),
-                }
+                candidate_currency = _staleness
         except Exception:
             logger.exception(
                 "[AGENT_FETCH] candidate_currency resolve failed for project %s",

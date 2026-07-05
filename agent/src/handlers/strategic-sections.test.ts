@@ -1821,6 +1821,32 @@ describe('buildPayloadStalenessSection', () => {
     expect(result).toContain('freshness check could not be completed');
   });
 
+  it('api_unreachable verdict — renders TEMPORARY reachability warning distinct from UNKNOWN/STALE', () => {
+    const result = buildPayloadStalenessSection({
+      verdict: 'api_unreachable',
+      reason: 'github_http_502',
+      checked_at: '2026-06-30T12:00:00',
+    });
+    expect(result).toContain('## Payload Currency (cycle-start check)');
+    expect(result).toContain('⚠ API UNREACHABLE');
+    expect(result).toContain('could not reach GitHub');
+    expect(result).toContain('github_http_502');
+    expect(result).toContain('2026-06-30T12:00:00');
+    // Key regression: must NOT push the strategist to re-ground everything as stale.
+    expect(result).toContain('TEMPORARY API-reachability problem');
+    expect(result).toContain('Do NOT re-ground');
+    // Distinct from the other verdicts — no STALE/UNKNOWN/CURRENT framing.
+    expect(result).not.toContain('⚠ STALE');
+    expect(result).not.toContain('⚠ UNKNOWN');
+    expect(result).not.toContain('Candidate is CURRENT');
+  });
+
+  it('api_unreachable verdict without reason/checked_at — still renders API UNREACHABLE section', () => {
+    const result = buildPayloadStalenessSection({ verdict: 'api_unreachable' });
+    expect(result).toContain('⚠ API UNREACHABLE');
+    expect(result).toContain('TEMPORARY API-reachability problem');
+  });
+
   it('divergence rendered — stale=true shows ⚠ STALE block with truncated SHAs (legacy payload_compiled_sha fallback)', () => {
     const result = buildPayloadStalenessSection({
       stale: true,

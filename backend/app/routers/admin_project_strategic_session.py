@@ -1171,7 +1171,7 @@ async def get_project_strategic_state(
         )
     ).scalars().first()
     from app.strategic_spawning import (
-        _build_freshness_shas_block,
+        _build_payload_staleness_block,
         _build_unknown_freshness_block,
         _resolve_candidate_currency,
         get_project_integration_branch,
@@ -1184,16 +1184,14 @@ async def get_project_strategic_state(
             currency = await _resolve_candidate_currency(
                 session, project, _last_qual, _integration_branch
             )
-            if currency is not None:
-                sha_freshness = {
-                    **_build_freshness_shas_block(currency),
-                    "integration_branch": _integration_branch,
-                }
-            else:
-                sha_freshness = {
-                    **_build_unknown_freshness_block(),
-                    "integration_branch": _integration_branch,
-                }
+            # Typed block: fresh/stale carry SHA detail; api_unreachable and
+            # unknown carry their verdict/reason WITHOUT a stale flag so the
+            # dashboard distinguishes a transient GitHub outage from genuine
+            # indeterminacy.
+            sha_freshness = {
+                **_build_payload_staleness_block(currency),
+                "integration_branch": _integration_branch,
+            }
         except Exception:
             logger.exception(
                 "[STRATEGIC_STATE] sha_freshness resolve failed for project %s",
