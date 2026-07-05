@@ -13274,6 +13274,9 @@ class TestBuildCycleStartReconciliation:
                 # is_current_readiness=False: live regime, ready=False is a
                 # regime relabel by _annotate_regime, not a real conflict.
                 "is_current_readiness": False,
+                # live_regime_calibration_artifact=True: machine-checkable signal
+                # that ready=False is a regime artifact, not a real failure.
+                "live_regime_calibration_artifact": True,
             },
         }
         out = _build_cycle_start_reconciliation(
@@ -13291,6 +13294,9 @@ class TestBuildCycleStartReconciliation:
         ]
         # Live-regime forced ready=False must not surface as a conflict
         assert len(pr_conflicts) == 0
+        # The promotion_readiness block carries the machine-checkable artifact flag.
+        pr_block = version_phase_block["promotion_readiness"]
+        assert pr_block.get("live_regime_calibration_artifact") is True
 
     def test_qualification_surface_conflicts_absent_without_version_phase_block(self):
         # When version_phase_block is None (no LTS split), the check simply

@@ -59,6 +59,7 @@ from app.release_artifacts import (
     summarize_required_artifact_gap,
     version_serving_summary as _version_serving_summary,
 )
+from app.release_version import QUALIFICATION_STATE_VOCAB
 from app.capability_demand import (
     fetch_missing_demand_for_spawn,
     missing_demand_prompt_hint,
@@ -1445,6 +1446,16 @@ _QUAL_STATUS_STATE_MAP: dict[str, frozenset[str]] = {
         }
     ),
 }
+# Guard: ensure all declared states in _QUAL_STATUS_STATE_MAP are valid members of
+# the authoritative QUALIFICATION_STATE_VOCAB. A mismatch (e.g., renamed/removed state,
+# or a typo) trips here at module load time rather than silently causing false conflicts
+# in strategic payloads downstream.
+_declared_states = {state for states in _QUAL_STATUS_STATE_MAP.values() for state in states}
+assert _declared_states <= QUALIFICATION_STATE_VOCAB, (
+    f"_QUAL_STATUS_STATE_MAP declares invalid states not in QUALIFICATION_STATE_VOCAB: "
+    f"{_declared_states - QUALIFICATION_STATE_VOCAB!r}"
+)
+
 # Name-length threshold for the long-name hygiene signal in prune candidates.
 # Capability/gap names longer than this are flagged as advisory cleanup targets.
 _CAPABILITY_LONG_NAME_THRESHOLD = 80

@@ -211,6 +211,10 @@ PROMOTION_READINESS_METRIC_MANIFEST: dict[str, dict] = {
         "ground_truth": "not promotion_enabled (False once promotion is live, since the dry-run window is then stale pre-go-live history)",
         "consumer": "admin_release_version router (readiness API response), admin-ui VersionLifecyclePanel",
     },
+    "live_regime_calibration_artifact": {
+        "ground_truth": "promotion_enabled == True — True iff ready=False was forced by _annotate_regime because promotion went live (not a real track-record failure); False in the dry-run window where ready reflects actual qualification history",
+        "consumer": "strategic_spawning._build_cycle_start_reconciliation (cycle-start reconciliation, distinguishes forced-not-ready regime relabel from genuine not-ready verdict without requiring cross-referencing is_current_readiness)",
+    },
 }
 
 
@@ -299,10 +303,18 @@ def _annotate_regime(out: dict[str, Any], promotion_enabled: bool) -> dict[str, 
     frozen on stale dry-runs, so we relabel it as a pre-go-live calibration window
     and force ``ready`` False — a stale dry-run streak must never read as a live
     'ready' signal.
+
+    ``live_regime_calibration_artifact`` is True exactly when ``ready=False`` was
+    forced by this function because promotion went live (a regime relabel), NOT
+    because the qualification track record is genuinely not ready.  Any consumer
+    that receives ``ready=False`` can check this flag without cross-referencing
+    ``is_current_readiness`` to know whether the not-ready verdict is a regime
+    artifact or a real track-record failure.
     """
     out["promotion_enabled"] = promotion_enabled
     out["regime"] = "live" if promotion_enabled else "pre_go_live_calibration"
     out["is_current_readiness"] = not promotion_enabled
+    out["live_regime_calibration_artifact"] = promotion_enabled
     if promotion_enabled:
         out["ready"] = False
         out["reason"] = _READINESS_LIVE_REGIME_NOTE
@@ -526,6 +538,7 @@ def _empty_readiness(
         "promotion_enabled": False,
         "regime": "pre_go_live_calibration",
         "is_current_readiness": True,
+        "live_regime_calibration_artifact": False,
     }
 
 

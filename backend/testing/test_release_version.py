@@ -2317,6 +2317,41 @@ class TestQualificationStateVocab:
                 f"remove dead entries from the map."
             )
 
+    def test_qual_status_state_map_pinned_to_vocab(self):
+        """Every state value declared in _QUAL_STATUS_STATE_MAP is a member of
+        QUALIFICATION_STATE_VOCAB.
+
+        Drift scenario: QUALIFICATION_STATE_VOCAB is updated (a state is added,
+        renamed, or removed) but _QUAL_STATUS_STATE_MAP is not, causing the map
+        to reference invalid/outdated states. This test catches that by requiring
+        all declared state values to be valid vocab members.
+
+        Note: This test complements test_status_to_expected_states_map_covers_all_
+        classifier_derivations by pinning the vocab-membership direction. The
+        existing reachability test ensures the map is complete (no dead entries);
+        this test ensures the map's values are valid (no drift).
+        """
+        map_under_test = ss._QUAL_STATUS_STATE_MAP
+        declared_states = set()
+        for status, states in map_under_test.items():
+            for state in states:
+                declared_states.add(state)
+
+        # Every declared state must be in the authoritative vocab
+        invalid_states = declared_states - rv.QUALIFICATION_STATE_VOCAB
+        assert not invalid_states, (
+            f"_QUAL_STATUS_STATE_MAP declares states not in QUALIFICATION_STATE_VOCAB: "
+            f"{invalid_states!r}. Either (a) update QUALIFICATION_STATE_VOCAB if these "
+            f"are legitimate new states from summarize_qualification_state, or (b) remove "
+            f"them from _QUAL_STATUS_STATE_MAP if they are no longer produced."
+        )
+
+        # Sanity check: the map should declare some states
+        assert declared_states, (
+            "_QUAL_STATUS_STATE_MAP is empty — expected at least some states to be "
+            "declared for the mapped statuses."
+        )
+
 
 # ===========================================================================
 # recent_closed_versions
