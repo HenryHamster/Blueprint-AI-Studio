@@ -608,12 +608,15 @@ export interface ExamSurface {
 
 /** One recorded look at a surface. `verdict` is the parsed tick outcome, or
  *  `unevidenced` when a CLEAR was claimed on a turn that examined nothing (no
- *  tool use) or the marker was missing/garbled — both corrected next tick. */
+ *  tool use) or the marker was missing/garbled — both corrected next tick.
+ *  `interrupted` is set when the turn was cut short before completing (operator
+ *  preemption, authority suspend, stall watchdog) — not a violation, no
+ *  corrective instruction. */
 export interface ExamRecord {
   surfaceKey: string;
   atTick: number;
   at: string;
-  verdict: 'clear' | 'found' | 'advanced' | 'unevidenced';
+  verdict: 'clear' | 'found' | 'advanced' | 'unevidenced' | 'interrupted';
   note: string;
 }
 
@@ -797,13 +800,19 @@ export interface TickLedgerUpdate {
 }
 
 /**
- * Classify a completed autonomous turn into a ledger update. A CLEAR on a turn
- * that used no tool (`sawToolUse === false`) is physically unevidenced; a
- * missing/garbled marker is a contract violation. Both are recorded `unevidenced`
- * and set the corrective flag so the next tick opens with "examine <stalest>
- * before concluding CLEAR" — never failing the session. ADVANCED/FOUND and an
- * evidenced CLEAR record their verdict against the named surface (falling back to
- * the stalest focus surface when the marker omitted a key, e.g. ADVANCED).
+ * Classify a completed (or interrupted) autonomous turn into a ledger update. A
+ * CLEAR on a turn that used no tool (`sawToolUse === false`) is physically
+ * unevidenced; a missing/garbled marker is a contract violation. Both are recorded
+ * `unevidenced` and set the corrective flag so the next tick opens with "examine
+ * <stalest> before concluding CLEAR" — never failing the session. ADVANCED/FOUND
+ * and an evidenced CLEAR record their verdict against the named surface (falling
+ * back to the stalest focus surface when the marker omitted a key, e.g. ADVANCED).
+ *
+ * When `interrupted` is true the turn was cut short before it could produce a
+ * TICK-VERDICT marker (operator preemption, authority suspend, stall watchdog).
+ * This is NOT a contract violation: it is recorded as `interrupted` with
+ * `corrective: false` and `agendaContinue: false` so the ledger and rotation are
+ * unaffected and no false corrective frame is raised.
  */
 export function classifyTickOutcome(params: {
   resultText: string;
@@ -811,11 +820,22 @@ export function classifyTickOutcome(params: {
   focus: ExamSurface[];
   atTick: number;
   at: string;
+  /** True when the turn was cut short before completion (preemption / suspend / stall). */
+  interrupted?: boolean;
 }): TickLedgerUpdate {
-  const verdict = parseTickVerdict(params.resultText);
-  const agendaContinue = parseAgendaContinue(params.resultText);
   const stalest = params.focus[0]?.key ?? '';
   const base = { atTick: params.atTick, at: params.at };
+
+  if (params.interrupted) {
+    return {
+      record: { surfaceKey: stalest, ...base, verdict: 'interrupted', note: 'turn interrupted before completion' },
+      corrective: false,
+      agendaContinue: false,
+    };
+  }
+
+  const verdict = parseTickVerdict(params.resultText);
+  const agendaContinue = parseAgendaContinue(params.resultText);
 
   if (!verdict) {
     return {
@@ -1009,7 +1029,7 @@ export function restoreLedger(
         surfaceKey: String(r.surfaceKey),
         atTick: typeof r.atTick === 'number' ? r.atTick : 0,
         at: typeof r.at === 'string' ? r.at : '',
-        verdict: (['clear', 'found', 'advanced', 'unevidenced'].includes(String(r.verdict))
+        verdict: (['clear', 'found', 'advanced', 'unevidenced', 'interrupted'].includes(String(r.verdict))
           ? r.verdict : 'unevidenced') as ExamRecord['verdict'],
         note: typeof r.note === 'string' ? r.note.slice(0, EXAM_NOTE_CAP) : '',
       }));

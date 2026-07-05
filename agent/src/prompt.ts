@@ -84,6 +84,15 @@ const READ_ONLY_BLOCK_MARKER = 'This is a read-only analysis task. Do NOT commit
 const READ_ONLY_BLOCK_HOOK = `#!/bin/sh\necho "ERROR: ${READ_ONLY_BLOCK_MARKER}" >&2\nexit 1\n`;
 const READ_ONLY_BLOCKED_HOOKS = ['pre-commit', 'pre-push'] as const;
 
+function installReadOnlyBlockHooks(hooksDir: string): void {
+  try {
+    fs.mkdirSync(hooksDir, { recursive: true });
+    for (const hook of READ_ONLY_BLOCKED_HOOKS) {
+      fs.writeFileSync(`${hooksDir}/${hook}`, READ_ONLY_BLOCK_HOOK, { mode: 0o755 });
+    }
+  } catch { /* hooks dir may not exist before clone completes */ }
+}
+
 export function configureAgentPermissions(taskType: string): string[] {
   const hooksDir = `${WORKSPACE}/.git/hooks`;
   if (isReadOnlyTaskType(taskType)) {
@@ -92,13 +101,8 @@ export function configureAgentPermissions(taskType: string): string[] {
       execFileSync('git', ['remote', 'set-url', 'origin', 'https://github.com/readonly/readonly.git'], { cwd: WORKSPACE });
     } catch { /* git dir may not exist yet */ }
 
-    // Block git commit/push via hooks (backup enforcement)
-    try {
-      fs.mkdirSync(hooksDir, { recursive: true });
-      for (const hook of READ_ONLY_BLOCKED_HOOKS) {
-        fs.writeFileSync(`${hooksDir}/${hook}`, READ_ONLY_BLOCK_HOOK, { mode: 0o755 });
-      }
-    } catch { /* hooks dir may not exist before clone completes */ }
+    // Block git commit/push via hooks (backup enforcement).
+    installReadOnlyBlockHooks(hooksDir);
 
     return ['Write', 'Edit', 'NotebookEdit'];
   }
@@ -124,6 +128,21 @@ export function configureAgentPermissions(taskType: string): string[] {
     } catch { /* nothing to clear / hooks dir absent */ }
   }
   return [];
+}
+
+/**
+ * Configure the resident seat's explicit read-only posture.
+ *
+ * The resident uses a live credential helper to keep `git fetch origin`
+ * working, so we only install the inner-agent write blockers and commit/push
+ * hooks here. The remote URL itself stays untouched.
+ */
+export function configureResidentAgentPermissions(taskType: string): string[] {
+  if (!isReadOnlyTaskType(taskType)) {
+    throw new Error(`resident permissions require a read-only task type, got "${taskType}"`);
+  }
+  installReadOnlyBlockHooks(`${WORKSPACE}/.git/hooks`);
+  return ['Write', 'Edit', 'NotebookEdit'];
 }
 
 export function strVal(v: unknown, fallback = ''): string {

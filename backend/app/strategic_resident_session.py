@@ -569,7 +569,12 @@ async def _find_adoptable_strategic_review_task(
 
 
 async def _spawn_resident_strategic_task(
-    session: AsyncSession, project: Project, runner_id: str | None, *, session_id: str
+    session: AsyncSession,
+    project: Project,
+    runner_id: str | None,
+    *,
+    session_id: str,
+    exam_ledger: str | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -614,7 +619,9 @@ async def _spawn_resident_strategic_task(
         # ``max_concurrent_vms=0``). When no runner is eligible (``runner_id`` None)
         # this stays None and the task is born QUEUED (degraded cloud fallback).
         runner_pin_id=str(runner_id) if runner_id else None,
-        extra_context=_resident_born_context(session_id, runner_id),
+        extra_context=_resident_born_context(
+            session_id, runner_id, exam_ledger=exam_ledger
+        ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
         # content/tree fetches, branch-SHA lookups, recent-intervention ancestry,
@@ -783,7 +790,7 @@ async def build_resident_runner_options(
 
 
 def _resident_born_context(
-    session_id: str, runner_id: str | None
+    session_id: str, runner_id: str | None, *, exam_ledger: str | None = None
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -810,11 +817,18 @@ def _resident_born_context(
         # operator's runner instead of falling back to a fresh cloud VM.
         context[STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY] = True
         context[STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY] = "resident_session"
+    # Carry the persisted exam ledger forward across a session restart: the agent
+    # restores it from ``task.context["_exam_ledger"]`` on startup, so a NEW
+    # session born on a fresh task continues the examination rotation instead of
+    # resetting to never-examined-first. Absent (first-ever start) leaves the
+    # context byte-identical to before.
+    if exam_ledger:
+        context["_exam_ledger"] = exam_ledger
     return context
 
 
 def _stamp_resident_context(
-    task: Task, *, session_id: str, runner_id: str | None
+    task: Task, *, session_id: str, runner_id: str | None, exam_ledger: str | None = None
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -850,6 +864,11 @@ def _stamp_resident_context(
     context = dict(task.context or {})
     context["_resident_session"] = True
     context["strategic_session_id"] = session_id
+    # Carry the persisted exam ledger forward (adopt-path twin of the born-context
+    # seed) so an adopted cadence task continues the examination rotation across a
+    # restart. Absent leaves the merged context unchanged.
+    if exam_ledger:
+        context["_exam_ledger"] = exam_ledger
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -994,6 +1013,22 @@ async def start_resident_session(
     # common "operator re-opens a running session" case.
     existing = read_resident_session(project.vision)
     stale_session_id: str | None = None
+    # Carry the persisted exam ledger forward across a session restart. A real
+    # restart ENDS the prior resident task and starts a NEW session on a fresh
+    # (spawned/adopted) task, so the ledger the heartbeat mirrored onto the OLD
+    # task's context would otherwise be lost and the examination rotation would
+    # reset to never-examined-first. Capture it from the prior session blob (the
+    # heartbeat also mirrors the ledger into the blob) and seed it into the new
+    # task's context + blob below so the agent restores it on startup. Bounded to
+    # the same byte cap the heartbeat enforces; a malformed/oversized value is
+    # dropped (best-effort — a lost ledger only costs one rotation reset).
+    carried_exam_ledger: str | None = None
+    if isinstance(existing, dict):
+        _raw_ledger = existing.get("_exam_ledger")
+        if isinstance(_raw_ledger, str) and 0 < len(
+            _raw_ledger.encode()
+        ) <= _EXAM_LEDGER_MAX_BYTES:
+            carried_exam_ledger = _raw_ledger
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
         live = None
@@ -1103,6 +1138,11 @@ async def start_resident_session(
             # session, which is itself an interaction.
             "last_operator_interaction_at": now_iso,
         }
+        # Preserve the carried-forward exam ledger on the new session blob too, so
+        # a subsequent restart BEFORE the new session's first heartbeat still has a
+        # ledger to carry forward (the heartbeat mirror re-writes it thereafter).
+        if carried_exam_ledger:
+            vision[RESIDENT_SESSION_KEY]["_exam_ledger"] = carried_exam_ledger
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
@@ -1172,6 +1212,7 @@ async def start_resident_session(
                             task,
                             session_id=session_id,
                             runner_id=effective_runner_id,
+                            exam_ledger=carried_exam_ledger,
                         )
                         session.add(task)
                         workbench_state = (
@@ -1217,7 +1258,11 @@ async def start_resident_session(
             # with-the-flag closes that race. No re-stamp here — we only finalize
             # the session blob (record task_id) + arm the lease below.
             task = await _spawn_resident_strategic_task(
-                session, project, effective_runner_id, session_id=session_id
+                session,
+                project,
+                effective_runner_id,
+                session_id=session_id,
+                exam_ledger=carried_exam_ledger,
             )
             if task is None:
                 raise HTTPException(

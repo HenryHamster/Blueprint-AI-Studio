@@ -5,7 +5,7 @@ import {
 } from '../index.js';
 import { prepareWorkspaceForRole, listWorkspaceTopDirs } from '../workspacePrep.js';
 import {
-  buildContextPrefix, configureAgentPermissions,
+  buildContextPrefix, configureResidentAgentPermissions,
   writePlaybookHelper, writeMessagesHelper,
 } from '../prompt.js';
 import { writeStrategicHelpers } from './strategic-helpers.js';
@@ -35,6 +35,8 @@ import {
   type StreamFrameKind, type StreamFrameStatus, type ExamRecord,
 } from './strategic-resident-lib.js';
 import { buildFetchGuidance, STRATEGIC_FETCH_VERBS } from './strategic-helpers.js';
+
+const _RESIDENT_STRATEGIC_TASK_TYPE = 'strategic_review' as const;
 
 // Coalesce streamed assistant deltas to at most ~10 WebSocket frames/sec so the
 // live transcript stays well under the backend's 20 msg/s close threshold
@@ -244,8 +246,7 @@ export async function handleStrategicResident(
 
   writePlaybookHelper(taskId);
   writeMessagesHelper(taskId);
-  const researchMode = strVal(payload.research_mode, 'research');
-  const disallowedTools = configureAgentPermissions(researchMode);
+  const disallowedTools = configureResidentAgentPermissions(_RESIDENT_STRATEGIC_TASK_TYPE);
   const contextPrefix = buildContextPrefix(task);
 
   const projectMetadata = task.project_metadata as Record<string, unknown> | undefined;
@@ -663,7 +664,6 @@ export async function handleStrategicResident(
       const openFound = openFoundLeads(examRecords);
       const corrective = correctiveNextTick;
       lastAutonomousTurnAt = Date.now();
-      lastAutonomousWorkStateRev = currentWorkStateRev;
       const turnPromise = runTurn(buildAutonomousPrompt(focus, recentRecords, openFound, corrective, cfg.maxOpsPerTurn), false);
       const watch = await watchTurn(turnPromise);
       if (watch.kind !== 'done') session.interrupt();
@@ -676,31 +676,35 @@ export async function handleStrategicResident(
       const r = await turnPromise;
       if (turnWedgedSession(r)) break;
       const hb = await heartbeat(r.appliedStrategicOp && authorityHeld);
+      // Record the pacing baseline AFTER the post-turn heartbeat so the loop's own
+      // writes are already folded into the rev we compare against next iteration.
+      // Recording it pre-turn would leave lastAutonomousWorkStateRev behind the
+      // heartbeat's updated currentWorkStateRev, causing the gate to fire again on
+      // the loop's own applied ops (self-echo).
+      lastAutonomousWorkStateRev = currentWorkStateRev;
       if (hb?.stop_requested || watch.kind === 'stop') break;
       if (r.processGone) { stopReason = 'session_process_exited'; break; }
 
-      // Update the examination ledger from the turn's TICK-VERDICT only for
-      // COMPLETED turns. Interrupted turns (operator preemption via watch.kind
-      // === 'message', authority suspend via watch.kind === 'suspend', or stall
-      // watchdog) never emit a TICK-VERDICT marker, so classifying them would
-      // always produce a spurious `unevidenced` violation, a false corrective
-      // instruction, and misleading previousTurnAgendaContinue. Skip entirely.
-      if (!r.interrupted) {
-        const upd = classifyTickOutcome({
-          resultText: r.resultText,
-          sawToolUse: r.sawToolUse,
-          focus,
-          atTick: examTick,
-          at: new Date().toISOString(),
-        });
-        examRecords.push(upd.record);
-        if (examRecords.length > EXAM_RECORDS_CAP) {
-          examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
-        }
-        correctiveNextTick = upd.corrective;
-        previousTurnAgendaContinue = upd.agendaContinue;
-        if (upd.statusNote) streamer.status(upd.statusNote);
+      // Update the examination ledger from the turn's TICK-VERDICT. Interrupted
+      // turns (operator preemption via watch.kind === 'message', authority suspend
+      // via watch.kind === 'suspend', or stall watchdog) never emit a TICK-VERDICT
+      // marker; classifyTickOutcome records them as `interrupted` (non-corrective)
+      // so the ledger captures the event without raising a false violation.
+      const upd = classifyTickOutcome({
+        resultText: r.resultText,
+        sawToolUse: r.sawToolUse,
+        focus,
+        atTick: examTick,
+        at: new Date().toISOString(),
+        interrupted: r.interrupted,
+      });
+      examRecords.push(upd.record);
+      if (examRecords.length > EXAM_RECORDS_CAP) {
+        examRecords.splice(0, examRecords.length - EXAM_RECORDS_CAP);
       }
+      correctiveNextTick = upd.corrective;
+      previousTurnAgendaContinue = upd.agendaContinue;
+      if (upd.statusNote) streamer.status(upd.statusNote);
 
       // Authority lapsed mid-turn ⇒ fall through to passive mode next iteration.
       if (watch.kind === 'suspend') continue;

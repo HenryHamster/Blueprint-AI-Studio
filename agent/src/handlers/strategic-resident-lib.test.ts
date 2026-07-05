@@ -651,28 +651,66 @@ describe('classifyTickOutcome (unevidenced / corrective path)', () => {
     expect(upd.agendaContinue).toBe(true);
   });
 
-  it('interrupted turn is not classified as a tick-contract violation', () => {
+  it('classifyTickOutcome does not mark interrupted turns corrective', () => {
     // An interrupted turn (operator preemption, authority suspend, stall watchdog)
     // produces empty resultText and sawToolUse=false — no TICK-VERDICT marker was
-    // ever written. Passing these inputs to classifyTickOutcome would record the
-    // turn as `unevidenced` and set the corrective flag, creating a spurious
-    // contract violation. This test documents that misclassification so the handler
-    // guard (`if (!r.interrupted)` in strategic-resident.ts) can be understood as
-    // the gate that prevents it from ever reaching classifyTickOutcome.
+    // ever written. With interrupted:true, classifyTickOutcome must NOT record the
+    // turn as unevidenced or set the corrective flag — that would create a spurious
+    // contract violation for something the agent never had a chance to finish.
     const upd = classifyTickOutcome({
       resultText: '',
       sawToolUse: false,
       focus,
       atTick: 8,
       at: 'ts',
+      interrupted: true,
     });
-    // Without the guard, this is what the ledger would receive — a spurious
-    // unevidenced record and a corrective flag for a turn the agent never finished.
+    expect(upd.record.verdict).toBe('interrupted');
+    expect(upd.corrective).toBe(false);
+    expect(upd.agendaContinue).toBe(false);
+    expect(upd.statusNote).toBeUndefined();
+  });
+
+  it('interrupted turn records the stalest focus surface as surfaceKey', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'partial output before interrupt',
+      sawToolUse: true,
+      focus,
+      atTick: 9,
+      at: 'ts',
+      interrupted: true,
+    });
+    expect(upd.record.surfaceKey).toBe('code:backend');
+    expect(upd.record.verdict).toBe('interrupted');
+    expect(upd.corrective).toBe(false);
+  });
+
+  it('non-interrupted CLEAR-with-no-tool-use is still corrective (not suppressed by interrupted path)', () => {
+    // Confirm the interrupted:false (default) path does not weaken the CLEAR check.
+    const upd = classifyTickOutcome({
+      resultText: 'TICK-VERDICT: CLEAR code:backend — looks fine',
+      sawToolUse: false,
+      focus,
+      atTick: 10,
+      at: 'ts',
+      interrupted: false,
+    });
     expect(upd.record.verdict).toBe('unevidenced');
     expect(upd.corrective).toBe(true);
-    // The handler's `if (!r.interrupted)` block ensures interrupted turns never
-    // reach this function and therefore never corrupt the ledger or set a false
-    // corrective instruction for the next tick.
+  });
+
+  it('non-interrupted missing marker is still corrective', () => {
+    const upd = classifyTickOutcome({
+      resultText: 'I looked around and nothing needs doing.',
+      sawToolUse: true,
+      focus,
+      atTick: 11,
+      at: 'ts',
+      interrupted: false,
+    });
+    expect(upd.record.verdict).toBe('unevidenced');
+    expect(upd.corrective).toBe(true);
+    expect(upd.statusNote).toContain('without a valid TICK-VERDICT');
   });
 });
 
@@ -713,6 +751,30 @@ describe('shouldRunAutonomousTurn (state-gated pacing)', () => {
 
   it('runs the first-ever tick (Infinity since last) via the floor', () => {
     expect(shouldRunAutonomousTurn({ ...base, msSinceLastAutonomousTurn: Number.POSITIVE_INFINITY })).toBe(true);
+  });
+
+  it('shouldRunAutonomousTurn does not fire on the loop\'s own applied ops', () => {
+    // Simulate the corrected post-turn baseline recording: lastTurnWorkStateRev is
+    // set to currentWorkStateRev AFTER the post-turn heartbeat, so the rev already
+    // includes the loop's own applied op. The next tick must NOT fire purely because
+    // of that self-echo — the gate should see no change.
+    const revAfterOwnOp = 'r-after-own-op';
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      currentWorkStateRev: revAfterOwnOp,
+      lastTurnWorkStateRev: revAfterOwnOp, // baseline already folded in own writes
+      msSinceLastAutonomousTurn: 0, // floor not elapsed
+    })).toBe(false);
+
+    // But a GENUINE external change (different rev since the loop set its baseline)
+    // must still fire the gate.
+    const revFromExternalChange = 'r-external';
+    expect(shouldRunAutonomousTurn({
+      ...base,
+      currentWorkStateRev: revFromExternalChange,
+      lastTurnWorkStateRev: revAfterOwnOp, // baseline is stale vs external change
+      msSinceLastAutonomousTurn: 0,
+    })).toBe(true);
   });
 });
 
@@ -900,6 +962,22 @@ describe('serializeLedger / restoreLedger', () => {
     expect(restored.corrective).toBe(true);
     expect(restored.tick).toBe(5);
     expect(restored.records).toHaveLength(0);
+  });
+
+  it('round-trips an interrupted verdict without coercing it to unevidenced', () => {
+    const records: ExamRecord[] = [{
+      surfaceKey: 'code:backend',
+      atTick: 3,
+      at: '2026-01-01T00:00:00Z',
+      verdict: 'interrupted',
+      note: 'turn interrupted before completion',
+    }];
+    const serialized = serializeLedger(records, 3, false);
+    const restored = restoreLedger(serialized);
+    if (restored === null) throw new Error('expected non-null restore');
+    expect(restored.records).toHaveLength(1);
+    expect(restored.records[0].verdict).toBe('interrupted');
+    expect(restored.records[0].surfaceKey).toBe('code:backend');
   });
 });
 

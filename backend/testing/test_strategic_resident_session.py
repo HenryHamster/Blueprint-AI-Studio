@@ -1201,7 +1201,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -2273,7 +2273,7 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
     # cadence spawn path in a standalone test).
     fresh_holder: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
         # its first committed state, exactly as start now relies on (no post-spawn
@@ -2717,6 +2717,76 @@ async def test_heartbeat_note_ledger_mirrored_to_task_context(db_session):
     stored = _json.loads(fresh_task.context["_exam_ledger"])
     assert stored["tick"] == _SAMPLE_LEDGER["tick"]
     assert len(stored["records"]) == len(_SAMPLE_LEDGER["records"])
+
+
+@pytest.mark.asyncio
+async def test_exam_ledger_round_trips_through_task_context(db_session):
+    """FULL-RESTART round-trip: the heartbeat-persisted exam ledger is carried
+    forward into the NEXT resident session's ``task.context["_exam_ledger"]`` so
+    the agent restores the examination rotation on startup instead of resetting
+    to never-examined-first.
+
+    A real restart ENDS the prior resident task and starts a fresh session on a
+    NEW (spawned/adopted) task; the ledger the heartbeat mirrored onto the OLD
+    task's context is not reachable from the new task. This test persists a
+    ledger via a session-1 heartbeat, drives that task terminal, starts a second
+    session that ADOPTS a fresh strategic_review task, and asserts the SAME
+    records round-trip losslessly through the new task's context (read back via a
+    FRESH session — the delivery path an agent restart actually sees).
+    """
+    import json as _json
+
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Session 1 heartbeat carrying the serialized ledger → mirrored into task1's
+    # context AND the session blob.
+    note = _json.dumps(_SAMPLE_LEDGER)
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project, session_id=snap1["session_id"],
+        task_id=snap1["task_id"], progress=False, note=note,
+    )
+    task1 = await db_session.get(Task, task1.id)
+    assert (task1.context or {}).get("_exam_ledger") is not None  # same-task path
+
+    # Simulate a real restart: the old resident task goes terminal and a fresh
+    # adoptable strategic_review is queued to host the next session.
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2, carrying the ledger forward from the prior
+    # session blob into the NEW task's context.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+    assert str(snap2["task_id"]) == str(task2.id)
+
+    # Read back via a FRESH session (the task.context an agent restart is served).
+    factory = _dedicated_session_factory(db_session)
+    async with factory() as s:
+        fresh_task2 = await s.get(Task, task2.id)
+        carried = (fresh_task2.context or {}).get("_exam_ledger")
+    assert carried is not None, "exam ledger not carried into the new session's task"
+
+    # Lossless: every field of every record survives the persist → restart → read.
+    restored = _json.loads(carried)
+    assert restored["tick"] == _SAMPLE_LEDGER["tick"]
+    assert restored["corrective"] == _SAMPLE_LEDGER["corrective"]
+    assert restored["records"] == _SAMPLE_LEDGER["records"]
+
+    # The carried ledger is NOT leaked by the operator-facing session snapshot.
+    fresh_project = await db_session.get(Project, project.id)
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None and "_exam_ledger" not in snap_dict
 
 
 @pytest.mark.asyncio

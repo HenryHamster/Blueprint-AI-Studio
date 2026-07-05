@@ -71,6 +71,7 @@ import {
   writeMessagesHelper,
   writeDesignDocHelper,
   writePlaybookHelper,
+  configureResidentAgentPermissions,
   CODE_CHANGE_HELPER_GUIDANCE,
   buildCodeChangeHelperGuidance,
   codeChangeGuidanceVariant,
@@ -2261,6 +2262,17 @@ describe('configureAgentPermissions', () => {
     vi.mocked(fs.existsSync).mockReturnValue(false);
     configureAgentPermissions('fix');
     expect(fs.unlinkSync).not.toHaveBeenCalled();
+  });
+
+  it('gives the strategic resident seat an explicit read-only posture without rewriting origin', () => {
+    const result = configureResidentAgentPermissions('strategic_review');
+
+    expect(result).toEqual(['Write', 'Edit', 'NotebookEdit']);
+    expect(execFileSync).not.toHaveBeenCalled();
+    const writes = vi.mocked(fs.writeFileSync).mock.calls;
+    const hookPaths = writes.map((c) => c[0]);
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-commit');
+    expect(hookPaths).toContain('/tmp/workspace/.git/hooks/pre-push');
   });
 });
 
