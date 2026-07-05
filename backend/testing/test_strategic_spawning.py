@@ -16991,3 +16991,447 @@ async def test_direction_stats_known_zero_reachable_survives_eviction(db_session
         "known-zero reachability must survive eviction via total_reachable_recorded_cycles counter"
     )
     assert evicted_dir["reachable_prs_merged"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Summarize fallbacks for previously-exempt droppable payload sections.
+# Each of the six sections below dropped WHOLESALE under byte-budget pressure
+# before gaining a summarize_fn. These tests assert each summarizer (a) shrinks
+# a representative oversized input, (b) never raises on malformed/empty input,
+# and (c) is wired into the schema with a callable summarize entry.
+# ---------------------------------------------------------------------------
+
+
+def _ser_size(value) -> int:
+    """Serialized byte size, matching the packer's accounting."""
+    return len(json.dumps(value, default=str))
+
+
+_DROPPABLE_SUMMARIZE_SECTIONS = (
+    "operator_overrides",
+    "knowledge_index",
+    "previous_decision_outcomes",
+    "playbook_summary",
+    "past_retirement_critiques",
+    "self_reflection_log",
+)
+
+
+def test_droppable_sections_have_summarize_fallback():
+    """The six previously-exempt droppable sections now carry a summarize_fn.
+
+    Acceptance contract: each section key in _STRATEGIC_REVIEW_SCHEMA maps to a
+    schema entry whose ``summarize`` value is CALLABLE (not exempt/None), so under
+    byte-budget pressure the packer degrades the section instead of dropping it
+    wholesale. knowledge_index is also checked in _DESIGN_DOC_UPDATE_SCHEMA.
+    """
+    from app.strategic_spawning import (
+        _STRATEGIC_REVIEW_SCHEMA,
+        _DESIGN_DOC_UPDATE_SCHEMA,
+    )
+
+    for key in _DROPPABLE_SUMMARIZE_SECTIONS:
+        entry = _STRATEGIC_REVIEW_SCHEMA.get(key)
+        assert entry is not None, f"{key} missing from _STRATEGIC_REVIEW_SCHEMA"
+        assert callable(entry.get("summarize")), (
+            f"{key} must have a callable summarize fallback, not exempt-drop"
+        )
+        assert not entry.get("exempt"), (
+            f"{key} must not be exempt once it has a summarize fallback"
+        )
+
+    # knowledge_index appears in the design-doc schema variant too.
+    dd_entry = _DESIGN_DOC_UPDATE_SCHEMA.get("knowledge_index")
+    assert dd_entry is not None
+    assert callable(dd_entry.get("summarize")), (
+        "knowledge_index must have a summarize fallback in _DESIGN_DOC_UPDATE_SCHEMA"
+    )
+
+
+def test_summarize_operator_overrides_shrinks_and_keeps_keys():
+    from app.strategic_spawning import _summarize_operator_overrides
+
+    overrides = [
+        {
+            "document": "vision",
+            "field": f"field_{i}",
+            "kind": "scalar_conflict",
+            "agent_value": "A" * 240,
+            "operator_value": "O" * 240,
+            "at": f"2026-07-0{i}T00:00:00Z",
+        }
+        for i in range(1, 9)
+    ]
+    result = _summarize_operator_overrides(overrides)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(overrides)
+    assert len(result) <= 4  # newest-few cap
+    # Load-bearing routing keys survive; prose values are truncated hard.
+    first = result[0]
+    assert first["document"] == "vision"
+    assert first["field"] == "field_1"
+    assert first["kind"] == "scalar_conflict"
+    assert first["at"] == "2026-07-01T00:00:00Z"
+    assert len(first["agent_value"]) < 240
+
+
+def test_summarize_operator_overrides_malformed_never_raises():
+    from app.strategic_spawning import _summarize_operator_overrides
+
+    assert _summarize_operator_overrides(None) is None
+    assert _summarize_operator_overrides("str") == "str"
+    assert _summarize_operator_overrides([]) == []
+    # Non-dict list entries pass through untouched.
+    assert _summarize_operator_overrides([123, "x"]) == [123, "x"]
+    # Missing fields don't crash.
+    assert _summarize_operator_overrides([{}]) == [
+        {
+            "document": None,
+            "field": None,
+            "kind": None,
+            "agent_value": None,
+            "operator_value": None,
+            "at": None,
+        }
+    ]
+
+
+def test_summarize_knowledge_index_shrinks_and_keeps_pointers():
+    from app.strategic_spawning import _summarize_knowledge_index
+
+    entries = [
+        {
+            "id": f"doc-{i}",
+            "title": f"Doc {i}",
+            "summary": "S" * 300,
+            "topic": "research",
+            "direction_id": f"d-{i}",
+            "source_kind": "web_research",
+            "sweep_id": None,
+            "arm_label": None,
+            "per_arm_verdicts": [{"arm": "a", "blob": "X" * 500}],
+            "origin_provenance": {"deep": {"nested": "Y" * 500}},
+            "knowledge_acceptance_evidence": "Z" * 300,
+            "created_at": "2026-07-01T00:00:00Z",
+        }
+        for i in range(15)
+    ]
+    result = _summarize_knowledge_index(entries)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(entries)
+    assert len(result) <= 8
+    first = result[0]
+    # Navigation pointers survive so ./fetch knowledge <id> still works.
+    assert first["id"] == "doc-0"
+    assert first["title"] == "Doc 0"
+    assert first["direction_id"] == "d-0"
+    # Heavy sub-fields dropped, summary truncated.
+    assert "per_arm_verdicts" not in first
+    assert "origin_provenance" not in first
+    assert len(first["summary"]) < 300
+
+
+def test_summarize_knowledge_index_malformed_never_raises():
+    from app.strategic_spawning import _summarize_knowledge_index
+
+    assert _summarize_knowledge_index(None) is None
+    assert _summarize_knowledge_index("x") == "x"
+    assert _summarize_knowledge_index([]) == []
+    assert _summarize_knowledge_index([123]) == [123]
+    # Entry with no summary key: no crash, id preserved.
+    assert _summarize_knowledge_index([{"id": "d1"}]) == [{"id": "d1"}]
+
+
+def test_summarize_previous_decision_outcomes_shrinks_keeps_ids():
+    from app.strategic_spawning import _summarize_previous_decision_outcomes
+
+    value = {
+        "cycle_id": "c-1",
+        "phase2_completed_at": "2026-07-01T00:00:00Z",
+        "summary_text": "T" * 500,
+        "cycle_reasoning": "R" * 2000,
+        "created": [
+            {
+                "direction_id": f"d-{i}",
+                "role": "created",
+                "status": "active",
+                "text": "X" * 200,
+                "prs_merged": 3,
+                "rationale": "why " * 100,
+                "prediction": {"similar_past_merges": 2, "blob": "P" * 500},
+            }
+            for i in range(10)
+        ],
+        "retired": [
+            {
+                "direction_id": "d-ret",
+                "role": "retired",
+                "status": "missing",
+                "final_metrics": {"merged": 5, "blob": "F" * 500},
+            }
+        ],
+    }
+    result = _summarize_previous_decision_outcomes(value)
+    assert isinstance(result, dict)
+    assert _ser_size(result) < _ser_size(value)
+    assert result["cycle_id"] == "c-1"
+    assert result["phase2_completed_at"] == "2026-07-01T00:00:00Z"
+    assert "cycle_reasoning" not in result  # verbose free-text dropped
+    assert len(result["created"]) <= 6
+    first = result["created"][0]
+    assert first["direction_id"] == "d-0"  # fetch pointer preserved
+    assert "prediction" not in first  # heavy sub-body dropped
+    assert "final_metrics" not in result["retired"][0]
+
+
+def test_summarize_previous_decision_outcomes_malformed_never_raises():
+    from app.strategic_spawning import _summarize_previous_decision_outcomes
+
+    assert _summarize_previous_decision_outcomes(None) is None
+    assert _summarize_previous_decision_outcomes("x") == "x"
+    assert _summarize_previous_decision_outcomes({}) == {}
+    # created not a list -> untouched key.
+    out = _summarize_previous_decision_outcomes({"cycle_id": "c", "created": "bad"})
+    assert out["cycle_id"] == "c"
+    assert out["created"] == "bad"
+
+
+def test_summarize_playbook_summary_shrinks_keeps_keys():
+    from app.strategic_spawning import _summarize_playbook_summary
+
+    value = {
+        "entries": [
+            {
+                "key": f"pb-{i}",
+                "content": "C" * 400,
+                "source": "auto-generated",
+                "updated_at": "2026-07-01T00:00:00Z",
+                "hit_count": 3,
+                "confirmed_count": 2,
+            }
+            for i in range(10)
+        ]
+    }
+    result = _summarize_playbook_summary(value)
+    assert isinstance(result, dict)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result["entries"]) <= 6
+    first = result["entries"][0]
+    assert first["key"] == "pb-0"  # fetch pointer preserved
+    assert len(first["content"]) < 400
+    assert "hit_count" not in first  # stat fields dropped
+
+
+def test_summarize_playbook_summary_malformed_never_raises():
+    from app.strategic_spawning import _summarize_playbook_summary
+
+    assert _summarize_playbook_summary(None) is None
+    assert _summarize_playbook_summary("x") == "x"
+    assert _summarize_playbook_summary({}) == {}
+    # entries not a list -> passthrough.
+    assert _summarize_playbook_summary({"entries": "bad"}) == {"entries": "bad"}
+    # Non-dict entry preserved.
+    out = _summarize_playbook_summary({"entries": [1, {"key": "k"}]})
+    assert out["entries"][0] == 1
+
+
+def test_summarize_past_retirement_critiques_shrinks_keeps_ids():
+    from app.strategic_spawning import _summarize_past_retirement_critiques
+
+    value = [
+        {
+            "direction_id": f"d-{i}",
+            "what_it_addressed": "W" * 300,
+            "pattern_that_produced_it": "P" * 300,
+            "lesson": "L" * 300,
+        }
+        for i in range(6)
+    ]
+    result = _summarize_past_retirement_critiques(value)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result) <= 3
+    first = result[0]
+    assert first["direction_id"] == "d-0"
+    assert len(first["lesson"]) < 300
+
+
+def test_summarize_past_retirement_critiques_sentinel_and_malformed():
+    from app.strategic_spawning import _summarize_past_retirement_critiques
+
+    assert _summarize_past_retirement_critiques(None) is None
+    assert _summarize_past_retirement_critiques("x") == "x"
+    assert _summarize_past_retirement_critiques([]) == []
+    # no_eligible_retirements sentinel is preserved.
+    assert _summarize_past_retirement_critiques([{"no_eligible_retirements": True}]) == [
+        {"no_eligible_retirements": True}
+    ]
+    assert _summarize_past_retirement_critiques([42]) == [42]
+
+
+def test_summarize_self_reflection_log_shrinks_keeps_pointers():
+    from app.strategic_spawning import _summarize_self_reflection_log
+
+    value = [
+        {
+            "ts": f"2026-07-0{i}T00:00:00Z",
+            "cycle_task_id": f"t-{i}",
+            "what_was_hard": "H" * 300,
+            "missing_context": "M" * 300,
+            "proposed_self_improvement": "I" * 300,
+        }
+        for i in range(1, 6)
+    ]
+    result = _summarize_self_reflection_log(value)
+    assert isinstance(result, list)
+    assert _ser_size(result) < _ser_size(value)
+    assert len(result) <= 3
+    # Newest-few (tail) kept; pointers preserved.
+    last = result[-1]
+    assert last["cycle_task_id"] == "t-5"
+    assert last["ts"] == "2026-07-05T00:00:00Z"
+    assert len(last["what_was_hard"]) < 300
+
+
+def test_summarize_self_reflection_log_malformed_never_raises():
+    from app.strategic_spawning import _summarize_self_reflection_log
+
+    assert _summarize_self_reflection_log(None) is None
+    assert _summarize_self_reflection_log("x") == "x"
+    assert _summarize_self_reflection_log([]) == []
+    assert _summarize_self_reflection_log(["str", 1]) == ["str", 1]
+
+
+def _oversized_section_fixtures() -> dict:
+    """Realistic oversized values for the six previously-exempt sections."""
+    return {
+        "operator_overrides": [
+            {
+                "document": "vision",
+                "field": f"f{i}",
+                "kind": "k",
+                "agent_value": "A" * 240,
+                "operator_value": "O" * 240,
+                "at": f"2026-07-0{(i % 9) + 1}T00:00:00Z",
+            }
+            for i in range(8)
+        ],
+        "knowledge_index": [
+            {
+                "id": f"doc-{i}",
+                "title": f"Doc {i}",
+                "summary": "S" * 300,
+                "topic": "t",
+                "direction_id": f"d-{i}",
+                "source_kind": "web_research",
+                "per_arm_verdicts": [{"blob": "X" * 400}],
+                "origin_provenance": {"blob": "Y" * 400},
+            }
+            for i in range(15)
+        ],
+        "previous_decision_outcomes": {
+            "cycle_id": "c-1",
+            "phase2_completed_at": "2026-07-01T00:00:00Z",
+            "summary_text": "T" * 500,
+            "cycle_reasoning": "R" * 2000,
+            "created": [
+                {
+                    "direction_id": f"d-{i}",
+                    "role": "created",
+                    "status": "active",
+                    "text": "X" * 200,
+                    "prediction": {"blob": "P" * 400},
+                }
+                for i in range(10)
+            ],
+            "retired": [],
+        },
+        "playbook_summary": {
+            "entries": [
+                {
+                    "key": f"pb-{i}",
+                    "content": "C" * 400,
+                    "source": "auto-generated",
+                    "hit_count": 3,
+                }
+                for i in range(10)
+            ]
+        },
+        "past_retirement_critiques": [
+            {
+                "direction_id": f"d-{i}",
+                "what_it_addressed": "W" * 300,
+                "pattern_that_produced_it": "P" * 300,
+                "lesson": "L" * 300,
+            }
+            for i in range(6)
+        ],
+        "self_reflection_log": [
+            {
+                "ts": f"2026-07-0{i}T00:00:00Z",
+                "cycle_task_id": f"t-{i}",
+                "what_was_hard": "H" * 300,
+                "missing_context": "M" * 300,
+                "proposed_self_improvement": "I" * 300,
+            }
+            for i in range(1, 6)
+        ],
+    }
+
+
+_CRITICAL_IDENTITY_PAYLOAD = {
+    "type": "strategic_review",
+    "research_mode": False,
+    "project_name": "P",
+    "base_branch": "main",
+    "is_self_repo": True,
+    "enable_self_improvement": True,
+    "model": "m",
+    "effort": "medium",
+    "vision": "V",
+    "direction_counts": {"active": 1},
+    "max_active_directions": 5,
+    "open_message_count": 0,
+}
+
+
+@pytest.mark.parametrize("section", _DROPPABLE_SUMMARIZE_SECTIONS)
+def test_droppable_section_degrades_not_drops_under_budget(section):
+    """Integration: each previously-exempt section trims (not drops) under pressure.
+
+    Packs the critical identity keys plus ONE oversized section at a budget just
+    below the whole-payload size, so the section cannot ship whole and must fall
+    through to its summarize_fn. Asserts the section survives (appears in output,
+    trimmed) rather than landing in the wholesale-dropped list — the exact
+    behavior change from swapping ``exempt: True`` to ``summarize: <fn>``.
+    """
+    from app.strategic_spawning import _STRATEGIC_REVIEW_SCHEMA
+    from app.payload_schemas import pack_under_budget
+
+    fixtures = _oversized_section_fixtures()
+    payload = {**_CRITICAL_IDENTITY_PAYLOAD, section: fixtures[section]}
+    # The packer's budget accounting sums per-VALUE sizes (not the whole-dict
+    # size). Reserve exactly the critical values plus one byte under the whole
+    # section value, so the section cannot ship whole and must fall through to
+    # its summarize_fn (which produces a strictly smaller, budget-fitting form).
+    critical_used = sum(
+        _ser_size(v) for v in _CRITICAL_IDENTITY_PAYLOAD.values()
+    )
+    whole_section = _ser_size(fixtures[section])
+    budget = critical_used + whole_section - 1
+    packed = pack_under_budget(payload, _STRATEGIC_REVIEW_SCHEMA, budget=budget)
+    meta = packed.get("_packer_meta", {})
+    dropped_keys = {d["key"] for d in meta.get("dropped", [])}
+    trimmed_keys = {t["key"] for t in meta.get("trimmed", [])}
+
+    assert section in packed, (
+        f"{section} degraded to nothing under budget — summarize should keep a skeleton"
+    )
+    assert section not in dropped_keys, (
+        f"{section} was dropped wholesale; expected it to be trimmed instead"
+    )
+    assert section in trimmed_keys, (
+        f"{section} should be recorded as trimmed in _packer_meta"
+    )
+    # The retained value is strictly smaller than the original.
+    assert _ser_size(packed[section]) < _ser_size(fixtures[section])

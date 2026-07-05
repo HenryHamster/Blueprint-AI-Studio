@@ -3506,6 +3506,14 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         isinstance(e, dict) and "problem_model" in str(e.get("key", "")).lower()
         for e in (dropped + trimmed)
     )
+    # High/critical-tier sections that dropped wholesale under budget pressure —
+    # the packer stamps each drop entry with its schema tier. A non-empty list
+    # means the strategist ran on a degraded payload; empty means clean.
+    high_tier_dropped: list[str] = [
+        str(e.get("key"))
+        for e in dropped
+        if isinstance(e, dict) and e.get("priority") in ("high", "critical")
+    ]
 
     gap_memory_trimmed: list = packer_meta.get("gap_memory_trimmed") or []
     gap_memory_trimmed_count: int = sum(
@@ -3538,6 +3546,7 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
         "model_size_status": model_size_status,
         "directions_dropped_count": directions_dropped_count,
         "problem_model_truncated": problem_model_truncated,
+        "high_tier_dropped": high_tier_dropped,
         "gap_memory_trimmed_count": gap_memory_trimmed_count,
         "gap_memory_hidden_entries": gap_memory_hidden_entries,
     }
@@ -3656,6 +3665,34 @@ async def _handle_strategic_completion(
                 _extra["model_gc_telemetry"] = _compute_model_gc_telemetry(
                     project, task
                 )
+                # A high/critical-tier section dropping wholesale means the
+                # strategist ran on a degraded payload — raise a loud, dedup'd
+                # operator alert. Medium/low drops are expected degradation and
+                # do NOT alert.
+                _high_tier_dropped = _extra["model_gc_telemetry"].get(
+                    "high_tier_dropped"
+                ) or []
+                if _high_tier_dropped:
+                    logger.error(
+                        "[STRATEGIC] Task %s: strategist ran on degraded payload — "
+                        "high-tier sections dropped under budget: %s",
+                        task.id,
+                        _high_tier_dropped,
+                    )
+                    try:
+                        await _create_strategic_alert(
+                            project.id,
+                            session,
+                            "Strategist ran on a degraded payload: high-tier "
+                            "section(s) dropped under the byte budget — "
+                            f"{', '.join(_high_tier_dropped)}. Context was "
+                            "truncated; verify the cycle's decisions.",
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            f"[STRATEGIC] Task {task.id}: failed to raise high-tier-drop alert (non-fatal)",
+                            exc_info=True,
+                        )
             except Exception:  # noqa: BLE001
                 logger.warning(
                     f"[STRATEGIC] Task {task.id}: failed to compute model_gc_telemetry (non-fatal)",

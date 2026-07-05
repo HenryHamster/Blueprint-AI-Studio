@@ -45,6 +45,7 @@ from app.strategic_payload_compaction import (
     _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
+    _bounded_text,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
     _directions_summary_floor,
     _enrich_drift_with_trend,
@@ -2871,6 +2872,265 @@ def _summarize_capability_trial_verdicts(v: Any) -> dict:
     return decided if decided else dict(list(v.items())[:8])
 
 
+# ── Long-tail section summarizers (budget-degradation fallbacks) ──────────────
+# These six sections were previously ``exempt`` (dropped WHOLESALE under byte
+# pressure). Each summarize_fn below degrades its section to a smaller-but-useful
+# form — fewer entries, tighter prose, verbose sub-bodies dropped — while keeping
+# the identifying keys/pointers so full detail stays reachable on demand via the
+# existing fetch verbs (``./fetch playbook|knowledge|direction``). Contract
+# (shared with every other summarize_fn the packer calls): PURE — build fresh
+# containers, never mutate the input; NEVER raise (a raising summarize is treated
+# as a drop); NEVER grow the serialized size; same top-level container type.
+
+_OPERATOR_OVERRIDES_SUMMARIZE_KEEP = 4
+_OVERRIDE_VALUE_SUMMARIZE_CAP = 80
+
+
+def _summarize_operator_overrides(v: Any) -> Any:
+    """Keep the newest few override entries; cut the before/after prose values.
+
+    Preserves the load-bearing routing keys (``document``, ``field``, ``kind``,
+    ``at``) so the agent still knows what it overrode where; the verbose
+    ``agent_value`` / ``operator_value`` bodies are truncated hard since the full
+    winning value is reconstructable from the live documents.
+    """
+    if not isinstance(v, list):
+        return v
+    out: list = []
+    for e in v[:_OPERATOR_OVERRIDES_SUMMARIZE_KEEP]:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        out.append(
+            {
+                "document": e.get("document"),
+                "field": e.get("field"),
+                "kind": e.get("kind"),
+                "agent_value": _bounded_text(
+                    e.get("agent_value"), _OVERRIDE_VALUE_SUMMARIZE_CAP
+                ),
+                "operator_value": _bounded_text(
+                    e.get("operator_value"), _OVERRIDE_VALUE_SUMMARIZE_CAP
+                ),
+                "at": e.get("at"),
+            }
+        )
+    return out
+
+
+_KNOWLEDGE_INDEX_SUMMARIZE_KEEP = 8
+_KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP = 120
+# Verbose / heavy optional sub-fields dropped from each knowledge entry under
+# budget pressure. The id/title/topic/direction pointers survive so the full
+# body stays fetchable via ``./fetch knowledge <id>``.
+_KNOWLEDGE_INDEX_HEAVY_FIELDS = (
+    "per_arm_verdicts",
+    "origin_provenance",
+    "knowledge_acceptance_evidence",
+    "compute_acceptance_reason",
+    "analysis_fallback_reason",
+    "criterion",
+)
+_KNOWLEDGE_INDEX_KEEP_KEYS = (
+    "id",
+    "title",
+    "topic",
+    "direction_id",
+    "source_kind",
+    "sweep_id",
+    "arm_label",
+    "criterion_met",
+    "compute_acceptance_grade",
+    "created_at",
+)
+
+
+def _summarize_knowledge_index(v: Any) -> Any:
+    """Keep the newest few knowledge entries; drop heavy sub-fields, trim summary.
+
+    Retains the navigation pointers (``id``, ``title``, ``topic``,
+    ``direction_id``, ``source_kind`` …) so the strategist can still fetch full
+    bodies via ``./fetch knowledge <id>``, while dropping the verbose per-arm
+    verdicts / provenance / acceptance-reason blobs and shortening the summary.
+    """
+    if not isinstance(v, list):
+        return v
+    out: list = []
+    for e in v[:_KNOWLEDGE_INDEX_SUMMARIZE_KEEP]:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        entry: dict[str, Any] = {
+            k: e[k] for k in _KNOWLEDGE_INDEX_KEEP_KEYS if k in e
+        }
+        summary = _bounded_text(
+            e.get("summary"), _KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP
+        )
+        if summary is not None:
+            entry["summary"] = summary
+        out.append(entry)
+    return out
+
+
+_PREV_OUTCOMES_ROLE_KEEP = 6
+_PREV_OUTCOMES_TEXT_CAP = 100
+_PREV_OUTCOMES_SUMMARY_TEXT_CAP = 300
+_PREV_OUTCOMES_RATIONALE_CAP = 160
+# Heavy per-direction sub-fields dropped under budget pressure; the direction_id
+# pointer + headline metrics survive so the outcome is still legible and the full
+# direction is fetchable via ``./fetch direction <id>``.
+_PREV_OUTCOMES_HEAVY_FIELDS = ("prediction", "final_metrics", "research_context")
+
+
+def _summarize_previous_decision_outcome_entry(e: Any) -> Any:
+    if not isinstance(e, dict):
+        return e
+    out = {k: val for k, val in e.items() if k not in _PREV_OUTCOMES_HEAVY_FIELDS}
+    if "text" in out:
+        out["text"] = _bounded_text(out.get("text"), _PREV_OUTCOMES_TEXT_CAP)
+    if "rationale" in out:
+        out["rationale"] = _bounded_text(
+            out.get("rationale"), _PREV_OUTCOMES_RATIONALE_CAP
+        )
+    return out
+
+
+def _summarize_previous_decision_outcomes(v: Any) -> Any:
+    """Trim the prior cycle's decision-outcome digest to headline metrics.
+
+    Keeps ``cycle_id`` / ``phase2_completed_at`` and a bounded ``created`` /
+    ``retired`` list (newest few), dropping the verbose ``prediction`` /
+    ``final_metrics`` sub-bodies and long prose while preserving each
+    ``direction_id`` so the direction remains fetchable on demand.
+    """
+    if not isinstance(v, dict):
+        return v
+    out: dict[str, Any] = dict(v)
+    if "summary_text" in out:
+        out["summary_text"] = _bounded_text(
+            out.get("summary_text"), _PREV_OUTCOMES_SUMMARY_TEXT_CAP
+        )
+    # cycle_reasoning is the single verbose free-text field — drop it entirely
+    # under pressure (the compact summary_text carries the headline).
+    out.pop("cycle_reasoning", None)
+    for role in ("created", "retired"):
+        entries = out.get(role)
+        if isinstance(entries, list):
+            out[role] = [
+                _summarize_previous_decision_outcome_entry(e)
+                for e in entries[:_PREV_OUTCOMES_ROLE_KEEP]
+            ]
+    return out
+
+
+_PLAYBOOK_SUMMARY_ENTRIES_KEEP = 6
+_PLAYBOOK_SUMMARY_CONTENT_CAP = 160
+# Optional stat fields dropped from each playbook entry under budget pressure —
+# the key/content headline survives and the full entry is fetchable via
+# ``./fetch playbook <key>``.
+_PLAYBOOK_SUMMARY_DROP_FIELDS = (
+    "hit_count",
+    "confirmed_count",
+    "scope",
+    "learned_from_direction",
+    "rejection_count",
+    "source",
+)
+
+
+def _summarize_playbook_summary(v: Any) -> Any:
+    """Keep the newest few playbook entries; trim content, drop stat fields.
+
+    Preserves each entry ``key`` (the fetch pointer) and a shortened ``content``
+    headline so the strategist knows the lesson exists and can pull the full
+    entry via ``./fetch playbook <key>``.
+    """
+    if not isinstance(v, dict):
+        return v
+    entries = v.get("entries")
+    if not isinstance(entries, list):
+        return v
+    trimmed: list = []
+    for e in entries[:_PLAYBOOK_SUMMARY_ENTRIES_KEEP]:
+        if not isinstance(e, dict):
+            trimmed.append(e)
+            continue
+        item: dict[str, Any] = {"key": e.get("key")}
+        content = _bounded_text(e.get("content"), _PLAYBOOK_SUMMARY_CONTENT_CAP)
+        if content is not None:
+            item["content"] = content
+        if e.get("updated_at") is not None:
+            item["updated_at"] = e.get("updated_at")
+        trimmed.append(item)
+    out = dict(v)
+    out["entries"] = trimmed
+    return out
+
+
+_PAST_CRITIQUES_KEEP = 3
+_PAST_CRITIQUE_TEXT_CAP = 200
+_PAST_CRITIQUE_TEXT_FIELDS = (
+    "what_it_addressed",
+    "pattern_that_produced_it",
+    "lesson",
+)
+
+
+def _summarize_past_retirement_critiques(v: Any) -> Any:
+    """Keep the newest few retirement critiques; truncate the prose fields.
+
+    Preserves ``direction_id`` and the ``no_eligible_retirements`` sentinel;
+    truncates the free-text lesson fields so the digest degrades to headlines
+    rather than dropping wholesale.
+    """
+    if not isinstance(v, list):
+        return v
+    out: list = []
+    for e in v[:_PAST_CRITIQUES_KEEP]:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        if e.get("no_eligible_retirements"):
+            out.append({"no_eligible_retirements": True})
+            continue
+        item = dict(e)
+        for field in _PAST_CRITIQUE_TEXT_FIELDS:
+            if field in item:
+                item[field] = _bounded_text(item.get(field), _PAST_CRITIQUE_TEXT_CAP)
+        out.append(item)
+    return out
+
+
+_SELF_REFLECTION_KEEP = 3
+_SELF_REFLECTION_TEXT_CAP = 200
+_SELF_REFLECTION_TEXT_FIELDS = (
+    "what_was_hard",
+    "missing_context",
+    "proposed_self_improvement",
+)
+
+
+def _summarize_self_reflection_log(v: Any) -> Any:
+    """Keep the newest few self-reflection entries; truncate the prose fields.
+
+    Preserves the ``ts`` / ``cycle_task_id`` pointers and shortens the free-text
+    reflection fields so the log degrades to recent headlines under pressure.
+    """
+    if not isinstance(v, list):
+        return v
+    out: list = []
+    for e in v[-_SELF_REFLECTION_KEEP:]:
+        if not isinstance(e, dict):
+            out.append(e)
+            continue
+        item = dict(e)
+        for field in _SELF_REFLECTION_TEXT_FIELDS:
+            if field in item:
+                item[field] = _bounded_text(item.get(field), _SELF_REFLECTION_TEXT_CAP)
+        out.append(item)
+    return out
+
+
 # Schemas for pack_under_budget. Each key declares its priority tier and an
 # optional summarize_fn. Critical = always shipped (raises if can't fit).
 # High = shipped unless budget exhausted by summarized criticals + earlier
@@ -2925,8 +3185,13 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # with no summarize_fn: it is already capped + char-bounded at build time, so
     # the packer drops it whole under budget rather than trimming. Closes the
     # operator-wins reconciliation loop so the agent reconciles instead of
-    # re-proposing overridden values.
-    "operator_overrides": {"priority": "medium", "exempt": True},
+    # re-proposing overridden values. Summarize fallback keeps the newest few
+    # entries (routing keys + tightened values) instead of dropping the whole
+    # ledger; full detail is reconstructable from the live documents.
+    "operator_overrides": {
+        "priority": "medium",
+        "summarize": _summarize_operator_overrides,
+    },
     # Recent operator-selected Strategic workbench pointers promoted out of
     # ProjectMessage.context.strategic_session so selected refs survive when the
     # conversation thread is trimmed. Already capped and pointer-only.
@@ -2988,10 +3253,14 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # summaries to a navigation skeleton under genuine budget exhaustion.
     "design_doc": {"priority": "medium", "summarize": _summarize_design_doc_index},
     # Compact, body-omitted index of existing knowledge documents (web_research /
-    # design output). Medium priority, exempt: already capped (count) and
-    # char-bounded (per-entry summary) at build time, so drop-whole is correct.
-    # Full bodies fetched on demand.
-    "knowledge_index": {"priority": "medium", "exempt": True},
+    # design output). Medium priority. Summarize fallback keeps the newest few
+    # entries with their navigation pointers (id/title/topic/direction) and drops
+    # the heavy per-arm-verdict / provenance sub-fields; full bodies remain
+    # fetchable on demand via ``./fetch knowledge <id>``.
+    "knowledge_index": {
+        "priority": "medium",
+        "summarize": _summarize_knowledge_index,
+    },
     # Per-sweep comparative arm grouping — bounded at build time so the packer
     # drops it whole under budget rather than trimming. Same tier as
     # knowledge_index.
@@ -3016,10 +3285,19 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # All exempt: already bounded at build time (list caps + char limits applied
     # before packing), so drop-whole is correct degradation for these low-priority
     # sections. Fuller detail is fetchable via playbook/direction fetch verbs.
-    "self_reflection_log": {"priority": "low", "exempt": True},
-    "previous_decision_outcomes": {"priority": "low", "exempt": True},
+    "self_reflection_log": {
+        "priority": "low",
+        "summarize": _summarize_self_reflection_log,
+    },
+    "previous_decision_outcomes": {
+        "priority": "low",
+        "summarize": _summarize_previous_decision_outcomes,
+    },
     "anomaly_summary": {"priority": "low", "exempt": True},
-    "playbook_summary": {"priority": "low", "exempt": True},
+    "playbook_summary": {
+        "priority": "low",
+        "summarize": _summarize_playbook_summary,
+    },
     "rejected_proposals": {"priority": "low", "exempt": True},
     "running_update_superseded": {"priority": "low", "exempt": True},
     "prediction_calibration_factor": {"priority": "low", "exempt": True},
@@ -3030,7 +3308,12 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # must survive budget pressure — promoted to medium alongside conversation_thread.
     "drift_signals": {"priority": "medium", "summarize": _summarize_drift_signals},
     # Lessons from retired directions — helps the agent avoid repeating patterns.
-    "past_retirement_critiques": {"priority": "low", "exempt": True},
+    # Summarize fallback keeps the newest few critiques (direction_id + truncated
+    # lesson fields) rather than dropping the whole feed.
+    "past_retirement_critiques": {
+        "priority": "low",
+        "summarize": _summarize_past_retirement_critiques,
+    },
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
     "retired_directions_summary": {"priority": "low", "exempt": True},
@@ -3146,8 +3429,12 @@ _DESIGN_DOC_UPDATE_SCHEMA: dict[str, dict] = {
     # priority; exempt: bounded at build time by collect_missing_capability_demand.
     "missing_capability_demand": {"priority": "medium", "exempt": True},
     # Compact, body-omitted index of existing knowledge documents — see
-    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Exempt: capped at build time.
-    "knowledge_index": {"priority": "medium", "exempt": True},
+    # _STRATEGIC_REVIEW_SCHEMA["knowledge_index"]. Summarize fallback degrades to
+    # the newest few navigation pointers rather than dropping the whole index.
+    "knowledge_index": {
+        "priority": "medium",
+        "summarize": _summarize_knowledge_index,
+    },
     # Per-sweep comparative arm grouping — exempt: bounded at build time.
     "compute_experiment_sweeps": {"priority": "medium", "exempt": True},
     # Shared capability vocabulary — see _STRATEGIC_REVIEW_SCHEMA. Exempt: small, bounded.

@@ -59,7 +59,11 @@ def test_drops_lowest_priority_first():
     assert "must_keep" in out
     assert "nice_to_have" not in out
     assert out["_packer_meta"]["dropped"] == [
-        {"key": "nice_to_have", "reason": "exceeds remaining budget (no summarize_fn)"},
+        {
+            "key": "nice_to_have",
+            "reason": "exceeds remaining budget (no summarize_fn)",
+            "priority": "low",
+        },
     ]
 
 
@@ -91,7 +95,11 @@ def test_summarize_still_overflows_drops_part():
     out = pack_under_budget(payload, schema, budget=100)
     assert "huge" not in out
     assert out["_packer_meta"]["dropped"] == [
-        {"key": "huge", "reason": "exceeds remaining budget even after summarize"},
+        {
+            "key": "huge",
+            "reason": "exceeds remaining budget even after summarize",
+            "priority": "medium",
+        },
     ]
 
 
@@ -1218,6 +1226,71 @@ def test_dropped_sections_logged_with_byte_accounting(caplog):
     assert str(core_bytes) in error_logs[0].message, (
         f"expected byte count {core_bytes} in ERROR log: {error_logs[0].message}"
     )
+
+
+def test_high_tier_drop_logged_loud(caplog):
+    """A high-tier (non-floor) drop logs at ERROR naming key, tier, bytes, reason;
+    a medium/low drop stays at WARNING.
+
+    Regression guard for the 2026-07-04 incident where 14 sections — including
+    the whole open-message inbox — dropped under the 120KB budget with no loud
+    backend signal. A high-tier wholesale drop must now be loud (ERROR) so an
+    operator sees the strategist ran on a degraded payload.
+    """
+    # --- high-tier drop → ERROR naming key, tier, bytes, reason ---
+    payload_hi = {"inbox": "x" * 400}
+    schema_hi = {"inbox": {"priority": "high"}}
+    inbox_bytes = _size("x" * 400)
+    with caplog.at_level(logging.INFO, logger="app.payload_schemas"):
+        out_hi = pack_under_budget(payload_hi, schema_hi, budget=10)
+    assert "inbox" not in out_hi
+    hi_logs = [
+        r for r in caplog.records
+        if r.levelno == logging.ERROR and "inbox" in r.message
+    ]
+    assert hi_logs, "expected an ERROR log when a high-tier section is dropped"
+    msg = hi_logs[0].message
+    assert "inbox" in msg, f"ERROR log must name the key: {msg}"
+    assert "high" in msg, f"ERROR log must name the tier: {msg}"
+    assert str(inbox_bytes) in msg, f"ERROR log must include byte size {inbox_bytes}: {msg}"
+    assert "budget" in msg.lower(), f"ERROR log must include the drop reason: {msg}"
+
+    # --- medium-tier drop → WARNING, NOT ERROR ---
+    caplog.clear()
+    payload_med = {"extra": "y" * 400}
+    schema_med = {"extra": {"priority": "medium"}}
+    with caplog.at_level(logging.INFO, logger="app.payload_schemas"):
+        out_med = pack_under_budget(payload_med, schema_med, budget=10)
+    assert "extra" not in out_med
+    med_drop_logs = [
+        r for r in caplog.records
+        if "dropped" in r.message.lower() and "extra" in r.message
+    ]
+    assert med_drop_logs, "expected a log record for the dropped 'extra' section"
+    assert all(r.levelno == logging.WARNING for r in med_drop_logs), (
+        "medium/low drop must log at WARNING, not ERROR"
+    )
+
+
+def test_dropped_entry_carries_priority():
+    """Each _packer_meta drop entry records the section's schema tier so
+    downstream telemetry can filter high/critical drops without a schema
+    re-lookup."""
+    payload = {
+        "top": "a" * 400,
+        "mid": "b" * 400,
+        "bottom": "c" * 400,
+    }
+    schema = {
+        "top": {"priority": "high"},
+        "mid": {"priority": "medium"},
+        "bottom": {"priority": "low"},
+    }
+    out = pack_under_budget(payload, schema, budget=10)
+    by_key = {d["key"]: d for d in out["_packer_meta"]["dropped"]}
+    assert by_key["top"]["priority"] == "high"
+    assert by_key["mid"]["priority"] == "medium"
+    assert by_key["bottom"]["priority"] == "low"
 
 
 def test_core_sections_survive_realistic_worst_case():

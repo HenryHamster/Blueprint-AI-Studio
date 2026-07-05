@@ -1532,8 +1532,17 @@ def pack_under_budget(
             # while the OTHER floored keys' reservations stay protected.
             reserved_remaining -= floor["size"]
         if p["unserializable"]:
-            dropped.append({"key": key, "reason": "value not JSON-serializable"})
-            logger.warning("pack_under_budget: dropped %r — value not JSON-serializable", key)
+            dropped.append(
+                {"key": key, "reason": "value not JSON-serializable", "priority": p["priority"]}
+            )
+            if p["priority"] in ("high", "critical"):
+                logger.error(
+                    "pack_under_budget: HIGH-TIER section %r (tier=%s) dropped "
+                    "(size unknown) — value not JSON-serializable",
+                    key, p["priority"],
+                )
+            else:
+                logger.warning("pack_under_budget: dropped %r — value not JSON-serializable", key)
             continue
         size = p["size"]
         assert size is not None
@@ -1595,13 +1604,22 @@ def pack_under_budget(
                 if p["summarize"]
                 else "exceeds remaining budget (no summarize_fn)"
             )
-            dropped.append({"key": key, "reason": drop_reason})
+            dropped.append({"key": key, "reason": drop_reason, "priority": p["priority"]})
             has_floor_in_schema = (schema.get(key) or {}).get("floor") is not None
             if has_floor_in_schema:
                 logger.error(
                     "pack_under_budget: CORE section %r dropped (%d bytes) — "
                     "floor guarantee lost; %s",
                     key, size, drop_reason,
+                )
+            elif p["priority"] in ("high", "critical"):
+                # A high/critical-tier section dropping wholesale is a degraded
+                # payload the operator must see loudly — the 2026-07-04 incident
+                # (14 sections, whole open-message inbox) produced no loud signal.
+                logger.error(
+                    "pack_under_budget: HIGH-TIER section %r (tier=%s) dropped "
+                    "(%d bytes) — %s",
+                    key, p["priority"], size, drop_reason,
                 )
             else:
                 logger.warning(

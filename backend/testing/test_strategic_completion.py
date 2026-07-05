@@ -15819,6 +15819,60 @@ def test_compute_model_gc_telemetry_basic_fields():
     assert result["model_size_status"] in ("healthy", "growing", "large", "oversized")
     assert result["directions_dropped_count"] == 0
     assert result["problem_model_truncated"] is False
+    # No drops → high_tier_dropped is an empty list (present, not None).
+    assert result["high_tier_dropped"] == []
+
+
+def test_compute_model_gc_telemetry_reports_high_tier_dropped():
+    """high_tier_dropped lists only high/critical-tier dropped keys; medium/low
+    drops are excluded (they are expected degradation, not a degraded payload)."""
+    project = Project(
+        name="P",
+        user_id="u1",
+        problem_model={
+            "intent": {"purpose": "test", "current_focus": ""},
+            "capabilities": [],
+            "gaps": [],
+            "friction": [],
+        },
+    )
+    task = Task(
+        project_id=project.id or uuid.uuid4(),
+        payloads=[
+            {
+                "type": "strategic_review",
+                "_packer_meta": {
+                    "budget_total": 120000,
+                    "budget_used": 119000,
+                    "trimmed": [],
+                    "dropped": [
+                        {
+                            "key": "open_messages",
+                            "reason": "exceeds remaining budget (no summarize_fn)",
+                            "priority": "high",
+                        },
+                        {
+                            "key": "playbook_summary",
+                            "reason": "exceeds remaining budget (no summarize_fn)",
+                            "priority": "low",
+                        },
+                        {
+                            "key": "identity",
+                            "reason": "value not JSON-serializable",
+                            "priority": "critical",
+                        },
+                    ],
+                },
+            }
+        ],
+        context={},
+    )
+
+    result = _compute_model_gc_telemetry(project, task)
+
+    # Only the high and critical keys appear; the low-tier drop is excluded.
+    assert set(result["high_tier_dropped"]) == {"open_messages", "identity"}
+    assert "playbook_summary" not in result["high_tier_dropped"]
 
 
 def test_compute_model_gc_telemetry_detects_directions_dropped():
