@@ -86,7 +86,7 @@ describe('handleMemo', () => {
     vi.mocked(getLlmTelemetry).mockReturnValue({
       llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
       total_cache_creation_input_tokens: 0, total_cache_read_input_tokens: 0,
-      viewport_screenshot_forwarded_count: 0, num_turns: 0,
+      viewport_screenshot_forwarded_count: 0, num_turns: 0, total_tool_result_bytes: 0,
     });
   });
 
@@ -263,6 +263,7 @@ describe('handleMemo', () => {
         total_cache_read_input_tokens: 0,
         viewport_screenshot_forwarded_count: 0,
         num_turns: 0,
+        total_tool_result_bytes: 0,
       };
     });
 

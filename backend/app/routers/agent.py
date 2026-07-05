@@ -2965,6 +2965,16 @@ async def claim_task(
                         review_quality_feedback
                     )
 
+                # recent_findings_evidence: structured claims+sources for the most
+                # recent merged/proposed findings under this direction. Populated here
+                # so the context-prefix renderer (task.direction_context.recent_findings_evidence)
+                # receives it via the claim response rather than via the bulkier
+                # research-payload path (autonomous_research.py) where no renderer
+                # consumed it.
+                _rfe = direction.get("recent_findings_evidence")
+                if _rfe and isinstance(_rfe, list):
+                    response["direction_context"]["recent_findings_evidence"] = _rfe
+
             # Surface saturation / deadlock signals to research agents so they can
             # pivot to direction_update/direction_note findings on stuck directions.
             if task_type == "research":
@@ -4803,7 +4813,7 @@ async def agent_heartbeat(
         or req.total_cache_creation_input_tokens is not None
         or req.total_cache_read_input_tokens is not None
         or req.viewport_screenshot_forwarded_count is not None
-        or req.num_turns is not None
+        or req.total_tool_result_bytes is not None
     ):
         summary = {
             "llm_call_count": int(req.llm_call_count or 0),
@@ -4829,6 +4839,10 @@ async def agent_heartbeat(
             summary["total_cache_read_input_tokens"] = int(
                 req.total_cache_read_input_tokens
             )
+        # Persist total_tool_result_bytes only when the agent sent it so older
+        # agents leave the key absent (unknown ≠ zero) in downstream aggregations.
+        if req.total_tool_result_bytes is not None:
+            summary["total_tool_result_bytes"] = int(req.total_tool_result_bytes)
         task.api_call_summary = summary
 
     # Per-task structured-output format-compliance telemetry (equipping

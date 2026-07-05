@@ -6861,6 +6861,101 @@ async def test_claim_direction_context_absent_review_iteration_when_no_history(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_injects_recent_findings_evidence_in_direction_context(
+    client: AsyncClient, db_session
+):
+    """Claim surfaces direction.recent_findings_evidence under direction_context for create tasks."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    evidence = [
+        {
+            "title": "Eliminate N+1 query in user loader",
+            "claims": ["loader issues 50 queries per request"],
+            "source_refs": ["backend/app/loaders.py:42"],
+        }
+    ]
+    project = Project(name="RFE Direction Context Test", user_id="test-user-rfe")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Optimize database access",
+            "priority": "high",
+            "research_context": "",
+            "research_history": [],
+            "recent_findings_evidence": evidence,
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Fix the N+1 query"}],
+        vm_instance_id="agent-vm-rfe-ctx",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rfe-ctx")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert dc.get("recent_findings_evidence") == evidence, (
+        "claim response should surface direction.recent_findings_evidence in direction_context"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
+async def test_claim_omits_recent_findings_evidence_when_absent_or_non_list(
+    client: AsyncClient, db_session
+):
+    """direction_context omits recent_findings_evidence when the direction has none or a non-list value."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    direction_id = str(uuid.uuid4())
+    project = Project(name="RFE Absent Test", user_id="test-user-rfe-absent")
+    project.directions = [
+        {
+            "id": direction_id,
+            "title": "Refactor auth",
+            "priority": "medium",
+            "research_context": "",
+            "research_history": [],
+            # No recent_findings_evidence key at all
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix", "prompt": "Fix auth bug"}],
+        vm_instance_id="agent-vm-rfe-absent",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-rfe-absent")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    dc = resp.json()["direction_context"]
+    assert "recent_findings_evidence" not in dc, (
+        "direction_context should not include recent_findings_evidence when direction has none"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_does_not_inject_direction_context_for_review_task(
     client: AsyncClient, db_session
 ):
@@ -18299,6 +18394,61 @@ async def test_heartbeat_persists_cache_input_token_breakdown(
     await db_session.refresh(task)
     assert "total_cache_creation_input_tokens" not in task.api_call_summary
     assert "total_cache_read_input_tokens" not in task.api_call_summary
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_tool_result_bytes(client: AsyncClient, db_session):
+    """Heartbeat persists total_tool_result_bytes into api_call_summary; key is
+    absent when the agent doesn't send it (backwards-compatible with older agents)."""
+    project = Project(name="Tool Result Bytes", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-tool-bytes",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-tool-bytes")
+    resp = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 2,
+            "total_input_tokens": 500,
+            "total_output_tokens": 100,
+            "total_tool_result_bytes": 65536,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(task)
+    summary = task.api_call_summary
+    assert summary is not None
+    assert summary["total_tool_result_bytes"] == 65536
+
+    # A heartbeat that omits total_tool_result_bytes leaves the key absent —
+    # unknown ≠ zero; backwards-compatible with older agents.
+    resp2 = await client.post(
+        "/api/agent/heartbeat",
+        json={
+            "task_id": str(task.id),
+            "llm_call_count": 3,
+            "total_input_tokens": 700,
+            "total_output_tokens": 150,
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 200
+    await db_session.refresh(task)
+    assert "total_tool_result_bytes" not in task.api_call_summary
 
 
 @pytest.mark.asyncio

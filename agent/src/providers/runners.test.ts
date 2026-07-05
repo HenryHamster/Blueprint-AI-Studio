@@ -44,6 +44,7 @@ vi.mock('../index.js', () => ({
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
   recordNumTurns: vi.fn(),
+  recordToolResultBytes: vi.fn(),
   estimateTokensFromChars: vi.fn().mockReturnValue(0),
   sanitize: vi.fn((s: string) => s),
   ClaudeTimeoutError: class ClaudeTimeoutError extends Error {
@@ -79,7 +80,7 @@ import {
   getLastProviderRunErrorReport,
   _setLastProviderRunErrorReportForTesting,
 } from './runners.js';
-import { recordLlmTokens } from '../index.js';
+import { recordLlmTokens, recordToolResultBytes } from '../index.js';
 import { CLAUDE_RESULT_GRACE_MS } from '../constants.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 
@@ -555,5 +556,59 @@ describe('drainJsonChunks — recordLlmTokens nested guard', () => {
     ]);
     await runProviderAgent('prompt', null, { value: '' });
     expect(vi.mocked(recordLlmTokens)).not.toHaveBeenCalled();
+  });
+});
+
+describe('drainJsonChunks — tool-result byte accounting (user events)', () => {
+  beforeEach(() => {
+    vi.mocked(recordToolResultBytes).mockClear();
+    vi.mocked(spawn).mockReset();
+  });
+
+  it('calls recordToolResultBytes with the JSON byte size of tool_result content blocks', async () => {
+    const block = { type: 'tool_result', tool_use_id: 'tr-1', content: 'hello world' };
+    const expectedBytes = Buffer.byteLength(JSON.stringify(block));
+    emitStream([
+      JSON.stringify({
+        type: 'user',
+        message: { content: [block] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledOnce();
+    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledWith(expectedBytes);
+  });
+
+  it('does NOT call recordToolResultBytes for a nested user event (parent_tool_use_id set)', async () => {
+    emitStream([
+      JSON.stringify({
+        type: 'user',
+        parent_tool_use_id: 'parent-id-nested',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'tr-2', content: 'sub result' }] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordToolResultBytes)).not.toHaveBeenCalled();
+  });
+
+  it('does NOT call recordToolResultBytes when user event has no message content', async () => {
+    emitStream([JSON.stringify({ type: 'user' })]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordToolResultBytes)).not.toHaveBeenCalled();
+  });
+
+  it('sums bytes across multiple content blocks in one user event', async () => {
+    const block1 = { type: 'tool_result', tool_use_id: 'tr-3', content: 'first' };
+    const block2 = { type: 'tool_result', tool_use_id: 'tr-4', content: 'second longer result' };
+    const expectedBytes = Buffer.byteLength(JSON.stringify(block1)) + Buffer.byteLength(JSON.stringify(block2));
+    emitStream([
+      JSON.stringify({
+        type: 'user',
+        message: { content: [block1, block2] },
+      }),
+    ]);
+    await runProviderAgent('prompt', null, { value: '' });
+    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledOnce();
+    expect(vi.mocked(recordToolResultBytes)).toHaveBeenCalledWith(expectedBytes);
   });
 });

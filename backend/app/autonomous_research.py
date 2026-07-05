@@ -1934,10 +1934,6 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
             ctx = d.get("research_context")
             if ctx:
                 summary["research_context"] = ctx[:2000]
-            # Include structured findings evidence for the strategic agent
-            rfe = d.get("recent_findings_evidence")
-            if rfe:
-                summary["recent_findings_evidence"] = rfe
             # Include compact history for agent-side analysis functions
             raw_history = d.get("research_history") or []
             raw_agg = d.get("history_aggregate") or {}

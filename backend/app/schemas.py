@@ -444,6 +444,10 @@ class HeartbeatRequest(BaseModel):
     # Count of viewport screenshots forwarded into agent prompts this task.
     # Backwards-compatible: older agents omit this field; treated as 0.
     viewport_screenshot_forwarded_count: int | None = Field(None, ge=0)
+    # Cumulative byte-count of all tool-result content blocks forwarded to the
+    # LLM within this task. Backwards-compatible: older agents omit this field;
+    # absent means unknown (not zero) in downstream aggregations.
+    total_tool_result_bytes: int | None = Field(None, ge=0)
     # Number of agent turns (user→assistant exchanges) in this CLI invocation.
     # Distinct from llm_call_count (API calls): allows per-turn context-size
     # decomposition in the efficiency snapshot. Backwards-compatible: older

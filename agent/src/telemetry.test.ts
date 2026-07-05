@@ -8,6 +8,7 @@ import {
   recordLlmTokens,
   recordNumTurns,
   recordViewportScreenshotDownload,
+  recordToolResultBytes,
   getLlmTelemetry,
   resetLlmTelemetry,
   recordFormatMiss,
@@ -74,6 +75,7 @@ describe('LLM telemetry', () => {
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
+      total_tool_result_bytes: 0,
     });
   });
   it('accumulates call counts and token totals', () => {
@@ -89,6 +91,7 @@ describe('LLM telemetry', () => {
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
+      total_tool_result_bytes: 0,
     });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
@@ -103,6 +106,7 @@ describe('LLM telemetry', () => {
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
+      total_tool_result_bytes: 0,
     });
   });
   it('resets all counters', () => {
@@ -117,6 +121,7 @@ describe('LLM telemetry', () => {
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
       num_turns: 0,
+      total_tool_result_bytes: 0,
     });
   });
   it('breaks out cache-creation and cache-read while total_input_tokens stays the inclusive sum', () => {
@@ -202,6 +207,38 @@ describe('num_turns telemetry', () => {
     recordNumTurns(3.9);
     recordNumTurns(2.1);
     expect(getLlmTelemetry().num_turns).toBe(5);
+  });
+});
+
+describe('tool-result byte telemetry', () => {
+  it('starts at zero', () => {
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(0);
+  });
+  it('accumulates across multiple record calls', () => {
+    recordToolResultBytes(1000);
+    recordToolResultBytes(500);
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(1500);
+  });
+  it('ignores zero and negative values', () => {
+    recordToolResultBytes(0);
+    recordToolResultBytes(-100);
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(0);
+  });
+  it('ignores invalid values (NaN, Infinity)', () => {
+    recordToolResultBytes(Number.NaN);
+    recordToolResultBytes(Number.POSITIVE_INFINITY);
+    recordToolResultBytes(200);
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(200);
+  });
+  it('resets with resetLlmTelemetry', () => {
+    recordToolResultBytes(999);
+    resetLlmTelemetry();
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(0);
+  });
+  it('floors non-integer byte values', () => {
+    recordToolResultBytes(100.9);
+    recordToolResultBytes(50.1);
+    expect(getLlmTelemetry().total_tool_result_bytes).toBe(150);
   });
 });
 

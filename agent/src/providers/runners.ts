@@ -14,7 +14,7 @@ import {
 } from '../constants.js';
 import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
-  recordLlmTokens, recordNumTurns, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
+  recordLlmTokens, recordNumTurns, recordToolResultBytes, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV } from '../token-file.js';
@@ -1344,6 +1344,15 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                   const slice = allOutput.slice(lastCheckOutputOffset);
                   recordCheckOutcome(!/\[check\].*FAILED/.test(slice));
                   lastCheckOutputOffset = -1;
+                }
+                // Accumulate tool-result content bytes for per-session attribution.
+                const content = (obj as { message?: { content?: unknown[] } }).message?.content;
+                if (Array.isArray(content)) {
+                  let byteSum = 0;
+                  for (const block of content) {
+                    byteSum += Buffer.byteLength(JSON.stringify(block));
+                  }
+                  if (byteSum > 0) recordToolResultBytes(byteSum);
                 }
               }
             } else {

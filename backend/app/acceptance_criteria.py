@@ -462,11 +462,19 @@ async def record_task_merge_evidence(
         rows = [r for r in all_rows if r.status == "active"]
         task_id_str = str(getattr(task, "id", "") or "")
         recorded = 0
+        # Batch-load all evidence for active criteria in one query to avoid N+1.
+        active_criterion_ids = [row.id for row in rows]
+        evidence_by_criterion: dict[uuid.UUID, set[tuple[str, str | None]]] = defaultdict(set)
+        if active_criterion_ids:
+            ev_result = await session.execute(
+                select(CriterionEvidence).where(
+                    CriterionEvidence.criterion_id.in_(active_criterion_ids)
+                )
+            )
+            for ev in ev_result.scalars().all():
+                evidence_by_criterion[ev.criterion_id].add((ev.source_kind, ev.source_id))
         for row in rows:
-            existing = {
-                (e.source_kind, e.source_id)
-                for e in await get_evidence_for_criterion(session, row.id)
-            }
+            existing = evidence_by_criterion[row.id]
             source_id = task_id_str or None
             wrote = False
             if ("task_merge", source_id) not in existing:

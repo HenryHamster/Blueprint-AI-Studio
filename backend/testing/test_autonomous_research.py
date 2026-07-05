@@ -7155,10 +7155,12 @@ async def test_recent_findings_evidence_absent_when_no_findings(db_session, mock
 
 
 @pytest.mark.asyncio
-async def test_recent_findings_evidence_in_direction_summary_payload(
+async def test_recent_findings_evidence_not_in_direction_summary_payload(
     db_session, mocker
 ):
-    """recent_findings_evidence on a direction is included in the spawned research task payload."""
+    """recent_findings_evidence is NOT copied into the spawned research task payload.
+    It was moved to the claim response's direction_context (routers/agent.py) so the
+    context-prefix renderer receives it there instead of via the bulkier research payload."""
     direction_id = "d-rfe0003"
     evidence = [
         {"title": "Fix N+1 query", "claims": ["query runs 100x"], "source_refs": []}
@@ -7186,7 +7188,10 @@ async def test_recent_findings_evidence_in_direction_summary_payload(
     spawned_dirs = research[0].payloads[0].get("directions", [])
     target = next((d for d in spawned_dirs if d.get("id") == direction_id), None)
     assert target is not None
-    assert target.get("recent_findings_evidence") == evidence
+    assert "recent_findings_evidence" not in target, (
+        "recent_findings_evidence should not be in the research summary payload; "
+        "it now flows via direction_context in the claim response"
+    )
 
 
 @pytest.mark.asyncio

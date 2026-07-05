@@ -43,6 +43,7 @@ let _totalCacheCreationInputTokens = 0; // @per-role
 let _totalCacheReadInputTokens = 0; // @per-role
 let _viewportScreenshotForwardedCount = 0; // @per-role
 let _totalNumTurns = 0; // @per-role
+let _totalToolResultBytes = 0; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
 export function recordLlmCallStart(): void {
@@ -93,6 +94,15 @@ export function recordNumTurns(numTurns: number): void {
   }
 }
 
+/** Add to the per-task tool-result byte counter from top-level user events.
+ *  Bytes are the JSON-serialized size of each tool_result content block.
+ *  Accumulated only for top-level events (not nested sub-agent tool results). */
+export function recordToolResultBytes(bytes: number): void {
+  if (Number.isFinite(bytes) && bytes > 0) {
+    _totalToolResultBytes += Math.floor(bytes);
+  }
+}
+
 /** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
 export function getLlmTelemetry(): {
   llm_call_count: number;
@@ -102,6 +112,7 @@ export function getLlmTelemetry(): {
   total_cache_read_input_tokens: number;
   viewport_screenshot_forwarded_count: number;
   num_turns: number;
+  total_tool_result_bytes: number;
 } {
   return {
     llm_call_count: _llmCallCount,
@@ -111,6 +122,7 @@ export function getLlmTelemetry(): {
     total_cache_read_input_tokens: _totalCacheReadInputTokens,
     viewport_screenshot_forwarded_count: _viewportScreenshotForwardedCount,
     num_turns: _totalNumTurns,
+    total_tool_result_bytes: _totalToolResultBytes,
   };
 }
 
@@ -123,6 +135,7 @@ export function resetLlmTelemetry(): void {
   _totalCacheReadInputTokens = 0;
   _viewportScreenshotForwardedCount = 0;
   _totalNumTurns = 0;
+  _totalToolResultBytes = 0;
 }
 
 // ── Per-task structured-output format-compliance telemetry (equipping d-46468a41) ─

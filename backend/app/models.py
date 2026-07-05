@@ -1898,6 +1898,11 @@ def bank_task_current_attempt(
     num_turns_val = (task.api_call_summary or {}).get("num_turns")
     if isinstance(num_turns_val, int) and num_turns_val >= 0:
         snapshot["num_turns"] = num_turns_val
+    # Carry total_tool_result_bytes only when the agent reported it; omit the key
+    # for older agents so downstream analysis can distinguish zero from unreported.
+    tool_result_bytes_val = (task.api_call_summary or {}).get("total_tool_result_bytes")
+    if isinstance(tool_result_bytes_val, int) and tool_result_bytes_val >= 0:
+        snapshot["total_tool_result_bytes"] = tool_result_bytes_val
     history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history
