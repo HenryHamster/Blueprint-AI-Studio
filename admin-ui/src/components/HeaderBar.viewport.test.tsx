@@ -272,7 +272,7 @@ describe('HeaderBar — viewport regression', () => {
     expect(onOpenCommandPalette).toHaveBeenCalledOnce();
   });
 
-  test('mobile Chat menu leaves command palette to the composer affordance', async () => {
+  test('mobile Chat menu surfaces the command palette', async () => {
     const onOpenCommandPalette = vi.fn();
     host = document.createElement('div');
     host.style.padding = '12px';
@@ -288,8 +288,9 @@ describe('HeaderBar — viewport regression', () => {
 
     const commandButton = Array.from(host.querySelectorAll<HTMLButtonElement>('button'))
       .find(button => button.textContent?.includes('Command palette'));
-    expect(commandButton).toBeUndefined();
-    expect(onOpenCommandPalette).not.toHaveBeenCalled();
+    expect(commandButton).toBeTruthy();
+    await act(async () => { commandButton?.click(); });
+    expect(onOpenCommandPalette).toHaveBeenCalledOnce();
   });
 
   test('global header does not expose permanent New task chrome outside Pipeline', async () => {
