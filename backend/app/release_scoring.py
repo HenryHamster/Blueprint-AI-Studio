@@ -2250,3 +2250,39 @@ def compute_challenged_vs_unchallenged_telemetry(
         "unchallenged": _cohort_stats(unchallenged, include_disagreement=False),
         "total_verdicts": len(verdicts),
     }
+
+
+def compute_enforce_confidence_preview(
+    existing_confidence: float,
+    debt_pressure_score: float,
+    *,
+    configured_weight: float | None = None,
+) -> dict[str, Any]:
+    """Compute the hypothetical confidence if ``completion_debt_weight_mode`` were "enforce".
+
+    Pure / side-effect-free.  Called in observe mode to record what enforce would
+    have done, so qualifications accumulate decision-ready evidence for graduating
+    the knob without affecting the live composite.
+
+    The effective weight mirrors ``_apply_completion_debt_weight_mode``'s enforce
+    branch exactly:
+      * ``configured_weight > 0`` → use it (clamped to [0, MAX_COMPLETION_DEBT_WEIGHT]).
+      * ``configured_weight <= 0`` or ``None`` → fall back to
+        ``DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT`` so a graduation with no explicit
+        weight still changes the composite.
+
+    Returns ``{"enforce_confidence": float, "effective_weight": float}``.
+    """
+    if configured_weight is not None and configured_weight > 0.0:
+        effective = max(0.0, min(float(configured_weight), MAX_COMPLETION_DEBT_WEIGHT))
+    else:
+        effective = DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    enforce_confidence = round(
+        _clamp01(
+            (1.0 - effective) * _clamp01(existing_confidence)
+            + effective * _clamp01(debt_pressure_score)
+        ),
+        4,
+    )
+    return {"enforce_confidence": enforce_confidence, "effective_weight": effective}

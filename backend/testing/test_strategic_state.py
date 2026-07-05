@@ -16,6 +16,7 @@ from app.models import (
     AlertSeverity,
     Artifact,
     ArtifactType,
+    CompletionDebtEntry,
     ComputeJob,
     ComputeJobStatus,
     Direction,
@@ -7102,3 +7103,152 @@ async def test_coverage_blocked_version_without_stuck_criteria_raises_attention(
     assert cb_item["severity"] == "needs_operator"
     assert "active" in cb_item["detail"]
     assert cb_item["lifecycle"]["operator_action"] == "monitor_active_direction_progress"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stale_completion_debt(
+    client: AsyncClient, db_session
+):
+    """Open debt older than the threshold with no linked tasks → needs_operator item."""
+    project = await _make_project(db_session)
+    old_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Old unworked knob obligation",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    db_session.add(old_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 1
+    item = stale_items[0]
+    assert item["severity"] == "needs_operator"
+    assert item["count"] == 1
+    assert item["lifecycle"]["operator_action"] == "link_task_or_resolve_debt"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_young_completion_debt(
+    client: AsyncClient, db_session
+):
+    """Open debt within the staleness threshold is NOT surfaced."""
+    project = await _make_project(db_session)
+    young_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Recently created knob obligation",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=1),
+    )
+    db_session.add(young_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_debt_with_linked_tasks(
+    client: AsyncClient, db_session
+):
+    """Old debt that already has linked tasks is NOT surfaced (work is in progress)."""
+    project = await _make_project(db_session)
+    linked_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Old knob obligation with work in flight",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+        detail={"linked_tasks": [{"task_id": str(uuid.uuid4())}]},
+    )
+    db_session.add(linked_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_does_not_surface_resolved_or_dismissed_debt(
+    client: AsyncClient, db_session
+):
+    """Resolved or dismissed debts are not surfaced regardless of age."""
+    project = await _make_project(db_session)
+    resolved_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Resolved old knob",
+        status="resolved",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    dismissed_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Dismissed old knob",
+        status="dismissed",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    db_session.add(resolved_entry)
+    db_session.add(dismissed_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 0
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 0
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_stale_debt_count_in_counts_block(
+    client: AsyncClient, db_session
+):
+    """counts.stale_completion_debts reflects both project-scoped and global (project_id=NULL) rows."""
+    project = await _make_project(db_session)
+    project_entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind="dormant_knob",
+        title="Project-scoped old debt",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=48),
+    )
+    global_entry = CompletionDebtEntry(
+        project_id=None,
+        kind="seed_inventory",
+        title="Global deployment-level old debt",
+        status="open",
+        created_at=_utcnow() - timedelta(hours=72),
+    )
+    db_session.add(project_entry)
+    db_session.add(global_entry)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["counts"]["stale_completion_debts"] == 2
+    stale_items = [i for i in attention["items"] if i["reason"] == "stale_completion_debt"]
+    assert len(stale_items) == 1
+    assert stale_items[0]["count"] == 2

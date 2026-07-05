@@ -179,6 +179,7 @@ from app.release_scoring import (
     _audit_finding_key,  # noqa: F401 — re-exported for callers/tests
     _audit_findings_carry_meta,
     _audit_missing_reason,
+    compute_enforce_confidence_preview,  # noqa: F401 — re-exported for callers/tests
     DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT,
     MAX_COMPLETION_DEBT_WEIGHT,
     _clamp01,  # noqa: F401
@@ -4119,6 +4120,27 @@ async def _finalize_qualification(
         # None when the ledger module is not yet available or returned no data.
         "completion_debt": _completion_debt,
     }
+
+    # Enforce-mode confidence preview — only in observe/off mode, only when no
+    # hard blocker fired and debt pressure was actually scored.  Records what
+    # enforce would have done to confidence so the operator can graduate the
+    # completion_debt_weight_mode knob with accumulated evidence rather than
+    # flying blind.  Has no effect on the live composite.
+    if (
+        _resolve_completion_debt_weight_mode() != "enforce"
+        and composite["blocker"] is None
+        and _debt_pressure_score is not None
+    ):
+        _configured_cd_weight = coerce_completion_debt_weight(
+            _runtime_config.get("promotion_weights") or {}
+        )
+        _preview = compute_enforce_confidence_preview(
+            composite["confidence"],
+            _debt_pressure_score,
+            configured_weight=_configured_cd_weight,
+        )
+        base_record["debt_enforce_confidence_preview"] = _preview["enforce_confidence"]
+        base_record["debt_enforce_weight_preview"] = _preview["effective_weight"]
 
     # Per-project override (falls back to the fleet-wide promotion_enabled when
     # this project has no explicit override) — additive, behavior unchanged for

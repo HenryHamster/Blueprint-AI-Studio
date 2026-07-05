@@ -1035,19 +1035,30 @@ async def apply_post_spawn_state(
                     if history:
                         last_entry = history[-1]
                         sub_notes = last_entry.get("sub_research_notes", [])
-                        sub_notes.append(
-                            {
-                                "sub_task_id": str(task.id),
-                                "depth": research_depth,
-                                "tasks_created": len(child_tasks),
-                                "finding_titles": [
-                                    f.get("title", "") for _, f, _ in deduplicated[:3]
-                                ],
-                                "insights": [
-                                    i["summary"][:150] for i in insights[:2]
-                                ],  # up to 2 insights, capped
-                            }
-                        )
+                        # Deduplicate by sub_task_id to prevent retried/replayed
+                        # completions from appending the same note twice. Check against
+                        # all notes in this entry and previous entries.
+                        subtask_id = str(task.id)
+                        all_subtask_ids = {note.get("sub_task_id") for note in sub_notes}
+                        for prev_entry in history[:-1]:
+                            all_subtask_ids.update(
+                                note.get("sub_task_id")
+                                for note in prev_entry.get("sub_research_notes", [])
+                            )
+                        if subtask_id not in all_subtask_ids:
+                            sub_notes.append(
+                                {
+                                    "sub_task_id": subtask_id,
+                                    "depth": research_depth,
+                                    "tasks_created": len(child_tasks),
+                                    "finding_titles": [
+                                        f.get("title", "") for _, f, _ in deduplicated[:3]
+                                    ],
+                                    "insights": [
+                                        i["summary"][:150] for i in insights[:2]
+                                    ],  # up to 2 insights, capped
+                                }
+                            )
                         last_entry["sub_research_notes"] = sub_notes[-5:]  # keep last 5
                         history[-1] = last_entry
                         d["research_history"] = history

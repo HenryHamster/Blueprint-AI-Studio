@@ -385,6 +385,10 @@ def format_qualification_for_api(qual: dict[str, Any]) -> dict[str, Any]:
         # Open completion-debt snapshot at qualification time (additive; None when
         # the ledger was unavailable or no debt was open).
         "completion_debt": qual.get("completion_debt"),
+        # Enforce-mode confidence preview (observe/off mode only; None when the mode
+        # is already enforce, a hard blocker fired, or debt pressure was unavailable).
+        "debt_enforce_confidence_preview": qual.get("debt_enforce_confidence_preview"),
+        "debt_enforce_weight_preview": qual.get("debt_enforce_weight_preview"),
     }
 
 

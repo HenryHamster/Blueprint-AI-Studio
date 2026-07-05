@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, not_
+from sqlalchemy import and_, case, func, not_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -27,6 +27,7 @@ from app.models import (
     AlertSeverity,
     Artifact,
     ArtifactType,
+    CompletionDebtEntry,
     LocalRunner,
     MessageType,
     MessagesLastSeen,
@@ -38,6 +39,7 @@ from app.models import (
     TaskStatus,
     VmContact,
 )
+from app.completion_debt import STATUS_OPEN as _DEBT_STATUS_OPEN
 from app.reaper_orphan_classify import _classify_orphan
 from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
@@ -84,6 +86,8 @@ _ALERT_ERROR_PREVIEW_LIMIT = 4
 _ALERT_WARNING_PREVIEW_LIMIT = 4
 _DEAD_RUNNER_PREVIEW_LIMIT = 4
 _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
+_STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
+_STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
@@ -99,6 +103,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "coverage_blocked"): 66,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "churn_retirement_recommended"): 72,
+    ("needs_operator", "stale_completion_debt"): 75,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
     ("watch", "alert"): 200,
@@ -216,6 +221,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "acceptance_criteria_lifecycle",
         "clears_when": "criterion_covered_or_version_closed",
         "operator_action": "monitor_active_direction_progress",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stale_completion_debt": {
+        "mode": "completion_debt_lifecycle",
+        "clears_when": "debt_resolved_dismissed_or_linked_to_work",
+        "operator_action": "link_task_or_resolve_debt",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -1204,6 +1216,91 @@ def _coverage_blocked_attention_item(
     }
 
 
+async def _load_stale_unworked_completion_debts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> tuple[int, list[CompletionDebtEntry]]:
+    """Return (count, oldest_preview) of open debts with no linked tasks older than the threshold.
+
+    Scoped to the project plus global (project_id IS NULL) rows, matching the
+    visibility rule used by the strategist completion-debt fetch.
+    """
+    cutoff = _utcnow() - _STALE_COMPLETION_DEBT_AFTER
+    linked_tasks_col = CompletionDebtEntry.detail["linked_tasks"]
+    no_linked_tasks = or_(
+        linked_tasks_col.is_(None),
+        func.jsonb_array_length(linked_tasks_col) == 0,
+    )
+    filters = (
+        or_(
+            CompletionDebtEntry.project_id == project_id,
+            CompletionDebtEntry.project_id.is_(None),
+        ),
+        CompletionDebtEntry.status == _DEBT_STATUS_OPEN,
+        CompletionDebtEntry.created_at < cutoff,
+        no_linked_tasks,
+    )
+    count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(CompletionDebtEntry)
+                .where(*filters)
+            )
+        ).scalar()
+        or 0
+    )
+    if count == 0:
+        return 0, []
+    entries = list(
+        (
+            await session.execute(
+                select(CompletionDebtEntry)
+                .where(*filters)
+                .order_by(
+                    CompletionDebtEntry.created_at.asc(),
+                    CompletionDebtEntry.id.asc(),
+                )
+                .limit(_STALE_COMPLETION_DEBT_PREVIEW_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return count, entries
+
+
+def _stale_completion_debt_attention_item(
+    project_id: uuid.UUID,
+    count: int,
+    entries: list[CompletionDebtEntry],
+) -> dict[str, Any]:
+    plural = "obligations" if count != 1 else "obligation"
+    if entries:
+        first_title = _compact_text(entries[0].title, max_chars=140)
+        detail = first_title if count == 1 else f"{first_title} (+{count - 1} more)"
+    else:
+        detail = f"{count} unworked completion-debt {plural}"
+    return {
+        "id": f"project:{project_id}:stale_completion_debt",
+        "kind": "completion_debt",
+        "severity": "needs_operator",
+        "reason": "stale_completion_debt",
+        "label": f"{count} completion-debt {plural} unworked",
+        "detail": detail,
+        "count": count,
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "completion_debt",
+        }),
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -1495,6 +1592,11 @@ async def build_operator_attention(
         stale_queued_tasks,
     ) = await _load_stale_queued_dependency_tasks(session, project.id)
 
+    (
+        stale_debt_count,
+        stale_debt_entries,
+    ) = await _load_stale_unworked_completion_debts(session, project.id)
+
     experiment_cutoff = _utcnow() - _EXPERIMENT_OUTCOME_WINDOW
     # JSONB `->` yields JSON null (not SQL NULL) when "met" is present with a
     # null value, so IS NOT NULL means the criterion carries a "met" key at
@@ -1751,6 +1853,10 @@ async def build_operator_attention(
         )
     for task in stale_queued_tasks:
         add_candidate(_stale_task_attention_item(task, reason="stale_queued_task"))
+    if stale_debt_count > 0:
+        add_candidate(
+            _stale_completion_debt_attention_item(project.id, stale_debt_count, stale_debt_entries)
+        )
     if stuck_criteria_count > 0:
         add_candidate(
             _stuck_criteria_attention_item(
@@ -1819,6 +1925,7 @@ async def build_operator_attention(
         + error_alert_count
         + stuck_criteria_count
         + coverage_blocked_count
+        + (1 if stale_debt_count > 0 else 0)
     )
     total_watch = (
         generic_failed_count
@@ -1893,6 +2000,7 @@ async def build_operator_attention(
             "parked_tasks": parked_count,
             "handmerge_preserved_tasks": handmerge_preserved_count,
             "experiment_outcomes": unmet_experiment_count,
+            "stale_completion_debts": stale_debt_count,
         },
         "items": items,
     }

@@ -15686,3 +15686,137 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
         "Direction with 3 credit-eligible aggregate merges (5 verified − 2 stranded) "
         "must auto-complete via apply_post_spawn_state"
     )
+
+
+@_pytest.mark.asyncio
+async def test_sub_research_note_append_is_idempotent_on_replay(db_session):
+    """Sub-research notes must not duplicate when research task is replayed.
+
+    When a research task with research_depth > 0 is retried/replayed, apply_post_spawn_state
+    must not append a duplicate sub_research_note with the same sub_task_id. The deduplication
+    checks across the entire history to prevent duplicate notes from evicting distinct
+    legitimate ones when the last-5 truncation applies.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task, _make_finding
+
+    direction_id = "d-sub-research-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for sub-research replay"),
+        "research_history": [
+            {
+                "timestamp": _utcnow().isoformat(),
+                "task_id": "t-parent-task",
+                "tasks_created": 1,
+                "findings_produced": 1,
+                "filter_breakdown": {
+                    "hash_dedup": 0,
+                    "word_overlap_dedup": 0,
+                    "file_overlap_dedup": 0,
+                    "evidence_overlap_dedup": 0,
+                    "type_filtered": 0,
+                    "empty_prompt": 0,
+                },
+                "summary": "parent research cycle",
+            }
+        ],
+    }
+    project = _Project(
+        name="Sub-research replay test",
+        user_id="test-user-sub-research-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    parent_task = await _make_research_task(project, direction, db_session)
+    parent_task.context = {**(parent_task.context or {}), "direction_id": direction_id}
+    db_session.add(parent_task)
+    await db_session.commit()
+
+    child = _Task(
+        project_id=project.id,
+        title="Sub-research child task",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.QUEUED,
+        parent_task_id=parent_task.id,
+        created_by="ORCHESTRATOR",
+        context={"direction_id": direction_id},
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    finding = _make_finding("Test finding", direction_id=direction_id)
+
+    # First call to apply_post_spawn_state: adds sub_research_note to the history entry
+    await apply_post_spawn_state(
+        db_session,
+        parent_task,
+        [finding],
+        [child],
+        [(0, finding, "hash-123")],
+        [{"summary": "Test insight"}],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        1,  # research_depth = 1 (sub-research)
+        str(uuid.uuid4()),  # parent_research_task_id
+    )
+    await db_session.refresh(project)
+
+    # Verify first call added sub_research_notes
+    d = project.directions[0]
+    history = d.get("research_history", [])
+    assert len(history) >= 1, "History should have at least 1 entry"
+    last_entry = history[-1]
+    sub_notes_first = last_entry.get("sub_research_notes", [])
+    assert len(sub_notes_first) == 1, f"Expected 1 sub_research_note, got {len(sub_notes_first)}"
+
+    # Second call to apply_post_spawn_state: replay with same parent_task.id
+    # This simulates a retry scenario where the same findings are re-processed
+    await apply_post_spawn_state(
+        db_session,
+        parent_task,  # Same task ID
+        [finding],
+        [child],
+        [(0, finding, "hash-123")],
+        [{"summary": "Test insight"}],
+        [],
+        [],
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        "research-branch",
+        "main",
+        1,  # research_depth = 1 (same depth)
+        str(uuid.uuid4()),  # parent_research_task_id (different but same sub_task_id)
+    )
+    await db_session.refresh(project)
+
+    # Verify second call did NOT duplicate the note
+    d = project.directions[0]
+    history = d.get("research_history", [])
+    last_entry = history[-1]
+    sub_notes_second = last_entry.get("sub_research_notes", [])
+
+    # The key check: even on replay, the sub_research_note should only appear once
+    # (or if a new history entry was created, it shouldn't have duplicates)
+    subtask_ids = [note.get("sub_task_id") for note in sub_notes_second]
+    assert len(subtask_ids) == len(set(subtask_ids)), (
+        f"Sub_research_notes contain duplicate sub_task_ids: {subtask_ids}. "
+        "Replay must be idempotent."
+    )
