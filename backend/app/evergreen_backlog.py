@@ -812,13 +812,19 @@ async def spawn_evergreen_probe(
         idempotency_key=evergreen_fill_idempotency_key(project_id, item.id),
     )
     session.add(task)
+    # Snapshot item.id BEFORE the flush. The idempotency-race rollback below
+    # expires every session-bound ORM instance (rollback expires regardless of
+    # expire_on_commit=False), so reading item.id in the skip-log afterwards
+    # would fire a sync lazy-load inside the AsyncSession -> MissingGreenlet,
+    # propagating instead of the intended `return None`.
+    _item_id = item.id
     try:
         await session.flush()
     except IntegrityError:
         await session.rollback()
         logger.info(
             "[EVERGREEN] idempotency race spawning probe for item %s — skipping",
-            item.id,
+            _item_id,
         )
         return None
 

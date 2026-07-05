@@ -2459,6 +2459,12 @@ async def strategic_operation(
             idempotency_key=idem_key,
         )
         session.add(new_msg)
+        # Snapshot project.id before commit: the IntegrityError rollback below
+        # expires `project` (rollback expires regardless of expire_on_commit), so
+        # evaluating ProjectMessage.project_id == project.id in the coalesce
+        # re-query would fire a sync lazy-load -> MissingGreenlet, 500-ing the
+        # idempotency-coalesce path instead of returning the existing message.
+        _project_id = project.id
         try:
             await session.commit()
         except IntegrityError:
@@ -2467,7 +2473,7 @@ async def strategic_operation(
                 existing = (
                     await session.execute(
                         select(ProjectMessage).where(
-                            ProjectMessage.project_id == project.id,
+                            ProjectMessage.project_id == _project_id,
                             ProjectMessage.idempotency_key == idem_key,
                         )
                     )
@@ -2483,7 +2489,7 @@ async def strategic_operation(
             raise
         # Broadcast so the UI can update immediately instead of waiting for poll
         await broadcast_to_project(
-            str(project.id),
+            str(_project_id),
             "message_created",
             message_event_payload(new_msg),
         )
@@ -2548,6 +2554,10 @@ async def strategic_operation(
         await session.commit()
         message_id_str = str(msg.id)
         message_update_event = message_updated_event_payload(msg)
+        # Snapshot project.id too: the reply-post except below rolls back the
+        # session (expiring `project`), and the unconditional broadcast that
+        # follows reads project.id — a sync lazy-load there would MissingGreenlet.
+        _project_id_str = str(project.id)
         reply_msg: ProjectMessage | None = None
         if msg.message_type in (MessageType.QUESTION, MessageType.FEEDBACK):
             try:
@@ -2580,13 +2590,13 @@ async def strategic_operation(
                     exc_info=True,
                 )
         await broadcast_to_project(
-            str(project.id),
+            _project_id_str,
             "message_updated",
             message_update_event,
         )
         if reply_msg is not None:
             await broadcast_to_project(
-                str(project.id),
+                _project_id_str,
                 "message_created",
                 message_event_payload(reply_msg),
             )

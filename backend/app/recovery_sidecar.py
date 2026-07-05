@@ -242,32 +242,20 @@ async def _sweep_stranded_sidecar_sources() -> None:
             )
             terminal_sources = pending_result.scalars().all()
 
-            # Batch-load terminal-source sidecars to avoid N+1 queries.
-            _terminal_sidecar_uuids_to_fetch: list = []
-            for source in terminal_sources:
-                ctx = source.context or {}
-                marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
-                if not isinstance(marker, dict):
-                    continue
-                sidecar_ref = marker.get("sidecar_task_id")
-                try:
-                    _terminal_sidecar_uuids_to_fetch.append(
-                        _uuid.UUID(str(sidecar_ref))
-                    )
-                except (ValueError, TypeError):
-                    continue
-
-            terminal_sidecars_by_id: dict = {}
-            if _terminal_sidecar_uuids_to_fetch:
-                _terminal_sidecar_rows = await session.execute(
-                    select(Task).where(Task.id.in_(_terminal_sidecar_uuids_to_fetch))
-                )
-                terminal_sidecars_by_id = {
-                    s.id: s for s in _terminal_sidecar_rows.scalars().all()
-                }
-
-            retried = 0
-            cleared = 0
+            # Snapshot (source id, marker dict, side-car uuid) into plain values
+            # up front. A per-source resolution failure below calls
+            # session.rollback(), which expires EVERY session-bound ORM instance
+            # regardless of expire_on_commit=False; iterating the terminal_sources
+            # ORM objects after that would fire a sync lazy-load on source.context
+            # inside the AsyncSession -> MissingGreenlet, propagating to the outer
+            # handler and aborting the whole sweep. Plain locals never expire; the
+            # side-car ORM (which is passed to the resolver) is re-fetched fresh
+            # each iteration so it too is unexpired after any prior rollback. The
+            # `marker` dict was extracted from source.context before any rollback,
+            # so the reference we hold stays valid. (This supersedes the WI-1
+            # batch-load of sidecars, whose ORM rows the rollback would also
+            # expire; per-iteration session.get re-fetches inside the greenlet.)
+            _pending_sources: list = []
             for source in terminal_sources:
                 ctx = source.context or {}
                 marker = ctx.get(_SIDECAR_VERDICT_APPLICATION_PENDING_KEY)
@@ -278,7 +266,14 @@ async def _sweep_stranded_sidecar_sources() -> None:
                     sidecar_uuid = _uuid.UUID(str(sidecar_ref))
                 except (ValueError, TypeError):
                     continue
-                sidecar = terminal_sidecars_by_id.get(sidecar_uuid)
+                _pending_sources.append((source.id, marker, sidecar_uuid))
+
+            retried = 0
+            cleared = 0
+            for _source_id, marker, sidecar_uuid in _pending_sources:
+                sidecar = await session.get(
+                    Task, sidecar_uuid, populate_existing=True
+                )
                 if sidecar is None or sidecar.status not in {
                     TaskStatus.COMPLETED,
                     TaskStatus.FAILED,
@@ -288,7 +283,7 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 logger.warning(
                     "[SIDECAR-RECOVERY] Source %s has unapplied side-car verdict "
                     "(lane=%s sidecar=%s status=%s) — retrying application",
-                    source.id,
+                    _source_id,
                     marker.get("lane"),
                     sidecar.id,
                     sidecar.status,
@@ -296,11 +291,11 @@ async def _sweep_stranded_sidecar_sources() -> None:
                 # Capture ids as plain strings BEFORE resolution. The resolver's
                 # best-effort sub-op rollbacks (and the connection-drop path)
                 # expire every ORM instance even under expire_on_commit=False, so
-                # a post-failure ``source.id`` / ``sidecar.id`` read fires a sync
-                # expired-load inside the async session -> MissingGreenlet, which
-                # masks the real error AND aborts the rest of the batch.
+                # a post-failure ``sidecar.id`` read fires a sync expired-load
+                # inside the async session -> MissingGreenlet, which masks the
+                # real error AND aborts the rest of the batch.
                 _sidecar_id_str = str(sidecar.id)
-                _source_id_str = str(source.id)
+                _source_id_str = str(_source_id)
                 try:
                     await trigger_stranded_sidecar_resolution(sidecar, session)
                     retried += 1

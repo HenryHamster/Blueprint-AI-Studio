@@ -934,13 +934,18 @@ async def promote(
     #
     # The dedicated session has ONLY qualifier state dirty (concern 1), so this
     # commit can never prematurely commit a caller's unrelated transaction.
+    # Snapshot version_number before the pre-I/O commit: a commit failure below
+    # rolls back (expiring `version` regardless of expire_on_commit), and both the
+    # rollback-failure log and the failure-record re-lock would then read version
+    # state on an expired instance -> sync lazy-load -> MissingGreenlet.
+    _version_number = version.version_number
     try:
         await session.commit()
     except Exception as exc:  # noqa: BLE001 — a commit failure here is recoverable
         logger.warning(
             "[RELEASE_QUALIFIER] promote: failed to commit before releasing "
             "the row lock for v%d (%s) — recording failure",
-            version.version_number,
+            _version_number,
             exc,
         )
         try:
@@ -949,9 +954,21 @@ async def promote(
             logger.exception(
                 "[RELEASE_QUALIFIER] promote: rollback after pre-I/O commit "
                 "failure also failed for v%d",
-                version.version_number,
+                _version_number,
             )
         # The rollback released the lock — the failure record must re-lock.
+        # The rollback also expired `version`; re-materialise it so
+        # _record_promotion_failure -> _relock_version_for_promotion_write can
+        # read version.id (~687) without a sync lazy-load -> MissingGreenlet,
+        # which would defeat failure recording and stick the version at "pending".
+        try:
+            await session.refresh(version)
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] promote: refresh after rollback failed for "
+                "v%d — failure recording may re-raise",
+                _version_number,
+            )
         return await _record_promotion_failure(
             session,
             version,

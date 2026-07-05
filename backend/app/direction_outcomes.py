@@ -2498,6 +2498,13 @@ async def refresh_direction_outcomes_after_merge(
     ctx = task.context or {}
     direction_id = ctx.get("direction_id")
     research_task_id = ctx.get("research_task_id")
+    # Snapshot the task id for the best-effort failure logs below. Both blocks
+    # call session.rollback() on failure (expiring `task` regardless of
+    # expire_on_commit); a later getattr(task, "id") in the except handlers would
+    # fire a sync lazy-load -> MissingGreenlet (getattr's default does NOT swallow
+    # it — a lazy-load raises MissingGreenlet, not AttributeError), which would
+    # propagate out of merge finalization.
+    _task_id_str = str(task.id)
     # Direction outcome recompute requires both IDs; skip if either is absent.
     if direction_id and research_task_id:
         try:
@@ -2507,11 +2514,16 @@ async def refresh_direction_outcomes_after_merge(
         except Exception as exc:  # noqa: BLE001 — best-effort; must not break merge finalize
             logging.getLogger(__name__).warning(
                 "[DIRECTION] post-merge outcome refresh failed for task %s: %r",
-                getattr(task, "id", None),
+                _task_id_str,
                 exc,
             )
             with contextlib.suppress(Exception):
                 await session.rollback()
+                # rollback expired `task`; re-materialise it so the criterion
+                # evidence block below (which passes the live ORM task to
+                # record_task_merge_evidence) runs on a live instance instead of
+                # firing a sync lazy-load -> MissingGreenlet.
+                await session.refresh(task)
     # Criterion evidence is independent of the direction recompute — record for
     # any task that carries criterion_ids and a proven verdict.
     # Best-effort: a failure here must never break merge finalization.
@@ -2522,7 +2534,7 @@ async def refresh_direction_outcomes_after_merge(
     except Exception as exc:  # noqa: BLE001
         logging.getLogger(__name__).warning(
             "[DIRECTION] criterion evidence recording failed for task %s: %r",
-            getattr(task, "id", None),
+            _task_id_str,
             exc,
         )
         with contextlib.suppress(Exception):

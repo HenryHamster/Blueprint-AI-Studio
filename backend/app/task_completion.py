@@ -2431,6 +2431,11 @@ async def _persist_compute_experiment_knowledge_best_effort(
         # fallback write starts from a clean transaction.
         try:
             await session.rollback()
+            # rollback expired `task`; re-materialise it so the fallback
+            # breadcrumb read+write below runs on a live instance instead of
+            # firing a sync lazy-load -> MissingGreenlet (swallowed by the
+            # except, silently dropping the {"persisted": False} breadcrumb).
+            await session.refresh(task)
             plan_output = dict(task.plan_output or {})
             plan_output["knowledge_document"] = {"persisted": False}
             task.plan_output = plan_output
@@ -2664,6 +2669,11 @@ async def run_compute_wake_post_commit(session: AsyncSession, registration) -> b
         # retried every cycle, which would starve newer marked rows.
         with contextlib.suppress(Exception):
             await session.rollback()
+            # rollback expired `registration`; re-materialise it so the backoff
+            # read/schedule below runs on a live instance instead of firing a
+            # sync lazy-load -> MissingGreenlet (swallowed by the suppress,
+            # silently skipping the anti-starvation backoff).
+            await session.refresh(registration)
             marker = dict(registration.source_metadata or {})
             marker_meta = dict(marker.get(_COMPUTE_WAKE_POST_COMMIT_META_KEY) or {})
             attempts = int(marker_meta.get("attempts", 0) or 0)

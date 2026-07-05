@@ -1444,7 +1444,18 @@ async def sweep_stranded_lanes(session, now: datetime, *, runtime_config) -> int
             session.expunge(t)
             tasks_by_id[t.id] = t
 
-    for lane in active_lanes:
+    # The batch-fetch above expunges the bound *tasks* so a per-lane rollback
+    # cannot expire them, but the ``active_lanes`` ORM rows themselves are still
+    # session-bound and would be expired by that same rollback. Re-fetch each
+    # lane fresh by id so reading lane.current_task_id / lane.id below never
+    # fires a sync lazy-load inside the AsyncSession -> MissingGreenlet, which
+    # would abort the whole stranded-lane sweep uncaught. populate_existing
+    # forces the reload inside the async greenlet and reflects committed state.
+    active_lane_ids = [lane.id for lane in active_lanes]
+    for lane_id in active_lane_ids:
+        lane = await session.get(ImprovementLane, lane_id, populate_existing=True)
+        if lane is None or lane.status != ImprovementLaneStatus.ACTIVE.value:
+            continue
         task = None
         stranded = False
         if lane.current_task_id is None:

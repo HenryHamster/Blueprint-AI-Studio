@@ -979,6 +979,12 @@ async def bulk_action_tasks(
     # window. approve/cancel still use the shared session — they don't call
     # _requeue_parent_task and their per-task commits already release locks
     # immediately.
+    # A per-item rollback (in the except handlers below) expires EVERY ORM object
+    # in `fetched` / `_cancel_children_by_parent` regardless of expire_on_commit;
+    # once that happens, subsequent iterations must re-fetch fresh or their reads
+    # fire a sync lazy-load -> MissingGreenlet (caught, but it cascades every
+    # remaining item to a spurious "error"). `_batch_dirty` flips on first rollback.
+    _batch_dirty = False
     for raw_id in body.task_ids:
         if raw_id not in valid_map:
             continue  # already reported as invalid
@@ -988,6 +994,17 @@ async def bulk_action_tasks(
                 {"task_id": raw_id, "status": "error", "error": "Task not found"}
             )
             continue
+        if _batch_dirty:
+            # Re-fetch this task fresh (populate_existing overwrites the expired
+            # instance) so the reads/mutations below run inside the async greenlet.
+            task = await session.get(
+                Task, valid_map[raw_id], populate_existing=True
+            )
+            if task is None:
+                results.append(
+                    {"task_id": raw_id, "status": "error", "error": "Task not found"}
+                )
+                continue
 
         try:
             if body.action == "retry":
@@ -1080,8 +1097,24 @@ async def bulk_action_tasks(
                     )
                     continue
 
-                # Use pre-fetched children (batch query before loop, no N+1)
-                active_children = _cancel_children_by_parent.get(task.id, [])
+                # Use pre-fetched children (batch query before loop, no N+1).
+                # If a prior item rolled back, the prefetch is expired — re-fetch
+                # this parent's active children fresh to avoid MissingGreenlet.
+                if _batch_dirty:
+                    active_children = list(
+                        (
+                            await session.execute(
+                                select(Task).where(
+                                    Task.parent_task_id == task.id,
+                                    Task.status.in_(CANCEL_CASCADE_CHILD_STATUSES),
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                else:
+                    active_children = _cancel_children_by_parent.get(task.id, [])
 
                 # Save VM and account info before any commit so we can access
                 # them after session.commit() expires ORM object attributes.
@@ -1172,9 +1205,11 @@ async def bulk_action_tasks(
             results.append({"task_id": raw_id, "status": "ok"})
         except HTTPException as e:
             await session.rollback()
+            _batch_dirty = True  # rollback expired the prefetched batch
             results.append({"task_id": raw_id, "status": "error", "error": e.detail})
         except Exception as e:
             await session.rollback()
+            _batch_dirty = True  # rollback expired the prefetched batch
             logger.error(
                 f"[ADMIN] Bulk action {body.action} failed for task {raw_id}: {e}",
                 exc_info=True,

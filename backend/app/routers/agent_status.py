@@ -1419,13 +1419,18 @@ async def update_agent_status(
                 persist_task_pr_linkage(
                     task, pr_number=parse_pr_number_from_url(payload.pr_url)
                 )
+                # Snapshot task.id before the flush: the dedup-race rollback
+                # below expires `task`, so reading task.id in the log would fire
+                # a sync lazy-load -> MissingGreenlet, 500-ing the status POST
+                # instead of returning the accepted-dedup-race response.
+                _dedup_race_task_id = task.id
                 try:
                     await session.flush()  # surface IntegrityError now, not at commit
                 except IntegrityError as ie:
                     # Concurrent peer beat us to it — partial UNIQUE caught the race.
                     await session.rollback()
                     logger.info(
-                        f"[STATUS] Task {task.id} PR artifact race lost (peer inserted first); "
+                        f"[STATUS] Task {_dedup_race_task_id} PR artifact race lost (peer inserted first); "
                         f"continuing with peer's row: {ie}"
                     )
                     return {"status": "accepted_dedup_race"}
@@ -1584,6 +1589,11 @@ async def update_agent_status(
                 # No-op if the account wasn't probing anything for this model.
                 acct_id_clear = get_task_llm_account_id(task)
                 model_clear = _extract_task_model(task)
+                # Snapshot vm_provisioned_at now: the regression-recovery except
+                # below may session.rollback() (expiring `task`), and the
+                # completion-event duration read further down would then fire a
+                # sync lazy-load -> MissingGreenlet on task.vm_provisioned_at.
+                _vm_provisioned_at = task.vm_provisioned_at
                 if acct_id_clear and model_clear:
                     try:
                         await clear_rate_limit_state_on_success(
@@ -1646,10 +1656,10 @@ async def update_agent_status(
                         # at ~1979 as an opaque PendingRollbackError.
                         with contextlib.suppress(Exception):
                             await session.rollback()
-                if acct_id_clear and task.vm_provisioned_at:
+                if acct_id_clear and _vm_provisioned_at:
                     try:
                         duration_secs = (
-                            _utcnow() - task.vm_provisioned_at
+                            _utcnow() - _vm_provisioned_at
                         ).total_seconds()
                         await record_completion_event(acct_id_clear, duration_secs)
                     except Exception as e:
@@ -1972,6 +1982,12 @@ async def update_agent_status(
                                         # breaker alert path).
                                         with contextlib.suppress(Exception):
                                             await session.rollback()
+                                            # rollback expired `task`; re-materialise it so
+                                            # the shared terminal path below
+                                            # (get_task_llm_account_id(task), task.context)
+                                            # runs on a live instance rather than
+                                            # firing a sync lazy-load -> MissingGreenlet.
+                                            await session.refresh(task)
                         else:
                             # Transient infrastructure outage: retry with exponential backoff.
                             # Budget is 5 retries (up from 3) to survive longer outages.
@@ -2248,6 +2264,11 @@ async def update_agent_status(
                                 )
                                 with contextlib.suppress(Exception):
                                     await session.rollback()
+                                    # rollback expired `task`; re-materialise it so
+                                    # the blacklist/requeue reads + mutations below
+                                    # (task.context, task.vm_instance_id, commit) run
+                                    # on a live instance instead of MissingGreenlet.
+                                    await session.refresh(task)
 
                     # Blacklist the disabled account so this task's next attempt
                     # picks a different account.
@@ -3530,6 +3551,10 @@ async def update_agent_status(
                     # was named in the leak categories at lines ~1951-1962.
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                        # rollback expired `task`; re-materialise it so
+                        # _propagate_pipeline_failure_to_original(task) below can
+                        # read task.first_payload without MissingGreenlet.
+                        await session.refresh(task)
 
             # CLOSED → OPEN after 5 consecutive infra failures (wall of provisioning/rate-limit)
             elif (
@@ -3576,6 +3601,10 @@ async def update_agent_status(
                     # surface the upstream poisoning as PendingRollbackError.
                     with contextlib.suppress(Exception):
                         await session.rollback()
+                        # rollback expired `task`; re-materialise it so
+                        # _propagate_pipeline_failure_to_original(task) below can
+                        # read task.first_payload without MissingGreenlet.
+                        await session.refresh(task)
             # Persist breaker state on any transition
             if (
                 breaker["state"] != "CLOSED"

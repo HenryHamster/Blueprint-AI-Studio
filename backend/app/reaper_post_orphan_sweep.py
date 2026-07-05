@@ -72,6 +72,14 @@ async def run_post_orphan_sweep(
         )
         post_reap_tasks = list(_rows.scalars().all())
 
+    # Snapshot ids now (fresh objects). Both post-commit loops below re-fetch
+    # each task by id because the internal rollbacks (97 deferred-requeue, 142
+    # rollup-check) expire EVERY post_reap_tasks ORM object regardless of
+    # expire_on_commit; a raw task.status read on an expired instance would fire
+    # a sync lazy-load inside the AsyncSession -> MissingGreenlet and abort the
+    # sweep uncaught.
+    post_reap_task_ids = [t.id for t in post_reap_tasks]
+
     # Audit A8: now that the orphan-row lock is released, do the
     # slow parent-requeue work (child clone + dep remap). Heartbeats
     # on the parent task will go through fine since we only set
@@ -110,9 +118,15 @@ async def run_post_orphan_sweep(
         await _ensure_vm_deleted(old_vm, reason="reaper")
 
     # Trigger rollup checks for failed tasks with parents (after commit)
-    for task in post_reap_tasks:
+    for _post_reap_task_id in post_reap_task_ids:
         # Heartbeat: _check_and_trigger_rollup hits GitHub per task.
         progress_cb()
+        # Re-fetch fresh each iteration: the deferred-requeue rollback (97) and a
+        # prior iteration's rollup-check rollback (142) both expire the batch, so
+        # reading task.status/.parent_task_id on a stale object would MissingGreenlet.
+        task = await session.get(Task, _post_reap_task_id, populate_existing=True)
+        if task is None:
+            continue
         if task.status == TaskStatus.FAILED and task.parent_task_id:
             try:
                 # C3: pass the heartbeat so the per-child
@@ -142,9 +156,14 @@ async def run_post_orphan_sweep(
                     await session.rollback()
 
     # Immediately unblock dependents of terminally failed tasks
-    for task in post_reap_tasks:
+    for _post_reap_task_id in post_reap_task_ids:
         # Heartbeat: per-task dependent-unblock opens its own session.
         progress_cb()
+        # Re-fetch fresh: loop-1's rollup-check rollback (142) expired the batch;
+        # a raw task.status read here would otherwise MissingGreenlet.
+        task = await session.get(Task, _post_reap_task_id, populate_existing=True)
+        if task is None:
+            continue
         if task.status == TaskStatus.FAILED:
             try:
                 async with AsyncSessionLocal() as dep_session:

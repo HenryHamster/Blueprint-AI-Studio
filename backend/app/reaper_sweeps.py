@@ -814,9 +814,17 @@ async def sweep_stale_staged_directions(session) -> int:
         return 0
 
     # Group staged rows by project so each project reads its open version once.
+    # Snapshot the fields we read (the ``data`` blob + ``direction_key``) into
+    # plain values NOW. A per-project failure below calls session.rollback()
+    # (rollback expires every Direction row regardless of expire_on_commit), and
+    # a later row.data / row.direction_key read on an expired row would fire a
+    # sync lazy-load inside the AsyncSession -> MissingGreenlet, spuriously
+    # skipping every subsequent project's staged rows. Plain locals never expire.
     by_project: dict = {}
     for r in rows:
-        by_project.setdefault(r.project_id, []).append(r)
+        by_project.setdefault(r.project_id, []).append(
+            (dict(r.data or {}), r.direction_key)
+        )
 
     now = _utcnow()
     total_alerts = 0
@@ -824,8 +832,7 @@ async def sweep_stale_staged_directions(session) -> int:
         try:
             open_version = await current_open_version(session, pid)
             open_n = open_version.version_number if open_version else None
-            for row in staged_rows:
-                d = row.data or {}
+            for d, row_direction_key in staged_rows:
                 target = d.get("staged_for_version")
                 try:
                     target_n = int(target)
@@ -859,7 +866,7 @@ async def sweep_stale_staged_directions(session) -> int:
                 created = await _maybe_create_stale_staged_direction_alert(
                     session,
                     pid,
-                    direction_id=str(d.get("id") or row.direction_key),
+                    direction_id=str(d.get("id") or row_direction_key),
                     direction_text=d.get("text"),
                     waited_days=waited_days,
                     staged_for_version=target_n,

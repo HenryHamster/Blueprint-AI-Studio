@@ -211,6 +211,11 @@ async def trigger_self_audit(
         idempotency_key=idempotency_key,
     )
     session.add(new_task)
+    # Snapshot project.id before commit: the IntegrityError rollback below
+    # expires `project` (rollback expires regardless of expire_on_commit), so
+    # reading project.id in the coalesce log/return would fire a sync lazy-load
+    # -> MissingGreenlet, 500-ing instead of coalescing onto the in-flight audit.
+    _project_id = project.id
     try:
         await session.commit()
     except IntegrityError:
@@ -236,12 +241,12 @@ async def trigger_self_audit(
                 detail="Self-audit is already in progress for this project.",
             )
         logger.info(
-            f"[ADMIN] Concurrent self-audit trigger for project {project.id} "
+            f"[ADMIN] Concurrent self-audit trigger for project {_project_id} "
             f"coalesced onto existing audit {existing.id}"
         )
         return {
             "task_id": str(existing.id),
-            "project_id": str(project.id),
+            "project_id": str(_project_id),
             "status": existing.status,
         }
     await session.refresh(new_task)
