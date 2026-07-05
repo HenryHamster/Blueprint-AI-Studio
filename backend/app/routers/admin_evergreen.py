@@ -192,3 +192,20 @@ async def get_structural_health(
     from app.structural_health_audit import get_structural_health_observability
 
     return get_structural_health_observability()
+
+
+@router.get("/metrics-integrity-observability")
+async def get_metrics_integrity(
+    current_user: dict = Depends(require_admin),
+) -> Dict[str, Any]:
+    """Bounded in-memory metrics-integrity sweep recent-results snapshot.
+
+    Surfaces the standing self-audit's view: recent ticks, the most-recent tick's
+    flags, and lifetime counters (flags/errors/enrolled). The sweep recomputes
+    selected self-reported counters from ground truth and flags drift WITHOUT
+    mutating the audited source; enforce-mode drift findings flow into the same
+    evergreen ledger surfaced by the backlog endpoints above.
+    """
+    from app.metrics_integrity_sweep import get_metrics_integrity_observability
+
+    return get_metrics_integrity_observability()

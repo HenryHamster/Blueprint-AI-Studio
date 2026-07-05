@@ -292,6 +292,7 @@ from app.reaper_sweeps import (
     sweep_deliver_task_wakes,
     sweep_wake_delivery_stall_alerts,
     sweep_orphaned_cross_base_children,
+    sweep_metrics_integrity,
     sweep_closed_handmerge_prs,
     _sweep_strategic_cycle_starvation,
 )
@@ -2711,6 +2712,25 @@ async def reaper_service():
                 except Exception as e:
                     logger.error(
                         f"[REAPER] Structural-health audit sweep error: {e}",
+                        exc_info=True,
+                    )
+                    with contextlib.suppress(Exception):
+                        await session.rollback()
+
+                # Step 16c: Metrics-integrity sweep — recurring leader-only self-audit
+                # that recomputes selected self-reported counters (landed-vs-reported
+                # merges, playbook confirmation integrity, non-code outcome window
+                # accounting) from ground truth and FLAGS drift WITHOUT mutating the
+                # audited source counter. Bounded per check; each check isolated.
+                # Mode- and cadence-gated; INERT in observe (records to observability)
+                # until an operator flips metrics_integrity_sweep_mode to enforce.
+                # Wrapped so it can never crash the cycle.
+                _mark_reaper_progress()
+                try:
+                    await sweep_metrics_integrity(session, now)
+                except Exception as e:
+                    logger.error(
+                        f"[REAPER] Metrics-integrity sweep error: {e}",
                         exc_info=True,
                     )
                     with contextlib.suppress(Exception):

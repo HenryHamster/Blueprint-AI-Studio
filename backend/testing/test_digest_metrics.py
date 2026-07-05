@@ -2380,6 +2380,37 @@ def test_compute_non_code_outcomes_empty_when_no_qualifying_tasks():
     assert _compute_non_code_outcomes([inflight], window_start) == {}
 
 
+def test_compute_non_code_outcomes_includes_window_straddling_terminal_task():
+    """Task created before window but completed within window is included.
+
+    A task created before window_start but whose terminal status transition
+    (completion/failure/cancellation) occurs within the window should be counted
+    in non-code outcomes. This ensures we measure the actual delivery of outcomes
+    within a time period, not the spawn time.
+    """
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Created well before the window
+    created_before_window = window_start - timedelta(hours=12)
+    # But completed within the window
+    completed_in_window = window_start + timedelta(hours=1)
+
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Investigate", "actionability_grade": "HIGH"}],
+        created_at=created_before_window,
+        status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
+    )
+
+    result = _compute_non_code_outcomes([task], window_start)
+    # Task should be included because it completed within the window.
+    assert result["total"] == 1
+    assert result["successes"] == 1
+    assert result["neutrals"] == 0
+    assert result["failures"] == 0
+
+
 class TestComputeRetryAnalytics:
     """Unit tests for the extracted compute_retry_analytics helper."""
 

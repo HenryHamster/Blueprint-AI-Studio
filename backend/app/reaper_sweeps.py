@@ -535,6 +535,21 @@ async def sweep_regression_scan(session) -> int:
     return await _run_regression_scan_and_notify(session)
 
 
+async def sweep_metrics_integrity(session, now=None) -> dict | None:
+    """Standing metrics-integrity sweep seam — recompute selected self-reported
+    counters from ground truth and FLAG drift without mutating the source.
+
+    Thin delegator to :func:`app.metrics_integrity_sweep.run_metrics_integrity_sweep`
+    so the sweep lives beside the other reaper housekeeping sweeps. Mode- and
+    cadence-gated inside the callee; returns the tick summary dict, or ``None``
+    when gated out (mode off / cadence not due). The reaper wraps this call in
+    its own try/except+rollback, so a raised error can never crash the cycle.
+    """
+    from app.metrics_integrity_sweep import run_metrics_integrity_sweep
+
+    return await run_metrics_integrity_sweep(session, now)
+
+
 async def sweep_stuck_qualifications(session, *, session_factory) -> int:
     """Step 9: Finalize release qualifications stuck 'pending'.
 

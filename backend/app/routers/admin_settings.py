@@ -108,6 +108,12 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "structural_health_audit_mode",
         "structural_health_audit_interval_minutes",
         "structural_health_audit_fat_row_bytes",
+        "metrics_integrity_sweep_mode",
+        "metrics_integrity_sweep_interval_minutes",
+        "metrics_integrity_sweep_max_checks",
+        "metrics_integrity_sweep_max_projects",
+        "metrics_integrity_sweep_sample_limit",
+        "metrics_integrity_sweep_window_days",
         "completion_debt_weight_mode",
         "category_routing",
         "ci_backstop_timeout_minutes",
@@ -385,6 +391,24 @@ async def get_settings(
         ),
         "structural_health_audit_fat_row_bytes": int(
             _runtime_config.get("structural_health_audit_fat_row_bytes", 1048576)
+        ),
+        "metrics_integrity_sweep_mode": str(
+            _runtime_config.get("metrics_integrity_sweep_mode", "observe")
+        ),
+        "metrics_integrity_sweep_interval_minutes": int(
+            _runtime_config.get("metrics_integrity_sweep_interval_minutes", 60)
+        ),
+        "metrics_integrity_sweep_max_checks": int(
+            _runtime_config.get("metrics_integrity_sweep_max_checks", 25)
+        ),
+        "metrics_integrity_sweep_max_projects": int(
+            _runtime_config.get("metrics_integrity_sweep_max_projects", 25)
+        ),
+        "metrics_integrity_sweep_sample_limit": int(
+            _runtime_config.get("metrics_integrity_sweep_sample_limit", 200)
+        ),
+        "metrics_integrity_sweep_window_days": int(
+            _runtime_config.get("metrics_integrity_sweep_window_days", 14)
         ),
         "completion_debt_weight_mode": str(
             _runtime_config.get("completion_debt_weight_mode", "observe")
@@ -1015,6 +1039,37 @@ async def _apply_settings(
                 detail="structural_health_audit_fat_row_bytes must be between 1024 and 1073741824",
             )
         _runtime_config["structural_health_audit_fat_row_bytes"] = val
+    if "metrics_integrity_sweep_mode" in payload:
+        val = str(payload["metrics_integrity_sweep_mode"] or "").strip().lower()
+        if val not in ("off", "observe", "enforce"):
+            raise HTTPException(
+                status_code=400,
+                detail="metrics_integrity_sweep_mode must be one of: off, observe, enforce",
+            )
+        _runtime_config["metrics_integrity_sweep_mode"] = val
+        if val == "enforce":
+            _debt_keys_to_resolve.append("dormant_knob:metrics_integrity_sweep_mode")
+    for _mi_key, _mi_lo, _mi_hi in (
+        ("metrics_integrity_sweep_interval_minutes", 1, 1440),
+        ("metrics_integrity_sweep_max_checks", 1, 1000),
+        ("metrics_integrity_sweep_max_projects", 1, 10000),
+        ("metrics_integrity_sweep_sample_limit", 1, 100000),
+        ("metrics_integrity_sweep_window_days", 1, 365),
+    ):
+        if _mi_key in payload:
+            try:
+                val = int(payload[_mi_key])
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_mi_key} must be a number",
+                )
+            if not (_mi_lo <= val <= _mi_hi):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{_mi_key} must be between {_mi_lo} and {_mi_hi}",
+                )
+            _runtime_config[_mi_key] = val
     if "evaluating_pipeline_timeout_minutes" in payload:
         try:
             val = int(payload["evaluating_pipeline_timeout_minutes"])

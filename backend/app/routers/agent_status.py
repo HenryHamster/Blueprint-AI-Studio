@@ -3197,12 +3197,15 @@ async def update_agent_status(
                                                 continue
                                         elif _task_type not in _PLAYBOOK_DEFAULT_TYPES:
                                             continue
+                                        # Only credit entries that were actually shown to this task
+                                        if _pk not in _shown_keys:
+                                            continue
                                         _entry = dict(_pv)
                                         _entry["confirmed_count"] = (
                                             _entry.get("confirmed_count", 0) + 1
                                         )
                                         _entry["last_confirmed_at"] = _now_iso
-                                        # Update rolling recent_outcomes only for entries shown to this task
+                                        # Update rolling recent_outcomes for entries shown to this task
                                         if _pk in _shown_keys:
                                             _recent = list(
                                                 _entry.get("recent_outcomes", [])

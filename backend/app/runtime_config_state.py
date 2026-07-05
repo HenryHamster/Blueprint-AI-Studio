@@ -151,6 +151,41 @@ runtime_config: Dict = {
     "structural_health_audit_fat_row_bytes": int(
         os.getenv("STRUCTURAL_HEALTH_AUDIT_FAT_ROW_BYTES", "1048576")
     ),
+    # --- Metrics-integrity sweep lane (standing self-audit of counters) ---
+    # Recurring leader-only reaper sweep that recomputes selected self-reported
+    # counters (landed-vs-reported merges, playbook confirmation integrity,
+    # non-code outcome window accounting) from ground truth and FLAGS drift
+    # WITHOUT ever mutating the audited source counter. Mode mirrors
+    # structural_health_audit_mode exactly:
+    #   off     — never run.
+    #   observe — recompute + record to the in-memory observability ring (default).
+    #   enforce — additionally enroll a deduped evergreen finding per flagged drift.
+    "metrics_integrity_sweep_mode": os.getenv(
+        "METRICS_INTEGRITY_SWEEP_MODE", "observe"
+    ).lower()
+    if os.getenv("METRICS_INTEGRITY_SWEEP_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
+    # Cadence (minutes) between metrics-integrity sweeps in the reaper loop.
+    "metrics_integrity_sweep_interval_minutes": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_INTERVAL_MINUTES", "60")
+    ),
+    # Max registered checks run per tick (backstop against an over-grown registry).
+    "metrics_integrity_sweep_max_checks": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_CHECKS", "25")
+    ),
+    # Max projects scanned per per-project check (bounds the scan fan-out).
+    "metrics_integrity_sweep_max_projects": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_MAX_PROJECTS", "25")
+    ),
+    # Max rows sampled per DB-backed check (bounds the recompute cost).
+    "metrics_integrity_sweep_sample_limit": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_SAMPLE_LIMIT", "200")
+    ),
+    # How far back (days) a windowed check recomputes ground truth.
+    "metrics_integrity_sweep_window_days": int(
+        os.getenv("METRICS_INTEGRITY_SWEEP_WINDOW_DAYS", "14")
+    ),
     # --- Completion-debt pressure signal graduation gate ---
     # Operator-facing graduation knob for blending the qualification debt-pressure
     # signal into the promotion composite (release_qualifier._load_policy →
@@ -1136,6 +1171,9 @@ _DORMANT_MODE_KNOBS = {
     "structural_health_audit_mode": (
         "Structural-health audit measuring but not enrolling findings"
     ),
+    "metrics_integrity_sweep_mode": (
+        "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
+    ),
     "safeguard_challenge_gate_mode": (
         "Safeguard challenge gate in observe-only shadow mode"
     ),
@@ -1681,6 +1719,32 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                         )
                     except (TypeError, ValueError):
                         pass
+                # Metrics-integrity sweep: mode + bounded numeric knobs. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances (mirrors the structural-health
+                # audit knobs above).
+                if "metrics_integrity_sweep_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["metrics_integrity_sweep_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("metrics_integrity_sweep_mode", raw_mode)
+                for _mi_int_key in (
+                    "metrics_integrity_sweep_interval_minutes",
+                    "metrics_integrity_sweep_max_checks",
+                    "metrics_integrity_sweep_max_projects",
+                    "metrics_integrity_sweep_sample_limit",
+                    "metrics_integrity_sweep_window_days",
+                ):
+                    if _mi_int_key in config_json:
+                        try:
+                            _mi_val = int(config_json[_mi_int_key])
+                            if _mi_val > 0:
+                                _set(_mi_int_key, _mi_val)
+                        except (TypeError, ValueError):
+                            pass
                 # Resident strategic session (dead-man's-switch safety + resident
                 # agent). Persisted so an operator enable/tune survives a Cloud Run
                 # restart and reaches the leader across instances; without these the

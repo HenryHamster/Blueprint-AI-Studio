@@ -12180,7 +12180,8 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
 ):
     """
     When a task completes on first attempt and the project has playbook entries,
-    confirmed_count is incremented for entries applicable to that task type.
+    confirmed_count is incremented ONLY for entries actually shown to that task
+    (via _shown_playbook_keys). Type-matching entries not shown are not credited.
     Entries not applicable to the task type are NOT incremented.
     """
     mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
@@ -12193,6 +12194,13 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
             "source_task_id": None,
             "updated_at": "2026-01-01T00:00:00",
             "confirmed_count": 2,
+        },
+        "playbook/create-unshown": {
+            "content": "create guidance but not shown",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 5,
         },
         "playbook/review-only": {
             "content": "review guidance",
@@ -12212,6 +12220,7 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
         vm_instance_id="agent-vm-confirm-1",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
+        context={"_shown_playbook_keys": ["create-entry"]},
     )
     db_session.add(task)
     await db_session.commit()
@@ -12226,8 +12235,10 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
     assert resp.status_code == 200
 
     await db_session.refresh(project)
-    # create-entry is applicable to 'create' tasks — confirmed_count should be incremented
+    # create-entry was shown — confirmed_count should be incremented
     assert project.design_doc["playbook/create-entry"]["confirmed_count"] == 3
+    # create-unshown is type-applicable but NOT in _shown_playbook_keys — must not be credited
+    assert project.design_doc["playbook/create-unshown"]["confirmed_count"] == 5
     # review-only is NOT applicable to 'create' tasks — confirmed_count unchanged
     assert project.design_doc["playbook/review-only"]["confirmed_count"] == 0
 
@@ -12277,6 +12288,97 @@ async def test_playbook_confirmed_count_not_incremented_on_retry_success(
     await db_session.refresh(project)
     # attempt_count=2 → _first_attempt_succeeded=False → confirmed_count unchanged
     assert project.design_doc["playbook/some-entry"]["confirmed_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_playbook_integrity_ignores_unshown_confirmations_and_dedupes_tombstones(
+    client: AsyncClient, db_session, mocker
+):
+    """
+    Acceptance: playbook integrity accounting is tight on two axes:
+
+    1. confirmed_count credits ONLY entries present in _shown_playbook_keys — a
+       type-applicable entry that was NOT shown must remain at its prior count.
+    2. Operator-deletion tombstones are idempotent: calling record_playbook_tombstone
+       twice for the same key produces exactly one operator_deleted archive row and
+       one deleted_keys entry.
+    """
+    from app.playbook_storage import record_playbook_tombstone
+
+    # ── Part 1: shown-key gate on confirmed_count ──────────────────────────
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    project = Project(
+        name="Playbook Integrity Test", user_id="test-user-integrity"
+    )
+    project.design_doc = {
+        "playbook/shown-entry": {
+            "content": "shown guidance",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 1,
+        },
+        "playbook/unshown-entry": {
+            "content": "unshown guidance",
+            "applicable_types": ["create"],
+            "source_task_id": None,
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": 3,
+        },
+    }
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "integrity check"}],
+        vm_instance_id="agent-vm-integrity-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,
+        context={"_shown_playbook_keys": ["shown-entry"]},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-integrity-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200
+
+    await db_session.refresh(project)
+    # shown-entry was in _shown_playbook_keys — must be credited
+    assert project.design_doc["playbook/shown-entry"]["confirmed_count"] == 2, (
+        "shown entry must be credited on first-attempt success"
+    )
+    # unshown-entry is type-applicable but NOT shown — must NOT be credited
+    assert project.design_doc["playbook/unshown-entry"]["confirmed_count"] == 3, (
+        "unshown type-applicable entry must not receive confirmation credit"
+    )
+
+    # ── Part 2: idempotent tombstone deduplication ─────────────────────────
+    doc: dict = {}
+    from app.time_utils import _utcnow  # noqa: PLC0415
+
+    now_iso = _utcnow().isoformat()
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+    record_playbook_tombstone(doc, "playbook/tip", archived_at=now_iso)
+
+    deleted_keys = doc["playbook_deleted_keys"]
+    assert deleted_keys == ["playbook/tip"], (
+        "deleted_keys must list 'playbook/tip' exactly once"
+    )
+    archive = doc["playbook_archive"]
+    assert len(archive) == 1, (
+        f"idempotent tombstone must produce exactly 1 archive row, got {len(archive)}"
+    )
+    assert archive[0]["_retirement_reason"] == "operator_deleted"
+    assert archive[0]["_archived_key"] == "playbook/tip"
 
 
 @pytest.mark.asyncio

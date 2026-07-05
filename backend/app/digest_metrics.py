@@ -1284,9 +1284,13 @@ def _compute_non_code_outcomes(
 
     Uses evaluate_task_outcome so each task type contributes its own honest
     success signal rather than appearing as a zero-output in the PR-based view.
+    Window is determined by terminal/completion time, not created_at: a task
+    created before the window but completed within it is included; a task created
+    within the window but completed before it is excluded.
     Returns an empty dict when no qualifying tasks exist in the window.
     """
     from app.task_outcomes import evaluate_task_outcome  # noqa: PLC0415
+    from app.routers.admin_analytics import _derive_completed_at
 
     success = 0
     neutral = 0
@@ -1305,7 +1309,8 @@ def _compute_non_code_outcomes(
             continue
         if isinstance((t.context or {}).get("review_loop"), dict):
             continue
-        if t.created_at is not None and t.created_at < window_start:
+        completed_at = _derive_completed_at(t)
+        if completed_at < window_start:
             continue
         outcome = evaluate_task_outcome(t)
         kind = outcome.kind
