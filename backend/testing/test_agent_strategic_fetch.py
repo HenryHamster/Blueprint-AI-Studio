@@ -4694,9 +4694,16 @@ def test_recoverable_sections_carry_actionable_fetch_verbs():
     )
 
     # Verify the sync (non-async) builder functions for non-cycle-history sections
-    # return a valid (non-None) result against a bare project.  This exercises the
-    # actual production code path at the sync level — the async endpoint wraps these
-    # calls verbatim.
+    # produce their structured output. This exercises the actual production code
+    # path at the sync level — the async endpoint wraps these calls verbatim.
+    #
+    # NOTE: the anomaly/playbook builders are *documented* to return None when
+    # nothing qualifies (so the packer omits the key), and the endpoint handles a
+    # None ``data`` fine. A bare project therefore yields None for them — which is
+    # correct, not a missing dispatch branch. To prove each dispatch branch exists
+    # and produces real structured output, seed the project (and the shared
+    # anomaly state the anomaly builder reads) with qualifying data.
+    from app import anomaly_state
     from app.strategic_spawning import (
         _build_anomaly_summary,
         _build_playbook_summary,
@@ -4709,23 +4716,51 @@ def test_recoverable_sections_carry_actionable_fetch_verbs():
         name="fetch-verb-test",
         user_id="test-user-fvt",
         self_reflection_log=[{"entry": "test", "created_at": "2026-01-01T00:00:00"}],
+        design_doc={
+            # Strategy-relevant playbook entry (source in the strategic sources and
+            # content mentioning a strategic keyword) so _build_playbook_summary
+            # includes it instead of returning None.
+            "playbook/recurring-failure": {
+                "content": "Recurring failure pattern: auto-pause the direction.",
+                "source": "auto-generated",
+                "confirmed_count": 3,
+                "updated_at": "2026-01-02T00:00:00",
+            },
+        },
     )
 
     # self_reflection_log: direct attribute access in the handler
     result = project.self_reflection_log or []
     assert result is not None, "self_reflection_log builder must return non-None"
 
-    # anomaly_summary
-    result = _build_anomaly_summary(project)
-    assert result is not None, "anomaly_summary builder must return non-None"
+    # anomaly_summary reads the in-memory persistent_anomalies keyed by project id;
+    # seed one high-occurrence entry so the builder emits its structured summary.
+    anomaly_key = str(project.id)
+    anomaly_state.persistent_anomalies[anomaly_key] = {
+        "CODE_ERROR": {
+            "occurrence_count": 3,
+            "severity": "high",
+            "first_seen": "2026-01-01T00:00:00",
+            "last_seen": "2026-01-02T00:00:00",
+            "direction_id": "dir-1",
+        }
+    }
+    try:
+        # anomaly_summary
+        result = _build_anomaly_summary(project)
+        assert result is not None, "anomaly_summary builder must return non-None"
+        assert "recurring_anomalies" in result
 
-    # playbook_summary
-    result = _build_playbook_summary(project)
-    assert result is not None, "playbook_summary builder must return non-None"
+        # playbook_summary
+        result = _build_playbook_summary(project)
+        assert result is not None, "playbook_summary builder must return non-None"
+        assert result["entries"], "playbook_summary must include the seeded entry"
 
-    # retired_directions_summary
-    result = _build_retired_directions_summary(project)
-    assert result is not None, "retired_directions_summary builder must return non-None"
+        # retired_directions_summary
+        result = _build_retired_directions_summary(project)
+        assert result is not None, "retired_directions_summary builder must return non-None"
+    finally:
+        anomaly_state.persistent_anomalies.pop(anomaly_key, None)
 
     # rejected_proposals: inline logic in handler — verify the filter produces a list
     from app.time_utils import _utcnow
