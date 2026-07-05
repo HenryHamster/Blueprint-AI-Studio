@@ -89,7 +89,7 @@ vi.mock('../telemetry.js', async (importOriginal) => {
     recordFormatRepairMiss: vi.fn(),
     recordFormatRepairInfraFailure: vi.fn(),
     getLlmTelemetry: vi.fn().mockReturnValue({
-      llm_call_count: 0, total_input_tokens: 0, total_output_tokens: 0,
+      llm_call_count: 0, num_turns: 0, total_input_tokens: 0, total_output_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
     }),
   };
@@ -160,7 +160,7 @@ async function runHandler() {
 describe('handlePanelReview', () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    vi.mocked(execFileSync).mockReturnValue('abc123\trefs/heads/feature/panel-review\n' as never);
+    vi.mocked(execFileSync).mockReturnValue('abc123\trefs/heads/feature/panel-review\n');
     // clearAllMocks clears call records but NOT implementations, so explicitly
     // restore the two mocks that individual tests mutate, keeping the default
     // path (native sub-agent / parallel) and a clean exit between tests.
@@ -172,7 +172,7 @@ describe('handlePanelReview', () => {
     global.fetch = vi.fn().mockResolvedValue({
       ok: true,
       json: () => Promise.resolve({ title: 'Panel review PR', body: 'Review this carefully.' }),
-    }) as unknown as typeof fetch;
+    });
   });
 
   it('declares the fixed backend lens contract in code', () => {

@@ -18,6 +18,7 @@ vi.mock('../index.js', () => ({
   sanitize: vi.fn((s: string) => s),
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordNumTurns: vi.fn(),
 }));
 
 vi.mock('../token-file.js', () => ({
@@ -56,7 +57,7 @@ vi.mock('./runners.js', () => ({
 import { spawn } from 'child_process';
 import { startResidentClaudeSession } from './resident-session.js';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
-import { recordLlmTokens } from '../index.js';
+import { recordLlmTokens, recordNumTurns } from '../index.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -249,6 +250,18 @@ describe('startResidentClaudeSession', () => {
     await turn;
     // inputTokens folds in the cache classes: 50 + 0 + 5 = 55.
     expect(recordLlmTokens).toHaveBeenCalledWith(55, 20, 0, 5);
+    session.close();
+  });
+
+  it('records num_turns from the result event', async () => {
+    const ctl = makeControllableChild();
+    vi.mocked(spawn).mockImplementationOnce(() => ctl.proc);
+    vi.mocked(recordNumTurns).mockClear();
+    const session = startResidentClaudeSession({});
+    const turn = session.sendTurn('q');
+    ctl.pushLine({ type: 'result', result: 'a', num_turns: 6 });
+    await turn;
+    expect(recordNumTurns).toHaveBeenCalledWith(6);
     session.close();
   });
 

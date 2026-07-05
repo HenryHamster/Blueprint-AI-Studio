@@ -885,6 +885,7 @@ describe('resetPerRoleModuleState (warm-VM isolation)', () => {
     expect(getCurrentPromptFingerprint()).toBeNull();
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,
@@ -7009,6 +7010,7 @@ describe('LLM telemetry counters', () => {
   it('starts at zero', () => {
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,
@@ -7024,6 +7026,7 @@ describe('LLM telemetry counters', () => {
     recordLlmTokens(200, 75);
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 2,
+      num_turns: 0,
       total_input_tokens: 300,
       total_output_tokens: 125,
       total_cache_creation_input_tokens: 0,
@@ -7038,6 +7041,7 @@ describe('LLM telemetry counters', () => {
     recordLlmTokens(100, Number.POSITIVE_INFINITY);
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 100,
       total_output_tokens: 50,
       total_cache_creation_input_tokens: 0,
@@ -7052,6 +7056,7 @@ describe('LLM telemetry counters', () => {
     resetLlmTelemetry();
     expect(getLlmTelemetry()).toEqual({
       llm_call_count: 0,
+      num_turns: 0,
       total_input_tokens: 0,
       total_output_tokens: 0,
       total_cache_creation_input_tokens: 0,

@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { registerChildPid, unregisterChildPid } from '../processTracking.js';
 import {
-  WORKSPACE, getAgentToken, log, recordLlmCallStart, recordLlmTokens, sanitize,
+  WORKSPACE, getAgentToken, log, recordLlmCallStart, recordLlmTokens, recordNumTurns, sanitize,
 } from '../index.js';
 import { writeAgentTokenFile } from '../token-file.js';
 import { PROCESS_KILL_GRACE_MS } from '../constants.js';
@@ -388,6 +388,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
             ev.usage.inputTokens, ev.usage.outputTokens,
             ev.usage.cacheCreationTokens, ev.usage.cacheReadTokens,
           );
+        }
+        if (ev.numTurns !== undefined) {
+          recordNumTurns(ev.numTurns);
         }
         // Swallow a result owed by an already-force-settled turn so it cannot
         // resolve a newer turn's promise (see staleResultsPending).

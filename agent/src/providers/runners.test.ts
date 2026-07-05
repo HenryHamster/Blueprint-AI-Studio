@@ -43,6 +43,7 @@ vi.mock('../index.js', () => ({
   recordToolUse: mockRecordToolUse,
   recordLlmCallStart: vi.fn(),
   recordLlmTokens: vi.fn(),
+  recordNumTurns: vi.fn(),
   estimateTokensFromChars: vi.fn().mockReturnValue(0),
   sanitize: vi.fn((s: string) => s),
   ClaudeTimeoutError: class ClaudeTimeoutError extends Error {

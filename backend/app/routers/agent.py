@@ -2212,6 +2212,29 @@ async def claim_task(
         _default_caps = {"fix": 8, "qa": 8, "review": 8, "create": 12, "refactor": 12}
         _cap = int(_playbook_caps.get(task_type, _default_caps.get(task_type, 10)))
         _capped_candidates = _playbook_candidates[: max(_cap, 0)]
+        # Apply a total-byte cap on top of the entry-count cap. Candidates are
+        # already sorted highest-relevance-first, so we drop from the tail
+        # (lowest-relevance) until the cumulative content bytes fit within the
+        # limit. Index 9 in the tuple holds the content string.
+        _PLAYBOOK_BYTE_CAP = 12_000
+        _byte_total = sum(len(_c[9]) for _c in _capped_candidates)
+        if _byte_total > _PLAYBOOK_BYTE_CAP:
+            _trimmed: list = []
+            _running = 0
+            for _c in _capped_candidates:
+                _entry_bytes = len(_c[9])
+                if _running + _entry_bytes <= _PLAYBOOK_BYTE_CAP:
+                    _trimmed.append(_c)
+                    _running += _entry_bytes
+            logger.warning(
+                "Playbook byte-capped to %d/%d entries (%d→%d bytes) for task %s",
+                len(_trimmed),
+                len(_capped_candidates),
+                _byte_total,
+                _running,
+                _claimed_task_id,
+            )
+            _capped_candidates = _trimmed
         # Derive landed-vs-not-landed for the SMALL capped set with a single
         # batched query (diverged is not a sort key, so doing this after the cap
         # is safe and keeps it off the per-entry hot loop). An entry is diverged
@@ -4755,6 +4778,7 @@ async def agent_heartbeat(
     # downstream aggregations always see the freshest snapshot.
     if (
         req.llm_call_count is not None
+        or req.num_turns is not None
         or req.total_input_tokens is not None
         or req.total_output_tokens is not None
         or req.total_cache_creation_input_tokens is not None
@@ -4764,6 +4788,7 @@ async def agent_heartbeat(
     ):
         summary = {
             "llm_call_count": int(req.llm_call_count or 0),
+            "num_turns": int(req.num_turns or 0),
             "total_input_tokens": int(req.total_input_tokens or 0),
             "total_output_tokens": int(req.total_output_tokens or 0),
             "viewport_screenshot_forwarded_count": int(

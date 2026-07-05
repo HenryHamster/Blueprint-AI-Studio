@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   splitStreamChunk, extractDeltaText, isStrategicMutation, isMessageSend,
   parseResidentLine, encodeUserTurn, encodeInterrupt, extractResultUsage,
-  describeToolUse, describeToolResult,
+  extractResultTurns, describeToolUse, describeToolResult,
 } from './resident-stream.js';
 
 describe('splitStreamChunk', () => {
@@ -91,6 +91,14 @@ describe('extractResultUsage', () => {
   it('returns undefined when usage is absent or all-zero', () => {
     expect(extractResultUsage({})).toBeUndefined();
     expect(extractResultUsage({ usage: { input_tokens: 0, output_tokens: 0 } })).toBeUndefined();
+  });
+});
+
+describe('extractResultTurns', () => {
+  it('returns a floored positive turn count and ignores invalid values', () => {
+    expect(extractResultTurns({ num_turns: 3.9 })).toBe(3);
+    expect(extractResultTurns({ num_turns: 0 })).toBeUndefined();
+    expect(extractResultTurns({ num_turns: Number.NaN })).toBeUndefined();
   });
 });
 
@@ -242,6 +250,13 @@ describe('parseResidentLine', () => {
     expect(events[0].usage).toEqual({
       inputTokens: 12, outputTokens: 3, cacheCreationTokens: 0, cacheReadTokens: 2,
     });
+  });
+
+  it('carries num_turns on a result event', () => {
+    const events = parseResidentLine(JSON.stringify({
+      type: 'result', result: 'done', num_turns: 4,
+    }));
+    expect(events[0].numTurns).toBe(4);
   });
 
   it('does NOT mark a nested result as a turn result', () => {

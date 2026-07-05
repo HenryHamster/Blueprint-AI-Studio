@@ -6017,6 +6017,66 @@ async def test_claim_caps_playbook_entries_for_create_tasks(
 
 @pytest.mark.smoketest
 @pytest.mark.asyncio
+async def test_claim_caps_playbook_by_bytes(
+    client: AsyncClient, db_session
+):
+    """Playbook byte cap (12,000 bytes) trims lowest-relevance tail entries even
+    when the entry-count cap would otherwise allow them through. Seeding 10
+    entries of ~1,500 chars each (~15,000 bytes total) into a create task
+    (entry cap = 12) verifies that the returned playbook stays under the byte
+    limit by dropping tail entries."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project = Project(name="Playbook Byte Cap Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Each entry is ~1,500 chars; 10 entries = ~15,000 bytes, which exceeds the
+    # 12,000-byte cap. Entries are ranked by confirmed_count ascending so that
+    # higher-index entries are higher-relevance and sort to the front; the
+    # lowest-relevance tail (index 0, 1, ...) should be dropped.
+    large_content = "x" * 1500
+    design_doc = {}
+    for i in range(10):
+        design_doc[f"playbook/byte-entry-{i:02d}"] = {
+            "content": large_content,
+            "source_task_id": "seed",
+            "updated_at": "2026-01-01T00:00:00",
+            "confirmed_count": i,
+            "reference_count": 1,
+        }
+    project.design_doc = design_doc
+    flag_modified(project, "design_doc")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "Build X"}],
+        vm_instance_id="agent-vm-pbcap-bytes-test",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "agent-vm-pbcap-bytes-test")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+    assert resp.status_code == 200
+    playbook = resp.json().get("playbook", {})
+    # 12,000 bytes / 1,500 bytes per entry = 8 entries max
+    assert len(playbook) <= 8, (
+        f"byte cap should trim playbook to ≤8 entries, got {len(playbook)}"
+    )
+    total_bytes = sum(len(v.get("content", "")) for v in playbook.values())
+    assert total_bytes <= 12_000, (
+        f"total playbook content should be ≤12,000 bytes, got {total_bytes}"
+    )
+
+
+@pytest.mark.smoketest
+@pytest.mark.asyncio
 async def test_claim_appends_recent_outcomes_on_reference(
     client: AsyncClient, db_session
 ):
@@ -18056,7 +18116,7 @@ async def test_claim_stamps_provision_slot_acquired_at_from_compute(
 
 @pytest.mark.asyncio
 async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_session):
-    """Heartbeat persists llm_call_count + token totals into Task.api_call_summary."""
+    """Heartbeat persists llm_call_count, num_turns, and token totals into Task.api_call_summary."""
     project = Project(name="API Call Summary", user_id="test-user-123")
     db_session.add(project)
     await db_session.commit()
@@ -18079,6 +18139,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
         json={
             "task_id": str(task.id),
             "llm_call_count": 3,
+            "num_turns": 7,
             "total_input_tokens": 12345,
             "total_output_tokens": 678,
         },
@@ -18090,6 +18151,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
     summary = task.api_call_summary
     assert summary is not None
     assert summary["llm_call_count"] == 3
+    assert summary["num_turns"] == 7
     assert summary["total_input_tokens"] == 12345
     assert summary["total_output_tokens"] == 678
     assert "last_updated_at" in summary
@@ -18100,6 +18162,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
         json={
             "task_id": str(task.id),
             "llm_call_count": 5,
+            "num_turns": 11,
             "total_input_tokens": 20000,
             "total_output_tokens": 999,
         },
@@ -18108,6 +18171,7 @@ async def test_heartbeat_persists_api_call_summary(client: AsyncClient, db_sessi
     assert resp2.status_code == 200
     await db_session.refresh(task)
     assert task.api_call_summary["llm_call_count"] == 5
+    assert task.api_call_summary["num_turns"] == 11
     assert task.api_call_summary["total_input_tokens"] == 20000
     assert task.api_call_summary["total_output_tokens"] == 999
 

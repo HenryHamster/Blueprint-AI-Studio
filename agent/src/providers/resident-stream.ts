@@ -161,6 +161,8 @@ export interface ResidentStreamEvent {
   nested?: boolean;
   /** token usage parsed from a top-level 'result' event (when the CLI reported it) */
   usage?: ResidentTokenUsage;
+  /** turn count parsed from a top-level 'result' event (when the CLI reported it) */
+  numTurns?: number;
   /** LIVE activity-strip kind for a 'tool' / 'tool_result' event (ephemeral) */
   activityKind?: ResidentActivityKind;
   /** LIVE activity-strip one-liner text for a 'tool' / 'tool_result' event */
@@ -182,6 +184,16 @@ export function extractResultUsage(obj: Record<string, unknown>): ResidentTokenU
   const outputTokens = Number(u.output_tokens ?? 0) || 0;
   if (inputTokens <= 0 && outputTokens <= 0) return undefined;
   return { inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens };
+}
+
+/**
+ * Extract the per-turn model-turn count from a `result` object, or undefined
+ * when absent/invalid.
+ */
+export function extractResultTurns(obj: Record<string, unknown>): number | undefined {
+  const numTurns = Number(obj.num_turns ?? 0);
+  if (!Number.isFinite(numTurns) || numTurns <= 0) return undefined;
+  return Math.floor(numTurns);
 }
 
 /**
@@ -314,6 +326,7 @@ export function parseResidentLine(line: string): ResidentStreamEvent[] {
     events.push({
       kind: 'result', text: result, isTurnResult: !nested, nested, sessionId,
       usage: extractResultUsage(obj),
+      numTurns: extractResultTurns(obj),
     });
     return events;
   }

@@ -398,6 +398,7 @@ class HeartbeatRequest(BaseModel):
     # Task.api_call_summary so the orchestrator can aggregate
     # api-calls-per-task and total-tokens-per-task across the fleet.
     llm_call_count: int | None = Field(None, ge=0)
+    num_turns: int | None = Field(None, ge=0)
     total_input_tokens: int | None = Field(None, ge=0)
     total_output_tokens: int | None = Field(None, ge=0)
     # Optional cache-class sub-counts of total_input_tokens (which stays the
