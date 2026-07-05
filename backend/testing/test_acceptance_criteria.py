@@ -1084,12 +1084,14 @@ async def test_autonomous_direction_task_inherits_criterion_ids_and_records_evid
         payloads=[{"type": "create", "prompt": "add tests"}],
         context={
             "direction_id": "d-autotest1",
+            "review_loop": {"pr_number": 77},
             # Simulate a proven merge-test verdict stamped by the acceptance gate
             CODE_ACCEPTANCE_VERDICT_KEY: {
                 "satisfied": True,
                 "proven": True,
                 "kind": "named_test",
                 "reason": "test ran green under verified merge",
+                "proof_ref": "testing/test_autotest1.py::test_coverage_passes",
             },
         },
         criterion_ids=[criterion.criterion_key],
@@ -1109,7 +1111,17 @@ async def test_autonomous_direction_task_inherits_criterion_ids_and_records_evid
     assert len(evidence) == 2
     assert {e.source_kind for e in evidence} == {"task_merge", "reachability"}
     assert {e.source_id for e in evidence} == {str(task.id)}
-    assert all(e.detail == {"proven": True} for e in evidence)
+
+    # task_merge detail must carry provenance fields (pr_number, direction_key, proof_ref)
+    task_merge_ev = next(e for e in evidence if e.source_kind == "task_merge")
+    assert task_merge_ev.detail.get("proven") is True
+    assert task_merge_ev.detail.get("pr_number") == 77
+    assert task_merge_ev.detail.get("direction_key") == "d-autotest1"
+    assert task_merge_ev.detail.get("proof_ref") == "testing/test_autotest1.py::test_coverage_passes"
+
+    # reachability row only needs proven=True (no extra provenance fields)
+    reachability_ev = next(e for e in evidence if e.source_kind == "reachability")
+    assert reachability_ev.detail == {"proven": True}
 
     # The criterion should now be 'covered' (proven task_merge evidence)
     coverage = ac.compute_criterion_coverage(evidence)
@@ -1141,6 +1153,102 @@ async def test_refresh_after_merge_records_evidence_only_when_proven(db_session)
     await refresh_direction_outcomes_after_merge(task, db_session)
 
     assert await ac.get_evidence_for_criterion(db_session, criterion.id) == []
+
+
+@pytest.mark.asyncio
+async def test_get_version_coverage_summary_evidence_provenance(db_session):
+    """get_version_coverage_summary includes an evidence list on each criterion item.
+
+    Each entry must carry source_kind, source_id, detail, and recorded_at so an
+    operator can audit provenance without SQL.  Covered criteria must expose the
+    task_merge detail dict including the pr_number, direction_key, and proof_ref
+    fields written by record_task_merge_evidence.
+    """
+    from app.acceptance_gate import CODE_ACCEPTANCE_VERDICT_KEY
+
+    project = await _make_project(db_session, "CoverageSummaryEvidence")
+    version = await _make_version(db_session, project)
+    criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Evidence provenance test criterion"
+    )
+
+    direction_row = Direction(
+        project_id=project.id,
+        direction_key="d-prov-test",
+        data={"id": "d-prov-test", "text": "Provenance direction", "status": "active"},
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(direction_row)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="Provenance task",
+        payloads=[{"type": "create", "prompt": "implement provenance"}],
+        context={
+            "direction_id": "d-prov-test",
+            "review_loop": {"pr_number": 99},
+            CODE_ACCEPTANCE_VERDICT_KEY: {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+                "proof_ref": "testing/test_provenance.py::test_it",
+            },
+        },
+        criterion_ids=[criterion.criterion_key],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    await ac.record_task_merge_evidence(db_session, task, project.id)
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+
+    criteria = summary["criteria"]
+    assert len(criteria) == 1
+    item = criteria[0]
+    assert item["criterion_key"] == criterion.criterion_key
+    assert item["coverage"] == "covered"
+
+    evidence_list = item["evidence"]
+    assert len(evidence_list) == 2  # task_merge + reachability
+
+    task_merge_entry = next(e for e in evidence_list if e["source_kind"] == "task_merge")
+    assert task_merge_entry["source_id"] == str(task.id)
+    assert task_merge_entry["detail"].get("proven") is True
+    assert task_merge_entry["detail"].get("pr_number") == 99
+    assert task_merge_entry["detail"].get("direction_key") == "d-prov-test"
+    assert task_merge_entry["detail"].get("proof_ref") == "testing/test_provenance.py::test_it"
+    assert task_merge_entry["recorded_at"] is not None  # ISO timestamp string
+
+    reachability_entry = next(e for e in evidence_list if e["source_kind"] == "reachability")
+    assert reachability_entry["detail"] == {"proven": True}
+
+
+@pytest.mark.asyncio
+async def test_list_criteria_evidence_field_present(db_session):
+    """Criteria items from get_version_coverage_summary always include an evidence list.
+
+    Even uncovered criteria with no evidence must carry an empty list so callers
+    can iterate without None-guards.
+    """
+    project = await _make_project(db_session, "EvidenceFieldAlways")
+    version = await _make_version(db_session, project)
+    await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion with no evidence yet"
+    )
+
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["total"] == 1
+
+    item = summary["criteria"][0]
+    assert "evidence" in item
+    assert isinstance(item["evidence"], list)
+    assert len(item["evidence"]) == 0
+    assert item["coverage"] == "uncovered"
 
 
 @pytest.mark.asyncio
@@ -1286,8 +1394,11 @@ async def test_task_merge_evidence_covers_late_mapped_direction_criteria(db_sess
     evidence = await ac.get_evidence_for_criterion(db_session, late_criterion.id)
     assert len(evidence) == 2
     assert {e.source_kind for e in evidence} == {"task_merge", "reachability"}
-    assert all(e.detail == {"proven": True} for e in evidence)
+    assert all(e.detail.get("proven") is True for e in evidence)
     assert {e.source_id for e in evidence} == {str(task.id)}
+    # task_merge row must carry direction_key provenance from the late-mapping path
+    task_merge_ev = next(e for e in evidence if e.source_kind == "task_merge")
+    assert task_merge_ev.detail.get("direction_key") == "d-latemap1"
 
     coverage = ac.compute_criterion_coverage(evidence)
     assert coverage == "covered"

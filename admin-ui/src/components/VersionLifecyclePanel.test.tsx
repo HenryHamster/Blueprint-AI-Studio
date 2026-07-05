@@ -3873,4 +3873,220 @@ describe('VersionLifecyclePanel', () => {
       });
     });
   });
+
+  describe('attest criterion', () => {
+    const TASKS: api.ChangelogEntry[] = [
+      { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+    ];
+
+    function makeStuckCoverage(stuckReason: 'no_mapping' | 'direction_retired'): api.VersionCriterionCoverage {
+      return {
+        total: 1,
+        covered: 0,
+        partial: 0,
+        uncovered: 1,
+        stuck_count: 1,
+        criteria: [
+          {
+            criterion_key: 'k-stuck',
+            text: 'Stuck criterion text',
+            coverage: 'uncovered',
+            evidence_count: 0,
+            stuck_reason: stuckReason,
+          },
+        ],
+      };
+    }
+
+    it('shows attestation reason dialog and calls attestAcceptanceCriterion on confirm', async () => {
+      vi.mocked(api.attestAcceptanceCriterion).mockResolvedValue({ status: 'ok', criterion_key: 'k-stuck', coverage: 'covered' });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('no_mapping'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      expect(await screen.findByText('Attest criterion')).toBeInTheDocument();
+      const input = screen.getByPlaceholderText(/verified live by hand|direction retired|attestation/i) ||
+        screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: 'Direction retired; criterion superseded' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(api.attestAcceptanceCriterion).toHaveBeenCalledWith('proj-1', 'k-stuck', 'Direction retired; criterion superseded');
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('does not call API when attestation dialog is cancelled', async () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('direction_retired'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      expect(await screen.findByText('Attest criterion')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Attest criterion')).not.toBeInTheDocument();
+      });
+      expect(api.attestAcceptanceCriterion).not.toHaveBeenCalled();
+    });
+
+    it('shows error message when attest API fails', async () => {
+      vi.mocked(api.attestAcceptanceCriterion).mockRejectedValue(new Error('Attestation failed'));
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: makeStuckCoverage('no_mapping'),
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const attestBtn = await screen.findByTestId('attest-btn-k-stuck');
+      fireEvent.click(attestBtn);
+
+      const input = await screen.findByRole('textbox');
+      fireEvent.change(input, { target: { value: 'some reason' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Attestation failed')).toBeInTheDocument();
+      });
+    });
+
+    it('Attest and Link direction buttons only appear on stuck active criteria', async () => {
+      const coverage: api.VersionCriterionCoverage = {
+        total: 2,
+        covered: 1,
+        partial: 0,
+        uncovered: 1,
+        stuck_count: 1,
+        criteria: [
+          {
+            criterion_key: 'k-stuck',
+            text: 'Stuck criterion',
+            coverage: 'uncovered',
+            evidence_count: 0,
+            stuck_reason: 'no_mapping',
+          },
+          {
+            criterion_key: 'k-ok',
+            text: 'Covered criterion',
+            coverage: 'covered',
+            evidence_count: 1,
+          },
+        ],
+      };
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 2,
+          criterion_coverage: coverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      await screen.findByTestId('criterion-coverage-panel');
+      expect(screen.getByTestId('attest-btn-k-stuck')).toBeInTheDocument();
+      expect(screen.getByTestId('link-direction-btn-k-stuck')).toBeInTheDocument();
+      expect(screen.queryByTestId('attest-btn-k-ok')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('link-direction-btn-k-ok')).not.toBeInTheDocument();
+    });
+  });
+
+  describe('link direction', () => {
+    const TASKS: api.ChangelogEntry[] = [
+      { task_type: 'create', title: 'Add feature', pr_number: 1, pr_url: null },
+    ];
+    const stuckCoverage: api.VersionCriterionCoverage = {
+      total: 1,
+      covered: 0,
+      partial: 0,
+      uncovered: 1,
+      stuck_count: 1,
+      criteria: [
+        {
+          criterion_key: 'k-stuck',
+          text: 'Needs direction link',
+          coverage: 'uncovered',
+          evidence_count: 0,
+          stuck_reason: 'direction_retired',
+        },
+      ],
+    };
+
+    it('shows direction-key input dialog and calls linkCriteriaToDirection on confirm', async () => {
+      vi.mocked(api.linkCriteriaToDirection).mockResolvedValue({ status: 'ok', direction_key: 'd-abc123', criterion_keys: ['k-stuck'] });
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: stuckCoverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const linkBtn = await screen.findByTestId('link-direction-btn-k-stuck');
+      fireEvent.click(linkBtn);
+
+      expect(await screen.findByText('Link criterion to direction')).toBeInTheDocument();
+      const input = screen.getByRole('textbox');
+      fireEvent.change(input, { target: { value: 'd-abc123' } });
+      fireEvent.click(screen.getByTestId('confirm-dialog-confirm'));
+
+      await waitFor(() => {
+        expect(api.linkCriteriaToDirection).toHaveBeenCalledWith('proj-1', 'd-abc123', ['k-stuck']);
+      });
+      expect(mockRefresh).toHaveBeenCalled();
+    });
+
+    it('does not call API when link direction dialog is cancelled', async () => {
+      const data = makeVersionLifecycleResponse({
+        current_version: makeCurrentVersion({
+          tasks_merged: TASKS,
+          merged_task_count: 1,
+          criterion_coverage: stuckCoverage,
+        }),
+      });
+
+      render(<VersionLifecyclePanel data={data} loading={false} projectId="proj-1" onRefresh={mockRefresh} />);
+      fireEvent.click(screen.getByTestId('changelog-toggle'));
+
+      const linkBtn = await screen.findByTestId('link-direction-btn-k-stuck');
+      fireEvent.click(linkBtn);
+
+      expect(await screen.findByText('Link criterion to direction')).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId('confirm-dialog-cancel'));
+
+      await waitFor(() => {
+        expect(screen.queryByText('Link criterion to direction')).not.toBeInTheDocument();
+      });
+      expect(api.linkCriteriaToDirection).not.toHaveBeenCalled();
+    });
+  });
 });

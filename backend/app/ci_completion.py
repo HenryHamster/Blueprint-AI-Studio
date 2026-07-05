@@ -652,12 +652,9 @@ async def _attempt_merge_with_retry_and_escalation(
                             await refresh_direction_outcomes_after_merge(
                                 orig, _orig_session
                             )
-                        if record_pr_merged and orig.criterion_ids:
-                            from app import acceptance_criteria as _ac
-
-                            await _ac.record_task_merge_evidence(
-                                _orig_session, orig, orig.project_id
-                            )
+                        # criterion evidence is recorded unconditionally inside
+                        # refresh_direction_outcomes_after_merge (direction_outcomes.py)
+                        # — no separate call needed here.
             except Exception as e:
                 logger.warning(
                     f"[CI] Failed to set pr_merged on {ci_orig_id}: {e}", exc_info=True

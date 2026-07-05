@@ -126,7 +126,7 @@ const STATUS_BADGE: Record<NonNullable<CriterionCoverageEntry['status']>, { labe
   superseded: { label: 'superseded', className: 'bg-sky-500/15 text-sky-300 border border-sky-500/30' },
 };
 
-function CriterionCoveragePanel({ coverage, onReinstate }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void> }): JSX.Element {
+function CriterionCoveragePanel({ coverage, onReinstate, onAttest, onLinkDirection }: { coverage: VersionCriterionCoverage; onReinstate?: (criterionKey: string) => Promise<void>; onAttest?: (criterionKey: string) => void; onLinkDirection?: (criterionKey: string) => void }): JSX.Element {
   if (coverage.criteria.length === 0) {
     return (
       <div className="mb-3" data-testid="criterion-coverage-panel">
@@ -197,6 +197,24 @@ function CriterionCoveragePanel({ coverage, onReinstate }: { coverage: VersionCr
               {c.evidence_count > 0 && (
                 <span className="shrink-0 text-ui-sm text-slate-500 ml-auto">{c.evidence_count} ev.</span>
               )}
+              {status === 'active' && stuckLabel != null && onAttest != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-amber-400 hover:text-amber-200 ml-1 transition-colors"
+                  data-testid={`attest-btn-${c.criterion_key}`}
+                  onClick={() => onAttest(c.criterion_key)}
+                >
+                  Attest
+                </button>
+              )}
+              {status === 'active' && stuckLabel != null && onLinkDirection != null && (
+                <button
+                  className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
+                  data-testid={`link-direction-btn-${c.criterion_key}`}
+                  onClick={() => onLinkDirection(c.criterion_key)}
+                >
+                  Link direction
+                </button>
+              )}
               {status !== 'active' && onReinstate != null && (
                 <button
                   className="shrink-0 text-ui-sm text-sky-400 hover:text-sky-200 ml-1 transition-colors"
@@ -236,12 +254,16 @@ export function VersionSummaryPanel({
   acceptanceAggregate,
   criterionCoverage,
   onReinstate,
+  onAttest,
+  onLinkDirection,
 }: {
   tasksMerged: ChangelogEntry[] | undefined;
   heading?: string;
   acceptanceAggregate?: Record<string, number> | null;
   criterionCoverage?: VersionCriterionCoverage | null;
   onReinstate?: (criterionKey: string) => Promise<void>;
+  onAttest?: (criterionKey: string) => void;
+  onLinkDirection?: (criterionKey: string) => void;
 }): JSX.Element | null {
   const [copied, setCopied] = useState(false);
   const [filter, setFilter] = useState('');
@@ -254,7 +276,7 @@ export function VersionSummaryPanel({
         data-testid="version-summary-panel-empty"
         className="mt-3 rounded border border-slate-700/60 bg-slate-800/40 px-3 py-2"
       >
-        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} />}
+        {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
         <div className="text-ui-md text-slate-500 italic">No tasks merged into this version yet.</div>
       </div>
     );
@@ -300,7 +322,7 @@ export function VersionSummaryPanel({
           {copied ? 'Copied!' : 'Copy markdown'}
         </button>
       </div>
-      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} />}
+      {criterionCoverage != null && <CriterionCoveragePanel coverage={criterionCoverage} onReinstate={onReinstate} onAttest={onAttest} onLinkDirection={onLinkDirection} />}
       {acceptanceAggregate && <AcceptanceBucketBreakdown aggregate={acceptanceAggregate} />}
       {/* Per-type count summary — lets operator grasp shape of release at a glance */}
       <div className="flex flex-wrap gap-1 mb-2" data-testid="type-count-summary">

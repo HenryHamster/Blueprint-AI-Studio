@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
+from app.acceptance_criteria import get_version_coverage_summary
 from app.message_convergence import OPEN_STATUS
 from app.failure_classification import is_non_death_cancellation
 from app.models import (
@@ -39,6 +40,7 @@ from app.strategic_runtime_work import (
     task_awaiting_local_runner_since,
     task_awaiting_strategic_local_runner_since,
 )
+from app.release_version import current_open_version
 from app.task_movement import build_task_movement_explanation
 from app.time_utils import _utcnow
 from app.workbench_contracts import compact_text, normalize_target
@@ -84,6 +86,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "dead_runner"): 45,
     ("needs_operator", "stale_provisioning_task"): 50,
     ("needs_operator", "stale_queued_task"): 60,
+    ("needs_operator", "stuck_criteria"): 65,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
@@ -167,6 +170,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "mode": "task_lifecycle",
         "clears_when": "dependency_recovers_task_leaves_queue_terminal_or_archived",
         "operator_action": "inspect_dependency_or_requeue_task",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
+    "stuck_criteria": {
+        "mode": "version_lifecycle",
+        "clears_when": "criterion_mapped_to_active_direction_or_operator_attested",
+        "operator_action": "remap_or_attest_criterion",
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
@@ -1005,6 +1015,40 @@ def _experiment_outcome_attention_item(task: Task) -> dict[str, Any]:
     }
 
 
+def _stuck_criteria_attention_item(
+    project_id: uuid.UUID,
+    stuck_count: int,
+    no_mapping_count: int,
+    direction_retired_count: int,
+) -> dict[str, Any]:
+    parts = []
+    if no_mapping_count:
+        noun = "criterion" if no_mapping_count == 1 else "criteria"
+        parts.append(f"{no_mapping_count} {noun} with no direction mapping")
+    if direction_retired_count:
+        noun = "criterion" if direction_retired_count == 1 else "criteria"
+        parts.append(f"{direction_retired_count} {noun} whose direction is retired")
+    detail = "; ".join(parts) if parts else f"{stuck_count} stuck criteria"
+    plural = "criteria" if stuck_count != 1 else "criterion"
+    return {
+        "id": f"project:{project_id}:stuck_criteria",
+        "kind": "version",
+        "severity": "needs_operator",
+        "reason": "stuck_criteria",
+        "label": f"{stuck_count} acceptance {plural} stuck",
+        "detail": _compact_text(detail, max_chars=180),
+        "ref": {
+            "kind": "project",
+            "id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "acceptance_criteria",
+        }),
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -1409,6 +1453,24 @@ async def build_operator_attention(
     )
     alerts = [*error_alerts, *warning_alerts]
 
+    # Stuck acceptance criteria: uncovered active criteria with no active direction.
+    stuck_criteria_count = 0
+    stuck_no_mapping_count = 0
+    stuck_direction_retired_count = 0
+    try:
+        open_version = await current_open_version(session, project.id)
+        if open_version is not None:
+            coverage = await get_version_coverage_summary(session, open_version.id)
+            stuck_criteria_count = coverage.get("stuck_count", 0)
+            for criterion in coverage.get("criteria", []):
+                reason = criterion.get("stuck_reason")
+                if reason == "no_mapping":
+                    stuck_no_mapping_count += 1
+                elif reason == "direction_retired":
+                    stuck_direction_retired_count += 1
+    except Exception:
+        pass
+
     directions = project.directions if isinstance(project.directions, list) else []
     manual_directions = [
         direction
@@ -1453,6 +1515,15 @@ async def build_operator_attention(
         )
     for task in stale_queued_tasks:
         add_candidate(_stale_task_attention_item(task, reason="stale_queued_task"))
+    if stuck_criteria_count > 0:
+        add_candidate(
+            _stuck_criteria_attention_item(
+                project.id,
+                stuck_criteria_count,
+                stuck_no_mapping_count,
+                stuck_direction_retired_count,
+            )
+        )
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
     for alert in alerts:
@@ -1492,6 +1563,7 @@ async def build_operator_attention(
         + stale_queued_count
         + len(manual_directions)
         + error_alert_count
+        + stuck_criteria_count
     )
     total_watch = (
         failed_count
@@ -1553,6 +1625,7 @@ async def build_operator_attention(
             "stale_provisioning_tasks": stale_provisioning_count,
             "stale_queued_tasks": stale_queued_count,
             "manual_directions": len(manual_directions),
+            "stuck_criteria": stuck_criteria_count,
             "alerts": error_alert_count + warning_alert_count,
             "error_alerts": error_alert_count,
             "warning_alerts": warning_alert_count,

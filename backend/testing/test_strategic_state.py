@@ -31,6 +31,7 @@ from app.models import (
     TaskWakeRegistration,
     TaskStatus,
     SourceKind,
+    VersionAcceptanceCriterion,
     WakeAction,
     WakeDeliveryState,
     _utcnow,
@@ -6471,3 +6472,92 @@ async def test_operator_attention_unmet_experiment_not_masked_by_newer_successes
     assert attention["counts"]["experiment_outcomes"] == 1
     item_ids = {item["id"] for item in attention["items"]}
     assert f"task:{unmet_task.id}:experiment_outcome" in item_ids
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_criteria_no_mapping(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion with no direction mapping surfaces as needs_operator stuck_criteria."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key="c-aabbccdd",
+        text="All tests pass",
+        status="active",
+    )
+    db_session.add(criterion)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["counts"]["stuck_criteria"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    stuck_items = [item for item in attention["items"] if item["reason"] == "stuck_criteria"]
+    assert len(stuck_items) == 1
+    item = stuck_items[0]
+    assert item["severity"] == "needs_operator"
+    assert "no direction mapping" in item["detail"]
+    assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_criteria_direction_retired(
+    client: AsyncClient, db_session
+):
+    """Uncovered criterion whose only mapped direction is retired surfaces as stuck_criteria."""
+    project = await _make_project(db_session)
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+    )
+    db_session.add(version)
+    await db_session.flush()
+
+    criterion_key = "c-11223344"
+    criterion = VersionAcceptanceCriterion(
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=criterion_key,
+        text="Performance within budget",
+        status="active",
+    )
+    retired_direction = Direction(
+        project_id=project.id,
+        direction_key="d-retired-dir",
+        status="retired",
+        criterion_keys=[criterion_key],
+    )
+    db_session.add_all([criterion, retired_direction])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    attention = resp.json()["attention"]
+
+    assert attention["counts"]["stuck_criteria"] >= 1
+    assert attention["counts"]["needs_operator"] >= 1
+    assert attention["level"] == "needs_operator"
+
+    stuck_items = [item for item in attention["items"] if item["reason"] == "stuck_criteria"]
+    assert len(stuck_items) == 1
+    item = stuck_items[0]
+    assert item["severity"] == "needs_operator"
+    assert "retired" in item["detail"]
+    assert item["lifecycle"]["operator_action"] == "remap_or_attest_criterion"

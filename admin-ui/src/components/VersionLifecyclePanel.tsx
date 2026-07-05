@@ -2,9 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { ConfirmDialog } from './ConfirmDialog';
 import { VersionSummaryPanel } from './VersionSummaryPanel';
 import {
+  attestAcceptanceCriterion,
   clearDeployFailed,
   cutVersion,
   fetchQualificationVerdicts,
+  linkCriteriaToDirection,
   patchAdminSettings,
   reinstateAcceptanceCriterion,
   setProjectPromotionEnabled,
@@ -402,6 +404,64 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
       }
     : undefined;
 
+  const handleAttest = projectId
+    ? (criterionKey: string) => {
+        setLocalDialog({
+          title: 'Attest criterion',
+          message: `Record an operator attestation that criterion "${criterionKey}" is intentionally accepted despite being stuck.`,
+          confirmLabel: 'Attest',
+          attestationInput: { label: 'Attestation reason', placeholder: 'e.g. direction retired; criterion superseded by new approach' },
+          onConfirm: async (reason?: string) => {
+            setLocalDialog(null);
+            if (!reason || !reason.trim()) {
+              setActionMsg('Attestation reason is required');
+              return;
+            }
+            setActionLoading('attest');
+            setActionMsg(null);
+            try {
+              await attestAcceptanceCriterion(projectId, criterionKey, reason.trim());
+              setActionMsg('Criterion attested');
+              onRefresh();
+            } catch (err) {
+              setActionMsg(err instanceof Error ? err.message : 'Failed to attest criterion');
+            } finally {
+              setActionLoading(null);
+            }
+          },
+        });
+      }
+    : undefined;
+
+  const handleLinkDirection = projectId
+    ? (criterionKey: string) => {
+        setLocalDialog({
+          title: 'Link criterion to direction',
+          message: `Link criterion "${criterionKey}" to a direction by entering the direction key. This replaces the direction's existing criterion links.`,
+          confirmLabel: 'Link',
+          attestationInput: { label: 'Direction key', placeholder: 'e.g. d-abc12345' },
+          onConfirm: async (directionKey?: string) => {
+            setLocalDialog(null);
+            if (!directionKey || !directionKey.trim()) {
+              setActionMsg('Direction key is required');
+              return;
+            }
+            setActionLoading('link-direction');
+            setActionMsg(null);
+            try {
+              await linkCriteriaToDirection(projectId, directionKey.trim(), [criterionKey]);
+              setActionMsg('Criterion linked to direction');
+              onRefresh();
+            } catch (err) {
+              setActionMsg(err instanceof Error ? err.message : 'Failed to link criterion');
+            } finally {
+              setActionLoading(null);
+            }
+          },
+        });
+      }
+    : undefined;
+
   return (
     <section data-testid="version-lifecycle-panel">
       <h2 className="text-ui-md font-bold text-neutral-400 uppercase tracking-widest mb-2">Version Lifecycle</h2>
@@ -758,7 +818,7 @@ export function VersionLifecyclePanel({ data, loading, projectId, onRefresh, use
                   </span>
                 </button>
                 {changelogExpanded && (
-                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} onReinstate={handleReinstate} />
+                  <VersionSummaryPanel tasksMerged={cv.tasks_merged} acceptanceAggregate={cv.acceptance_aggregate} criterionCoverage={cv.criterion_coverage} onReinstate={handleReinstate} onAttest={handleAttest} onLinkDirection={handleLinkDirection} />
                 )}
               </div>
             )}

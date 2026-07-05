@@ -2793,6 +2793,40 @@ export async function reinstateAcceptanceCriterion(
   return data;
 }
 
+export async function attestAcceptanceCriterion(
+  projectId: string,
+  criterionKey: string,
+  reason: string,
+): Promise<{ status: string; criterion_key: string; coverage: string }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/${encodeURIComponent(criterionKey)}/attest`,
+    { method: 'POST', body: JSON.stringify({ reason }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to attest criterion: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to attest criterion: ${res.status}`);
+  }
+  return data;
+}
+
+export async function linkCriteriaToDirection(
+  projectId: string,
+  directionKey: string,
+  criterionKeys: string[],
+): Promise<{ status: string; direction_key: string; criterion_keys: string[] }> {
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/acceptance-criteria/link-direction`,
+    { method: 'POST', body: JSON.stringify({ direction_key: directionKey, criterion_keys: criterionKeys }) },
+  );
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const detail = data?.detail || `Failed to link criteria to direction: ${res.status}`;
+    throw new Error(typeof detail === 'string' ? detail : `Failed to link criteria to direction: ${res.status}`);
+  }
+  return data;
+}
+
 export type QualifyTriggerStatus =
   | 'wrong_phase'
   | 'already_pending'

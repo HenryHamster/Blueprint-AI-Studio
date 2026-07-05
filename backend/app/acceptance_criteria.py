@@ -421,6 +421,23 @@ async def record_task_merge_evidence(
     verdict = task_context.get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not acceptance_is_proven(verdict):
         return 0
+    # Extract provenance fields for the evidence detail dict so operators can
+    # audit why a criterion counts as covered without resorting to SQL.
+    pr_number: int | str | None = (
+        task_context.get("review_loop", {}).get("pr_number")
+        if isinstance(task_context.get("review_loop"), dict)
+        else None
+    )
+    proof_ref: str | None = (
+        verdict.get("proof_ref") if isinstance(verdict, dict) else None
+    )
+    task_merge_detail: dict[str, Any] = {"proven": True}
+    if pr_number is not None:
+        task_merge_detail["pr_number"] = pr_number
+    if direction_id_key is not None:
+        task_merge_detail["direction_key"] = direction_id_key
+    if proof_ref is not None:
+        task_merge_detail["proof_ref"] = proof_ref
     try:
         _release_version_id: uuid.UUID | None = None
         try:
@@ -459,7 +476,7 @@ async def record_task_merge_evidence(
                     project_id=project_id,
                     source_kind="task_merge",
                     source_id=source_id,
-                    detail={"proven": True},
+                    detail=task_merge_detail,
                 )
                 wrote = True
             if ("reachability", source_id) not in existing:
@@ -764,6 +781,15 @@ async def get_version_coverage_summary(
                 "status": criterion.status,
                 "evidence_count": len(evidence),
                 "stuck_reason": stuck_reason,
+                "evidence": [
+                    {
+                        "source_kind": e.source_kind,
+                        "source_id": e.source_id,
+                        "detail": e.detail,
+                        "recorded_at": e.recorded_at.isoformat() if e.recorded_at else None,
+                    }
+                    for e in evidence
+                ],
             }
         )
 
