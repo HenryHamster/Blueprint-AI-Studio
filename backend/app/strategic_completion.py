@@ -4479,9 +4479,10 @@ async def _handle_strategic_completion(
     _pending_rejected_proposals: list = []
     retired_rationales_fb: Dict[str, str] = {}
     # Gap-staffing reconciliations to apply to project.problem_model after the
-    # op loop. Each entry is ``(direction_id, new_gap_id, prior_gap_id)`` — the
-    # fallback mirror of the HTTP create/update_direction reconciliation. Applied
-    # once after the loop, in the same locked transaction as the directions write.
+    # op loop. Each entry is
+    # ``(direction_id, new_gap_id, prior_gap_id, new_status, prior_status)``.
+    # Applied once after the loop, in the same locked transaction as the
+    # directions write.
     _pending_gap_reconciles: list = []
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
@@ -4788,7 +4789,7 @@ async def _handle_strategic_completion(
                 # is not yet working it). Applied to problem_model after the loop.
                 if new_dir.get("gap_id") and new_dir.get("status") == "active":
                     _pending_gap_reconciles.append(
-                        (new_dir["id"], new_dir["gap_id"], None)
+                        (new_dir["id"], new_dir["gap_id"], None, "active", None)
                     )
                 ops_applied += 1
                 creates_count += 1
@@ -4838,6 +4839,7 @@ async def _handle_strategic_completion(
                         # exactly once (and not on updates that were already
                         # terminal).
                         _pre_status_fb = d.get("status")
+                        _gap_changed_fb = False
                         if "text" in changes:
                             new_text = str(changes["text"])
                             if len(new_text) > STRATEGIC_DIRECTION_TEXT_MAX:
@@ -4869,14 +4871,10 @@ async def _handle_strategic_completion(
                                     )
                                 else:
                                     d["gap_id"] = _gid_fb
-                                    _pending_gap_reconciles.append(
-                                        (str(dir_id), _gid_fb, _pre_gap_id_fb)
-                                    )
+                                    _gap_changed_fb = True
                             else:
                                 d.pop("gap_id", None)
-                                _pending_gap_reconciles.append(
-                                    (str(dir_id), None, _pre_gap_id_fb)
-                                )
+                                _gap_changed_fb = True
                         if "system_id" in changes:
                             if changes["system_id"]:
                                 sid_new = str(changes["system_id"])
@@ -5091,6 +5089,16 @@ async def _handle_strategic_completion(
                                     f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
                                 )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        if _gap_changed_fb or d.get("status") != _pre_status_fb:
+                            _pending_gap_reconciles.append(
+                                (
+                                    str(dir_id),
+                                    d.get("gap_id"),
+                                    _pre_gap_id_fb,
+                                    d.get("status"),
+                                    _pre_status_fb,
+                                )
+                            )
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}"
@@ -5180,6 +5188,8 @@ async def _handle_strategic_completion(
                 for d in directions:
                     if d.get("id") == dir_id:
                         staged_for_version = open_version.version_number
+                        _pre_status_fb = d.get("status")
+                        _gap_id_fb = d.get("gap_id")
                         d["status"] = "staged"
                         d["staged_for_version"] = staged_for_version
                         d["staged_at"] = _utcnow().isoformat()
@@ -5208,6 +5218,16 @@ async def _handle_strategic_completion(
                         }
                         flag_modified(task, "context")
                         session.add(task)
+                        if _gap_id_fb:
+                            _pending_gap_reconciles.append(
+                                (
+                                    str(dir_id),
+                                    _gap_id_fb,
+                                    _gap_id_fb,
+                                    "staged",
+                                    _pre_status_fb,
+                                )
+                            )
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Staged direction {dir_id} for project {project.id}"
@@ -5255,6 +5275,16 @@ async def _handle_strategic_completion(
                     continue
                 target["status"] = "active"
                 target["activated_at"] = _utcnow().isoformat()
+                if target.get("gap_id"):
+                    _pending_gap_reconciles.append(
+                        (
+                            str(dir_id),
+                            target.get("gap_id"),
+                            target.get("gap_id"),
+                            "active",
+                            "proposed",
+                        )
+                    )
                 notes = target.get("notes", [])
                 notes.append(
                     {
@@ -5408,7 +5438,7 @@ async def _handle_strategic_completion(
         if _pending_gap_reconciles:
             from app.problem_model import (
                 parse_problem_model,
-                reconcile_gap_staffing,
+                reconcile_gap_staffing_for_status,
             )
             from pydantic import ValidationError as _PMValidationError
 
@@ -5418,9 +5448,32 @@ async def _handle_strategic_completion(
                 _pm_model = None
             if _pm_model is not None:
                 _pm_changed = False
-                for _did, _new_g, _prior_g in _pending_gap_reconciles:
-                    if reconcile_gap_staffing(_pm_model, _did, _new_g, _prior_g):
+                for _entry in _pending_gap_reconciles:
+                    if len(_entry) == 3:
+                        _did, _new_g, _prior_g = _entry
+                        _new_status = "active"
+                        _prior_status = None
+                    else:
+                        _did, _new_g, _prior_g, _new_status, _prior_status = _entry
+                    _result = reconcile_gap_staffing_for_status(
+                        _pm_model,
+                        _did,
+                        _new_g,
+                        _prior_g,
+                        new_status=_new_status,
+                        prior_status=_prior_status,
+                        now_iso=_utcnow().isoformat(),
+                    )
+                    if _result.changed:
                         _pm_changed = True
+                    if _result.unresolved_gap_ids:
+                        logger.warning(
+                            "[STRATEGIC] Task %s: fallback gap staffing "
+                            "reconciliation unresolved for %s: %s",
+                            task.id,
+                            _did,
+                            _result.model_dump(),
+                        )
                 if _pm_changed:
                     project.problem_model = _pm_model.model_dump()
                     flag_modified(project, "problem_model")

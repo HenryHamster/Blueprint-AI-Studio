@@ -47,6 +47,7 @@ from app.problem_model import (
     parse_problem_model,
     reconcile_gap_staffing,
     reconcile_gap_staffing_raw,
+    reconcile_gap_staffing_raw_result,
     reconcile_gaps_for_retired_directions,
 )
 
@@ -4350,6 +4351,25 @@ def test_unknown_gap_id_is_safe_no_op():
 
     assert changed is False
     assert model.gaps[0].active_moves == []
+
+
+def test_raw_gap_staffing_classifies_unresolved_gap_id():
+    """Dangling links remain fail-open but are classified for caller logging."""
+    raw = ProblemModel(gaps=[Gap(id="g-1", name="real")]).model_dump()
+
+    result = reconcile_gap_staffing_raw_result(
+        raw,
+        "d-new",
+        "g-missing",
+        None,
+        new_status="active",
+    )
+
+    assert result["changed"] is False
+    assert result["problem_model"] is None
+    details = result["result"]
+    assert details["unresolved_gap_ids"] == {"new_gap_id": "g-missing"}
+    assert details["malformed_model"] is False
 
 
 def test_reground_to_same_gap_is_no_op():

@@ -181,6 +181,50 @@ async def test_activation_helper_flips_eligible_only(db_session):
 
 
 @pytest.mark.asyncio
+async def test_activation_helper_restaffs_problem_model_gap(db_session):
+    """Activating staged gap-linked work staffs its gap and clears deferral."""
+    project = Project(
+        name="Staged-Activate-Gap",
+        user_id="staged-user",
+        autonomous_enabled=True,
+        directions=[
+            _staged_direction("d-gap", staged_for_version=2, gap_id="g-gap"),
+        ],
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-gap",
+                    "name": "gap",
+                    "status": "active",
+                    "active_moves": [],
+                    "past_moves": ["d-old"],
+                    "deferral": {
+                        "rationale": "intentionally staged",
+                        "created_at": "2026-01-01T00:00:00",
+                    },
+                }
+            ],
+        },
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    activated = await activate_eligible_staged_directions(
+        db_session, project.id, promoted_version_number=2
+    )
+
+    assert activated == ["d-gap"]
+    await db_session.refresh(project)
+    gap = project.problem_model["gaps"][0]
+    assert gap["active_moves"] == ["d-gap"]
+    assert gap["past_moves"] == ["d-old"]
+    assert gap["deferral"] is None
+
+
+@pytest.mark.asyncio
 async def test_activation_helper_fail_open_on_missing_marker(db_session):
     """A staged direction with no parseable staged_for_version is activated
     (fail-open) so a malformed marker can never strand work forever."""

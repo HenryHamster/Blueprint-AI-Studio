@@ -5671,7 +5671,9 @@ async def test_set_retirement_critiques_rejects_all_malformed(client, db_session
 # ── set_evidence_progress HTTP API path ────────────────────────────────────────
 
 
-async def _make_strategic_task(db_session, *, name, vm, directions=None):
+async def _make_strategic_task(
+    db_session, *, name, vm, directions=None, problem_model=None
+):
     """Build a committed project + cycle + strategic_review task; return the task."""
     from app.models import TaskStatus
     from app import strategic_cycle
@@ -5680,6 +5682,7 @@ async def _make_strategic_task(db_session, *, name, vm, directions=None):
         name=name,
         user_id="u1",
         vision={"purpose": "test", "revision": 1},
+        problem_model=problem_model,
         directions=directions or [],
     )
     db_session.add(project)
@@ -6413,6 +6416,72 @@ async def test_approve_direction_rejected_portfolio_operation_blocks(
     approved = next(d for d in project.directions if d.get("id") == "d-approve")
     assert approved["status"] == "proposed"
     assert "activated_at" not in approved
+
+
+@pytest.mark.asyncio
+async def test_approve_direction_staffs_linked_gap(client, db_session):
+    """Approve direction must activate the direction and staff its linked gap."""
+    from app.auth import create_agent_token
+
+    task = await _make_strategic_task(
+        db_session,
+        name="PO-APPROVE-GAP",
+        vm="vm-po-approve-gap",
+        directions=[
+            {
+                "id": "d-approve",
+                "status": "proposed",
+                "text": "Approve me",
+                "gap_id": "g-1",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+        problem_model={
+            "revision": 1,
+            "gaps": [
+                {
+                    "id": "g-1",
+                    "name": "Gap 1",
+                    "status": "active",
+                    "active_moves": [],
+                    "past_moves": [],
+                    "deferral": {
+                        "rationale": "waiting on staffing",
+                        "created_at": "2026-01-01T00:00:00",
+                    },
+                }
+            ],
+        },
+    )
+
+    token = create_agent_token(
+        str(task.id), "vm-po-approve-gap", task_type="strategic_review"
+    )
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "approve_direction",
+            "data": {"direction_id": "d-approve", "rationale": "good idea"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "approve_direction"
+
+    project = await db_session.get(Project, task.project_id)
+    await db_session.refresh(project)
+    approved = next(d for d in project.directions if d.get("id") == "d-approve")
+    assert approved["status"] == "active"
+    assert approved["activated_at"]
+
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-1")
+    assert gap["active_moves"] == ["d-approve"]
+    assert gap["past_moves"] == []
+    assert gap["deferral"] is None
 
 
 @pytest.mark.asyncio
@@ -17423,3 +17492,105 @@ async def test_set_acceptance_criteria_dedup_does_not_consume_headroom(
     # DB count unchanged
     count_after = await ac.count_criteria_for_version(db_session, version.id)
     assert count_after == ac.MAX_CRITERIA_PER_VERSION
+
+
+@pytest.mark.asyncio
+async def test_set_acceptance_criteria_rejects_inactive_or_dangling_direction_mapping_key(
+    client: AsyncClient, db_session
+):
+    """set_acceptance_criteria scrubs inactive and dangling criterion keys
+    from Direction.criterion_keys when merging new mappings via classify_criterion_key.
+
+    A direction may carry stale criterion_keys from prior operations.  When
+    set_acceptance_criteria maps a new criterion to that direction, the guard
+    classifies each existing key — inactive (retracted) and dangling (never
+    existed) keys are filtered out, leaving only active or newly-created keys.
+    """
+    from app import acceptance_criteria as ac
+
+    project = Project(name="AC-Guard-Scrub-Test", user_id="test-user-ac-guard")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(project_id=project.id, version_number=1, status="open")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Create a criterion and retract it so it becomes inactive.
+    inactive_criterion = await ac.create_criterion(
+        db_session, project.id, version.id, "Criterion that will be retracted"
+    )
+    await ac.retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=inactive_criterion.criterion_key,
+        reason="superseded in test",
+        retracted_by="test",
+    )
+
+    # Direction pre-loaded with one inactive key and one dangling key (never existed).
+    dangling_key = "c-dangling-does-not-exist"
+    direction = Direction(
+        project_id=project.id,
+        direction_key="d-guard-scrub-test1",
+        data={"id": "d-guard-scrub-test1", "text": "Test direction", "status": "active"},
+        status="active",
+        criterion_keys=[inactive_criterion.criterion_key, dangling_key],
+    )
+    db_session.add(direction)
+    await db_session.commit()
+    await db_session.refresh(direction)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review"}],
+        vm_instance_id="agent-vm-ac-guard",
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(
+        str(task.id), "agent-vm-ac-guard", task_type="strategic_review"
+    )
+    headers = {"x-agent-token": token}
+
+    # Map a new active criterion to the direction.
+    resp = await client.post(
+        "/api/agent/strategic",
+        headers=headers,
+        json={
+            "task_id": str(task.id),
+            "op": "set_acceptance_criteria",
+            "data": {
+                "criteria": [
+                    {
+                        "text": "New active criterion to map",
+                        "direction_keys": ["d-guard-scrub-test1"],
+                    }
+                ]
+            },
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert len(body["criteria"]) == 1
+    new_criterion_key = body["criteria"][0]["criterion_key"]
+    assert body["criteria"][0]["direction_keys"] == ["d-guard-scrub-test1"]
+
+    # The direction must contain only the new active key.
+    # classify_criterion_key must have scrubbed both the inactive and dangling keys.
+    await db_session.refresh(direction)
+    assert new_criterion_key in direction.criterion_keys, (
+        "New criterion key must be present in direction.criterion_keys"
+    )
+    assert inactive_criterion.criterion_key not in direction.criterion_keys, (
+        "Inactive (retracted) criterion key must be scrubbed from direction.criterion_keys"
+    )
+    assert dangling_key not in direction.criterion_keys, (
+        "Dangling criterion key must be scrubbed from direction.criterion_keys"
+    )

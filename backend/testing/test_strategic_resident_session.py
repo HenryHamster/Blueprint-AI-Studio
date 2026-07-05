@@ -2341,3 +2341,96 @@ def test_compute_model_integrity_conflicts_paused_direction_not_active():
     # g-1 is not referenced by any active direction → orphaned
     assert len(result["orphaned_gaps"]) == 1
     assert result["counts"]["total"] >= 2
+
+
+def test_compute_model_integrity_conflicts_gap_conflicts_carry_recovery_hints():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-old"])]}
+    dirs = [_make_dir("d-1", "Ungrounded dir")]  # no gap → ungrounded + orphan
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    # Every gap-integrity entry surfaces an actionable, operator-facing hint.
+    assert result["orphaned_gaps"][0]["recovery_hint"] == (
+        "Assign an active direction to this gap or record a deferral."
+    )
+    assert result["ungrounded_directions"][0]["recovery_hint"] == (
+        "Link this direction to an open gap or retire it."
+    )
+    assert result["stale_active_moves"][0]["recovery_hint"] == (
+        "Reconcile the gap's active_moves — the listed directions are no longer active."
+    )
+
+
+def test_compute_model_integrity_conflicts_ungrounded_closed_gap_hint():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", status="closed")]}
+    dirs = [_make_dir("d-1", "Direction", gap_id="g-1")]
+    result = compute_model_integrity_conflicts(pm, dirs)
+    assert result is not None
+    ud = result["ungrounded_directions"][0]
+    assert ud["reason"] == "gap_not_active"
+    assert ud["recovery_hint"] == (
+        "Reground this direction to an active gap — its current gap is closed."
+    )
+
+
+def test_compute_model_integrity_conflicts_criterion_links_absent_by_default():
+    # A gap-clean model with no criterion inputs stays clean (backward compatible).
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    assert compute_model_integrity_conflicts(pm, dirs) is None
+
+
+def test_compute_model_integrity_conflicts_criterion_link_inactive_and_dangling():
+    pm = {"gaps": [_make_gap("g-1", "Gap 1", active_moves=["d-1"])]}
+    dirs = [_make_dir("d-1", "Direction 1", gap_id="g-1")]
+    criterion_links = [
+        {
+            "id": "d-1",
+            "text": "Direction 1",
+            "status": "active",
+            "criterion_keys": ["c-ok", "c-retracted", "c-unknown"],
+        }
+    ]
+    result = compute_model_integrity_conflicts(
+        pm,
+        dirs,
+        criterion_links=criterion_links,
+        active_criterion_keys=frozenset({"c-ok"}),
+        inactive_criterion_keys=frozenset({"c-retracted"}),
+    )
+    assert result is not None
+    clc = result["criterion_link_conflicts"]
+    assert len(clc) == 2
+    by_key = {c["criterion_key"]: c for c in clc}
+    assert by_key["c-retracted"]["classification"] == "inactive"
+    assert by_key["c-retracted"]["recovery_hint"] == (
+        "Remap to an active criterion — this key is retracted or superseded."
+    )
+    assert by_key["c-unknown"]["classification"] == "dangling"
+    assert by_key["c-unknown"]["recovery_hint"] == (
+        "Remap to a criterion in the open version — this key is unknown there."
+    )
+    assert by_key["c-retracted"]["direction_id"] == "d-1"
+    assert result["counts"]["criterion_link_conflicts"] == 2
+    assert result["counts"]["total"] == 2
+
+
+def test_compute_model_integrity_conflicts_criterion_links_ignore_inactive_directions():
+    # A retired/paused direction's stale criterion keys are not operator-actionable.
+    pm = {"gaps": []}
+    dirs: list = []
+    criterion_links = [
+        {
+            "id": "d-old",
+            "text": "Retired direction",
+            "status": "retired",
+            "criterion_keys": ["c-unknown"],
+        }
+    ]
+    result = compute_model_integrity_conflicts(
+        pm,
+        dirs,
+        criterion_links=criterion_links,
+        active_criterion_keys=frozenset(),
+        inactive_criterion_keys=frozenset(),
+    )
+    assert result is None

@@ -427,6 +427,37 @@ describe('buildCycleStartReconciliationSection', () => {
     expect(result).toContain('d-aaaabbbb cited in running_update');
   });
 
+  it('renders broken criterion links (inactive + dangling) with recovery hints', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      stale_active_moves: [],
+      criterion_link_conflicts: [
+        { direction_id: 'd-1', direction_text: 'ship valve', criterion_key: 'c-dead', classification: 'inactive', recovery_hint: 'Remap to an active criterion.' },
+        { direction_id: 'd-2', direction_text: 'wrong version', criterion_key: 'c-ghost', classification: 'dangling', recovery_hint: 'Remap to a criterion in the open version.' },
+      ],
+      direction_pipeline: [],
+      counts: { criterion_link_conflicts: 2 },
+    });
+
+    expect(result).toContain('Broken criterion links — direction maps to a non-active criterion (2)');
+    expect(result).toContain('ship valve (id: d-1) → criterion c-dead is retracted or superseded — Remap to an active criterion.');
+    expect(result).toContain('wrong version (id: d-2) → criterion c-ghost is not in the open version — Remap to a criterion in the open version.');
+  });
+
+  it('omits the criterion-link section when there are no criterion conflicts', () => {
+    const result = buildCycleStartReconciliationSection({
+      capability_contradictions: [],
+      orphaned_gaps: [],
+      ungrounded_directions: [],
+      stale_active_moves: [],
+      direction_pipeline: [],
+      counts: {},
+    });
+    expect(result).not.toContain('Broken criterion links');
+  });
+
   it('splits the research pipeline into held / recent / waiting / in-progress / idle', () => {
     const result = buildCycleStartReconciliationSection({
       capability_contradictions: [],

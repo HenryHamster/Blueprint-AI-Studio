@@ -363,6 +363,44 @@ async def test_link_direction_400_unknown_criterion_key(client: AsyncClient, db_
 
 
 @pytest.mark.asyncio
+async def test_link_direction_400_dangling_key_returns_structured_error(
+    client: AsyncClient, db_session
+):
+    """A dangling criterion key returns a structured 400 with active_criterion_keys.
+
+    check_criterion_key_write normalises both dangling and inactive failures
+    into the same structured error shape so callers can inspect
+    error='criterion_key_invalid', classification, keys, and active_criterion_keys.
+    """
+    project = await _make_project_member(db_session, role="member")
+    version = await _make_version(db_session, project)
+    direction = await _make_direction(db_session, project)
+
+    # Create one active criterion so the active_criterion_keys list is non-empty.
+    active = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="Active criterion",
+    )
+
+    resp = await client.post(
+        f"{_BASE}/projects/{project.id}/acceptance-criteria/link-direction",
+        json={
+            "direction_key": direction.direction_key,
+            "criterion_keys": ["c-does-not-exist"],
+        },
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    detail = body.get("error", {}).get("message", body)
+    assert detail.get("error") == "criterion_key_invalid"
+    assert detail.get("classification") == "dangling"
+    assert "c-does-not-exist" in detail.get("keys", [])
+    assert active.criterion_key in detail.get("active_criterion_keys", [])
+
+
+@pytest.mark.asyncio
 async def test_link_direction_404_unknown_direction(client: AsyncClient, db_session):
     """Returns 404 when direction_key does not exist in the project."""
     project = await _make_project_member(db_session)

@@ -677,15 +677,41 @@ def _resident_session_availability(
     return {"available": enabled, "state": state, "reason": reason}
 
 
+# Concise, operator-facing recovery hints keyed by conflict class. Kept short
+# so both the admin workspace panel and the agent section renderer can surface
+# the same actionable text without re-deriving it per surface.
+_RECOVERY_HINTS: dict[str, str] = {
+    "orphaned_gap": "Assign an active direction to this gap or record a deferral.",
+    "ungrounded_no_gap_id": "Link this direction to an open gap or retire it.",
+    "ungrounded_gap_not_active": "Reground this direction to an active gap — its current gap is closed.",
+    "stale_active_moves": "Reconcile the gap's active_moves — the listed directions are no longer active.",
+    "criterion_inactive": "Remap to an active criterion — this key is retracted or superseded.",
+    "criterion_dangling": "Remap to a criterion in the open version — this key is unknown there.",
+}
+
+
 def compute_model_integrity_conflicts(
     problem_model: Any,
     directions: Any,
+    *,
+    criterion_links: Any = None,
+    active_criterion_keys: Any = None,
+    inactive_criterion_keys: Any = None,
 ) -> dict | None:
     """Compute integrity conflict classes from the live problem model.
 
     Returns None when the model is clean (no conflicts). When conflicts exist,
-    returns a dict with three lists — orphaned_gaps, ungrounded_directions,
-    stale_active_moves — and aggregate counts.
+    returns a dict with four lists — orphaned_gaps, ungrounded_directions,
+    stale_active_moves, criterion_link_conflicts — each entry carrying a
+    concise ``recovery_hint``, plus aggregate counts.
+
+    Gap integrity (the first three classes) is derived purely from
+    ``problem_model`` and ``directions``. Criterion-mapping integrity is
+    optional: pass ``criterion_links`` (a list of ``{"id","text","status",
+    "criterion_keys"}`` dicts sourced from Direction rows) together with the
+    open version's ``active_criterion_keys`` / ``inactive_criterion_keys``
+    frozensets. When those are omitted, criterion conflicts are simply not
+    computed and the returned shape stays backward compatible.
 
     Pure and side-effect-free; operates only on the data handed in.
     """
@@ -721,6 +747,7 @@ def compute_model_integrity_conflicts(
                 "id": gap_id,
                 "name": str(g.get("name") or "")[:80],
                 "status": g.get("status") or "active",
+                "recovery_hint": _RECOVERY_HINTS["orphaned_gap"],
             })
 
     # 2. Active directions whose gap_id is absent or points to a non-active gap.
@@ -728,11 +755,16 @@ def compute_model_integrity_conflicts(
     for d in active_dirs:
         gap_id = d.get("gap_id")
         if not gap_id or str(gap_id) not in active_gap_ids:
+            reason = "no_gap_id" if not gap_id else "gap_not_active"
             ungrounded_directions.append({
                 "id": str(d.get("id") or ""),
                 "text": str(d.get("text") or "")[:120],
                 "gap_id": str(gap_id) if gap_id else None,
-                "reason": "no_gap_id" if not gap_id else "gap_not_active",
+                "reason": reason,
+                "recovery_hint": _RECOVERY_HINTS[
+                    "ungrounded_no_gap_id" if reason == "no_gap_id"
+                    else "ungrounded_gap_not_active"
+                ],
             })
 
     # 3. Gaps whose active_moves list cites direction IDs that are no longer active.
@@ -753,19 +785,92 @@ def compute_model_integrity_conflicts(
                 "gap_id": gap_id,
                 "gap_name": str(g.get("name") or "")[:80],
                 "stale_direction_ids": stale_ids[:8],
+                "recovery_hint": _RECOVERY_HINTS["stale_active_moves"],
             })
 
-    if not orphaned_gaps and not ungrounded_directions and not stale_active_moves:
+    # 4. Active directions whose criterion_keys point at inactive or unknown
+    #    (dangling / wrong-version) acceptance criteria for the open version.
+    criterion_link_conflicts = _compute_criterion_link_conflicts(
+        criterion_links,
+        active_criterion_keys,
+        inactive_criterion_keys,
+    )
+
+    if (
+        not orphaned_gaps
+        and not ungrounded_directions
+        and not stale_active_moves
+        and not criterion_link_conflicts
+    ):
         return None
 
     return {
         "orphaned_gaps": orphaned_gaps,
         "ungrounded_directions": ungrounded_directions,
         "stale_active_moves": stale_active_moves,
+        "criterion_link_conflicts": criterion_link_conflicts,
         "counts": {
             "orphaned_gaps": len(orphaned_gaps),
             "ungrounded_directions": len(ungrounded_directions),
             "stale_active_moves": len(stale_active_moves),
-            "total": len(orphaned_gaps) + len(ungrounded_directions) + len(stale_active_moves),
+            "criterion_link_conflicts": len(criterion_link_conflicts),
+            "total": (
+                len(orphaned_gaps)
+                + len(ungrounded_directions)
+                + len(stale_active_moves)
+                + len(criterion_link_conflicts)
+            ),
         },
     }
+
+
+def _compute_criterion_link_conflicts(
+    criterion_links: Any,
+    active_criterion_keys: Any,
+    inactive_criterion_keys: Any,
+) -> list[dict]:
+    """Classify each active direction's criterion_keys against the open version.
+
+    Returns one conflict entry per (direction, offending key) pair for keys that
+    are ``inactive`` (retracted/superseded) or ``dangling`` (absent from the
+    open version — which also covers keys carried over from a different
+    version). Valid keys and inputs that are absent/malformed yield an empty
+    list, so the caller can pass this through unconditionally.
+    """
+    if not isinstance(criterion_links, list) or active_criterion_keys is None:
+        return []
+
+    from app.direction_referential_guard import classify_criterion_key
+
+    active_keys = frozenset(active_criterion_keys or ())
+    inactive_keys = frozenset(inactive_criterion_keys or ())
+
+    conflicts: list[dict] = []
+    for link in criterion_links:
+        if not isinstance(link, dict):
+            continue
+        if (link.get("status") or "active") != "active":
+            continue
+        keys = link.get("criterion_keys")
+        if not isinstance(keys, list):
+            continue
+        direction_id = str(link.get("id") or "")
+        direction_text = str(link.get("text") or "")[:120]
+        for raw_key in keys:
+            key = str(raw_key or "")
+            if not key:
+                continue
+            cls = classify_criterion_key(key, active_keys, inactive_keys)
+            if cls == "valid":
+                continue
+            conflicts.append({
+                "direction_id": direction_id,
+                "direction_text": direction_text,
+                "criterion_key": key,
+                "classification": cls,
+                "recovery_hint": _RECOVERY_HINTS[
+                    "criterion_inactive" if cls == "inactive"
+                    else "criterion_dangling"
+                ],
+            })
+    return conflicts

@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
+from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
@@ -40,7 +41,12 @@ from app.project_message_creation import (
     create_operator_project_message,
     parse_operator_message_type,
 )
-from app.problem_model import check_gap_id_write, compute_model_size_signal, ProblemModel
+from app.problem_model import (
+    ProblemModel,
+    check_gap_id_write,
+    compute_model_size_signal,
+    reconcile_gap_staffing_raw_result,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +58,33 @@ router = APIRouter(
 DIRECTION_TEXT_MAX = 2000
 COMPLETION_CRITERIA_MAX = 500
 DIRECTION_CONTEXT_FIELD_MAX = 500
+
+
+def _log_gap_staffing_reconcile_result(
+    *,
+    source: str,
+    project_id: uuid.UUID,
+    result: dict[str, Any],
+) -> None:
+    details = result.get("result") if isinstance(result, dict) else None
+    if not isinstance(details, dict):
+        return
+    if details.get("malformed_model"):
+        logger.warning(
+            "[directions] gap staffing reconciliation skipped malformed problem_model",
+            extra={"source": source, "project_id": str(project_id)},
+        )
+    unresolved = details.get("unresolved_gap_ids") or {}
+    if unresolved:
+        logger.warning(
+            "[directions] gap staffing reconciliation unresolved gap link",
+            extra={
+                "source": source,
+                "project_id": str(project_id),
+                "direction_id": details.get("direction_id"),
+                "unresolved_gap_ids": unresolved,
+            },
+        )
 
 
 def _compute_direction_merges_per_cycle(d: dict) -> Any:
@@ -453,6 +486,23 @@ async def add_direction(
             status_code=429,
             detail="Project row locked by concurrent write, retry",
             headers={"Retry-After": "2"},
+        )
+    if not existing_direction and direction.get("gap_id") and not payload.staged:
+        reconciliation = reconcile_gap_staffing_raw_result(
+            project.problem_model,
+            direction["id"],
+            direction["gap_id"],
+            None,
+            new_status=direction.get("status"),
+            now_iso=_utcnow().isoformat(),
+        )
+        if reconciliation.get("problem_model") is not None:
+            project.problem_model = reconciliation["problem_model"]
+            flag_modified(project, "problem_model")
+        _log_gap_staffing_reconcile_result(
+            source="operator_create_direction",
+            project_id=project.id,
+            result=reconciliation,
         )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
@@ -876,6 +926,7 @@ async def update_direction(
             staged_for_version = target
 
     updated_direction: list = []  # [d] populated by mutate_fn
+    staffing_transition: list[dict[str, Any]] = []
 
     def _mutate_update(directions: list) -> None:
         # Cap check (needs locked data): if reactivating, ensure cap won't be exceeded
@@ -917,6 +968,8 @@ async def update_direction(
                 _pre_ctx = d.get("context") or {}
                 _pre_se = _pre_ctx.get("success_evidence")
                 _pre_rc = _pre_ctx.get("retirement_condition")
+                _pre_gap_id = d.get("gap_id")
+                _pre_status = d.get("status")
 
                 if "priority" in payload:
                     d["priority"] = payload["priority"]
@@ -1055,6 +1108,15 @@ async def update_direction(
                 ):
                     _reset_outcome_detection_state(d)
 
+                if "gap_id" in payload or "status" in payload:
+                    staffing_transition.append(
+                        {
+                            "prior_gap_id": _pre_gap_id,
+                            "new_gap_id": d.get("gap_id"),
+                            "prior_status": _pre_status,
+                            "new_status": d.get("status"),
+                        }
+                    )
                 updated_direction.append(d)
                 return
         raise HTTPException(status_code=404, detail="Direction not found")
@@ -1067,6 +1129,25 @@ async def update_direction(
             status_code=429,
             detail="Project row locked by concurrent write, retry",
             headers={"Retry-After": "2"},
+        )
+    if staffing_transition:
+        transition = staffing_transition[0]
+        reconciliation = reconcile_gap_staffing_raw_result(
+            project.problem_model,
+            direction_id,
+            transition.get("new_gap_id"),
+            transition.get("prior_gap_id"),
+            new_status=transition.get("new_status"),
+            prior_status=transition.get("prior_status"),
+            now_iso=_utcnow().isoformat(),
+        )
+        if reconciliation.get("problem_model") is not None:
+            project.problem_model = reconciliation["problem_model"]
+            flag_modified(project, "problem_model")
+        _log_gap_staffing_reconcile_result(
+            source="operator_update_direction",
+            project_id=project.id,
+            result=reconciliation,
         )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)

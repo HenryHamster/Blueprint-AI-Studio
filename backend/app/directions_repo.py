@@ -356,15 +356,31 @@ async def activate_eligible_staged_directions(
     # transaction (committed below). Mirrors create_direction's staffing:
     # add direction_id to gap.active_moves and clear any GapDeferral.
     if activated_with_gaps:
-        from app.problem_model import reconcile_gap_staffing_raw as _rcgs  # noqa: PLC0415
+        from app.problem_model import reconcile_gap_staffing_raw_result as _rcgs  # noqa: PLC0415
         from app.task_locking import with_problem_model_locked as _wpm_locked  # noqa: PLC0415
 
         def _restaff_pm(pm: dict) -> None:
             current = dict(pm)
             for _did, _gid in activated_with_gaps:
-                result = _rcgs(current, _did, _gid, None)
-                if result is not None:
-                    current = result
+                result = _rcgs(
+                    current,
+                    _did,
+                    _gid,
+                    None,
+                    new_status="active",
+                    prior_status="staged",
+                    now_iso=now_iso,
+                )
+                if result.get("problem_model") is not None:
+                    current = result["problem_model"]
+                details = result.get("result") or {}
+                if details.get("malformed_model") or details.get("unresolved_gap_ids"):
+                    logger.warning(
+                        "[directions_repo] staged-activation gap re-staffing "
+                        "classified drift for %s: %s",
+                        _did,
+                        details,
+                    )
             pm.clear()
             pm.update(current)
 

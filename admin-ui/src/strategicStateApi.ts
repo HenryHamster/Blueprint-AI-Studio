@@ -973,22 +973,32 @@ export interface StrategicStateResponse {
     stale_reason?: string | null;
   } | null;
   model_integrity?: {
-    orphaned_gaps: Array<{ id: string; name: string; status: string }>;
+    orphaned_gaps: Array<{ id: string; name: string; status: string; recovery_hint?: string }>;
     ungrounded_directions: Array<{
       id: string;
       text: string;
       gap_id: string | null;
       reason: 'no_gap_id' | 'gap_not_active' | string;
+      recovery_hint?: string;
     }>;
     stale_active_moves: Array<{
       gap_id: string;
       gap_name: string;
       stale_direction_ids: string[];
+      recovery_hint?: string;
+    }>;
+    criterion_link_conflicts?: Array<{
+      direction_id: string;
+      direction_text: string;
+      criterion_key: string;
+      classification: 'inactive' | 'dangling' | string;
+      recovery_hint?: string;
     }>;
     counts: {
       orphaned_gaps: number;
       ungrounded_directions: number;
       stale_active_moves: number;
+      criterion_link_conflicts?: number;
       total: number;
     };
   } | null;

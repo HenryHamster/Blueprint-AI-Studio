@@ -250,6 +250,25 @@ export function buildCycleStartReconciliationSection(recon: Record<string, unkno
     }
   }
 
+  // Active directions whose criterion_keys map to inactive or unknown
+  // (dangling / wrong-version) acceptance criteria for the open version.
+  const criterionLinkConflicts = Array.isArray(recon.criterion_link_conflicts)
+    ? recon.criterion_link_conflicts as Array<Record<string, unknown>> : [];
+  if (criterionLinkConflicts.length > 0) {
+    lines.push(`\n### Broken criterion links — direction maps to a non-active criterion (${fmtScalar(counts.criterion_link_conflicts, String(criterionLinkConflicts.length))})`);
+    lines.push('These directions carry criterion_keys that are retracted/superseded (inactive) or absent from the open version (dangling). Remap each to an active criterion or clear the stale key.');
+    for (const c of criterionLinkConflicts) {
+      const text = strVal(c.direction_text ?? c.text, '?');
+      const did = strVal(c.direction_id, '?');
+      const key = strVal(c.criterion_key, '?');
+      const cls = strVal(c.classification) === 'inactive'
+        ? 'retracted or superseded'
+        : 'not in the open version';
+      const hint = c.recovery_hint ? ` — ${strVal(c.recovery_hint)}` : '';
+      lines.push(`- ${text} (id: ${did}) → criterion ${key} is ${cls}${hint}`);
+    }
+  }
+
   if (phantomRefs.length > 0) {
     lines.push(`\n### Phantom direction refs — prose cites missing directions (${fmtScalar(counts.phantom_direction_refs, String(phantomRefs.length))})`);
     lines.push('These prose references do not resolve to any known direction. Rewrite the stale narrative or link it to a real direction.');

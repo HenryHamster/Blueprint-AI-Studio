@@ -23,6 +23,7 @@ from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
     MESSAGE_CONTENT_MAX,
+    Direction,
     ProjectMessage,
     MessageType,
     ReleaseVersion,
@@ -1201,9 +1202,62 @@ async def get_project_strategic_state(
     else:
         sha_freshness = _build_unknown_freshness_block()
 
+    # Criterion-mapping integrity: Direction.criterion_keys live on the
+    # Direction rows (not the directions blob), so fetch them and the open
+    # version's key sets to classify inactive/dangling/wrong-version links.
+    # Best-effort — a DB hiccup here must not sink the whole endpoint, so it
+    # degrades to gap-only integrity.
+    criterion_links: list[dict] | None = None
+    active_crit_keys = None
+    inactive_crit_keys = None
+    if open_version is not None:
+        try:
+            from app.direction_referential_guard import (
+                load_version_criterion_key_sets,
+            )
+
+            active_crit_keys, inactive_crit_keys = (
+                await load_version_criterion_key_sets(
+                    session, project.id, open_version.id
+                )
+            )
+            crit_rows = (
+                (
+                    await session.execute(
+                        select(Direction).where(
+                            Direction.project_id == project.id,
+                            Direction.status == "active",
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            criterion_links = [
+                {
+                    "id": row.direction_key,
+                    "text": row.text or "",
+                    "status": row.status,
+                    "criterion_keys": list(row.criterion_keys or []),
+                }
+                for row in crit_rows
+                if row.criterion_keys
+            ]
+        except Exception:
+            logger.exception(
+                "[STRATEGIC_STATE] criterion-link integrity resolve failed for project %s",
+                project.id,
+            )
+            criterion_links = None
+            active_crit_keys = None
+            inactive_crit_keys = None
+
     model_integrity = compute_model_integrity_conflicts(
         project.problem_model,
         project.directions,
+        criterion_links=criterion_links,
+        active_criterion_keys=active_crit_keys,
+        inactive_criterion_keys=inactive_crit_keys,
     )
 
     return {

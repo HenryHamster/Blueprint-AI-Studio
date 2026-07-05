@@ -462,6 +462,42 @@ async def _process_direction_lifecycle_locked(
         project.problem_model = _reconciled
         flag_modified(project, "problem_model")
 
+    def _reconcile_gap_status(
+        direction: dict,
+        *,
+        new_status: str,
+        prior_status: str | None,
+        rationale: str | None = None,
+    ) -> None:
+        """Keep problem-model gap staffing aligned with lifecycle status flips."""
+        did = direction.get("id")
+        gap_id = direction.get("gap_id")
+        if not did or not gap_id:
+            return
+        from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+        result = reconcile_gap_staffing_raw_result(
+            project.problem_model,
+            str(did),
+            str(gap_id),
+            str(gap_id),
+            new_status=new_status,
+            prior_status=prior_status,
+            now_iso=_utcnow().isoformat(),
+            rationale=rationale,
+        )
+        if result.get("problem_model") is not None:
+            project.problem_model = result["problem_model"]
+            flag_modified(project, "problem_model")
+        details = result.get("result") or {}
+        if details.get("malformed_model") or details.get("unresolved_gap_ids"):
+            logger.warning(
+                "[AUTONOMOUS] Gap staffing reconciliation classified drift for "
+                "direction %s: %s",
+                did,
+                details,
+            )
+
     async def _retire_lifetime_burn(d: dict, did, lb_pause_count: int) -> None:
         """Apply the terminal lifetime-burn retirement to ``d`` in place.
 
@@ -661,6 +697,7 @@ async def _process_direction_lifecycle_locked(
         if hours < recovery_hours:
             continue
         if not d.get("needs_manual_intervention"):
+            prior_status = d.get("status")
             d["status"] = "active"
             for k in ("auto_paused", "paused_reason", "paused_at"):
                 d.pop(k, None)
@@ -677,6 +714,11 @@ async def _process_direction_lifecycle_locked(
                 d["remediation_monitor_started_at"] = _utcnow().isoformat()
             logger.info(
                 f"[AUTONOMOUS] Auto-recovered direction {d.get('id')} after {hours:.0f}h cooldown"
+            )
+            _reconcile_gap_status(
+                d,
+                new_status="active",
+                prior_status=prior_status,
             )
             directions_modified = True
         else:
@@ -961,6 +1003,7 @@ async def _process_direction_lifecycle_locked(
             )
             pause_reason = None
         if pause_reason:
+            prior_status = d.get("status")
             d["status"] = "paused"
             d["paused_reason"] = pause_reason
             d["paused_at"] = _utcnow().isoformat()
@@ -1122,6 +1165,12 @@ async def _process_direction_lifecycle_locked(
                             d.get("escalation_notification_retries", 0)
                         )
             logger.info(f"[AUTONOMOUS] Auto-paused direction {did}: {pause_reason}")
+            _reconcile_gap_status(
+                d,
+                new_status="paused",
+                prior_status=prior_status,
+                rationale=pause_reason,
+            )
             auto_paused_any = True
             try:
                 if pause_reason.startswith("Lifetime burn backstop:"):

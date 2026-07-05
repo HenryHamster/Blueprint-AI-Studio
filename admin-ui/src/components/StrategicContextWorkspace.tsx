@@ -885,6 +885,9 @@ export function StrategicContextWorkspace({
                       <span className="mt-0.5 block truncate text-xs text-neutral-500">
                         {gap.status === 'blocked' ? 'blocked gap' : 'gap'} {gap.id.slice(0, 8)} has no active direction
                       </span>
+                      {gap.recovery_hint && (
+                        <span className="mt-0.5 block text-xs text-emerald-400">→ {gap.recovery_hint}</span>
+                      )}
                     </div>
                   ))}
                   {state.model_integrity.ungrounded_directions.map(dir => (
@@ -894,6 +897,9 @@ export function StrategicContextWorkspace({
                       <span className="mt-0.5 block truncate text-xs text-neutral-500">
                         {dir.reason === 'no_gap_id' ? 'no gap linked' : `gap ${dir.gap_id} is not active`}
                       </span>
+                      {dir.recovery_hint && (
+                        <span className="mt-0.5 block text-xs text-emerald-400">→ {dir.recovery_hint}</span>
+                      )}
                     </div>
                   ))}
                   {state.model_integrity.stale_active_moves.map(item => (
@@ -903,6 +909,23 @@ export function StrategicContextWorkspace({
                       <span className="mt-0.5 block truncate text-xs text-neutral-500">
                         {`${item.stale_direction_ids.length} stale direction${item.stale_direction_ids.length !== 1 ? 's' : ''} in active_moves`}
                       </span>
+                      {item.recovery_hint && (
+                        <span className="mt-0.5 block text-xs text-emerald-400">→ {item.recovery_hint}</span>
+                      )}
+                    </div>
+                  ))}
+                  {(state.model_integrity.criterion_link_conflicts ?? []).map(link => (
+                    <div key={`crit:${link.direction_id}:${link.criterion_key}`} className="border-t border-neutral-800/70 py-2 first:border-t-0">
+                      <span className="block truncate text-sm font-semibold text-neutral-100">{link.direction_text || link.direction_id}</span>
+                      <span className="mt-0.5 block text-ui-sm font-semibold uppercase text-amber-400">
+                        {link.classification === 'inactive' ? 'inactive criterion link' : 'dangling criterion link'}
+                      </span>
+                      <span className="mt-0.5 block truncate text-xs text-neutral-500">
+                        criterion {link.criterion_key} {link.classification === 'inactive' ? 'is retracted or superseded' : 'is not in the open version'}
+                      </span>
+                      {link.recovery_hint && (
+                        <span className="mt-0.5 block text-xs text-emerald-400">→ {link.recovery_hint}</span>
+                      )}
                     </div>
                   ))}
                 </div>

@@ -587,4 +587,56 @@ describe('StrategicContextWorkspace', () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onOpenTarget).toHaveBeenCalledWith({ surface: 'runtime', section: 'devices' });
   });
+
+  test('renders model-integrity conflicts with recovery hints and criterion links', () => {
+    const stateWithIntegrity: StrategicStateResponse = {
+      ...STATE,
+      model_integrity: {
+        orphaned_gaps: [
+          { id: 'g-abcdef12', name: 'Cross-cycle memory', status: 'active', recovery_hint: 'Assign an active direction to this gap or record a deferral.' },
+        ],
+        ungrounded_directions: [
+          { id: 'd-1', text: 'Refactor auth', gap_id: null, reason: 'no_gap_id', recovery_hint: 'Link this direction to an open gap or retire it.' },
+        ],
+        stale_active_moves: [
+          { gap_id: 'g-2', gap_name: 'Payload budget', stale_direction_ids: ['d-old'], recovery_hint: "Reconcile the gap's active_moves — the listed directions are no longer active." },
+        ],
+        criterion_link_conflicts: [
+          { direction_id: 'd-3', direction_text: 'Ship valve', criterion_key: 'c-dead', classification: 'inactive', recovery_hint: 'Remap to an active criterion — this key is retracted or superseded.' },
+          { direction_id: 'd-4', direction_text: 'Wrong version', criterion_key: 'c-ghost', classification: 'dangling', recovery_hint: 'Remap to a criterion in the open version — this key is unknown there.' },
+        ],
+        counts: {
+          orphaned_gaps: 1,
+          ungrounded_directions: 1,
+          stale_active_moves: 1,
+          criterion_link_conflicts: 2,
+          total: 5,
+        },
+      },
+    };
+    const { host } = mount({ state: stateWithIntegrity });
+
+    const panel = host.querySelector('[data-testid="strategic-context-workspace-integrity"]');
+    expect(panel).not.toBeNull();
+    const text = panel?.textContent ?? '';
+    expect(text).toContain('5 conflicts');
+    // Gap-integrity classes render with their recovery hints.
+    expect(text).toContain('orphaned gap');
+    expect(text).toContain('Assign an active direction to this gap or record a deferral.');
+    expect(text).toContain('ungrounded direction');
+    expect(text).toContain('Link this direction to an open gap or retire it.');
+    expect(text).toContain('stale active_moves');
+    // Criterion-mapping classes render distinctly with their own hints.
+    expect(text).toContain('inactive criterion link');
+    expect(text).toContain('criterion c-dead is retracted or superseded');
+    expect(text).toContain('Remap to an active criterion — this key is retracted or superseded.');
+    expect(text).toContain('dangling criterion link');
+    expect(text).toContain('criterion c-ghost is not in the open version');
+    expect(text).toContain('Remap to a criterion in the open version — this key is unknown there.');
+  });
+
+  test('hides the model-integrity panel when there are no conflicts', () => {
+    const { host } = mount();
+    expect(host.querySelector('[data-testid="strategic-context-workspace-integrity"]')).toBeNull();
+  });
 });

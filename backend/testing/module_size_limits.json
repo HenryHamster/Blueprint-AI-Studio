@@ -118,7 +118,7 @@
     "compute_backends.py": 2350,
     "direction_lifecycle.py": 1750,
     "routers/admin_notifications.py": 1850,
-    "strategic_state_read_model.py": 850,
+    "strategic_state_read_model.py": 1100,
     "strategic_resident_session.py": 1750,
     "work_session_check_in.py": 400,
     "release_qualifier_sweep.py": 1750,

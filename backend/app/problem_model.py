@@ -287,6 +287,22 @@ class Gap(BaseModel):
     (cannot be regressed by a stale directive)."""
 
 
+class GapStaffingReconciliation(BaseModel):
+    """Structured result for direction/gap staffing reconciliation."""
+
+    changed: bool = False
+    direction_id: str = ""
+    new_gap_id: str | None = None
+    prior_gap_id: str | None = None
+    new_status: str | None = None
+    prior_status: str | None = None
+    staffed_gap_id: str | None = None
+    pruned_gap_ids: list[str] = Field(default_factory=list)
+    newly_deferred_gap_ids: list[str] = Field(default_factory=list)
+    unresolved_gap_ids: dict[str, str] = Field(default_factory=dict)
+    malformed_model: bool = False
+
+
 # ---------------------------------------------------------------------------
 # Friction
 # ---------------------------------------------------------------------------
@@ -667,75 +683,152 @@ def reconcile_gaps_for_retired_directions(
     return model, newly_deferred
 
 
-def reconcile_gap_staffing(
+def _record_gap_staffing_prune(
+    gap: Gap,
+    direction_id: str,
+    now_iso: str | None,
+    rationale: str | None,
+) -> tuple[bool, bool]:
+    """Prune a direction from one gap, archive it, and defer if emptied."""
+    changed = False
+    newly_deferred = False
+    if direction_id in gap.active_moves:
+        gap.active_moves = [m for m in gap.active_moves if m != direction_id]
+        changed = True
+    if direction_id not in gap.past_moves:
+        gap.past_moves.append(direction_id)
+        changed = True
+    if not gap.active_moves and gap.deferral is None:
+        gap.deferral = GapDeferral(
+            rationale=(
+                rationale
+                or f"auto-deferred: staffing direction {direction_id} no longer active"
+            ),
+            created_at=now_iso or "",
+        )
+        changed = True
+        newly_deferred = True
+    return changed, newly_deferred
+
+
+def reconcile_gap_staffing_status(
     model: ProblemModel,
     direction_id: str,
     new_gap_id: str | None,
     prior_gap_id: str | None = None,
-) -> bool:
+) -> GapStaffingReconciliation:
     """Reconcile a gap's ``active_moves`` / ``deferral`` when a direction is
-    created on, or re-grounded onto, a gap.
+    created on, re-grounded onto, or status-flipped against a gap.
 
     The staffing-side mirror of the retire-side reconciliation: where retiring a
     gap-linked direction prunes it from the gap's ``active_moves`` (and resolves
     or re-defers the now-unstaffed gap), *staffing* a gap with a direction must
     record that the gap is being actively worked again.
 
-    Mutates ``model`` in place and returns ``True`` iff something changed (so the
-    caller can skip a no-op write and keep the durable model byte-identical):
+    Mutates ``model`` in place and returns a structured result:
 
-    - ``new_gap_id`` set and matching an existing gap — add ``direction_id`` to
-      that gap's ``active_moves`` (no duplicate) and clear any ``deferral`` (set
-      ``None``): the gap is now actively staffed, so a recorded "intentionally
-      unstaffed this cycle" decision is false.
+    - active directions with a valid ``new_gap_id`` staff that gap and clear any
+      stale deferral;
+    - non-active directions (paused/staged/expired/superseded/completed/etc.)
+      do not staff a gap, and any prior active staffing is pruned into
+      ``past_moves``;
     - ``prior_gap_id`` set, matching an existing gap, and different from
       ``new_gap_id`` — the direction re-grounded away from (or cleared) its old
       gap: prune ``direction_id`` from that gap's ``active_moves`` and record it
-      in ``past_moves`` (the merged/failed move-history convention). Clearing the
-      linkage entirely (``new_gap_id`` falsy) prunes the old gap with no new
-      staffing.
+      in ``past_moves``. If the prune empties the gap, record a
+      :class:`GapDeferral`;
+    - unresolved new/prior gap ids are reported in ``unresolved_gap_ids`` so
+      callers can log or surface drift instead of treating it as a clean no-op.
 
     Proposed-wins compatible and non-destructive: it only adjusts
     ``active_moves`` / ``past_moves`` / ``deferral`` on gaps that already exist in
-    the model — it never creates a gap or touches any other field, so it cannot
-    fight the strategic agent's own problem-model writes. An ``new_gap_id`` /
-    ``prior_gap_id`` with no matching gap is a safe no-op (mirrors how the
-    retire/respawn paths tolerate a dangling ``gap_id`` linkage). Idempotent:
-    re-running with the same linkage neither duplicates an ``active_moves`` entry
-    nor re-clears an already-cleared deferral.
+    the model — it never creates a gap or touches any other field.
     """
+    return reconcile_gap_staffing_for_status(
+        model,
+        direction_id,
+        new_gap_id,
+        prior_gap_id,
+        new_status="active",
+    )
+
+
+def reconcile_gap_staffing_for_status(
+    model: ProblemModel,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+    *,
+    new_status: str | None = "active",
+    prior_status: str | None = None,
+    now_iso: str | None = None,
+    rationale: str | None = None,
+) -> GapStaffingReconciliation:
+    """Status-aware direction/gap staffing reconciliation."""
+    result = GapStaffingReconciliation(
+        direction_id=str(direction_id or ""),
+        new_gap_id=str(new_gap_id) if new_gap_id else None,
+        prior_gap_id=str(prior_gap_id) if prior_gap_id else None,
+        new_status=str(new_status) if new_status is not None else None,
+        prior_status=str(prior_status) if prior_status is not None else None,
+    )
     if not direction_id:
-        return False
+        return result
 
     gap_by_id = {gap.id: gap for gap in model.gaps}
-    changed = False
+    # Legacy direction dicts sometimes omit status; existing write paths treat
+    # missing status as active, so preserve that compatibility here.
+    is_active_status = new_status is None or str(new_status) == "active"
+    active_new_gap_id = result.new_gap_id if is_active_status else None
 
     # Re-ground away from (or clear) the OLD gap: prune the move, archive it in
-    # past_moves. Only when the linkage actually moved to a different gap.
-    if prior_gap_id and prior_gap_id != new_gap_id:
-        old_gap = gap_by_id.get(prior_gap_id)
+    # past_moves. For status transitions to non-active, active_new_gap_id is
+    # None, so the existing gap is pruned even when the direction's gap_id field
+    # itself did not change.
+    if result.prior_gap_id and result.prior_gap_id != active_new_gap_id:
+        old_gap = gap_by_id.get(result.prior_gap_id)
         if old_gap is not None:
-            if direction_id in old_gap.active_moves:
-                old_gap.active_moves = [
-                    m for m in old_gap.active_moves if m != direction_id
-                ]
-                changed = True
-            if direction_id not in old_gap.past_moves:
-                old_gap.past_moves.append(direction_id)
-                changed = True
+            changed, newly_deferred = _record_gap_staffing_prune(
+                old_gap,
+                str(direction_id),
+                now_iso,
+                rationale,
+            )
+            if changed:
+                result.changed = True
+                result.pruned_gap_ids.append(old_gap.id)
+            if newly_deferred:
+                result.newly_deferred_gap_ids.append(old_gap.id)
+        else:
+            result.unresolved_gap_ids["prior_gap_id"] = result.prior_gap_id
 
     # Staff the NEW gap: record the active move and drop a now-false deferral.
-    if new_gap_id:
-        new_gap = gap_by_id.get(new_gap_id)
+    if active_new_gap_id:
+        new_gap = gap_by_id.get(active_new_gap_id)
         if new_gap is not None:
             if direction_id not in new_gap.active_moves:
                 new_gap.active_moves.append(direction_id)
-                changed = True
+                result.changed = True
             if new_gap.deferral is not None:
                 new_gap.deferral = None
-                changed = True
+                result.changed = True
+            result.staffed_gap_id = new_gap.id
+        else:
+            result.unresolved_gap_ids["new_gap_id"] = active_new_gap_id
 
-    return changed
+    return result
+
+
+def reconcile_gap_staffing(
+    model: ProblemModel,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+) -> bool:
+    """Boolean compatibility wrapper for active create/re-ground paths."""
+    return reconcile_gap_staffing_status(
+        model, direction_id, new_gap_id, prior_gap_id
+    ).changed
 
 
 def reconcile_gap_staffing_raw(
@@ -756,15 +849,62 @@ def reconcile_gap_staffing_raw(
     durable problem model can never block a direction create/update — mirroring
     how the retire/respawn paths tolerate a model they cannot reconcile.
     """
+    result = reconcile_gap_staffing_raw_result(
+        problem_model_raw,
+        direction_id,
+        new_gap_id,
+        prior_gap_id,
+        new_status="active",
+    )
+    return result.get("problem_model") if result.get("changed") else None
+
+
+def reconcile_gap_staffing_raw_result(
+    problem_model_raw: dict | None,
+    direction_id: str,
+    new_gap_id: str | None,
+    prior_gap_id: str | None = None,
+    *,
+    new_status: str | None = "active",
+    prior_status: str | None = None,
+    now_iso: str | None = None,
+    rationale: str | None = None,
+) -> dict[str, Any]:
+    """Raw-JSONB adapter returning structured reconciliation diagnostics.
+
+    ``problem_model`` is present only when a write-back is needed. Malformed or
+    empty models fail open but are classified so callers can distinguish them
+    from a clean no-op.
+    """
+    empty = GapStaffingReconciliation(
+        direction_id=str(direction_id or ""),
+        new_gap_id=str(new_gap_id) if new_gap_id else None,
+        prior_gap_id=str(prior_gap_id) if prior_gap_id else None,
+        new_status=str(new_status) if new_status is not None else None,
+        prior_status=str(prior_status) if prior_status is not None else None,
+    )
     if not problem_model_raw:
-        return None
+        return {"changed": False, "problem_model": None, "result": empty.model_dump()}
     try:
         model = parse_problem_model(problem_model_raw)
     except ValidationError:
-        return None
-    if reconcile_gap_staffing(model, direction_id, new_gap_id, prior_gap_id):
-        return model.model_dump()
-    return None
+        empty.malformed_model = True
+        return {"changed": False, "problem_model": None, "result": empty.model_dump()}
+    result = reconcile_gap_staffing_for_status(
+        model,
+        direction_id,
+        new_gap_id,
+        prior_gap_id,
+        new_status=new_status,
+        prior_status=prior_status,
+        now_iso=now_iso,
+        rationale=rationale,
+    )
+    return {
+        "changed": result.changed,
+        "problem_model": model.model_dump() if result.changed else None,
+        "result": result.model_dump(),
+    }
 
 
 def _archived_gap_recency_key(gap: Gap) -> str:

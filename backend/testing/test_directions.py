@@ -757,6 +757,87 @@ async def test_update_direction_priority(client: AsyncClient, mocker):
 
 
 @pytest.mark.asyncio
+async def test_operator_update_direction_reconciles_gap_staffing_on_status_and_gap_changes(
+    client: AsyncClient, db_session, mocker
+):
+    """PATCH re-ground/status changes keep problem-model gap staffing in sync."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project_id = await _deploy_project(client, mocker)
+    direction_id = "d-staffed"
+    project = (
+        await db_session.execute(
+            select(Project).where(Project.id == uuid.UUID(project_id))
+        )
+    ).scalar_one()
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-old",
+                "name": "old gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            },
+            {
+                "id": "g-new",
+                "name": "new gap",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": [],
+                "deferral": {
+                    "rationale": "parked before staffing",
+                    "created_at": "2026-01-01T00:00:00",
+                },
+            },
+        ],
+    }
+    flag_modified(project, "problem_model")
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Move from old gap to new gap",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "gap_id": "g-old",
+            "added_at": "2026-01-01T00:00:00",
+        }
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    pause_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"gap_id": "g-new", "status": "paused"},
+    )
+    assert pause_resp.status_code == 200, pause_resp.text
+    assert pause_resp.json()["direction"]["gap_id"] == "g-new"
+    assert pause_resp.json()["direction"]["status"] == "paused"
+
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert gaps["g-old"]["active_moves"] == []
+    assert gaps["g-old"]["past_moves"] == [direction_id]
+    assert gaps["g-old"]["deferral"]["created_at"]
+    assert direction_id in gaps["g-old"]["deferral"]["rationale"]
+    assert gaps["g-new"]["active_moves"] == []
+    assert gaps["g-new"]["deferral"]["rationale"] == "parked before staffing"
+
+    active_resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"status": "active"},
+    )
+    assert active_resp.status_code == 200, active_resp.text
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert gaps["g-new"]["active_moves"] == [direction_id]
+    assert gaps["g-new"]["deferral"] is None
+
+
+@pytest.mark.asyncio
 async def test_update_direction_status_stage_sets_version_marker(
     client: AsyncClient, db_session, mocker
 ):

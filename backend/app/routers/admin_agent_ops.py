@@ -1137,14 +1137,28 @@ async def strategic_operation(
         # gap: add it to active_moves and clear any now-false deferral. Mirrors
         # the retire-side reconciliation but in the staffing direction.
         if new_dir.get("gap_id") and not staged_create:
-            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
 
-            _reconciled_pm = reconcile_gap_staffing_raw(
-                project.problem_model, new_dir["id"], new_dir["gap_id"], None
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                new_dir["id"],
+                new_dir["gap_id"],
+                None,
+                new_status=new_dir.get("status"),
+                now_iso=_utcnow().isoformat(),
             )
-            if _reconciled_pm is not None:
-                project.problem_model = _reconciled_pm
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
                 flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] create_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -1408,42 +1422,40 @@ async def strategic_operation(
                 break
         if not updated:
             raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
-        # Re-ground reconciliation, in the same locked transaction: when the
-        # direction's gap_id changed, stage the new gap (active_moves + clear
-        # deferral) and prune the old one. Mirrors create_direction and the
-        # retire-side reconciliation.
-        if _gap_reground is not None:
-            from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
-
-            _new_gap_id, _prior_gap_id = _gap_reground
-            _reconciled_pm = reconcile_gap_staffing_raw(
-                project.problem_model, str(dir_id), _new_gap_id, _prior_gap_id
-            )
-            if _reconciled_pm is not None:
-                project.problem_model = _reconciled_pm
-                flag_modified(project, "problem_model")
-        # Status-change gap staffing: pause prunes active_moves (auto-defers
-        # an emptied gap); reactivating from paused re-staffs the gap.
         _updated_dir = next((x for x in directions if x.get("id") == dir_id), None)
         _new_status = _updated_dir.get("status") if _updated_dir else None
-        if _new_status != _pre_status and _gap_reground is None:
-            _cur_gap = _updated_dir.get("gap_id") if _updated_dir else None
-            if _cur_gap:
-                if _new_status == "paused":
-                    from app.problem_model import reconcile_gaps_for_retired_directions  # noqa: PLC0415
-                    _pm_raw, _ = reconcile_gaps_for_retired_directions(
-                        dict(project.problem_model or {}), [str(dir_id)], now_iso
-                    )
-                    project.problem_model = _pm_raw
-                    flag_modified(project, "problem_model")
-                elif _new_status == "active" and _pre_status == "paused":
-                    from app.problem_model import reconcile_gap_staffing_raw  # noqa: PLC0415
-                    _pm = reconcile_gap_staffing_raw(
-                        project.problem_model, str(dir_id), _cur_gap, None
-                    )
-                    if _pm is not None:
-                        project.problem_model = _pm
-                        flag_modified(project, "problem_model")
+        if _updated_dir is not None and (
+            _gap_reground is not None or _new_status != _pre_status
+        ):
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            _new_gap_id = _updated_dir.get("gap_id")
+            _prior_gap_id = (
+                _gap_reground[1]
+                if _gap_reground is not None
+                else _updated_dir.get("gap_id")
+            )
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _new_gap_id,
+                _prior_gap_id,
+                new_status=_new_status,
+                prior_status=_pre_status,
+                now_iso=now_iso,
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] update_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
         # Record retired-direction memory when this update flipped the direction
         # into a terminal state, in the SAME committed transaction (mirrors the
         # retire_direction op). Only fires on a real non-terminal->terminal
@@ -1782,6 +1794,8 @@ async def strategic_operation(
                 status_code=409,
             )
         staged_for_version = open_version.version_number
+        _pre_status = target.get("status")
+        _gap_id = target.get("gap_id")
         target["status"] = "staged"
         target["staged_for_version"] = staged_for_version
         target["staged_at"] = _utcnow().isoformat()
@@ -1800,6 +1814,30 @@ async def strategic_operation(
         )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
+        if _gap_id:
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _gap_id,
+                _gap_id,
+                new_status="staged",
+                prior_status=_pre_status,
+                now_iso=_utcnow().isoformat(),
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] stage_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
         ctx = task.context or {}
         staged_ids = list(ctx.get("_strategic_staged_ids", []))
         staged_ids.append(dir_id)
@@ -1888,6 +1926,31 @@ async def strategic_operation(
         target["notes"] = _cap_list(
             notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
         )
+        if target.get("gap_id"):
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            now_iso = _utcnow().isoformat()
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                dir_id,
+                target["gap_id"],
+                None,
+                new_status="active",
+                prior_status="proposed",
+                now_iso=now_iso,
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] approve_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
         _d = directions
         await _with_directions_locked(session, project.id, lambda _: _d)
         ctx = task.context or {}
@@ -3719,9 +3782,7 @@ async def strategic_operation(
         from app.direction_referential_guard import (
             load_version_criterion_key_sets as _load_crit_key_sets,
         )
-        _db_active_crit_keys, _ = await _load_crit_key_sets(
-            session, project.id, open_version.id
-        )
+        _db_active_crit_keys, _ = await _load_crit_key_sets(session, project.id, open_version.id)
         _call_crit_keys: set[str] = set()
         new_added_count = 0
         skipped_over_cap = 0

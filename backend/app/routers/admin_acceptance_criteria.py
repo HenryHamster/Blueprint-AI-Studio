@@ -236,35 +236,27 @@ async def link_criteria_to_direction(
     # one query (guard mirrors check_gap_id_write in problem_model.py).
     if deduped_keys:
         from app.direction_referential_guard import (
-            classify_criterion_key,
+            check_criterion_key_write,
             load_version_criterion_key_sets,
         )
 
         active_keys, inactive_keys = await load_version_criterion_key_sets(
             session, project_id, open_version.id
         )
-        unknown = [
-            k
-            for k in deduped_keys
-            if classify_criterion_key(k, active_keys, inactive_keys) == "dangling"
-        ]
-        if unknown:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown criterion keys for this version: {unknown}",
-            )
-        inactive = [
-            k
-            for k in deduped_keys
-            if classify_criterion_key(k, active_keys, inactive_keys) == "inactive"
-        ]
-        if inactive:
+        failures: dict[str, list[str]] = {}
+        for k in deduped_keys:
+            cls, _ = check_criterion_key_write(k, active_keys, inactive_keys)
+            if cls is not None:
+                failures.setdefault(cls, []).append(k)
+        if failures:
+            # Prioritize dangling over inactive in the error report.
+            classification = "dangling" if "dangling" in failures else "inactive"
             raise HTTPException(
                 status_code=400,
                 detail={
                     "error": "criterion_key_invalid",
-                    "classification": "inactive",
-                    "keys": inactive,
+                    "classification": classification,
+                    "keys": failures[classification],
                     "active_criterion_keys": sorted(active_keys),
                 },
             )
