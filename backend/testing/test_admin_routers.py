@@ -11455,7 +11455,9 @@ class TestAcceptanceCriteriaRouter:
             "covered": 0,
             "partial": 0,
             "uncovered": 0,
+            "inactive": 0,
             "retracted": 0,
+            "superseded": 0,
             "stuck_count": 0,
             "criteria": [],
         }
@@ -14427,15 +14429,14 @@ class TestVersionLifecycleCurrentVersionHighlights:
 class TestVersionLifecycleAcceptanceAggregate:
     """The version-lifecycle current_version and qualification-verdicts rows
     expose the additive ``acceptance_aggregate`` key (proven-vs-merged) ALONGSIDE
-    the unchanged raw merged-count fields, backward-compatibly defaulting to
-    None on rows with no stored aggregate."""
+    the unchanged raw merged-count fields, with the open version computed live."""
 
     @pytest.mark.asyncio
     async def test_current_version_exposes_acceptance_aggregate_key(
         self, client: AsyncClient, db_session
     ):
-        """current_version carries acceptance_aggregate (None default) next to
-        the unchanged merged_task_count."""
+        """current_version carries a live zeroed acceptance aggregate for an
+        empty open window."""
         project = await _make_project(db_session)
         await _make_open_version(db_session, project.id, phase="stabilize")
 
@@ -14454,10 +14455,6 @@ class TestVersionLifecycleAcceptanceAggregate:
                     }
                 ),
             ),
-            patch(
-                "app.release_version.count_merged_since",
-                new=AsyncMock(return_value=2),
-            ),
         ):
             resp = await client.get(
                 f"/api/admin/projects/{project.id}/version-lifecycle"
@@ -14465,37 +14462,88 @@ class TestVersionLifecycleAcceptanceAggregate:
 
         assert resp.status_code == 200, resp.text
         current = resp.json()["current_version"]
-        # Additive key is present and backward-compatible (None on legacy rows)...
+        # Additive key is present and computed live for the open version window.
         assert "acceptance_aggregate" in current
-        assert current["acceptance_aggregate"] is None
-        # ...and the raw merged-count field is preserved unchanged.
-        assert current["merged_task_count"] == 2
-
-    @pytest.mark.asyncio
-    async def test_current_version_surfaces_stored_acceptance_aggregate_after_reload(
-        self, client: AsyncClient, db_session
-    ):
-        """current_version reads acceptance_aggregate back out of persisted
-        last_qualification JSON after the row is reloaded from the database."""
-        project = await _make_project(db_session)
-        version = await _make_open_version(db_session, project.id, phase="stabilize")
-        aggregate = {
-            "total": 3,
-            "proven": 2,
+        assert current["acceptance_aggregate"] == {
+            "proven": 0,
             "satisfied_unproven": 0,
-            "declared_unsatisfied": 1,
+            "declared_unsatisfied": 0,
             "undeclared": 0,
             "merged_unverified_degraded": 0,
             "malformed": 0,
-            "proven_rate": 0.667,
-            "satisfied_rate": 0.667,
+            "total": 0,
+        }
+        # ...and the raw merged-count field is preserved unchanged.
+        assert current["merged_task_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_version_lifecycle_current_version_acceptance_aggregate_computed_live(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version recomputes acceptance_aggregate live for the open
+        version window, ignoring stale last_qualification snapshots."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        opened_at = _utcnow() - timedelta(hours=3)
+        finalized_at = opened_at + timedelta(hours=1)
+        version.opened_at = opened_at
+        aggregate = {
+            "total": 1,
+            "proven": 1,
+            "satisfied_unproven": 0,
+            "declared_unsatisfied": 0,
+            "undeclared": 0,
+            "merged_unverified_degraded": 0,
+            "malformed": 0,
         }
         version.last_qualification = {
             "status": "dry_run",
             "acceptance_aggregate": aggregate,
+            "finalized_at": finalized_at.isoformat(),
         }
         db_session.add(version)
         await db_session.commit()
+
+        for completed_at, context in (
+            (
+                opened_at + timedelta(minutes=30),
+                {
+                    "pr_merged": True,
+                    "landed_on_integration": True,
+                    "code_acceptance_verdict": {
+                        "satisfied": True,
+                        "proven": True,
+                        "kind": "named_test",
+                    },
+                },
+            ),
+            (
+                opened_at + timedelta(hours=2),
+                {
+                    "pr_merged": True,
+                    "landed_on_integration": True,
+                    "code_acceptance_verdict": {
+                        "satisfied": False,
+                        "kind": "named_test",
+                    },
+                },
+            ),
+        ):
+            task = Task(
+                project_id=project.id,
+                title="merge-test-task",
+                payloads=[{"type": "create", "prompt": "x", "pr_number": 42}],
+                status=TaskStatus.COMPLETED,
+                context=context,
+                created_at=completed_at,
+                updated_at=completed_at,
+            )
+            db_session.add(task)
+            await db_session.commit()
+
+        expected = await rv.compute_version_acceptance_aggregate(
+            db_session, project.id, since=opened_at
+        )
 
         with (
             patch(
@@ -14512,10 +14560,6 @@ class TestVersionLifecycleAcceptanceAggregate:
                     }
                 ),
             ),
-            patch(
-                "app.release_version.count_merged_since",
-                new=AsyncMock(return_value=0),
-            ),
         ):
             resp = await client.get(
                 f"/api/admin/projects/{project.id}/version-lifecycle"
@@ -14523,8 +14567,10 @@ class TestVersionLifecycleAcceptanceAggregate:
 
         assert resp.status_code == 200, resp.text
         current = resp.json()["current_version"]
-        assert current["acceptance_aggregate"] == aggregate
-        assert current["merged_task_count"] == 0
+        assert current["acceptance_aggregate"] == expected
+        assert current["acceptance_aggregate"] != aggregate
+        assert current["merged_task_count"] == 2
+        assert current["merged_since_verdict"] == 1
 
     @pytest.mark.asyncio
     async def test_verdict_row_exposes_acceptance_aggregate_key(

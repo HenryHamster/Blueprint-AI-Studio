@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Bell, Send } from 'lucide-react';
-import { API_BASE_URL, authHeaders } from '../api';
+import { API_BASE_URL, apiFetch, authHeaders } from '../api';
 
 export interface NotificationConfig {
   webhook_url: string;
@@ -37,6 +37,174 @@ interface SettingsNotificationsSectionProps {
   dailyCostCeilingUsd: number;
   onUpdateDailyCostCeiling: (value: number) => void;
   isAdmin: boolean;
+  selectedProjectId?: string | null;
+}
+
+interface WebhookDeliveryStats {
+  total_dispatched: number;
+  total_delivered: number;
+  total_failed: number;
+  last_failure_reason: string;
+  last_failure_at: string | null;
+  retry_queue_depth: number;
+}
+
+function summarizeWebhookDeliveryHealth(stats: WebhookDeliveryStats | null, webhookUrl: string, loading: boolean) {
+  if (!webhookUrl) {
+    return {
+      tone: 'neutral' as const,
+      label: 'Webhook not configured',
+      detail: 'Add a webhook URL to inspect delivery health for this project.',
+    };
+  }
+
+  if (loading) {
+    return {
+      tone: 'neutral' as const,
+      label: 'Checking delivery health',
+      detail: 'Loading project delivery stats...',
+    };
+  }
+
+  if (!stats) {
+    return {
+      tone: 'neutral' as const,
+      label: webhookUrl ? 'Delivery health unavailable' : 'Delivery health unavailable',
+      detail: webhookUrl ? 'No delivery stats are available yet for this project.' : 'Select a project to inspect webhook delivery health.',
+    };
+  }
+
+  if (stats.total_dispatched === 0) {
+    return {
+      tone: 'neutral' as const,
+      label: 'No webhook deliveries yet',
+      detail: webhookUrl
+        ? 'The configured webhook has not been exercised for this project yet.'
+        : 'Configure a webhook URL and send a notification to verify delivery.',
+    };
+  }
+
+  if (stats.total_failed > 0 || stats.retry_queue_depth > 0) {
+    return {
+      tone: 'amber' as const,
+      label: 'Delivery degraded',
+      detail: [
+        `${stats.total_delivered} delivered`,
+        `${stats.total_failed} failed`,
+        stats.retry_queue_depth > 0 ? `${stats.retry_queue_depth} queued` : null,
+        stats.last_failure_reason ? `last: ${stats.last_failure_reason}` : null,
+      ].filter(Boolean).join(' · '),
+    };
+  }
+
+  return {
+    tone: 'emerald' as const,
+    label: 'Delivery healthy',
+    detail: `${stats.total_delivered} delivered · ${stats.total_failed} failed · ${stats.retry_queue_depth} queued`,
+  };
+}
+
+function WebhookDeliveryHealthCard({
+  webhookUrl,
+  selectedProjectId,
+}: {
+  webhookUrl: string;
+  selectedProjectId: string;
+}) {
+  const [webhookStats, setWebhookStats] = useState<WebhookDeliveryStats | null>(null);
+  const [webhookStatsError, setWebhookStatsError] = useState<string>('');
+
+  const loading = webhookStats === null && webhookStatsError === '';
+  const hasWebhookUrl = webhookUrl.trim().length > 0;
+  const deliveryError = hasWebhookUrl ? webhookStatsError : '';
+  const healthSummary = summarizeWebhookDeliveryHealth(webhookStats, webhookUrl, loading);
+
+  useEffect(() => {
+    if (!hasWebhookUrl) {
+      return;
+    }
+
+    const controller = new AbortController();
+
+    void apiFetch(
+      `/api/admin/notification-dispatch/stats?project_id=${encodeURIComponent(selectedProjectId)}`,
+      undefined,
+      2,
+      30000,
+      controller.signal,
+    )
+      .then(async res => {
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+        return res.json();
+      })
+      .then(data => {
+        if (controller.signal.aborted) return;
+        const stats = data as Partial<WebhookDeliveryStats> | null;
+        if (
+          !stats
+          || typeof stats.total_dispatched !== 'number'
+          || typeof stats.total_delivered !== 'number'
+          || typeof stats.total_failed !== 'number'
+          || typeof stats.last_failure_reason !== 'string'
+          || typeof stats.retry_queue_depth !== 'number'
+        ) {
+          throw new Error('Unexpected webhook stats payload');
+        }
+        setWebhookStats({
+          total_dispatched: stats.total_dispatched,
+          total_delivered: stats.total_delivered,
+          total_failed: stats.total_failed,
+          last_failure_reason: stats.last_failure_reason,
+          last_failure_at: typeof stats.last_failure_at === 'string' ? stats.last_failure_at : null,
+          retry_queue_depth: stats.retry_queue_depth,
+        });
+      })
+      .catch(e => {
+        if (controller.signal.aborted) return;
+        setWebhookStats(null);
+        setWebhookStatsError(e instanceof Error ? e.message : 'Failed to load webhook delivery health');
+      });
+
+    return () => controller.abort();
+  }, [hasWebhookUrl, selectedProjectId, webhookUrl]);
+
+  return (
+    <div
+      className={`mt-2 rounded-lg border px-3 py-2 text-ui-md ${
+        deliveryError
+          ? 'border-red-500/30 bg-red-950/20 text-red-300'
+          : healthSummary.tone === 'emerald'
+            ? 'border-emerald-500/30 bg-emerald-950/20 text-emerald-200'
+            : healthSummary.tone === 'amber'
+              ? 'border-amber-500/30 bg-amber-950/20 text-amber-200'
+              : 'border-neutral-700 bg-neutral-900 text-neutral-300'
+      }`}
+    >
+      <div className="flex items-center gap-2">
+        <span
+          className={`h-2.5 w-2.5 rounded-full ${
+            deliveryError
+              ? 'bg-red-400'
+              : loading
+                ? 'bg-neutral-500'
+                : healthSummary.tone === 'emerald'
+                  ? 'bg-emerald-400'
+                  : healthSummary.tone === 'amber'
+                    ? 'bg-amber-400'
+                    : 'bg-neutral-400'
+          }`}
+        />
+        <span className="font-medium">
+          {deliveryError ? 'Delivery health unavailable' : healthSummary.label}
+        </span>
+      </div>
+      <p className="mt-1 text-ui-md text-inherit/80">
+        {deliveryError ? deliveryError : healthSummary.detail}
+      </p>
+    </div>
+  );
 }
 
 function Toggle({ enabled, onChange }: { enabled: boolean; onChange: (v: boolean) => void }) {
@@ -62,6 +230,7 @@ export function SettingsNotificationsSection({
   dailyCostCeilingUsd,
   onUpdateDailyCostCeiling,
   isAdmin,
+  selectedProjectId,
 }: SettingsNotificationsSectionProps) {
   const [urlDraft, setUrlDraft] = useState(webhookUrl);
   const [testStatus, setTestStatus] = useState<'idle' | 'sending' | 'success' | 'error'>('idle');
@@ -172,6 +341,13 @@ export function SettingsNotificationsSection({
               'Not configured'
             )}
           </div>
+        )}
+        {selectedProjectId && (
+          <WebhookDeliveryHealthCard
+            key={selectedProjectId}
+            webhookUrl={webhookUrl}
+            selectedProjectId={selectedProjectId}
+          />
         )}
       </div>
 

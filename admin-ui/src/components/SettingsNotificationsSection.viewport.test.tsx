@@ -1,8 +1,18 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
+import { waitFor } from '@testing-library/react';
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
 import { expectNoOverflowAt, expectMinTouchTargetAt } from '../test/viewport';
+import { apiFetch } from '../api';
+
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    apiFetch: vi.fn(),
+  };
+});
 
 const ALL_EVENTS = [
   'TASK_FAILED',
@@ -158,5 +168,43 @@ describe('SettingsNotificationsSection — viewport regression', () => {
         );
       });
     }, { selector: 'button, a[href]' });
+  });
+
+  test('renders project webhook health without horizontal overflow at 375px', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        total_dispatched: 4,
+        total_delivered: 4,
+        total_failed: 0,
+        last_failure_reason: '',
+        last_failure_at: null,
+        retry_queue_depth: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    await expectNoOverflowAt(375, async () => {
+      host = document.createElement('div');
+      document.body.appendChild(host);
+      root = createRoot(host);
+      await act(async () => {
+        root?.render(
+          <SettingsNotificationsSection
+            webhookUrl="https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX"
+            onUpdateWebhookUrl={() => {}}
+            enabledEvents={ALL_EVENTS}
+            onUpdateEnabledEvents={() => {}}
+            throttleSeconds={300}
+            onUpdateThrottleSeconds={() => {}}
+            dailyCostCeilingUsd={50}
+            onUpdateDailyCostCeiling={() => {}}
+            isAdmin={true}
+            selectedProjectId="project-123"
+          />
+        );
+      });
+      await waitFor(() => {
+        expect(host?.textContent).toContain('Delivery healthy');
+      });
+    });
   });
 });

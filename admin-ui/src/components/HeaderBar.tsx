@@ -4,6 +4,7 @@ import { Activity, Microscope, BookOpen, Command, LogOut, MoreHorizontal, Search
 import { AutonomousStatus } from './AutonomousStatus';
 import { OrchestratorHealthBar } from './OrchestratorHealthBar';
 import type { DetailedHealth, PipelineThrottle } from './OrchestratorHealthBar';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 import { ProjectSwitcherDropdown } from './ProjectSwitcherDropdown';
 import type { DeployState, OrchestratorHealth } from '../types/settings';
 import type { Task } from '../types/task';
@@ -44,6 +45,7 @@ export interface HeaderBarProps {
   health: OrchestratorHealth | null;
   detailedHealth: DetailedHealth | null;
   pipelineThrottle?: PipelineThrottle | null;
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   costSectionAvailable?: boolean;
   /** Opens the ProjectManagementModal (archive/delete/unarchive + new-project). */
   onManageProjects?: () => void;
@@ -195,6 +197,7 @@ export function HeaderBar(props: HeaderBarProps) {
             lastFetchTime={lastFetchTime}
             tasks={tasks}
             pipelineThrottle={props.pipelineThrottle}
+            gatedTaskTypes={props.gatedTaskTypes}
             costSectionAvailable={props.costSectionAvailable}
           />
         </div>

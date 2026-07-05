@@ -570,10 +570,28 @@ async def get_version_lifecycle(
                 open_row, project_row
             )
             acceptance_aggregate = None
-            if isinstance(qual, dict):
-                acceptance_aggregate = qual.get("acceptance_aggregate")
-            if acceptance_aggregate is None:
-                acceptance_aggregate = getattr(open_row, "acceptance_aggregate", None)
+            try:
+                from app.release_version import (  # noqa: PLC0415
+                    compute_version_acceptance_aggregate,
+                )
+
+                acceptance_aggregate = await compute_version_acceptance_aggregate(
+                    session,
+                    project_id,
+                    since=open_row.opened_at,
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] acceptance aggregate compute failed "
+                    "for project %s; serving lifecycle with the stored fallback",
+                    project_id,
+                )
+                if isinstance(qual, dict):
+                    acceptance_aggregate = qual.get("acceptance_aggregate")
+                if acceptance_aggregate is None:
+                    acceptance_aggregate = getattr(
+                        open_row, "acceptance_aggregate", None
+                    )
             # Verdict-staleness signal: how many tasks merged AT/AFTER the open
             # version's last qualification verdict was finalized. Each verdict is
             # evaluated against one candidate commit; merges landing after

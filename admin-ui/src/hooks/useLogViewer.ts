@@ -2,6 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 import {
   workbenchMessageMatchesProject,
   workbenchRefetchSurfacesFromMessage,
@@ -131,6 +132,7 @@ export function useLogViewer({
   const [wsDisconnectReason, setWsDisconnectReason] = useState<string | null>(null);
   const [wsConnected, setWsConnected] = useState(false);
   const [pipelineThrottle, setPipelineThrottle] = useState<{ reason: string; detail: string; recovery_seconds: number | null } | null>(null);
+  const [gatedTypesMap, setGatedTypesMap] = useState<Map<string, FailingTaskTypeEntry>>(new Map());
   // Lightweight "strategist is working" indicator, toggled by strategic_cycle_started/completed events.
   const [strategistActive, setStrategistActive] = useState(false);
   // Phase-level progress from the current running cycle (null when idle).
@@ -191,6 +193,9 @@ export function useLogViewer({
     // The transcript is a per-project live buffer; a fresh project starts empty
     // and the resident session re-streams its own strategic_session deltas.
     setStrategicSessionTranscript([]);
+    // Per-type gate state is global, but clear on project switch so stale gates
+    // from a previous project don't bleed onto the newly-selected project's view.
+    setGatedTypesMap(new Map());
   }, [selectedProjectId]);
 
   // Clean up WebSocket and timers on unmount
@@ -421,6 +426,28 @@ export function useLogViewer({
         if (pipelineThrottleTimerRef.current) clearTimeout(pipelineThrottleTimerRef.current);
         const clearMs = (msg.data.recovery_seconds ?? 60) * 1000;
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
+      }
+      if (projectEventApplies && msg.event === 'type_throttle' && typeof msg.data?.type === 'string') {
+        const entry: FailingTaskTypeEntry = {
+          task_type: msg.data.type as string,
+          failure_rate: typeof msg.data.failure_rate === 'number' ? msg.data.failure_rate : 0,
+          sample_size: typeof msg.data.sample_size === 'number' ? msg.data.sample_size : 0,
+          threshold: 0.7,
+        };
+        setGatedTypesMap(prev => {
+          const next = new Map(prev);
+          next.set(entry.task_type, entry);
+          return next;
+        });
+      }
+      if (projectEventApplies && msg.event === 'type_unthrottle' && typeof msg.data?.type === 'string') {
+        const ttype = msg.data.type as string;
+        setGatedTypesMap(prev => {
+          if (!prev.has(ttype)) return prev;
+          const next = new Map(prev);
+          next.delete(ttype);
+          return next;
+        });
       }
       if (projectEventApplies && (
         msg.event === 'task_updated'
@@ -792,11 +819,14 @@ export function useLogViewer({
     }
   }, [hasForegroundLogTask, restoreSelectedProjectStream]);
 
+  const gatedTaskTypes = [...gatedTypesMap.values()].sort((a, b) => a.task_type.localeCompare(b.task_type));
+
   return {
     logTask, logLines, logsConnecting, wsDisconnected, wsDisconnectReason,
     handleViewLogs, closeLogViewer,
     wsRef, wsConnected,
     pipelineThrottle,
+    gatedTaskTypes,
     strategistActive,
     cycleProgress,
     lastCycleCompletion,

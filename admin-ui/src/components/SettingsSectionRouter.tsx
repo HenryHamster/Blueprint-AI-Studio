@@ -462,6 +462,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           dailyCostCeilingUsd={props.dailyCostCeilingUsd}
           onUpdateDailyCostCeiling={props.onUpdateDailyCostCeiling}
           isAdmin={props.isAdmin}
+          selectedProjectId={props.selectedProjectId}
         />
       );
     case 'build-config':

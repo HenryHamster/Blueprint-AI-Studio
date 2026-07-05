@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 
 vi.mock('../firebase', () => ({
@@ -9,7 +9,16 @@ vi.mock('../firebase', () => ({
   signOut: vi.fn(),
 }));
 
+vi.mock('../api', async () => {
+  const actual = await vi.importActual<typeof import('../api')>('../api');
+  return {
+    ...actual,
+    apiFetch: vi.fn(),
+  };
+});
+
 import { SettingsNotificationsSection } from './SettingsNotificationsSection';
+import { apiFetch } from '../api';
 
 const baseProps = {
   webhookUrl: '',
@@ -30,6 +39,10 @@ function getToggleButton(label: string) {
 }
 
 describe('SettingsNotificationsSection', () => {
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
   it('shows remediation escalation and toggles it in enabled_events', () => {
     const onUpdateEnabledEvents = vi.fn();
     const { rerender } = render(
@@ -94,5 +107,71 @@ describe('SettingsNotificationsSection', () => {
     );
     fireEvent.click(getToggleButton('Merged Without Test Verification'));
     expect(onUpdateEnabledEvents).toHaveBeenLastCalledWith(['TASK_FAILED', 'MERGE_UNVERIFIED']);
+  });
+
+  it('fetches project webhook health and shows a healthy delivery summary', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        total_dispatched: 12,
+        total_delivered: 12,
+        total_failed: 0,
+        last_failure_reason: '',
+        last_failure_at: null,
+        retry_queue_depth: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
+
+    expect(await screen.findByText('Delivery healthy')).toBeInTheDocument();
+    expect(screen.getByText(/12 delivered · 0 failed · 0 queued/i)).toBeInTheDocument();
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledWith(
+      '/api/admin/notification-dispatch/stats?project_id=project-123',
+      undefined,
+      2,
+      30000,
+      expect.any(AbortSignal),
+    );
+  });
+
+  it('shows degraded delivery health when failures or retry backlog exist', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        total_dispatched: 8,
+        total_delivered: 6,
+        total_failed: 2,
+        last_failure_reason: 'timeout',
+        last_failure_at: '2026-07-05T00:00:00Z',
+        retry_queue_depth: 1,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
+
+    expect(await screen.findByText('Delivery degraded')).toBeInTheDocument();
+    expect(screen.getByText(/6 delivered · 2 failed · 1 queued · last: timeout/i)).toBeInTheDocument();
+  });
+
+  it('falls back to not configured when the webhook url is cleared after prior health stats', async () => {
+    vi.mocked(apiFetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({
+        total_dispatched: 7,
+        total_delivered: 7,
+        total_failed: 0,
+        last_failure_reason: '',
+        last_failure_at: null,
+        retry_queue_depth: 0,
+      }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+
+    const { rerender } = render(<SettingsNotificationsSection {...baseProps} webhookUrl="https://hooks.example.com/health" selectedProjectId="project-123" />);
+
+    expect(await screen.findByText('Delivery healthy')).toBeInTheDocument();
+
+    rerender(<SettingsNotificationsSection {...baseProps} webhookUrl="" selectedProjectId="project-123" />);
+
+    expect(screen.getByText('Webhook not configured')).toBeInTheDocument();
+    expect(screen.getByText(/Add a webhook URL to inspect delivery health/i)).toBeInTheDocument();
+    expect(vi.mocked(apiFetch)).toHaveBeenCalledTimes(1);
   });
 });

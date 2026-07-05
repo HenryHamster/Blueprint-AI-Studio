@@ -1402,6 +1402,7 @@ export default function App() {
         health={s.orchestratorHealth}
         detailedHealth={s.detailedHealth}
         pipelineThrottle={s.pipelineThrottle}
+        gatedTaskTypes={s.gatedTaskTypes}
         costSectionAvailable={activeTab === 'runtime' && runtimeSection === 'analytics'}
       />
       <CommandPaletteHost open={commandPaletteOpen} commands={workbenchCommands} query={commandPaletteQuery} onQueryChange={setCommandPaletteQuery} setOpen={setCommandPaletteOpen} />

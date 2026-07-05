@@ -443,6 +443,70 @@ async def test_agent_claim_omits_reservation_when_none(client: AsyncClient, db_s
 
 
 @pytest.mark.asyncio
+async def test_agent_claim_ancestor_chain_fetched_in_single_query(
+    client: AsyncClient, db_session
+):
+    """Ancestor walk uses a recursive CTE — all levels are found in one round-trip.
+
+    Builds a grandparent -> parent -> task chain; the grandparent holds the
+    reservation. The claim must surface the reservation even though it is two
+    hops away, exercising that the CTE walks the full chain.
+    """
+    from app.models import MigrationReservation, MigrationReservationStatus
+
+    project = Project(name="Agent Claim Ancestor Chain", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    grandparent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+    )
+    db_session.add(grandparent_task)
+    await db_session.commit()
+    await db_session.refresh(grandparent_task)
+
+    reservation = MigrationReservation(
+        project_id=project.id,
+        task_id=grandparent_task.id,
+        provisional_revision="0301",
+        provisional_down_revision="0299",
+        status=MigrationReservationStatus.ACTIVE,
+    )
+    db_session.add(reservation)
+    await db_session.commit()
+
+    parent_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "plan"}],
+        parent_task_id=grandparent_task.id,
+    )
+    db_session.add(parent_task)
+    await db_session.commit()
+    await db_session.refresh(parent_task)
+
+    leaf_task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        parent_task_id=parent_task.id,
+        vm_instance_id="agent-vm-ancestor-chain",
+    )
+    db_session.add(leaf_task)
+    await db_session.commit()
+    await db_session.refresh(leaf_task)
+
+    token = create_agent_token(str(leaf_task.id), "agent-vm-ancestor-chain")
+    resp = await client.post("/api/agent/claim", headers={"x-agent-token": token})
+
+    assert resp.status_code == 200
+    assert resp.json()["migration_reservation"] == {
+        "provisional_revision": "0301",
+        "provisional_down_revision": "0299",
+    }
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_compute_experiment_capability_slice(
     client: AsyncClient, db_session
 ):

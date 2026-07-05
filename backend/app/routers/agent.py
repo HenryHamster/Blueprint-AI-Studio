@@ -13,7 +13,7 @@ from typing import Dict, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Header, Query, Request
 from fastapi.responses import JSONResponse
-from sqlalchemy import and_, func, or_
+from sqlalchemy import and_, func, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
@@ -1033,16 +1033,35 @@ async def claim_task(
         (_claimed_context.get("review_loop") or {}).get("original_task_id")
     )
 
-    _cursor = task
     _MAX_ANCESTOR_DEPTH = 5
-    for _ in range(_MAX_ANCESTOR_DEPTH):
-        if _cursor.parent_task_id is None:
-            break
-        _cursor = await session.get(Task, _cursor.parent_task_id)
-        if _cursor is None:
-            break
-        if _cursor.id not in _ancestor_ids:
-            _ancestor_ids.append(_cursor.id)
+    if task.parent_task_id is not None:
+        _ancestor_result = await session.execute(
+            text(
+                """
+                WITH RECURSIVE ancestor_chain(id, parent_task_id, depth) AS (
+                    SELECT id, parent_task_id, 0
+                    FROM task
+                    WHERE id = :start_id
+                    UNION ALL
+                    SELECT t.id, t.parent_task_id, a.depth + 1
+                    FROM task t
+                    JOIN ancestor_chain a ON t.id = a.parent_task_id
+                    WHERE a.parent_task_id IS NOT NULL AND a.depth < :max_depth
+                )
+                SELECT id FROM ancestor_chain
+                WHERE id != :self_id
+                """
+            ),
+            {
+                "start_id": str(task.parent_task_id),
+                "max_depth": _MAX_ANCESTOR_DEPTH,
+                "self_id": str(task.id),
+            },
+        )
+        for _row in _ancestor_result:
+            _row_id = uuid.UUID(str(_row[0]))
+            if _row_id not in _ancestor_ids:
+                _ancestor_ids.append(_row_id)
 
     _migration_reservation = await get_migration_reservation_for_task_chain(
         session, task_ids=_ancestor_ids

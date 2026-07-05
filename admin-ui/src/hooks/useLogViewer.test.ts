@@ -1074,4 +1074,69 @@ describe('useLogViewer strategist events', () => {
     act(() => { vi.advanceTimersByTime(500); });
     expect(fetchDirections).toHaveBeenCalledTimes(1);
   });
+
+  it('adds a gated type on type_throttle and removes it on type_unthrottle', async () => {
+    const { result } = setup({ selectedProjectId: 'proj-live' });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(0);
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('create');
+    expect(result.current.lv.gatedTaskTypes[0].failure_rate).toBe(0.8);
+    expect(result.current.lv.gatedTaskTypes[0].sample_size).toBe(10);
+    expect(result.current.lv.gatedTaskTypes[0].threshold).toBe(0.7);
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'fix', failure_rate: 0.9, sample_size: 5, detail: 'gated' } });
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(2);
+    // Sorted alphabetically
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('create');
+    expect(result.current.lv.gatedTaskTypes[1].task_type).toBe('fix');
+
+    act(() => {
+      ws.emit({ event: 'type_unthrottle', data: { type: 'create', failure_rate: 0.5, sample_size: 10, detail: 'recovered' } });
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+    expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('fix');
+  });
+
+  it('clears gated types on project change', async () => {
+    const { result, rerender } = renderHook(
+      ({ pid }: { pid: string | null }) => {
+        const fetchTasksRef = useRef<() => void>(vi.fn());
+        const fetchDirectionsRef = useRef<() => void>(vi.fn());
+        const refreshMessagesRef = useRef<() => void>(vi.fn());
+        const setDeployState = vi.fn();
+        const lv = useLogViewer({ fetchTasksRef, setDeployState, fetchDirectionsRef, refreshMessagesRef, selectedProjectId: pid });
+        return { lv };
+      },
+      { initialProps: { pid: 'projA' as string | null } },
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    const ws = MockWebSocket.instances[0];
+    act(() => { ws.onopen?.({}); });
+
+    act(() => {
+      ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
+    });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
+
+    act(() => { rerender({ pid: 'projB' }); });
+    expect(result.current.lv.gatedTaskTypes).toHaveLength(0);
+  });
 });
