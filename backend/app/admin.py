@@ -25,7 +25,8 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
 from app.database import get_session, resolve_async_engine
-from app.direct_llm_client import call_direct_llm, get_anthropic_api_key
+from app.direct_llm_client import get_anthropic_api_key
+from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -2539,8 +2540,6 @@ class ComputeExperimentDraft(BaseModel):
     machine_type: str | None = None
 
 
-_DRAFT_LLM_TIMEOUT = 30.0
-_DRAFT_LLM_MAX_TOKENS = 2000
 _DISABLE_DRAFT_LLM_ENV = "DISABLE_COMPUTE_EXPERIMENT_DRAFT_LLM"
 
 _DRAFT_LLM_SYSTEM = """You are an expert at designing compute experiments for ML/research projects.
@@ -2698,34 +2697,12 @@ async def _call_draft_llm(
         ]
     else:
         messages = [{"role": "user", "content": user_message}]
-
-    for attempt in range(2):
-        try:
-            raw_text = await call_direct_llm(
-                api_key,
-                messages=messages,
-                max_tokens=_DRAFT_LLM_MAX_TOKENS,
-                timeout=_DRAFT_LLM_TIMEOUT,
-                system=_DRAFT_LLM_SYSTEM,
-            )
-            parsed = _parse_draft_json(raw_text)
-            if parsed is None:
-                if attempt == 0:
-                    logger.info("[DRAFT] JSON parse failed on first attempt, retrying")
-                    continue
-                logger.info("[DRAFT] JSON parse failed on retry; draft unavailable")
-                return None
-            return parsed
-        except (json.JSONDecodeError, ValueError, KeyError, IndexError) as exc:
-            if attempt == 0:
-                logger.info("[DRAFT] parse error %s, retrying once", exc)
-                continue
-            logger.info("[DRAFT] parse error on retry; draft unavailable")
-            return None
-        except Exception as exc:  # noqa: BLE001
-            logger.info("[DRAFT] LLM call failed (%s); draft unavailable", exc)
-            return None
-    return None
+    return await call_inline_llm_json(
+        "compute_draft",
+        user_message,
+        system=_DRAFT_LLM_SYSTEM,
+        messages=messages,
+    )
 
 
 @router.post("/tasks/compute-experiment/draft")
@@ -2751,6 +2728,11 @@ async def compute_experiment_draft(
         return ComputeExperimentDraft(
             draft_available=False,
             notes="Draft generation is unavailable: ANTHROPIC_API_KEY is not configured.",
+        )
+    if resolve_inline_llm_settings("compute_draft").disabled:
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes="Draft LLM is disabled via environment configuration.",
         )
 
     raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch, payload.prior_draft)

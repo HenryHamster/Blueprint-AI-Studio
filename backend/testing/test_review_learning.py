@@ -2152,6 +2152,41 @@ async def test_categorize_review_issues_llm_falls_back_on_api_error():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"classifications": [{"index": 0, "category": "bogus"}]},
+        {"classifications": [{"index": 0}]},
+        {"classifications": {"index": 0, "category": "security"}},
+        {"classifications": [{"index": "zero", "category": "security"}]},
+    ],
+)
+async def test_categorize_review_issues_llm_falls_back_on_malformed_llm_output(payload):
+    """Malformed classification payloads should still use keyword fallback."""
+    from app.playbook_learning import categorize_review_issues_llm, _keyword_from_flat
+
+    issues = [
+        {"description": "missing unit tests", "severity": "MAJOR", "iteration": 1},
+    ]
+
+    import os
+
+    with (
+        patch.dict(
+            os.environ,
+            {"ANTHROPIC_API_KEY": "test-key", "DISABLE_LLM_REVIEW_CATEGORIZATION": ""},
+        ),
+        patch("anthropic.AsyncAnthropic") as mock_cls,
+        patch("app.review_learning.call_inline_llm_json", AsyncMock(return_value=payload)),
+    ):
+        result = await categorize_review_issues_llm(issues)
+        mock_cls.assert_not_called()
+
+    expected = _keyword_from_flat(issues)
+    assert result == expected
+
+
+@pytest.mark.asyncio
 async def test_categorize_review_issues_llm_kill_switch():
     """When DISABLE_LLM_REVIEW_CATEGORIZATION=1, no Anthropic client is constructed."""
     from app.playbook_learning import categorize_review_issues_llm

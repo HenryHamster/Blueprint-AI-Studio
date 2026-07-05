@@ -479,6 +479,7 @@ runtime_config: Dict = {
             "max": {"model": "glm-5.2", "effort": "max"},
         },
     },
+    "inline_llm": {},
     # Sparse per-(task_type, provider) surgical overrides. For cases that
     # don't fit the matrix — e.g. "when this task type routes to openai,
     # also force verbosity=low". Wins over the effort matrix.
@@ -1432,6 +1433,7 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                     "task_type_routing",
                     "task_type_model_preferences",
                     "provider_settings_by_effort",
+                    "inline_llm",
                     "provider_selection_mode",
                     "cross_provider_fallback_enabled",
                     "agent_prompt_suffixes",

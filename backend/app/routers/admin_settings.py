@@ -21,6 +21,7 @@ from sqlalchemy.orm import aliased
 
 from app.database import get_session
 from app.deploy_identity import deploy_repo_identity as _deploy_repo_identity
+from app.inline_llm import validate_inline_llm_runtime_config
 from app.url_security import _is_safe_external_url
 from app.shared_state import limiter, circuit_breakers as _circuit_breakers
 from app.models import (
@@ -201,6 +202,7 @@ _KNOWN_SETTINGS_KEYS = frozenset(
         "warm_pool_cross_provider_retarget_enabled",
         "diagnostics_after_edit_holdback_fraction",
         "diagnostics_after_edit_enabled",
+        "inline_llm",
         "improvement_lanes_enabled",
         "review_fix_lane_pilot_enabled",
         "direction_gap_respawn_block_mode",
@@ -416,6 +418,7 @@ async def get_settings(
         "provider_settings_defaults": _runtime_config.get(
             "provider_settings_defaults", {}
         ),
+        "inline_llm": _runtime_config.get("inline_llm", {}),
         "provider_settings_by_effort": _runtime_config.get(
             "provider_settings_by_effort", {}
         ),
@@ -2038,6 +2041,13 @@ async def _apply_settings(
                         detail=f"Invalid model in model preferences for {task_type}",
                     )
         _runtime_config["task_type_model_preferences"] = val
+    if "inline_llm" in payload:
+        val = payload["inline_llm"]
+        try:
+            cleaned_inline_llm = validate_inline_llm_runtime_config(val)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        _runtime_config["inline_llm"] = cleaned_inline_llm
     # provider_selection_mode is the canonical control; cross_provider_fallback_enabled
     # is accepted as a compatibility shim (True→"preferred", False→"exclusive").
     # When both are present in the same PATCH, the enum wins.
@@ -2795,6 +2805,7 @@ async def _apply_settings(
                     "provider_settings_defaults": _runtime_config.get(
                         "provider_settings_defaults", {}
                     ),
+                    "inline_llm": _runtime_config.get("inline_llm", {}),
                     "provider_settings_by_effort": _runtime_config.get(
                         "provider_settings_by_effort", {}
                     ),

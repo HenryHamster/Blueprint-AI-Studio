@@ -168,7 +168,10 @@ async def test_call_draft_llm_uses_shared_model():
     mock_client = MagicMock()
     mock_client.messages.create = mock_create
 
-    with patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)):
+    with (
+        patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}),
+        patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)),
+    ):
         result = await _call_draft_llm("sk-test", "run an experiment", None, None)
 
     assert result is not None
@@ -198,7 +201,10 @@ async def test_call_compute_analysis_llm_uses_shared_model():
     mock_client = MagicMock()
     mock_client.messages.create = mock_create
 
-    with patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)):
+    with (
+        patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-test"}),
+        patch("anthropic.AsyncAnthropic", MagicMock(return_value=mock_client)),
+    ):
         result = await _call_compute_analysis_llm("sk-test", "Analyze this experiment.")
 
     assert result == good_analysis

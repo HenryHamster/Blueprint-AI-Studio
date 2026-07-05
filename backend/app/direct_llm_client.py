@@ -26,6 +26,7 @@ async def call_direct_llm(
     messages: list[dict],
     max_tokens: int,
     timeout: float,
+    model: str = DIRECT_LLM_MODEL,
     system: str | None = None,
 ) -> str:
     """Construct an AsyncAnthropic client and make one messages.create call.
@@ -38,7 +39,7 @@ async def call_direct_llm(
 
     client = _anthropic.AsyncAnthropic(api_key=api_key)
     kwargs: dict = dict(
-        model=DIRECT_LLM_MODEL,
+        model=model,
         max_tokens=max_tokens,
         timeout=timeout,
         messages=messages,
