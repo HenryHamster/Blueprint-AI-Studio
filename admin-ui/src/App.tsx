@@ -1641,6 +1641,7 @@ export default function App() {
             onConfigureTargets={handleConfigureTargets}
             onSpawnOrphanFix={(pr) => s.openPrefilledTaskModal({ taskType: 'fix', title: pr.pr_title, prompt: `PR #${pr.pr_number} is open but has no active task - investigate and either close or push remediation. PR: ${pr.pr_url}`, prNumber: pr.pr_number, prBranch: pr.pr_branch })}
             onPanelReviewPr={(pr) => s.openPrefilledTaskModal({ taskType: 'panel_review', title: `Panel review PR #${pr.pr_number}`, prompt: '', prNumber: pr.pr_number, prBranch: pr.pr_branch, baseBranch: pr.pr_base_branch })}
+            gatedTaskTypes={s.gatedTaskTypes}
             onApproveExperiment={s.handleApprove}
             onDismissExperiment={s.handleDismiss}
             onNavigateToKnowledge={(docId) => { setKnowledgeBrowserInitialDocId(docId); s.setShowKnowledgeBrowser(true); }}

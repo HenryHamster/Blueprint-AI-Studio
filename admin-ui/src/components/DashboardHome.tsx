@@ -64,6 +64,7 @@ import { useDashboardDigest, type SparkPoint } from '../hooks/useDashboardDigest
 import { useOpenPRs } from '../hooks/useOpenPRs';
 import { useVersionLifecycle } from '../hooks/useVersionLifecycle';
 import { useProjectMetrics } from '../hooks/useProjectMetrics';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 
 // Dashboard reads DirectionPortfolioSection's `DirectionProgress` shape off
 // `direction_progress`, so it instantiates the generic canonical type with it.
@@ -102,6 +103,7 @@ export interface DashboardHomeProps {
   onConfigureTargets?: () => void;
   onSpawnOrphanFix?: (pr: OpenPR) => void;
   onPanelReviewPr?: (pr: OpenPR) => void;
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   userRole?: 'admin' | 'user' | null;
 }
 
@@ -115,7 +117,7 @@ const WINDOW_OPTIONS = [
   { label: '7d', value: 168 },
 ];
 
-export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, userRole }: DashboardHomeProps) {
+export function DashboardHome({ tasks, selectedProjectId, projects, globalActiveCount, globalQueuedCount, scopedActiveCount, scopedQueuedCount, onViewTask, onDirectionClick, onCategoryClick, onScopeClick, onConfigureTargets, onSpawnOrphanFix, onPanelReviewPr, gatedTaskTypes, userRole }: DashboardHomeProps) {
   const [fixLoopTrendDays, setFixLoopTrendDays] = useState<7 | 14 | 30>(7);
   const [windowHours, setWindowHours] = useState(24);
   const [selectedSrCategory, setSelectedSrCategory] = useState<string>('');
@@ -288,7 +290,7 @@ export function DashboardHome({ tasks, selectedProjectId, projects, globalActive
       </div>
 
       {/* Anomaly Throttle Banner */}
-      <AnomalyThrottleBanner digest={digest} onRestored={refetchDigest} />
+      <AnomalyThrottleBanner digest={digest} onRestored={refetchDigest} gatedTaskTypes={gatedTaskTypes} />
 
       {/* System Health — actionable issues with remediation hints */}
       <SystemHealthCard

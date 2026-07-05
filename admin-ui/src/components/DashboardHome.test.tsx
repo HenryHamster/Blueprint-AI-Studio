@@ -2724,6 +2724,32 @@ describe('DashboardHome', () => {
   });
 
   describe('digest staleness banner', () => {
+    it('surfaces partial dispatch gates from the runtime state', async () => {
+      setupApiMocks({
+        digest: {
+          failed_count: 0,
+          pending_approval_count: 0,
+          completed_count: 0,
+          failure_groups: [],
+          direction_progress: [],
+          recent_completions: [],
+        },
+        diagnostics: makeDiagnostics(),
+      });
+
+      render(
+        <DashboardHome
+          tasks={[]}
+          selectedProjectId="proj1"
+          onViewTask={vi.fn()}
+          gatedTaskTypes={[{ task_type: 'create', failure_rate: 0.83, sample_size: 12, threshold: 0.6 }]}
+        />,
+      );
+
+      expect(await screen.findByText(/Partial dispatch gate — 1 task type blocked/)).toBeInTheDocument();
+      expect(screen.getByText('create')).toBeInTheDocument();
+    });
+
     it('shows the stale banner when the backend returns served_stale=true', async () => {
       setupApiMocks({
         digest: {

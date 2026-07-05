@@ -14,6 +14,7 @@ import { SettingsSectionRouter, type SettingsSectionRouterProps } from './Settin
 import type { Task } from './TaskCard';
 import { WarmVmPanel } from './WarmVmPanel';
 import { WorkbenchPanel, WorkbenchSurface } from './WorkbenchLayout';
+import type { FailingTaskTypeEntry } from '../types/diagnostics';
 import {
   PROJECT_MANAGE_SECTIONS,
   RUNTIME_SECTIONS,
@@ -454,6 +455,7 @@ interface RuntimeWorkspaceProps {
   onConfigureTargets: () => void;
   onSpawnOrphanFix: DashboardHomeProps['onSpawnOrphanFix'];
   onPanelReviewPr: DashboardHomeProps['onPanelReviewPr'];
+  gatedTaskTypes?: FailingTaskTypeEntry[];
   onApproveExperiment: (taskId: string) => Promise<void>;
   onDismissExperiment: (taskId: string) => Promise<void>;
   onNavigateToKnowledge: (documentId: string) => void;
@@ -488,6 +490,7 @@ export function RuntimeWorkspace({
   onConfigureTargets,
   onSpawnOrphanFix,
   onPanelReviewPr,
+  gatedTaskTypes,
   onApproveExperiment,
   onDismissExperiment,
   onNavigateToKnowledge,
@@ -655,6 +658,7 @@ export function RuntimeWorkspace({
           onConfigureTargets={onConfigureTargets}
           onSpawnOrphanFix={onSpawnOrphanFix}
           onPanelReviewPr={onPanelReviewPr}
+          gatedTaskTypes={gatedTaskTypes}
           userRole={userRole}
         />
       ) : runtimeSection === 'accounts' ? (

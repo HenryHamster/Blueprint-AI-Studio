@@ -14712,6 +14712,69 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert current["merged_since_verdict"] == 1
 
     @pytest.mark.asyncio
+    async def test_version_lifecycle_current_version_acceptance_aggregate_falls_back_when_live_compute_fails(
+        self, client: AsyncClient, db_session
+    ):
+        """current_version serves the stored aggregate when live recomputation fails."""
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        opened_at = _utcnow() - timedelta(hours=3)
+        version.opened_at = opened_at
+        aggregate = {
+            "total": 7,
+            "proven": 5,
+            "satisfied_unproven": 1,
+            "declared_unsatisfied": 1,
+            "undeclared": 0,
+            "merged_unverified_degraded": 0,
+            "malformed": 0,
+        }
+        version.last_qualification = {
+            "status": "dry_run",
+            "acceptance_aggregate": aggregate,
+            "finalized_at": (opened_at + timedelta(hours=1)).isoformat(),
+        }
+        db_session.add(version)
+        await db_session.commit()
+
+        with (
+            patch(
+                "app.release_version.count_merged_since",
+                new=AsyncMock(return_value=2),
+            ),
+            patch(
+                "app.release_version.list_merged_tasks_for_version",
+                new=AsyncMock(return_value=[]),
+            ),
+            patch(
+                "app.release_qualifier.compute_promotion_readiness",
+                new=AsyncMock(return_value={"ready": False, "reason": "test"}),
+            ),
+            patch(
+                "app.release_qualifier.resolve_lifecycle_audit_evidence",
+                new=AsyncMock(
+                    return_value={
+                        "state": "none",
+                        "latest_audit": None,
+                        "stale_audit": None,
+                    }
+                ),
+            ),
+            patch(
+                "app.release_version.compute_version_acceptance_aggregate",
+                new=AsyncMock(side_effect=RuntimeError("boom")),
+            ),
+        ):
+            resp = await client.get(
+                f"/api/admin/projects/{project.id}/version-lifecycle"
+            )
+
+        assert resp.status_code == 200, resp.text
+        current = resp.json()["current_version"]
+        assert current["acceptance_aggregate"] == aggregate
+        assert current["merged_task_count"] == 2
+
+    @pytest.mark.asyncio
     async def test_verdict_row_exposes_acceptance_aggregate_key(
         self, client: AsyncClient, db_session
     ):

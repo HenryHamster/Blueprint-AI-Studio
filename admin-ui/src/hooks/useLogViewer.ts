@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import type { Task, TaskStatus, TrackLogEntry } from '../types/task';
 import type { DeployState } from '../types/settings';
 import type { StrategicChallengeSummary } from '../types/digest';
-import type { FailingTaskTypeEntry } from '../types/diagnostics';
+import type { FailingTaskTypeEntry, FailingTaskTypes } from '../types/diagnostics';
 import {
   workbenchMessageMatchesProject,
   workbenchRefetchSurfacesFromMessage,
@@ -141,6 +141,7 @@ export function useLogViewer({
   const [lastCycleCompletion, setLastCycleCompletion] = useState<StrategicCycleCompletion | null>(null);
   // Live resident-session transcript buffer, appended from strategic_session events.
   const [strategicSessionTranscript, setStrategicSessionTranscript] = useState<StrategicSessionDelta[]>([]);
+  const gatedTypesRefreshSeqRef = useRef(0);
   const pipelineThrottleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const wsConnectingProjectRef = useRef<string | null>(null);
@@ -174,6 +175,29 @@ export function useLogViewer({
   useEffect(() => { logTaskRef.current = logTask; }, [logTask]);
   useEffect(() => { selectedProjectIdRef.current = selectedProjectId; }, [selectedProjectId]);
 
+  const refreshGatedTaskTypes = useCallback(async () => {
+    const seq = ++gatedTypesRefreshSeqRef.current;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/admin/failing-task-types`, {
+        headers: await authHeaders(),
+      });
+      if (!res.ok) return;
+      const data = await res.json() as FailingTaskTypes;
+      if (gatedTypesRefreshSeqRef.current !== seq) return;
+      const threshold = typeof data.global_failure_threshold === 'number'
+        ? data.global_failure_threshold
+        : 0.7;
+      const gatedTypes = Array.isArray(data.gated_types) ? data.gated_types : [];
+      const next = new Map<string, FailingTaskTypeEntry>();
+      for (const entry of gatedTypes) {
+        next.set(entry.task_type, { ...entry, threshold });
+      }
+      setGatedTypesMap(next);
+    } catch {
+      // Preserve the current banner state if the snapshot probe fails.
+    }
+  }, []);
+
   // Clear wsDisconnected banner when task reaches a terminal state
   useEffect(() => {
     if (logTask && ['COMPLETED', 'FAILED', 'CANCELLED'].includes(logTask.status)) {
@@ -195,6 +219,7 @@ export function useLogViewer({
     setStrategicSessionTranscript([]);
     // Per-type gate state is global, but clear on project switch so stale gates
     // from a previous project don't bleed onto the newly-selected project's view.
+    gatedTypesRefreshSeqRef.current += 1;
     setGatedTypesMap(new Map());
   }, [selectedProjectId]);
 
@@ -428,26 +453,10 @@ export function useLogViewer({
         pipelineThrottleTimerRef.current = setTimeout(() => setPipelineThrottle(null), clearMs);
       }
       if (projectEventApplies && msg.event === 'type_throttle' && typeof msg.data?.type === 'string') {
-        const entry: FailingTaskTypeEntry = {
-          task_type: msg.data.type as string,
-          failure_rate: typeof msg.data.failure_rate === 'number' ? msg.data.failure_rate : 0,
-          sample_size: typeof msg.data.sample_size === 'number' ? msg.data.sample_size : 0,
-          threshold: 0.7,
-        };
-        setGatedTypesMap(prev => {
-          const next = new Map(prev);
-          next.set(entry.task_type, entry);
-          return next;
-        });
+        void refreshGatedTaskTypes();
       }
       if (projectEventApplies && msg.event === 'type_unthrottle' && typeof msg.data?.type === 'string') {
-        const ttype = msg.data.type as string;
-        setGatedTypesMap(prev => {
-          if (!prev.has(ttype)) return prev;
-          const next = new Map(prev);
-          next.delete(ttype);
-          return next;
-        });
+        void refreshGatedTaskTypes();
       }
       if (projectEventApplies && (
         msg.event === 'task_updated'
@@ -542,7 +551,7 @@ export function useLogViewer({
     } catch {
       // ignore parse errors
     }
-  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts, refreshFleetRunnersRef]);
+  }, [appendTrackLog, hasActiveTrackedTasks, hasForegroundLogTask, refreshGatedTaskTypes, restoreSelectedProjectStream, setDeployState, fetchTasksRef, fetchDirectionsRef, refreshStrategicReadModel, refreshMessages, refreshAlerts, refreshFleetRunnersRef]);
 
   const connectWs = useCallback(async (projectId: string) => {
     if (hasActiveWsForProject(projectId)) return;
@@ -630,6 +639,7 @@ export function useLogViewer({
         // Refresh task list to catch up on any missed state changes during disconnect
         setLogLines(prev => [...prev, '[Refreshing task list after reconnect]']);
         fetchTasksRef.current();
+        void refreshGatedTaskTypes();
       };
 
       ws.onmessage = handleWsMessage;
@@ -684,7 +694,7 @@ export function useLogViewer({
       setLogsConnecting(false);
       setLogLines(prev => [...prev, `[Connection error: ${err}]`]);
     }
-  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject]);
+  }, [handleWsMessage, appendTrackLog, fetchTasksRef, hasActiveWsForProject, refreshGatedTaskTypes]);
 
   // Keep connectWsRef in sync so the online listener can call the latest version
   useEffect(() => { connectWsRef.current = connectWs; }, [connectWs]);

@@ -34,6 +34,7 @@ class MockWebSocket {
 }
 
 let fetchSpy: ReturnType<typeof vi.fn>;
+let failingTaskTypesFetchCount = 0;
 
 function setup(options: { selectedProjectId?: string | null; realtimeWsEnabled?: boolean } = {}) {
   return renderHook(() => {
@@ -63,7 +64,59 @@ describe('useLogViewer strategist events', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     MockWebSocket.instances = [];
-    fetchSpy = vi.fn().mockResolvedValue({ ok: true, json: () => Promise.resolve({ ticket: 't' }) });
+    failingTaskTypesFetchCount = 0;
+    fetchSpy = vi.fn((url: RequestInfo | URL) => {
+      const path = String(url);
+      if (path.includes('/ws-ticket')) {
+        return Promise.resolve({ ok: true, json: async () => ({ ticket: 't' }) });
+      }
+      if (path.includes('/failing-task-types')) {
+        failingTaskTypesFetchCount += 1;
+        const payload = failingTaskTypesFetchCount === 1
+          ? {
+              gated_types: [],
+              global_failure_threshold: 0.6,
+              anomaly_tightened: true,
+              window_minutes: 15,
+              generated_at: '2026-07-05T12:00:00Z',
+            }
+          : failingTaskTypesFetchCount === 2
+            ? {
+                gated_types: [
+                  { task_type: 'create', failure_rate: 0.8, sample_size: 10, threshold: 0.6 },
+                ],
+                global_failure_threshold: 0.6,
+                anomaly_tightened: true,
+                window_minutes: 15,
+                generated_at: '2026-07-05T12:00:00Z',
+              }
+            : failingTaskTypesFetchCount === 3
+              ? {
+                  gated_types: [
+                    { task_type: 'create', failure_rate: 0.8, sample_size: 10, threshold: 0.6 },
+                    { task_type: 'fix', failure_rate: 0.9, sample_size: 5, threshold: 0.6 },
+                  ],
+                  global_failure_threshold: 0.6,
+                  anomaly_tightened: true,
+                  window_minutes: 15,
+                  generated_at: '2026-07-05T12:00:00Z',
+                }
+              : {
+                  gated_types: [
+                    { task_type: 'fix', failure_rate: 0.9, sample_size: 5, threshold: 0.6 },
+                  ],
+                  global_failure_threshold: 0.6,
+                  anomaly_tightened: true,
+                  window_minutes: 15,
+                  generated_at: '2026-07-05T12:00:00Z',
+                };
+        return Promise.resolve({
+          ok: true,
+          json: async () => payload,
+        });
+      }
+      return Promise.resolve({ ok: true, json: async () => ({}) });
+    });
     vi.stubGlobal('fetch', fetchSpy);
     vi.stubGlobal('WebSocket', MockWebSocket as unknown as typeof WebSocket);
   });
@@ -1090,14 +1143,22 @@ describe('useLogViewer strategist events', () => {
     act(() => {
       ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
     });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
     expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('create');
     expect(result.current.lv.gatedTaskTypes[0].failure_rate).toBe(0.8);
     expect(result.current.lv.gatedTaskTypes[0].sample_size).toBe(10);
-    expect(result.current.lv.gatedTaskTypes[0].threshold).toBe(0.7);
+    expect(result.current.lv.gatedTaskTypes[0].threshold).toBe(0.6);
 
     act(() => {
       ws.emit({ event: 'type_throttle', data: { type: 'fix', failure_rate: 0.9, sample_size: 5, detail: 'gated' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
     });
     expect(result.current.lv.gatedTaskTypes).toHaveLength(2);
     // Sorted alphabetically
@@ -1106,6 +1167,10 @@ describe('useLogViewer strategist events', () => {
 
     act(() => {
       ws.emit({ event: 'type_unthrottle', data: { type: 'create', failure_rate: 0.5, sample_size: 10, detail: 'recovered' } });
+    });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
     });
     expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
     expect(result.current.lv.gatedTaskTypes[0].task_type).toBe('fix');
@@ -1134,9 +1199,17 @@ describe('useLogViewer strategist events', () => {
     act(() => {
       ws.emit({ event: 'type_throttle', data: { type: 'create', failure_rate: 0.8, sample_size: 10, detail: 'gated' } });
     });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(result.current.lv.gatedTaskTypes).toHaveLength(1);
 
     act(() => { rerender({ pid: 'projB' }); });
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
     expect(result.current.lv.gatedTaskTypes).toHaveLength(0);
   });
 });
