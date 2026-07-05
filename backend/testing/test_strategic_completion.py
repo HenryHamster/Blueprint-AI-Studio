@@ -9094,6 +9094,84 @@ async def test_set_problem_model_with_qualify_request_does_not_400(client, db_se
     assert body["qualify_request_received"] is True
 
 
+@pytest.mark.asyncio
+async def test_qualify_request_failure_recorded_on_release_version(
+    db_session, mocker
+):
+    """When run_qualification raises unexpectedly, _apply_qualify_request must
+    record a durable qualify_request_error on ReleaseVersion.last_qualification
+    rather than silently swallowing the failure into a log line only.
+
+    Regression: before this fix the outer except swallowed all exceptions with
+    no queryable trace — qualification_attempts stayed 0, last_qualification
+    stayed None, and diagnosis required log-diving.
+    """
+    from unittest.mock import AsyncMock
+    from app.models import TaskStatus
+    from app.strategic_completion import _apply_qualify_request
+    from app import release_version as rv
+
+    project = Project(
+        name="QR-ERR-DURABLE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="ready")
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    assert version.last_qualification is None
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-err",
+        payloads=[
+            {"type": "strategic_review", "prompt": "r", "vision": {"revision": 1}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Force run_qualification to raise — simulates any unexpected failure
+    # (DB error, network blip, unhandled edge case inside the qualifier).
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError("injected failure for durable-error test"),
+    )
+
+    await _apply_qualify_request(
+        {"reason": "ready"},
+        task,
+        project,
+        db_session,
+        path="test",
+    )
+
+    # The failure must be recorded on the ReleaseVersion row, not just logged.
+    await db_session.refresh(version)
+    lq = version.last_qualification
+    assert lq is not None, (
+        "last_qualification must be set after run_qualification raises — "
+        "a silent log line is not queryable by the agent or operator"
+    )
+    assert "qualify_request_error" in lq, (
+        f"last_qualification must contain qualify_request_error; got: {lq}"
+    )
+    assert "qualify_request_error_at" in lq
+    # The error text must identify the failure so it is diagnosable without logs.
+    assert "injected failure" in lq["qualify_request_error"]
+
+
 # ── new_acceptance_criteria transport / fallback ─────────────────────────────
 
 

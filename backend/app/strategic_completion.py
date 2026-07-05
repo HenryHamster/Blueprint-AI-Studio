@@ -1408,6 +1408,9 @@ async def _apply_qualify_request(
         return
     reason_raw = request.get("reason")
     reason = reason_raw.strip() or None if isinstance(reason_raw, str) else None
+    # Initialised outside the try so the except clause can record a durable
+    # failure on the version row even if run_qualification throws.
+    open_ver = None
     try:
         from app import release_qualifier as _rq
         from app import release_version as _rv
@@ -1493,12 +1496,35 @@ async def _apply_qualify_request(
             reason,
         )
     except Exception:
+        import traceback as _tb
+
         logger.exception(
             "[STRATEGIC] Task %s (%s path): failed to apply qualify_request "
             "(non-fatal)",
             task.id,
             path,
         )
+        # Record the failure durably on the ReleaseVersion row so it is
+        # queryable via the strategic payload / admin version-phase fetch.
+        # A log line alone is not fetchable by the agent or operator without
+        # direct log access.  Merges under a separate key so a partial write
+        # by run_qualification (e.g. "status": "error") is preserved.
+        if open_ver is not None:
+            try:
+                open_ver.last_qualification = {
+                    **(open_ver.last_qualification or {}),
+                    "qualify_request_error": _tb.format_exc(limit=5)[:500],
+                    "qualify_request_error_at": _utcnow().isoformat(),
+                }
+                flag_modified(open_ver, "last_qualification")
+                session.add(open_ver)
+            except Exception:  # noqa: BLE001 — recording must never re-raise
+                logger.exception(
+                    "[STRATEGIC] Task %s (%s path): also failed to record "
+                    "qualify_request error on ReleaseVersion — failure lost",
+                    task.id,
+                    path,
+                )
 
 
 def _extract_rationale_from_notes(direction: dict | None, prefix: str) -> str | None:
