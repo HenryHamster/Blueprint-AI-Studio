@@ -116,6 +116,40 @@ async def maybe_record_direction_event(
         )
 
 
+async def latest_direction_snapshot(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    direction_key: str,
+) -> Dict[str, Any] | None:
+    """Return the most recent non-null ``snapshot_data`` for a direction.
+
+    Reads the append-only ``DirectionEvent`` trail to reconstruct the full
+    direction dict (text, paths, gap_id, criterion_keys, context, ...) even after
+    the row was pruned from ``project.directions`` by a lifecycle sweep. Every
+    created / status_changed / pruned event carries a full snapshot, so the latest
+    one is the direction's last-known good shape.
+
+    Returns ``None`` when no event with a snapshot exists for this key.
+    """
+    from sqlalchemy import select  # local import: keep module import surface small
+
+    snapshot = (
+        await session.execute(
+            select(DirectionEvent.snapshot_data)
+            .where(
+                DirectionEvent.project_id == project_id,
+                DirectionEvent.direction_key == str(direction_key)[:128],
+                DirectionEvent.snapshot_data.isnot(None),
+            )
+            .order_by(DirectionEvent.recorded_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not isinstance(snapshot, dict):
+        return None
+    return dict(snapshot)
+
+
 async def record_direction_pruned(
     session: AsyncSession,
     project_id: uuid.UUID,

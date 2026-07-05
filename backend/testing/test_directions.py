@@ -10434,3 +10434,233 @@ async def test_strategic_api_reject_direction_cancels_queued_tasks(
     finally:
         app.dependency_overrides.pop(get_session, None)
         app.dependency_overrides.pop(verify_agent_token, None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Guarded resurrection endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _churn_history(now: datetime) -> list[dict]:
+    """5 cycles that trip the churn guardrail (Rule 5): 1 merge total, ~2% rate."""
+    return [
+        {
+            "timestamp": (now - timedelta(days=5)).isoformat(),
+            "tasks_created": 10,
+            "tasks_completed": 10,
+            "tasks_failed": 0,
+            "tasks_failed_infra": 0,
+            "prs_merged": 1,  # one merge => total_merged=1, bypasses Rule 2
+        },
+        *[
+            {
+                "timestamp": (now - timedelta(days=i)).isoformat(),
+                "tasks_created": 10,
+                "tasks_completed": 10,
+                "tasks_failed": 0,
+                "tasks_failed_infra": 0,
+                "prs_merged": 0,
+            }
+            for i in range(4, 0, -1)
+        ],
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resurrect_pruned_direction_resets_ladder_and_restaffs_gap(
+    client: AsyncClient, db_session, mocker
+):
+    """End-to-end: auto-retire+prune a gap-linked direction, then resurrect it.
+
+    Asserts the resurrected direction is back in project.directions with
+    status='active', every auto-retire ladder counter reset to 0, terminal
+    residue cleared, auto_recovered_at (grace) set, and its id re-staffed into the
+    owning gap's active_moves.
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.directions_repo import sync_directions
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+    now = datetime.utcnow()
+
+    # The exact terminal end-state the zombie auto-retire ladder leaves: status
+    # 'completed', auto_completed residue stamped, EVERY ladder counter primed at
+    # or above its threshold, and a gap link. This is what a raw completed->active
+    # flip cannot safely undo.
+    direction = {
+        "id": "d-resurrect-me",
+        "text": "Direction that was wrongly auto-retired",
+        "status": "completed",
+        "auto_completed": True,
+        "auto_completed_reason": (
+            "Auto-retired: zombie direction paused 2 times with no merged PRs."
+        ),
+        "completed_at": now.isoformat(),
+        "priority": "medium",
+        "paths": ["backend/app/foo.py"],
+        "added_at": "2026-01-01T00:00:00",
+        "gap_id": "g-resurrect",
+        "churn_family_pause_count": 2,
+        "lifetime_burn_pause_count": 2,
+        "code_failure_pause_count": 1,
+        "auto_pause_count": 3,
+        "churn_pause_evidence": {"non_merge_finished": 49, "merge_rate": 0.02},
+        "lifetime_burn_pause_evidence": {"lifetime_non_merge": 200},
+        "research_history": _churn_history(now),
+    }
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.autonomous_enabled = True
+    # Row already pruned out of the blob (as the lifecycle sweep does within one
+    # tick), and the gap already unstaffed (the retire reconciliation moved the
+    # direction from active_moves into past_moves).
+    project.directions = []
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-resurrect",
+                "name": "the gap this direction staffs",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": ["d-resurrect-me"],
+            }
+        ],
+    }
+    flag_modified(project, "directions")
+    flag_modified(project, "problem_model")
+    db_session.add(project)
+    await db_session.commit()
+
+    # (a) Reproduce the append-only DirectionEvent trail the real retire+prune
+    # emits: a snapshot-carrying row is written, then pruned. The pruned event's
+    # snapshot_data is what makes a vanished direction resurrectable at all.
+    await sync_directions(db_session, pid, [direction])
+    await db_session.commit()
+    await sync_directions(db_session, pid, [])  # prune -> emits pruned snapshot event
+    await db_session.commit()
+
+    # Precondition: the direction is gone and the gap is unstaffed.
+    db_session.expire_all()
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    assert all(d.get("id") != "d-resurrect-me" for d in (project.directions or []))
+    gap = next(g for g in project.problem_model["gaps"] if g["id"] == "g-resurrect")
+    assert "d-resurrect-me" not in gap["active_moves"], "gap unstaffed before resurrect"
+
+    # (b) Resurrect via the endpoint (reconstructs from the DirectionEvent snapshot).
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-resurrect-me/resurrect",
+        json={"rationale": "operator confirmed this retirement was wrong"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["resurrected_at"]
+    d = body["direction"]
+
+    # (c) Clean, resurrectable end-state: ladder reset, residue stripped, grace set.
+    assert d["status"] == "active"
+    assert d["churn_family_pause_count"] == 0
+    assert d["lifetime_burn_pause_count"] == 0
+    assert d["code_failure_pause_count"] == 0
+    assert d["auto_pause_count"] == 0
+    assert "churn_pause_evidence" not in d
+    assert "lifetime_burn_pause_evidence" not in d
+    assert "auto_completed" not in d
+    assert "auto_completed_reason" not in d
+    assert "completed_at" not in d
+    assert d.get("auto_recovered_at") is not None
+    assert d.get("resurrected_at") is not None
+    # Full contract reconstructed from the snapshot even though the row was gone.
+    assert d["gap_id"] == "g-resurrect"
+    assert d["paths"] == ["backend/app/foo.py"]
+
+    # Persisted back into project.directions + gap re-staffed. Read through the
+    # GET endpoint (app session) so the assertion sees the committed write.
+    get_resp = await client.get(f"/api/admin/projects/{project_id}/directions")
+    assert get_resp.status_code == 200, get_resp.text
+    get_body = get_resp.json()
+    ids = [x.get("id") for x in (get_body["directions"] or [])]
+    assert "d-resurrect-me" in ids, "resurrected direction back in project.directions"
+    revived = next(
+        x for x in get_body["directions"] if x.get("id") == "d-resurrect-me"
+    )
+    assert revived["status"] == "active"
+    gap = next(
+        g for g in get_body["problem_model"]["gaps"] if g["id"] == "g-resurrect"
+    )
+    assert "d-resurrect-me" in gap["active_moves"], (
+        "resurrected direction id must be re-staffed into its gap's active_moves"
+    )
+
+
+@pytest.mark.asyncio
+async def test_resurrect_direction_409_when_at_active_cap(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrection enforces the active-direction cap exactly like reactivation."""
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.shared_state import runtime_config
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = [
+        {
+            "id": "d-active-1",
+            "text": "already active",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        },
+        {
+            "id": "d-terminal",
+            "text": "terminal direction to resurrect",
+            "status": "completed",
+            "auto_completed": True,
+            "completed_at": "2026-06-01T00:00:00",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+        },
+    ]
+    flag_modified(project, "directions")
+    db_session.add(project)
+    await db_session.commit()
+
+    prior_cap = runtime_config.get("max_active_directions")
+    runtime_config["max_active_directions"] = 1
+    try:
+        resp = await client.post(
+            f"/api/admin/projects/{project_id}/directions/d-terminal/resurrect",
+            json={},
+        )
+    finally:
+        if prior_cap is None:
+            runtime_config.pop("max_active_directions", None)
+        else:
+            runtime_config["max_active_directions"] = prior_cap
+    assert resp.status_code == 409, resp.text
+    assert "cap" in resp.json()["error"]["message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_resurrect_direction_404_when_no_snapshot(
+    client: AsyncClient, db_session, mocker
+):
+    """Resurrecting a pruned direction with no event snapshot returns 404."""
+    project_id = await _deploy_project(client, mocker)
+
+    resp = await client.post(
+        f"/api/admin/projects/{project_id}/directions/d-never-existed/resurrect",
+        json={},
+    )
+    assert resp.status_code == 404, resp.text
+    assert "snapshot" in resp.json()["error"]["message"].lower()

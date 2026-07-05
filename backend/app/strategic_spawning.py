@@ -5844,6 +5844,10 @@ def _build_direction_stats(
             stat_entry["auto_paused"] = bool(d.get("auto_paused"))
             if d.get("paused_reason"):
                 stat_entry["paused_reason"] = d.get("paused_reason")
+            if d.get("lifetime_burn_pause_count") is not None:
+                stat_entry["lifetime_burn_pause_count"] = d.get(
+                    "lifetime_burn_pause_count"
+                )
         elif d.get("status") == "proposed":
             if d.get("proposed_by"):
                 stat_entry["proposed_by"] = str(d["proposed_by"])
@@ -5851,6 +5855,20 @@ def _build_direction_stats(
                 stat_entry["proposal_rationale"] = d["proposal_rationale"]
             if d.get("proposed_at"):
                 stat_entry["proposed_at"] = d["proposed_at"]
+        # Surface auto_retire_pending metadata regardless of direction status:
+        # the scaffolding retire path sets auto_retire_pending=True while keeping
+        # the direction active (retired on the next lifecycle tick), so this must
+        # not be gated on status=="paused".
+        if d.get("auto_retire_pending"):
+            stat_entry["auto_retire_pending"] = True
+            if d.get("auto_retire_pending_reason"):
+                stat_entry["auto_retire_pending_reason"] = d.get(
+                    "auto_retire_pending_reason"
+                )
+            if d.get("auto_retire_pending_at"):
+                stat_entry["auto_retire_pending_at"] = d.get(
+                    "auto_retire_pending_at"
+                )
         # Surface non-default recommended_mode so the strategic agent can bias
         # its direction decisions (audit/fundamentals → prefer non-feature work;
         # pause → tactical spawning should be skipped by autonomous_research).

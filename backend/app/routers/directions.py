@@ -36,7 +36,9 @@ from app.direction_lifecycle import (
     _clear_direction_reactivation_state,
     _reset_outcome_detection_state,
     reactivate_paused_direction,
+    resurrect_direction,
 )
+from app.direction_event_trail import latest_direction_snapshot
 from app.strategic_events import STRATEGIC_KIND_DIRECTIONS, emit_strategic_updated
 from app.capability_proof import enrich_problem_model_capability_proofs
 from app.direction_refractory import get_direction_refractory_info
@@ -1147,6 +1149,175 @@ async def update_direction(
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"direction": updated_direction[0]}
+
+
+_RESURRECTABLE_TERMINAL_STATUSES = {"completed", "expired", "superseded"}
+
+
+def _is_terminal_direction(d: dict) -> bool:
+    return (
+        d.get("status") in _RESURRECTABLE_TERMINAL_STATUSES
+        or bool(d.get("auto_completed"))
+    )
+
+
+@router.post("/projects/{project_id}/directions/{direction_id}/resurrect")
+async def resurrect_direction_endpoint(
+    project_id: uuid.UUID,
+    direction_id: str,
+    payload: Dict[str, Any] | None = None,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Sanctioned, guarded revival of a wrongly auto-retired direction.
+
+    Undo path for the d-21efb120 class of incident. A raw completed->active flip
+    re-retires almost immediately (ladder counters stay primed, terminal residue
+    stays stamped, no grace, gap not re-staffed); this endpoint applies
+    ``resurrect_direction`` — which resets every ladder counter, strips terminal
+    residue, and grants one grace window — and re-staffs the owning gap.
+
+    Handles both cases:
+      * direction still in ``project.directions`` and terminal -> revive in place
+      * direction already pruned from ``project.directions`` -> reconstruct from
+        the latest ``DirectionEvent`` snapshot (404 if none) and re-insert.
+
+    Enforces the active-direction cap (409 at cap) exactly like reactivation.
+    Optional body ``{"rationale"?: str}`` is recorded on the audit note.
+    """
+    project = await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+
+    rationale: str | None = None
+    if isinstance(payload, dict):
+        raw_rationale = payload.get("rationale")
+        if raw_rationale is not None:
+            if not isinstance(raw_rationale, str):
+                raise HTTPException(
+                    status_code=400, detail="rationale must be a string or null"
+                )
+            rationale = raw_rationale
+
+    # Reconstruct-from-snapshot data must be fetched BEFORE the (sync) locked
+    # mutate. It is only consumed when the direction is absent from the locked
+    # list, so the live row always wins when present.
+    snapshot = await latest_direction_snapshot(session, project.id, direction_id)
+
+    from app.shared_state import runtime_config as _runtime_config
+
+    max_active = _runtime_config.get("max_active_directions", 5)
+    now_iso = _utcnow().isoformat()
+
+    resurrected_holder: list[dict] = []
+    staffing_holder: list[dict[str, Any]] = []
+    actor = current_user.get("email") or current_user.get("user_id") or "operator"
+
+    def _mutate_resurrect(directions: list) -> None:
+        existing = next(
+            (d for d in directions if d.get("id") == direction_id), None
+        )
+
+        if existing is not None:
+            if not _is_terminal_direction(existing):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Direction is not retired "
+                        f"(status={existing.get('status')!r}); resurrection only "
+                        "applies to a terminal/auto-retired direction"
+                    ),
+                )
+            target = existing
+            reinsert = False
+        else:
+            if not snapshot:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        "No snapshot found to resurrect this direction — it was "
+                        "never recorded in the direction event trail"
+                    ),
+                )
+            target = dict(snapshot)
+            target["id"] = direction_id
+            reinsert = True
+
+        # Active-direction cap (evaluated inside the lock against live data).
+        active_count = sum(
+            1
+            for d in directions
+            if d.get("status") == "active" and d.get("id") != direction_id
+        )
+        if active_count >= max_active:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Direction cap reached: max {max_active} active directions allowed",
+            )
+
+        prior_status = target.get("status")
+        prior_gap_id = target.get("gap_id")
+
+        resurrect_direction(
+            target,
+            now_iso=now_iso,
+            actor=actor,
+            rationale=rationale,
+        )
+
+        if reinsert:
+            directions.append(target)
+
+        staffing_holder.append(
+            {
+                "prior_gap_id": prior_gap_id,
+                "new_gap_id": target.get("gap_id"),
+                "prior_status": prior_status,
+                "new_status": "active",
+            }
+        )
+        resurrected_holder.append(target)
+
+    applied = await with_directions_locked(
+        session, project.id, _mutate_resurrect, skip_locked=True
+    )
+    if not applied:
+        raise HTTPException(
+            status_code=429,
+            detail="Project row locked by concurrent write, retry",
+            headers={"Retry-After": "2"},
+        )
+
+    # Re-staff the owning gap: add the resurrected direction id back into its
+    # gap's active_moves and drop it from past_moves (same reconciliation the
+    # operator PATCH status/gap_id path runs).
+    if staffing_holder:
+        transition = staffing_holder[0]
+        reconciliation = reconcile_gap_staffing_raw_result(
+            project.problem_model,
+            direction_id,
+            transition.get("new_gap_id"),
+            transition.get("prior_gap_id"),
+            new_status=transition.get("new_status"),
+            prior_status=transition.get("prior_status"),
+            now_iso=now_iso,
+            rationale="direction resurrected",
+        )
+        if reconciliation.get("problem_model") is not None:
+            project.problem_model = reconciliation["problem_model"]
+            flag_modified(project, "problem_model")
+        _log_gap_staffing_reconcile_result(
+            source="operator_resurrect_direction",
+            project_id=project.id,
+            result=reconciliation,
+        )
+
+    await session.commit()
+    await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
+    return {
+        "direction": resurrected_holder[0],
+        "resurrected_at": now_iso,
+    }
 
 
 @router.post("/projects/{project_id}/directions/{direction_id}/research")

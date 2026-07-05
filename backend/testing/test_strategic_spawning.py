@@ -2790,6 +2790,97 @@ async def test_recommended_mode_pause_present_in_direction_stats(db_session):
 
 
 @pytest.mark.asyncio
+async def test_auto_retire_pending_surfaces_in_direction_stats(db_session, mocker):
+    """Paused lifetime-burn directions keep their retire-pending metadata in the strategist payload."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    now = datetime.utcnow()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-retire-pending",
+                "status": "paused",
+                "text": "Direction pending lifetime-burn retirement",
+                "priority": "medium",
+                "auto_paused": True,
+                "paused_reason": "Lifetime burn backstop: cumulative non-merge ratio above threshold",
+                "auto_retire_pending": True,
+                "auto_retire_pending_reason": "lifetime_burn",
+                "auto_retire_pending_at": (now - timedelta(hours=1)).isoformat(),
+                "lifetime_burn_pause_count": 2,
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-retire-pending"
+    )
+
+    assert d_stat.get("auto_retire_pending") is True
+    assert d_stat.get("auto_retire_pending_reason") == "lifetime_burn"
+    assert d_stat.get("auto_retire_pending_at") == (now - timedelta(hours=1)).isoformat()
+    assert d_stat.get("lifetime_burn_pause_count") == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_retire_pending_surfaces_for_active_scaffolding_direction(
+    db_session, mocker
+):
+    """Active scaffolding-flagged directions surface retire-pending metadata in the strategist payload."""
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+    now = datetime.utcnow()
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-scaffolding-retire",
+                "status": "active",
+                "text": "Direction pending scaffolding retirement",
+                "priority": "medium",
+                "auto_retire_pending": True,
+                "auto_retire_pending_reason": "scaffolding",
+                "auto_retire_pending_at": (now - timedelta(minutes=5)).isoformat(),
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    payload = result.scalars().all()[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-scaffolding-retire"
+    )
+
+    assert d_stat.get("auto_retire_pending") is True
+    assert d_stat.get("auto_retire_pending_reason") == "scaffolding"
+    assert d_stat.get("auto_retire_pending_at") == (
+        now - timedelta(minutes=5)
+    ).isoformat()
+    assert d_stat.get("status") == "active"
+
+
+@pytest.mark.asyncio
 async def test_spawn_gate_metrics_present_in_direction_stats(db_session):
     """spawn_gate_metrics appears in direction stats when direction has spawn-gate activity."""
     project = _make_project(
@@ -7035,7 +7126,13 @@ async def test_version_phase_block_carries_criterion_coverage(
 
     floor = _version_phase_floor(vp)
     assert floor["criterion_coverage"]["total"] == 3
-    assert "criteria" not in floor["criterion_coverage"]
+    floor_criteria = floor["criterion_coverage"]["criteria"]
+    assert len(floor_criteria) == 3
+    assert {entry["criterion_key"] for entry in floor_criteria} == {
+        c_covered.criterion_key,
+        c_partial.criterion_key,
+        c_uncovered.criterion_key,
+    }
 
     # stuck_count survives compaction — the uncovered criterion has no direction
     # mapping so its stuck_reason is "no_mapping" and stuck_count is 1.
