@@ -1,5 +1,6 @@
 import { strVal } from '../index.js';
 import { calcMessageAge, parseResearchContext } from './research-plan.js';
+import { formatRetiredDirectionGrounding } from './research-direction-context.js';
 
 export function fmtScalar(v: unknown, fallback = '?'): string {
   if (v === undefined || v === null) return fallback;
@@ -1212,7 +1213,10 @@ export function buildDirSummaryText(
 
     const scaffoldingNote = d.outcome_scaffolding_flagged === true ? ' [SCAFFOLDING]' : '';
 
-    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}`;
+    const groundingText = formatRetiredDirectionGrounding(d.retired_direction_grounding);
+    const groundingSection = groundingText ? `\n   ${groundingText}` : '';
+
+    return `${i + 1}. [${strVal(d.priority, 'medium')}]${catNote} ${strVal(d.text)} (id: ${strVal(d.id)})${statusNote}${satNote}${sysNote}${scaffoldingNote}\n   Stats: ${parts.join(', ')}${ctxSection}${findingsSection}${failuresSection}${spawnGateSection}${groundingSection}`;
   }).join('\n\n');
   // When the shipped detail list is shorter than the authoritative active count,
   // render an honest "showing M of N" header instead of letting the reader infer

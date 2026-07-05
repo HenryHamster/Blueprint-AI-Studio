@@ -3296,6 +3296,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "previous_decision_outcomes": {
         "priority": "low",
         "summarize": _summarize_previous_decision_outcomes,
+        # Recoverable via the exact section-fetch endpoint (see
+        # SECTION_FETCH_INVENTORY "sections"); a broad ./fetch direction cannot
+        # return this section summary. Keep in sync with the inventory.
+        "fetch_verb": "sections",
     },
     "anomaly_summary": {"priority": "low", "exempt": True},
     "playbook_summary": {
@@ -3318,10 +3322,19 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "past_retirement_critiques": {
         "priority": "low",
         "summarize": _summarize_past_retirement_critiques,
+        # Recoverable via the exact section-fetch endpoint (SECTION_FETCH_INVENTORY
+        # "sections"), not a per-direction fetch. Keep in sync with the inventory.
+        "fetch_verb": "sections",
     },
     # Raw retired-direction context (metrics + failed_approaches). Lower priority
     # than past_retirement_critiques (curated) — dropped first when budget is tight.
-    "retired_directions_summary": {"priority": "low", "exempt": True},
+    # Recoverable via the exact section-fetch endpoint (SECTION_FETCH_INVENTORY
+    # "sections"), not a per-direction fetch. Keep in sync with the inventory.
+    "retired_directions_summary": {
+        "priority": "low",
+        "exempt": True,
+        "fetch_verb": "sections",
+    },
     # Bounded fail-closed retirement deferrals from the prior cycle. High
     # priority so a supported/unsupported retirement second opinion stays
     # visible to the next strategist pass instead of getting dropped behind
@@ -5394,6 +5407,55 @@ async def _maybe_spawn_ci_compliance_cap_bump_fix(
     return task
 
 
+def _bound_retired_direction_grounding(
+    grounding: Any, *, field_max: int = 500
+) -> dict[str, Any] | None:
+    """Return a bounded copy of a direction's ``retired_direction_grounding``.
+
+    The write side (``build_retired_direction_grounding``) already produces a
+    compact dict, but this defends the payload against oversized ``reason`` /
+    ``summary`` text and drops any unexpected nested bodies so the active-
+    direction summary stays within the same char discipline as its sibling
+    context fields. Returns ``None`` when the input is not a usable mapping.
+    """
+    if not isinstance(grounding, dict):
+        return None
+    out: dict[str, Any] = {}
+    direction_id = str(grounding.get("direction_id") or "").strip()
+    if direction_id:
+        out["direction_id"] = direction_id[:field_max]
+    classification = str(grounding.get("classification") or "").strip()
+    if classification:
+        out["classification"] = classification[:field_max]
+    reason = str(grounding.get("reason") or "").strip()
+    if reason:
+        out["reason"] = reason[:field_max]
+    metrics = grounding.get("metrics")
+    if isinstance(metrics, dict):
+        bounded_metrics = {
+            str(k): v
+            for k, v in metrics.items()
+            if isinstance(v, (int, float, bool)) or v is None
+        }
+        if bounded_metrics:
+            out["metrics"] = bounded_metrics
+    gap_id = grounding.get("gap_id")
+    if gap_id:
+        out["gap_id"] = str(gap_id)[:field_max]
+    memo = grounding.get("retirement_memo")
+    if isinstance(memo, dict):
+        bounded_memo: dict[str, Any] = {}
+        memo_id = memo.get("knowledge_doc_id")
+        if memo_id:
+            bounded_memo["knowledge_doc_id"] = str(memo_id)[:field_max]
+        summary = str(memo.get("summary") or "").strip()
+        if summary:
+            bounded_memo["summary"] = summary[:field_max]
+        if bounded_memo:
+            out["retirement_memo"] = bounded_memo
+    return out or None
+
+
 def _build_direction_stats(
     project: Project,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -5591,6 +5653,17 @@ def _build_direction_stats(
         ).strip()
         if _retirement_condition:
             stat_entry["retirement_condition"] = _retirement_condition[:_DIR_FIELD_MAX]
+        # Retired-origin grounding: when this direction was created as a
+        # continuation/re-staffing of a retired one, strategic_completion stores
+        # a compact grounding object under context["retired_direction_grounding"]
+        # (classification/metrics/reason + optional gap_id/retirement_memo). Surface
+        # it — bounded like the sibling context fields — so the strategist can tell
+        # an active direction picks up prior work and how that prior work ended.
+        _grounding = _bound_retired_direction_grounding(
+            dir_context.get("retired_direction_grounding"), field_max=_DIR_FIELD_MAX
+        )
+        if _grounding:
+            stat_entry["retired_direction_grounding"] = _grounding
         # Advisory outcome-less-scaffolding flag: surfaces a long-running direction
         # that keeps merging PRs but never advances its success_evidence, so the
         # strategic agent sees it as a first-class signal (not just merge/cost metrics).
@@ -6054,12 +6127,13 @@ async def _spawn_strategic_review(
         # DB-only reads, none of which hold a connection across a network call —
         # so the resident agent is NOT context-blind at boot: without ``vision`` /
         # ``problem_model`` / ``running_update`` / ``directions_summary`` /
-        # ``direction_counts`` it would re-derive (and risk re-creating) existing
-        # directions, and without ``open_messages`` an operator message older than
-        # the resident's ~2-minute first-poll cursor would surface NOWHERE (not in
-        # bootstrap, not in the first poll). ``problem_model`` is the UNVERIFIED
-        # agent-view (the backing-path verification is exactly the skipped
-        # GitHub I/O). The transaction stays short: cheap reads only, zero network.
+        # ``direction_counts`` / the retired/prior-decision context below it would
+        # re-derive (and risk re-creating) existing directions, and without
+        # ``open_messages`` an operator message older than the resident's
+        # ~2-minute first-poll cursor would surface NOWHERE (not in bootstrap,
+        # not in the first poll). ``problem_model`` is the UNVERIFIED agent-view
+        # (the backing-path verification is exactly the skipped GitHub I/O). The
+        # transaction stays short: cheap reads only, zero network.
         review_model = (
             _runtime_config.get("task_type_models", {}).get("strategic_review")
             or _runtime_config.get("task_type_models", {}).get("research")
@@ -6072,6 +6146,15 @@ async def _spawn_strategic_review(
         )
         _res_direction_counts = _build_direction_counts(project)
         _res_direction_stats = _build_direction_stats(project)[1]
+        from app.strategic_analysis import _build_retired_directions_summary
+
+        cycle_history = await strategic_cycle.recent_for_agent_context(
+            session,
+            project.id,
+            limit=20,
+        )
+        _res_retired_summary = _build_retired_directions_summary(project)
+        _res_prev_outcomes = _build_previous_decision_outcomes(project, cycle_history)
         _res_open_messages = await _fetch_open_messages(session, project.id)
         minimal_payload = validate_internal_payload(
             pack_under_budget(
@@ -6088,6 +6171,16 @@ async def _spawn_strategic_review(
                     "directions_summary": _res_direction_stats,
                     "direction_counts": _res_direction_counts,
                     "max_active_directions": _res_direction_counts["max_active"],
+                    **(
+                        {"retired_directions_summary": _res_retired_summary}
+                        if _res_retired_summary
+                        else {}
+                    ),
+                    **(
+                        {"previous_decision_outcomes": _res_prev_outcomes}
+                        if _res_prev_outcomes
+                        else {}
+                    ),
                     # DB-only open-operator-message feed (no network) — the
                     # load-bearing key: surfaces messages older than the runner's
                     # first-poll cursor that would otherwise be missed entirely.

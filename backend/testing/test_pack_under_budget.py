@@ -22,6 +22,47 @@ def _size(value) -> int:
     return len(json.dumps(value, default=str).encode())
 
 
+def test_compact_direction_entry_preserves_retired_grounding():
+    """_compact_direction_summary_entry keeps retired_direction_grounding through
+    compaction, including nested metrics and retirement_memo bodies."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    stat = {
+        "id": "d-rg",
+        "status": "active",
+        "text": "continuation direction",
+        "retired_direction_grounding": {
+            "direction_id": "d-prior",
+            "classification": "success_evidence_met",
+            "metrics": {"prs_merged": 5, "cycles": 9},
+            "reason": "prior direction met its success evidence",
+            "gap_id": "g-x",
+            "retirement_memo": {
+                "knowledge_doc_id": "kd-1",
+                "summary": "landed the ledger feature",
+            },
+        },
+    }
+    out = _compact_direction_summary_entry(stat)
+    grounding = out["retired_direction_grounding"]
+    assert grounding["direction_id"] == "d-prior"
+    assert grounding["classification"] == "success_evidence_met"
+    # nested bodies preserved, not flattened away
+    assert grounding["metrics"] == {"prs_merged": 5, "cycles": 9}
+    assert grounding["retirement_memo"] == {
+        "knowledge_doc_id": "kd-1",
+        "summary": "landed the ledger feature",
+    }
+
+
+def test_compact_direction_entry_omits_grounding_when_absent():
+    """No retired_direction_grounding on input → key absent from compacted entry."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    out = _compact_direction_summary_entry({"id": "d-novel", "status": "active"})
+    assert "retired_direction_grounding" not in out
+
+
 def test_packs_all_parts_under_budget():
     """Small payload, generous budget — every key included, no trims/drops."""
     payload = {

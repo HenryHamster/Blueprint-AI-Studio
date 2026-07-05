@@ -679,13 +679,39 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     GitHub-derived keys stay absent.
     """
     project = _make_project(
-        vision={"purpose": "test purpose"},
+        vision={
+            "purpose": "test purpose",
+            "_strategic_cycle_history": [
+                    {
+                        "cycle_id": "sc-resident-01",
+                        "outcome": "completed",
+                        "phase2_completed_at": "2026-07-02T00:00:00+00:00",
+                        "summary_text": "rev 12, 1 created, 1 retired",
+                        "created_direction_ids": ["d1"],
+                        "retired_direction_ids": ["d-ret"],
+                        "created_rationales": {"d1": "new direction for active work"},
+                        "retired_rationales": {"d-ret": "landed elsewhere"},
+                },
+            ],
+        },
         problem_model={
             "capabilities": [
                 {"id": "c1", "status": "working", "backing_paths": ["app/foo.py"]}
             ]
         },
-        directions=[{"id": "d1", "text": "ship it", "status": "active"}],
+        directions=[
+            {"id": "d1", "text": "ship it", "status": "active"},
+                {
+                    "id": "d-ret",
+                    "text": "retired work",
+                    "status": "retired",
+                    "retired_at": "2026-07-01T00:00:00+00:00",
+                    "retirement_reason": "landed elsewhere",
+                    "retirement_outcome": "merged on automain",
+                    "research_history": [{"timestamp": "2026-07-01T00:00:00+00:00", "prs_merged": 2}],
+                    "history_aggregate": {"total_cycles": 1, "total_prs_merged": 2},
+                },
+        ],
     )
     db_session.add(project)
     await db_session.commit()
@@ -704,6 +730,7 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
         )
     )
     await db_session.commit()
+    await _seed_legacy_cycles(db_session, project)
 
     # ONLY the four slow, network-I/O builders are tripwires. The cheap DB/
     # in-memory grounding builders are intentionally NOT tripwired — the resident
@@ -753,6 +780,14 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     assert "direction_counts" in payload
     assert payload["direction_counts"]["active"] == 1
     assert [d["id"] for d in payload.get("directions_summary") or []] == ["d1"]
+    retired_summary = payload.get("retired_directions_summary")
+    assert retired_summary and retired_summary[0]["id"] == "d-ret"
+    assert retired_summary[0]["retirement_reason"] == "landed elsewhere"
+    assert retired_summary[0]["retirement_outcome"] == "merged on automain"
+    prev_outcomes = payload.get("previous_decision_outcomes")
+    assert prev_outcomes and prev_outcomes["cycle_id"] == "sc-resident-01"
+    assert prev_outcomes["created"][0]["direction_id"] == "d1"
+    assert prev_outcomes["retired"][0]["direction_id"] == "d-ret"
     # The queued operator message is surfaced (would otherwise be missed).
     assert any(
         "operator question queued" in (m.get("content") or "")
@@ -1518,6 +1553,80 @@ async def test_success_evidence_absent_when_not_in_context(db_session):
 
     assert "success_evidence" not in d_stat
     assert "retirement_condition" not in d_stat
+
+
+@pytest.mark.asyncio
+async def test_retired_direction_grounding_present_in_direction_stats(db_session):
+    """retired_direction_grounding from context reaches the direction stat entry,
+    bounded, and survives summarize compaction (metrics + retirement_memo kept)."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    grounding = {
+        "direction_id": "d-prior99",
+        "classification": "abandoned",
+        "metrics": {"prs_merged": 3, "cycles": 7},
+        "reason": "R" * 700,
+        "gap_id": "g-some-gap",
+        "retirement_memo": {
+            "knowledge_doc_id": "kd-abc",
+            "summary": "prior work stalled on flaky infra",
+        },
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-rg01",
+                "status": "active",
+                "text": "Continuation of retired work",
+                "priority": "medium",
+                "context": {"retired_direction_grounding": grounding},
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+            {
+                "id": "d-rg02",
+                "status": "active",
+                "text": "Novel direction with no retired origin",
+                "priority": "medium",
+                "research_history": [{"prs_merged": 1, "prs_rejected": 0}],
+            },
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(s for s in payload["directions_summary"] if s["id"] == "d-rg01")
+
+    surfaced = d_stat["retired_direction_grounding"]
+    assert surfaced["direction_id"] == "d-prior99"
+    assert surfaced["classification"] == "abandoned"
+    assert surfaced["metrics"] == {"prs_merged": 3, "cycles": 7}
+    assert surfaced["gap_id"] == "g-some-gap"
+    assert surfaced["retirement_memo"]["knowledge_doc_id"] == "kd-abc"
+    # reason bounded to the sibling-field cap (500)
+    assert surfaced["reason"] == "R" * 500
+
+    # A direction with no retired origin omits the field entirely.
+    d_stat_novel = next(s for s in payload["directions_summary"] if s["id"] == "d-rg02")
+    assert "retired_direction_grounding" not in d_stat_novel
+
+    # The field must survive summarize compaction (nested metrics + memo kept).
+    compacted = _compact_direction_summary_entry(d_stat)
+    assert "retired_direction_grounding" in compacted, (
+        "compaction must preserve retired_direction_grounding, not drop it"
+    )
+    compacted_grounding = compacted["retired_direction_grounding"]
+    assert compacted_grounding["classification"] == "abandoned"
+    assert compacted_grounding["metrics"] == {"prs_merged": 3, "cycles": 7}
+    assert compacted_grounding["retirement_memo"]["knowledge_doc_id"] == "kd-abc"
 
 
 @pytest.mark.asyncio

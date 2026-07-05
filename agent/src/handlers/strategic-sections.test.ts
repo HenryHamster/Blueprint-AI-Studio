@@ -1339,6 +1339,36 @@ describe('buildDirSummaryText', () => {
     }]);
     expect(result).not.toContain('[SCAFFOLDING]');
   });
+
+  it('renders retired_direction_grounding when present on an active direction', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-grounding',
+      text: 'Re-staffed direction',
+      status: 'active',
+      priority: 'medium',
+      total_cycles: 1,
+      retired_direction_grounding: {
+        direction_id: 'd-prior-001',
+        classification: 'abandoned',
+        metrics: { prs_merged: 0, cycles: 5 },
+        reason: 'stalled on flaky infra',
+      },
+    }]);
+    expect(result).toContain('d-prior-001');
+    expect(result).toContain('[abandoned]');
+    expect(result).toContain('stalled on flaky infra');
+  });
+
+  it('omits grounding section when retired_direction_grounding is absent', () => {
+    const result = buildDirSummaryText([{
+      id: 'd-no-grounding',
+      text: 'Novel direction',
+      status: 'active',
+      priority: 'high',
+      total_cycles: 2,
+    }]);
+    expect(result).not.toContain('Re-staffing of retired work');
+  });
 });
 
 describe('buildDirHealthSummary', () => {

@@ -10,7 +10,37 @@ import {
   formatPreviousDecisionOutcomes,
   formatPastRetirementCritiques,
   formatRetiredDirectionsSummary,
+  formatRetiredDirectionGrounding,
 } from './research-direction-context.js';
+
+describe('formatRetiredDirectionGrounding', () => {
+  it('returns empty string for non-object / empty grounding', () => {
+    expect(formatRetiredDirectionGrounding(undefined)).toBe('');
+    expect(formatRetiredDirectionGrounding(null)).toBe('');
+    expect(formatRetiredDirectionGrounding([])).toBe('');
+    expect(formatRetiredDirectionGrounding({})).toBe('');
+  });
+
+  it('renders classification, prior id, metrics and reason', () => {
+    const out = formatRetiredDirectionGrounding({
+      direction_id: 'd-prior',
+      classification: 'abandoned',
+      metrics: { prs_merged: 0, cycles: 4 },
+      reason: 'stalled on flaky infra',
+    });
+    expect(out).toContain('d-prior');
+    expect(out).toContain('[abandoned]');
+    expect(out).toContain('prs_merged=0');
+    expect(out).toContain('cycles=4');
+    expect(out).toContain('stalled on flaky infra');
+  });
+
+  it('renders without metrics when metrics are absent', () => {
+    const out = formatRetiredDirectionGrounding({ classification: 'landed' });
+    expect(out).toContain('[landed]');
+    expect(out).not.toContain('(');
+  });
+});
 
 describe('formatCochangeHints', () => {
   it('returns empty string when direction context is undefined', () => {
@@ -324,5 +354,35 @@ describe('formatRetiredDirectionsSummary', () => {
     ]);
     expect(out).toContain('a1; a2; a3');
     expect(out).not.toContain('a4');
+  });
+
+  it('renders retirement_outcome when present', () => {
+    const out = formatRetiredDirectionsSummary([
+      {
+        id: 'd-outcome',
+        text: 'Some direction',
+        status: 'auto_completed',
+        cycles: 3,
+        prs_merged: 1,
+        retirement_outcome: 'all acceptance criteria met',
+      },
+    ]);
+    expect(out).toContain('outcome: all acceptance criteria met');
+  });
+
+  it('renders both retirement_reason and retirement_outcome when both present', () => {
+    const out = formatRetiredDirectionsSummary([
+      {
+        id: 'd-both',
+        text: 'Direction with both',
+        status: 'retired',
+        cycles: 2,
+        prs_merged: 0,
+        retirement_reason: 'stalled due to infra',
+        retirement_outcome: 'no progress made',
+      },
+    ]);
+    expect(out).toContain('reason: stalled due to infra');
+    expect(out).toContain('outcome: no progress made');
   });
 });

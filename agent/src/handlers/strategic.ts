@@ -516,6 +516,22 @@ export async function handleStrategic(
     // wholesale; both forms land in payload._packer_meta. Render them so the
     // agent knows what's available-but-not-shipped and can call ./fetch.
     const packerMeta = payload._packer_meta as Record<string, unknown> | undefined;
+    // Sections whose recovery path is the generic section-fetch endpoint carry a
+    // `fetch_verb` of "sections" in the packer meta. Render the command with the
+    // section name so the strategist gets an actionable `./fetch sections <name>`.
+    const SECTION_FETCH_VERB = 'sections';
+    const sectionFetchHint = (sectionName: string): string =>
+      `./fetch sections ${sectionName}`;
+    // Build the "; run ... " recovery clause for a packer-meta record. When the
+    // fetch verb is the generic section verb, emit the exact `./fetch sections <name>`
+    // CLI command — 'sections' is a real FetchVerb granted to strategic agents.
+    const recoveryClause = (fetchVerb: string, key: string, tail: string): string => {
+      if (!fetchVerb) return '';
+      if (fetchVerb === SECTION_FETCH_VERB) {
+        return `; run \`./fetch sections ${key}\` ${tail}`;
+      }
+      return `; run \`./fetch ${fetchVerb}\` ${tail}`;
+    };
     // Maps each strategic payload key to the ./fetch command that recovers it.
     const PAYLOAD_KEY_FETCH_VERB: Record<string, string> = {
       'problem_model':              './fetch problem-model',
@@ -529,15 +545,18 @@ export async function handleStrategic(
       'compute_experiment_sweeps':  './fetch compute-sweeps',
       'efficiency_snapshot':        './fetch efficiency-snapshot',
       'ci_compliance':              './fetch ci-compliance',
-      // sections-type keys: served by /api/agent/projects/{id}/sections/{name}
-      'self_reflection_log':        './fetch sections self_reflection_log',
-      'anomaly_summary':            './fetch sections anomaly_summary',
-      'playbook_summary':           './fetch sections playbook_summary',
-      'retired_directions_summary': './fetch sections retired_directions_summary',
-      'rejected_proposals':         './fetch sections rejected_proposals',
-      'past_retirement_critiques':  './fetch sections past_retirement_critiques',
-      'previous_decision_outcomes': './fetch sections previous_decision_outcomes',
-      'outcome_evaluation':         './fetch sections outcome_evaluation',
+      // sections-type keys: served by /api/agent/projects/{id}/sections/{name}.
+      // retirement_deferrals is intentionally omitted: it has no recovery path
+      // (SECTION_FETCH_INVENTORY maps it to None), so advertising any fetch
+      // would mislead.
+      'self_reflection_log':        sectionFetchHint('self_reflection_log'),
+      'anomaly_summary':            sectionFetchHint('anomaly_summary'),
+      'playbook_summary':           sectionFetchHint('playbook_summary'),
+      'retired_directions_summary': sectionFetchHint('retired_directions_summary'),
+      'rejected_proposals':         sectionFetchHint('rejected_proposals'),
+      'past_retirement_critiques':  sectionFetchHint('past_retirement_critiques'),
+      'previous_decision_outcomes': sectionFetchHint('previous_decision_outcomes'),
+      'outcome_evaluation':         sectionFetchHint('outcome_evaluation'),
     };
     const renderPackerMeta = (meta: Record<string, unknown> | undefined): string => {
       if (!meta) return '';
@@ -553,7 +572,7 @@ export async function handleStrategic(
           const bytesOrig = typeof t.bytes_original === 'number'
             ? ` (${t.bytes_original}→${typeof t.bytes_trimmed === 'number' ? t.bytes_trimmed : '?'} bytes)` : '';
           const fetchVerb = strVal(t.fetch_verb);
-          const recovery = fetchVerb ? `; run \`./fetch ${fetchVerb}\` for full detail` : '';
+          const recovery = recoveryClause(fetchVerb, k, 'for full detail');
           if (kind === 'list_trimmed') {
             const shown = (t.shown as number | undefined) ?? '?';
             const total = (t.total as number | undefined) ?? '?';
@@ -572,7 +591,7 @@ export async function handleStrategic(
           const reason = strVal(d.reason, 'budget exhausted');
           const bytes = typeof d.bytes === 'number' ? ` (${d.bytes} bytes)` : '';
           const fetchVerb = strVal(d.fetch_verb);
-          const recovery = fetchVerb ? `; run \`./fetch ${fetchVerb}\` to recover` : '';
+          const recovery = recoveryClause(fetchVerb, k, 'to recover');
           lines.push(`  - ${k}${bytes}: ${reason}${recovery}`);
           const fetchHint = PAYLOAD_KEY_FETCH_VERB[k];
           if (fetchHint) lines.push(`    → ${fetchHint}`);

@@ -766,6 +766,31 @@ def _compact_spawn_gate_metrics(value: Any) -> dict | None:
     return out or None
 
 
+def _compact_retired_grounding(value: Any) -> dict | None:
+    """Preserve a direction's ``retired_direction_grounding`` through compaction.
+
+    Routing this through ``_compact_scalar_mapping`` would drop the nested
+    ``metrics`` and ``retirement_memo`` bodies, so keep those explicitly while
+    still bounding every string field.
+    """
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, Any] = {}
+    for key in ("direction_id", "classification", "reason", "gap_id"):
+        _put_present(out, value, key, text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+    metrics = _compact_scalar_mapping(value.get("metrics"), text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+    if metrics:
+        out["metrics"] = metrics
+    memo = value.get("retirement_memo")
+    if isinstance(memo, dict):
+        compact_memo: dict[str, Any] = {}
+        for key in ("knowledge_doc_id", "summary"):
+            _put_present(compact_memo, memo, key, text_cap=_DIRECTION_SUMMARY_TEXT_CAP)
+        if compact_memo:
+            out["retirement_memo"] = compact_memo
+    return out or None
+
+
 def _compact_direction_summary_entry(stat: dict) -> dict:
     out: dict[str, Any] = {}
     for key in (
@@ -857,5 +882,8 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
     spawn_gate = _compact_spawn_gate_metrics(stat.get("spawn_gate_metrics"))
     if spawn_gate:
         out["spawn_gate_metrics"] = spawn_gate
+    grounding = _compact_retired_grounding(stat.get("retired_direction_grounding"))
+    if grounding:
+        out["retired_direction_grounding"] = grounding
     return out
 

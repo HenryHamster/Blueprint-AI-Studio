@@ -14,13 +14,17 @@ import {
   startResidentClaudeSession,
   type ResidentSession, type ResidentTurnResult,
 } from '../providers/resident-session.js';
-import { buildDirSummaryText, buildOpenMessagesText } from './strategic-sections.js';
+import {
+  buildDirSummaryText,
+  buildOpenMessagesText,
+} from './strategic-sections.js';
 import {
   residentConfig, initialCursor, advanceCursorFromMessages,
   BoundedSeenSet, dedupNewMessages, combineOperatorMessages,
   buildBootstrapPrompt, buildAutonomousPrompt, resolveTerminalStatus,
   nextAuthorityHeld, autonomousActive, FrameCoalescer,
   MESSAGE_POLL_LIMIT, MAX_POLL_PAGES,
+  buildPriorDecisionsText, buildRetiredContextText,
   type MessagesPollResponse, type SessionHeartbeatResponse, type ResidentInboundMessage,
   type StreamFrameKind, type StreamFrameStatus,
 } from './strategic-resident-lib.js';
@@ -252,6 +256,12 @@ export async function handleStrategicResident(
     ? directionCounts.active : undefined;
   const openMessages = Array.isArray(payload.open_messages)
     ? payload.open_messages as Array<Record<string, unknown>> : [];
+  const retiredDirections = Array.isArray(payload.retired_directions_summary)
+    ? payload.retired_directions_summary as Array<Record<string, unknown>> : [];
+  const previousDecisionOutcomes = payload.previous_decision_outcomes
+    && typeof payload.previous_decision_outcomes === 'object'
+    ? payload.previous_decision_outcomes as Record<string, unknown>
+    : undefined;
 
   const bootstrapPrompt = buildBootstrapPrompt({
     contextPrefix,
@@ -259,6 +269,8 @@ export async function handleStrategicResident(
     problemModelJson,
     runningUpdate: typeof payload.running_update === 'string' ? payload.running_update : '',
     directionsText: buildDirSummaryText(directionsSummary, authoritativeActive),
+    retiredDirectionsText: buildRetiredContextText(retiredDirections),
+    previousDecisionOutcomesText: buildPriorDecisionsText(previousDecisionOutcomes),
     visionJson,
     openMessagesText: buildOpenMessagesText(openMessages),
     sessionId,

@@ -176,6 +176,7 @@ export function formatRetiredDirectionsSummary(raw: unknown): string {
     const merged = typeof d.prs_merged === 'number' ? d.prs_merged : 0;
     const reason = typeof d.retirement_reason === 'string' ? d.retirement_reason
       : typeof d.auto_completed_reason === 'string' ? d.auto_completed_reason : '';
+    const outcome = typeof d.retirement_outcome === 'string' ? d.retirement_outcome : '';
     const tax = typeof d.dominant_taxonomy === 'string' ? d.dominant_taxonomy : '';
     const cpm = typeof d.cost_per_merge === 'number' ? `, $${d.cost_per_merge}/merge` : '';
     const failed = Array.isArray(d.failed_approaches) ? d.failed_approaches as string[] : [];
@@ -183,12 +184,44 @@ export function formatRetiredDirectionsSummary(raw: unknown): string {
     let line = `- **${id}** [${status}]: "${text.slice(0, 120)}" — ${cycles} cycles, ${merged} merged${cpm}`;
     if (tax) line += `, dominant: ${tax}`;
     if (reason) line += `; reason: ${reason.slice(0, 120)}`;
+    if (outcome) line += `; outcome: ${outcome.slice(0, 120)}`;
     lines.push(line);
     if (failed.length > 0) {
       lines.push(`  Failed approaches: ${failed.slice(0, 3).join('; ')}`);
     }
   }
   return '\n' + lines.join('\n') + '\n';
+}
+
+/**
+ * Render the `retired_direction_grounding` object an active direction carries
+ * when it was created as a continuation/re-staffing of a retired one. Surfaces
+ * how the prior work ended (classification + metrics) so the strategist can tell
+ * an active direction picks up abandoned/landed work rather than being novel.
+ * Returns '' when no usable grounding is present.
+ */
+export function formatRetiredDirectionGrounding(grounding: unknown): string {
+  if (!grounding || typeof grounding !== 'object' || Array.isArray(grounding)) return '';
+  const g = grounding as Record<string, unknown>;
+  const classification = typeof g.classification === 'string' ? g.classification : '';
+  const priorId = typeof g.direction_id === 'string' ? g.direction_id : '';
+  const reason = typeof g.reason === 'string' ? g.reason : '';
+  if (!classification && !priorId && !reason) return '';
+
+  const metricBits: string[] = [];
+  const metrics = g.metrics;
+  if (metrics && typeof metrics === 'object' && !Array.isArray(metrics)) {
+    for (const [k, v] of Object.entries(metrics as Record<string, unknown>)) {
+      if (typeof v === 'number' || typeof v === 'boolean') metricBits.push(`${k}=${v}`);
+    }
+  }
+
+  let line = 'Re-staffing of retired work';
+  if (priorId) line += ` ${priorId}`;
+  if (classification) line += ` [${classification}]`;
+  if (metricBits.length > 0) line += ` (${metricBits.join(', ')})`;
+  if (reason) line += `; prior reason: ${reason.slice(0, 200)}`;
+  return line;
 }
 
 // re-export differentiationHintFor for use in research-plan.ts

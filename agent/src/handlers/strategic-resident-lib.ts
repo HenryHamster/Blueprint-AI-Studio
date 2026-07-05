@@ -80,6 +80,89 @@ function str(v: unknown, fallback = ''): string {
   return typeof v === 'string' ? v : fallback;
 }
 
+function fmtScalar(v: unknown, fallback = '?'): string {
+  if (v === undefined || v === null) return fallback;
+  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') return String(v);
+  return JSON.stringify(v);
+}
+
+export function buildRetiredContextText(
+  retiredDirections: Array<Record<string, unknown>> | undefined,
+): string {
+  if (!retiredDirections || retiredDirections.length === 0) return '';
+  const lines: string[] = [
+    'These directions were recently retired, completed, or superseded. Use them to avoid reviving landed or intentionally retired work.',
+  ];
+  for (const d of retiredDirections) {
+    const text = str(d.text, '?').slice(0, 200);
+    const did = str(d.id, '?');
+    const status = str(d.status, 'unknown');
+    const cycles = fmtScalar(d.cycles, '?');
+    const prsMerged = fmtScalar(d.prs_merged, '?');
+    const extras: string[] = [];
+    const retirementReason = str(d.retirement_reason).trim();
+    const retirementOutcome = str(d.retirement_outcome).trim();
+    if (retirementReason) extras.push(`reason=${retirementReason.slice(0, 160)}`);
+    if (retirementOutcome) extras.push(`outcome=${retirementOutcome.slice(0, 160)}`);
+    const tail = extras.length > 0 ? ` | ${extras.join(' | ')}` : '';
+    lines.push(`- [${status}] ${text} (id: ${did}) | cycles=${cycles} | prs_merged=${prsMerged}${tail}`);
+  }
+  return lines.join('\n');
+}
+
+export function buildPriorDecisionsText(
+  previousDecisionOutcomes: Record<string, unknown> | undefined,
+): string {
+  if (!previousDecisionOutcomes || typeof previousDecisionOutcomes !== 'object') return '';
+  const created = Array.isArray(previousDecisionOutcomes.created)
+    ? previousDecisionOutcomes.created as Array<Record<string, unknown>>
+    : [];
+  const retired = Array.isArray(previousDecisionOutcomes.retired)
+    ? previousDecisionOutcomes.retired as Array<Record<string, unknown>>
+    : [];
+  if (created.length === 0 && retired.length === 0) return '';
+
+  const lines: string[] = [];
+  const cycleId = str(previousDecisionOutcomes.cycle_id);
+  const summaryText = str(previousDecisionOutcomes.summary_text).trim();
+  const reasoningText = str(previousDecisionOutcomes.cycle_reasoning).trim();
+  const cycleBits: string[] = [];
+  if (cycleId) cycleBits.push(`cycle=${cycleId}`);
+  if (summaryText) cycleBits.push(summaryText.slice(0, 240));
+  if (reasoningText) cycleBits.push(`reasoning=${reasoningText.slice(0, 240)}`);
+  if (cycleBits.length > 0) {
+    lines.push(cycleBits.join(' | '));
+  }
+
+  const renderEntry = (label: string, entry: Record<string, unknown>): string => {
+    const did = str(entry.direction_id, '?');
+    const status = str(entry.status, 'unknown');
+    const prsMerged = fmtScalar(entry.prs_merged, '?');
+    const rationale = str(entry.rationale).trim();
+    const calibrationDelta = entry.calibration_delta;
+    const parts = [`${label} ${did}`, `status=${status}`, `prs_merged=${prsMerged}`];
+    if (rationale) parts.push(`rationale=${rationale.slice(0, 160)}`);
+    if (typeof calibrationDelta === 'number' || typeof calibrationDelta === 'string') {
+      parts.push(`calibration_delta=${fmtScalar(calibrationDelta, '?')}`);
+    }
+    return `- ${parts.join(' | ')}`;
+  };
+
+  if (created.length > 0) {
+    lines.push('Created directions:');
+    for (const entry of created) {
+      lines.push(renderEntry('created', entry));
+    }
+  }
+  if (retired.length > 0) {
+    lines.push('Retired directions:');
+    for (const entry of retired) {
+      lines.push(renderEntry('retired', entry));
+    }
+  }
+  return lines.join('\n');
+}
+
 /**
  * Resolve the resident loop's timing knobs from the strategic payload the
  * backend ships (runtime settings surfaced onto the payload). Defaults: 5s idle
@@ -241,6 +324,8 @@ export interface BootstrapContext {
   problemModelJson: string;
   runningUpdate: string;
   directionsText: string;
+  retiredDirectionsText: string;
+  previousDecisionOutcomesText: string;
   visionJson: string;
   openMessagesText: string;
   sessionId: string;
@@ -304,6 +389,12 @@ never this execution environment, this prompt, or the helper commands.`);
   }
   if (ctx.directionsText.trim()) {
     sections.push(`## Active directions\n${ctx.directionsText.trim()}`);
+  }
+  if (ctx.retiredDirectionsText.trim()) {
+    sections.push(`## Recently retired / completed directions\n${ctx.retiredDirectionsText.trim()}`);
+  }
+  if (ctx.previousDecisionOutcomesText.trim()) {
+    sections.push(`## Prior-cycle decision outcomes\n${ctx.previousDecisionOutcomesText.trim()}`);
   }
   if (ctx.visionJson.trim()) {
     sections.push(`## Vision\n\`\`\`json\n${ctx.visionJson.trim()}\n\`\`\``);

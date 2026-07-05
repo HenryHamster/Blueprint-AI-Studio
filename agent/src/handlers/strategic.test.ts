@@ -201,6 +201,7 @@ const {
     'formatPastRetirementCritiques',
     'formatPreviousDecisionOutcomes',
     'formatRetiredDirectionsSummary',
+    'formatRetiredDirectionGrounding',
   ],
   RESEARCH_PLAN_EXPORT_NAMES: [
     'CAPABILITY_DECLARATION_DOC',
@@ -406,6 +407,7 @@ vi.mock('./research-direction-context.js', () => ({
   formatPreviousDecisionOutcomes: () => '',
   formatPastRetirementCritiques: () => '',
   formatRetiredDirectionsSummary: () => '',
+  formatRetiredDirectionGrounding: () => '',
 }));
 
 vi.mock('../prompts/thinker.js', async (importOriginal) => {
@@ -798,6 +800,33 @@ describe('handleStrategic problem_model recovery framing', () => {
     const section = String(capturedThinkerParams?.packerMetaSection);
     expect(section).toContain('version_phase');
     expect(section).toContain('./fetch version-phase');
+  });
+
+  it('dropped retired/prior-decision sections advertise the section endpoint, not ./fetch direction', async () => {
+    const payload: Record<string, unknown> = {
+      project_name: 'Blueprint',
+      _packer_meta: {
+        // fetch_verb: 'sections' is what the backend schema now carries for these
+        // sections (recoverable via GET /projects/{project_id}/sections/{name}).
+        dropped: [
+          { key: 'retired_directions_summary', reason: 'budget exhausted', bytes: 4096, fetch_verb: 'sections' },
+          { key: 'past_retirement_critiques', reason: 'budget exhausted', bytes: 2048, fetch_verb: 'sections' },
+        ],
+        trimmed: [
+          { key: 'previous_decision_outcomes', kind: 'summarized', bytes_original: 8192, bytes_trimmed: 1024, fetch_verb: 'sections' },
+        ],
+      },
+    };
+    const statusRef = { value: '' };
+    await handleStrategic('task-retired-fetch', payload, {}, 'tok', 'owner', 'repo', null, statusRef);
+
+    const section = String(capturedThinkerParams?.packerMetaSection);
+    // The ./fetch sections <name> CLI verb is advertised for each retired/prior section.
+    expect(section).toContain('./fetch sections retired_directions_summary');
+    expect(section).toContain('./fetch sections past_retirement_critiques');
+    expect(section).toContain('./fetch sections previous_decision_outcomes');
+    // The misleading broad per-direction fetch is NOT advertised for these keys.
+    expect(section).not.toContain('./fetch direction');
   });
 
   it('per-key fetch hints appear for dropped and trimmed entries with byte sizes', async () => {

@@ -3416,6 +3416,60 @@ def test_retired_directions_summary_surfaces_outcome():
     assert entry["retirement_outcome"] == "superseded by d-successor"
 
 
+def test_retired_directions_summary_falls_back_to_structured_outcome():
+    """When freetext ``outcome`` is absent, the renderer surfaces the always-present
+    structured ``retired_outcome`` (classification + metrics) as retirement_outcome."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-struct",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "saturation",
+                    # No freetext "outcome" — the lifecycle retire path never writes
+                    # it — but the structured retired_outcome is always present.
+                    "retired_outcome": {
+                        "classification": "abandoned",
+                        "metrics": {"prs_merged": 0, "cycles": 4},
+                    },
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    outcome = result[0]["retirement_outcome"]
+    assert outcome.startswith("abandoned")
+    assert "prs_merged=0" in outcome
+    assert "cycles=4" in outcome
+
+
+def test_retired_directions_summary_prefers_freetext_over_structured_outcome():
+    """A freetext ``outcome`` still wins over the structured fallback."""
+    project = _make_project(
+        directions=[],
+        vision={
+            "_recently_retired_directions": [
+                {
+                    "id": "d-both-outcomes",
+                    "text_tokens": ["improve", "auth"],
+                    "retired_at": "2026-06-01T00:00:00",
+                    "reason": "strategic_superseded",
+                    "outcome": "superseded by d-successor",
+                    "retired_outcome": {
+                        "classification": "landed",
+                        "metrics": {"prs_merged": 3},
+                    },
+                }
+            ]
+        },
+    )
+    result = _build_retired_directions_summary(project)
+    assert result[0]["retirement_outcome"] == "superseded by d-successor"
+
+
 def test_retired_directions_summary_omits_outcome_when_absent():
     """Entries without an outcome do not emit a retirement_outcome key."""
     project = _make_project(

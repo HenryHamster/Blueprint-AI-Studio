@@ -4,6 +4,8 @@ import {
   BoundedSeenSet, dedupNewMessages, extractMessageContent,
   combineOperatorMessages, buildBootstrapPrompt, buildAutonomousPrompt,
   resolveTerminalStatus, nextAuthorityHeld, autonomousActive, FrameCoalescer,
+  buildPriorDecisionsText,
+  buildRetiredContextText,
   MESSAGE_POLL_LIMIT,
 } from './strategic-resident-lib.js';
 
@@ -198,6 +200,8 @@ describe('buildBootstrapPrompt', () => {
     problemModelJson: '{"gaps":[]}',
     runningUpdate: 'all good',
     directionsText: '- d1 active',
+    retiredDirectionsText: '',
+    previousDecisionOutcomesText: '',
     visionJson: '{"v":1}',
     openMessagesText: 'msg1',
     sessionId: 'ss-1',
@@ -219,6 +223,18 @@ describe('buildBootstrapPrompt', () => {
     expect(p).toContain('empty — bootstrap it');
   });
 
+  it('includes the optional retired and prior-decision sections when provided', () => {
+    const p = buildBootstrapPrompt({
+      ...base,
+      retiredDirectionsText: 'retired block',
+      previousDecisionOutcomesText: 'prior block',
+    });
+    expect(p).toContain('Recently retired / completed directions');
+    expect(p).toContain('retired block');
+    expect(p).toContain('Prior-cycle decision outcomes');
+    expect(p).toContain('prior block');
+  });
+
   it('omits optional sections that are blank', () => {
     const p = buildBootstrapPrompt({
       ...base, runningUpdate: '', directionsText: '', visionJson: '', openMessagesText: '',
@@ -226,6 +242,95 @@ describe('buildBootstrapPrompt', () => {
     expect(p).not.toContain('Active directions');
     expect(p).not.toContain('Open operator messages');
     expect(p).not.toContain('## Vision');
+    expect(p).not.toContain('Recently retired / completed directions');
+    expect(p).not.toContain('Prior-cycle decision outcomes');
+  });
+});
+
+describe('retired/prior-context renderers', () => {
+  it('renders compact retired-direction lines and omits empty input', () => {
+    expect(buildRetiredContextText([])).toBe('');
+    expect(buildRetiredContextText(undefined)).toBe('');
+    const rendered = buildRetiredContextText([
+      {
+        id: 'd-ret',
+        text: 'Retired direction',
+        status: 'retired',
+        cycles: 4,
+        prs_merged: 7,
+        retirement_reason: 'merged elsewhere',
+        retirement_outcome: 'landed on integration',
+      },
+    ]);
+    expect(rendered).not.toContain('## Recently retired / completed directions');
+    expect(rendered).toContain('[retired] Retired direction (id: d-ret)');
+    expect(rendered).toContain('cycles=4');
+    expect(rendered).toContain('prs_merged=7');
+    expect(rendered).toContain('reason=merged elsewhere');
+    expect(rendered).toContain('outcome=landed on integration');
+  });
+
+  it('renders compact prior-decision lines and omits empty input', () => {
+    expect(buildPriorDecisionsText(undefined)).toBe('');
+    expect(buildPriorDecisionsText({ created: [], retired: [] })).toBe('');
+    const rendered = buildPriorDecisionsText({
+      cycle_id: 'sc-123',
+      summary_text: 'rev 5, 2 created, 1 retired',
+      cycle_reasoning: 'calibrated on shipped work',
+      created: [
+        {
+          direction_id: 'd-new',
+          status: 'active',
+          prs_merged: 3,
+          rationale: 'cover the missing API surface',
+          calibration_delta: 1,
+        },
+      ],
+      retired: [
+        {
+          direction_id: 'd-old',
+          status: 'retired',
+          prs_merged: 8,
+        },
+      ],
+    });
+    expect(rendered).not.toContain('## Prior-cycle decision outcomes');
+    expect(rendered).toContain('cycle=sc-123');
+    expect(rendered).toContain('Created directions:');
+    expect(rendered).toContain('created d-new');
+    expect(rendered).toContain('status=active');
+    expect(rendered).toContain('prs_merged=3');
+    expect(rendered).toContain('rationale=cover the missing API surface');
+    expect(rendered).toContain('calibration_delta=1');
+    expect(rendered).toContain('Retired directions:');
+    expect(rendered).toContain('retired d-old');
+  });
+
+  it('headers appear exactly once when renderers are composed into buildBootstrapPrompt', () => {
+    const retiredText = buildRetiredContextText([
+      { id: 'd-r', text: 'Done work', status: 'retired', cycles: 1, prs_merged: 2 },
+    ]);
+    const priorText = buildPriorDecisionsText({
+      cycle_id: 'sc-1',
+      created: [{ direction_id: 'd-new', status: 'active', prs_merged: 0 }],
+      retired: [],
+    });
+    const p = buildBootstrapPrompt({
+      contextPrefix: 'CTX',
+      projectName: 'Acme',
+      problemModelJson: '{}',
+      runningUpdate: 'ok',
+      directionsText: '- d1',
+      retiredDirectionsText: retiredText,
+      previousDecisionOutcomesText: priorText,
+      visionJson: '',
+      openMessagesText: '',
+      sessionId: 'ss-x',
+    });
+    const retiredMatches = (p.match(/## Recently retired \/ completed directions/g) ?? []).length;
+    const priorMatches = (p.match(/## Prior-cycle decision outcomes/g) ?? []).length;
+    expect(retiredMatches).toBe(1);
+    expect(priorMatches).toBe(1);
   });
 });
 
