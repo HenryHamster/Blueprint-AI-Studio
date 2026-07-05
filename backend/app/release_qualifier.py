@@ -804,6 +804,8 @@ async def _qualification_in_flight(
 
 def _promotion_in_flight_result(
     version: release_version.ReleaseVersion,
+    *,
+    latest_verdict: Any = None,
 ) -> dict[str, Any] | None:
     """Return a promotion-blocking status dict, or None when not mid-promotion.
 
@@ -820,10 +822,21 @@ def _promotion_in_flight_result(
     lever does (``abandon_current_version`` raises ``VersionCutBlockedByPromotion``
     on the same predicate). Reuses ``summarize_qualification_state`` so all the
     operator levers agree by construction.
+
+    When ``latest_verdict`` is passed, applies finalized-verdict substitution
+    (via :func:`~app.qualification_state_resolver.apply_verdict_substitution`)
+    before classifying so stale-pending records with an already-finalized verdict
+    row are not misclassified as still-blocking.
     """
-    qual_state = release_version.summarize_qualification_state(
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = (
         version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
     )
+    effective_qual, _ = apply_verdict_substitution(qual, latest_verdict)
+    qual_state = release_version.summarize_qualification_state(effective_qual)
     if (
         qual_state
         and qual_state.get("state") in release_version.PROMOTION_BLOCKING_STATES
@@ -1621,13 +1634,20 @@ async def run_qualification(
         )
         return {"status": "already_pending"}
 
-    # Cheap pre-lock promotion-in-flight check (no I/O — pure DB read).  A
-    # version whose audit passed and now has an open promotion PR auto-merging
+    # Cheap pre-lock promotion-in-flight check (no I/O beyond verdict fetch).
+    # A version whose audit passed and now has an open promotion PR auto-merging
     # must not be re-qualified: doing so spawns a fresh heavy audit/smoketest
     # pair and clobbers the promotion-pending record.  Consistent with the
     # version-cut lever, which refuses in the same state.  Best-effort fast path
     # — the authoritative re-check happens under the row lock below.
-    _promo = _promotion_in_flight_result(version)
+    # Fetch the newest verdict so stale-pending+finalized-verdict is not
+    # misclassified as still-blocking.
+    from app.qualification_state_resolver import resolve_newest_qualification_verdict
+
+    _latest_verdict_prelock = await resolve_newest_qualification_verdict(
+        session, version
+    )
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_prelock)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
@@ -1915,7 +1935,12 @@ async def run_qualification(
     # record would discard the provenance the rest of the system relies on to
     # know the promotion is still legitimately merging — so refuse (no-op),
     # consistent with the version-cut lever.
-    _promo = _promotion_in_flight_result(version)
+    # Re-fetch the verdict under the lock (the pre-lock fetch may be stale if a
+    # concurrent promotion finalized between the pre-lock check and here).
+    _latest_verdict_locked = await resolve_newest_qualification_verdict(
+        session, version
+    )
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_locked)
     if _promo is not None:
         logger.info(
             "[RELEASE_QUALIFIER] run_qualification: version v%d has a promotion "
@@ -4984,7 +5009,12 @@ async def _force_promote_locked(
     # Refuse when a promotion is already in flight (an audit-passed PR open + the
     # Fix-3 claim, or a concurrent force-promote) — mirrors the /qualify + the
     # version-cut levers so every lever over an in-flight promotion agrees.
-    _promo = _promotion_in_flight_result(version)
+    # Apply finalized-verdict substitution so a stale-pending+finalized-verdict
+    # is not misclassified as still-blocking.
+    from app.qualification_state_resolver import resolve_newest_qualification_verdict
+
+    _latest_verdict_force = await resolve_newest_qualification_verdict(session, version)
+    _promo = _promotion_in_flight_result(version, latest_verdict=_latest_verdict_force)
     if _promo is not None:
         return _promo
     now = _utcnow()

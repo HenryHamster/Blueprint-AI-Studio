@@ -7028,6 +7028,209 @@ async def test_run_qualification_promotion_in_flight_is_noop(db_session, mocker)
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_ignores_stale_pending_when_verdict_finalized(
+    db_session, mocker
+):
+    """Stale-pending window: last_qualification.status='pending' with a
+    promotion_pending sub-key but the newest QualificationVerdict row already
+    has a finalized terminal_status (e.g. 'promoted'). In this window the
+    effective state is NOT promotion_in_flight — the verdict already resolved.
+    run_qualification must proceed (return 'spawned'), not block with a false
+    promotion_in_flight refusal."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Need a terminal audit child so _qualification_in_flight sees no live child.
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-stale-verdict",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-stale-verdict",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # Stale-pending: last_qualification says promotion is in flight...
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "cafe" * 10,
+        "ci_green": True,
+        "started_at": "2026-06-01T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 9999,
+            "pr_url": "https://github.com/o/r/pull/9999",
+            "auto_merge_enabled": True,
+        },
+    }
+    db_session.add(version)
+
+    # ...but the verdict row already says 'promoted' — finalized.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="cafe" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Advance the automain SHA so the pre-lock hash-reuse check doesn't fire.
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="a1b2c3d4" * 5),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # Must NOT refuse with promotion_in_flight — the verdict already resolved.
+    assert result["status"] == "spawned", (
+        f"expected 'spawned' but got {result['status']!r}; "
+        "stale-pending+finalized-verdict should be transparent to action guards"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_qualification_stale_verdict_still_blocks_live_promotion(
+    db_session, mocker
+):
+    """Temporal-ordering fix regression: a finalized verdict for the SAME
+    candidate_sha that is OLDER than the live promotion_pending must NOT
+    suppress the promotion_pending guard.
+
+    Scenario: a 'dry_run' verdict was recorded for sha ABCD, then the operator
+    force-promoted that sha, opening a new promotion PR.  The verdict row is NOW
+    stale relative to the live attempt.  apply_verdict_substitution must NOT use
+    the pre-attempt verdict to classify the state as 'dry_run' — it must keep
+    promotion_pending visible so run_qualification blocks with promotion_in_flight.
+    """
+    from datetime import datetime
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    audit_task = Task(
+        project_id=project.id,
+        title="audit-done",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-stale-temporal",
+        status=TaskStatus.COMPLETED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    # Verdict was written BEFORE the current promotion attempt (2026-01-01),
+    # promotion attempt started AFTER (enabled_at = 2026-06-01).
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abcd" * 10,
+        terminal_status="dry_run",
+        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "ci_green": True,
+        "started_at": "2026-05-01T00:00:00",
+        "audit_task_id": str(audit_task.id),
+        "smoketest_task_id": None,
+        "smoketest_enabled": False,
+        "promotion_pending": {
+            "pr_number": 7070,
+            "pr_url": "https://github.com/o/r/pull/7070",
+            "auto_merge_enabled": True,
+            "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=AsyncMock(return_value="cafe" * 10),
+    )
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    # The stale verdict must NOT unblock the live promotion — should still block.
+    assert result["status"] == "promotion_in_flight", (
+        f"expected 'promotion_in_flight' but got {result['status']!r}; "
+        "a pre-attempt verdict must not suppress an active promotion_pending"
+    )
+    assert result["promotion_pr_number"] == 7070
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_stale_verdict_still_blocks_live_promotion(
+    db_session,
+):
+    """Temporal-ordering fix regression (abandon surface): a finalized verdict for
+    the SAME candidate_sha that is OLDER than the live promotion_pending must NOT
+    suppress the promotion_pending guard on abandon_current_version.
+
+    Scenario: a 'not_promoted' verdict was written for sha BEEF, then a same-sha
+    re-run opened a new promotion PR.  abandon_current_version must still raise
+    VersionCutBlockedByPromotion — the stale verdict must not be used to clear
+    the live in-flight state.
+    """
+    from datetime import datetime
+
+    from app.release_version import VersionCutBlockedByPromotion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Verdict written BEFORE the current promotion attempt.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="beef" * 10,
+        terminal_status="not_promoted",
+        created_at=datetime(2026, 1, 1),  # OLDER than the pending attempt
+    )
+    db_session.add(verdict)
+
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "beef" * 10,
+        "ci_green": False,
+        "promotion_pending": {
+            "pr_number": 8080,
+            "pr_url": "https://github.com/o/r/pull/8080",
+            "auto_merge_enabled": False,
+            "enabled_at": "2026-06-01T00:00:00",  # AFTER the verdict
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    with pytest.raises(VersionCutBlockedByPromotion) as exc_info:
+        await rv.abandon_current_version(
+            db_session,
+            project.id,
+            reason="operator cut",
+            operator_id="op@example.com",
+        )
+
+    assert exc_info.value.promotion_pr_number == 8080, (
+        "abandon_current_version must block with the live PR number, "
+        "not be cleared by the pre-attempt verdict"
+    )
+
+
+@pytest.mark.asyncio
 async def test_run_qualification_managed_check_wait_is_noop(db_session, mocker):
     """A version whose migration-carrying promotion PR is held in
     managed_check_wait (status='pending' + promotion_pending.managed_check_wait)
@@ -13297,6 +13500,63 @@ async def test_force_promote_refuses_when_promotion_in_flight(db_session, mocker
     await db_session.refresh(version)
     # The in-flight promotion record is untouched.
     assert version.last_qualification["promotion_pending"]["pr_number"] == 42
+
+
+@pytest.mark.asyncio
+async def test_force_promote_proceeds_when_verdict_finalized(db_session, mocker):
+    """Stale-pending window: last_qualification has promotion_pending but the
+    newest QualificationVerdict row already carries terminal_status='promoted'.
+    force_promote must not refuse with promotion_in_flight — the verdict resolved."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "abcd" * 10,
+        "promotion_pending": {
+            "pr_number": 77,
+            "pr_url": "http://pr/77",
+            "enabled_at": "2026-07-02T00:00:00",
+        },
+    }
+    db_session.add(version)
+
+    # Finalized verdict already exists — promotion resolved.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="abcd" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain="facec0de" * 5),
+    )
+    mocker.patch(
+        "app.github.list_repo_tree_paths_at_ref",
+        new=AsyncMock(
+            return_value=[{"path": "backend/app/main.py", "size": 10, "sha": "b1"}]
+        ),
+    )
+    mocker.patch("app.github.create_pull_request", new=AsyncMock())
+
+    result = await rq.force_promote_current_version(
+        db_session,
+        project.id,
+        actor="op",
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    # Must NOT refuse with promotion_in_flight — verdict already resolved.
+    assert result["status"] != "promotion_in_flight", (
+        "stale-pending+finalized-verdict should not block force_promote"
+    )
 
 
 @pytest.mark.asyncio

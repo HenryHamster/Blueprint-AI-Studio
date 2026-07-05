@@ -4073,24 +4073,37 @@ async def test_open_version_qualification_state_agrees_across_surfaces(
 # ---------------------------------------------------------------------------
 
 
-def _fake_verdict(terminal_status):
+def _fake_verdict(terminal_status, candidate_sha=None, created_at=None):
     from types import SimpleNamespace
 
-    return SimpleNamespace(terminal_status=terminal_status)
+    return SimpleNamespace(
+        terminal_status=terminal_status,
+        candidate_sha=candidate_sha,
+        created_at=created_at,
+    )
 
 
 def test_apply_verdict_substitution_finalized_verdict_supersedes_pending():
     """A finalized verdict supersedes a transient pending+promotion_pending record."""
+    from datetime import datetime
+
     from app.qualification_state_resolver import apply_verdict_substitution
 
     qual = {
         "status": "pending",
         "candidate_sha": "a" * 40,
-        "promotion_pending": {"pr_number": 42},
+        "promotion_pending": {
+            "pr_number": 42,
+            "enabled_at": "2026-01-01T00:00:00",  # attempt started Jan 1
+        },
     }
-    effective, disagreement = apply_verdict_substitution(
-        qual, _fake_verdict("promoted")
+    # Verdict created AFTER the pending attempt (Jan 2 > Jan 1).
+    verdict = _fake_verdict(
+        "promoted",
+        candidate_sha="a" * 40,
+        created_at=datetime(2026, 1, 2),
     )
+    effective, disagreement = apply_verdict_substitution(qual, verdict)
 
     # Effective record adopts the verdict's finalized status and drops the
     # transient promotion_pending sub-key so the classifier sees the resolution.
@@ -4107,13 +4120,83 @@ def test_apply_verdict_substitution_finalized_verdict_supersedes_pending():
     }
 
 
+def test_apply_verdict_substitution_finalized_verdict_supersedes_pending_no_timestamps():
+    """Legacy records without timestamps still get substituted — the temporal guard
+    only blocks when BOTH timestamps are present and verdict predates the attempt."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    # Legacy shape: promotion_pending has no enabled_at, qual has no started_at,
+    # verdict has no created_at — all three timestamps absent.
+    qual = {
+        "status": "pending",
+        "candidate_sha": "a" * 40,
+        "promotion_pending": {"pr_number": 42},
+    }
+    effective, disagreement = apply_verdict_substitution(
+        qual, _fake_verdict("promoted", candidate_sha="a" * 40)
+    )
+
+    assert effective["status"] == "promoted"
+    assert "promotion_pending" not in effective
+    assert disagreement is not None
+    assert disagreement["verdict_terminal_status"] == "promoted"
+
+
+def test_apply_verdict_substitution_stale_verdict_before_pending_does_not_substitute():
+    """A finalized verdict that PREDATES the current promotion attempt must NOT
+    suppress the live promotion_pending (same-sha re-run scenario)."""
+    from datetime import datetime
+
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = {
+        "status": "pending",
+        "candidate_sha": "beef" * 10,
+        "promotion_pending": {
+            "pr_number": 99,
+            "enabled_at": "2026-06-01T00:00:00",  # new attempt: June 1
+        },
+    }
+    # Verdict from BEFORE the new attempt (Jan 1 < June 1) — stale re-run verdict.
+    verdict = _fake_verdict(
+        "not_promoted",
+        candidate_sha="beef" * 10,
+        created_at=datetime(2026, 1, 1),
+    )
+    effective, disagreement = apply_verdict_substitution(qual, verdict)
+
+    # Stale verdict must not clear the live promotion_pending.
+    assert effective is qual
+    assert disagreement is None
+
+
+def test_apply_verdict_substitution_requires_matching_candidate_sha():
+    """A finalized verdict for a different candidate must not suppress live promotion."""
+    from app.qualification_state_resolver import apply_verdict_substitution
+
+    qual = {
+        "status": "pending",
+        "candidate_sha": "a" * 40,
+        "promotion_pending": {"pr_number": 42},
+    }
+    effective, disagreement = apply_verdict_substitution(
+        qual,
+        _fake_verdict("promoted", candidate_sha="b" * 40),
+    )
+
+    assert effective is qual
+    assert disagreement is None
+
+
 def test_apply_verdict_substitution_non_finalized_verdict_is_noop():
     """A non-finalized verdict terminal_status leaves the pending record untouched."""
     from app.qualification_state_resolver import apply_verdict_substitution
 
     qual = {"status": "pending", "promotion_pending": {"pr_number": 7}}
     # ``pending`` is not in FINALIZED_TERMINAL_STATUSES.
-    effective, disagreement = apply_verdict_substitution(qual, _fake_verdict("pending"))
+    effective, disagreement = apply_verdict_substitution(
+        qual, _fake_verdict("pending", candidate_sha="a" * 40)
+    )
 
     assert effective is qual
     assert disagreement is None
@@ -4124,7 +4207,9 @@ def test_apply_verdict_substitution_requires_promotion_pending():
     from app.qualification_state_resolver import apply_verdict_substitution
 
     qual = {"status": "pending"}
-    effective, disagreement = apply_verdict_substitution(qual, _fake_verdict("promoted"))
+    effective, disagreement = apply_verdict_substitution(
+        qual, _fake_verdict("promoted", candidate_sha="a" * 40)
+    )
 
     assert effective is qual
     assert disagreement is None
@@ -4142,12 +4227,14 @@ def test_apply_verdict_substitution_no_verdict_or_non_pending_status():
     # Already-terminal status is never overwritten even when a verdict exists.
     promoted = {"status": "promoted", "promotion_pending": {"pr_number": 2}}
     effective, disagreement = apply_verdict_substitution(
-        promoted, _fake_verdict("not_promoted")
+        promoted, _fake_verdict("not_promoted", candidate_sha="a" * 40)
     )
     assert effective is promoted and disagreement is None
 
     # None / non-dict input degrades to an empty dict without raising.
-    effective, disagreement = apply_verdict_substitution(None, _fake_verdict("promoted"))
+    effective, disagreement = apply_verdict_substitution(
+        None, _fake_verdict("promoted", candidate_sha="a" * 40)
+    )
     assert effective == {} and disagreement is None
 
 

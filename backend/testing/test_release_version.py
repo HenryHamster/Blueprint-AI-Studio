@@ -27,7 +27,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app import release_version as rv
 from app import strategic_spawning as ss
-from app.models import Project, ReleaseVersion, Task, TaskStatus
+from app.models import Project, QualificationVerdict, ReleaseVersion, Task, TaskStatus
 from app.time_utils import _utcnow
 
 
@@ -3041,6 +3041,77 @@ async def test_abandon_concurrent_race_guard_independent_of_idempotency(db_sessi
     )
 
     assert abandoned is None and new_version is None
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_blocked_when_promotion_in_flight(db_session):
+    """abandon_current_version raises VersionCutBlockedByPromotion when the
+    version's last_qualification carries promotion_pending and no finalized
+    verdict row exists (true in-flight promotion must still block)."""
+    project = await _make_project(db_session)
+    version = await _make_open_version_row(db_session, project, version_number=5)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "dead" * 10,
+        "promotion_pending": {
+            "pr_number": 55,
+            "pr_url": "http://pr/55",
+            "enabled_at": "2026-07-01T00:00:00",
+        },
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    with pytest.raises(rv.VersionCutBlockedByPromotion) as exc_info:
+        await rv.abandon_current_version(
+            db_session, project.id, reason="operator cut", operator_id="op@example.com"
+        )
+
+    assert exc_info.value.promotion_pr_number == 55
+
+
+@pytest.mark.asyncio
+async def test_abandon_current_version_succeeds_when_verdict_finalized(db_session):
+    """Stale-pending window: last_qualification has promotion_pending but the
+    newest QualificationVerdict row already carries a finalized terminal_status.
+    abandon_current_version must NOT raise VersionCutBlockedByPromotion — the
+    promotion already resolved, so cutting is allowed."""
+    project = await _make_project(db_session)
+    version = await _make_open_version_row(db_session, project, version_number=6)
+    version.last_qualification = {
+        "status": "pending",
+        "candidate_sha": "babe" * 10,
+        "promotion_pending": {
+            "pr_number": 66,
+            "pr_url": "http://pr/66",
+            "enabled_at": "2026-07-01T00:00:00",
+        },
+    }
+    db_session.add(version)
+
+    # Finalized verdict already exists — promotion resolved.
+    verdict = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha="babe" * 10,
+        terminal_status="promoted",
+    )
+    db_session.add(verdict)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    abandoned, new_version = await rv.abandon_current_version(
+        db_session,
+        project.id,
+        reason="cut after promotion resolved",
+        operator_id="op@example.com",
+    )
+    await db_session.commit()
+
+    assert abandoned is not None and new_version is not None
+    await db_session.refresh(abandoned)
+    assert abandoned.status == "abandoned"
 
 
 # ===========================================================================

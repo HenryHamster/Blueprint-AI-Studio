@@ -31,6 +31,7 @@ from app.release_artifacts import version_serving_summary as _version_serving_su
 from app.qualification_state_resolver import (
     resolve_effective_qualification_state,
     resolve_open_version_qualification_state,
+    resolve_promotion_blocking_result,
 )
 from app.time_utils import _coerce_naive_utc
 from app import release_version as _release_version
@@ -887,15 +888,11 @@ async def set_version_phase(
     # predicate. (Only the operator endpoint guards this — the internal
     # set_version_phase helper stays open for finalize/sweep/promotion flows that
     # legitimately flip phase mid-promotion.)
-    # Re-check this against the LOCKED row's last_qualification, not a stale read.
-    _qual_state = _release_version.summarize_qualification_state(
-        open_ver.last_qualification
-    )
-    if (
-        _qual_state
-        and _qual_state.get("state") in _release_version.PROMOTION_BLOCKING_STATES
-    ):
-        if _qual_state.get("state") == "promotion_check_wait":
+    # Re-check against the LOCKED row with finalized-verdict substitution so a
+    # stale-pending+finalized-verdict is not misclassified as still-blocking.
+    _promo_state = await resolve_promotion_blocking_result(session, open_ver)
+    if _promo_state is not None:
+        if _promo_state.get("status") == "promotion_check_wait":
             detail = (
                 "a migration-carrying promotion PR is open and waiting for "
                 "required checks — Blueprint will retry the merge automatically; "
@@ -906,14 +903,14 @@ async def set_version_phase(
                 "a promotion PR is open and auto-merging — wait for it to land or "
                 "cancel it before changing the phase"
             )
-        pr_number = _qual_state.get("promotion_pr_number")
+        pr_number = _promo_state.get("promotion_pr_number")
         if pr_number is not None:
             detail += f" (PR #{pr_number}"
-            pr_url = _qual_state.get("promotion_pr_url")
+            pr_url = _promo_state.get("promotion_pr_url")
             if pr_url:
                 detail += f" {pr_url}"
             detail += ")"
-        detail += _release_version.format_promotion_freshness(_qual_state)
+        detail += _release_version.format_promotion_freshness(_promo_state)
         raise HTTPException(status_code=409, detail=detail)
 
     operator_id = current_user.get("email") or current_user["user_id"]

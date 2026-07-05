@@ -11755,6 +11755,88 @@ class TestSetVersionPhase:
         assert "promotion PR is open and auto-merging" in resp.text
         assert "5555" in resp.text
 
+    @pytest.mark.asyncio
+    async def test_set_phase_allows_flip_when_verdict_finalized(
+        self, client: AsyncClient, db_session
+    ):
+        """Stale-pending window: last_qualification has promotion_pending but the
+        newest QualificationVerdict row already carries a finalized terminal_status.
+        The phase flip must succeed (200) — not be refused with 409."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "abcdef" * 6 + "abcd",
+            "promotion_pending": {
+                "pr_number": 7777,
+                "pr_url": "https://example/pr/7777",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+
+        # Finalized verdict — promotion already resolved.
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="abcdef" * 6 + "abcd",
+            terminal_status="promoted",
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-phase",
+            json={"phase": "build"},
+        )
+        assert resp.status_code == 200, (
+            f"Expected 200 for stale-pending+finalized-verdict but got {resp.status_code}: "
+            f"{resp.text}"
+        )
+        assert resp.json()["phase"] == "build"
+
+    @pytest.mark.asyncio
+    async def test_version_cut_allows_cut_when_verdict_finalized(
+        self, client: AsyncClient, db_session
+    ):
+        """Stale-pending window: last_qualification has promotion_pending but the
+        newest QualificationVerdict row already carries a finalized terminal_status.
+        version-cut must succeed (200) — not be refused with 409."""
+        from app.models import QualificationVerdict
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id, phase="stabilize")
+        version.last_qualification = {
+            "status": "pending",
+            "candidate_sha": "feed" * 10,
+            "promotion_pending": {
+                "pr_number": 8888,
+                "pr_url": "https://example/pr/8888",
+                "auto_merge_enabled": True,
+            },
+        }
+        db_session.add(version)
+
+        verdict = QualificationVerdict(
+            project_id=project.id,
+            release_version_id=version.id,
+            candidate_sha="feed" * 10,
+            terminal_status="not_promoted",
+        )
+        db_session.add(verdict)
+        await db_session.commit()
+
+        resp = await client.post(
+            f"/api/admin/projects/{project.id}/version-cut",
+            json={"reason": "cut after promotion resolved"},
+        )
+        assert resp.status_code == 200, (
+            f"Expected 200 for stale-pending+finalized-verdict but got {resp.status_code}: "
+            f"{resp.text}"
+        )
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # admin_release_version.py — Set Version Goal

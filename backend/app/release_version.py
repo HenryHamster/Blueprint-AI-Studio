@@ -1573,12 +1573,14 @@ async def abandon_current_version(
         )
         return None, None
 
-    qual_state = summarize_qualification_state(locked.last_qualification)
-    if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
+    from app.qualification_state_resolver import resolve_promotion_blocking_result
+
+    _promo = await resolve_promotion_blocking_result(session, locked)
+    if _promo is not None:
         raise VersionCutBlockedByPromotion(
-            qual_state.get("promotion_pr_number"),
-            qual_state.get("promotion_pr_url"),
-            promotion_freshness=qual_state,
+            _promo.get("promotion_pr_number"),
+            _promo.get("promotion_pr_url"),
+            promotion_freshness=_promo,
         )
 
     project = await session.get(Project, project_id)

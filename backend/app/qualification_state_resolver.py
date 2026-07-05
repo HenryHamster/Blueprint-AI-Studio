@@ -41,6 +41,7 @@ did not so the guarantee holds regardless of caller.
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any, Tuple, TYPE_CHECKING
 
 from sqlalchemy import select
@@ -52,6 +53,19 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from app.models import ReleaseVersion, Project
 
 logger = logging.getLogger("backend.app.qualification_state_resolver")
+
+
+def _parse_iso_naive(raw: Any) -> datetime | None:
+    """Parse an ISO-8601 string to a naive datetime, or return None on failure."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+        # Strip tzinfo to produce a naive UTC datetime comparable to DB values.
+        return dt.replace(tzinfo=None)
+    except ValueError:
+        return None
+
 
 # Sentinel distinguishing "caller did not resolve this enrichment" (backfill it)
 # from "caller resolved it and it is genuinely ``None``" (respect the ``None``).
@@ -77,22 +91,49 @@ def apply_verdict_substitution(
 
     ``disagreement`` is ``None`` unless the raw ``last_qualification`` sits in a
     transient ``pending`` state with a ``promotion_pending`` sub-key *while* the
-    newest verdict row already carries a finalized ``terminal_status``. In that
-    window the verdict is canonical: the returned ``effective_qual`` adopts the
-    verdict's terminal status (and drops ``promotion_pending``) so downstream
-    ``summarize_qualification_state`` sees the resolved outcome instead of the
-    stale ``promotion_in_flight``, and ``disagreement`` records both sides for
-    surfacing.
+    newest verdict row already carries a finalized ``terminal_status`` for the
+    same ``candidate_sha``. In that window the verdict is canonical: the
+    returned ``effective_qual`` adopts the verdict's terminal status (and drops
+    ``promotion_pending``) so downstream ``summarize_qualification_state`` sees
+    the resolved outcome instead of the stale ``promotion_in_flight``, and
+    ``disagreement`` records both sides for surfacing.
 
     Otherwise the input dict is returned unchanged with ``disagreement=None``.
     """
     q = qual if isinstance(qual, dict) else {}
+    candidate_sha = q.get("candidate_sha")
+    promotion_pending = q.get("promotion_pending")
     if (
         latest_verdict is not None
         and q.get("status") == "pending"
-        and isinstance(q.get("promotion_pending"), dict)
+        and isinstance(promotion_pending, dict)
+        and isinstance(candidate_sha, str)
+        and candidate_sha
+        and getattr(latest_verdict, "candidate_sha", None) == candidate_sha
         and latest_verdict.terminal_status in FINALIZED_TERMINAL_STATUSES
     ):
+        # Temporal guard: a finalized verdict for the SAME sha from a PREVIOUS
+        # attempt (dry_run before a force-promote, not_promoted before a
+        # same-sha re-run, promotion_failed before a retry) must NOT suppress
+        # the live promotion_pending.  When BOTH timestamps are present and
+        # the verdict predates the pending attempt we can confirm the verdict
+        # is stale and fail closed.  When either timestamp is absent (legacy /
+        # timeless promotion_pending shapes) we cannot distinguish a stale
+        # re-run from a record that was simply written before timestamp fields
+        # existed — trust the finalized verdict and substitute.
+        verdict_ts: datetime | None = getattr(latest_verdict, "created_at", None)
+        if not isinstance(verdict_ts, datetime):
+            verdict_ts = None
+        # Prefer promotion_pending.enabled_at; fall back to qual.started_at.
+        pending_ts: datetime | None = _parse_iso_naive(
+            promotion_pending.get("enabled_at")
+        ) or _parse_iso_naive(q.get("started_at"))
+        # Strip tzinfo from verdict_ts so both sides are naive UTC.
+        if verdict_ts is not None:
+            verdict_ts = verdict_ts.replace(tzinfo=None)
+        if pending_ts is not None and verdict_ts is not None and verdict_ts <= pending_ts:
+            # Confirmed stale: verdict predates this promotion attempt.
+            return q, None
         effective = {**q, "status": latest_verdict.terminal_status}
         effective.pop("promotion_pending", None)
         disagreement = {
@@ -183,6 +224,55 @@ async def resolve_newest_qualification_verdict(
         .scalars()
         .first()
     )
+
+
+async def resolve_promotion_blocking_result(
+    session: AsyncSession,
+    version: ReleaseVersion,
+) -> "dict[str, Any] | None":
+    """Return a promotion-blocking status dict, or None when not mid-promotion.
+
+    Shared predicate for all four promotion-blocking operator levers
+    (run_qualification, force_promote, abandon_current_version, set_version_phase).
+    Mirrors ``_promotion_in_flight_result`` in ``release_qualifier`` but applies
+    finalized-verdict substitution via :func:`apply_verdict_substitution` so that
+    a stale-pending record with a finalized ``QualificationVerdict`` row is not
+    misclassified as ``promotion_in_flight`` / ``promotion_check_wait``.
+
+    Returns a dict with ``status``, ``promotion_pr_number``, ``promotion_pr_url``,
+    and any freshness keys when the version is genuinely mid-promotion, or ``None``
+    when the effective state is not in ``PROMOTION_BLOCKING_STATES``.
+    """
+    from app.release_version import (
+        summarize_qualification_state,
+        PROMOTION_BLOCKING_STATES,
+        _PROMOTION_FRESHNESS_KEYS,
+    )
+
+    latest_verdict = await resolve_newest_qualification_verdict(session, version)
+    qual = (
+        version.last_qualification
+        if isinstance(version.last_qualification, dict)
+        else {}
+    )
+    effective_qual, _ = apply_verdict_substitution(qual, latest_verdict)
+    qual_state = summarize_qualification_state(effective_qual)
+    if qual_state and qual_state.get("state") in PROMOTION_BLOCKING_STATES:
+        result: dict[str, Any] = {
+            # "status" mirrors _promotion_in_flight_result's return shape
+            # (used by run_qualification / force_promote / set_version_phase).
+            # "state" is included so VersionCutBlockedByPromotion.promotion_freshness
+            # consumers (the version-cut router) that read .get("state") still work.
+            "status": qual_state["state"],
+            "state": qual_state["state"],
+            "promotion_pr_number": qual_state.get("promotion_pr_number"),
+            "promotion_pr_url": qual_state.get("promotion_pr_url"),
+        }
+        for key in _PROMOTION_FRESHNESS_KEYS:
+            if key in qual_state:
+                result[key] = qual_state[key]
+        return result
+    return None
 
 
 async def resolve_open_version_qualification_state(
