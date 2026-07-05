@@ -50,6 +50,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
+from app.direct_llm_client import DIRECT_LLM_MODEL, call_direct_llm, get_anthropic_api_key
 from app.json_extract import _extract_json_object
 from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
@@ -1124,9 +1125,8 @@ async def _handle_knowledge_document_completion(
 # ---------------------------------------------------------------------------
 
 # LLM analysis call shape — mirrors review_learning.categorize_review_issues_llm:
-# a locally-instantiated AsyncAnthropic client, an explicit model + timeout, a
-# small JSON-parse retry, gated behind ANTHROPIC_API_KEY and an opt-out flag.
-_COMPUTE_LLM_ANALYSIS_MODEL = "claude-haiku-4-5-20251001"
+# a shared direct-client call, an explicit timeout, a small JSON-parse retry,
+# gated behind ANTHROPIC_API_KEY and an opt-out flag.
 _COMPUTE_LLM_ANALYSIS_TIMEOUT = 30.0
 _COMPUTE_LLM_ANALYSIS_MAX_TOKENS = 2000
 # Opt-out switch in the same spirit as DISABLE_LLM_REVIEW_CATEGORIZATION.
@@ -1873,16 +1873,12 @@ async def _call_compute_analysis_llm(
     """
     for attempt in range(2):
         try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_COMPUTE_LLM_ANALYSIS_MODEL,
+            raw = await call_direct_llm(
+                api_key,
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=_COMPUTE_LLM_ANALYSIS_MAX_TOKENS,
                 timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
             data = _parse_compute_analysis_json(raw)
             if not isinstance(data, dict) or not all(
                 k in data for k in ("title", "summary", "body")
@@ -1926,7 +1922,7 @@ async def _analyze_compute_experiment_with_llm(
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
         logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
         return None, "analysis-disabled"
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         logger.info(
             "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
@@ -1966,7 +1962,7 @@ def _ground_and_assemble_compute_analysis(
     evidence: dict[str, Any],
     fallback: dict[str, Any],
     *,
-    analysis_model: str = _COMPUTE_LLM_ANALYSIS_MODEL,
+    analysis_model: str = DIRECT_LLM_MODEL,
     execution: str = "backend",
 ) -> tuple[dict[str, Any] | None, str]:
     """Ground a produced analysis document and assemble the upgrade payload.
@@ -2699,7 +2695,7 @@ async def answer_compute_experiment_question(
     grounding_miss, and fallback_reason. Declines honestly when evidence is insufficient
     or the LLM is unavailable. Never persists any data — purely ephemeral Q&A.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1" or not api_key:
         return _qa_unavailable("llm-disabled")
     evidence = await _gather_compute_evidence(
@@ -2732,16 +2728,12 @@ async def answer_compute_experiment_question(
     allowed_set = set(evidence.get("citations", []))
     for attempt in range(2):
         try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_COMPUTE_LLM_ANALYSIS_MODEL,
+            raw = await call_direct_llm(
+                api_key,
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=_COMPUTE_QA_MAX_TOKENS,
                 timeout=_COMPUTE_LLM_ANALYSIS_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
             data = _parse_compute_analysis_json(raw)
             if not isinstance(data, dict) or "answer" not in data:
                 raise ValueError("QA response missing 'answer'")

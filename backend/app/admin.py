@@ -25,6 +25,7 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
 from app.database import get_session, resolve_async_engine
+from app.direct_llm_client import call_direct_llm, get_anthropic_api_key
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -2538,7 +2539,6 @@ class ComputeExperimentDraft(BaseModel):
     machine_type: str | None = None
 
 
-_DRAFT_LLM_MODEL = "claude-haiku-4-5-20251001"
 _DRAFT_LLM_TIMEOUT = 30.0
 _DRAFT_LLM_MAX_TOKENS = 2000
 _DISABLE_DRAFT_LLM_ENV = "DISABLE_COMPUTE_EXPERIMENT_DRAFT_LLM"
@@ -2701,17 +2701,13 @@ async def _call_draft_llm(
 
     for attempt in range(2):
         try:
-            import anthropic as _anthropic
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_DRAFT_LLM_MODEL,
+            raw_text = await call_direct_llm(
+                api_key,
+                messages=messages,
                 max_tokens=_DRAFT_LLM_MAX_TOKENS,
                 timeout=_DRAFT_LLM_TIMEOUT,
                 system=_DRAFT_LLM_SYSTEM,
-                messages=messages,
             )
-            raw_text = resp.content[0].text.strip()
             parsed = _parse_draft_json(raw_text)
             if parsed is None:
                 if attempt == 0:
@@ -2750,7 +2746,7 @@ async def compute_experiment_draft(
             notes="Draft LLM is disabled via environment configuration.",
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         return ComputeExperimentDraft(
             draft_available=False,

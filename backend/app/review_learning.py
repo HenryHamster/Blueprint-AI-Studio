@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.direct_llm_client import call_direct_llm, get_anthropic_api_key
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity, _mark_stale_review_entries
 from app.time_utils import _to_naive_utc
@@ -196,7 +197,6 @@ _REVIEW_CATEGORIES: dict[str, list[str]] = {
 }
 
 _VALID_CATEGORIES = set(_REVIEW_CATEGORIES.keys()) | {"other"}
-_LLM_CATEGORIZE_MODEL = "claude-haiku-4-5-20251001"
 _LLM_CATEGORIZE_TIMEOUT = 10.0
 
 _MODULE_FEEDBACK_KEY = "module_feedback"
@@ -289,7 +289,7 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
             ]
         )
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+    api_key = get_anthropic_api_key()
     if not api_key:
         logger.info(
             "categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback"
@@ -311,16 +311,12 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
 
     for attempt in range(2):
         try:
-            import anthropic as _anthropic  # noqa: PLC0415
-
-            client = _anthropic.AsyncAnthropic(api_key=api_key)
-            resp = await client.messages.create(
-                model=_LLM_CATEGORIZE_MODEL,
+            raw = await call_direct_llm(
+                api_key,
+                messages=[{"role": "user", "content": prompt}],
                 max_tokens=512,
                 timeout=_LLM_CATEGORIZE_TIMEOUT,
-                messages=[{"role": "user", "content": prompt}],
             )
-            raw = resp.content[0].text.strip()
             data = json.loads(raw)
             classifications = data["classifications"]
             for classification in classifications:
@@ -389,7 +385,7 @@ async def cache_first_attempt_classification(
     """Run LLM categoriser (keyword fallback inside) and cache result in task_context."""
     if (
         os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1"
-        or not os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        or not get_anthropic_api_key()
     ):
         method = "keyword"
         buckets = _keyword_from_flat(issues)
