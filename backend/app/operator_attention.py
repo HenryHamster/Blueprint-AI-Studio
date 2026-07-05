@@ -6,6 +6,7 @@ not create a second task/message/alert lifecycle.
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta
 from typing import Any
@@ -15,8 +16,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
 
-from app.acceptance_criteria import get_version_coverage_summary
 from app.message_convergence import OPEN_STATUS
+from app.acceptance_criteria import (
+    get_criteria_for_version,
+    get_version_coverage_summary,
+)
 from app.failure_classification import is_non_death_cancellation
 from app.models import (
     Alert,
@@ -28,11 +32,14 @@ from app.models import (
     MessagesLastSeen,
     Project,
     ProjectMessage,
+    ReleaseVersion,
+    VersionAcceptanceCriterion,
     Task,
     TaskStatus,
     VmContact,
 )
 from app.reaper_orphan_classify import _classify_orphan
+from app.release_version import current_open_version
 from app.routers.admin_runners import _runner_health
 from app.strategic_runtime_work import (
     local_runner_hold_task_filters,
@@ -40,7 +47,6 @@ from app.strategic_runtime_work import (
     task_awaiting_local_runner_since,
     task_awaiting_strategic_local_runner_since,
 )
-from app.release_version import current_open_version
 from app.task_movement import build_task_movement_explanation
 from app.time_utils import _utcnow
 from app.workbench_contracts import compact_text, normalize_target
@@ -77,6 +83,7 @@ _MESSAGE_WATCH_PREVIEW_LIMIT = 24
 _ALERT_ERROR_PREVIEW_LIMIT = 4
 _ALERT_WARNING_PREVIEW_LIMIT = 4
 _DEAD_RUNNER_PREVIEW_LIMIT = 4
+_STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
@@ -87,6 +94,7 @@ _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "stale_provisioning_task"): 50,
     ("needs_operator", "stale_queued_task"): 60,
     ("needs_operator", "stuck_criteria"): 65,
+    ("needs_operator", "stuck_acceptance_criterion"): 65,
     ("needs_operator", "manual_intervention"): 70,
     ("needs_operator", "blocker"): 80,
     ("needs_operator", "question"): 90,
@@ -187,6 +195,13 @@ _ATTENTION_LIFECYCLE_BY_REASON: dict[str, dict[str, Any]] = {
         "acknowledgeable": False,
         "acknowledge_effect": "none",
     },
+    "stuck_acceptance_criterion": {
+        "mode": "acceptance_criteria_lifecycle",
+        "clears_when": "criterion_covered_or_version_closed_or_attested",
+        "operator_action": "remap_direction_or_attest_criterion",
+        "acknowledgeable": False,
+        "acknowledge_effect": "none",
+    },
     "alert": {
         "mode": "alert_lifecycle",
         "clears_when": "alert_dismissed_or_resolved_at_source",
@@ -231,6 +246,9 @@ _DEFAULT_ATTENTION_LIFECYCLE = {
     "acknowledgeable": False,
     "acknowledge_effect": "none",
 }
+
+
+logger = logging.getLogger(__name__)
 
 
 def _enum_value(value: Any) -> str:
@@ -543,6 +561,45 @@ def _direction_attention_item(
             "project_id": str(project_id),
             "section": "directions",
             "direction_id": direction_id,
+        }),
+    }
+
+
+def _stuck_acceptance_criterion_attention_item(
+    project_id: uuid.UUID,
+    version: ReleaseVersion,
+    criterion: VersionAcceptanceCriterion,
+    summary_row: dict[str, Any],
+) -> dict[str, Any]:
+    stuck_reason = str(summary_row.get("stuck_reason") or "")
+    reason_label = {
+        "no_mapping": "Acceptance criterion is unmapped",
+        "direction_retired": "Acceptance criterion points to a retired direction",
+    }.get(stuck_reason, "Acceptance criterion needs attention")
+    detail_parts = [criterion.text, reason_label]
+    detail = " - ".join(part for part in detail_parts if part)
+    return {
+        "id": f"version:{version.id}:acceptance_criterion:{criterion.criterion_key}",
+        "kind": "acceptance_criterion",
+        "severity": "needs_operator",
+        "reason": "stuck_acceptance_criterion",
+        "label": reason_label,
+        "detail": _compact_text(detail, max_chars=180),
+        "status": _enum_value(criterion.status),
+        "created_at": criterion.created_at.isoformat() if criterion.created_at else None,
+        "criterion_key": criterion.criterion_key,
+        "stuck_reason": stuck_reason or None,
+        "release_version_id": str(version.id),
+        "release_version_number": version.version_number,
+        "ref": {
+            "kind": "acceptance_criterion",
+            "id": criterion.criterion_key,
+            "project_id": str(project_id),
+        },
+        "target": _attention_target({
+            "surface": "project",
+            "project_id": str(project_id),
+            "section": "manage",
         }),
     }
 
@@ -1457,6 +1514,8 @@ async def build_operator_attention(
     stuck_criteria_count = 0
     stuck_no_mapping_count = 0
     stuck_direction_retired_count = 0
+    stuck_acceptance_criteria_count = 0
+    stuck_acceptance_criteria: list[dict[str, Any]] = []
     try:
         open_version = await current_open_version(session, project.id)
         if open_version is not None:
@@ -1468,6 +1527,39 @@ async def build_operator_attention(
                     stuck_no_mapping_count += 1
                 elif reason == "direction_retired":
                     stuck_direction_retired_count += 1
+            stuck_by_key = {
+                c["criterion_key"]: c
+                for c in coverage.get("criteria", [])
+                if c["status"] == "active"
+                and c["coverage"] == "uncovered"
+                and c.get("stuck_reason") is not None
+            }
+            stuck_acceptance_criteria_count = len(stuck_by_key)
+            if stuck_acceptance_criteria_count:
+                try:
+                    criterion_rows = await get_criteria_for_version(
+                        session, open_version.id
+                    )
+                    for criterion in criterion_rows:
+                        summary_row = stuck_by_key.get(criterion.criterion_key)
+                        if summary_row is None:
+                            continue
+                        stuck_acceptance_criteria.append(
+                            _stuck_acceptance_criterion_attention_item(
+                                project.id,
+                                open_version,
+                                criterion,
+                                summary_row,
+                            )
+                        )
+                    stuck_acceptance_criteria = stuck_acceptance_criteria[
+                        :_STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT
+                    ]
+                except Exception:
+                    logger.exception(
+                        "operator_attention: failed to load stuck acceptance criteria for project %s",
+                        project.id,
+                    )
     except Exception:
         pass
 
@@ -1526,6 +1618,8 @@ async def build_operator_attention(
         )
     for direction in manual_directions[:3]:
         add_candidate(_direction_attention_item(project.id, direction))
+    for item in stuck_acceptance_criteria:
+        add_candidate(item)
     for alert in alerts:
         add_candidate(_alert_attention_item(alert))
     for task in held_tasks:
@@ -1605,6 +1699,7 @@ async def build_operator_attention(
             "stale_task_preview": _STALE_TASK_PREVIEW_LIMIT,
             "alert_error_preview": _ALERT_ERROR_PREVIEW_LIMIT,
             "alert_warning_preview": _ALERT_WARNING_PREVIEW_LIMIT,
+            "stuck_acceptance_criteria_preview": _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT,
         },
         "counts": {
             "needs_operator": total_needs_operator,
@@ -1624,6 +1719,7 @@ async def build_operator_attention(
             "dead_runners": dead_runner_needs_operator_count + dead_runner_watch_count,
             "stale_provisioning_tasks": stale_provisioning_count,
             "stale_queued_tasks": stale_queued_count,
+            "stuck_acceptance_criteria": stuck_acceptance_criteria_count,
             "manual_directions": len(manual_directions),
             "stuck_criteria": stuck_criteria_count,
             "alerts": error_alert_count + warning_alert_count,

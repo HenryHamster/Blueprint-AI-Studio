@@ -1608,5 +1608,22 @@ async def _process_direction_lifecycle_locked(
     if auto_paused_any or directions_modified:
         flag_modified(project, "directions")
         session.add(project)
+        # P2 (p2-direction-table): dual-write the normalised ``direction`` table
+        # so it stays consistent with the authoritative blob after lifecycle
+        # mutations (auto-pause, auto-retire, prune). Best-effort — a sync
+        # failure must never break the blob write.
+        try:
+            from app.directions_repo import sync_directions
+
+            await sync_directions(
+                session, project.id, list(project.directions or [])
+            )
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover - defensive
+            logger.warning(
+                "[direction_lifecycle] direction-table dual-write sync failed "
+                "for project %s (blob write unaffected): %s",
+                project.id,
+                exc,
+            )
         await session.commit()
     return active_directions

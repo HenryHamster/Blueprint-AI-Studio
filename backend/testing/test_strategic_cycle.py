@@ -12,7 +12,7 @@ import pytest
 from sqlmodel import select
 
 from app import strategic_cycle, vision_merge
-from app.models import Project, StrategicCycle, Task, TaskStatus
+from app.models import CYCLE_META_INTEGRITY_CONFLICT_COUNTS, Project, StrategicCycle, Task, TaskStatus
 from app.time_utils import _utcnow
 from app.workbench_state import (
     STRATEGIC_LOCAL_RUNNER_HOLD_CONTEXT_KEY,
@@ -804,3 +804,134 @@ async def test_strategic_debug_recent_cycles_from_table(client, db_session):
     assert last["outcome"] == strategic_cycle.OUTCOME_COMPLETED
     # Newest first — directions_created on the second cycle is 2.
     assert last["directions_created"] == 2
+
+
+# --- integrity conflict counts -----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_record_integrity_conflict_counts_stamps_metadata(db_session):
+    """record_integrity_conflict_counts writes the three counts into cycle_metadata."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    counts = {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0}
+    strategic_cycle.record_integrity_conflict_counts(cycle, counts)
+    db_session.add(cycle)
+    await db_session.commit()
+
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert fetched is not None
+    stored = fetched.cycle_metadata.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS)
+    assert stored == {"orphaned_gaps": 2, "ungrounded_directions": 1, "stale_active_moves": 0}
+
+
+@pytest.mark.asyncio
+async def test_record_integrity_conflict_counts_zeros_are_explicit(db_session):
+    """Explicit zero counts are stored, distinguishing clean cycles from legacy (no stamp)."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+    strategic_cycle.record_integrity_conflict_counts(cycle, counts)
+    db_session.add(cycle)
+    await db_session.commit()
+
+    fetched = await strategic_cycle.get(db_session, cycle.id)
+    assert fetched is not None
+    stored = fetched.cycle_metadata.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS)
+    assert stored is not None
+    assert stored["orphaned_gaps"] == 0
+    assert stored["ungrounded_directions"] == 0
+    assert stored["stale_active_moves"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recent_integrity_conflict_trend_consecutive_clean(db_session):
+    """consecutive_clean_cycles counts unbroken clean cycles from most recent."""
+    project = await _make_project(db_session)
+
+    async def _make_completed_cycle(counts):
+        c = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        strategic_cycle.record_integrity_conflict_counts(c, counts)
+        db_session.add(c)
+        await strategic_cycle.mark_phase1_completed(db_session, c.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase2_completed(db_session, c.id)
+        await db_session.commit()
+        return c
+
+    # Oldest cycle has conflicts, two newer ones are clean.
+    await _make_completed_cycle({"orphaned_gaps": 3, "ungrounded_directions": 1, "stale_active_moves": 0})
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
+
+    trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
+    assert trend["stamped_cycles"] == 3
+    assert trend["consecutive_clean_cycles"] == 2
+    assert trend["last_counts"] == {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+
+
+@pytest.mark.asyncio
+async def test_recent_integrity_conflict_trend_dirty_resets_count(db_session):
+    """A dirty cycle breaks the clean streak even when older cycles are clean."""
+    project = await _make_project(db_session)
+
+    async def _make_completed_cycle(counts):
+        c = await strategic_cycle.create(db_session, project_id=project.id)
+        await db_session.commit()
+        strategic_cycle.record_integrity_conflict_counts(c, counts)
+        db_session.add(c)
+        await strategic_cycle.mark_phase1_completed(db_session, c.id)
+        await db_session.commit()
+        await strategic_cycle.mark_phase2_completed(db_session, c.id)
+        await db_session.commit()
+        return c
+
+    # Most-recent cycle has conflicts — streak is zero even though prior was clean.
+    await _make_completed_cycle({"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0})
+    await _make_completed_cycle({"orphaned_gaps": 1, "ungrounded_directions": 0, "stale_active_moves": 0})
+
+    trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
+    assert trend["stamped_cycles"] == 2
+    assert trend["consecutive_clean_cycles"] == 0
+    assert trend["last_counts"]["orphaned_gaps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_recent_integrity_conflict_trend_no_stamps(db_session):
+    """Legacy cycles without stamps return zero stamped_cycles and clean streak."""
+    project = await _make_project(db_session)
+
+    # Completed cycle with no integrity_conflict_counts stamp (legacy).
+    c = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+    await strategic_cycle.mark_phase1_completed(db_session, c.id)
+    await db_session.commit()
+    await strategic_cycle.mark_phase2_completed(db_session, c.id)
+    await db_session.commit()
+
+    trend = await strategic_cycle.recent_integrity_conflict_trend(db_session, project.id)
+    assert trend["stamped_cycles"] == 0
+    assert trend["consecutive_clean_cycles"] == 0
+    assert trend["last_counts"] is None
+
+
+@pytest.mark.asyncio
+async def test_to_legacy_dict_includes_integrity_conflict_counts(db_session):
+    """integrity_conflict_counts from cycle_metadata propagates into the agent-context dict."""
+    project = await _make_project(db_session)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    counts = {"orphaned_gaps": 0, "ungrounded_directions": 0, "stale_active_moves": 0}
+    strategic_cycle.record_integrity_conflict_counts(cycle, counts)
+    db_session.add(cycle)
+    await db_session.commit()
+
+    legacy = strategic_cycle._to_legacy_dict(cycle)
+    assert CYCLE_META_INTEGRITY_CONFLICT_COUNTS in legacy
+    assert legacy[CYCLE_META_INTEGRITY_CONFLICT_COUNTS] == counts

@@ -25,6 +25,7 @@ from httpx import AsyncClient
 from sqlmodel import select
 
 from app import acceptance_criteria as ac
+from app.operator_attention import build_operator_attention
 from app.models import (
     CriterionEvidence,
     Direction,
@@ -665,6 +666,58 @@ async def test_stuck_count_aggregates_across_criteria(db_session):
     assert by_key[c_covered.criterion_key]["stuck_reason"] is None
     # no_map + retired are stuck; active and covered are not.
     assert summary["stuck_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_stuck_criterion_attention_item(db_session):
+    """Open-version stuck criteria surface as operator-attention items."""
+    project = await _make_project(db_session)
+    version = await _make_version(db_session, project)
+
+    c_no_map = await ac.create_criterion(
+        db_session, project.id, version.id, "Unmapped criterion"
+    )
+    c_retired = await ac.create_criterion(
+        db_session, project.id, version.id, "Retired-mapped criterion"
+    )
+    c_active = await ac.create_criterion(
+        db_session, project.id, version.id, "Active-mapped criterion"
+    )
+    db_session.add(
+        _make_direction(project.id, "ret", [c_retired.criterion_key], "superseded")
+    )
+    db_session.add(_make_direction(project.id, "act", [c_active.criterion_key], "active"))
+    await db_session.commit()
+
+    attention = await build_operator_attention(db_session, project, _TEST_USER_ID)
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["stuck_acceptance_criteria"] == 2
+    assert attention["counts"]["needs_operator"] == 2
+    items = {item["id"]: item for item in attention["items"]}
+    no_map_id = f"version:{version.id}:acceptance_criterion:{c_no_map.criterion_key}"
+    retired_id = f"version:{version.id}:acceptance_criterion:{c_retired.criterion_key}"
+    active_id = f"version:{version.id}:acceptance_criterion:{c_active.criterion_key}"
+    assert no_map_id in items
+    assert retired_id in items
+    assert active_id not in items
+    no_map_item = items[no_map_id]
+    retired_item = items[retired_id]
+    assert no_map_item["reason"] == "stuck_acceptance_criterion"
+    assert no_map_item["stuck_reason"] == "no_mapping"
+    assert no_map_item["label"] == "Acceptance criterion is unmapped"
+    assert no_map_item["release_version_id"] == str(version.id)
+    assert no_map_item["release_version_number"] == 1
+    assert no_map_item["target"] == {
+        "surface": "project",
+        "project_id": str(project.id),
+        "section": "manage",
+    }
+    assert retired_item["stuck_reason"] == "direction_retired"
+    assert (
+        retired_item["label"]
+        == "Acceptance criterion points to a retired direction"
+    )
 
 
 # ---------------------------------------------------------------------------

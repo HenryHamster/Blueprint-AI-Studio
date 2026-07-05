@@ -12,6 +12,7 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app.models import (
+    CYCLE_META_INTEGRITY_CONFLICT_COUNTS,
     Project,
     ProjectMessage,
     StrategicCycle,
@@ -373,6 +374,7 @@ def _cycle_summary(
         "vision_updated": cycle.vision_updated,
         "problem_model_changed": bool(metadata.get("problem_model_changed")),
         "running_update_changed": bool(metadata.get("running_update_changed")),
+        "integrity_conflict_counts": metadata.get(CYCLE_META_INTEGRITY_CONFLICT_COUNTS),
     }
 
 
@@ -822,6 +824,36 @@ def compute_model_integrity_conflicts(
             ),
         },
     }
+
+
+async def _integrity_conflict_trend(
+    session: AsyncSession,
+    project_id,
+    *,
+    limit: int = 10,
+) -> dict[str, Any]:
+    """Return durable integrity-conflict trend data for the strategic-state endpoint.
+
+    Delegates to :func:`strategic_cycle.recent_integrity_conflict_trend` and
+    wraps the result for the HTTP response body.  Fails open — an empty trend
+    dict is returned when the query raises so a DB hiccup doesn't take down
+    the entire strategic-state endpoint.
+    """
+    try:
+        return await strategic_cycle.recent_integrity_conflict_trend(
+            session, project_id, limit=limit
+        )
+    except Exception:
+        import logging  # noqa: PLC0415
+        logging.getLogger(__name__).exception(
+            "[STRATEGIC_STATE] integrity_conflict_trend query failed for project %s",
+            project_id,
+        )
+        return {
+            "stamped_cycles": 0,
+            "consecutive_clean_cycles": 0,
+            "last_counts": None,
+        }
 
 
 def _compute_criterion_link_conflicts(

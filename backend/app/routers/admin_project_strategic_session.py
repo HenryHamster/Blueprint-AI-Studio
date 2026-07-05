@@ -87,6 +87,7 @@ from app.strategic_state_read_model import (
     _cycle_summary,
     _dedupe_workbench_refs,
     _direction_summary,
+    _integrity_conflict_trend,
     _is_live_strategic_task,
     _problem_model_summary,
     _resident_session_available,
@@ -1259,6 +1260,7 @@ async def get_project_strategic_state(
         active_criterion_keys=active_crit_keys,
         inactive_criterion_keys=inactive_crit_keys,
     )
+    integrity_trend = await _integrity_conflict_trend(session, project.id)
 
     return {
         "project_id": str(project.id),
@@ -1323,6 +1325,7 @@ async def get_project_strategic_state(
         },
         "sha_freshness": sha_freshness,
         "model_integrity": model_integrity,
+        "integrity_conflict_trend": integrity_trend,
     }
 
 

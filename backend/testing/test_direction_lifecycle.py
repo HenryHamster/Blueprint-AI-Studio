@@ -3608,3 +3608,70 @@ async def test_malformed_paused_at_skips_only_bad_direction(db_session, mocker):
         "auto_recovered_at should be stamped on auto-recovery"
     )
 
+
+@pytest.mark.asyncio
+async def test_lifecycle_sweep_syncs_direction_table(db_session, mocker):
+    """After a lifecycle sweep auto-pauses a direction, the Direction table row
+    must reflect the new status — the dual-write in _process_direction_lifecycle_locked
+    must sync the normalised table before committing the blob.
+    """
+    from app.models import Direction
+
+    mocker.patch(
+        "app.direction_lifecycle._compute_direction_error_fingerprint",
+        new_callable=AsyncMock,
+        return_value=None,
+    )
+    now = datetime.utcnow()
+    direction = {
+        "id": "d-sweep-sync-test",
+        "text": "Direction to be auto-paused by sweep",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+        "cost_budget_usd": 1.0,
+        # Two history entries summing to 2.0 > budget of 1.0 → triggers auto-pause
+        "research_history": _cost_history(1.1, 0.9),
+    }
+    project = Project(
+        name="Sweep Sync Test Project",
+        user_id="u-sweep-sync",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    _ss.circuit_breakers.pop(str(project.id), None)
+
+    # Run the lifecycle sweep — should auto-pause the direction AND sync Direction table
+    await _process_direction_lifecycle(
+        project,
+        db_session,
+        busy_direction_ids=set(),
+        now=now,
+    )
+    await db_session.refresh(project)
+
+    # Blob should show the direction as paused
+    blob_dir = project.directions[0]
+    assert blob_dir["status"] == "paused", (
+        f"blob status should be paused after sweep, got {blob_dir['status']!r}"
+    )
+
+    # Direction table row must also reflect the paused status (the dual-write)
+    result = await db_session.execute(
+        select(Direction).where(
+            Direction.project_id == project.id,
+            Direction.direction_key == "d-sweep-sync-test",
+        )
+    )
+    row = result.scalars().first()
+    assert row is not None, (
+        "Direction table row must exist after lifecycle sweep syncs the table"
+    )
+    assert row.status == "paused", (
+        f"Direction table row status should be 'paused' after sweep, got {row.status!r}"
+    )

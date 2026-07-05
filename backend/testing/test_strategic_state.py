@@ -8,6 +8,7 @@ from httpx import AsyncClient
 from sqlalchemy import func
 from sqlmodel import select
 
+from app import acceptance_criteria as ac
 from app.compute_backends import RUNNER_SUBPROCESS_BACKEND_NAME
 from app.models import (
     ReleaseVersion,
@@ -5137,6 +5138,7 @@ async def test_strategic_state_includes_operator_attention(
         "stale_task_preview": 4,
         "alert_error_preview": 4,
         "alert_warning_preview": 4,
+        "stuck_acceptance_criteria_preview": 4,
     }
     assert len(attention["items"]) <= 8
 
@@ -5238,6 +5240,75 @@ async def test_strategic_state_includes_operator_attention(
         "alert_id": str(active_alert.id),
         "action": "dismiss_alert",
     }
+
+
+@pytest.mark.asyncio
+async def test_operator_attention_surfaces_stuck_acceptance_criteria(
+    client: AsyncClient, db_session
+):
+    project = await _make_project(db_session)
+    version = ReleaseVersion(project_id=project.id, version_number=1)
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    c_no_map = await ac.create_criterion(
+        db_session, project.id, version.id, "Unmapped criterion"
+    )
+    c_retired = await ac.create_criterion(
+        db_session, project.id, version.id, "Retired criterion"
+    )
+    c_active = await ac.create_criterion(
+        db_session, project.id, version.id, "Active criterion"
+    )
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-retired",
+            text="Retired mapping",
+            status="retired",
+            criterion_keys=[c_retired.criterion_key],
+        )
+    )
+    db_session.add(
+        Direction(
+            project_id=project.id,
+            direction_key="d-active",
+            text="Active mapping",
+            status="active",
+            criterion_keys=[c_active.criterion_key],
+        )
+    )
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/admin/operator-attention?project_id={project.id}"
+    )
+    assert resp.status_code == 200
+    attention = resp.json()
+
+    assert attention["level"] == "needs_operator"
+    assert attention["counts"]["stuck_acceptance_criteria"] == 2
+    assert attention["counts"]["needs_operator"] == 2
+    item_ids = {item["id"] for item in attention["items"]}
+    no_map_id = f"version:{version.id}:acceptance_criterion:{c_no_map.criterion_key}"
+    retired_id = f"version:{version.id}:acceptance_criterion:{c_retired.criterion_key}"
+    active_id = f"version:{version.id}:acceptance_criterion:{c_active.criterion_key}"
+    assert no_map_id in item_ids
+    assert retired_id in item_ids
+    assert active_id not in item_ids
+    no_map_item = next(item for item in attention["items"] if item["id"] == no_map_id)
+    retired_item = next(
+        item for item in attention["items"] if item["id"] == retired_id
+    )
+    assert no_map_item["reason"] == "stuck_acceptance_criterion"
+    assert no_map_item["stuck_reason"] == "no_mapping"
+    assert no_map_item["label"] == "Acceptance criterion is unmapped"
+    assert retired_item["stuck_reason"] == "direction_retired"
+    assert (
+        retired_item["label"]
+        == "Acceptance criterion points to a retired direction"
+    )
 
 
 @pytest.mark.asyncio

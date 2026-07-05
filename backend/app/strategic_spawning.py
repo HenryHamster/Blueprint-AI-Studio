@@ -5712,6 +5712,7 @@ async def _finalize_strategic_review_spawn(
     operator_steered: bool,
     steering_excerpt: str | None,
     runner_pin_id: str | None = None,
+    integrity_conflict_counts: dict[str, int] | None = None,
 ) -> bool:
     """Guarded INSERT/commit tail shared by the cadence + resident spawn paths.
 
@@ -5848,11 +5849,14 @@ async def _finalize_strategic_review_spawn(
     # instead of patching vision._strategic_cycle_history JSONB. For a
     # strategy-only cycle this flips the just-created row to phase2_running with
     # phase1_completed_at set (its architecture phase is a no-op).
-    await strategic_cycle.mark_phase1_completed(
+    _cycle_row = await strategic_cycle.mark_phase1_completed(
         session,
         cycle_id,
         phase2_task_id=new_task.id,
     )
+    if _cycle_row is not None and integrity_conflict_counts is not None:
+        strategic_cycle.record_integrity_conflict_counts(_cycle_row, integrity_conflict_counts)
+        session.add(_cycle_row)
     await session.commit()
     # Post-commit: signal the admin UI that a strategic cycle (Phase 2) started.
     from app.strategic_events import emit_strategic_cycle_started
@@ -7913,6 +7917,19 @@ async def _spawn_strategic_review(
     )
     payload = validate_internal_payload(payload, "autonomous_research:strategic_review")
 
+    # Extract the three integrity-conflict counts from the reconciliation so they
+    # can be persisted on the cycle row for trend queries.
+    _recon_counts = (
+        (_cycle_start_reconciliation or {}).get("counts") or {}
+        if _cycle_start_reconciliation
+        else {}
+    )
+    _integrity_counts: dict[str, int] | None = {
+        "orphaned_gaps": int(_recon_counts.get("orphaned_gaps") or 0),
+        "ungrounded_directions": int(_recon_counts.get("ungrounded_directions") or 0),
+        "stale_active_moves": int(_recon_counts.get("stale_active_moves") or 0),
+    }
+
     # Re-arm the duplicate-spawn guards, create the task, record the cycle, and
     # commit — the short finalize transaction shared with the resident-minimal
     # path above (see ``_finalize_strategic_review_spawn``).
@@ -7931,6 +7948,7 @@ async def _spawn_strategic_review(
         extra_context=extra_context,
         operator_steered=operator_steered,
         steering_excerpt=steering_excerpt,
+        integrity_conflict_counts=_integrity_counts,
     )
 
 
