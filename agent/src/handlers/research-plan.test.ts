@@ -236,6 +236,14 @@ vi.mock('../prompt.js', async (importOriginal) => {
   };
 });
 
+vi.mock('../providers/runners.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../providers/runners.js')>();
+  return {
+    ...actual,
+    providerAutoInjectsClaudeMd: vi.fn().mockReturnValue(true),
+  };
+});
+
 import fs from 'fs';
 import * as mockedIndexModule from '../index.js';
 import { runClaudeCode, persistAndPostStatus, getProviderRunner, apiGet } from '../index.js';
@@ -243,7 +251,8 @@ import { execFileSync } from 'child_process';
 import * as mockedWorkspacePrepModule from '../workspacePrep.js';
 import { handlePlan, handleResearch } from './research-plan.js';
 import { handleStrategic } from './strategic.js';
-import { writeDesignDocHelper } from '../prompt.js';
+import { writeDesignDocHelper, readClaudeMd } from '../prompt.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { expectCalledWith } from '../utils/typed-mock-call.js';
 import { recordFormatRepairAttempt, recordFormatRepairSuccess } from '../telemetry.js';
 import {
@@ -3325,17 +3334,30 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     expect(p).toContain('admin-ui');
   });
 
-  it('handleResearch prompt documents the visual acceptance_evidence kind in BOTH the payload and context vocabularies', async () => {
+  it('handleResearch prompt documents acceptance_evidence in a SINGLE canonical (payload) vocab', async () => {
     await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
     const p = vi.mocked(runClaudeCode).mock.calls[0][0];
-    // Payload vocab (named_test/observable_behavior/downstream_artifact/visual).
+    // Canonical payload vocab (named_test/observable_behavior/downstream_artifact/visual)
+    // — the shape the merge gate consumes; the backend normalizes it into the
+    // lighter context form (parse_acceptance_evidence), so no second vocab is taught.
+    expect(p).toContain('"kind": "named_test"');
     expect(p).toContain('"kind": "visual"');
     expect(p).toContain('"viewport_width"');
-    // Context vocab (test|behavior|artifact|visual with descriptor/selector).
-    expect(p).toContain('"test"|"behavior"|"artifact"|"visual"');
-    // Documents the descriptor=component / selector=width mapping for visual.
-    expect(p).toMatch(/descriptor = the component name/);
     expect(p).toMatch(/FRONTEND-TOUCHING/);
+    // The contradictory second (lighter/context) vocab must NOT be re-taught — it
+    // was silently dropped by the finding parser and duplicated per-turn tokens.
+    expect(p).not.toContain('"test"|"behavior"|"artifact"|"visual"');
+    expect(p).not.toMatch(/descriptor = the component name/);
+  });
+
+  // Size/dedup assertion over the canonical static block: acceptance_evidence is
+  // documented by EXACTLY ONE rubric heading in the research prompt (previously
+  // two contradictory rubrics were re-read every turn).
+  it('handleResearch prompt declares the acceptance_evidence rubric exactly once', async () => {
+    await handleResearch(FP_TASK_ID, FP_PAYLOAD, FP_TASK, FP_GH_TOKEN, FP_OWNER, FP_REPO, FP_WS, FP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    const rubricHeadings = (p.match(/\*\*acceptance_evidence\*\*/g) || []).length;
+    expect(rubricHeadings).toBe(1);
   });
 
   // ── handlePlan atomic schema-change rule (no split model/migrate subtasks) ────
@@ -3548,6 +3570,62 @@ describe('handlePlan / handleResearch task-specific prompt fingerprints', () => 
     // absent — the field-doc rules may still REFERENCE the vocabulary, but no
     // capability list is injected when none were supplied.
     expect(p).not.toContain('# AVAILABLE CAPABILITIES (shared vocabulary)');
+  });
+});
+
+// ── CLAUDE.md embed gating by provider ──────────────────────────────────────
+// When the active provider auto-injects the workspace CLAUDE.md (anthropic),
+// the plan and research prompts must NOT embed a second copy via
+// ## Codebase Instructions. For other providers the embed must be retained.
+describe('handlePlan / handleResearch CLAUDE.md embed gating', () => {
+  const GP_TASK_ID = 'gp-task-001';
+  const GP_GH_TOKEN = 'gh-token';
+  const GP_OWNER = 'owner';
+  const GP_REPO = 'repo';
+  const GP_WS = null;
+  const GP_STATUS_REF = () => ({ value: '' });
+  const GP_TASK = { title: 'Test', description: 'test task', context: {}, project_context: {} };
+  const GP_PAYLOAD = { base_branch: 'main', prompt: 'analyze the codebase' };
+  const CLAUDE_MD_CONTENT = 'project-specific instructions here';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(runClaudeCode).mockResolvedValue({ exitCode: 0, allOutput: '', lastResultText: '' });
+    vi.mocked(persistAndPostStatus).mockResolvedValue(undefined);
+    vi.mocked(getProviderRunner).mockReturnValue({ displayName: 'claude' } as ReturnType<typeof getProviderRunner>);
+    vi.mocked(fs.existsSync as (p: string) => boolean).mockReturnValue(false);
+    vi.mocked(fs.readFileSync).mockReturnValue('');
+    vi.mocked(readClaudeMd).mockReturnValue(CLAUDE_MD_CONTENT);
+  });
+
+  it('handlePlan omits ## Codebase Instructions when provider auto-injects CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(true);
+    await handlePlan(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Codebase Instructions');
+  });
+
+  it('handlePlan includes ## Codebase Instructions when provider does not auto-inject CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(false);
+    await handlePlan(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('## Codebase Instructions');
+    expect(p).toContain(CLAUDE_MD_CONTENT);
+  });
+
+  it('handleResearch omits ## Codebase Instructions when provider auto-injects CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(true);
+    await handleResearch(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).not.toContain('## Codebase Instructions');
+  });
+
+  it('handleResearch includes ## Codebase Instructions when provider does not auto-inject CLAUDE.md', async () => {
+    vi.mocked(providerAutoInjectsClaudeMd).mockReturnValue(false);
+    await handleResearch(GP_TASK_ID, GP_PAYLOAD, GP_TASK, GP_GH_TOKEN, GP_OWNER, GP_REPO, GP_WS, GP_STATUS_REF());
+    const p = vi.mocked(runClaudeCode).mock.calls[0][0];
+    expect(p).toContain('## Codebase Instructions');
+    expect(p).toContain(CLAUDE_MD_CONTENT);
   });
 });
 

@@ -4657,6 +4657,141 @@ def test_compact_llm_cost_attribution():
     assert create_row["cost_usd"] > 0
 
 
+def test_per_turn_metrics_present_when_num_turns_reported():
+    """mean_turns_per_call, mean_input_tokens_per_turn, mean_uncached_input_tokens_per_call,
+    and cache_read_share are computed correctly when tasks report num_turns."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    # 4000 input tokens (1000 cache_read), 10 calls, 5 turns across 2 tasks
+    task1 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 3000,
+            "total_output_tokens": 600,
+            "llm_call_count": 6,
+            "total_cache_read_input_tokens": 600,
+            "total_cache_creation_input_tokens": 0,
+            "num_turns": 3,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    task2 = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 4,
+            "total_cache_read_input_tokens": 400,
+            "total_cache_creation_input_tokens": 0,
+            "num_turns": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task1, task2])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["research"]
+
+    # total_input=4000, cache_read=1000, llm_call_count=10, num_turns=5
+    assert row["llm_call_count"] == 10
+    assert row["total_input_tokens"] == 4000
+    assert row["total_cache_read_input_tokens"] == 1000
+    # mean_turns_per_call = 5 / 10 = 0.5
+    assert row["mean_turns_per_call"] == 0.5
+    # mean_input_tokens_per_turn = 4000 / 5 = 800
+    assert row["mean_input_tokens_per_turn"] == 800
+    # uncached = 4000 - 0 - 1000 = 3000; per call = 3000 / 10 = 300
+    assert row["mean_uncached_input_tokens_per_call"] == 300
+    # cache_read_share = 1000 / 4000 = 0.25
+    assert row["cache_read_share"] == 0.25
+
+
+def test_per_turn_metrics_absent_when_num_turns_not_reported():
+    """mean_turns_per_call and mean_input_tokens_per_turn are None when no task
+    in the bucket reports num_turns (absent-counter tolerance)."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "create"}],
+        api_call_summary={
+            "total_input_tokens": 2000,
+            "total_output_tokens": 400,
+            "llm_call_count": 5,
+            # num_turns deliberately absent (older agent)
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["create"]
+
+    # num_turns absent → turn-dependent metrics are None
+    assert row["mean_turns_per_call"] is None
+    assert row["mean_input_tokens_per_turn"] is None
+    # uncached and cache_read_share don't depend on num_turns
+    assert row["mean_uncached_input_tokens_per_call"] == 400  # 2000 / 5
+    # cache_read absent → 0 / 2000 = 0.0 (not None, input exists)
+    assert row["cache_read_share"] == 0.0
+    assert row["total_cache_read_input_tokens"] == 0
+
+
+def test_per_turn_metrics_from_attempt_history():
+    """num_turns is accumulated from attempt_history (banked attempts) as well
+    as the live api_call_summary."""
+    import uuid
+
+    project_id = uuid.uuid4()
+
+    task = make_task(
+        project_id=project_id,
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "fix"}],
+        # current attempt has num_turns=2
+        api_call_summary={
+            "total_input_tokens": 1000,
+            "total_output_tokens": 200,
+            "llm_call_count": 3,
+            "num_turns": 2,
+        },
+        provider="anthropic",
+        model="claude-sonnet-4-6",
+    )
+    # attempt_history set after creation (property setter pattern used by other tests)
+    task.attempt_history = [
+        {
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+            "llm_input_tokens": 1500,
+            "llm_output_tokens": 300,
+            "llm_call_count": 4,
+            "num_turns": 3,
+        }
+    ]
+
+    rows = compute_llm_cost_by_task_type([task])
+    by_type = {r["task_type"]: r for r in rows}
+    row = by_type["fix"]
+
+    # total turns = 3 (history) + 2 (current) = 5
+    # llm_call_count = 4 (history) + 3 (current) = 7
+    assert row["mean_turns_per_call"] == round(5 / 7, 2)
+    # total_input = 1500 (history) + 1000 (current) = 2500
+    assert row["mean_input_tokens_per_turn"] == round(2500 / 5)
+
 
 @pytest.mark.asyncio
 async def test_llm_cost_breakdown_endpoint_includes_by_task_type(

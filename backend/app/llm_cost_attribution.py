@@ -807,6 +807,8 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             "merged_count": 0,
             "verified_merged_count": 0,
             "cost_usd": 0.0,
+            # num_turns is None when no task in the bucket reported it, an int otherwise.
+            "num_turns": None,
         }
     )
     total_cost = 0.0
@@ -864,6 +866,17 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
 
         total_cost += task_cost
 
+        # Accumulate num_turns from attempt_history and current api_call_summary.
+        # Only counts when at least one attempt carried the field; absent = None so
+        # per-turn metrics degrade gracefully for tasks that predate turn tracking.
+        for attempt in t.attempt_history or []:
+            turns = attempt.get("num_turns")
+            if isinstance(turns, int) and turns >= 0:
+                bucket["num_turns"] = (bucket["num_turns"] or 0) + turns
+        current_turns = (t.api_call_summary or {}).get("num_turns")
+        if isinstance(current_turns, int) and current_turns >= 0:
+            bucket["num_turns"] = (bucket["num_turns"] or 0) + current_turns
+
     def _share(cost: float) -> float | None:
         if total_cost <= 0:
             return None
@@ -902,6 +915,31 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
             "mean_input_tokens_per_call": (
                 round(b["input_tokens"] / b["llm_call_count"])
                 if b["llm_call_count"] > 0
+                else None
+            ),
+            # Per-turn metrics — None when no task in this bucket reported num_turns,
+            # or when the denominator is zero (absent-counter tolerant).
+            "mean_turns_per_call": (
+                round(b["num_turns"] / b["llm_call_count"], 2)
+                if b["num_turns"] is not None and b["llm_call_count"] > 0
+                else None
+            ),
+            "mean_input_tokens_per_turn": (
+                round(b["input_tokens"] / b["num_turns"])
+                if b["num_turns"] is not None and b["num_turns"] > 0
+                else None
+            ),
+            "mean_uncached_input_tokens_per_call": (
+                round(
+                    (b["input_tokens"] - b["cache_creation_input_tokens"] - b["cache_read_input_tokens"])
+                    / b["llm_call_count"]
+                )
+                if b["llm_call_count"] > 0
+                else None
+            ),
+            "cache_read_share": (
+                round(b["cache_read_input_tokens"] / b["input_tokens"], 4)
+                if b["input_tokens"] > 0
                 else None
             ),
         }

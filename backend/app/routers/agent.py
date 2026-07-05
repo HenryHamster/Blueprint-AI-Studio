@@ -4760,6 +4760,7 @@ async def agent_heartbeat(
         or req.total_cache_creation_input_tokens is not None
         or req.total_cache_read_input_tokens is not None
         or req.viewport_screenshot_forwarded_count is not None
+        or req.num_turns is not None
     ):
         summary = {
             "llm_call_count": int(req.llm_call_count or 0),
@@ -4770,6 +4771,8 @@ async def agent_heartbeat(
             ),
             "last_updated_at": _utcnow().isoformat(),
         }
+        if req.num_turns is not None:
+            summary["num_turns"] = int(req.num_turns)
         # Persist the cache-class sub-counts only when the agent actually sent
         # them, so an older agent's heartbeat writes a byte-for-byte unchanged
         # summary. total_input_tokens stays the INCLUSIVE input total; these are

@@ -443,6 +443,11 @@ class HeartbeatRequest(BaseModel):
     # Count of viewport screenshots forwarded into agent prompts this task.
     # Backwards-compatible: older agents omit this field; treated as 0.
     viewport_screenshot_forwarded_count: int | None = Field(None, ge=0)
+    # Number of agent turns (user→assistant exchanges) in this CLI invocation.
+    # Distinct from llm_call_count (API calls): allows per-turn context-size
+    # decomposition in the efficiency snapshot. Backwards-compatible: older
+    # agents omit this field; treated as absent in all downstream aggregations.
+    num_turns: int | None = Field(None, ge=0)
     # Whether the language-aware repo map was non-empty and injected into the
     # agent prompt for this task. Set once on the first heartbeat after the
     # standard handler registers it; used as the receipt/compliance signal

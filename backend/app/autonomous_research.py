@@ -1973,7 +1973,7 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                     )
             direction_summaries.append(summary)
 
-        # Design doc summary — just keys and playbook, not full content.
+        # Design doc summary — just keys and playbook keys index, not full content.
         # Agent can fetch specific sections via ./design-doc get <key>.
         doc = project.design_doc or {}
         design_doc_summary: dict = {
@@ -1983,15 +1983,20 @@ async def _spawn_research_task_inner(project: Project, session: AsyncSession):
                 if not k.startswith("_") and not k.startswith("playbook/")
             ],
         }
-        # Include playbook entries (small, operationally critical).
+        # Include playbook entry names only — verbatim content already ships via
+        # task.playbook (capped, relevance-ranked selection). Embedding every entry
+        # in full here doubles the payload and is re-read on every agentic turn;
+        # the agent can fetch on demand with ./playbook get <key>.
         # Skip pending_source entries — those are mid-flight writes whose
         # source task hasn't completed yet. See main.py update_playbook for
         # the anti-poisoning rationale.
-        for k, v in doc.items():
-            if k.startswith("playbook/") and isinstance(v, dict):
-                if v.get("pending_source"):
-                    continue
-                design_doc_summary[k] = v.get("content", "")
+        playbook_keys = [
+            k[len("playbook/"):]
+            for k, v in doc.items()
+            if k.startswith("playbook/") and isinstance(v, dict) and not v.get("pending_source")
+        ]
+        if playbook_keys:
+            design_doc_summary["_playbook_keys"] = playbook_keys
 
         # Verify design-doc system module paths against the integration-branch
         # file tree before trusting their status claims. Read-only/advisory: the

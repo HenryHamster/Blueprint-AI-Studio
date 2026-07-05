@@ -14,7 +14,7 @@ import {
 } from '../constants.js';
 import {
   WORKSPACE, ClaudeTimeoutError, getAgentToken, log, recordLlmCallStart,
-  recordLlmTokens, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
+  recordLlmTokens, recordNumTurns, recordToolUse, sanitize, sendLog, strVal, estimateTokensFromChars,
 } from '../index.js';
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV } from '../token-file.js';
@@ -170,6 +170,10 @@ export function refreshRuntimeState(): void {
  */
 export function providerSupportsNativeSubagents(provider: ProviderName = PROVIDER): boolean {
   return provider === 'anthropic' || provider === 'zai';
+}
+
+export function providerAutoInjectsClaudeMd(provider: ProviderName = PROVIDER): boolean {
+  return provider === 'anthropic';
 }
 
 function getRateLimitPatterns(provider: ProviderName, authMode: AuthMode): readonly string[] {
@@ -1290,6 +1294,10 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 const outputTokens = Number(usage.output_tokens ?? 0);
                 recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
               }
+              // num_turns is a top-level field on the Claude Code stream-json result
+              // event (sibling of `usage`, not inside it).
+              const numTurns = Number((obj as { num_turns?: unknown }).num_turns ?? 0);
+              if (!isNested) recordNumTurns(numTurns);
               if (!isNested && resultGraceTimer === null && processGroupStillOwned()) {
                 resultGraceTimer = setTimeout(() => {
                   if (!processGroupStillOwned()) return;
@@ -1462,6 +1470,16 @@ export async function runProviderAgent(prompt: string, ws: WebSocket | null, sta
                 const outputTokens = Number(usage.output_tokens ?? 0);
                 recordLlmTokens(inputTokens, outputTokens, cacheCreationTokens, cacheReadTokens);
               }
+              // Codex CLI event shape is provider-specific: num_turns may be inside
+              // `usage` or at the top level depending on the CLI version. Check both.
+              const codexUsageObj = usage && typeof usage === 'object' ? usage : null;
+              const numTurns = Number(
+                (codexUsageObj?.num_turns) ?? (obj as { num_turns?: unknown }).num_turns ?? 0,
+              );
+              // Codex uses a one-shot turn model with no nested sub-agent stream (see
+              // comment above), so every turn.completed is a top-level event — no
+              // isNested guard needed unlike the Claude provider.
+              recordNumTurns(numTurns);
             } else if (eventType === 'turn.failed') {
               const errEnvelope = obj.error as { message?: string; code?: string } | undefined;
               const err = errEnvelope?.message ?? '';

@@ -48,6 +48,7 @@ import {
 import { fetchPriorKnowledge, buildPriorKnowledgeSection } from './prior-knowledge.js';
 import { repairStructuredOutput } from './structured-output-repair.js';
 import { resolveBuildConfig } from '../build-config.js';
+import { providerAutoInjectsClaudeMd } from '../providers/runners.js';
 import { resolveMigrationLayout } from './specialized.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
@@ -1824,7 +1825,7 @@ export async function handlePlan(
   const contextPrefix = buildContextPrefix(task);
 
   const claudeMd = readClaudeMd();
-  const claudeMdPrefix = claudeMd ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
+  const claudeMdPrefix = (claudeMd && !providerAutoInjectsClaudeMd()) ? `## Codebase Instructions\n${claudeMd}\n\n` : '';
   const planPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
   const planRetryContext = buildRetryContext(task);
   const planFirstTaskSection = task.first_task_on_repo ? FIRST_TASK_GUIDANCE : '';
@@ -2070,23 +2071,18 @@ export async function handleResearch(
   } catch (e) {
     sendLog(ws, `Warning: git hotspots failed: ${String(e)}\n`);
   }
-  const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? `## Recent Git History (last 30 commits)
-${gitLogOutput || '(unavailable)'}
-
-## Top Contributors (last 20, no merges)
-${gitShortlogOutput || '(unavailable)'}
-
-## Recent Changes Summary (last 5 commits diff stat)
-${gitDiffStatOutput || '(unavailable)'}
-
-${hotspotsSection}
-
-` : '';
+  const gitHistorySection = (gitLogOutput || gitDiffStatOutput) ? [
+    gitLogOutput ? `## Recent Git History (last 30 commits)\n${gitLogOutput}` : '',
+    gitShortlogOutput ? `## Top Contributors (last 20, no merges)\n${gitShortlogOutput}` : '',
+    gitDiffStatOutput ? `## Recent Changes Summary (last 5 commits diff stat)\n${gitDiffStatOutput}` : '',
+    hotspotsSection,
+    '',
+  ].filter(Boolean).join('\n\n') + '\n' : '';
 
   // Build codebase summary to reduce exploration overhead
 
   const claudeMd = readClaudeMd();
-  const codebaseSummary = claudeMd
+  const codebaseSummary = (claudeMd && !providerAutoInjectsClaudeMd())
     ? `## Codebase Instructions\n${claudeMd}\n\n`
     : '';
   const researchPlaybookSection = formatPlaybook(task.playbook as Record<string, PlaybookEntry | string> | undefined);
@@ -2204,7 +2200,7 @@ ${hotspotsSection}
     }
   }
 
-  const contextPrefix = buildContextPrefix(task);
+  const contextPrefix = buildContextPrefix(task, { suppressTaskLists: true });
 
   // ── Tactical research mode (default) ──────────────────────────────────
   const recentlyCompleted = Array.isArray(projectCtx?.recently_completed_tasks)
@@ -2266,20 +2262,21 @@ ${hotspotsSection}
     designDocHighlight = lines.join('\n') + '\n';
   }
 
-  // Design doc: only include key listing + playbook. Full sections available via ./design-doc get <key>.
+  // Design doc: only include key listing + playbook keys index. Full sections available via ./design-doc get <key>.
+  // Playbook content is already in researchPlaybookSection (task.playbook — capped, ranked selection).
+  // Rendering it again from design_doc would double the context on every agentic turn.
   let designDocSection = '';
   if (tacticalDesignDoc && Object.keys(tacticalDesignDoc).length > 0) {
     const docKeys = Array.isArray(tacticalDesignDoc._keys)
       ? tacticalDesignDoc._keys as string[]
       : Object.keys(tacticalDesignDoc).filter(k => !k.startsWith('_') && !k.startsWith('playbook/'));
-    const playbookEntries = Object.entries(tacticalDesignDoc)
-      .filter(([k]) => k.startsWith('playbook/'))
-      .map(([k, v]) => `- **${k.replace('playbook/', '')}**: ${typeof v === 'string' ? v : JSON.stringify(v)}`)
-      .join('\n');
+    const playbookKeys = Array.isArray(tacticalDesignDoc._playbook_keys)
+      ? tacticalDesignDoc._playbook_keys as string[]
+      : [];
     designDocSection = `# ARCHITECTURE (Design Document)
 Available sections (use \`./design-doc get <key>\` to read): ${docKeys.join(', ')}
 
-${playbookEntries ? `## Operational Playbook\n${playbookEntries}\n` : ''}
+${playbookKeys.length > 0 ? `Playbook entries available (use \`./playbook get <key>\` to read full content): ${playbookKeys.join(', ')}\n` : ''}
 `;
   }
 
@@ -2474,7 +2471,7 @@ for it. Use scope=large when the change genuinely requires cross-component coord
 
 # BEFORE YOU WRITE FINDINGS — dedup check
 
-Review the DEDUP list and Project Context above. For each finding you're about to propose,
+Review the DEDUP list above. For each finding you're about to propose,
 ask: "is this genuinely new work, or does an active/completed/queued task already cover it?"
 Different approaches to the same area ARE valid (e.g. "add rate limiting to webhooks" vs
 "add error handling to webhooks"). Only skip a finding if a prior task solves the same problem.
@@ -2600,8 +2597,6 @@ implementation findings. Add metadata alongside them when relevant.
 **compute_experiment** (optional, default null): Present ONLY on a compute_experiment/measurement/benchmark finding — the launch contract for the budgeted compute job. Required keys \`command\`, \`spend_cap_usd\` (positive), \`deadline_seconds\` (positive); optional \`success_criterion\` (numeric metric/operator/threshold goal) and benchmark metadata (\`machine_type\`, \`accelerator\`, \`experiment\`, \`benchmark\`, \`metric\`, \`cwd\`, \`env\`). The \`accelerator\` field (one of \`T4\`, \`L4\`, \`V100\`) is **sufficient on its own** to request a single GPU — you do NOT need to specify \`machine_type\` when requesting a single GPU by accelerator name; the system resolves the correct GPU machine type automatically. Optional \`container_image\`: runs \`command\` INSIDE the given docker image (e.g. an NVIDIA NGC image such as \`nvcr.io/nvidia/tensorflow:25.01\`) — REQUIRED when the experiment needs a runtime the repo cannot \`pip install\` natively, e.g. a CUDA/cuDNN/framework stack; without it the command runs BARE and dies with ModuleNotFoundError. Optional \`setup_step\`: runs as bare \`bash -lc\` on the HOST, BEFORE and OUTSIDE the container — use it ONLY for host-level pre-container prep. Anything that needs the container's environment (pip installs into the experiment's interpreter, importing the container's libraries) MUST go in \`command\`, NOT \`setup_step\`. Omit entirely on non-experiment findings.
 
 **provides_capability** (optional, default null): A short kebab-case capability name this finding's task advertises (e.g. "<feature>-core"), so a sibling finding (or another lane) declaring \`{"kind": "capability", "ref": "<feature>-core"}\` can depend on it. DRAW THE NAME from the AVAILABLE CAPABILITIES vocabulary above when one fits; propose a NEW kebab-case name (same convention) ONLY for a genuinely new capability not already listed. Omit unless another task needs to gate on this one by capability. ${CAPABILITY_DECLARATION_DOC}
-
-**acceptance_evidence** (optional): Declare the proof that will show this finding's claim is true. Shape: \`{"kind": "test"|"behavior"|"artifact"|"visual", "descriptor": "short human-readable proof", "selector": "optional test path/selector, artifact ref, or viewport width"}\`. kind=test = a named test/selector exercising the seam end-to-end; behavior = an observable runtime behavior; artifact = an artifact a downstream task consumes; visual = a viewport screenshot of a FRONTEND/admin-ui component (descriptor = the component name, selector = the viewport width in px as a string), proven by an uploaded screenshot of that component at that width on a successful run. Omit the whole object when you are not declaring a proof — omitting it preserves today's behavior exactly. Do NOT invent other kinds.
 
 **actionability_grade rubric** (required on every finding):
 - HIGH: problem statement is clear, desired outcome is clear, related files identified, no major unknowns blocking implementation.

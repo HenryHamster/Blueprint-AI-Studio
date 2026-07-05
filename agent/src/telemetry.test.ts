@@ -6,6 +6,7 @@ import {
   getCurrentPromptFingerprint,
   recordLlmCallStart,
   recordLlmTokens,
+  recordNumTurns,
   recordViewportScreenshotDownload,
   getLlmTelemetry,
   resetLlmTelemetry,
@@ -72,6 +73,7 @@ describe('LLM telemetry', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      num_turns: 0,
     });
   });
   it('accumulates call counts and token totals', () => {
@@ -86,6 +88,7 @@ describe('LLM telemetry', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      num_turns: 0,
     });
   });
   it('ignores invalid token values (NaN, negative, Infinity)', () => {
@@ -99,6 +102,7 @@ describe('LLM telemetry', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      num_turns: 0,
     });
   });
   it('resets all counters', () => {
@@ -112,6 +116,7 @@ describe('LLM telemetry', () => {
       total_cache_creation_input_tokens: 0,
       total_cache_read_input_tokens: 0,
       viewport_screenshot_forwarded_count: 0,
+      num_turns: 0,
     });
   });
   it('breaks out cache-creation and cache-read while total_input_tokens stays the inclusive sum', () => {
@@ -123,12 +128,14 @@ describe('LLM telemetry', () => {
     expect(tel.total_cache_creation_input_tokens).toBe(50);  // 40 + 10
     expect(tel.total_cache_read_input_tokens).toBe(150);     // 60 + 90
     expect(tel.total_output_tokens).toBe(100);
+    expect(tel.num_turns).toBe(0);                       // not set by recordLlmTokens
   });
   it('leaves cache counters at zero for 2-arg (text-mode) calls', () => {
     recordLlmTokens(100, 50);
     const tel = getLlmTelemetry();
     expect(tel.total_cache_creation_input_tokens).toBe(0);
     expect(tel.total_cache_read_input_tokens).toBe(0);
+    expect(tel.num_turns).toBe(0);
   });
   it('ignores invalid cache token values (NaN, negative, Infinity)', () => {
     recordLlmTokens(100, 50, Number.NaN, -5);
@@ -163,6 +170,38 @@ describe('viewport screenshot telemetry', () => {
     recordViewportScreenshotDownload(4);
     resetLlmTelemetry();
     expect(getLlmTelemetry().viewport_screenshot_forwarded_count).toBe(0);
+  });
+});
+
+describe('num_turns telemetry', () => {
+  it('starts at zero', () => {
+    expect(getLlmTelemetry().num_turns).toBe(0);
+  });
+  it('accumulates turn counts from result events', () => {
+    recordNumTurns(3);
+    recordNumTurns(2);
+    expect(getLlmTelemetry().num_turns).toBe(5);
+  });
+  it('ignores zero and negative values', () => {
+    recordNumTurns(0);
+    recordNumTurns(-5);
+    expect(getLlmTelemetry().num_turns).toBe(0);
+  });
+  it('ignores invalid values (NaN, Infinity)', () => {
+    recordNumTurns(Number.NaN);
+    recordNumTurns(Number.POSITIVE_INFINITY);
+    recordNumTurns(10);
+    expect(getLlmTelemetry().num_turns).toBe(10);
+  });
+  it('resets with resetLlmTelemetry', () => {
+    recordNumTurns(7);
+    resetLlmTelemetry();
+    expect(getLlmTelemetry().num_turns).toBe(0);
+  });
+  it('floors non-integer turn values', () => {
+    recordNumTurns(3.9);
+    recordNumTurns(2.1);
+    expect(getLlmTelemetry().num_turns).toBe(5);
   });
 });
 

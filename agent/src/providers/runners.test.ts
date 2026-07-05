@@ -500,3 +500,25 @@ describe('spawn stdio validation — no-stdio branch does not leak PID or timers
     expect(abortCalls.length).toBeGreaterThan(0);
   });
 });
+
+describe('providerAutoInjectsClaudeMd', () => {
+  it('returns true for anthropic', async () => {
+    const { providerAutoInjectsClaudeMd } = await import('./runners.js');
+    expect(providerAutoInjectsClaudeMd('anthropic')).toBe(true);
+  });
+
+  it('returns false for gemini', async () => {
+    const { providerAutoInjectsClaudeMd } = await import('./runners.js');
+    expect(providerAutoInjectsClaudeMd('gemini')).toBe(false);
+  });
+
+  it('returns false for openai', async () => {
+    const { providerAutoInjectsClaudeMd } = await import('./runners.js');
+    expect(providerAutoInjectsClaudeMd('openai')).toBe(false);
+  });
+
+  it('returns false for zai', async () => {
+    const { providerAutoInjectsClaudeMd } = await import('./runners.js');
+    expect(providerAutoInjectsClaudeMd('zai')).toBe(false);
+  });
+});

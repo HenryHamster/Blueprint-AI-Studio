@@ -640,3 +640,87 @@ describe('formatProjectContext — BLOCKED active tasks', () => {
     expect(result).not.toContain('NOTE: Tasks marked BLOCKED');
   });
 });
+
+describe('formatProjectContext — suppressTaskLists option', () => {
+  const ctxWithLists = {
+    active_tasks: [
+      { task_type: 'fix', title: 'Active fix', status: 'IN_PROGRESS', prompt: 'Fix bug' },
+    ],
+    queued_tasks: [
+      { task_type: 'create', title: 'Queued create' },
+    ],
+    direction_recent_tasks: [
+      { task_type: 'refactor', title: 'Recent refactor', pr_url: 'https://github.com/x/pull/1' },
+    ],
+    recently_completed_tasks: [
+      { task_type: 'docs', title: 'Docs task', pr_url: 'https://github.com/x/pull/2' },
+    ],
+    sibling_tasks: [
+      { status: 'QUEUED', title: 'Sibling', active: false },
+    ],
+  };
+
+  it('includes all task list sections without suppressTaskLists', () => {
+    const result = formatProjectContext(ctxWithLists);
+    expect(result).toContain('### Active Tasks');
+    expect(result).toContain('### Queued Tasks');
+    expect(result).toContain('### Recent Tasks in This Direction');
+    expect(result).toContain('### Recently Completed Tasks');
+  });
+
+  it('omits active/queued/direction-recent/recently-completed when suppressTaskLists is true', () => {
+    const result = formatProjectContext(ctxWithLists, '', '', '', 0, { suppressTaskLists: true });
+    expect(result).not.toContain('### Active Tasks');
+    expect(result).not.toContain('### Queued Tasks');
+    expect(result).not.toContain('### Recent Tasks in This Direction');
+    expect(result).not.toContain('### Recently Completed Tasks');
+    // sibling tasks remain
+    expect(result).toContain('## Sibling Tasks');
+  });
+});
+
+describe('formatProjectContext — lesson dedup', () => {
+  it('collapses lessons with identical last_feedback to a single entry', () => {
+    const ctx = {
+      lessons: [
+        { task_title: 'Task A', iterations: 2, last_feedback: 'Add error handling', failure_class: 'error-handling' },
+        { task_title: 'Task B', iterations: 1, last_feedback: 'Add error handling', failure_class: 'error-handling' },
+        { task_title: 'Task C', iterations: 3, last_feedback: 'Different lesson', failure_class: 'style' },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    expect(result).toContain('### Lessons from Past Reviews');
+    // 'Add error handling' should appear only once
+    const addErrorCount = (result.match(/Add error handling/g) || []).length;
+    expect(addErrorCount).toBe(1);
+    expect(result).toContain('Different lesson');
+  });
+
+  it('collapses lessons with same task_title and failure_class', () => {
+    const ctx = {
+      lessons: [
+        { task_title: 'Feature X', iterations: 1, last_feedback: 'Feedback one', failure_class: 'correctness' },
+        { task_title: 'Feature X', iterations: 2, last_feedback: 'Feedback two', failure_class: 'correctness' },
+        { task_title: 'Feature Y', iterations: 1, last_feedback: 'Feedback three', failure_class: 'correctness' },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    // Feature X with correctness: only first should appear
+    expect(result).toContain('Feature X');
+    expect(result).toContain('Feedback one');
+    expect(result).not.toContain('Feedback two');
+    expect(result).toContain('Feature Y');
+  });
+
+  it('does not dedup lessons when they are genuinely distinct', () => {
+    const ctx = {
+      lessons: [
+        { task_title: 'Task A', iterations: 1, last_feedback: 'First lesson here', failure_class: 'correctness' },
+        { task_title: 'Task B', iterations: 1, last_feedback: 'Second lesson here', failure_class: 'style' },
+      ],
+    };
+    const result = formatProjectContext(ctx);
+    expect(result).toContain('First lesson here');
+    expect(result).toContain('Second lesson here');
+  });
+});

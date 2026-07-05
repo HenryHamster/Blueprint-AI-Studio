@@ -728,6 +728,47 @@ class PlanAcceptanceEvidence(BaseModel):
     selector: str | None = None
 
 
+def _normalize_payload_acceptance_evidence(raw: dict) -> dict | None:
+    """Normalize a *payload*-vocabulary acceptance-evidence dict into the lighter
+    ``{kind, descriptor[, selector]}`` context shape.
+
+    Findings and plan subtasks declare acceptance_evidence in the payload vocab
+    (:class:`AcceptanceEvidence`: ``named_test`` / ``observable_behavior`` /
+    ``downstream_artifact`` / ``visual``) — that is the shape the merge gate
+    (:func:`read_acceptance_evidence`) consumes. The context channel wants the
+    lighter :class:`PlanAcceptanceEvidence` vocab. Historically the two were
+    disjoint, so a finding that declared the payload vocab was silently dropped
+    from the child context. This maps one onto the other so a single declaration
+    populates BOTH channels. Returns ``None`` (never raises) when *raw* is not a
+    well-formed payload-vocab declaration, leaving the caller's fall-through to
+    treat it as absent.
+    """
+    try:
+        evidence = AcceptanceEvidence.model_validate(raw)
+    except Exception:  # noqa: BLE001 — not a payload-vocab declaration → treat as absent
+        return None
+    if evidence.kind == "named_test":
+        # Carry the full path (optionally ``path::node``) as the selector and a
+        # human-readable reference as the descriptor.
+        selector = (evidence.test_path or "").strip()
+        _, _, node = selector.partition("::")
+        descriptor = (evidence.test_id or node or selector).strip()
+        return {"kind": "test", "descriptor": descriptor, "selector": selector}
+    if evidence.kind == "observable_behavior":
+        return {"kind": "behavior", "descriptor": (evidence.description or "").strip()}
+    if evidence.kind == "downstream_artifact":
+        return {"kind": "artifact", "descriptor": (evidence.artifact_id or "").strip()}
+    if evidence.kind == "visual":
+        result: dict[str, Any] = {
+            "kind": "visual",
+            "descriptor": (evidence.component or "").strip(),
+        }
+        if evidence.viewport_width is not None:
+            result["selector"] = str(evidence.viewport_width)
+        return result
+    return None
+
+
 def parse_acceptance_evidence(raw: Any) -> dict | None:
     """Validate an arbitrary raw acceptance-evidence value into a normalized dict.
 
@@ -738,13 +779,21 @@ def parse_acceptance_evidence(raw: Any) -> dict | None:
     defensive read in ``task_evaluators._declared_success_criterion`` so an
     invalid declaration degrades to today's exact behavior rather than failing a
     decomposition or summary path.
+
+    Accepts BOTH historical shapes: the lighter context vocab
+    (:class:`PlanAcceptanceEvidence`: ``test`` / ``behavior`` / ``artifact`` /
+    ``visual`` with ``descriptor`` / ``selector``) round-trips unchanged, and the
+    payload vocab (:class:`AcceptanceEvidence`: ``named_test`` / … the shape the
+    merge gate consumes) is normalized into the lighter form. The two vocabularies
+    are disjoint on ``kind``, so a declaration matches at most one — previously a
+    payload-vocab declaration was silently dropped from the context channel.
     """
     if not isinstance(raw, dict):
         return None
     try:
         evidence = PlanAcceptanceEvidence.model_validate(raw)
-    except Exception:  # noqa: BLE001 — any validation error means treat as absent
-        return None
+    except Exception:  # noqa: BLE001 — not the context vocab; try the payload vocab below
+        return _normalize_payload_acceptance_evidence(raw)
     descriptor = evidence.descriptor.strip()
     if not descriptor:
         return None

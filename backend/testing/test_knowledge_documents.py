@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import func
 from sqlmodel import select
 
 from app.knowledge_completion import (
@@ -2095,6 +2096,120 @@ async def test_origin_provenance_legacy_null_serialization(
     )
     assert detail.status_code == 200
     assert detail.json()["origin_provenance"] == origin
+
+
+@pytest.mark.asyncio
+async def test_knowledge_index_durable_docs_outrank_newer_stubs(db_session):
+    """Durable design/web_research docs outrank newer research_audit stubs within
+    the 20-slot bound. Documents are ranked by source-kind tier (durable first),
+    then creation date descending, so newer stubs do not crowd out older durable knowledge."""
+    from app.knowledge_query import build_knowledge_index
+    from datetime import timedelta
+
+    proj = await _seed_project_with_membership(db_session, "KDrank")
+    base_time = (await db_session.execute(select(func.now()))).scalar()
+
+    # Create durable task sources.
+    design_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    web_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+    db_session.add(design_task)
+    db_session.add(web_task)
+    await db_session.commit()
+    await db_session.refresh(design_task)
+    await db_session.refresh(web_task)
+
+    # Create older durable docs (should rank first).
+    durable_design = KnowledgeDocument(
+        project_id=proj.id,
+        source_task_id=design_task.id,
+        title="Durable design doc (old)",
+        summary="Design knowledge.",
+        body="# Design\n\nImportant design decisions.",
+        topic="design",
+        tags=["design"],
+        source_citations=["backend/app/models.py"],
+        source_kind="design",
+        forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+        created_at=base_time - timedelta(days=5),
+    )
+    durable_web = KnowledgeDocument(
+        project_id=proj.id,
+        source_task_id=web_task.id,
+        title="Durable web research doc (old)",
+        summary="Web research knowledge.",
+        body="# Research\n\nWeb survey findings.",
+        topic="web",
+        tags=["web"],
+        source_citations=["https://example.com"],
+        source_kind="web_research",
+        forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+        created_at=base_time - timedelta(days=3),
+    )
+    db_session.add(durable_design)
+    db_session.add(durable_web)
+    await db_session.commit()
+
+    # Create many newer research_audit stubs (should rank after durables).
+    for i in range(25):
+        stub_task = make_task(project_id=proj.id, status=TaskStatus.COMPLETED)
+        db_session.add(stub_task)
+    await db_session.commit()
+
+    stub_tasks = (
+        (
+            await db_session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == proj.id,
+                    Task.id != design_task.id,
+                    Task.id != web_task.id,
+                )
+                .order_by(Task.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    for i, stub_task in enumerate(stub_tasks):
+        stub = KnowledgeDocument(
+            project_id=proj.id,
+            source_task_id=stub_task.id,
+            title=f"Research audit stub {i}",
+            summary=f"{i} finding(s) recorded",
+            body=f"Audit findings {i}.",
+            topic="audit",
+            tags=["audit"],
+            source_citations=[],
+            source_kind="research_audit",
+            forward_quality_verdict={"passed": True, "strategy": "forward-quality"},
+            created_at=base_time - timedelta(hours=1 - i),
+        )
+        db_session.add(stub)
+    await db_session.commit()
+
+    # Build the index (limited to 20 slots).
+    index = await build_knowledge_index(db_session, proj.id, limit=20)
+
+    # Both durable docs should be in the index.
+    titles = {entry["title"] for entry in index}
+    assert "Durable design doc (old)" in titles
+    assert "Durable web research doc (old)" in titles
+
+    # The durable docs should come before research_audit stubs in the ranking.
+    durable_positions = [
+        i
+        for i, entry in enumerate(index)
+        if entry["source_kind"] in ("design", "web_research")
+    ]
+    stub_positions = [
+        i
+        for i, entry in enumerate(index)
+        if entry["source_kind"] == "research_audit"
+    ]
+    # All durable docs should appear before all stubs.
+    if durable_positions and stub_positions:
+        assert max(durable_positions) < min(stub_positions)
 
 
 @pytest.mark.asyncio

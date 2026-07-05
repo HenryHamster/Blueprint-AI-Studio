@@ -76,6 +76,88 @@ def test_parse_acceptance_evidence_malformed_returns_none(raw):
     assert parse_acceptance_evidence(raw) is None
 
 
+# --- normalization: the payload vocab (named_test/…) is accepted too ----------
+# Findings and plan subtasks declare acceptance_evidence in the payload vocab
+# (the shape the merge gate consumes). Historically that shape was silently
+# dropped from the context channel by parse_acceptance_evidence (the two
+# vocabularies were disjoint on ``kind``). It is now normalized into the lighter
+# context form so a single declaration populates BOTH channels.
+
+
+def test_parse_acceptance_evidence_normalizes_named_test():
+    out = parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}
+    )
+    assert out == {
+        "kind": "test",
+        "descriptor": "test_bar",
+        "selector": "testing/test_foo.py",
+    }
+
+
+def test_parse_acceptance_evidence_normalizes_named_test_inline_node():
+    """A ``path::node`` test_path with no test_id still yields a descriptor."""
+    out = parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "testing/test_foo.py::test_bar"}
+    )
+    assert out == {
+        "kind": "test",
+        "descriptor": "test_bar",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+
+
+def test_parse_acceptance_evidence_normalizes_observable_behavior():
+    out = parse_acceptance_evidence(
+        {"kind": "observable_behavior", "description": "endpoint returns scoped audit"}
+    )
+    assert out == {"kind": "behavior", "descriptor": "endpoint returns scoped audit"}
+
+
+def test_parse_acceptance_evidence_normalizes_downstream_artifact():
+    out = parse_acceptance_evidence(
+        {"kind": "downstream_artifact", "artifact_id": "design-doc-42"}
+    )
+    assert out == {"kind": "artifact", "descriptor": "design-doc-42"}
+
+
+def test_parse_acceptance_evidence_normalizes_visual():
+    out = parse_acceptance_evidence(
+        {"kind": "visual", "component": "FleetRunnersPanel", "viewport_width": 375}
+    )
+    assert out == {
+        "kind": "visual",
+        "descriptor": "FleetRunnersPanel",
+        "selector": "375",
+    }
+
+
+def test_parse_acceptance_evidence_rejects_malformed_payload_vocab():
+    """A payload-vocab kind that fails its own validation still yields None."""
+    # named_test whose test_path does not look like a real test file.
+    assert parse_acceptance_evidence(
+        {"kind": "named_test", "test_path": "app/main.py"}
+    ) is None
+    # observable_behavior with a trivially-short description.
+    assert parse_acceptance_evidence(
+        {"kind": "observable_behavior", "description": "ok"}
+    ) is None
+    # An unknown extra key is forbidden by the payload schema too.
+    assert parse_acceptance_evidence(
+        {"kind": "downstream_artifact", "artifact_id": "x", "extra": "no"}
+    ) is None
+
+
+def test_parse_acceptance_evidence_context_vocab_unchanged_by_normalization():
+    """Regression guard: the lighter context vocab still round-trips byte-for-byte."""
+    raw = {
+        "kind": "test",
+        "descriptor": "end-to-end seam test passes",
+        "selector": "testing/test_foo.py::test_bar",
+    }
+    assert parse_acceptance_evidence(raw) == raw
+
+
 # ---------------------------------------------------------------------------
 # TaskType enum / ALL_TASK_TYPES
 # ---------------------------------------------------------------------------

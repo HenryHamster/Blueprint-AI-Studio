@@ -1893,6 +1893,11 @@ def bank_task_current_attempt(
     if cache_creation_tokens > 0 or cache_read_tokens > 0:
         snapshot["llm_cache_creation_input_tokens"] = cache_creation_tokens
         snapshot["llm_cache_read_input_tokens"] = cache_read_tokens
+    # Carry num_turns only when the agent reported it; older agents that omit the
+    # field produce banked rows without this key so per-turn metrics stay None.
+    num_turns_val = (task.api_call_summary or {}).get("num_turns")
+    if isinstance(num_turns_val, int) and num_turns_val >= 0:
+        snapshot["num_turns"] = num_turns_val
     history = list(task.attempt_history or [])
     history.append(snapshot)
     task.attempt_history = history

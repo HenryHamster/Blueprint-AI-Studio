@@ -324,6 +324,49 @@ async def test_research_payload_includes_compute_experiment_sweeps(
 
 
 @pytest.mark.asyncio
+async def test_research_payload_playbook_bounded_to_keys_index(db_session):
+    """The research payload's design_doc carries only playbook key names (_playbook_keys),
+    never full verbatim content. The capped ranked selection already ships via task.playbook;
+    embedding all entries here would double the context on every agentic turn."""
+    project = Project(
+        name="Playbook Bounded Research",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-playbook-bounded")],
+        vision={"purpose": "test"},
+        design_doc={
+            "playbook/key-one": {"content": "Verbose playbook entry content that should not ship"},
+            "playbook/key-two": {"content": "Another verbose entry that should not ship"},
+            "playbook/pending-key": {"content": "Pending entry", "pending_source": "task-abc"},
+            "systems/sys-test": {"name": "Test System", "status": "functional"},
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    await _spawn_research_task(project, db_session)
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    research = [t for t in result.scalars().all() if t.first_payload.get("type") == "research"]
+    assert len(research) == 1
+    payload = research[0].first_payload
+    design_doc = payload.get("design_doc", {})
+
+    # Full playbook content must NOT be embedded in design_doc
+    for k in design_doc:
+        assert not k.startswith("playbook/"), (
+            f"Full playbook entry '{k}' was embedded verbatim — should only ship key names"
+        )
+
+    # _playbook_keys must list non-pending entries only
+    assert "_playbook_keys" in design_doc, "design_doc must carry _playbook_keys index"
+    assert set(design_doc["_playbook_keys"]) == {"key-one", "key-two"}, (
+        "pending_source entries must be excluded from _playbook_keys"
+    )
+
+
+@pytest.mark.asyncio
 async def test_research_payload_annotations_include_capability_proof_status(
     db_session,
 ):

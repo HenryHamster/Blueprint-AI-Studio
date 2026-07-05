@@ -42,6 +42,7 @@ let _totalOutputTokens = 0; // @per-role
 let _totalCacheCreationInputTokens = 0; // @per-role
 let _totalCacheReadInputTokens = 0; // @per-role
 let _viewportScreenshotForwardedCount = 0; // @per-role
+let _totalNumTurns = 0; // @per-role
 
 /** Increment the per-task LLM call counter (one per CLI invocation). */
 export function recordLlmCallStart(): void {
@@ -83,6 +84,15 @@ export function recordViewportScreenshotDownload(count: number): void {
   }
 }
 
+/** Add to the per-task turn counter from a single CLI invocation result event.
+ *  Turns are user→assistant exchanges; distinct from llm_call_count (API calls).
+ *  Accumulates only top-level result events (not nested sub-agent results). */
+export function recordNumTurns(numTurns: number): void {
+  if (Number.isFinite(numTurns) && numTurns > 0) {
+    _totalNumTurns += Math.floor(numTurns);
+  }
+}
+
 /** Snapshot the current cumulative LLM telemetry for heartbeat / status posts. */
 export function getLlmTelemetry(): {
   llm_call_count: number;
@@ -91,6 +101,7 @@ export function getLlmTelemetry(): {
   total_cache_creation_input_tokens: number;
   total_cache_read_input_tokens: number;
   viewport_screenshot_forwarded_count: number;
+  num_turns: number;
 } {
   return {
     llm_call_count: _llmCallCount,
@@ -99,6 +110,7 @@ export function getLlmTelemetry(): {
     total_cache_creation_input_tokens: _totalCacheCreationInputTokens,
     total_cache_read_input_tokens: _totalCacheReadInputTokens,
     viewport_screenshot_forwarded_count: _viewportScreenshotForwardedCount,
+    num_turns: _totalNumTurns,
   };
 }
 
@@ -110,6 +122,7 @@ export function resetLlmTelemetry(): void {
   _totalCacheCreationInputTokens = 0;
   _totalCacheReadInputTokens = 0;
   _viewportScreenshotForwardedCount = 0;
+  _totalNumTurns = 0;
 }
 
 // ── Per-task structured-output format-compliance telemetry (equipping d-46468a41) ─
