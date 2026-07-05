@@ -5,7 +5,6 @@ import type { ComputeExperimentForm } from '../hooks/useTaskModal';
 import { COMPUTE_ACCELERATOR_OPTIONS, COMPUTE_EXPERIMENT_TASK_TYPE, canonicalMachineTypeForAccelerator } from '../hooks/useTaskModal';
 import type { ComputeSuccessOperator, ComputeExperimentPreflightResponse, ComputeExperimentDraftResponse } from '../api';
 import { draftComputeExperiment } from '../api';
-import { usePersistedState } from '../hooks/usePersistedState';
 
 const TASK_TYPE_OPTION_ICONS: Record<string, typeof Plus> = {
   create: Plus,
@@ -67,6 +66,11 @@ interface NewTaskModalProps {
   preflightResult: ComputeExperimentPreflightResponse | null;
   preflightLoading: boolean;
   preflightError: string | null;
+  ideaText: string;
+  setIdeaText: (value: string) => void;
+  draftNotes: string | null;
+  setDraftNotes: (value: string | null) => void;
+  onDraftApplied: () => void;
   onRepoChange: (value: string) => void;
   onSubmit: (e: React.FormEvent) => Promise<void>;
   onClose: () => void;
@@ -114,6 +118,11 @@ export function NewTaskModal({
   preflightResult,
   preflightLoading,
   preflightError,
+  ideaText,
+  setIdeaText,
+  draftNotes,
+  setDraftNotes,
+  onDraftApplied,
   onRepoChange,
   onSubmit,
   onClose,
@@ -125,19 +134,19 @@ export function NewTaskModal({
   const [registryAuthOpen, setRegistryAuthOpen] = useState(false);
   const prNumberRef = useRef<HTMLInputElement>(null);
 
-  const [ideaText, setIdeaText] = usePersistedState('compute-experiment-idea', '');
   const [draftLoading, setDraftLoading] = useState(false);
   const [draftError, setDraftError] = useState<string | null>(null);
-  const [draftNotes, setDraftNotes] = usePersistedState<string | null>('compute-experiment-draft-notes', null);
   // Keep the last backend draft only for the current modal session. Persisting
   // it across remounts would replay an old `prior_draft` into a later launch.
   const [lastDraft, setLastDraft] = useState<ComputeExperimentDraftResponse | null>(null);
+  const [draftChanges, setDraftChanges] = useState<string[]>([]);
 
   const handleDraftContract = async () => {
     if (!ideaText.trim()) return;
     setDraftLoading(true);
     setDraftError(null);
     setDraftNotes(null);
+    setDraftChanges([]);
     try {
       const draft = await draftComputeExperiment({
         idea: ideaText.trim(),
@@ -149,7 +158,60 @@ export function NewTaskModal({
         setDraftError(draft.notes || 'Draft not available — fill the form manually.');
         return;
       }
+
+      // Track changes before applying the draft
+      const changes: string[] = [];
       const hasArms = Array.isArray(draft.arms) && draft.arms.length >= 2;
+
+      if (draft.title && draft.title !== newTaskTitle) {
+        changes.push('Title');
+      }
+      if (draft.prompt && draft.prompt !== newTaskPrompt) {
+        changes.push('Prompt');
+      }
+      if (!hasArms && draft.command && draft.command !== computeExperiment.command) {
+        changes.push('Command');
+      }
+      if (hasArms && draft.arms && JSON.stringify(draft.arms) !== JSON.stringify(computeExperiment.arms)) {
+        changes.push('Arms');
+      }
+      if (draft.declared_metric && draft.declared_metric !== computeExperiment.declaredMetric) {
+        changes.push('Declared metric');
+      }
+      if (draft.spend_cap_usd != null && String(draft.spend_cap_usd) !== computeExperiment.spendCapUsd) {
+        changes.push('Spend cap');
+      }
+      if (draft.deadline_seconds != null && String(draft.deadline_seconds) !== computeExperiment.deadlineSeconds) {
+        changes.push('Deadline');
+      }
+      if (draft.experiment && draft.experiment !== computeExperiment.experiment) {
+        changes.push('Experiment');
+      }
+      if (draft.benchmark && draft.benchmark !== computeExperiment.benchmark) {
+        changes.push('Benchmark');
+      }
+      if (draft.hypothesis && draft.hypothesis !== computeExperiment.hypothesis) {
+        changes.push('Hypothesis');
+      }
+      if (draft.metric && draft.metric !== computeExperiment.metric) {
+        changes.push('Metric');
+      }
+      if (draft.success_criterion?.metric && draft.success_criterion.metric !== computeExperiment.successMetric) {
+        changes.push('Success metric');
+      }
+      if (draft.success_criterion?.operator && draft.success_criterion.operator !== computeExperiment.successOperator) {
+        changes.push('Success operator');
+      }
+      if (draft.success_criterion?.threshold != null && String(draft.success_criterion.threshold) !== computeExperiment.successThreshold) {
+        changes.push('Success threshold');
+      }
+      if (draft.accelerator && draft.accelerator !== computeExperiment.accelerator) {
+        changes.push('Accelerator');
+      }
+      if (draft.machine_type && draft.machine_type !== computeExperiment.machineType) {
+        changes.push('Machine type');
+      }
+
       setComputeExperiment(f => ({
         ...f,
         useArmsMode: hasArms,
@@ -173,7 +235,9 @@ export function NewTaskModal({
       if (draft.title) setNewTaskTitle(draft.title);
       if (draft.prompt) setNewTaskPrompt(draft.prompt);
       setDraftNotes(draft.notes ?? null);
+      setDraftChanges(changes);
       setLastDraft(draft);
+      onDraftApplied();
     } catch (err) {
       setDraftError(err instanceof Error ? err.message : 'Draft failed');
     } finally {
@@ -449,6 +513,11 @@ export function NewTaskModal({
                   </button>
                 </div>
                 {draftError && <p className="text-ui-sm text-red-400 mt-1">{draftError}</p>}
+                {draftChanges.length > 0 && !draftError && (
+                  <p className="text-ui-sm text-amber-400 mt-1">
+                    Updated: {draftChanges.join(', ')}
+                  </p>
+                )}
                 {draftNotes && !draftError && <p className="text-ui-sm text-neutral-400 mt-1">{draftNotes}</p>}
               </div>
               {computeExperiment.useArmsMode ? (

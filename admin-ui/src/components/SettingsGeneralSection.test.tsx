@@ -78,4 +78,28 @@ describe('SettingsGeneralSection', () => {
     render(<SettingsGeneralSection {...baseProps} apiHealthy={false} />);
     expect(screen.getByText('API Error')).toBeInTheDocument();
   });
+
+  it('renders onboarding progress when proof is provided', () => {
+    const onboardingProof = {
+      repo_added_at: '2024-01-01T00:00:00Z',
+      bootstrap_completed_at: '2024-01-02T00:00:00Z',
+      first_task_spawned_at: '2024-01-03T00:00:00Z',
+      first_pr_opened_at: '2024-01-04T00:00:00Z',
+      first_merge_gate_verdict_at: '2024-01-05T00:00:00Z',
+      first_merge_gate_executed_tests: true,
+      first_merge_gate_unverified_reason: null,
+      first_pr_merged_at: '2024-01-06T00:00:00Z',
+      first_autonomous_improvement_at: null,
+    };
+    render(<SettingsGeneralSection {...baseProps} selectedProjectOnboardingProof={onboardingProof} />);
+    expect(screen.getByText('Onboarding Progress')).toBeInTheDocument();
+    expect(screen.getByText('Repository Added')).toBeInTheDocument();
+    expect(screen.getByText('Bootstrap Completed')).toBeInTheDocument();
+    expect(screen.getByText('First Autonomous Improvement')).toBeInTheDocument();
+  });
+
+  it('does not render onboarding progress when proof is null', () => {
+    render(<SettingsGeneralSection {...baseProps} selectedProjectOnboardingProof={null} />);
+    expect(screen.queryByText('Onboarding Progress')).not.toBeInTheDocument();
+  });
 });

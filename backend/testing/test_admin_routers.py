@@ -19756,7 +19756,12 @@ class TestComputeExperimentTaskLaunch:
         try:
             resp = await client.post(
                 "/api/admin/tasks/compute-experiment",
-                json=self._valid_payload(idempotency_key="gpu-smoke"),
+                json=self._valid_payload(
+                    idempotency_key="gpu-smoke",
+                    idea="Tune GPU throughput from the original operator prompt",
+                    draft_notes="Drafting chose a benchmark-led contract.",
+                    drafted_from_refinement=True,
+                ),
             )
         finally:
             if previous_threshold is None:
@@ -19787,6 +19792,11 @@ class TestComputeExperimentTaskLaunch:
         assert payload["benchmark"] == "tokens-per-second"
         assert payload["hypothesis"] == "L4 throughput exceeds the acceptance floor."
         assert payload["metric"] == "tokens_per_second"
+        assert payload["provenance"] == {
+            "idea": "Tune GPU throughput from the original operator prompt",
+            "draft_notes": "Drafting chose a benchmark-led contract.",
+            "drafted_from_refinement": True,
+        }
         # The criterion now carries an explicit kind discriminator (defaulting to
         # "metric" for backward compatibility) plus the min_file_count field used
         # by the artifact_produced kind; the metric/operator/threshold trio is

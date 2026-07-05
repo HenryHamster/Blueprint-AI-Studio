@@ -996,6 +996,7 @@ export default function App() {
     onUpdateIntegrationBranch: s.handleUpdateIntegrationBranch,
     promotionTargetData: s.promotionTargetData,
     onUpdatePromotionTarget: s.handleUpdatePromotionTarget,
+    selectedProjectOnboardingProof: selectedProject?.onboarding_proof ?? null,
   };
 
   // activeTab drives the four operator modes: Strategic, Pipeline, Project, Runtime.
@@ -1851,6 +1852,11 @@ export default function App() {
           preflightResult={s.preflightResult}
           preflightLoading={s.preflightLoading}
           preflightError={s.preflightError}
+          ideaText={s.ideaText}
+          setIdeaText={s.setIdeaText}
+          draftNotes={s.draftNotes}
+          setDraftNotes={s.setDraftNotes}
+          onDraftApplied={s.onDraftApplied}
           repoOptions={s.repoOptions}
           repoLoading={s.repoLoading}
           repoError={s.repoError}

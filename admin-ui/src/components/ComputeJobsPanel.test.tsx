@@ -226,6 +226,9 @@ describe('ComputeJobsPanel render + kill', () => {
     rerunComputeExperiment.mockReset();
     askComputeJob.mockReset();
     vi.restoreAllMocks();
+    // Clear persisted ask state between tests to prevent cross-test contamination
+    localStorage.removeItem('blueprint-admin:compute-ask-state:proj-1');
+    localStorage.removeItem('blueprint-admin:compute-ask-state:test-proj-persist');
   });
 
   test('renders budget bar and task title for an active job', async () => {
@@ -3346,5 +3349,126 @@ describe('ComputeJobsPanel render + kill', () => {
     expect(identitySection.textContent).toContain('model-accuracy-sweep');
     expect(identitySection.textContent).toContain('Increasing batch size improves convergence speed');
     expect(identitySection.textContent).toContain('accuracy >= 0.92');
+  });
+
+  test('ask-this-run threads persist across panel visits via localStorage', async () => {
+    // Clear only the key we'll use for this test
+    const testKey = 'blueprint-admin:compute-ask-state:test-proj-persist';
+    localStorage.removeItem(testKey);
+
+    const terminal = makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 });
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+    askComputeJob.mockResolvedValue({
+      answer: 'The run succeeded because all metrics met the criterion.',
+      citations: ['criterion_verdict:accuracy=0.95'],
+      grounding_miss: false,
+      fallback_reason: null,
+    });
+
+    // Render 1: ask a question and get a response using a unique project ID
+    const { findByTestId: findByTestId1, unmount: unmount1 } = render(
+      <ComputeJobsPanel projectId="test-proj-persist" />
+    );
+    const input1 = await findByTestId1('compute-ask-input');
+    await act(async () => { fireEvent.change(input1, { target: { value: 'Why did this succeed?' } }); });
+    const submitBtn1 = await findByTestId1('compute-ask-submit');
+    await act(async () => { submitBtn1.click(); });
+
+    // Wait for the response to appear in the thread
+    await findByTestId1('compute-ask-thread');
+
+    // Verify localStorage has the question + response saved
+    const storedState1 = localStorage.getItem(testKey);
+    expect(storedState1).toBeTruthy();
+    const parsed1 = JSON.parse(storedState1!);
+    expect(parsed1['job-1']).toBeTruthy();
+    expect(parsed1['job-1'].thread).toHaveLength(1);
+    expect(parsed1['job-1'].thread[0].question).toBe('Why did this succeed?');
+    expect(parsed1['job-1'].thread[0].result.answer).toContain('metrics met');
+
+    // Unmount the component
+    unmount1();
+
+    // Reset the fetch mock for the second render
+    fetchComputeJobs.mockClear();
+    fetchComputeJobs.mockResolvedValue(wrapJobs([terminal]));
+
+    // Render 2: component should restore the thread from localStorage
+    const { findByTestId: findByTestId2 } = render(
+      <ComputeJobsPanel projectId="test-proj-persist" />
+    );
+
+    // Thread should be visible immediately without asking again
+    const thread = await findByTestId2('compute-ask-thread');
+    expect(thread.textContent).toContain('Why did this succeed?');
+    expect(thread.textContent).toContain('The run succeeded because all metrics met the criterion.');
+
+    // Verify localStorage still has the same state
+    const storedState2 = localStorage.getItem(testKey);
+    expect(storedState2).toBe(storedState1);
+
+    // Cleanup
+    localStorage.removeItem(testKey);
+  });
+});
+
+describe('ComputeJobsPanel — draft provenance', () => {
+  beforeEach(() => {
+    fetchComputeJobs.mockReset();
+    killComputeJob.mockReset();
+    analyzeComputeJob.mockReset();
+    rerunComputeExperiment.mockReset();
+    askComputeJob.mockReset();
+  });
+
+  test('renders provenance block when operator_idea_text is present', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        launch_params: {
+          provenance: {
+            idea: 'Fine-tune LR on ImageNet',
+            draft_notes: 'Suggested 0.01 as the optimal learning rate based on literature.',
+            drafted_from_refinement: true,
+          },
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-draft-provenance');
+    expect(block.textContent).toContain('Fine-tune LR on ImageNet');
+    expect(block.textContent).toContain('Suggested 0.01 as the optimal learning rate');
+    expect(block.textContent).toContain('From AI draft');
+  });
+
+  test('renders provenance block with only idea text when llm_draft_notes is absent', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({
+        status: 'SUCCEEDED',
+        outcome: 'SUCCESS',
+        final_cost_usd: 1.0,
+        launch_params: {
+          provenance: {
+            idea: 'Test batch size scaling',
+            drafted_from_refinement: false,
+          },
+        },
+      }),
+    ]));
+    const { findByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    const block = await findByTestId('compute-draft-provenance');
+    expect(block.textContent).toContain('Test batch size scaling');
+    expect(block.textContent).not.toContain('From AI draft');
+  });
+
+  test('does not render provenance block when neither idea nor notes are present', async () => {
+    fetchComputeJobs.mockResolvedValue(wrapJobs([
+      makeJob({ status: 'SUCCEEDED', outcome: 'SUCCESS', final_cost_usd: 1.0 }),
+    ]));
+    const { findByText, queryByTestId } = render(<ComputeJobsPanel projectId="proj-1" />);
+    await findByText('compute_experiment: sweep');
+    expect(queryByTestId('compute-draft-provenance')).toBeNull();
   });
 });

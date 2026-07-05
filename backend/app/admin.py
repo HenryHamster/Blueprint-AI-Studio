@@ -2059,6 +2059,9 @@ class ComputeExperimentTaskPayload(BaseModel):
     github_repo: str = Field(..., pattern=r"^[a-zA-Z0-9_.-]+/[a-zA-Z0-9_.-]+$")
     title: str = Field(..., min_length=1, max_length=200)
     prompt: str = Field(..., min_length=1, max_length=50000)
+    idea: str | None = Field(default=None, min_length=1, max_length=10000)
+    draft_notes: str | None = Field(default=None, min_length=1, max_length=10000)
+    drafted_from_refinement: bool | None = None
     base_branch: str | None = Field(
         default=None, max_length=255, pattern=r"^[a-zA-Z0-9_./-]*[a-zA-Z0-9_.-]$"
     )
@@ -2941,6 +2944,15 @@ async def create_compute_experiment_task(
         launch_contract["command"] = payload.command
     if payload.success_criterion is not None:
         launch_contract["success_criterion"] = payload.success_criterion.model_dump()
+    provenance: dict[str, Any] = {}
+    if payload.idea is not None:
+        provenance["idea"] = payload.idea
+    if payload.draft_notes is not None:
+        provenance["draft_notes"] = payload.draft_notes
+    if payload.drafted_from_refinement is not None:
+        provenance["drafted_from_refinement"] = payload.drafted_from_refinement
+    if provenance:
+        launch_contract["provenance"] = provenance
     for opt_key in (
         "accelerator",
         "machine_type",
@@ -3028,6 +3040,11 @@ async def create_compute_experiment_task(
         **(
             {"success_criterion": launch_contract["success_criterion"]}
             if launch_contract.get("success_criterion") is not None
+            else {}
+        ),
+        **(
+            {"provenance": launch_contract["provenance"]}
+            if launch_contract.get("provenance") is not None
             else {}
         ),
         **{

@@ -2295,6 +2295,11 @@ async def test_compute_job_payload_exposes_launch_params(
                 "command": "python train.py",
                 "declared_metric": "accuracy",
                 "metric": "accuracy",
+                "provenance": {
+                    "idea": "Measure how the draft was shaped by the original operator idea",
+                    "draft_notes": "The contract was refined from the draft before launch.",
+                    "drafted_from_refinement": True,
+                },
                 "cwd": "/workspace",
                 "env": {"SEED": "42", "LR": "0.01"},
                 "accelerator": "T4",
@@ -2347,6 +2352,11 @@ async def test_compute_job_payload_exposes_launch_params(
     assert lp["env_keys"] == ["LR", "SEED"]
     assert "env" not in lp
     assert "42" not in str(lp) and "0.01" not in str(lp)
+    assert lp["provenance"] == {
+        "idea": "Measure how the draft was shaped by the original operator idea",
+        "draft_notes": "The contract was refined from the draft before launch.",
+        "drafted_from_refinement": True,
+    }
     assert lp["accelerator"] == "T4"
     assert lp["machine_type"] == "n1-standard-1"
     assert lp["container_image"] == "nvcr.io/nvidia/pytorch:24.01"

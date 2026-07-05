@@ -434,6 +434,26 @@ def test_compute_experiment_payload_carries_launch_and_benchmark_fields():
     assert result["experiment"] == "perf-sweep-v3"
 
 
+def test_compute_experiment_payload_carries_provenance_roundtrip():
+    raw = {
+        "type": "compute_experiment",
+        "command": "python bench.py --suite full",
+        "spend_cap_usd": 2.5,
+        "deadline_seconds": 1800,
+        "provenance": {
+            "idea": "Tune throughput on the target GPU",
+            "draft_notes": "Draft preferred a short benchmark and a tight deadline.",
+            "drafted_from_refinement": True,
+        },
+    }
+    result = _valid(raw)
+    assert result["provenance"] == {
+        "idea": "Tune throughput on the target GPU",
+        "draft_notes": "Draft preferred a short benchmark and a tight deadline.",
+        "drafted_from_refinement": True,
+    }
+
+
 def test_compute_experiment_payload_tolerates_extra_benchmark_fields():
     # Backward-compatible extra-field tolerance: a new benchmark field that the
     # schema does not declare must round-trip rather than be rejected/dropped.

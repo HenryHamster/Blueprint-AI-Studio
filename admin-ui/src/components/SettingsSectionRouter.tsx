@@ -24,6 +24,7 @@ import type {
   AutoReviewConfig,
   ProjectResourceEnvelopeResponse,
   ResourceEnvelopeConfig,
+  OnboardingProof,
 } from '../types/project';
 import type { UserLaunchableTaskType } from '../taskCapabilities';
 import type { ViewMode } from '../hooks/useViewPreferences';
@@ -222,6 +223,7 @@ export interface SettingsSectionRouterProps {
   selectedProjectRepo: string | null;
   selectedProjectIsSelfRepo?: boolean;
   selectedProjectRole?: 'owner' | 'member' | 'viewer' | null;
+  selectedProjectOnboardingProof?: OnboardingProof | null;
   buildConfig: BuildConfig | null;
   onUpdateBuildConfig: (config: BuildConfig) => Promise<void>;
   onDetectBuildConfig: () => Promise<void>;
@@ -284,6 +286,7 @@ export function SettingsSectionRouter(props: SettingsSectionRouterProps) {
           notifyOnHighSignalMessage={props.notifyOnHighSignalMessage}
           onUpdateNotifyOnHighSignalMessage={props.onUpdateNotifyOnHighSignalMessage}
           onNavigateToNotifications={() => props.onNavigateToSection('notifications')}
+          selectedProjectOnboardingProof={props.selectedProjectOnboardingProof}
         />
       );
     case 'provider-routing':

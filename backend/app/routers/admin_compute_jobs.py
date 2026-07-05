@@ -242,6 +242,7 @@ async def _build_compute_job_payload(
             arms_val = raw_arms if isinstance(raw_arms, list) else None
             raw_env = fp.get("env")
             env_key_names = sorted(raw_env.keys()) if isinstance(raw_env, dict) else None
+            raw_provenance = fp.get("provenance")
             raw_spend = fp.get("spend_cap_usd")
             raw_deadline = fp.get("deadline_seconds")
             launch_params = {
@@ -255,6 +256,7 @@ async def _build_compute_job_payload(
                 "machine_type": fp.get("machine_type") or None,
                 "container_image": fp.get("container_image") or None,
                 "provisioning_model": fp.get("provisioning_model") or None,
+                "provenance": raw_provenance if isinstance(raw_provenance, dict) else None,
                 "spend_cap_usd": float(raw_spend) if raw_spend is not None else None,
                 "deadline_seconds": int(raw_deadline) if raw_deadline is not None else None,
                 "require_live_release": bool(fp.get("require_live_release")) if fp.get("require_live_release") is not None else None,

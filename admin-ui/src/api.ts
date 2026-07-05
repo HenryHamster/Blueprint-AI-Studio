@@ -285,6 +285,11 @@ export interface ComputeExperimentLaunchRequest {
   };
   model?: string;
   effort?: string;
+  // Provenance: the operator's original idea text, the LLM draft rationale, and
+  // whether this contract came from a drafted refinement (vs. hand-typed).
+  idea?: string;
+  draft_notes?: string;
+  drafted_from_refinement?: boolean;
 }
 
 /** Response from the dedicated compute_experiment launch endpoint — the created
@@ -3346,6 +3351,12 @@ export interface ComputeJob {
     deadline_seconds?: number | null;
     require_live_release?: boolean | null;
     require_durable_artifact?: boolean | null;
+    // Provenance persisted at launch time; absent on legacy or manually-configured launches.
+    provenance?: {
+      idea?: string | null;
+      draft_notes?: string | null;
+      drafted_from_refinement?: boolean | null;
+    } | null;
   } | null;
 }
 

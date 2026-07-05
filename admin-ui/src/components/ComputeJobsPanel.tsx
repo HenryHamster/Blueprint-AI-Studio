@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useState } from 'react';
 import { Cpu, Square, AlertTriangle, Clock, ExternalLink, Package, FileText, LayoutGrid, CheckCircle, XCircle, BookOpen } from 'lucide-react';
 import { analyzeComputeJob, askComputeJob, fetchAwaitingLocalRunnerHolds, fetchComputeJobsPaged, fetchComputeJobsAggregateSummary, fetchComputeSweepGroups, fetchHeldComputeExperiments, fetchKnowledgeDocument, killComputeJob, rerunComputeExperiment, type AwaitingLocalRunnerHold, type ComputeJob, type ComputeJobCommandLog, type ComputeJobLiveOutput, type ComputeJobsSummary, type ComputeSweepGroupsResponse, type ComputeSuccessOperator, type HeldComputeExperiment, type KnowledgeDocument } from '../api';
 import { type ComputeExperimentForm, defaultComputeExperimentForm } from '../hooks/useTaskModal';
+import { usePersistedState } from '../hooks/usePersistedState';
 import { usePoller } from '../hooks/usePoller';
 import { ResolvedReferenceLink } from './TaskCard';
 import { ConfirmDialog } from './ConfirmDialog';
@@ -34,6 +35,30 @@ const WINDOW_OPTIONS: { label: string; minutes: number }[] = [
   { label: '3d', minutes: 4320 },
   { label: '7d', minutes: 10080 },
 ];
+
+type AskStateValue = {
+  question: string;
+  submitting: boolean;
+  thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
+  error: string | null;
+};
+
+function sanitizeAskState(parsed: unknown): Record<string, AskStateValue> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+  const obj = parsed as Record<string, unknown>;
+  const result: Record<string, AskStateValue> = {};
+  for (const [jobId, state] of Object.entries(obj)) {
+    if (!state || typeof state !== 'object' || Array.isArray(state)) continue;
+    const s = state as Record<string, unknown>;
+    result[jobId] = {
+      question: typeof s.question === 'string' ? s.question : '',
+      submitting: false,
+      thread: Array.isArray(s.thread) ? s.thread : [],
+      error: s.error === null || typeof s.error === 'string' ? s.error : null,
+    };
+  }
+  return result;
+}
 
 type MetricDirection = 'higher_better' | 'lower_better' | 'unknown';
 
@@ -774,12 +799,11 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
   const [sweepGroups, setSweepGroups] = useState<ComputeSweepGroupsResponse['sweep_groups']>({});
   const [expandedDocIds, setExpandedDocIds] = useState<Set<string>>(new Set());
   const [nowMs, setNowMs] = useState(() => Date.now());
-  const [askState, setAskState] = useState<Record<string, {
-    question: string;
-    submitting: boolean;
-    thread: Array<{ question: string; result: { answer: string | null; citations: string[]; grounding_miss: boolean; fallback_reason: string | null } }>;
-    error: string | null;
-  }>>({});
+  const [askState, setAskState] = usePersistedState<Record<string, AskStateValue>>(
+    `compute-ask-state:${projectId}`,
+    {},
+    sanitizeAskState,
+  );
 
   const toggleDocExpanded = useCallback((key: string) => {
     setExpandedDocIds((prev) => {
@@ -1047,7 +1071,7 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
         [jobId]: { ...(prev[jobId] ?? { question: q, submitting: false, thread: [], error: null }), submitting: false, error: e instanceof Error ? e.message : 'Ask failed' },
       }));
     }
-  }, [askState]);
+  }, [askState, setAskState]);
 
   if (!projectId) {
     return (
@@ -1323,6 +1347,36 @@ export function ComputeJobsPanel({ projectId, onNavigateToTask, onLaunchCompute,
                         </div>
                       )}
                     </div>
+                  </div>
+                );
+              })()}
+
+              {(() => {
+                const prov = job.launch_params?.provenance;
+                const hasProvenance = !!(prov?.idea || prov?.draft_notes);
+                if (!hasProvenance) return null;
+                return (
+                  <div
+                    className="mb-1.5 rounded border border-neutral-700/50 bg-neutral-800/40 px-2 py-1.5 flex flex-col gap-0.5"
+                    data-testid="compute-draft-provenance"
+                  >
+                    {prov?.drafted_from_refinement && (
+                      <div className="flex items-center gap-1.5 text-ui-sm font-mono text-neutral-500 mb-0.5">
+                        <span>From AI draft</span>
+                      </div>
+                    )}
+                    {prov?.idea && (
+                      <div className="flex items-start gap-1.5 text-ui-sm font-mono">
+                        <span className="text-neutral-500 shrink-0">Idea</span>
+                        <span className="text-neutral-300 break-words">{prov.idea}</span>
+                      </div>
+                    )}
+                    {prov?.draft_notes && (
+                      <div className="flex items-start gap-1.5 text-ui-sm font-mono">
+                        <span className="text-neutral-500 shrink-0">Draft notes</span>
+                        <span className="text-neutral-400 break-words">{prov.draft_notes}</span>
+                      </div>
+                    )}
                   </div>
                 );
               })()}
