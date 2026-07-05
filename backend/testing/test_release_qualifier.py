@@ -7970,6 +7970,87 @@ async def test_run_qualification_criterion_retraction_clears_coverage_bypasses_c
 
 
 @pytest.mark.asyncio
+async def test_run_qualification_criterion_supersession_clears_coverage_bypasses_cache(
+    db_session, mocker
+):
+    """Superseding the only uncovered criterion also frees same-SHA requalification."""
+    from app import acceptance_criteria as ac
+    from app.acceptance_criteria import retract_criterion
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    candidate_sha = "suprclr0" * 5  # 40-char placeholder SHA
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": candidate_sha,
+        "blocker": "criterion_coverage_incomplete",
+        "ci_green": True,
+        "confidence": 0.0,
+        "started_at": "2026-05-19T00:00:00",
+        "finalized_at": "2026-05-19T00:05:00",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    source = await _add_version_criterion(
+        db_session, project, version,
+        key="c-supersede-me", text="Replacement will supersede this",
+    )
+    successor = await _add_version_criterion(
+        db_session, project, version,
+        key="c-superseding", text="Replacement criterion",
+        source_kind="task_merge",
+    )
+
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=candidate_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_candidate_ci",
+        new=AsyncMock(
+            return_value={
+                "state": "green",
+                "ci_green": True,
+                "resolved_sha": candidate_sha,
+                "detail": "checks passed",
+            }
+        ),
+    )
+
+    cached = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+    assert cached["status"] == "cached_verdict"
+    assert len(await _audit_tasks(db_session, project.id)) == 0
+
+    await db_session.refresh(version)
+    row = await retract_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        criterion_key=source.criterion_key,
+        reason="replaced by sharper criterion",
+        retracted_by="strategist",
+        superseded_by_key=successor.criterion_key,
+    )
+    assert row is not None and row.status == "superseded"
+    coverage = await ac.get_version_coverage_summary(db_session, version.id)
+    assert coverage["total"] == 1
+    assert coverage["covered"] == 1
+    assert coverage["superseded"] == 1
+
+    result = await rq.run_qualification(db_session, project.id, version)
+    await db_session.commit()
+
+    assert result["status"] == "spawned"
+    assert result["candidate_sha"] == candidate_sha
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+    assert version.last_qualification["candidate_sha"] == candidate_sha
+    assert len(await _audit_tasks(db_session, project.id)) == 1
+
+
+@pytest.mark.asyncio
 async def test_reconcile_if_criterion_coverage_now_complete_respawns_after_retraction(
     db_session, mocker
 ):
