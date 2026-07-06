@@ -393,6 +393,27 @@ def _promotion_target_rollup_allowed(parent: Task, target_branch: str) -> bool:
     return bool(payload.get("hotfix") or ctx.get("hotfix"))
 
 
+def _task_owns_staging_branch(task: Task, staging_branch: str | None) -> bool:
+    """Whether ``task`` may roll ``staging_branch`` up to the base.
+
+    Research/plan staging branches are minted ``{prefix}{task.id[:8]}``, so the
+    branch's trailing path segment is the OWNER's 8-hex id-prefix. Returns
+    ``False`` only on positive proof of foreign ownership — the trailing segment
+    is a valid id-prefix that is not this task's — i.e. the branch was inherited
+    from an ancestor. Any other name (no id-suffix / legacy) is treated as owned,
+    so we defer on evidence, never on ambiguity.
+    """
+    if not staging_branch:
+        return False
+    tail = staging_branch.rsplit("/", 1)[-1]
+    looks_like_id_prefix = len(tail) == 8 and all(
+        c in "0123456789abcdef" for c in tail
+    )
+    if not looks_like_id_prefix:
+        return True
+    return tail == str(task.id).replace("-", "")[:8]
+
+
 _FORCE_DROP_REASONS = frozenset(
     {"rollup_no_pr_artifact", "malformed_pr_url", "review_respawn_cap"}
 )
@@ -2043,6 +2064,43 @@ async def _check_and_trigger_rollup(
             )
             return
 
+        # ── Structural invariant: only a staging branch's OWNER rolls it up ──
+        # A descendant that merely INHERITED an ancestor's research/plan branch
+        # (research_completion stamps it into every child; the derivation above
+        # reads that inherited value) must not open a SECOND rollup for it — its
+        # children's PRs already merged into that shared branch and the owner
+        # carries them to base exactly once. The per-task rollup_pr_number guard
+        # further down can't see the peer's PR. Ownership is proven off the
+        # branch name (mints are {prefix}{id[:8]}); owns_rollup_branch is a
+        # DURABLE flag for requeue-clones / mid-recreate tasks whose volatile
+        # rollup_pr_number marker was cleared. (Incident: dup rollups
+        # #13026/#13035 on research/bdb302f7 — the second wedged and FAILED.)
+        if (
+            staging_branch
+            and not _task_owns_staging_branch(parent, staging_branch)
+            and not parent_ctx.get("owns_rollup_branch")
+            and not parent_ctx.get("rollup_pr_number")
+        ):
+            parent.status = TaskStatus.COMPLETED
+            parent.context = _clear_rollup_transient_state(parent.context)
+            parent.latest_status_message = (
+                f"✓ {completed_count} subtask(s) merged into {staging_branch} "
+                f"— rollup deferred to that branch's owner (not this task's branch)"
+            )
+            session.add(parent)
+            await session.commit()
+            await broadcast_to_project(
+                str(parent.project_id),
+                "task_updated",
+                {"task_id": str(parent.id), "status": TaskStatus.COMPLETED},
+            )
+            logger.info(
+                f"[ROLLUP] Parent {parent.id} completed WITHOUT rollup — staging "
+                f"branch '{staging_branch}' is owned by an ancestor; its owner "
+                f"carries the {completed_count} merged subtask(s) to base"
+            )
+            return
+
         cap_exhausted_children = [
             c
             for c in failed_children
@@ -2566,6 +2624,15 @@ async def _check_and_trigger_rollup(
                                     for k, v in parent_ctx.items()
                                     if k not in ("rollup_pr_number", "rollup_pr_url")
                                 }
+                                # Durable ownership survives the volatile marker
+                                # clear: a requeue-clone on a foreign-named branch
+                                # whose rollup_pr_number is being dropped here to
+                                # retry with a fresh PR must still be recognized as
+                                # the branch owner next cycle — otherwise the
+                                # OWNER-gate above would see (foreign branch + no
+                                # marker) and silently strand reviewed work
+                                # (invariant #2).
+                                parent.context["owns_rollup_branch"] = True
                                 parent_ctx = parent.context
                                 existing_pr = None
                                 session.add(parent)

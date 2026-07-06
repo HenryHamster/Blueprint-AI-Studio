@@ -2712,8 +2712,14 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     _rctx = task.context or {}
     _inherited_research_branch = _rctx.get("research_branch")
     _has_rollup_pr = bool(_rctx.get("rollup_pr_number"))
+    _adopted_foreign_branch = False
     if _inherited_research_branch and _has_rollup_pr:
         research_branch = _inherited_research_branch
+        # This requeue-clone adopts an ancestor-named (foreign) staging branch
+        # to keep the merge-guard invariant intact. Stamp a DURABLE ownership
+        # flag so the rollup OWNER-gate lets this task carry the branch to base
+        # even though the name doesn't match its own id-prefix (invariant #2).
+        _adopted_foreign_branch = True
     else:
         research_branch = f"{research_branch_prefix}{short_id}"
 
@@ -2724,6 +2730,8 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     # the findings and re-running the agent.
     _ctx_sp = dict(task.context or {})
     _ctx_sp["_research_spawn_pending"] = True
+    if _adopted_foreign_branch:
+        _ctx_sp["owns_rollup_branch"] = True
     task.context = _ctx_sp
     flag_modified(task, "context")
 

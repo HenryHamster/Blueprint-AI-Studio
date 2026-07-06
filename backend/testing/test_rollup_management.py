@@ -3717,3 +3717,91 @@ async def test_backfill_leaves_unlanded_rollup_children_untouched(cleanup_db):
     assert has_landed_signal(refreshed_child) is False
     # The merge-unblock signal is still present — it simply was not promoted.
     assert has_merge_unblock_signal(refreshed_child) is True
+
+
+# ── Structural OWNER-gate: only a staging branch's owner rolls it up ──────────
+
+
+def test_task_owns_staging_branch_gate():
+    """Ownership is proven off the branch name: the trailing segment is the
+    OWNER's 8-hex id-prefix. Foreign id-prefixes → not owned; anything without a
+    valid id-suffix (legacy / custom) defers to owned so we never strand work."""
+    from app.rollup_management import _task_owns_staging_branch
+
+    task = Task(
+        id=uuid.UUID("bdb302f7-61f8-43d4-aa71-7754a623750a"),
+        payloads=[{}],
+        context={},
+    )
+    # Own id-prefix (research + plan mints) → owned.
+    assert _task_owns_staging_branch(task, "research/bdb302f7") is True
+    assert _task_owns_staging_branch(task, "plan/bdb302f7") is True
+    # A DIFFERENT valid id-prefix → inherited from an ancestor → not owned.
+    assert _task_owns_staging_branch(task, "research/2fea759a") is False
+    # Non-id-prefix trailing segments default to owned (no positive foreign proof).
+    assert _task_owns_staging_branch(task, "research/dup-stg") is True
+    assert _task_owns_staging_branch(task, "feature/some-branch") is True
+    # No branch at all → nothing to roll up.
+    assert _task_owns_staging_branch(task, None) is False
+    assert _task_owns_staging_branch(task, "") is False
+
+
+@pytest.mark.asyncio
+async def test_inherited_staging_branch_completes_without_duplicate_rollup(
+    cleanup_db, mocker
+):
+    """A parent whose staging branch was INHERITED from an ancestor (a foreign
+    id-prefix, no durable owns flag, no PR marker) must NOT open a duplicate
+    rollup PR — it completes and defers the roll-up to the branch's owner."""
+    mock_create = _mock_rollup_create_path(mocker)
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={"research_branch": "research/aabbccdd"},
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_not_called()
+    await cleanup_db.refresh(parent)
+    assert parent.status == TaskStatus.COMPLETED
+    assert "owner" in (parent.latest_status_message or "")
+
+
+@pytest.mark.asyncio
+async def test_adopted_branch_recreates_rollup(cleanup_db, mocker):
+    """Invariant #2: a requeue-clone that legitimately adopted a foreign-named
+    branch carries the durable ``owns_rollup_branch`` flag. Even with no
+    ``rollup_pr_number`` marker (transiently cleared), the OWNER-gate must NOT
+    fire — the self-heal recreates the rollup PR."""
+    mock_create = _mock_rollup_create_path(
+        mocker,
+        create_return={
+            "empty_diff": True,
+            "merged": True,
+            "html_url": "",
+            "number": 0,
+        },
+    )
+
+    from app.rollup_management import _check_and_trigger_rollup
+
+    project = await _make_project(cleanup_db)
+    parent = await _make_rollup_parent_no_pr(
+        cleanup_db,
+        project.id,
+        extra_context={
+            "research_branch": "research/aabbccdd",
+            "owns_rollup_branch": True,
+        },
+    )
+    child = await _make_merged_child(cleanup_db, project.id, parent.id)
+
+    await _check_and_trigger_rollup(child, cleanup_db)
+
+    mock_create.assert_awaited_once()
