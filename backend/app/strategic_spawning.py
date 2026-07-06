@@ -3565,6 +3565,10 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     # hold threshold. Low priority — purely observational planning context the
     # strategic agent reads to decide whether to refine/retire a stuck direction.
     "held_directions": {"priority": "low", "exempt": True},
+    # Open FOUND leads from the resident exam ledger. Medium priority, exempt:
+    # bounded at build time (only open FOUND entries, compact shape). Absent
+    # when no resident session has run or no open leads exist.
+    "resident_exam_leads": {"priority": "medium", "exempt": True},
     # Aggregated missing-foundation demand (capability/foundation prerequisites
     # declared by dependents that no task provides). Medium priority, exempt:
     # bounded at build time by collect_missing_capability_demand.
@@ -6052,6 +6056,62 @@ def _build_direction_counts(project: Project) -> dict[str, Any]:
     }
 
 
+def _resident_open_found_leads(project: Project) -> list[dict[str, Any]] | None:
+    """Return compact open FOUND leads from the resident session's exam ledger.
+
+    Reads ``vision[RESIDENT_SESSION_KEY]["_exam_ledger"]``, deduplicates records
+    by ``surfaceKey`` keeping the latest by ``atTick``, then returns only those
+    whose final verdict is ``"found"`` as ``[{surfaceKey, note, at}]``.
+
+    Returns ``None`` when no ledger exists, the JSON is invalid, or no open
+    FOUND leads remain — so callers can skip injection on the common path.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    vision = project.vision or {}
+    resident_blob = vision.get(RESIDENT_SESSION_KEY)
+    if not resident_blob or not isinstance(resident_blob, dict):
+        return None
+    raw_ledger = resident_blob.get("_exam_ledger")
+    if not raw_ledger or not isinstance(raw_ledger, str):
+        return None
+    try:
+        parsed = json.loads(raw_ledger)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    raw_records = parsed.get("records")
+    if not isinstance(raw_records, list):
+        return None
+
+    # Dedup by surfaceKey, keeping the record with the highest atTick.
+    latest: dict[str, dict] = {}
+    for rec in raw_records:
+        if not isinstance(rec, dict):
+            continue
+        surface_key = rec.get("surfaceKey")
+        if not isinstance(surface_key, str) or not surface_key:
+            continue
+        at_tick = rec.get("atTick")
+        at_tick = at_tick if isinstance(at_tick, (int, float)) else 0
+        prev = latest.get(surface_key)
+        prev_tick = prev.get("atTick", 0) if prev else -1
+        if at_tick >= prev_tick:
+            latest[surface_key] = rec
+
+    leads = [
+        {
+            "surfaceKey": r["surfaceKey"],
+            "note": str(r.get("note") or ""),
+            "at": str(r.get("at") or ""),
+        }
+        for r in latest.values()
+        if r.get("verdict") == "found"
+    ]
+    return leads if leads else None
+
+
 async def _finalize_strategic_review_spawn(
     session: AsyncSession,
     *,
@@ -6476,6 +6536,7 @@ async def _spawn_strategic_review(
                 )
             ),
         }
+        _res_exam_leads = _resident_open_found_leads(project)
         minimal_payload = validate_internal_payload(
             pack_under_budget(
                 {
@@ -6510,6 +6571,13 @@ async def _spawn_strategic_review(
                     **({"effort": review_effort} if review_effort else {}),
                     # Live, operator-tunable resident-session pacing knobs.
                     **_res_pacing_knobs,
+                    # Open FOUND leads from the resident exam ledger (pure
+                    # in-memory read — no I/O). Absent when no ledger or no leads.
+                    **(
+                        {"resident_exam_leads": _res_exam_leads}
+                        if _res_exam_leads
+                        else {}
+                    ),
                 },
                 _STRATEGIC_REVIEW_SCHEMA,
             ),
@@ -8181,6 +8249,7 @@ async def _spawn_strategic_review(
     _knowledge_by_direction = await fetch_direction_knowledge_index(
         session, project.id, _active_direction_ids
     )
+    _cadence_exam_leads = _resident_open_found_leads(project)
     payload: dict = pack_under_budget(
         {
             "type": "strategic_review",
@@ -8382,6 +8451,11 @@ async def _spawn_strategic_review(
             **(
                 {"capability_trial_verdicts": _sr_capability_trial_verdicts}
                 if _sr_capability_trial_verdicts
+                else {}
+            ),
+            **(
+                {"resident_exam_leads": _cadence_exam_leads}
+                if _cadence_exam_leads
                 else {}
             ),
             "base_branch": get_project_integration_branch(project),

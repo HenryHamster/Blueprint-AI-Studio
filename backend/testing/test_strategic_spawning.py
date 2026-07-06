@@ -815,6 +815,218 @@ async def test_spawn_strategic_review_resident_minimal_skips_slow_context_build(
     assert task.strategic_cycle_id
 
 
+# ── resident_exam_leads surfacing ──
+
+
+@pytest.mark.asyncio
+async def test_payload_includes_resident_exam_leads_section(db_session, mocker):
+    """resident_exam_leads from the exam ledger surfaces in the resident-minimal payload.
+
+    A ledger with one FOUND and one CLEAR record for different surfaces must
+    produce exactly one entry in ``resident_exam_leads`` (the FOUND one only).
+    The CLEAR entry must NOT appear.
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    ledger = json.dumps({
+        "records": [
+            {
+                "surfaceKey": "direction:d-found",
+                "atTick": 3,
+                "at": "2026-07-05T10:00:00Z",
+                "verdict": "found",
+                "note": "missing test coverage",
+            },
+            {
+                "surfaceKey": "direction:d-clear",
+                "atTick": 2,
+                "at": "2026-07-05T09:00:00Z",
+                "verdict": "clear",
+                "note": "",
+            },
+        ],
+        "tick": 3,
+        "corrective": False,
+    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                "_exam_ledger": ledger,
+            },
+        },
+        directions=[{"id": "d-found", "text": "active direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-exam-leads",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+        "preferred_runner_target_id": "runner-exam",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    leads = payload.get("resident_exam_leads")
+    assert leads is not None, "resident_exam_leads should be present when FOUND leads exist"
+    assert len(leads) == 1, f"Expected 1 open FOUND lead, got {len(leads)}: {leads}"
+    assert leads[0]["surfaceKey"] == "direction:d-found"
+    assert leads[0]["note"] == "missing test coverage"
+    assert leads[0]["at"] == "2026-07-05T10:00:00Z"
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_no_resident_leads_when_ledger_absent(db_session, mocker):
+    """When no _exam_ledger is present in the resident session blob, resident_exam_leads is absent."""
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                # No _exam_ledger key
+            },
+        },
+        directions=[{"id": "d1", "text": "active direction", "status": "active"}],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-no-ledger",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    assert "resident_exam_leads" not in payload, (
+        "resident_exam_leads should be absent when no _exam_ledger is present"
+    )
+
+
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_resident_minimal_dedup_keeps_latest_by_tick(db_session, mocker):
+    """Dedup by surfaceKey keeps the record with the highest atTick.
+
+    Two FOUND records for the same surface (atTick=1 and atTick=5); a later
+    CLEAR (atTick=3) for a second surface. Result: first surface stays FOUND
+    (highest tick wins the dedup), second surface is CLEARED (not in output).
+    """
+    from app.strategic_resident_session import RESIDENT_SESSION_KEY
+
+    ledger = json.dumps({
+        "records": [
+            # First surface: FOUND at tick 1, then another FOUND at tick 5 (latest wins)
+            {"surfaceKey": "fetch:ci", "atTick": 1, "at": "2026-07-05T08:00:00Z", "verdict": "found", "note": "old note"},
+            {"surfaceKey": "fetch:ci", "atTick": 5, "at": "2026-07-05T12:00:00Z", "verdict": "found", "note": "newer note"},
+            # Second surface: FOUND at tick 2, then CLEAR at tick 4 (latest wins → cleared)
+            {"surfaceKey": "direction:d2", "atTick": 2, "at": "2026-07-05T09:00:00Z", "verdict": "found", "note": ""},
+            {"surfaceKey": "direction:d2", "atTick": 4, "at": "2026-07-05T11:00:00Z", "verdict": "clear", "note": ""},
+        ],
+        "tick": 5,
+        "corrective": False,
+    })
+    project = _make_project(
+        vision={
+            "purpose": "test purpose",
+            RESIDENT_SESSION_KEY: {
+                "version": 1,
+                "status": "active",
+                "_exam_ledger": ledger,
+            },
+        },
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    for _name in (
+        "resolve_branch_verification_context",
+        "_verify_capability_backing_paths",
+        "_build_recent_interventions",
+        "ground_design_doc",
+    ):
+        mocker.patch(
+            f"app.strategic_spawning.{_name}",
+            new=AsyncMock(side_effect=AssertionError(f"must not call {_name}")),
+        )
+
+    extra = {
+        "_resident_session": True,
+        "strategic_session_id": "ss-dedup",
+        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
+        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "resident_session",
+    }
+    spawned = await _spawn_strategic_review(
+        project, db_session, extra_context=extra, resident_minimal=True
+    )
+    assert spawned is True
+
+    task = (
+        (await db_session.execute(select(Task).where(Task.project_id == project.id)))
+        .scalars()
+        .all()[0]
+    )
+    payload = task.payloads[0]
+    leads = payload.get("resident_exam_leads")
+    assert leads is not None, "resident_exam_leads should be present"
+    assert len(leads) == 1, f"Expected 1 open FOUND lead (fetch:ci only), got {leads}"
+    assert leads[0]["surfaceKey"] == "fetch:ci"
+    assert leads[0]["note"] == "newer note"
+
+
 @pytest.mark.asyncio
 async def test_spawn_strategic_review_cadence_still_runs_context_build(db_session):
     """Regression guard for the resident_minimal refactor: a plain cadence spawn

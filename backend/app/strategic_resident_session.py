@@ -96,6 +96,12 @@ RESIDENT_SESSION_REASON_KEY = "_resident_strategic_session_reason"
 # by the auto-start hook because they are runtime outcomes, not static config.
 RESIDENT_SESSION_REASON_NO_RUNNER = "no_runner"
 RESIDENT_SESSION_REASON_START_FAILED_PREFIX = "start_failed"
+# Transient block: a batch strategic cycle is already in flight (IN_PROGRESS /
+# EVALUATING) — no adoptable task exists and the spawn guard refuses to create a
+# duplicate. The blocking cycle completes on its own; the strategic_completion
+# handler re-tries the Workday auto-start once it finishes, so the operator
+# session starts without manual re-entry into Workday mode.
+RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT = "cycle_in_flight"
 # Multi-device block reason: the runner the session is pinned to (an explicit
 # operator override at start, OR the auto-picked device mid-session) is offline /
 # no longer available. Derived by the read model from the live runner set + the
@@ -256,6 +262,36 @@ async def set_resident_session_blocked_reason(
         logger.warning(
             "[RESIDENT_SESSION] failed to %s blocked-reason for project %s",
             "clear" if reason is None else "record",
+            project.id,
+            exc_info=True,
+        )
+
+
+async def _set_cycle_in_flight_reason(
+    session: AsyncSession,
+    project: Project,
+    operator_user_id: str,
+) -> None:
+    """Record the ``cycle_in_flight`` reason, including the operator_user_id.
+
+    Stores the operator_user_id alongside the reason so the completion-retry
+    handler can re-run the Workday auto-start with the right user identity once
+    the blocking cycle finishes. Best-effort: failure is logged and swallowed.
+    """
+    try:
+        def _apply(vision: dict[str, Any]) -> None:
+            vision[RESIDENT_SESSION_REASON_KEY] = {
+                "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+                "recorded_at": _utcnow().isoformat(),
+                "operator_user_id": str(operator_user_id)[:200],
+            }
+
+        await with_vision_locked(session, project.id, _apply, skip_locked=False)
+        await session.commit()
+        await session.refresh(project)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] failed to record cycle_in_flight reason for project %s",
             project.id,
             exc_info=True,
         )
@@ -1710,6 +1746,22 @@ async def _auto_start_on_workday_entry(
                     fresh, project, RESIDENT_SESSION_REASON_NO_RUNNER
                 )
                 return None
+            # Pre-check: if no adoptable strategic_review exists AND a batch
+            # strategic cycle is in flight, the spawn path would be refused with
+            # a generic 409. Detect this early and record a named reason so the
+            # read model can surface a non-alarming "waiting on active cycle"
+            # state, and the completion handler can retry once the cycle finishes.
+            _adopt_hint = await _find_adoptable_strategic_review_task(
+                fresh, project.id
+            )
+            if _adopt_hint is None:
+                from app.task_lifecycle import _has_active_strategic_task
+
+                if await _has_active_strategic_task(project.id, fresh):
+                    await _set_cycle_in_flight_reason(
+                        fresh, project, operator_user_id
+                    )
+                    return None
             snapshot = await start_resident_session(
                 fresh,
                 project,

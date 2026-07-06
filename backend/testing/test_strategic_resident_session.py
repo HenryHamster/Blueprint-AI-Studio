@@ -36,6 +36,7 @@ from app.shared_state import runtime_config
 import app.strategic_resident_session as srs
 from app.strategic_resident_session import (
     RESIDENT_SESSION_KEY,
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_KEY,
     RESIDENT_SESSION_REASON_NO_RUNNER,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
@@ -3238,3 +3239,130 @@ async def test_heartbeat_returns_active_direction_ids(db_session):
     # All excluded statuses must be absent.
     for key, _ in excluded_statuses:
         assert key not in ids, f"{key} should be excluded from active_direction_ids"
+
+
+# ---------------------------------------------------------------------------
+# cycle_in_flight: named block reason + completion retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_workday_entry_while_cycle_in_flight_records_named_reason(
+    db_session, enable_strategic_session_flag
+):
+    """Entering Workday while a batch strategic cycle is IN_PROGRESS (non-adoptable)
+    records ``cycle_in_flight`` — NOT the generic ``start_failed`` reason — and the
+    read model surfaces ``blocked`` (not ``error``) with the named reason.
+
+    This exercises the new pre-check in ``_auto_start_on_workday_entry`` that
+    detects the spawn-guard condition before the start path raises a 409.
+    """
+    project = await _make_project_with_member(db_session)
+    # A runner is required to get past the no_runner gate; the cycle_in_flight
+    # check comes AFTER the runner check so both must pass.
+    await _make_live_local_runner(db_session, project)
+    # An IN_PROGRESS strategic_review task (not adoptable — started_at is set)
+    # means: nothing to adopt AND _has_active_strategic_task returns True.
+    in_flight = Task(
+        project_id=project.id,
+        title="batch cycle",
+        payloads=[{"type": "strategic_review"}],
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="agent-vm-batch",
+        started_at=_utcnow(),
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(in_flight)
+    await db_session.commit()
+
+    factory = _dedicated_session_factory(db_session)
+    snapshot = await sync_resident_session_for_interaction_mode(
+        db_session,
+        project,
+        operator_user_id=TEST_USER_ID,
+        previous_mode="chat",
+        new_mode="continuous",
+        session_factory=factory,
+    )
+    # Auto-start was blocked — no session started.
+    assert snapshot is None
+
+    vision = await _fresh_vision(factory, project.id)
+    blocked_reason = read_resident_session_blocked_reason(vision)
+    # Must be the named cycle_in_flight reason, NOT the generic start_failed.
+    assert blocked_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+
+    # The read model must surface ``blocked`` (not ``error``).
+    avail = _resident_session_availability(
+        _project_with_vision(vision), eligible_live_runner_count=1
+    )
+    assert avail["state"] == "blocked"
+    assert avail["reason"] == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT
+
+    # The operator_user_id must be stored so the retry handler can use it.
+    raw_blob = vision.get(RESIDENT_SESSION_REASON_KEY) or {}
+    assert raw_blob.get("operator_user_id") == TEST_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_cycle_completion_retries_workday_auto_start(
+    db_session, enable_strategic_session_flag
+):
+    """Completing a blocking strategic cycle re-triggers the Workday auto-start
+    when the project is in continuous mode with a ``cycle_in_flight`` block.
+
+    This exercises ``_maybe_retry_workday_auto_start`` from
+    ``app.strategic_completion``, which reads the blocked reason, checks the
+    interaction mode, and calls ``_auto_start_on_workday_entry`` on a fresh
+    session. The retry succeeds when an adoptable task and a live runner are
+    available after the blocking cycle finishes.
+    """
+    from app.strategic_completion import _maybe_retry_workday_auto_start
+    from app.workbench_state import upsert_strategic_workbench_state_with_previous
+
+    project = await _make_project_with_member(db_session)
+    # Provide a live runner so the retry auto-start can pick a device.
+    await _make_live_local_runner(db_session, project)
+    # Provide an adoptable strategic_review task (QUEUED, no started_at) so the
+    # retry can adopt it rather than spawning (which would be blocked by the
+    # still-present in-flight task state).
+    adoptable_task = await _make_strategic_review_task(db_session, project)
+
+    # Set interaction_mode=continuous via the real per-user prefs store
+    # (MessagesNoisePrefs), which is where workbench state is actually persisted.
+    await upsert_strategic_workbench_state_with_previous(
+        db_session,
+        TEST_USER_ID,
+        project.id,
+        {"interaction_mode": "continuous"},
+    )
+
+    # Manually set the RESIDENT_SESSION_REASON_KEY == cycle_in_flight in vision.
+    project = await db_session.get(Project, project.id)
+    from sqlalchemy.orm.attributes import flag_modified as _fm
+
+    vision = dict(project.vision or {})
+    vision[RESIDENT_SESSION_REASON_KEY] = {
+        "reason": RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
+        "recorded_at": _utcnow().isoformat(),
+        "operator_user_id": TEST_USER_ID,
+    }
+    project.vision = vision
+    _fm(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    factory = _dedicated_session_factory(db_session)
+    # Call the retry helper directly (as strategic_completion does post-commit).
+    await _maybe_retry_workday_auto_start(project.id, session_factory=factory)
+
+    # The retry should have started a session: the session blob is now active.
+    vision_after = await _fresh_vision(factory, project.id)
+    assert resident_session_is_active(read_resident_session(vision_after)), (
+        "Expected an active resident session after the cycle_in_flight retry"
+    )
+    # The session must have adopted the available strategic_review task.
+    blob = read_resident_session(vision_after) or {}
+    assert blob.get("task_id") == str(adoptable_task.id)
+    # The blocked reason is cleared on a successful start.
+    assert read_resident_session_blocked_reason(vision_after) is None

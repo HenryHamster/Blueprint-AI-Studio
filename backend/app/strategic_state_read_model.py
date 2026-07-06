@@ -22,6 +22,7 @@ from app.models import (
 from app import strategic_cycle
 from app.shared_state import runtime_config
 from app.strategic_resident_session import (
+    RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT,
     RESIDENT_SESSION_REASON_RUNNER_OFFLINE,
     RESIDENT_SESSION_REASON_START_FAILED_PREFIX,
     STRATEGIC_SESSION_ENABLED_SETTING,
@@ -659,6 +660,13 @@ def _resident_session_availability(
         # runner count — the last auto-start genuinely errored.
         reason = recorded_reason
         state = "error"
+    elif recorded_reason == RESIDENT_SESSION_REASON_CYCLE_IN_FLIGHT:
+        # A batch strategic cycle is in flight — not an error, just a transient
+        # wait. The completion handler re-tries the auto-start when the blocking
+        # cycle finishes, so this resolves on its own. Slot before the
+        # has_live_runner check so a live runner does not hide the conflict.
+        reason = recorded_reason
+        state = "blocked"
     elif has_live_runner:
         # A live runner is plainly attached. A positive count OVERRIDES a stale
         # recorded ``no_runner`` — it is only authoritative while the live count

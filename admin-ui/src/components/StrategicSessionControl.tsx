@@ -667,6 +667,7 @@ function humanizeResidentReason(
   if (!trimmed) return null;
   if (trimmed === 'sessions_disabled') return 'Resident sessions disabled';
   if (trimmed === 'no_runner') return 'No live local runner';
+  if (trimmed === 'cycle_in_flight') return 'Waiting for the current strategic cycle to finish…';
   if (trimmed === 'runner_offline') {
     // Block-on-offline: name the pinned device and tell the operator to restart
     // (Workday does not auto-migrate to another device).
@@ -734,8 +735,22 @@ function residentSessionView(
   // still `active`, but the read model reports blocked/runner_offline. Prompt a
   // RESTART (Stop, then re-pick a device and Start) — no auto-migration.
   const runnerOffline = normalized === 'blocked' && reasonCode === 'runner_offline';
-  const active = (sessionActive || normalized === 'active') && !runnerOffline;
+  // Transient block: a batch strategic cycle is in flight. The session will
+  // auto-start once the cycle completes — show a calm waiting state, not an error.
+  const cycleInFlight = normalized === 'blocked' && reasonCode === 'cycle_in_flight';
+  const active = (sessionActive || normalized === 'active') && !runnerOffline && !cycleInFlight;
   const detail = humanizeResidentReason(reason, selectedDeviceName);
+  if (cycleInFlight) {
+    return {
+      tone: 'info',
+      Icon: LoaderCircle,
+      label: 'Waiting',
+      detail: detail ?? 'The current strategic cycle is running. The session will start automatically when it finishes.',
+      showStop: false,
+      showStart: false,
+      showAddRunner: false,
+    };
+  }
   if (runnerOffline) {
     return {
       tone: 'warning',

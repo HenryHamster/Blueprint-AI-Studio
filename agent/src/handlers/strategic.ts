@@ -66,6 +66,7 @@ import {
   buildCiComplianceSection,
   buildCompletionDebtSection,
   buildPayloadStalenessSection,
+  buildResidentExamLeadsSection,
 } from './strategic-sections.js';
 
 /**
@@ -317,9 +318,14 @@ export async function handleStrategic(
       ? payload.held_directions as Array<Record<string, unknown>>
       : [];
 
+    const residentExamLeads = Array.isArray(payload.resident_exam_leads)
+      ? payload.resident_exam_leads as Array<Record<string, unknown>>
+      : [];
+
     const systemMaturitySection = buildSystemMaturitySection(systemMaturity);
     const driftSection = buildDriftSection(driftSignals);
     const heldDirectionsSection = buildHeldDirectionsSection(heldDirections);
+    const residentExamLeadsSection = buildResidentExamLeadsSection(residentExamLeads);
 
     const efficiencySnapshotSection = buildEfficiencySnapshotSection(payload.efficiency_snapshot);
     const ciComplianceSection = buildCiComplianceSection(payload.ci_compliance);
@@ -734,6 +740,7 @@ prompts, schemas, tools, or orchestration.` : '';
       systemMaturitySection,
       driftSection,
       heldDirectionsSection,
+      residentExamLeadsSection,
       recentWorkSection,
       feedbackSection,
       questionSection,
