@@ -324,6 +324,81 @@ async def get_project(
     }
 
 
+@router.get("/projects/{project_id}/summary")
+@limiter.limit("30/minute")
+async def get_project_summary(
+    request: Request,
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return a lightweight project summary excluding heavy JSONB fields.
+
+    Omits design_doc and self_reflection_log (which can be hundreds of KB)
+    so mount-time fetches stay small. Use GET /api/admin/projects/{id} for the
+    full record when design_doc or self_reflection_log are explicitly needed.
+    """
+    query = (
+        select(Project, ProjectMember.role)
+        .join(ProjectMember, ProjectMember.project_id == Project.id)
+        .where(
+            Project.id == project_id,
+            ProjectMember.user_id == current_user["user_id"],
+        )
+    )
+    row = (await session.execute(query)).one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    project, role = row
+    problem_model_dict = project.problem_model or {}
+    proof_problem_model = enrich_problem_model_capability_proofs(
+        problem_model_dict,
+        getattr(project, "capability_proof_records", None),
+    )
+    size_health = None
+    if problem_model_dict:
+        try:
+            pm = ProblemModel(**problem_model_dict)
+            size_health = compute_model_size_signal(pm)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "[STRATEGIC_STATE] problem model size signal skipped: %s",
+                exc,
+            )
+    return {
+        "id": str(project.id),
+        "name": project.name,
+        "user_id": project.user_id,
+        "status": project.status,
+        "github_owner": project.github_owner,
+        "github_repo": project.github_repo,
+        "created_at": project.created_at.isoformat() if project.created_at else None,
+        "directions": project.directions,
+        "vision": project.vision or {},
+        "problem_model": proof_problem_model,
+        "problem_model_size_health": size_health,
+        "running_update": project.running_update,
+        "running_update_acknowledged_at": (
+            project.running_update_acknowledged_at.isoformat()
+            if project.running_update_acknowledged_at
+            else None
+        ),
+        "build_config": _redact_build_config(project.build_config or {}, role),
+        "build_config_warnings": build_config_lint_warnings(project.build_config),
+        "merge_verification_verdict": compute_merge_verification_verdict(project),
+        "merge_gate_runtime": merge_gate_runtime_block(project),
+        "autonomous_enabled": project.autonomous_enabled,
+        "paused": project.paused,
+        "is_self_repo": project.is_self_repo,
+        "sr_catch_rate_targets": project.sr_catch_rate_targets or {},
+        "approval_gate_config": project.approval_gate_config or {},
+        "capability_proof_summary": _build_capability_proof_summary(
+            project.capability_proof_records or {}
+        ),
+        "capability_adoption_verdicts": get_trial_verdicts(project),
+        "my_role": role,
+        "onboarding_proof": build_onboarding_proof_block(project),
+    }
 
 
 class ProjectUpdate(BaseModel):

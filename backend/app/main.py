@@ -16,7 +16,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Callable
 from fastapi import (
     FastAPI,
     Depends,
@@ -28,6 +28,8 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from slowapi.errors import RateLimitExceeded
 from app.csrf import CSRFMiddleware
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -104,7 +106,7 @@ logger = logging.getLogger(__name__)
 
 # Expected schema revision — must match the latest alembic migration.
 # Update this when adding new migrations.
-EXPECTED_SCHEMA_REVISION = "0381"
+EXPECTED_SCHEMA_REVISION = "0384"
 
 # --- Task Priority Map ---
 # Maps priority string labels to integer values stored on Task.priority.
@@ -774,6 +776,46 @@ from app.alert_dispatch import (  # noqa: F401  re-exported for back-compat (cal
     _maybe_create_cascade_cancel_alert,
     _create_strategic_alert,
 )
+
+
+class RequestDurationMiddleware(BaseHTTPMiddleware):
+    """Middleware to measure admin API request duration and add Server-Timing headers.
+
+    Tracks backend processing time for each request, adds Server-Timing header,
+    and logs requests exceeding the slow-request threshold.
+    """
+
+    SLOW_REQUEST_THRESHOLD_MS = 500  # Log requests slower than 500ms
+
+    async def dispatch(self, request: Request, call_next: Callable) -> Response:
+        # Only measure admin/debug API endpoints
+        path = request.url.path
+        is_admin_endpoint = path.startswith("/api/admin/") or path.startswith(
+            "/api/debug/"
+        )
+        if not is_admin_endpoint:
+            return await call_next(request)
+
+        start_time = time.monotonic()
+        response = await call_next(request)
+        elapsed_ms = (time.monotonic() - start_time) * 1000
+
+        # Add Server-Timing header with backend duration
+        response.headers["Server-Timing"] = f"backend;dur={elapsed_ms:.1f}"
+
+        # Log slow requests with route template and duration
+        if elapsed_ms > self.SLOW_REQUEST_THRESHOLD_MS:
+            logger.warning(
+                "[ADMIN_PERF] slow request",
+                extra={
+                    "route": path,
+                    "method": request.method,
+                    "duration_ms": round(elapsed_ms, 1),
+                    "status": response.status_code,
+                },
+            )
+
+        return response
 
 
 app = FastAPI(
@@ -1871,6 +1913,8 @@ app.add_middleware(
         "X-CSRF-Token",
     ],
 )
+
+app.add_middleware(RequestDurationMiddleware)
 
 
 @app.get("/")

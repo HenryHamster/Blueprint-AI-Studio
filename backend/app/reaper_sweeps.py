@@ -411,6 +411,27 @@ async def sweep_stalled_strategic_cycles(
     _step7_now = _utcnow()
     actually_stalled: list = []
     pending_broadcasts: list[tuple[str, dict]] = []
+
+    # Batch-fetch all linked tasks in a single IN query to avoid N+1
+    # round-trips (one session.get per stalled cycle).
+    _pre_linked_ids: list = []
+    for _c in stalled:
+        if _c.outcome in (
+            strategic_cycle.OUTCOME_IN_PROGRESS,
+            strategic_cycle.OUTCOME_PHASE1_RUNNING,
+            strategic_cycle.OUTCOME_PHASE1_DONE,
+        ):
+            _tid = _c.phase1_task_id
+        else:
+            _tid = _c.phase2_task_id
+        if _tid is not None:
+            _pre_linked_ids.append(_tid)
+    _linked_tasks: dict = {}
+    if _pre_linked_ids:
+        _rows = await session.execute(select(Task).where(Task.id.in_(_pre_linked_ids)))
+        for _t in _rows.scalars():
+            _linked_tasks[_t.id] = _t
+
     for c in stalled:
         if c.outcome in (
             strategic_cycle.OUTCOME_IN_PROGRESS,
@@ -424,7 +445,7 @@ async def sweep_stalled_strategic_cycles(
             linked_task_id = c.phase2_task_id
 
         if linked_task_id is not None:
-            linked_task = await session.get(Task, linked_task_id)
+            linked_task = _linked_tasks.get(linked_task_id)
             if task_is_strategic_local_runner_hold(linked_task):
                 logger.info(
                     f"[REAPER] Cycle {c.id} in {stalled_phase} >3h "

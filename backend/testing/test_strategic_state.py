@@ -332,6 +332,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         status=TaskStatus.IN_PROGRESS,
         strategic_cycle_id="sc-active",
         vm_runtime_cost_banked_db=1.25,
+        estimated_cost_usd=1.25,
     )
     queued_task = Task(
         project_id=project.id,
@@ -339,6 +340,7 @@ async def test_strategic_state_returns_persistent_workbench_projection(
         payloads=[{"type": "create"}],
         status=TaskStatus.QUEUED,
         vm_runtime_cost_banked_db=0.75,
+        estimated_cost_usd=0.75,
     )
     db_session.add(phase2_task)
     db_session.add(queued_task)
@@ -773,40 +775,112 @@ async def test_strategic_state_surfaces_resident_session_availability_flag(
 
 
 @pytest.mark.asyncio
-async def test_strategic_state_cost_uses_vm_cost_source_of_truth(
+async def test_strategic_state_cost_uses_estimated_cost_usd(
     client: AsyncClient, db_session
 ):
+    """estimated_cost_usd is the source of truth for cumulative cost.
+
+    Single-attempt completed tasks never bank their cost into
+    vm_runtime_cost_banked_db (banking only runs on retry/requeue paths).
+    The terminal-success path sets estimated_cost_usd to the full VM cost
+    (banked + current-attempt), so summing that column captures all tasks.
+    """
     project = await _make_project(db_session)
-    stale_estimate_only = Task(
+    # Single-attempt completed task: cost only in estimated_cost_usd (never banked).
+    single_attempt_completed = Task(
         project_id=project.id,
-        title="Legacy estimate only",
+        title="Single-attempt completed",
         payloads=[{"type": "create"}],
         status=TaskStatus.COMPLETED,
-        estimated_cost_usd=999.0,
+        estimated_cost_usd=1.5,
     )
-    banked_cost = Task(
+    # Multi-attempt failed task: estimated_cost_usd holds the full cost;
+    # vm_runtime_cost_banked_db holds only the banked portion from prior retries.
+    multi_attempt_failed = Task(
         project_id=project.id,
-        title="Banked retry cost",
+        title="Multi-attempt failed",
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
-        estimated_cost_usd=999.0,
-        vm_runtime_cost_banked_db=1.25,
+        estimated_cost_usd=0.75,
+        vm_runtime_cost_banked_db=0.5,
     )
+    # Archived task must be excluded regardless of its cost.
     archived_cost = Task(
         project_id=project.id,
-        title="Archived retry cost",
+        title="Archived task",
         payloads=[{"type": "create"}],
         status=TaskStatus.FAILED,
         archived=True,
+        estimated_cost_usd=10.0,
         vm_runtime_cost_banked_db=10.0,
     )
-    db_session.add_all([stale_estimate_only, banked_cost, archived_cost])
+    # Active task with no prior attempts has estimated_cost_usd=NULL → contributes 0.
+    no_cost_yet = Task(
+        project_id=project.id,
+        title="Active first attempt",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add_all(
+        [single_attempt_completed, multi_attempt_failed, archived_cost, no_cost_yet]
+    )
     await db_session.commit()
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
 
     assert resp.status_code == 200
-    assert resp.json()["tasks"]["cumulative_estimated_cost_usd"] == pytest.approx(1.25)
+    # 1.5 (single-attempt) + 0.75 (multi-attempt full cost) = 2.25; archived excluded.
+    assert resp.json()["tasks"]["cumulative_estimated_cost_usd"] == pytest.approx(2.25)
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_cost_uses_sql_aggregate_and_current_attempt(
+    client: AsyncClient, db_session
+):
+    """Cost total uses SQL SUM(estimated_cost_usd) for non-archived tasks."""
+    project = await _make_project(db_session)
+    # Task 1: completed with estimated_cost_usd — covered by SQL aggregate
+    completed = Task(
+        project_id=project.id,
+        title="Completed task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        estimated_cost_usd=2.00,
+    )
+    # Task 2: failed with estimated_cost_usd — also covered by SQL aggregate
+    failed = Task(
+        project_id=project.id,
+        title="Failed task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.FAILED,
+        estimated_cost_usd=1.50,
+    )
+    # Task 3: archived — excluded from SQL aggregate
+    archived = Task(
+        project_id=project.id,
+        title="Archived cost",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        archived=True,
+        estimated_cost_usd=99.0,
+    )
+    # Task 4: active with no estimated_cost_usd — contributes 0
+    active = Task(
+        project_id=project.id,
+        title="Active task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.IN_PROGRESS,
+        estimated_cost_usd=None,
+    )
+    db_session.add_all([completed, failed, archived, active])
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    assert resp.status_code == 200
+    data = resp.json()
+    cost = data["tasks"]["cumulative_estimated_cost_usd"]
+    # SQL aggregate picks up 2.00 + 1.50; archived and active(NULL) excluded.
+    assert cost == pytest.approx(3.50)
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-import { useMemo, useRef, useEffect, useState, useCallback } from 'react';
+import { useMemo, useRef, useEffect, useState, useCallback, lazy, Suspense } from 'react';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Activity, AlertCircle, CheckSquare, LayoutList, PanelRightOpen } from 'lucide-react';
 import { ColumnsPicker } from './components/ColumnsPicker';
@@ -43,8 +43,10 @@ import { FAILURE_CLASS_CONFIG } from './components/TaskCard';
 import type { Task } from './components/TaskCard';
 import { VersionMismatchBanner } from './components/VersionMismatchBanner';
 import { NullBranchDiagnosticsPanel } from './components/NullBranchDiagnosticsPanel';
-import { ProjectWorkspace, RuntimeWorkspace, type ProjectManageSection, type ProjectSection, type RuntimeSection, type RuntimeSettingsSection } from './components/OperatorWorkspaces';
-import { PipelineWorkspace } from './components/PipelineWorkspace';
+import type { ProjectManageSection, ProjectSection, RuntimeSection, RuntimeSettingsSection } from './components/OperatorWorkspaces';
+const ProjectWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.ProjectWorkspace })));
+const RuntimeWorkspace = lazy(() => import('./components/OperatorWorkspaces').then(m => ({ default: m.RuntimeWorkspace })));
+const PipelineWorkspace = lazy(() => import('./components/PipelineWorkspace').then(m => ({ default: m.PipelineWorkspace })));
 import { WorkbenchFrame, WorkbenchSplit, WorkbenchStatusBar, WorkbenchSurface } from './components/WorkbenchLayout';
 import { useStrategicReadModel } from './hooks/useStrategicReadModel';
 import { useOperatorKeyboardShortcuts } from './hooks/useOperatorKeyboardShortcuts';
@@ -1614,6 +1616,7 @@ export default function App() {
         </WorkbenchSurface>
       ) : activeTab === 'project' ? (
         <ErrorBoundary level="panel">
+          <Suspense fallback={null}>
           <ProjectWorkspace
             projectSection={projectSection}
             onProjectSectionChange={setProjectSection}
@@ -1635,9 +1638,11 @@ export default function App() {
             onViewKnowledge={(dirId) => { setKnowledgeBrowserDirectionId(dirId); s.setShowKnowledgeBrowser(true); }}
             onNavigateToTask={handleViewTaskById}
           />
+          </Suspense>
         </ErrorBoundary>
       ) : activeTab === 'runtime' ? (
         <ErrorBoundary level="panel">
+          <Suspense fallback={null}>
           <RuntimeWorkspace
             runtimeSection={runtimeSection}
             onRuntimeSectionChange={setRuntimeSection}
@@ -1687,8 +1692,10 @@ export default function App() {
             versionLifecycleRefreshing={versionLifecycleRefreshing}
             refreshVersionLifecycle={refreshVersionLifecycle}
           />
+          </Suspense>
         </ErrorBoundary>
       ) : (
+        <Suspense fallback={null}>
         <PipelineWorkspace
           surface={{
             pipelineSection,
@@ -1819,6 +1826,7 @@ export default function App() {
             onUntrackAll: s.untrackAll,
           }}
         />
+        </Suspense>
       )}
       </WorkbenchFrame>
 

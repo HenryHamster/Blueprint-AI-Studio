@@ -6,7 +6,9 @@ and work_session_check_in. It is registered in main.py alongside
 admin_projects_router under the same /api/admin prefix.
 """
 
+import asyncio
 import logging
+import time
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
@@ -15,7 +17,6 @@ from sqlmodel import select
 from sqlalchemy import func, or_, and_
 from typing import Dict, Any
 import uuid
-from sqlalchemy.orm import load_only
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.database import get_session
@@ -32,8 +33,6 @@ from app.models import (
     TaskStatus,
     Project,
     _utcnow,
-    _TASK_BANKED_VM_RUNTIME_COST_KEY,
-    get_task_total_vm_cost_usd_or_none,
 )
 from app.auth import get_current_user
 from app.admin import _get_user_project_with_role
@@ -121,6 +120,23 @@ router = APIRouter(
 )
 
 logger = logging.getLogger(__name__)
+
+# In-process TTL cache for _resolve_candidate_currency results.
+# Key: (project_id_str, integration_branch, candidate_sha)
+# Value: (result_dict, expires_monotonic)
+_CURRENCY_CACHE: dict[tuple[str, str, str], tuple[dict, float]] = {}
+_CURRENCY_CACHE_TTL_S = 60.0
+
+# In-process TTL cache for project cumulative cost aggregation.
+# Key: project_id_str
+# Value: (cost_float, expires_monotonic)
+_COST_CACHE: dict[str, tuple[float, float]] = {}
+_COST_CACHE_TTL_S = 90.0
+
+# Timeout for the GitHub API call in the strategic-state hot path.
+# On cache miss this call can block up to 15 s (bounded retries + HTTP timeout);
+# cap it at 3 s so a slow or unreachable GitHub degrades to 'unknown' quickly.
+_CURRENCY_RESOLVE_TIMEOUT_S = 3.0
 
 
 def _build_work_session_summary(
@@ -996,46 +1012,33 @@ async def get_project_strategic_state(
         elif status == TaskStatus.CANCELLED:
             task_counts["cancelled"] += n
 
-    # Only tasks with actual VM-cost evidence can contribute to the total —
-    # get_task_total_vm_cost_usd_or_none returns None (skipped below) for any
-    # task with no banked amount and no provisioning window. Filtering to that
-    # set in SQL keeps the materialized rows bounded to cost-bearing tasks
-    # instead of every non-archived task, with identical cost semantics. A pure
-    # func.sum() cannot replace this because the per-task current-attempt cost
-    # depends on machine-type/spot pricing resolved in Python.
-    cost_tasks = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.project_id == project.id,
-                Task.archived.is_(False),
-                or_(
-                    Task.vm_provisioned_at.is_not(None),
-                    Task.vm_runtime_cost_banked_db.is_not(None),
-                    Task.context[_TASK_BANKED_VM_RUNTIME_COST_KEY]
-                    .as_string()
-                    .is_not(None),
-                ),
-            )
-            .options(
-                load_only(
-                    Task.id,
-                    Task.context,
-                    Task.vm_runtime_cost_banked_db,
-                    Task.vm_provisioned_at,
-                    Task.vm_stopped_at,
-                    Task.vm_machine_type,
-                    Task.vm_spot,
-                    raiseload=True,
+    # Aggregate estimated_cost_usd in SQL to avoid materializing every non-archived
+    # task row. estimated_cost_usd is set at completion (terminal success/failure)
+    # to the full VM cost (banked retries + current-attempt interval), and is also
+    # updated by bank_task_current_attempt on retry/requeue paths. This correctly
+    # captures single-attempt completed tasks whose cost was never banked into
+    # vm_runtime_cost_banked_db. Active tasks with no prior attempts have
+    # estimated_cost_usd=NULL and contribute 0, matching the original behavior
+    # (current-attempt cost requires Python pricing logic and vm_stopped_at).
+    # Result is cached for _COST_CACHE_TTL_S to avoid a full-table scan on
+    # every 30-second poll tick.
+    _cost_key = str(project.id)
+    _cost_now = time.monotonic()
+    _cost_cached = _COST_CACHE.get(_cost_key)
+    if _cost_cached is not None and _cost_cached[1] > _cost_now:
+        cost_total = _cost_cached[0]
+    else:
+        cost_total = (
+            await session.execute(
+                select(
+                    func.coalesce(func.sum(Task.estimated_cost_usd), 0.0)
+                ).where(
+                    Task.project_id == project.id,
+                    Task.archived.is_(False),
                 )
             )
-        )
-    ).scalars().all()
-    cost_total = sum(
-        cost
-        for task in cost_tasks
-        if (cost := get_task_total_vm_cost_usd_or_none(task)) is not None
-    )
+        ).scalar() or 0.0
+        _COST_CACHE[_cost_key] = (float(cost_total), _cost_now + _COST_CACHE_TTL_S)
     task_focus = await _build_task_focus(session, project.id)
 
     message_rows = (
@@ -1183,9 +1186,29 @@ async def get_project_strategic_state(
         try:
             _last_qual = open_version.last_qualification or {}
             _integration_branch = get_project_integration_branch(project)
-            currency = await _resolve_candidate_currency(
-                session, project, _last_qual, _integration_branch
-            )
+            _candidate_sha = _last_qual.get("candidate_sha") or ""
+            _cache_key = (str(project.id), _integration_branch, _candidate_sha)
+            _now = time.monotonic()
+            _cached = _CURRENCY_CACHE.get(_cache_key)
+            if _cached is not None and _cached[1] > _now:
+                currency = _cached[0]
+            else:
+                currency = await asyncio.wait_for(
+                    _resolve_candidate_currency(
+                        session, project, _last_qual, _integration_branch
+                    ),
+                    timeout=_CURRENCY_RESOLVE_TIMEOUT_S,
+                )
+                # Don't cache transient api_unreachable verdicts — a GitHub blip
+                # should not pin a stale banner for the full TTL.
+                _verdict = currency.get("verdict") if isinstance(currency, dict) else None
+                if _verdict != "api_unreachable":
+                    # Purge expired entries on write to prevent unbounded growth
+                    # (key includes candidate_sha which rotates each cycle).
+                    _expired = [k for k, v in _CURRENCY_CACHE.items() if v[1] <= _now]
+                    for _k in _expired:
+                        del _CURRENCY_CACHE[_k]
+                    _CURRENCY_CACHE[_cache_key] = (currency, _now + _CURRENCY_CACHE_TTL_S)
             # Typed block: fresh/stale carry SHA detail; api_unreachable and
             # unknown carry their verdict/reason WITHOUT a stale flag so the
             # dashboard distinguishes a transient GitHub outage from genuine

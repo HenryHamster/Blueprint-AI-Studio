@@ -980,6 +980,44 @@ class TestGetProject:
         assert "proof_records" not in caps[1]
 
 
+class TestGetProjectSummary:
+    @pytest.mark.asyncio
+    async def test_summary_excludes_design_doc_and_self_reflection_log(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /summary omits design_doc and self_reflection_log but returns
+        essential fields like capability_adoption_verdicts and build_config."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project = await _make_project(db_session, name="Summary Endpoint Test")
+        project.design_doc = {"repo_overview": {"overview": "x" * 5000}}
+        project.self_reflection_log = [{"entry": "log entry 1"}]
+        flag_modified(project, "design_doc")
+        flag_modified(project, "self_reflection_log")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/projects/{project.id}/summary")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "design_doc" not in data
+        assert "self_reflection_log" not in data
+        assert data["id"] == str(project.id)
+        assert data["name"] == "Summary Endpoint Test"
+        assert "capability_adoption_verdicts" in data
+        assert "capability_proof_summary" in data
+        assert "my_role" in data
+        assert "build_config" in data
+
+    @pytest.mark.asyncio
+    async def test_summary_returns_404_for_unknown_project(
+        self, client: AsyncClient, db_session
+    ):
+        """GET /summary returns 404 when project does not exist."""
+        resp = await client.get(f"/api/admin/projects/{uuid.uuid4()}/summary")
+        assert resp.status_code == 404
+
+
 class TestUpdateProject:
     @pytest.mark.asyncio
     async def test_update_project_name(self, client: AsyncClient, db_session):

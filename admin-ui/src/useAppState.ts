@@ -336,7 +336,7 @@ export function useAppState({ refreshStrategicReadModelRef, refreshMessagesRef, 
     if (selectedProject.capability_proof_summary && selectedProject.capability_adoption_verdicts) return;
 
     let cancelled = false;
-    authGet(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}`)
+    authGet(`${API_BASE_URL}/api/admin/projects/${encodeURIComponent(selectedProjectId)}/summary`)
       .then(async res => {
         if (!res.ok || cancelled) return;
         const detailedProject = await res.json() as Project;

@@ -2963,6 +2963,7 @@ class ProjectMessage(SQLModel, table=True):
         ),
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
+        Index("ix_projectmessage_from_task_id", "from_task_id"),
     )
 
 

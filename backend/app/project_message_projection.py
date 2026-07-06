@@ -29,6 +29,25 @@ DEFAULT_MESSAGE_CONTEXT_PREVIEW_KEYS = (
     "dedupe_key",
 )
 
+# Compact set of context keys rendered by the list UI (grouping, severity badges,
+# reply previews, convergence links, etc.). strategic_session is handled separately
+# below via sanitize_strategic_session_snapshot to keep the payload bounded.
+_LIST_CONTEXT_KEYS = frozenset({
+    "event_type",
+    "severity",
+    "annotation_type",
+    "task_type",
+    "source",
+    "milestone",
+    "reply_to",
+    "reply_preview",
+    "_convergence_link",
+    "_provenance_warnings",
+    "task_id",
+    "pr_url",
+    "result",
+})
+
 MESSAGE_EVENT_REFETCH_SURFACES = (SURFACE_MESSAGES, SURFACE_STRATEGIC_SESSION)
 _MESSAGE_EVENT_EXCERPT_MAX_CHARS = 160
 
@@ -73,6 +92,35 @@ def project_message_base(message: ProjectMessage) -> dict[str, Any]:
 
 def admin_message_dict(message: ProjectMessage) -> dict[str, Any]:
     return project_message_base(message)
+
+
+def admin_message_list_dict(message: ProjectMessage) -> dict[str, Any]:
+    """Like admin_message_dict but filters context to the compact set rendered by the list UI.
+
+    The list endpoint fetches context but strips large keys before returning, keeping
+    the 30-second poll payload small while preserving context fields needed for grouping,
+    severity, badges, reply previews, and the strategic context descriptor on user messages.
+    strategic_session is included but sanitized via sanitize_strategic_session_snapshot.
+    """
+    ctx = _message_context(message)
+    compact_ctx = {k: v for k, v in ctx.items() if k in _LIST_CONTEXT_KEYS}
+    if isinstance(ctx.get("strategic_session"), dict):
+        sanitized = sanitize_strategic_session_snapshot(ctx["strategic_session"])
+        if strategic_session_snapshot_has_signal(sanitized):
+            compact_ctx["strategic_session"] = sanitized
+    return {
+        "id": str(message.id),
+        "project_id": str(message.project_id),
+        "message_type": enum_value(message.message_type),
+        "from_type": message.from_type,
+        "from_task_id": str(message.from_task_id) if message.from_task_id else None,
+        "content": message.content,
+        "context": compact_ctx,
+        "status": enum_value(message.status),
+        "resolution": message.resolution,
+        "resolved_at": _isoformat(message.resolved_at),
+        "created_at": _isoformat(message.created_at),
+    }
 
 
 def message_event_payload(
