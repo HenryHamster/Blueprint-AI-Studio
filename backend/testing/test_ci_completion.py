@@ -5082,8 +5082,9 @@ async def test_criterion_evidence_persisted_via_attempt_merge(db_session, mocker
     task_merge_ev = [e for e in evidence if e.source_kind == "task_merge"]
     assert len(task_merge_ev) == 1, "exactly one task_merge evidence row expected"
     assert task_merge_ev[0].source_id == str(orig_task.id)
-    # Evidence must include proven=True so the criterion coverage transitions to 'covered'
-    assert task_merge_ev[0].detail == {"proven": True}, (
+    # Evidence must include proven=True so the criterion coverage transitions to 'covered'.
+    # The detail dict may also contain direction_key and other metadata fields.
+    assert task_merge_ev[0].detail.get("proven") is True, (
         "task_merge evidence must have proven=True to satisfy criterion coverage"
     )
     # Verify coverage is 'covered' due to the proven evidence

@@ -292,8 +292,13 @@ async def agent_list_tasks(
     id_order = {tid: idx for idx, tid in enumerate(task_ids)}
     rows = sorted(rows_unordered, key=lambda t: id_order.get(t.id, len(task_ids)))
 
+    # Only surface top-level strategist tasks (depth=0); children appear nested
+    # under their parent via the children field, not as separate top-level items.
+    task_id_set = {t.id for t in rows}
+    top_level_rows = [t for t in rows if t.parent_task_id not in task_id_set]
+
     # Fetch PR artifacts for terminal tasks in one query to avoid N+1.
-    terminal_ids = [t.id for t in rows if t.status in _TERMINAL_STATUSES]
+    terminal_ids = [t.id for t in top_level_rows if t.status in _TERMINAL_STATUSES]
     pr_map: dict[uuid.UUID, str] = {}
     if terminal_ids:
         art_rows = (
@@ -310,11 +315,11 @@ async def agent_list_tasks(
         for a in art_rows:
             pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
 
-    parent_ids = [t.id for t in rows]
+    parent_ids = [t.id for t in top_level_rows]
     children_map = await _fetch_children(parent_ids, project_id, session)
 
     items = []
-    for t in rows:
+    for t in top_level_rows:
         pr_url = pr_map.get(t.id) if t.status in _TERMINAL_STATUSES else None
         item = _build_task_response(t, pr_url=pr_url)
         item["children"] = children_map.get(t.id, [])

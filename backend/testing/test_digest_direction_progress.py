@@ -2312,7 +2312,7 @@ async def test_digest_direction_progress_tz_aware_timestamp_counted(
 async def test_conversion_rate_excludes_non_pr_task_types(
     client: AsyncClient, db_session
 ):
-    """Conversion rate denominator excludes research/investigate/audit/memo tasks that never open PRs."""
+    """Conversion rate denominator excludes research/investigate/security_audit/memo tasks that never open PRs."""
     project = make_project(
         directions=[
             {
@@ -2326,11 +2326,12 @@ async def test_conversion_rate_excludes_non_pr_task_types(
                         ).isoformat(),
                         "prs_merged": 3,
                         "tasks_created": 8,
-                        # 8 total tasks: 3 create (PR-eligible), 2 research + 2 audit + 1 memo (non-PR)
+                        # 8 total tasks: 3 create (PR-eligible),
+                        # 2 research + 2 security_audit + 1 memo (all in READ_ONLY_TASK_TYPES = non-PR)
                         "type_breakdown": {
                             "create": {"created": 3, "merged": 3, "failed": 0},
                             "research": {"created": 2, "merged": 0, "failed": 0},
-                            "audit": {"created": 2, "merged": 0, "failed": 0},
+                            "security_audit": {"created": 2, "merged": 0, "failed": 0},
                             "memo": {"created": 1, "merged": 0, "failed": 0},
                         },
                     }
@@ -2360,7 +2361,8 @@ async def test_conversion_rate_excludes_non_pr_task_types(
     assert len(data["direction_progress"]) == 1
     dp = data["direction_progress"][0]
     # conversion_rate should be 3 merged / 3 PR-eligible (create tasks only)
-    # Not 3 / 8 (which would be the old incorrect behavior)
+    # Not 3 / 8 (which would be the old incorrect behavior).
+    # security_audit, research, memo are all in READ_ONLY_TASK_TYPES (= PR_INELIGIBLE_TASK_TYPES).
     assert dp["prs_merged"] == 3
     assert dp["conversion_rate"] == 1.0  # 3 merged / 3 PR-eligible
 

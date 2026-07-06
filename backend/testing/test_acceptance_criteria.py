@@ -694,7 +694,9 @@ async def test_stuck_criterion_attention_item(db_session):
 
     assert attention["level"] == "needs_operator"
     assert attention["counts"]["stuck_acceptance_criteria"] == 2
-    assert attention["counts"]["needs_operator"] == 2
+    # stuck_criteria_count (2) + coverage_blocked_count (1 for c_active: uncovered with
+    # active direction but no evidence yet) = 3 total needs_operator items.
+    assert attention["counts"]["needs_operator"] == 3
     items = {item["id"]: item for item in attention["items"]}
     no_map_id = f"version:{version.id}:acceptance_criterion:{c_no_map.criterion_key}"
     retired_id = f"version:{version.id}:acceptance_criterion:{c_retired.criterion_key}"
