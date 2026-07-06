@@ -896,7 +896,11 @@ async def _apply_rollup_merge_classification(
     Returns (record_merged, terminal, landed_branch).
     """
     from app.branch_resolution import classify_rollup_merge_outcome
-    from app.landed_signal import apply_merged_landed_signal, mark_landed_on_integration
+    from app.landed_signal import (
+        apply_merged_landed_signal,
+        has_landed_signal,
+        mark_landed_on_integration,
+    )
 
     record_merged, terminal, landed = await classify_rollup_merge_outcome(
         task,
@@ -927,6 +931,31 @@ async def _apply_rollup_merge_classification(
                 hotfix_lane=hotfix_lane,
                 non_merge_reason=non_merge_reason,
             )
+        # Membership-based merge-credit propagation. The signal writes above only
+        # stamp the rollup ITSELF; when it landed on the integration branch, every
+        # child whose PR merged onto the rollup's staging branch reached the trunk
+        # too — but squash-merge makes each child's own merge commit an ancestor of
+        # nothing on integration, so per-task ancestry reconciliation can never
+        # re-credit it. Propagate by lineage subtree instead. This is a bare
+        # ``session.add`` on descendant rows (no commit); every recovery caller
+        # (reaper orphan sweep, EVALUATING pr-check, lost-marker recovery) commits
+        # ``task`` afterwards, so the child stamps ride that commit. Best-effort: a
+        # propagation error must never undo the recovered rollup landing.
+        if has_landed_signal(task):
+            try:
+                from app.rollup_management import (
+                    _propagate_landed_to_staging_merged_descendants,
+                )
+
+                await _propagate_landed_to_staging_merged_descendants(task.id, session)
+            except Exception:  # noqa: BLE001 — credit propagation never blocks recovery
+                logger.warning(
+                    "[ROLLUP] landed-signal propagation failed for recovered "
+                    "rollup %s (%s)",
+                    getattr(task, "id", None),
+                    source,
+                    exc_info=True,
+                )
     return record_merged, terminal, landed
 
 

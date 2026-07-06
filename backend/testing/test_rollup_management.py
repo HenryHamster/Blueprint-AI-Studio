@@ -2881,6 +2881,71 @@ async def test_propagate_landed_bfs_stamps_grandchildren(cleanup_db):
     assert "_non_merge_unblock_reason" not in (grandchild.context or {})
 
 
+@pytest.mark.asyncio
+async def test_propagate_landed_descendants_returns_stamped_and_is_idempotent(
+    cleanup_db,
+):
+    """The BFS sweep RETURNS the descendants it newly stamped so callers (the
+    ci_completion rollup-landing path) can re-credit their directions, and it is
+    idempotent: a second sweep, with everything already landed, stamps nothing and
+    returns []. Force-dropped children are never stamped nor returned.
+    """
+    from app.rollup_management import _propagate_landed_to_staging_merged_descendants
+    from app.landed_signal import has_landed_signal
+
+    project = await _make_project(cleanup_db, integration_branch="main")
+    outer = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+    )
+    # staging-merged child — must be stamped AND returned
+    child = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+        },
+    )
+    # force-dropped child (never genuinely merged) — must NOT be stamped or returned
+    dropped = await _make_task(
+        cleanup_db,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=outer.id,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "rollup_no_pr_artifact",
+        },
+    )
+
+    stamped = await _propagate_landed_to_staging_merged_descendants(
+        outer.id, cleanup_db
+    )
+    await cleanup_db.commit()
+
+    stamped_ids = {t.id for t in stamped}
+    assert child.id in stamped_ids
+    assert dropped.id not in stamped_ids
+    assert has_landed_signal(child)
+    await cleanup_db.refresh(dropped)
+    assert (dropped.context or {}).get("landed_on_integration") is False
+
+    # Idempotent: everything is already landed / force-dropped, so a re-run stamps
+    # nothing and returns an empty list (no double-credit).
+    again = await _propagate_landed_to_staging_merged_descendants(outer.id, cleanup_db)
+    assert again == []
+
+
 # ---------------------------------------------------------------------------
 # _do_rollup_post_merge_housekeeping: multi-direction refresh
 # ---------------------------------------------------------------------------

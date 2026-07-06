@@ -37,7 +37,11 @@ from app.acceptance_gate import (
     acceptance_was_declared,
     classify_merged_acceptance,
 )
-from app.landed_signal import LANDED_ON_INTEGRATION_KEY, is_merged_completion
+from app.landed_signal import (
+    LANDED_ON_INTEGRATION_KEY,
+    has_merge_unblock_signal,
+    is_merged_completion,
+)
 from app.models import (
     Artifact,
     ArtifactType,
@@ -638,6 +642,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     # --- PR / merge counts ---
     "prs_merged": {
         "consumer": "digest_direction_progress.py, direction_lifecycle.py, strategic_spawning.py, DirectionCard.tsx (+ many)"
+    },
+    "merged_prs_any_base": {
+        "consumer": "strategic_completion.py (_compute_churn_metrics raw-merge-volume backstop — never pause a direction with real merges in flight)"
     },
     "prs_rejected": {
         "consumer": "review_pipeline.py, pipeline_health.py, strategic_spawning.py"
@@ -1422,6 +1429,23 @@ async def _update_direction_research_outcomes(
     # to return them to QUEUED.
     # tasks_blocked retired 2026-06-05 — see RESEARCH_HISTORY_METRIC_MANIFEST.
     entry["prs_merged"] = sum(1 for ct in child_tasks_rows if is_merged_completion(ct))
+    # merged_prs_any_base: children that COMPLETED, opened a real PR, and got that
+    # PR MERGED — onto the integration branch OR a rollup staging branch. It is the
+    # raw merge-*volume* signal: unlike prs_merged (integration-landed only, gated
+    # on is_merged_completion), a child whose PR merged to a staging branch still
+    # carries has_merge_unblock_signal=True (pr_merged) even before its rollup lands
+    # and re-stamps landed_on_integration. No-op / no-PR success closes are excluded
+    # via _opened_pr, so this never counts "no changes needed" completions as merges.
+    # Consumed by the churn guardrail as a defense-in-depth backstop: a direction
+    # with real merges in flight is never paused as "0 real merges" even if a rollup
+    # landing's credit propagation has not yet recomputed prs_merged.
+    entry["merged_prs_any_base"] = sum(
+        1
+        for ct in child_tasks_rows
+        if ct.status == TaskStatus.COMPLETED
+        and has_merge_unblock_signal(ct)
+        and _opened_pr(ct)
+    )
     entry["prs_rejected"] = sum(
         1
         for ct in child_tasks_rows

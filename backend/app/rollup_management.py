@@ -433,7 +433,7 @@ def _propagate_landed_to_rollup_children(
 
 async def _propagate_landed_to_staging_merged_descendants(
     parent_task_id, session: AsyncSession
-) -> None:
+) -> list[Task]:
     """Recursively stamp landed_on_integration on all staging-merged descendants.
 
     ``_propagate_landed_to_rollup_children`` only touches the direct children
@@ -450,6 +450,14 @@ async def _propagate_landed_to_staging_merged_descendants(
     ``has_landed_signal``, skipping force-dropped children exactly as the sync
     helper does.  Idempotent: descendants that already carry the landed signal
     are skipped.
+
+    Returns the descendant tasks newly stamped by THIS call (empty when every
+    descendant was already landed / force-dropped / never merged). Callers that
+    must also re-credit the affected directions — the churn / merge-rate
+    counters are recomputed per-cycle from ``research_history`` and only pick a
+    child up once ``is_merged_completion`` is True — use the returned tasks to
+    drive one ``refresh_direction_outcomes_after_merge`` per distinct direction.
+    Existing callers that ignore the return value are unaffected.
     """
     from app.landed_signal import (
         NON_MERGE_UNBLOCK_REASON_KEY,
@@ -460,6 +468,7 @@ async def _propagate_landed_to_staging_merged_descendants(
 
     visited: set = {parent_task_id}
     queue: list = [parent_task_id]
+    stamped: list[Task] = []
 
     while queue:
         rows = (
@@ -486,10 +495,13 @@ async def _propagate_landed_to_staging_merged_descendants(
             ):
                 mark_landed_on_integration(row)
                 session.add(row)
+                stamped.append(row)
 
             next_queue.append(row.id)
 
         queue = next_queue
+
+    return stamped
 
 
 async def _hold_rollup_for_branch_safety(

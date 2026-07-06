@@ -608,6 +608,77 @@ class TestCheckDirectionHealth:
         assert "0 merged" in result
         assert "5 cycles" in result
 
+    # --- Rule 5 defense-in-depth: raw merge-volume backstop ---
+
+    def test_compute_churn_metrics_exposes_real_merges(self):
+        # real_merges is the windowed sum of merged_prs_any_base (raw merge volume).
+        hist = _history(3, prs_merged=0)
+        for e in hist:
+            e["merged_prs_any_base"] = 2
+        m = _compute_churn_metrics(_direction(research_history=hist))
+        assert m["real_merges"] == 6
+        # Legacy entries lacking the field contribute 0 — no crash, no false credit.
+        legacy = _compute_churn_metrics(
+            _direction(research_history=_history(3, prs_merged=0))
+        )
+        assert legacy["real_merges"] == 0
+
+    def test_rule5_churn_suppressed_when_real_merges_present(self):
+        # Same shape as the default-threshold churn case (non_merge_finished=15,
+        # credit-gate merge_rate=0%), but the cycles ALSO carry raw staging/
+        # integration merges whose landed credit has not yet propagated into
+        # verified_prs_merged. The defense-in-depth guard must suppress the pause.
+        hist = _history(
+            5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+        )
+        for e in hist:
+            e["merged_prs_any_base"] = 3
+        d = _direction(research_history=hist)
+        m = _compute_churn_metrics(d)
+        # credit-gate metrics still look exactly like churn...
+        assert m["non_merge_finished"] >= 15
+        assert m["merge_rate"] < 0.10
+        assert m["real_merges"] == 15
+        # ...but real merges are in flight, so the guardrail must NOT pause.
+        assert _check_direction_health(d) is None
+
+    def test_rule5_churn_still_fires_when_no_real_merges(self):
+        # Explicit merged_prs_any_base=0 on every cycle: nothing merged anywhere.
+        # This is GENUINE churn and the guardrail must still pause.
+        hist = _history(
+            5, tasks_created=5, tasks_completed=3, tasks_failed=0, prs_merged=0
+        )
+        for e in hist:
+            e["merged_prs_any_base"] = 0
+        d = _direction(research_history=hist)
+        result = _check_direction_health(d)
+        assert result is not None
+        assert "Churn guardrail" in result
+
+    def test_non_merge_pause_suppressed_when_real_merges_present(self):
+        # Isolates the NON-MERGE-RATE proxy (the zero-merge tail): 5 finished cycles,
+        # 0 credited merges, and NO code failures (tasks_failed=0) so the separate,
+        # deliberately-ungated code-failure "Recent stall" guard cannot fire. The
+        # bare fixture pauses "Unproductive:"; injecting real staging/integration
+        # merges (merged_prs_any_base>0) whose landed credit has not yet propagated
+        # must suppress it. The raw-merge guard is scoped to the merge-rate proxy
+        # ONLY — it never masks a genuine crash signal.
+        cycle = dict(
+            tasks_created=2,
+            tasks_completed=2,
+            tasks_failed=0,
+            tasks_failed_infra=0,
+            prs_merged=0,
+        )
+        churning = _direction(research_history=[dict(cycle) for _ in range(5)])
+        result = _check_direction_health(churning)
+        assert result is not None and "Unproductive" in result  # fires w/o raw merges
+
+        landing = _direction(
+            research_history=[{**cycle, "merged_prs_any_base": 2} for _ in range(5)]
+        )
+        assert _check_direction_health(landing) is None  # suppressed by raw volume
+
     # --- Rule 6: Lifetime cumulative burn backstop ---
 
     def test_rule6_fires_when_aggregate_pushes_lifetime_over_threshold(self):

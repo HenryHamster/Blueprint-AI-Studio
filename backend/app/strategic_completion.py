@@ -2177,11 +2177,21 @@ def _compute_churn_metrics(direction: dict) -> dict | None:
     )
     total_finished = merged + non_merge_finished
     merge_rate = proof_merged / total_finished if total_finished > 0 else 0.0
+    # Raw merge volume: children whose PR actually MERGED — onto the integration
+    # branch OR a rollup staging branch — over the window. Unlike ``merged``
+    # (credit-gate, integration-landed only), this stays non-zero the moment work
+    # lands on a staging branch, before the rollup lands and re-stamps
+    # landed_on_integration. It is a defense-in-depth backstop for the pause gate:
+    # a direction whose work is demonstrably landing must never be paused as
+    # "0 real merges" merely because rollup-landing credit propagation has not yet
+    # recomputed prs_merged. Legacy entries lacking the field contribute 0.
+    real_merges = sum(int(e.get("merged_prs_any_base") or 0) for e in window)
     return {
         "window_cycles": len(window),
         "merged": merged,
         "non_merge_finished": non_merge_finished,
         "merge_rate": round(merge_rate, 3),
+        "real_merges": real_merges,
     }
 
 
@@ -2405,7 +2415,16 @@ def _direction_non_merge_pause(direction: dict) -> str | None:
     # same non-merge proxy: a direction shipping literally nothing over five cycles.
     if len(history) >= 5:
         total_merged = sum(verified_merged_count(entry) for entry in history)
-        if total_merged == 0:
+        # Raw merge volume across the direction's whole life (integration + staging
+        # merges). A direction that merged real PRs — even ones whose rollup-landing
+        # credit has not yet propagated back into verified_prs_merged — is NOT
+        # "shipping literally nothing"; this zero-merge pause must not fire on the
+        # merge-credit-propagation lag. Legacy entries lacking the field contribute 0,
+        # preserving the pause for genuinely unproductive directions.
+        real_merges_any = sum(
+            int(entry.get("merged_prs_any_base") or 0) for entry in history
+        )
+        if total_merged == 0 and real_merges_any == 0:
             non_merge_real = sum(
                 max(0, entry.get("tasks_completed", 0))
                 - entry.get("tasks_completed_no_pr", 0)
@@ -2441,6 +2460,13 @@ def _direction_non_merge_pause(direction: dict) -> str | None:
             metrics
             and metrics["non_merge_finished"] >= churn_threshold
             and metrics["merge_rate"] < churn_min_merge_rate
+            # Defense-in-depth: never pause a direction whose work is demonstrably
+            # landing. ``real_merges`` counts PRs that actually merged (integration
+            # OR staging) over the window; it stays non-zero even when a rollup
+            # landing's merge-credit has not yet propagated into the credit-gate
+            # ``merge_rate``. Genuine churn (nothing merged anywhere) keeps
+            # ``real_merges == 0`` and still trips the guardrail.
+            and metrics.get("real_merges", 0) == 0
         ):
             return (
                 f"Churn guardrail: {metrics['non_merge_finished']} tasks finished "

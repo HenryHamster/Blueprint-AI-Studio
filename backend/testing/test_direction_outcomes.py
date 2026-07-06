@@ -519,6 +519,76 @@ async def test_pr_metrics_exclude_non_merge_unblocks(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_merged_prs_any_base_counts_staging_and_integration(
+    db_session: AsyncSession,
+):
+    """merged_prs_any_base is the raw merge-VOLUME backstop for the churn guardrail.
+
+    It counts children that opened a PR and got it MERGED — onto the integration
+    branch OR a rollup staging branch — while excluding no-op / no-PR success
+    closes. Unlike prs_merged (integration-landed only), a staging-merged child is
+    counted here even before its rollup lands and re-stamps landed_on_integration,
+    so a direction whose work is demonstrably landing is never falsely paused as
+    "0 real merges".
+    """
+    direction_id = "d-any-base"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # (1) landed on integration — counts in prs_merged AND merged_prs_any_base.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True, "pr_number": 101},
+        title="landed",
+    )
+    # (2) merged onto a staging branch (rollup not yet landed) — counts ONLY in
+    #     merged_prs_any_base, not prs_merged.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "landed_on_integration": False,
+            "_non_merge_unblock_reason": "merged_pr_non_integration_branch",
+            "pr_number": 102,
+        },
+        title="staging-merged",
+    )
+    # (3) no-op success close (pr_merged, but no PR ever opened) — counts in NEITHER.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="no-op-success",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry["prs_merged"] == 1  # integration-landed only
+    assert entry["merged_prs_any_base"] == 2  # landed + staging-merged, NOT the no-op
+
+
+@pytest.mark.asyncio
 async def test_confirmed_non_landing_discounts_credit_gate(db_session: AsyncSession):
     """A badge-counted task confirmed non-landing via ancestry reduces credit_gate_merged_count.
 

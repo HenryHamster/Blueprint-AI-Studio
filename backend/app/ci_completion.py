@@ -614,8 +614,18 @@ async def _attempt_merge_with_retry_and_escalation(
                                 == "stranded"
                             ):
                                 record_pr_merged = False
+                        # One representative task id per distinct direction among the
+                        # rollup's descendants that this landing newly credits —
+                        # populated by the membership propagation below and consumed by
+                        # the post-commit direction recompute so multi-direction rollups
+                        # heal every affected direction, not just orig's own. Storing the
+                        # id (a plain value) rather than the ORM object keeps the loop
+                        # safe across a mid-refresh session.rollback() that would expire
+                        # every instance and turn a stale attribute read into a
+                        # MissingGreenlet lazy-load.
+                        _orig_dir_reps: dict = {}
                         if record_pr_merged:
-                            apply_merged_landed_signal(
+                            _orig_landed_on_integration = apply_merged_landed_signal(
                                 orig,
                                 orig_project,
                                 base_branch=ci_base,
@@ -625,6 +635,40 @@ async def _attempt_merge_with_retry_and_escalation(
                                 ),
                                 non_merge_reason="merged_pr_non_integration_branch",
                             )
+                            # Membership-based merge-credit propagation across the
+                            # nested-rollup + squash boundary. apply_merged_landed_signal
+                            # above stamps only the rollup ITSELF; when it landed on the
+                            # integration branch every child whose PR merged onto the
+                            # rollup's staging branch also reached the trunk — but
+                            # squash-merge leaves each child's own merge commit an
+                            # ancestor of NOTHING on integration, so per-task ancestry
+                            # reconciliation (verify_rollup_merge_landed) can never
+                            # re-credit it. Stamp the landed signal by lineage subtree
+                            # instead — idempotent, force-drop aware — mirroring the
+                            # rollup-management sweep. Snapshot one representative task
+                            # id per distinct direction now (a plain value, safe across
+                            # a later session.rollback()) so the recompute below
+                            # re-credits each direction's churn / merge-rate counters.
+                            if _orig_landed_on_integration:
+                                from app.rollup_management import (
+                                    _propagate_landed_to_staging_merged_descendants,
+                                )
+
+                                _orig_stamped = (
+                                    await _propagate_landed_to_staging_merged_descendants(
+                                        orig.id, _orig_session
+                                    )
+                                )
+                                for _desc in _orig_stamped:
+                                    _desc_ctx = _desc.context or {}
+                                    _desc_did = _desc_ctx.get("direction_id")
+                                    _desc_rid = _desc_ctx.get("research_task_id")
+                                    if (
+                                        _desc_did
+                                        and _desc_rid
+                                        and _desc_did not in _orig_dir_reps
+                                    ):
+                                        _orig_dir_reps[_desc_did] = _desc.id
                         await _finalize_migration_reservation_after_merge(
                             orig,
                             _orig_session,
@@ -671,6 +715,39 @@ async def _attempt_merge_with_retry_and_escalation(
                             await refresh_direction_outcomes_after_merge(
                                 orig, _orig_session
                             )
+                            # The rollup can carry children in directions OTHER than
+                            # orig's own (a multi-direction research cycle). The
+                            # refresh above only heals orig's direction; recompute
+                            # each DISTINCT direction among the descendants just
+                            # stamped landed so its churn / merge-rate counters pick
+                            # up the merges that reached the trunk this tick. Deduped
+                            # by direction, so a rollup with many same-direction
+                            # children recomputes once.
+                            #
+                            # Re-materialize each rep by id inside the loop:
+                            # refresh_direction_outcomes_after_merge rolls the session
+                            # back on an internal recompute error, which expires every
+                            # ORM instance — a stale rep read on the next iteration
+                            # would then lazy-load under the async session and raise
+                            # MissingGreenlet. A fresh .get after a rollback reloads
+                            # cleanly (or returns None if the row vanished). Isolate
+                            # each rep in its own try/except so one direction's failure
+                            # can't abort the remaining recomputes for this tick.
+                            for _rep_id in _orig_dir_reps.values():
+                                try:
+                                    _rep = await _orig_session.get(Task, _rep_id)
+                                    if _rep is None:
+                                        continue
+                                    await refresh_direction_outcomes_after_merge(
+                                        _rep, _orig_session
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "[CI] direction recompute failed for rep "
+                                        "task %s after rollup merge (non-fatal)",
+                                        _rep_id,
+                                        exc_info=True,
+                                    )
                         # criterion evidence is recorded unconditionally inside
                         # refresh_direction_outcomes_after_merge (direction_outcomes.py)
                         # — no separate call needed here.
