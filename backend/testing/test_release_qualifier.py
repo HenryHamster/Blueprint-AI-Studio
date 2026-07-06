@@ -31067,6 +31067,11 @@ async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker)
         "app.release_readiness.compute_requalification_readiness",
         new=AsyncMock(return_value={"requalification_ready": True}),
     )
+    # Full-suite CI green gate reports green → the re-driver may proceed.
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(return_value={"gate_state": "green", "head_sha": "dead" * 10}),
+    )
     mocker.patch(
         "app.release_qualifier.run_qualification",
         new=AsyncMock(return_value={"status": "spawned"}),
@@ -31077,6 +31082,112 @@ async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker)
     )
 
     assert result is True
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_defers_when_ci_gate_not_green(
+    db_session, mocker
+):
+    """When the full-suite CI green gate is NOT green (e.g. red), the re-driver
+    must return False WITHOUT calling run_qualification — no audit is burned and
+    no circuit-breaker attempt is consumed."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "face" * 10,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    gate = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": "face" * 10,
+                "reason": "ci.yml run for integration HEAD concluded failure",
+            }
+        ),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+    # The read-only gate check runs with dispatch=False (no run is triggered here).
+    gate.assert_awaited_once()
+    assert gate.await_args.kwargs.get("dispatch") is False
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_no_signal_dispatches_and_defers(
+    db_session, mocker
+):
+    """When there is no ci.yml run for the integration HEAD (no_signal), the
+    re-driver must dispatch a fresh full-matrix run, persist the preflight marker,
+    and defer WITHOUT calling run_qualification."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    head = "0ff1ce" * 6 + "0000"
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": head,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+
+    async def _gate(session, project_id, *, dispatch=True):
+        # dispatch=False (the redrive's read) reports no_signal; dispatch=True
+        # (the _maybe_dispatch_ci_preflight follow-up) reports it kicked one off.
+        if dispatch:
+            return {"gate_state": "dispatched", "head_sha": head, "run_id": 4242}
+        return {"gate_state": "no_signal", "head_sha": head}
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(side_effect=_gate),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+    # The preflight marker must have been persisted (committed) for the HEAD sha.
+    await db_session.refresh(version)
+    marker = version.last_qualification.get("promotion_ci_preflight")
+    assert marker is not None
+    assert marker["sha"] == head
+    assert marker["run_id"] == 4242
 
 
 @pytest.mark.asyncio
@@ -32609,3 +32720,167 @@ async def test_fire_initial_qualification_if_coverage_complete(db_session, mocke
     blocked2 = await compute_qualification_trigger_state(db_session, project3.id)
     assert blocked2["trigger_state"] == "blocked"
     assert blocked2["reason"] == "coverage_incomplete"
+
+
+# ===========================================================================
+# _check_full_suite_drift_sentinel
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_skips_when_flag_disabled(db_session):
+    """Sentinel returns False immediately when build_config flag is absent."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # No build_config flag set — sentinel must no-op.
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_skips_non_stabilize_version(db_session, mocker):
+    """Sentinel returns False for a build-phase version even when flag is set."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_dispatches_when_no_ci_run(db_session, mocker):
+    """Sentinel returns True and logs when ci.yml is dispatched for HEAD."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "abc12345" * 5,
+                "run_id": 999,
+                "html_url": "https://github.com/runs/999",
+                "reason": "no run for HEAD — dispatched",
+            }
+        ),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_alerts_and_harvests_on_red(db_session, mocker):
+    """Sentinel raises an Alert and calls harvest when CI concludes red."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from sqlalchemy import select
+
+    HEAD_SHA = "deadbeef" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 42,
+                "html_url": "https://github.com/runs/42",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+
+    # An Alert should have been created.
+    alert = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert HEAD_SHA[:8] in alert.title
+    assert alert.dedupe_key is not None
+
+    # Harvest was called once.
+    harvest_mock.assert_called_once()
+    call_kwargs = harvest_mock.call_args.kwargs
+    assert call_kwargs["ci_source_sha"] == HEAD_SHA
+    assert call_kwargs["selfheal_enabled"] is True
+
+
+@pytest.mark.asyncio
+async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker):
+    """Sentinel does not create a second Alert when one for the SHA already exists."""
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel
+    from sqlalchemy import select
+
+    HEAD_SHA = "cafebabe" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 7,
+                "html_url": "",
+                "reason": "red",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    # First call — creates the Alert.
+    await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Second call — same SHA, same project.
+    await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Exactly one Alert row despite two calls.
+    alerts = (
+        await db_session.execute(
+            select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1

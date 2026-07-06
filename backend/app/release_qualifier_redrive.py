@@ -18,6 +18,7 @@ tunable caps) remain importable and test-patchable at their original paths, and
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from sqlalchemy.orm.attributes import flag_modified
 
@@ -27,6 +28,69 @@ from app.models import Alert, AlertSeverity, Project
 from app.time_utils import _utcnow
 
 logger = logging.getLogger(__name__)
+
+# Cooldown between full-suite CI preflight dispatches for the SAME integration
+# HEAD.  The promotion_failed re-driver runs every sweep; without this bound a red
+# candidate whose HEAD is unchanged would re-dispatch ci.yml on every cycle. A
+# fresh run is still dispatched immediately whenever HEAD advances past the marker.
+_PROMOTION_CI_PREFLIGHT_COOLDOWN_SECONDS = 30 * 60
+
+
+def _should_dispatch_ci_preflight(
+    marker: dict | None,
+    head_sha: str | None,
+    now: datetime,
+) -> bool:
+    """Decide whether to dispatch a fresh CI preflight run (pure; no I/O).
+
+    Dispatch when there is no prior marker, when the integration HEAD advanced
+    past the marker's recorded sha, or when the cooldown has elapsed since the
+    last dispatch.  An unparseable / missing timestamp errs toward dispatching
+    (the safe direction — a missing green signal keeps re-qualification deferred).
+    """
+    if not isinstance(marker, dict):
+        return True
+    if marker.get("sha") != head_sha:
+        return True
+    dispatched_at = marker.get("dispatched_at")
+    if not dispatched_at:
+        return True
+    try:
+        prev = datetime.fromisoformat(dispatched_at)
+    except (ValueError, TypeError):
+        return True
+    return (now - prev).total_seconds() >= _PROMOTION_CI_PREFLIGHT_COOLDOWN_SECONDS
+
+
+async def _maybe_dispatch_ci_preflight(session, version, head_sha: str | None) -> None:
+    """Dispatch a fresh full-suite ci.yml run for the integration HEAD, if due.
+
+    Bounded by the per-SHA marker + cooldown in
+    ``last_qualification.promotion_ci_preflight`` so frequent sweeps cannot storm
+    ``workflow_dispatch``.  Persists (but does NOT commit — the caller owns the
+    commit) an updated marker whenever a dispatch is attempted.  Best-effort: a
+    dispatch failure only means the next sweep re-tries.
+    """
+    from app.release_readiness import compute_promotion_ci_green_gate
+
+    qual = version.last_qualification if isinstance(version.last_qualification, dict) else {}
+    marker = qual.get("promotion_ci_preflight") or {}
+    now = _utcnow()
+    if not _should_dispatch_ci_preflight(marker, head_sha, now):
+        return
+    gate = await compute_promotion_ci_green_gate(
+        session, version.project_id, dispatch=True
+    )
+    version.last_qualification = {
+        **qual,
+        "promotion_ci_preflight": {
+            "sha": head_sha,
+            "run_id": gate.get("run_id"),
+            "dispatched_at": now.isoformat(),
+        },
+    }
+    flag_modified(version, "last_qualification")
+    session.add(version)
 
 
 # Maximum number of sweep-driven re-entries for a ``status=error`` version.
@@ -552,6 +616,40 @@ async def _redrive_promotion_failed_qualification(
             redrive_session, version.project_id
         )
         if not readiness.get("requalification_ready"):
+            return False
+
+        # Full-suite green gate: even once the remediation window clears, only
+        # re-enter qualification when the integration-branch HEAD has a COMPLETED,
+        # green ci.yml run (the full 8-shard backend + frontend + agent matrix).
+        # Deferring on any non-green verdict is the SAFE direction — it burns no
+        # audit and consumes no circuit-breaker attempt, and it cannot wedge
+        # permanently because HEAD advancing or the dispatched run finishing green
+        # clears it on a later sweep.
+        from app.release_readiness import compute_promotion_ci_green_gate
+
+        gate = await compute_promotion_ci_green_gate(
+            redrive_session, version.project_id, dispatch=False
+        )
+        gate_state = gate.get("gate_state")
+        if gate_state != "green":
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep: v%d promotion_failed re-drive deferred "
+                "— CI green gate is %s (%s)",
+                version.version_number,
+                gate_state,
+                gate.get("reason"),
+            )
+            if gate_state == "no_signal":
+                # No ci.yml run exists for the current integration HEAD — kick off a
+                # fresh full-matrix run (bounded by a per-SHA marker + cooldown), then
+                # defer.  A later sweep re-enters once it concludes green.
+                await _maybe_dispatch_ci_preflight(
+                    redrive_session, version, gate.get("head_sha")
+                )
+                await redrive_session.commit()
+            else:
+                # pending / red / dispatched / unavailable — nothing to persist.
+                await redrive_session.rollback()
             return False
 
         # Thread session_factory so run_qualification's passing-audit reuse

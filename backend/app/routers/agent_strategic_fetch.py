@@ -579,6 +579,7 @@ async def agent_fetch_qualification(
         "requalification_readiness_reason": None,
         "gating_total": None,
         "gating_resolved": None,
+        "promotion_ci_green_gate": None,
     }
     try:
         from app.release_readiness import (  # noqa: PLC0415
@@ -597,11 +598,35 @@ async def agent_fetch_qualification(
             "requalification_readiness_reason": readiness["reason"],
             "gating_total": readiness["gating_total"],
             "gating_resolved": readiness["gating_resolved"],
+            # Populated by the CI-green-gate block below; keep the key present so
+            # the response shape is stable whether or not that compute succeeds.
+            "promotion_ci_green_gate": None,
         }
     except Exception:
         logger.exception(
             "[AGENT_FETCH] requalification readiness compute failed for project %s; "
             "serving qualification without the readiness signal",
+            project_id,
+        )
+
+    # Full-suite CI green gate (ADDITIVE, READ-ONLY). Surfaces whether the
+    # integration-branch HEAD has a green ci.yml full-matrix run — the same gate
+    # the promotion_failed re-driver consults before re-entering qualification.
+    # dispatch=False so this read NEVER triggers a workflow run. Best-effort: a
+    # GitHub failure degrades to ``promotion_ci_green_gate: None`` without breaking
+    # the read or changing any existing key.
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_promotion_ci_green_gate,
+        )
+
+        requalification_extra["promotion_ci_green_gate"] = (
+            await compute_promotion_ci_green_gate(session, project_id, dispatch=False)
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] promotion CI green gate compute failed for project %s; "
+            "serving qualification without the gate signal",
             project_id,
         )
 

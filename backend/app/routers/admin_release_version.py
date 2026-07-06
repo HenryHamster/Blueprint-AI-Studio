@@ -554,6 +554,27 @@ async def get_version_lifecycle(
                     project_id,
                 )
 
+        # Full-suite drift-sentinel CI gate (ADDITIVE, read-only).  Surfaces the
+        # latest ci.yml run state for the integration-branch HEAD so the admin UI
+        # can show full-suite status without waiting for a promotion PR. dispatch=False
+        # so this read NEVER triggers a workflow run; the sweep sentinel dispatches.
+        full_suite_ci_gate: Optional[Dict[str, Any]] = None
+        if open_row is not None:
+            try:
+                from app.release_readiness import (  # noqa: PLC0415
+                    compute_promotion_ci_green_gate,
+                )
+
+                full_suite_ci_gate = await compute_promotion_ci_green_gate(
+                    session, project_id, dispatch=False
+                )
+            except Exception:
+                logger.exception(
+                    "[VERSION_LIFECYCLE] full-suite CI gate compute failed "
+                    "for project %s; serving lifecycle without the signal",
+                    project_id,
+                )
+
         current_version_out: Optional[Dict[str, Any]] = None
         if open_row is not None:
             merged_count = await count_merged_since(
@@ -751,6 +772,11 @@ async def get_version_lifecycle(
                 # appear in criteria with status=retracted|superseded and
                 # inactive lifecycle counts.
                 "criterion_coverage": criterion_coverage,
+                # Full-suite drift-sentinel CI gate (additive; nullable when the
+                # gate could not be computed or project lacks GitHub creds).
+                # Shows the latest ci.yml run state for the integration-branch HEAD
+                # so operators can see full-suite health without a promotion PR.
+                "full_suite_ci_gate": full_suite_ci_gate,
             }
 
         history_rows = (

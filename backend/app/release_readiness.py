@@ -1118,6 +1118,174 @@ async def compute_requalification_readiness(
     )
 
 
+# Gate-state vocabulary emitted by ``compute_promotion_ci_green_gate``.  Only
+# ``green`` clears the promotion_failed re-driver; every other state defers.
+_PROMOTION_CI_GATE_STATES = frozenset(
+    {"green", "pending", "red", "dispatched", "no_signal", "unavailable"}
+)
+
+
+def _promotion_ci_gate_verdict(
+    gate_state: str,
+    *,
+    head_sha: str | None = None,
+    run_id: Any = None,
+    html_url: str | None = None,
+    reason: str = "",
+) -> dict[str, Any]:
+    """Small, stable verdict dict for :func:`compute_promotion_ci_green_gate`."""
+    return {
+        "gate_state": gate_state,
+        "head_sha": head_sha,
+        "run_id": run_id,
+        "html_url": html_url,
+        "reason": reason,
+    }
+
+
+async def compute_promotion_ci_green_gate(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    dispatch: bool = True,
+) -> dict[str, Any]:
+    """Resolve whether the integration-branch HEAD has a green full-suite CI run.
+
+    This is the promotion_failed-specific full-matrix green gate.  It resolves the
+    project's GitHub creds, the integration branch, and the current integration
+    HEAD sha, then looks up the latest ``ci.yml`` Actions run for that HEAD sha via
+    :func:`app.github.get_workflow_run_for_sha` (which filters by ``head_sha``, so a
+    returned run is always FOR the current HEAD).
+
+    Returns a small verdict dict ``{gate_state, head_sha, run_id, html_url, reason}``
+    where ``gate_state`` is one of:
+
+      * ``green``      — a COMPLETED ``ci.yml`` run for the current HEAD concluded success
+      * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
+      * ``red``        — a run for HEAD concluded non-success
+      * ``dispatched`` — no run existed for HEAD, so one was just dispatched
+      * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD
+      * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
+
+    When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
+    fresh ``ci.yml`` run on the integration branch (the full 8-shard backend +
+    frontend + agent matrix, since ci.yml's ``detect`` job forces all-true on a
+    ``workflow_dispatch``) and returns ``dispatched``.
+
+    IMPORTANT: this performs a GitHub round-trip and is DELIBERATELY separate from
+    :func:`compute_requalification_readiness`, which stays DB-only and
+    side-effect-free.  Never raises — any failure degrades to ``unavailable``.
+    """
+    from app import github  # noqa: PLC0415 — avoid import cycle
+    from app.github_checks import CI_WORKFLOW_FILE  # noqa: PLC0415
+    from app.models import Project  # noqa: PLC0415
+    from app.release_promotion import (  # noqa: PLC0415
+        _lts_branch_names,
+        _resolve_github_with_session,
+    )
+
+    try:
+        project = await session.get(Project, project_id)
+        if project is None:
+            return _promotion_ci_gate_verdict(
+                "unavailable", reason="project not found"
+            )
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return _promotion_ci_gate_verdict(
+                "unavailable", reason="GitHub credentials unavailable"
+            )
+        token, owner, repo = resolved
+        integration_branch, _promotion_target = _lts_branch_names(project)
+        head_sha = await github.get_branch_sha(token, owner, repo, integration_branch)
+        if not head_sha:
+            return _promotion_ci_gate_verdict(
+                "unavailable",
+                reason=f"could not resolve {integration_branch} HEAD sha",
+            )
+
+        run = await github.get_workflow_run_for_sha(
+            token,
+            owner,
+            repo,
+            head_sha,
+            workflow_file=CI_WORKFLOW_FILE,
+            project_id=str(project_id),
+        )
+        if run is not None:
+            run_id = run.get("run_id")
+            html_url = run.get("html_url") or ""
+            status_ = run.get("status")
+            conclusion = run.get("conclusion")
+            if status_ == "completed":
+                if conclusion == "success":
+                    return _promotion_ci_gate_verdict(
+                        "green",
+                        head_sha=head_sha,
+                        run_id=run_id,
+                        html_url=html_url,
+                        reason="ci.yml run for integration HEAD concluded success",
+                    )
+                return _promotion_ci_gate_verdict(
+                    "red",
+                    head_sha=head_sha,
+                    run_id=run_id,
+                    html_url=html_url,
+                    reason=(
+                        "ci.yml run for integration HEAD concluded "
+                        f"{conclusion or 'non-success'}"
+                    ),
+                )
+            # queued / in_progress / waiting / requested — a run is in flight.
+            return _promotion_ci_gate_verdict(
+                "pending",
+                head_sha=head_sha,
+                run_id=run_id,
+                html_url=html_url,
+                reason=f"ci.yml run for integration HEAD is {status_ or 'in flight'}",
+            )
+
+        # No run exists for the current HEAD.
+        if not dispatch:
+            return _promotion_ci_gate_verdict(
+                "no_signal",
+                head_sha=head_sha,
+                reason=(
+                    "no ci.yml run for integration HEAD "
+                    "(read-only gate, no run dispatched)"
+                ),
+            )
+        dispatched = await github.dispatch_workflow_run(
+            token,
+            owner,
+            repo,
+            CI_WORKFLOW_FILE,
+            integration_branch,
+            project_id=str(project_id),
+        )
+        if dispatched:
+            return _promotion_ci_gate_verdict(
+                "dispatched",
+                head_sha=head_sha,
+                reason=(
+                    "no ci.yml run for integration HEAD — dispatched a fresh "
+                    f"full-matrix run on {integration_branch}"
+                ),
+            )
+        return _promotion_ci_gate_verdict(
+            "unavailable",
+            head_sha=head_sha,
+            reason="failed to dispatch ci.yml run for integration HEAD",
+        )
+    except Exception:
+        logger.exception(
+            "[PROMOTION_CI_GATE] compute failed for project %s", project_id
+        )
+        return _promotion_ci_gate_verdict(
+            "unavailable", reason="error computing promotion CI green gate"
+        )
+
+
 async def compute_qualification_trigger_state(
     session: AsyncSession,
     project_id: uuid.UUID,

@@ -954,6 +954,127 @@ async def _promote_dry_run_pass_if_enabled(
     return promoted
 
 
+async def _check_full_suite_drift_sentinel(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Dispatch and evaluate the standing full-suite CI sentinel on automain.
+
+    When ``build_config.full_suite_drift_sentinel_enabled`` is True, resolves
+    the integration-branch HEAD and dispatches a ci.yml full-matrix run if none
+    exists for that SHA.  A concluded-red run raises a deduplicated Alert
+    (keyed on project+SHA so repeated sweeps do not double-alert) and spawns
+    harvest remediation via the same path used by the promotion-failed re-driver.
+
+    Only fires for open, stabilize-phase versions; ignores all others.
+    Best-effort: any exception is swallowed and logged.  Returns True when a
+    dispatch or alert/harvest occurred.
+    """
+    from app import release_qualifier
+    from app.release_readiness import compute_promotion_ci_green_gate
+    from app.release_reconciliation import _harvest_promotion_ci_failures
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None or version.phase != "stabilize" or version.status != "open":
+                return False
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            if not (project.build_config or {}).get("full_suite_drift_sentinel_enabled"):
+                return False
+
+            gate = await compute_promotion_ci_green_gate(
+                session, version.project_id, dispatch=True
+            )
+            gate_state = gate.get("gate_state")
+            head_sha = gate.get("head_sha") or ""
+
+            if gate_state == "dispatched":
+                logger.info(
+                    "[DRIFT_SENTINEL] dispatched full-suite CI run for project %s "
+                    "HEAD %s",
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
+                )
+                return True
+
+            if gate_state != "red":
+                return False
+
+            # Red: raise a deduplicated alert + spawn harvest remediation.
+            dedupe_key = f"drift_sentinel:red:{version.project_id}:{head_sha}"
+            existing = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == version.project_id,
+                            Alert.dedupe_key == dedupe_key,
+                            Alert.dismissed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .first()
+            )
+            if existing is None:
+                run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+                session.add(
+                    Alert(
+                        project_id=version.project_id,
+                        severity=AlertSeverity.ERROR,
+                        title=(
+                            f"Full-suite CI red on integration branch "
+                            f"({head_sha[:8] if head_sha else '?'})"
+                        ),
+                        message=(
+                            f"Standing drift sentinel: ci.yml concluded failure for "
+                            f"integration HEAD {head_sha[:12] if head_sha else '?'}."
+                            + (f" Run: {run_url}." if run_url else "")
+                            + " Harvest remediation spawning."
+                        ),
+                        dedupe_key=dedupe_key,
+                    )
+                )
+                await session.commit()
+                logger.warning(
+                    "[DRIFT_SENTINEL] full-suite CI red for project %s HEAD %s — "
+                    "alert raised, harvest spawning",
+                    version.project_id,
+                    head_sha[:8] if head_sha else "?",
+                )
+
+            # Harvest is best-effort and self-gating (per-hour/concurrent caps).
+            integration_branch, _ = release_qualifier._lts_branch_names(project)
+            auto_rem = (project.design_doc or {}).get("_auto_remediation") or {}
+            await _harvest_promotion_ci_failures(
+                project_id=version.project_id,
+                version_id=version.id,
+                version_number=version.version_number,
+                owner=project.github_owner or "",
+                repo=project.github_repo or "",
+                ci_source_sha=head_sha,
+                integration_branch=integration_branch,
+                auto_remediation_config=auto_rem,
+                selfheal_enabled=True,
+            )
+            return True
+        except Exception:
+            logger.exception(
+                "[DRIFT_SENTINEL] sentinel check failed for version %s", version_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[DRIFT_SENTINEL] rollback failed for version %s", version_id
+                )
+            return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -1722,6 +1843,25 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep fired initial qualification for "
                 "version %s (coverage complete — first qualification spawned)",
+                version_id,
+            )
+
+    # Standing full-suite drift sentinel: on a build_config opt-in, dispatch
+    # ci.yml on the integration branch for each stabilize-phase open version,
+    # alert+harvest when a run concludes red.  This catches full-suite CI drift
+    # before it accumulates invisibly across hundreds of targeted-CI merges and
+    # surfaces at a promotion-gate failure.  Each version runs in its own
+    # dedicated session via the function itself.
+    for version_id in version_ids:
+        try:
+            await _check_full_suite_drift_sentinel(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: full-suite drift sentinel failed "
+                "for version %s",
                 version_id,
             )
 

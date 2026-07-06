@@ -10349,3 +10349,184 @@ def test_get_branch_sha_live_guard_scanner_flags_injected_site():
     )
     tree = ast.parse(src)
     assert list(_live_true_get_branch_sha_sites(tree, "fake.py")) == ["fake.py:_bad"]
+
+
+# ---------------------------------------------------------------------------
+# String patch-target resolution invariant
+# ---------------------------------------------------------------------------
+
+def _collect_app_patch_targets(testing_dir: Path) -> dict[str, set[str]]:
+    """Return {filename: {target, ...}} for app.* string patch targets in test files.
+
+    Excludes patch() calls that carry ``create=True`` — those intentionally
+    name attributes that don't exist at module level.
+    """
+    result: dict[str, set[str]] = {}
+    for py_file in sorted(testing_dir.glob("*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=py_file.name)
+        except (SyntaxError, UnicodeDecodeError):
+            continue
+
+        targets: set[str] = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if isinstance(func, ast.Attribute) and func.attr in ("patch", "setattr"):
+                pass
+            elif isinstance(func, ast.Name) and func.id == "patch":
+                pass
+            else:
+                continue
+
+            # create=True patches intentionally reference non-existent attributes
+            if any(
+                kw.arg == "create"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+                for kw in node.keywords
+            ):
+                continue
+
+            if not node.args:
+                continue
+            first_arg = node.args[0]
+            if not isinstance(first_arg, ast.Constant) or not isinstance(
+                first_arg.value, str
+            ):
+                continue
+            target = first_arg.value
+            # Require at least app.<module>.<attr> (two dots minimum)
+            if target.startswith("app.") and "." in target[4:]:
+                targets.add(target)
+
+        if targets:
+            result[py_file.name] = targets
+    return result
+
+
+def _app_module_top_level_names(app_dir: Path, module_dotted: str) -> set[str] | None:
+    """Return the set of top-level names in a module file, or None if not found.
+
+    Scans only module-level statements (defs, class defs, assignments, imports).
+    Returns None when ``module_dotted`` does not map to a file on disk, which
+    indicates a "nested import" pattern (e.g. app.storage.storage mapping to
+    google.cloud.storage accessed via app.storage) — those are skipped rather
+    than flagged.
+    """
+    parts = module_dotted.split(".")
+    base = app_dir.parent  # backend/
+
+    candidate = base.joinpath(*parts).with_suffix(".py")
+    if not candidate.exists():
+        candidate = base.joinpath(*parts, "__init__.py")
+        if not candidate.exists():
+            return None
+
+    try:
+        source = candidate.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(candidate))
+    except (SyntaxError, UnicodeDecodeError):
+        return None
+
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, ast.Assign):
+            for tgt in node.targets:
+                for n in ast.walk(tgt):
+                    if isinstance(n, ast.Name):
+                        names.add(n.id)
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names.add(node.target.id)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname if alias.asname else alias.name)
+    return names
+
+
+def test_string_patch_targets_resolve():
+    """Every app.* string patch target in backend/testing/*.py must resolve to
+    an existing top-level name in its module.
+
+    Renaming or deleting an app.* symbol that is referenced in a string patch
+    target (mocker.patch / mock.patch / @patch / monkeypatch.setattr) silently
+    voids the mock — the real function runs instead of the mock, producing
+    false-passing tests. This invariant makes that class of breakage fail at
+    the standalone gate (scripts/test-backend.sh --standalone --no-postgres)
+    before it reaches CI, naming the offending test file and target.
+
+    Excluded: ``create=True`` patches (intentionally naming absent attributes)
+    and targets whose module path does not map to a file on disk (nested import
+    patterns such as ``app.storage.storage.Client``).
+    """
+    testing_dir = Path(__file__).resolve().parent
+    app_dir = Path(__file__).resolve().parents[1] / "app"
+
+    targets_by_file = _collect_app_patch_targets(testing_dir)
+
+    module_cache: dict[str, set[str] | None] = {}
+    failures: list[str] = []
+
+    for test_file, targets in sorted(targets_by_file.items()):
+        for target in sorted(targets):
+            last_dot = target.rfind(".")
+            if last_dot == -1:
+                continue
+            module_dotted = target[:last_dot]
+            attr = target[last_dot + 1:]
+
+            if module_dotted not in module_cache:
+                module_cache[module_dotted] = _app_module_top_level_names(
+                    app_dir, module_dotted
+                )
+
+            top_level = module_cache[module_dotted]
+            if top_level is None:
+                continue  # nested import pattern — not checkable statically
+            if attr not in top_level:
+                failures.append(
+                    f"  {test_file}: '{target}' — '{attr}' not defined in {module_dotted}"
+                )
+
+    assert not failures, (
+        f"String patch targets that do not resolve ({len(failures)} offender(s)):\n"
+        + "\n".join(sorted(failures))
+        + "\n\nFix: rename the patch target string to match the current symbol name, "
+        "or remove the test if the functionality was deleted."
+    )
+
+
+def test_string_patch_target_scanner_self_tests():
+    """Self-tests for the patch-target scanner helpers."""
+    import textwrap
+    import tempfile
+
+    # Scanner detects a stale patch target
+    src_stale = textwrap.dedent("""
+        async def test_foo(mocker):
+            mocker.patch("app.nonexistent_module_xyz.nonexistent_func")
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        (tmpdir_path / "test_fake.py").write_text(src_stale)
+        result = _collect_app_patch_targets(tmpdir_path)
+        assert result == {
+            "test_fake.py": {"app.nonexistent_module_xyz.nonexistent_func"}
+        }
+
+    # create=True patches are excluded
+    src_create = textwrap.dedent("""
+        async def test_bar(mocker):
+            mocker.patch("app.some_module.some_func", create=True)
+    """)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir_path = Path(tmpdir)
+        (tmpdir_path / "test_create.py").write_text(src_create)
+        assert _collect_app_patch_targets(tmpdir_path) == {}

@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+from unittest.mock import AsyncMock
+
+import pytest
+
+from app import release_version as rv
+from app.models import Project
 from app.release_readiness import (
     _annotate_regime,
     _compute_requalification_decision,
+    compute_promotion_ci_green_gate,
     PROMOTION_READINESS_METRIC_MANIFEST,
     _READINESS_LIVE_REGIME_NOTE,
 )
@@ -259,3 +267,191 @@ class TestComputeRequalificationDecision:
         ):
             assert key in result, f"missing key: {key}"
         assert result["open_version_id"] == "test-version-id"
+
+
+async def _make_project_and_version(db_session, *, phase: str = "stabilize"):
+    """Minimal project (authorized repo, distinct integration/promotion branches)
+    plus an open version in the requested phase."""
+    project = Project(
+        name="RR-Test",
+        user_id="rr-user",
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    if phase != "build":
+        rv.set_version_phase(version, phase, reasoning="test setup")
+        db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+    return project, version
+
+
+def _patch_gate_github(
+    mocker,
+    *,
+    run: dict | None,
+    head_sha: str = "abc123def456",
+    resolved=("tok", "acme", "widget"),
+    dispatch_ok: bool = True,
+):
+    """Monkeypatch the github helpers the CI green gate consults — no live network.
+
+    Returns the ``dispatch_workflow_run`` mock so tests can assert on it.
+    """
+    mocker.patch(
+        "app.release_promotion._resolve_github_with_session",
+        new=AsyncMock(return_value=resolved),
+    )
+    mocker.patch("app.github.get_branch_sha", new=AsyncMock(return_value=head_sha))
+    mocker.patch(
+        "app.github.get_workflow_run_for_sha", new=AsyncMock(return_value=run)
+    )
+    return mocker.patch(
+        "app.github.dispatch_workflow_run", new=AsyncMock(return_value=dispatch_ok)
+    )
+
+
+class TestPromotionCiGreenGate:
+    """Unit tests for compute_promotion_ci_green_gate state mapping (mocked GitHub)."""
+
+    @pytest.mark.asyncio
+    async def test_completed_success_maps_to_green(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(
+            mocker,
+            run={
+                "run_id": 11,
+                "status": "completed",
+                "conclusion": "success",
+                "html_url": "https://gh/run/11",
+            },
+            head_sha="deadbeef",
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "green"
+        assert gate["head_sha"] == "deadbeef"
+        assert gate["run_id"] == 11
+        # A green (or any existing) run must NOT trigger a fresh dispatch.
+        disp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_in_progress_maps_to_pending(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={"run_id": 12, "status": "in_progress", "conclusion": None},
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "pending"
+        assert gate["run_id"] == 12
+
+    @pytest.mark.asyncio
+    async def test_completed_failure_maps_to_red(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        _patch_gate_github(
+            mocker,
+            run={"run_id": 13, "status": "completed", "conclusion": "failure"},
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "red"
+        assert gate["run_id"] == 13
+
+    @pytest.mark.asyncio
+    async def test_no_run_with_dispatch_maps_to_dispatched(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(mocker, run=None, head_sha="cafe1234")
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "dispatched"
+        assert gate["head_sha"] == "cafe1234"
+        disp.assert_awaited_once()
+        # Must dispatch ci.yml on the project's integration branch.
+        args = disp.await_args.args
+        assert args[3] == "ci.yml"
+        assert args[4] == "automain"
+
+    @pytest.mark.asyncio
+    async def test_no_run_without_dispatch_maps_to_no_signal(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(mocker, run=None)
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=False
+        )
+        assert gate["gate_state"] == "no_signal"
+        disp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_credentials_maps_to_unavailable(self, db_session, mocker):
+        project, _ = await _make_project_and_version(db_session)
+        mocker.patch(
+            "app.release_promotion._resolve_github_with_session",
+            new=AsyncMock(return_value=None),
+        )
+        gate = await compute_promotion_ci_green_gate(db_session, project.id)
+        assert gate["gate_state"] == "unavailable"
+
+    @pytest.mark.asyncio
+    async def test_promotion_ci_green_gate_defers_when_suite_not_green(
+        self, db_session, mocker
+    ):
+        """Named acceptance test: a non-green integration-HEAD CI run makes the
+        promotion_failed re-driver DEFER — it returns False without calling
+        run_qualification, so no audit and no circuit-breaker attempt are burned.
+
+        Exercises the real production code end-to-end: compute_promotion_ci_green_gate
+        (release_readiness) resolves a FAILED ci.yml run for the integration HEAD,
+        and _redrive_promotion_failed_qualification (release_qualifier_redrive) reads
+        that non-green verdict and defers.
+        """
+        from app.release_qualifier_sweep import (
+            _redrive_promotion_failed_qualification,
+        )
+
+        project, version = await _make_project_and_version(db_session)
+        version.last_qualification = {
+            "status": "promotion_failed",
+            "candidate_sha": "abc123def456",
+            "error": "required_check_failed",
+            "promotion_failure_count": 1,
+        }
+        db_session.add(version)
+        await db_session.commit()
+        await db_session.refresh(version)
+
+        # Remediation window clear → readiness ready; the ONLY thing that should
+        # stop the re-drive is the not-green CI gate.
+        mocker.patch(
+            "app.release_readiness.compute_requalification_readiness",
+            new=AsyncMock(return_value={"requalification_ready": True}),
+        )
+        # Real gate runs against these mocked github helpers → a FAILED run.
+        _patch_gate_github(
+            mocker,
+            run={"run_id": 99, "status": "completed", "conclusion": "failure"},
+            head_sha="abc123def456",
+        )
+        run_qual = mocker.patch(
+            "app.release_qualifier.run_qualification",
+            new=AsyncMock(return_value={"status": "spawned"}),
+        )
+
+        @contextlib.asynccontextmanager
+        async def _factory():
+            yield db_session
+
+        result = await _redrive_promotion_failed_qualification(
+            version.id, session_factory=_factory
+        )
+
+        assert result is False
+        run_qual.assert_not_awaited()
