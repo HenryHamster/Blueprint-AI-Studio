@@ -258,14 +258,16 @@ async def test_scratch_db_is_isolated_from_prod(monkeypatch):
 @requires_postgres
 @pytest.mark.asyncio
 async def test_fetch_failure_defers(monkeypatch):
-    """A GitHub fetch failure for the candidate's migration list must HOLD
-    (defer), never wave through — a fetch error is not 'no migrations'."""
+    """A GitHub fetch failure for the candidate's migration sources must HOLD
+    (defer), never wave through — a fetch error is not 'no migrations'. Sources
+    now come from the repo tarball, so a download failure is the fetch-failure
+    path."""
     import app.migration_apply_gate as gate_mod
 
-    async def _boom(*_a, **_k):
-        raise RuntimeError("GitHub unreachable")
+    async def _no_archive(*_a, **_k):
+        return None
 
-    monkeypatch.setattr(gate_mod.github, "list_versions_at_ref", _boom)
+    monkeypatch.setattr(gate_mod, "_download_candidate_repo_archive", _no_archive)
     async with ephemeral_postgres_database(_base_url()) as (prod_engine, _name):
         await _seed_prod_sim(prod_engine, {"widget": True}, revision="a01")
         verdict, detail = await run_migration_apply_gate(
@@ -279,6 +281,51 @@ async def test_fetch_failure_defers(monkeypatch):
 
     assert verdict == "defer", detail
     assert "deadbeef" in detail
+
+
+@pytest.mark.asyncio
+async def test_candidate_sources_read_from_tarball_no_contents_calls(monkeypatch):
+    """Regression guard for the apply-gate fetch storm: migration sources must be
+    read from the ONE repo tarball, NOT a contents-API call per file (~215/attempt,
+    the budget-draining twin of the identity-gate storm). Asserts zero
+    list_versions_at_ref / get_file_text_at_ref calls, plus correct filtering."""
+    import io
+    import tarfile
+
+    import app.migration_apply_gate as gate_mod
+
+    # In-memory tarball: one top-level repo root, a real migration plus an
+    # __init__.py that _is_migration_source must filter out.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+        for path, body in [
+            (
+                "myrepo-abc123/backend/alembic/versions/0001_init.py",
+                "revision = '0001'\ndown_revision = None\n",
+            ),
+            ("myrepo-abc123/backend/alembic/versions/__init__.py", ""),
+        ]:
+            data = body.encode()
+            info = tarfile.TarInfo(path)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+
+    monkeypatch.setattr(
+        gate_mod,
+        "_download_candidate_repo_archive",
+        AsyncMock(return_value=buf.getvalue()),
+    )
+    list_spy = AsyncMock(return_value=[])
+    get_spy = AsyncMock(return_value=None)
+    monkeypatch.setattr(gate_mod.github, "list_versions_at_ref", list_spy)
+    monkeypatch.setattr(gate_mod.github, "get_file_text_at_ref", get_spy)
+
+    sources = await gate_mod._fetch_candidate_sources("t", "o", "r", "ref", None)
+
+    assert sources == {"0001_init.py": "revision = '0001'\ndown_revision = None\n"}
+    # The storm calls must never happen — the whole point of the fix.
+    assert list_spy.await_count == 0
+    assert get_spy.await_count == 0
 
 
 # --- Concurrency safety (runs everywhere) ----------------------------------
