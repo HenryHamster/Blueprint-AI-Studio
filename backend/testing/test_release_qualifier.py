@@ -9737,6 +9737,8 @@ async def test_no_criteria_no_criterion_blocker(db_session, mocker):
         "uncovered": 0,
         "retracted": 0,
         "stuck_count": 0,
+        "inactive": 0,
+        "superseded": 0,
         "criteria": [],
     }
     promote_spy.assert_not_called()
@@ -17850,6 +17852,13 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
         "app.github.get_branch_sha",
         side_effect=RuntimeError("transient GitHub 503"),
     )
+    # Prevent _redrive_error_qualification from picking up the sha_error status
+    # written by the deferred_unsynced re-drive and committing it — that loop
+    # runs after the deferred_unsynced rollback in the same sweep cycle.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_error_qualification",
+        new=AsyncMock(return_value=False),
+    )
 
     count = await rq.sweep_stuck_qualifications(
         db_session, session_factory=_shared_session_factory(db_session)
@@ -19407,7 +19416,7 @@ async def test_auto_stale_file_anchored_finding_not_staled_when_file_unchanged(
     from app.models import AuditFindingResolution, QualificationVerdict
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    old_sha = "oldsha9" * 5 + "0000000"
+    old_sha = "oldsha9" * 5 + "00000"
     version.last_qualification = {
         "status": "not_promoted",
         "candidate_sha": old_sha,
@@ -20050,6 +20059,12 @@ async def test_sweep_force_finalizes_timed_out_qualification(db_session, mocker)
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -20106,6 +20121,10 @@ async def test_timed_out_already_promoted_uses_qualification_superseded(db_sessi
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -20159,6 +20178,10 @@ async def test_timed_out_not_promoted_uses_qualification_timeout(db_session, moc
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 
@@ -20216,6 +20239,10 @@ async def test_timed_out_supersession_check_exception_falls_back_to_qualificatio
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
     )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -20267,6 +20294,10 @@ async def test_timed_out_cred_missing_falls_back_to_qualification_timeout(
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 
@@ -20610,11 +20641,15 @@ async def test_sweep_does_not_time_out_a_fresh_qualification(db_session):
 
 
 @pytest.mark.asyncio
-async def test_sweep_timeout_takes_priority_over_terminal_children(db_session):
+async def test_sweep_timeout_takes_priority_over_terminal_children(db_session, mocker):
     """Audit H2: when a qualification is BOTH past the timeout AND has all
     children terminal, the timeout path wins — it is checked first and is
     child-state-independent (a stuck qualification this old should surface as
     a timeout, not silently finalize)."""
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app.time_utils import _utcnow
@@ -20798,6 +20833,12 @@ async def test_sweep_finalize_crash_loop_force_finalizes_and_alerts(db_session, 
         rq,
         "_finalize_qualification",
         new=AsyncMock(side_effect=RuntimeError("persistent finalize crash")),
+    )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
 
     count = await rq.sweep_stuck_qualifications(
@@ -21655,6 +21696,12 @@ async def test_sweep_timeout_fires_when_started_at_unparseable(db_session, mocke
     mocker.patch(
         "app.release_qualifier._maybe_trigger_strategic_after_qualification",
         new=AsyncMock(return_value=None),
+    )
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
     )
     from datetime import timedelta
 

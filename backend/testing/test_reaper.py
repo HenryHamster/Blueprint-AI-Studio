@@ -5230,7 +5230,7 @@ async def test_get_reaper_stats_reports_recent_age_after_cycle(
 
 @pytest.mark.asyncio
 async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_kill(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """A ReleaseVersion stuck at last_qualification.status=='pending' whose
     audit + smoketest children are BOTH FAILED is finalized by the reaper's
@@ -5249,6 +5249,12 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
     broken pipeline, not a quality verdict — yielding status 'infra_failure')
     and phase is back to 'stabilize'.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from app import shared_state
 
     _original_promotion = shared_state.runtime_config.get("promotion_enabled")
@@ -5341,7 +5347,7 @@ async def test_step9_sweep_finalizes_qualification_stuck_pending_after_reaper_ki
 
 @pytest.mark.asyncio
 async def test_step9_sweep_skips_qualification_with_running_child(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """Step 9 must NOT finalize a 'pending' version while a qualifier child is
     still non-terminal — the normal completion path owns that case.
@@ -5360,6 +5366,12 @@ async def test_step9_sweep_skips_qualification_with_running_child(
     the test fails on either fault: a broken finalize path fails the positive
     control; a premature sweep wrongly finalizes the running-child version.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from app import shared_state
     from app.time_utils import _utcnow as _now_for_seed
 
@@ -5502,7 +5514,7 @@ async def test_step9_sweep_skips_qualification_with_running_child(
 
 @pytest.mark.asyncio
 async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
-    reaper_db, stop_after_one_cycle, reaper_side_effects
+    reaper_db, stop_after_one_cycle, reaper_side_effects, mocker
 ):
     """Audit R4-H5: the reaper's Step 9 sweep must STILL force-finalize a
     qualification that is past the timeout when its started_at is corrupt /
@@ -5514,6 +5526,12 @@ async def test_step9_sweep_times_out_qualification_with_unparseable_started_at(
     clock exceeds the qualification timeout.  After one reaper cycle the
     version is force-finalized as a qualification_timeout.
     """
+    # Prevent the infra_failure redrive loop (runs after force-finalize in the
+    # same sweep cycle) from overwriting the infra_failure status with error.
+    mocker.patch(
+        "app.release_qualifier_sweep._redrive_infra_failure_qualification",
+        new=AsyncMock(return_value=False),
+    )
     from datetime import timedelta
 
     from app import release_qualifier as _rq
