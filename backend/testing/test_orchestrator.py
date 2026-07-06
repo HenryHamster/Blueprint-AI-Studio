@@ -2721,6 +2721,7 @@ class TestProjectConcurrencyCap:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
@@ -3807,6 +3808,9 @@ class TestPersistDepsSatisfied:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         await _persist_deps_satisfied(task)
 
@@ -3834,8 +3838,12 @@ class TestPersistDepsSatisfied:
         )
         # If the helper opened a session it would hit this un-redirected factory
         # and fail; the early-return guard means it never does.
-        sentinel = mocker.patch(
+        mocker.patch(
             "app.orchestrator.AsyncSessionLocal",
+            side_effect=AssertionError("should not open a session when marker present"),
+        )
+        sentinel = mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal",
             side_effect=AssertionError("should not open a session when marker present"),
         )
         await _persist_deps_satisfied(task)
@@ -3888,6 +3896,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
         assert marked == 1
@@ -3936,6 +3947,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         before = get_reuse_funnel_snapshot()["completion_dependents_marked"]
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -3983,6 +3997,9 @@ class TestMarkUnblockedDependents:
 
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -4071,6 +4088,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
         assert marked == 1
@@ -4149,6 +4169,9 @@ class TestMarkUnblockedDependents:
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
 
         # Re-cut conflicts → no dependents marked.
         marked = await _mark_unblocked_dependents(completed, self._verify_true)
@@ -4221,6 +4244,9 @@ class TestMarkUnblockedDependents:
 
         mocker.patch(
             "app.orchestrator.AsyncSessionLocal", _FakeSessionFactory(db_session)
+        )
+        mocker.patch(
+            "app.dep_lifecycle.AsyncSessionLocal", _FakeSessionFactory(db_session)
         )
 
         # Transient error → no dependents marked.
@@ -4342,6 +4368,7 @@ class TestWarmVMSkipProvision:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)
@@ -8305,6 +8332,7 @@ class TestDispatchCrashContainment:
                 expire_on_commit=False,
             )
             mocker.patch("app.orchestrator.AsyncSessionLocal", _Session)
+            mocker.patch("app.dep_lifecycle.AsyncSessionLocal", _Session)
             mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._ensure_vm_deleted", new_callable=AsyncMock)
             mocker.patch("app.vm_lifecycle._get_actual_gcp_vm_count", return_value=0)

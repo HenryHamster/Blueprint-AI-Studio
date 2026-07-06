@@ -7330,7 +7330,7 @@ class TestMarkDependentsWarmClaimable:
         )
 
         spy = mocker.patch(
-            "app.orchestrator._mark_unblocked_dependents",
+            "app.dep_lifecycle._mark_unblocked_dependents",
             new_callable=AsyncMock,
             return_value=2,
         )
@@ -7354,7 +7354,7 @@ class TestMarkDependentsWarmClaimable:
         )
 
         mocker.patch(
-            "app.orchestrator._mark_unblocked_dependents",
+            "app.dep_lifecycle._mark_unblocked_dependents",
             new_callable=AsyncMock,
             side_effect=RuntimeError("boom"),
         )

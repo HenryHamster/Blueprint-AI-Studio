@@ -386,7 +386,7 @@ async def _mark_dependents_warm_claimable(landed_task: Task) -> None:
     import (orchestrator is a heavy module that is already loaded by call time).
     """
     try:
-        from app.orchestrator import _mark_unblocked_dependents
+        from app.dep_lifecycle import _mark_unblocked_dependents
         from app.rollup_management import _verify_pr_merged
 
         unblocked = await _mark_unblocked_dependents(landed_task, _verify_pr_merged)
