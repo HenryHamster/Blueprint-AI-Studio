@@ -736,7 +736,10 @@ export async function handleStrategicResident(
         const or = await runTurn(combineOperatorMessages(watch.messages), true);
         if (turnWedgedSession(or)) break;
         await persistReply(or);
-        const hb2 = await heartbeat(true);
+        // Extract the ids of the messages we just consumed so the backend can mark
+        // them handled — same as the fast-path operator-message pre-emption above.
+        const consumedIds = watch.messages.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        const hb2 = await heartbeat(true, consumedIds);
         if (hb2?.stop_requested) break;
         if (or.processGone) { stopReason = 'session_process_exited'; break; }
         operatorTurnJustCompleted = true;
