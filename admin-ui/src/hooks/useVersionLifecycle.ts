@@ -2,6 +2,11 @@ import { useState, useRef, useCallback } from 'react';
 import { apiFetch, type VersionLifecycleResponse } from '../api';
 import { usePoller, DEFAULT_POLL_MS } from './usePoller';
 
+export function hasVersionLifecycleData(versionLifecycle: VersionLifecycleResponse | null): boolean {
+  return versionLifecycle !== null &&
+    (versionLifecycle.current_version !== null || versionLifecycle.recent_versions.length > 0);
+}
+
 export interface UseVersionLifecycleResult {
   versionLifecycle: VersionLifecycleResponse | null;
   versionLifecycleError: string | null;

@@ -52,6 +52,7 @@ import { useStrategicMessageTarget } from './hooks/useStrategicMessageTarget';
 import { useCommandPaletteState } from './hooks/useCommandPaletteState';
 import { useStrategicContextNavigation } from './hooks/useStrategicContextNavigation';
 import { useWorkbenchCommands, type PipelineSection } from './hooks/useWorkbenchCommands';
+import { useVersionLifecycle, hasVersionLifecycleData } from './hooks/useVersionLifecycle';
 import { checkInStrategicSession, startStrategicSession, stopStrategicSession, updateStrategicWorkbenchState, type StrategicResidentRunnerOption, type StrategicResidentSessionSnapshot, type StrategicStateAttentionItem, type StrategicWorkbenchState } from './strategicStateApi';
 import { parseTimestamp } from './utils/time';
 import { matchesStatusFilter } from './utils/statusFilter';
@@ -64,7 +65,7 @@ type StrategicSessionRefs = StrategicWorkbenchState['selected_refs'];
 type PipelineDirectionOption = { id: string; text: string };
 const PIPELINE_SECTION_ORDER: readonly PipelineSection[] = ['flow', 'board', 'archive'];
 const PROJECT_SECTION_ORDER: readonly ProjectSection[] = ['running-update', 'directions', 'problem-model', 'design-doc', 'manage'];
-const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics'];
+const RUNTIME_SECTION_ORDER: readonly RuntimeSection[] = ['health', 'devices', 'compute', 'accounts', 'settings', 'analytics', 'version-lifecycle'];
 const ACTIVE_TASK_STATUS_FILTER = STATUS_OPTIONS.map(option => option.value);
 
 function cycleSection<T extends string>(sections: readonly T[], current: T, direction: -1 | 1): T {
@@ -785,6 +786,8 @@ export default function App() {
   const [projectManageSection, setProjectManageSection] = useState<ProjectManageSection>('overview');
   const [runtimeSection, setRuntimeSection] = useState<RuntimeSection>('health');
   const [runtimeConfigSection, setRuntimeConfigSection] = useState<RuntimeSettingsSection>('orchestrator');
+  const { versionLifecycle, versionLifecycleError, versionLifecycleLastSuccessAt, versionLifecycleRefreshing, refreshVersionLifecycle } = useVersionLifecycle(s.selectedProjectId);
+  const hasVersionLifecycle = hasVersionLifecycleData(versionLifecycle);
   const { setActiveTab: setPrimaryTab, setShowArchive: setArchiveVisible, setViewMode: setTaskViewMode } = s;
   const applyPipelineSection = useCallback((section: PipelineSection) => {
     setPipelineSection(section);
@@ -802,11 +805,14 @@ export default function App() {
       return true;
     }
     if (activeTab === 'runtime') {
-      setRuntimeSection(cycleSection(RUNTIME_SECTION_ORDER, runtimeSection, direction));
+      const visibleRuntimeSections = RUNTIME_SECTION_ORDER.filter(
+        s => s !== 'version-lifecycle' || hasVersionLifecycle,
+      );
+      setRuntimeSection(cycleSection(visibleRuntimeSections, runtimeSection, direction));
       return true;
     }
     return false;
-  }, [activeTab, applyPipelineSection, pipelineSection, projectSection, runtimeSection]);
+  }, [activeTab, applyPipelineSection, hasVersionLifecycle, pipelineSection, projectSection, runtimeSection]);
   useEffect(() => {
     if (!selectedProjectId || !strategicWorkbenchState?.active_surface) return;
     if (strategicWorkbenchOperatorSurfaceTouchedRef.current) return;
@@ -1149,6 +1155,7 @@ export default function App() {
   const workbenchCommands = useWorkbenchCommands({
     selectedProjectId: s.selectedProjectId,
     selectedProjectRepoLabel,
+    hasVersionLifecycle,
     directionsCount: directions.length,
     filteredTaskCount: filteredTasks.length,
     visibleActiveCount: visibleActiveTasks.length,
@@ -1674,6 +1681,11 @@ export default function App() {
             onRestartOrchestrator={s.handleRestartOrchestrator}
             fleetRunnersRefreshSignal={s.fleetRunnersRefreshSignal}
             addToast={s.addToast}
+            versionLifecycle={versionLifecycle}
+            versionLifecycleError={versionLifecycleError}
+            versionLifecycleLastSuccessAt={versionLifecycleLastSuccessAt}
+            versionLifecycleRefreshing={versionLifecycleRefreshing}
+            refreshVersionLifecycle={refreshVersionLifecycle}
           />
         </ErrorBoundary>
       ) : (

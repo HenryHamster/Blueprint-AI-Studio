@@ -43,6 +43,14 @@ vi.mock('./DashboardHome', () => ({
   DashboardHome: () => <div>analytics</div>,
 }));
 
+vi.mock('./VersionLifecyclePanel', () => ({
+  VersionLifecyclePanel: ({ data }: { data: { current_version?: { version_number: number } | null } | null }) => (
+    <div data-testid="version-lifecycle-panel">
+      {data?.current_version ? `v${data.current_version.version_number}` : 'no version data'}
+    </div>
+  ),
+}));
+
 vi.mock('./RuntimeAccountsPanel', () => ({
   RuntimeAccountsPanel: () => <div data-testid="runtime-accounts-panel">account monitor</div>,
 }));
@@ -135,6 +143,11 @@ function runtimeProps(overrides: {
     onDismissExperiment: vi.fn(async () => {}),
     onNavigateToKnowledge: vi.fn(),
     onRestartOrchestrator: vi.fn(async () => {}),
+    versionLifecycle: null,
+    versionLifecycleError: null,
+    versionLifecycleLastSuccessAt: null,
+    versionLifecycleRefreshing: false,
+    refreshVersionLifecycle: vi.fn(async () => {}),
   };
 }
 
@@ -366,5 +379,41 @@ describe('Operator workspaces', () => {
     expect(screen.getByText('WS')).toBeInTheDocument();
     expect(screen.getByText('stale')).toBeInTheDocument();
     expect(screen.getByText('fleet-wide')).toBeInTheDocument();
+  });
+
+  test('version-lifecycle section renders panel when data is present and hides tab when absent', async () => {
+    const user = userEvent.setup();
+    const onRuntimeSectionChange = vi.fn();
+
+    // No version data: tab should not appear
+    const { rerender } = render(
+      <RuntimeWorkspace
+        {...runtimeProps({ runtimeSection: 'health', onRuntimeSectionChange })}
+        versionLifecycle={null}
+      />,
+    );
+    const tabContainer = screen.getByLabelText('Runtime sections');
+    expect(within(tabContainer).queryByRole('button', { name: 'Versions' })).not.toBeInTheDocument();
+
+    // With version data: Versions tab appears
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ runtimeSection: 'health', onRuntimeSectionChange })}
+        versionLifecycle={{ current_version: { version_number: 7, phase: 'stabilize', phase_changed_at: '2026-01-01T00:00:00Z', opened_at: '2026-01-01T00:00:00Z', qualification_attempts: 0, merged_task_count: 0, goal: null, goal_updated_at: null, goal_editor_info: null, phase_reasoning: null, qualification_state: null, last_qualification: null, active_candidate_sha: null, latest_audit: null, audit_evidence_state: 'none', stale_audit: null }, recent_versions: [], promotion_enabled: false, promotion_readiness: null }}
+      />,
+    );
+    expect(within(screen.getByLabelText('Runtime sections')).getByRole('button', { name: 'Versions' })).toBeInTheDocument();
+
+    // Navigate to version-lifecycle section
+    await user.click(within(screen.getByLabelText('Runtime sections')).getByRole('button', { name: 'Versions' }));
+    expect(onRuntimeSectionChange).toHaveBeenCalledWith('version-lifecycle');
+
+    rerender(
+      <RuntimeWorkspace
+        {...runtimeProps({ runtimeSection: 'version-lifecycle', onRuntimeSectionChange })}
+        versionLifecycle={{ current_version: { version_number: 7, phase: 'stabilize', phase_changed_at: '2026-01-01T00:00:00Z', opened_at: '2026-01-01T00:00:00Z', qualification_attempts: 0, merged_task_count: 0, goal: null, goal_updated_at: null, goal_editor_info: null, phase_reasoning: null, qualification_state: null, last_qualification: null, active_candidate_sha: null, latest_audit: null, audit_evidence_state: 'none', stale_audit: null }, recent_versions: [], promotion_enabled: false, promotion_readiness: null }}
+      />,
+    );
+    expect(screen.getByTestId('version-lifecycle-panel')).toHaveTextContent('v7');
   });
 });
