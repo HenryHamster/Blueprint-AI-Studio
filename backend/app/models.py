@@ -2961,6 +2961,14 @@ class ProjectMessage(SQLModel, table=True):
         Index("ix_projectmessage_created_at", "created_at"),
         Index("ix_projectmessage_project_created_at", "project_id", "created_at"),
         Index("ix_projectmessage_from_task_id", "from_task_id"),
+        # Accelerates high-signal message fetches filtered by (project_id, message_type)
+        # and ordered by created_at DESC (build_operator_attention, get_operator_message_counts).
+        Index(
+            "ix_projectmessage_project_message_created",
+            "project_id",
+            "message_type",
+            "created_at",
+        ),
         # Serves the session-scoped poll / unattended-cap / pacing queries
         # (project_id + resident_session_id + created_at ordering/aggregation).
         Index(
@@ -4607,4 +4615,23 @@ class LocalRunner(SQLModel, table=True):
             "project_id",
             "status",
         ),
+    )
+
+
+class UiLoadTimingSample(SQLModel, table=True):
+    """Persisted admin-UI initial-load timing sample.
+
+    Written on every POST /api/admin/ui-load-timing so samples survive
+    process restarts and can span before/after deploy comparisons.
+    Capped at 200 rows per surface via application-layer trim on insert.
+    """
+
+    __tablename__ = "ui_load_timing_sample"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    surface: str = Field(sa_column=Column(String(64), nullable=False, index=True))
+    page_ready_ms: int = Field(sa_column=Column(Integer, nullable=False))
+    recorded_at: datetime = Field(
+        default_factory=_utcnow,
+        sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),
     )

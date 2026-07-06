@@ -21,6 +21,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy import delete
+from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -36,6 +38,7 @@ from app.models import (
     Project,
     Task,
     TaskStatus,
+    UiLoadTimingSample,
     _utcnow,
     get_task_total_vm_cost_usd_or_none,
 )
@@ -1833,44 +1836,74 @@ async def get_spawn_gate_census(
 
 
 # ---------------------------------------------------------------------------
-# Admin-UI initial-load timing: in-memory ring buffer per surface
+# Admin-UI initial-load timing: persisted per surface
 # ---------------------------------------------------------------------------
 
 _UI_TIMING_LOCK = threading.Lock()
 _UI_TIMING_SAMPLES: Dict[str, deque] = {}
-_UI_TIMING_MAX_PER_SURFACE = 100
+_UI_TIMING_MAX_PER_SURFACE = 200
 
 
 @router.post("/ui-load-timing")
 async def record_ui_load_timing(
     payload: Dict[str, Any],
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ) -> Dict[str, Any]:
     """Record one admin-UI initial-load timing sample for a surface.
 
-    Stored in-memory (resets on restart).  The companion GET endpoint
-    returns recent samples per surface for before/after comparison.
+    Persisted to the database so samples survive process restarts and can
+    be used for before/after deploy comparisons.  The in-memory ring buffer
+    is retained for cross-test compatibility.
     """
     surface = str(payload.get("surface") or "unknown")[:64]
     ms_raw = payload.get("page_ready_ms")
     if not isinstance(ms_raw, (int, float)) or ms_raw < 0 or ms_raw > 600_000:
         raise HTTPException(status_code=400, detail="page_ready_ms must be a non-negative number ≤600000")
-    sample: Dict[str, Any] = {"ts": _utcnow().isoformat(), "page_ready_ms": int(ms_raw)}
+    ms = int(ms_raw)
+    now = _utcnow()
+    sample_row = UiLoadTimingSample(surface=surface, page_ready_ms=ms, recorded_at=now)
+    session.add(sample_row)
+    # Trim oldest rows beyond cap (keep newest _UI_TIMING_MAX_PER_SURFACE)
+    cutoff_sq = (
+        sa_select(UiLoadTimingSample.recorded_at)
+        .where(UiLoadTimingSample.surface == surface)
+        .order_by(UiLoadTimingSample.recorded_at.desc())
+        .offset(_UI_TIMING_MAX_PER_SURFACE - 1)
+        .limit(1)
+        .scalar_subquery()
+    )
+    await session.execute(
+        delete(UiLoadTimingSample).where(
+            UiLoadTimingSample.surface == surface,
+            UiLoadTimingSample.recorded_at < cutoff_sq,
+        )
+    )
+    await session.commit()
     with _UI_TIMING_LOCK:
         q = _UI_TIMING_SAMPLES.setdefault(surface, deque(maxlen=_UI_TIMING_MAX_PER_SURFACE))
-        q.append(sample)
+        q.append({"ts": now.isoformat(), "page_ready_ms": ms})
     return {"ok": True}
 
 
 @router.get("/ui-load-timing")
 async def get_ui_load_timing(
+    session: AsyncSession = Depends(get_session),
     current_user: dict = Depends(require_admin),  # noqa: ARG001
 ) -> Dict[str, Any]:
     """Return recent admin-UI initial-load timing samples grouped by surface.
 
     Each surface entry is a list of {ts, page_ready_ms} objects ordered
-    oldest-first (up to 100 per surface).  Resets on process restart.
+    oldest-first (up to 200 per surface).  Persisted across restarts.
     """
-    with _UI_TIMING_LOCK:
-        surfaces = {s: list(q) for s, q in _UI_TIMING_SAMPLES.items()}
+    rows = (
+        await session.execute(
+            select(UiLoadTimingSample).order_by(UiLoadTimingSample.recorded_at.asc())
+        )
+    ).scalars().all()
+    surfaces: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        surfaces.setdefault(row.surface, []).append(
+            {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms}
+        )
     return {"surfaces": surfaces}

@@ -333,6 +333,7 @@ export interface Task {
   } | null;
   fix_loop_history?: Record<string, FixLoopAttempt[]> | null;
   fix_loop_summary?: FixLoopSummary[] | null;
+  plan_subtasks?: Array<{ title: string; depends_on_indices?: number[] }> | null;
   edges_considered?: EdgeConsidered[] | null;
   // Transitional state: agent run completed but post-commit side effects
   // (PR submission, child task spawns, merge) haven't fired yet.

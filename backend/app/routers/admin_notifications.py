@@ -627,6 +627,46 @@ async def list_messages(
     }
 
 
+@router.get("/messages/counts")
+async def get_message_counts(
+    project_id: str = Query(...),
+    last_seen_ms: Optional[int] = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return high-signal open message counts by type plus an unread total.
+
+    Lightweight badge-poll alternative to GET /messages — returns only integers,
+    no message content or previews.
+    """
+    try:
+        pid = uuid.UUID(project_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=400, detail="Invalid project_id format")
+    await _get_user_project(pid, current_user["user_id"], session)
+
+    from app.messages_last_seen import timestamp_ms_to_naive_utc
+    from app.models import MessagesLastSeen
+    from app.operator_attention import get_operator_message_counts
+
+    client_last_seen_at = timestamp_ms_to_naive_utc(last_seen_ms) if last_seen_ms is not None else None
+    # Merge client-supplied timestamp with server-stored last_seen so the badge
+    # works correctly on a fresh device / cleared localStorage (cross-device).
+    server_last_seen_at = (
+        await session.execute(
+            select(MessagesLastSeen.last_seen_at).where(
+                MessagesLastSeen.project_id == pid,
+                MessagesLastSeen.user_id == current_user["user_id"],
+            )
+        )
+    ).scalar_one_or_none()
+    if client_last_seen_at is not None and server_last_seen_at is not None:
+        last_seen_at = max(client_last_seen_at, server_last_seen_at)
+    else:
+        last_seen_at = client_last_seen_at or server_last_seen_at
+    return await get_operator_message_counts(session, pid, last_seen_at, user_id=current_user["user_id"])
+
+
 @router.post("/messages")
 async def create_message(
     payload: _MessageCreate,

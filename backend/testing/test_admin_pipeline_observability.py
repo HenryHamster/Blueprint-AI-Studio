@@ -651,3 +651,42 @@ async def test_ui_load_timing_get_empty(client, db_session):
     resp = await client.get("/api/admin/ui-load-timing")
     assert resp.status_code == 200
     assert resp.json()["surfaces"] == {}
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_aggregates_persist_across_process_restart(
+    client, db_session
+):
+    """Samples written to the DB survive an in-process ring-buffer reset.
+
+    Simulates a deploy (process restart) by clearing the in-memory cache
+    after recording samples.  The GET endpoint must still return the
+    persisted rows because it reads from the DB, not the cache.
+    """
+    import app.routers.admin_pipeline_observability as obs_mod
+
+    # Record two samples on different surfaces.
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "chat", "page_ready_ms": 800},
+    )
+    assert resp.status_code == 200
+
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "pipeline", "page_ready_ms": 1500},
+    )
+    assert resp.status_code == 200
+
+    # Simulate a process restart by wiping the in-memory cache.
+    with obs_mod._UI_TIMING_LOCK:
+        obs_mod._UI_TIMING_SAMPLES.clear()
+
+    # GET must still return both samples from the database.
+    resp = await client.get("/api/admin/ui-load-timing")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "chat" in data["surfaces"]
+    assert "pipeline" in data["surfaces"]
+    assert data["surfaces"]["chat"][0]["page_ready_ms"] == 800
+    assert data["surfaces"]["pipeline"][0]["page_ready_ms"] == 1500

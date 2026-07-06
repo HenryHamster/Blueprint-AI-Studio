@@ -5,7 +5,7 @@ import type { LogLevel } from './TaskDetailDrawerLogs';
 import { StatusBadge, TaskTypeBadge } from './TaskCard';
 import type { Task } from './TaskCard';
 import { DetailsTab } from './TaskDetailDrawerMeta';
-import { API_BASE_URL, authGet, fetchTaskPrFiles } from '../api';
+import { API_BASE_URL, authGet, fetchTask, fetchTaskPrFiles } from '../api';
 import type { PrFileEntry } from '../api';
 import { isCancellableTaskStatus, taskCancelConsequence } from './taskCancelCopy';
 
@@ -325,6 +325,20 @@ export function TaskDetailDrawer({
   const [includePatch, setIncludePatch] = useState(false);
   const [cancelImpact, setCancelImpact] = useState<CancelImpactResponse | null>(null);
   const [cancelImpactStatus, setCancelImpactStatus] = useState<CancelImpactStatus>('idle');
+  const [detailTask, setDetailTask] = useState<Task | null>(null);
+
+  // Fetch full task detail (status_log, plan_output) which are omitted from the list endpoint.
+  useEffect(() => {
+    setDetailTask(null);
+    let cancelled = false;
+    fetchTask(task.id).then(t => {
+      if (!cancelled) setDetailTask(t);
+    }).catch(() => {});
+    return () => { cancelled = true; };
+  }, [task.id]);
+
+  // Merge list task with detail task: detail fields overlay list fields when available.
+  const richTask: Task = detailTask ? { ...task, ...detailTask } : task;
 
   // Detect mobile viewport (< 640px, Tailwind sm: breakpoint)
   useEffect(() => {
@@ -638,7 +652,7 @@ export function TaskDetailDrawer({
           </div>
         )}
         {activeTab === 'details' ? (
-          <DetailsTab task={task} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
+          <DetailsTab task={richTask} tasks={tasks} gcpProjectId={gcpProjectId} onNavigateToTask={onNavigateToTask} />
         ) : activeTab === 'changes' ? (
           <ChangesTabContent
             prFiles={prFiles}

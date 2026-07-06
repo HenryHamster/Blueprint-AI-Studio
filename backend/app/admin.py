@@ -114,6 +114,25 @@ _LOOP_MAX_ATTEMPTS: Dict[str, int] = {"lint": 5, "test": 3, "check": 5}
 _FIX_LOOP_SUCCESS_REASONS = frozenset({"passed", "early_unchanged"})
 
 
+def _plan_subtasks(
+    plan_output: Dict[str, Any] | None,
+) -> List[Dict[str, Any]] | None:
+    """Return slim subtask list (title + dependency indices) for task card display."""
+    if not isinstance(plan_output, dict):
+        return None
+    subtasks = plan_output.get("subtasks")
+    if not isinstance(subtasks, list):
+        return None
+    return [
+        {
+            "title": s.get("title", ""),
+            "depends_on_indices": s.get("depends_on_indices", []),
+        }
+        for s in subtasks
+        if isinstance(s, dict)
+    ]
+
+
 def _fix_loop_summary(
     history: Dict[str, Any] | None,
 ) -> List[Dict[str, Any]] | None:
@@ -220,14 +239,14 @@ ADMIN_TASKS_MAX_LIMIT = 500
 # format_compliance_summary.
 _TASK_LIST_COLS = [
     Task.id, Task.project_id, Task.title, Task.description, Task.status,
-    Task.payloads, Task.vm_instance_id, Task.latest_status_message, Task.status_log,
+    Task.payloads, Task.vm_instance_id, Task.latest_status_message,
     Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
     Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
     Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
     Task.blocker_kind, Task.blocked_reason, Task.blocked_at, Task.recheck_after,
     Task.parked_at, Task.park_reason, Task.context, Task.archived,
     Task.vm_runtime_cost_banked_db, Task.vm_provisioned_at, Task.vm_stopped_at,
-    Task.fix_loop_history, Task.post_commit_pending, Task.updated_at,
+    Task.post_commit_pending, Task.updated_at,
     Task.vm_machine_type, Task.vm_spot, Task.prompt_fingerprint,
 ]
 
@@ -502,12 +521,11 @@ async def get_all_tasks(
             "task_type": task_type,
             "vm_instance_id": t.vm_instance_id,
             "latest_status_message": t.latest_status_message,
-            "status_log": t.status_log or [],
             "created_by": t.created_by,
             "requires_approval": t.requires_approval,
             "parent_task_id": str(t.parent_task_id) if t.parent_task_id else None,
             "depends_on": t.depends_on or [],
-            "plan_output": t.plan_output,
+            "plan_subtasks": _plan_subtasks(t.plan_output),
             "created_at": t.created_at.isoformat() if t.created_at else None,
             "started_at": t.started_at.isoformat() if t.started_at else None,
             "last_heartbeat": t.last_heartbeat.isoformat()
@@ -563,7 +581,7 @@ async def get_all_tasks(
             and t.latest_status_message
             else None,
             "estimated_cost_usd": get_task_total_vm_cost_usd_or_none(t),
-            "fix_loop_summary": _fix_loop_summary(t.fix_loop_history),
+            "fix_loop_summary": None,
             "post_commit_pending": t.post_commit_pending,
         }
         result_list.append(task_dict)

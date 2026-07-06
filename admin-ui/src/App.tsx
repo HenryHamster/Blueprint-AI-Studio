@@ -11,7 +11,7 @@ import { ResearchBrowser } from './components/ResearchBrowser';
 import { KnowledgeBrowser } from './components/KnowledgeBrowser';
 import { auth, signInWithGoogle, signOut } from './firebase';
 import { fetchTask, apiFetch, API_BASE_URL } from './api';
-import { countHighSignalMessages, countNewSinceLastVisit, loadLastSeen, fetchBackendLastSeen, resolveLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
+import { loadLastSeen, loadEventPrefs, loadTemporaryMutes, fetchServerNoisePrefs, fetchServerTempMutes, resolveNoisePrefs, resolveServerTempMutes, type EventPref, type TemporaryMutes } from './components/MessagesPanel.utils';
 import { type SrInvestigationSignal } from './components/SrTrendBreakdown';
 import { TaskDetailDrawer } from './components/TaskDetailDrawer';
 import { ToastContainer } from './components/Toasts';
@@ -245,21 +245,18 @@ export default function App() {
     if (!selectedProjectId) return;
     const pid = selectedProjectId; // narrowed to string
     try {
-      const params = new URLSearchParams({ project_id: pid, status: 'open', limit: '100' });
-      const [res, backendTs] = await Promise.all([
-        apiFetch(`${API_BASE_URL}/api/admin/messages?${params}`),
-        fetchBackendLastSeen(pid),
-      ]);
+      // Use the lightweight counts endpoint — returns only integers, no message previews.
+      const localTs = loadLastSeen(s.user?.email, pid);
+      const params = new URLSearchParams({ project_id: pid });
+      if (localTs !== null) params.set('last_seen_ms', String(localTs));
+      const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/counts?${params}`);
       if (!res.ok || signal.aborted) return;
       const data = await res.json();
-      const msgs: Array<{ message_type: string; from_type: string; status: string; context: Record<string, unknown>; created_at?: string | null }> = data.messages ?? [];
       if (!signal.aborted) {
-        const noisePrefs = closedPanelNoisePrefsRef.current;
-        const tempMutes = closedPanelTempMutesRef.current;
-        setOpenMessageCount(countHighSignalMessages(msgs, noisePrefs, tempMutes));
-        const localTs = loadLastSeen(s.user?.email, pid);
-        const lastSeenTs = resolveLastSeen(localTs, backendTs);
-        setNewSinceLastVisit(countNewSinceLastVisit(msgs, lastSeenTs, noisePrefs, tempMutes));
+        setOpenMessageCount(
+          (data.blocker ?? 0) + (data.question ?? 0) + (data.bug_report ?? 0) + (data.feedback ?? 0) + (data.high_signal_note ?? 0),
+        );
+        setNewSinceLastVisit(data.unread ?? 0);
       }
     } catch { /* ignore */ }
   }, {

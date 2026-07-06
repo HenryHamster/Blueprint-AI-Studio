@@ -87,6 +87,53 @@ def _record_crash_and_count(
     return len(crash_timestamps[name])
 
 
+async def _emit_crash_alert(
+    session_factory,
+    name: str,
+    cause_str: str,
+) -> int:
+    """Emit a deduped ``AlertSeverity.ERROR`` per-crash Alert for every project.
+
+    Uses a single batched query to check for existing open alerts rather than
+    one query per project. Returns the number of Alert rows actually created.
+    """
+    alert_title = f"Background service crashed: {name}"
+    async with session_factory() as alert_session:
+        project_ids = (
+            (await alert_session.execute(select(Project.id))).scalars().all()
+        )
+        if not project_ids:
+            return 0
+        already_alerted = set(
+            (
+                await alert_session.execute(
+                    select(Alert.project_id).where(
+                        Alert.project_id.in_(project_ids),
+                        Alert.title == alert_title,
+                        Alert.dismissed_at.is_(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        created = 0
+        for project_id in project_ids:
+            if project_id in already_alerted:
+                continue
+            alert_session.add(
+                Alert(
+                    project_id=project_id,
+                    severity=AlertSeverity.ERROR,
+                    title=alert_title,
+                    message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
+                )
+            )
+            created += 1
+        await alert_session.commit()
+    return created
+
+
 async def _emit_crash_episode_alert(
     session_factory,
     name: str,
@@ -1354,37 +1401,9 @@ async def lifespan(app):
                             )
                         )
                         try:
-                            async with AsyncSessionLocal() as alert_session:
-                                project_ids = (
-                                    (await alert_session.execute(select(Project.id)))
-                                    .scalars()
-                                    .all()
-                                )
-                                alert_title = f"Background service crashed: {name}"
-                                for project_id in project_ids:
-                                    existing = (
-                                        (
-                                            await alert_session.execute(
-                                                select(Alert).where(
-                                                    Alert.project_id == project_id,
-                                                    Alert.title == alert_title,
-                                                    Alert.dismissed_at.is_(None),
-                                                )
-                                            )
-                                        )
-                                        .scalars()
-                                        .first()
-                                    )
-                                    if existing:
-                                        continue
-                                    alert = Alert(
-                                        project_id=project_id,
-                                        severity=AlertSeverity.ERROR,
-                                        title=alert_title,
-                                        message=f"Background service '{name}' crashed with: {cause_str[:300]}. Auto-restarting with backoff.",
-                                    )
-                                    alert_session.add(alert)
-                                await alert_session.commit()
+                            await _emit_crash_alert(
+                                AsyncSessionLocal, name, cause_str
+                            )
                         except Exception as alert_exc:
                             logger.warning(
                                 f"[MONITOR] Failed to create crash alert: {alert_exc}"

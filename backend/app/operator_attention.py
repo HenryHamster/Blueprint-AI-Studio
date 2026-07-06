@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import and_, case, func, not_, or_
+from sqlalchemy import and_, case, func, not_, or_, union_all
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -60,6 +60,8 @@ _HIGH_SIGNAL_MESSAGE_TYPES = (
     MessageType.BUG_REPORT,
     MessageType.FEEDBACK,
 )
+# Reserved keys in MessagesNoisePrefs.prefs that are not event-type visibility prefs.
+_PREFS_RESERVED_KEYS = frozenset({"_temp_mutes", "_mute_window", "_strategic_workbench"})
 _NEEDS_OPERATOR_MESSAGE_TYPES = (MessageType.QUESTION, MessageType.BLOCKER)
 _APPROVAL_TASK_STATUSES = (
     TaskStatus.QUEUED,
@@ -1383,6 +1385,132 @@ def _stale_completion_debt_attention_item(
     }
 
 
+async def get_operator_message_counts(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    last_seen_at: datetime | None = None,
+    user_id: str | None = None,
+) -> dict[str, int]:
+    """Return high-signal open message counts by type plus an unread total.
+
+    Lightweight alternative to build_operator_attention for badge-poll callers
+    that only need integers, not full message previews.  Includes high-signal
+    NOTE escalations (event_type in HIGH_SIGNAL_NOTE_EVENT_TYPES) and honours
+    per-operator noise prefs / temp-mutes when user_id is provided.
+    """
+    from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+    from app.messages_noise_prefs_store import get_messages_noise_prefs_row
+
+    # Build the set of event types the operator has muted.
+    muted_event_types: set[str] = set()
+    if user_id is not None:
+        prefs_row = await get_messages_noise_prefs_row(session, user_id, project_id)
+        if prefs_row is not None:
+            prefs_dict = dict(prefs_row.prefs or {})
+            # Permanent per-event-type mutes and routines (excluded from badge)
+            muted_event_types = {
+                et
+                for et, pref in prefs_dict.items()
+                if et not in _PREFS_RESERVED_KEYS and pref in ("mute", "routine")
+            }
+            # Active temporary mutes
+            now_ms = int(_utcnow().timestamp() * 1000)
+            temp_mutes = prefs_dict.get("_temp_mutes") or {}
+            if isinstance(temp_mutes, dict):
+                muted_event_types |= {
+                    et
+                    for et, exp in temp_mutes.items()
+                    if isinstance(exp, (int, float)) and exp > now_ms
+                }
+
+    _hs_types = list(_HIGH_SIGNAL_MESSAGE_TYPES)
+    count_rows = (
+        await session.execute(
+            select(ProjectMessage.message_type, func.count())
+            .where(
+                ProjectMessage.project_id == project_id,
+                ProjectMessage.status == OPEN_STATUS,
+                ProjectMessage.from_type != "user",
+                ProjectMessage.message_type.in_(_hs_types),
+            )
+            .group_by(ProjectMessage.message_type)
+        )
+    ).all()
+    counts = {mt: int(cnt or 0) for mt, cnt in count_rows}
+
+    # Count high-signal NOTE escalations, excluding muted event types.
+    included_note_ets = list(HIGH_SIGNAL_NOTE_EVENT_TYPES - muted_event_types)
+    note_count = 0
+    if included_note_ets:
+        note_count = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        ProjectMessage.project_id == project_id,
+                        ProjectMessage.status == OPEN_STATUS,
+                        ProjectMessage.from_type != "user",
+                        ProjectMessage.message_type == MessageType.NOTE,
+                        ProjectMessage.context.op("->>")(
+                            "event_type"
+                        ).in_(included_note_ets),
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+
+    _base_unread = [
+        ProjectMessage.project_id == project_id,
+        ProjectMessage.status == OPEN_STATUS,
+        ProjectMessage.from_type != "user",
+    ]
+    _ts_filter = (
+        [ProjectMessage.created_at > last_seen_at] if last_seen_at is not None else []
+    )
+    unread = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(ProjectMessage)
+                .where(
+                    *_base_unread,
+                    ProjectMessage.message_type.in_(_hs_types),
+                    *_ts_filter,
+                )
+            )
+        ).scalar()
+        or 0
+    )
+    if included_note_ets:
+        unread += int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(ProjectMessage)
+                    .where(
+                        *_base_unread,
+                        ProjectMessage.message_type == MessageType.NOTE,
+                        ProjectMessage.context.op("->>")(
+                            "event_type"
+                        ).in_(included_note_ets),
+                        *_ts_filter,
+                    )
+                )
+            ).scalar()
+            or 0
+        )
+    return {
+        "blocker": counts.get(MessageType.BLOCKER, 0),
+        "question": counts.get(MessageType.QUESTION, 0),
+        "bug_report": counts.get(MessageType.BUG_REPORT, 0),
+        "feedback": counts.get(MessageType.FEEDBACK, 0),
+        "high_signal_note": note_count,
+        "unread": unread,
+    }
+
+
 async def build_operator_attention(
     session: AsyncSession,
     project: Project,
@@ -1409,58 +1537,40 @@ async def build_operator_attention(
         ProjectMessage.status == OPEN_STATUS,
         ProjectMessage.from_type != "user",
     ]
-    # Use UNION ALL with per-type LIMITs so that BLOCKER/QUESTION previews are
-    # always fetched independently of watch-message volume.  A single combined
-    # query with one global LIMIT loses high-priority blockers/questions whenever
-    # a burst of BUG_REPORT/FEEDBACK messages fills the recency window.
-    blocker_message_rows = list(
+    # UNION ALL with per-type LIMITs: one round-trip while preserving independent
+    # per-priority caps so a burst of BUG_REPORT/FEEDBACK can't crowd out BLOCKERs.
+    _blocker_q = (
+        select(ProjectMessage)
+        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.BLOCKER)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
+    )
+    _question_q = (
+        select(ProjectMessage)
+        .where(*_common_message_filters, ProjectMessage.message_type == MessageType.QUESTION)
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
+    )
+    _watch_q = (
+        select(ProjectMessage)
+        .where(
+            *_common_message_filters,
+            ProjectMessage.message_type.in_([MessageType.BUG_REPORT, MessageType.FEEDBACK]),
+        )
+        .order_by(ProjectMessage.created_at.desc())
+        .limit(_MESSAGE_WATCH_PREVIEW_LIMIT)
+    )
+    message_rows = list(
         (
             await session.execute(
-                select(ProjectMessage)
-                .where(
-                    *_common_message_filters,
-                    ProjectMessage.message_type == MessageType.BLOCKER,
+                select(ProjectMessage).from_statement(
+                    union_all(_blocker_q, _question_q, _watch_q)
                 )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_BLOCKER_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
-    question_message_rows = list(
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    *_common_message_filters,
-                    ProjectMessage.message_type == MessageType.QUESTION,
-                )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_QUESTION_PREVIEW_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    watch_message_rows = list(
-        (
-            await session.execute(
-                select(ProjectMessage)
-                .where(
-                    *_common_message_filters,
-                    ProjectMessage.message_type.in_(
-                        [MessageType.BUG_REPORT, MessageType.FEEDBACK]
-                    ),
-                )
-                .order_by(ProjectMessage.created_at.desc())
-                .limit(_MESSAGE_WATCH_PREVIEW_LIMIT)
-            )
-        )
-        .scalars()
-        .all()
-    )
-    message_rows = [*blocker_message_rows, *question_message_rows, *watch_message_rows]
     message_count_rows = (
         await session.execute(
             select(ProjectMessage.message_type, func.count())

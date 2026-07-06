@@ -6321,6 +6321,247 @@ class TestMessages:
             f"expected resident_session_id=None (no active session), got {msg.resident_session_id!r}"
         )
 
+    @pytest.mark.asyncio
+    async def test_get_message_counts_empty(self, client: AsyncClient, db_session):
+        """New project returns zero counts for all types."""
+        project = await _make_project(db_session)
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["blocker"] == 0
+        assert data["question"] == 0
+        assert data["bug_report"] == 0
+        assert data["feedback"] == 0
+        assert data["unread"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_by_type(self, client: AsyncClient, db_session):
+        """Counts return correct per-type totals for open high-signal messages."""
+        project = await _make_project(db_session)
+        for mtype in (MessageType.BLOCKER, MessageType.BLOCKER, MessageType.QUESTION):
+            db_session.add(ProjectMessage(
+                project_id=project.id,
+                message_type=mtype,
+                from_type="system",
+                content="test",
+                status="open",
+            ))
+        # User-authored message should be excluded from counts (from_type="user")
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="user",
+            content="user msg",
+            status="open",
+        ))
+        # Resolved message should be excluded
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="resolved",
+            status="resolved",
+        ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["blocker"] == 2
+        assert data["question"] == 1
+        assert data["bug_report"] == 0
+        assert data["feedback"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_high_signal_note(self, client: AsyncClient, db_session):
+        """NOTE messages with HIGH_SIGNAL_NOTE_EVENT_TYPES event_type are counted in high_signal_note."""
+        from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+        project = await _make_project(db_session)
+        hs_event = next(iter(HIGH_SIGNAL_NOTE_EVENT_TYPES))  # pick any valid high-signal event type
+
+        # High-signal NOTE — should be counted
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="high signal note",
+            status="open",
+            context={"event_type": hs_event},
+        ))
+        # NOTE with non-high-signal event_type — should NOT be counted
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="routine note",
+            status="open",
+            context={"event_type": "some_low_signal_event"},
+        ))
+        # Resolved high-signal NOTE — should NOT be counted
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="resolved high signal note",
+            status="resolved",
+            context={"event_type": hs_event},
+        ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["high_signal_note"] == 1, f"expected 1 high_signal_note, got {data['high_signal_note']}"
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_noise_prefs_muted_event_excluded(self, client: AsyncClient, db_session):
+        """high_signal_note excludes NOTE messages whose event_type is muted in operator noise prefs."""
+        from app.notification_dispatch import HIGH_SIGNAL_NOTE_EVENT_TYPES
+
+        project = await _make_project(db_session)
+        event_types = list(HIGH_SIGNAL_NOTE_EVENT_TYPES)
+        muted_event = event_types[0]
+        visible_event = event_types[1] if len(event_types) > 1 else event_types[0]
+
+        # Create noise prefs row muting muted_event for the test user
+        db_session.add(MessagesNoisePrefs(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            prefs={muted_event: "mute"},
+        ))
+        # NOTE whose event_type is muted — should be excluded
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="system",
+            content="muted high signal note",
+            status="open",
+            context={"event_type": muted_event},
+        ))
+        if visible_event != muted_event:
+            # NOTE whose event_type is NOT muted — should be included
+            db_session.add(ProjectMessage(
+                project_id=project.id,
+                message_type=MessageType.NOTE,
+                from_type="system",
+                content="visible high signal note",
+                status="open",
+                context={"event_type": visible_event},
+            ))
+        await db_session.commit()
+
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        expected = 0 if muted_event == visible_event else 1
+        assert data["high_signal_note"] == expected, (
+            f"muted event {muted_event!r} should be excluded; got high_signal_note={data['high_signal_note']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_cross_device_last_seen(self, client: AsyncClient, db_session):
+        """When last_seen_ms is omitted, server-stored MessagesLastSeen drives the unread count."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old_ts = now - timedelta(hours=2)
+        new_ts = now - timedelta(minutes=5)
+        one_hour_ago = now - timedelta(hours=1)
+
+        # Store server-side last-seen as 1 hour ago
+        db_session.add(MessagesLastSeen(
+            user_id=TEST_USER_ID,
+            project_id=project.id,
+            last_seen_at=one_hour_ago,
+        ))
+        # Old message — before server last_seen, should NOT be unread
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="old blocker",
+            status="open",
+            created_at=old_ts,
+        ))
+        # New message — after server last_seen, SHOULD be unread
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="new question",
+            status="open",
+            created_at=new_ts,
+        ))
+        await db_session.commit()
+
+        # No last_seen_ms param — server-stored value should be used
+        resp = await client.get(f"/api/admin/messages/counts?project_id={project.id}")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["unread"] == 1, (
+            f"server-stored last_seen should exclude old message; got unread={data['unread']}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_unread_with_last_seen_ms(self, client: AsyncClient, db_session):
+        """unread count returns only messages newer than last_seen_ms."""
+        from datetime import datetime, timedelta, timezone
+
+        project = await _make_project(db_session)
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        old_ts = now - timedelta(hours=2)
+        new_ts = now - timedelta(minutes=5)
+
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.BLOCKER,
+            from_type="system",
+            content="old blocker",
+            status="open",
+            created_at=old_ts,
+        ))
+        db_session.add(ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.QUESTION,
+            from_type="system",
+            content="new question",
+            status="open",
+            created_at=new_ts,
+        ))
+        await db_session.commit()
+
+        # last_seen_ms set to 1 hour ago — only the new question is unread
+        one_hour_ago_ms = int((now - timedelta(hours=1)).timestamp() * 1000)
+        resp = await client.get(
+            f"/api/admin/messages/counts?project_id={project.id}&last_seen_ms={one_hour_ago_ms}"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["blocker"] == 1
+        assert data["question"] == 1
+        assert data["unread"] == 1  # only the new question
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_invalid_project_returns_404(
+        self, client: AsyncClient, db_session
+    ):
+        """Non-existent project returns 404."""
+        resp = await client.get(
+            f"/api/admin/messages/counts?project_id={uuid.uuid4()}"
+        )
+        assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_get_message_counts_invalid_project_id_format_returns_400(
+        self, client: AsyncClient, db_session
+    ):
+        """Invalid UUID format returns 400."""
+        resp = await client.get("/api/admin/messages/counts?project_id=not-a-uuid")
+        assert resp.status_code == 400
+
 
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
@@ -27007,3 +27248,177 @@ def test_strategic_agent_ops_all_have_real_handlers():
         f"STRATEGIC_AGENT_OPS lists ops with no elif handler in strategic_operation: {sorted(missing)}. "
         "Add the handler or remove the op from STRATEGIC_AGENT_OPS."
     )
+
+
+# ── _plan_subtasks unit tests ──────────────────────────────────────────────────
+
+
+def test_plan_subtasks_none_when_plan_output_is_none():
+    from app.admin import _plan_subtasks
+
+    assert _plan_subtasks(None) is None
+
+
+def test_plan_subtasks_none_when_plan_output_is_list():
+    from app.admin import _plan_subtasks
+
+    # research tasks use a list-shaped plan_output
+    assert _plan_subtasks([{"title": "Finding 1"}]) is None
+
+
+def test_plan_subtasks_none_when_plan_output_is_string():
+    from app.admin import _plan_subtasks
+
+    assert _plan_subtasks("not a dict") is None  # type: ignore[arg-type]
+
+
+def test_plan_subtasks_none_when_subtasks_missing():
+    from app.admin import _plan_subtasks
+
+    assert _plan_subtasks({"description": "no subtasks key"}) is None
+
+
+def test_plan_subtasks_none_when_subtasks_not_a_list():
+    from app.admin import _plan_subtasks
+
+    assert _plan_subtasks({"subtasks": {"a": "b"}}) is None
+
+
+def test_plan_subtasks_empty_list_when_subtasks_is_empty():
+    from app.admin import _plan_subtasks
+
+    assert _plan_subtasks({"subtasks": []}) == []
+
+
+def test_plan_subtasks_filters_non_dict_entries():
+    from app.admin import _plan_subtasks
+
+    result = _plan_subtasks({"subtasks": ["string_entry", 42, {"title": "Real", "depends_on_indices": [0]}]})
+    assert result == [{"title": "Real", "depends_on_indices": [0]}]
+
+
+def test_plan_subtasks_returns_title_and_depends_on_indices():
+    from app.admin import _plan_subtasks
+
+    plan = {
+        "subtasks": [
+            {"title": "Step A", "depends_on_indices": []},
+            {"title": "Step B", "depends_on_indices": [0], "extra_field": "ignored"},
+        ]
+    }
+    result = _plan_subtasks(plan)
+    assert result == [
+        {"title": "Step A", "depends_on_indices": []},
+        {"title": "Step B", "depends_on_indices": [0]},
+    ]
+
+
+def test_plan_subtasks_defaults_missing_fields():
+    from app.admin import _plan_subtasks
+
+    # subtask dict with neither title nor depends_on_indices
+    result = _plan_subtasks({"subtasks": [{}]})
+    assert result == [{"title": "", "depends_on_indices": []}]
+
+
+# ── GET /api/admin/tasks — plan_subtasks contract ─────────────────────────────
+
+
+class TestTaskListPlanSubtasksContract:
+    """GET /api/admin/tasks drops heavy JSONB blobs and exposes plan_subtasks."""
+
+    @pytest.mark.asyncio
+    async def test_list_omits_heavy_jsonb_fields(self, client: AsyncClient, db_session):
+        """status_log, plan_output, and fix_loop_history must not appear in list response."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            plan_output={
+                "subtasks": [
+                    {"title": "Write tests", "depends_on_indices": []},
+                    {"title": "Review", "depends_on_indices": [0]},
+                ]
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        tasks = resp.json()["tasks"]
+        assert len(tasks) == 1
+        t = tasks[0]
+
+        # Heavy JSONB columns must be absent from the list wire payload
+        assert "status_log" not in t, "status_log must not be in list response"
+        assert "plan_output" not in t, "plan_output must not be in list response"
+        assert "fix_loop_history" not in t, "fix_loop_history must not be in list response"
+
+    @pytest.mark.asyncio
+    async def test_list_returns_plan_subtasks_shape(self, client: AsyncClient, db_session):
+        """plan_subtasks carries {title, depends_on_indices} for each subtask."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.IN_PROGRESS,
+            plan_output={
+                "subtasks": [
+                    {"title": "Step 1", "depends_on_indices": []},
+                    {"title": "Step 2", "depends_on_indices": [0], "extra": "dropped"},
+                ]
+            },
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        t = resp.json()["tasks"][0]
+
+        assert t["plan_subtasks"] == [
+            {"title": "Step 1", "depends_on_indices": []},
+            {"title": "Step 2", "depends_on_indices": [0]},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_list_plan_subtasks_null_when_no_plan_output(
+        self, client: AsyncClient, db_session
+    ):
+        """plan_subtasks is null when a task has no plan_output."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.QUEUED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        t = resp.json()["tasks"][0]
+        assert t["plan_subtasks"] is None
+
+    @pytest.mark.asyncio
+    async def test_list_fix_loop_summary_is_null(self, client: AsyncClient, db_session):
+        """fix_loop_summary in the list response is always null (fix_loop_history not loaded)."""
+        project = await _make_project(db_session)
+        task = Task(
+            project_id=project.id,
+            payloads=[{"type": "fix"}],
+            status=TaskStatus.COMPLETED,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        resp = await client.get(f"/api/admin/tasks?project_id={project.id}")
+        assert resp.status_code == 200, resp.text
+        t = resp.json()["tasks"][0]
+        assert t["fix_loop_summary"] is None
