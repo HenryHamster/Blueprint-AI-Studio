@@ -735,7 +735,11 @@ class StrategicOp(BaseModel):
     """Incremental strategic review operation from an agent."""
 
     task_id: uuid.UUID
-    op: str  # "set_vision", "create_direction", "update_direction", "retire_direction", "decide_churn_retirement", "stage_direction", "create_message", "resolve_message", "spawn_task", "spawn_fix", "set_strategic_challenge", "set_acceptance_criteria", "dispose_completion_debt"
+    # The accepted op vocabulary is the canonical registry mirrored in
+    # app/strategic_ops_manifest.json (single source of truth for the ./strategic
+    # CLI, the resident prompt, and this dispatch chain). test_strategic_ops_registry.py
+    # asserts the dispatch below accepts EXACTLY the manifest's op names.
+    op: str
     data: Any = {}
 
 
@@ -2386,6 +2390,145 @@ async def strategic_operation(
                 "direction_id": dir_id,
                 "cancelled_tasks": cancelled_count,
             }
+        )
+
+    elif payload.op == "activate_direction":
+        # Reactivate a staged or paused direction back to active.
+        # This is the sanctioned reactivation path — allows resuming user-paused
+        # directions because the strategist is explicitly requesting it (unlike the
+        # autonomous lifecycle which blocks user-paused via allow_user_paused=False).
+        dir_id = data.get("direction_id")
+        if not dir_id:
+            raise HTTPException(status_code=400, detail="direction_id required")
+        rationale = _cap_str(
+            data.get("rationale", ""), STRATEGIC_RATIONALE_MAX, "rationale", warnings
+        )
+        directions = list(project.directions or [])
+        target = next((d for d in directions if d.get("id") == dir_id), None)
+        if not target:
+            raise HTTPException(status_code=404, detail=f"Direction {dir_id} not found")
+        cur_status = target.get("status")
+        _TERMINAL_STATUSES = frozenset(
+            {"retired", "expired", "superseded", "completed", "rejected"}
+        )
+        if cur_status == "active":
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp({"status": "skipped", "reason": "Direction is already active"}),
+                status_code=409,
+            )
+        if cur_status in _TERMINAL_STATUSES:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction is in terminal state '{cur_status}'",
+                    }
+                ),
+                status_code=409,
+            )
+        _blk = await _challenge_gate("activate_direction", direction_id=str(dir_id))
+        if _blk is not None:
+            return _blk
+        active_count = sum(1 for d in directions if d.get("status") == "active")
+        max_active = _runtime_config.get("max_active_directions", 5)
+        if active_count >= max_active:
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return JSONResponse(
+                content=_resp(
+                    {
+                        "status": "skipped",
+                        "reason": f"Direction cap reached: {active_count}/{max_active} active",
+                    }
+                ),
+                status_code=409,
+            )
+        _pre_status = cur_status
+        _gap_id = target.get("gap_id")
+        reactivate_paused_direction(target, allow_user_paused=True)
+        # reactivate_paused_direction clears staged_for_version/staged_activated_at
+        # but not staged_at — pop it so staged→active leaves no staging residue.
+        target.pop("staged_at", None)
+        if rationale:
+            notes = target.get("notes", [])
+            notes.append(
+                {
+                    "text": f"Reactivated by strategic op: {rationale}",
+                    "added_at": _utcnow().isoformat(),
+                }
+            )
+            target["notes"] = _cap_list(
+                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+            )
+        if _gap_id:
+            from app.problem_model import reconcile_gap_staffing_raw_result  # noqa: PLC0415
+
+            _gap_reconcile = reconcile_gap_staffing_raw_result(
+                project.problem_model,
+                str(dir_id),
+                _gap_id,
+                _gap_id,
+                new_status="active",
+                prior_status=_pre_status,
+                now_iso=_utcnow().isoformat(),
+            )
+            if _gap_reconcile.get("problem_model") is not None:
+                project.problem_model = _gap_reconcile["problem_model"]
+                flag_modified(project, "problem_model")
+            _gap_details = _gap_reconcile.get("result") or {}
+            if _gap_details.get("malformed_model") or _gap_details.get(
+                "unresolved_gap_ids"
+            ):
+                logger.warning(
+                    "[STRATEGIC API] activate_direction gap staffing reconciliation "
+                    "classified drift: %s",
+                    _gap_details,
+                )
+        _captured_activated_dir = dict(target)
+        _captured_activate_id = str(dir_id)
+        def _apply_activate(fresh: list) -> list:
+            return [
+                _captured_activated_dir if d.get("id") == _captured_activate_id else d
+                for d in fresh
+            ]
+        await _with_directions_locked(session, project.id, _apply_activate)
+        ctx = task.context or {}
+        task.context = {
+            **ctx,
+            "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+            "_strategic_updated_ids": list(ctx.get("_strategic_updated_ids", []))
+            + [dir_id],
+            "_strategic_api_called": True,
+        }
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        await _emit_updated(
+            STRATEGIC_KIND_DIRECTIONS,
+            changed_direction_ids=[dir_id],
+            changed_count=1,
+        )
+        logger.info(
+            "[STRATEGIC API] Reactivated direction %s from '%s' for project %s",
+            dir_id,
+            _pre_status,
+            project.id,
+        )
+        return _resp(
+            {"status": "ok", "op": "activate_direction", "direction_id": dir_id}
         )
 
     elif payload.op == "create_message":

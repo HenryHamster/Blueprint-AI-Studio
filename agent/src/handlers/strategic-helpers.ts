@@ -5,6 +5,7 @@ import { excludeAgentHelpers, writeDesignDocHelper, shellEscapeDoubleQuoted, DEF
 import { extractJsonObject } from '../json-extract.js';
 import { VmConfigMissingError } from '../providers/runners.js';
 import { agentTokenShellFn } from '../token-file.js';
+import { cliOps } from './strategic-ops-registry.js';
 
 // Strategic shell-helper generators
 // Generates three independent bash scripts for strategic-mode task execution:
@@ -12,12 +13,48 @@ import { agentTokenShellFn } from '../token-file.js';
 // - fetch: detail-pull for items trimmed by the packer
 // - design-doc: CRUD operations for design document sections
 
+// Case arms for CLI ops that need a body beyond the default `_call "<op>"`,
+// keyed by the backend op name. set_running_update reads a markdown FILE path
+// and wraps its contents as {markdown: "..."} before the usual POST. Kept here
+// (not in the pure registry) so the registry stays plain metadata and the
+// shared manifest carries no bash. The value is the FULL case arm (label + body
+// + `;;`); ops absent here render the uniform default arm.
+const SPECIAL_CLI_CASE_BODIES: Record<string, string> = {
+  set_running_update: `  set-running-update)
+    # DATA is a path to the markdown file written by the Thinker. Wrap
+    # the file contents as {markdown: "..."} before the usual body build.
+    FILE="$DATA"
+    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
+    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
+    _call "set_running_update"
+    ;;`,
+};
+
+// Render the `./strategic` CLI's usage alias list and case body from the single
+// canonical registry (strategic-ops-registry.ts) so neither can drift from the
+// backend dispatch chain. Every CLI-flagged op becomes a `<alias>) _call "<op>"`
+// arm (or its SPECIAL_CLI_CASE_BODIES override); the usage string lists the same
+// aliases in the same order.
+function renderStrategicUsageAliases(): string {
+  return cliOps().map(e => e.alias).join('|');
+}
+
+function renderStrategicCaseBody(): string {
+  return cliOps()
+    .map(e => SPECIAL_CLI_CASE_BODIES[e.op] ?? `  ${e.alias}) _call "${e.op}" ;;`)
+    .join('\n');
+}
+
 function generateStrategicScript(taskIdRaw: string): string {
   const taskId = shellEscapeDoubleQuoted(taskIdRaw);
+  const usageAliases = renderStrategicUsageAliases();
+  const caseBody = renderStrategicCaseBody();
   return `#!/bin/bash
 # Strategic review tool — updates problem_model, running_update, directions,
 # messages via API. Reads ORCHESTRATOR_URL and AGENT_API_TOKEN from env.
-OP="\${1:?Usage: strategic set-problem-model|set-running-update|reflect|pending-confirm|set-vision|create-direction|update-direction|retire-direction|stage-direction|approve-direction|reject-direction|create-message|resolve-message|spawn-task|spawn-fix|dispose-completion-debt|set-retirement-critiques|set-evidence-progress|set-acceptance-criteria <json-or-file>}"
+# The op vocabulary below is DERIVED from the canonical registry
+# (strategic-ops-registry.ts) — do not hand-edit the case/usage list.
+OP="\${1:?Usage: strategic ${usageAliases} <json-or-file>}"
 shift
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 ${agentTokenShellFn()}
@@ -79,32 +116,7 @@ _call() {
 }
 
 case "$OP" in
-  set-problem-model)    _call "set_problem_model" ;;
-  set-running-update)
-    # DATA is a path to the markdown file written by the Thinker. Wrap
-    # the file contents as {markdown: "..."} before the usual body build.
-    FILE="$DATA"
-    [ -f "$FILE" ] || { echo "[ERROR] set-running-update: file not found: $FILE" >&2; exit 1; }
-    DATA=$(jq -Rs '{markdown: .}' < "$FILE")
-    _call "set_running_update"
-    ;;
-  reflect)              _call "reflect" ;;
-  pending-confirm)      _call "pending_confirm" ;;
-  set-vision)           _call "set_vision" ;;
-  create-direction)     _call "create_direction" ;;
-  update-direction)     _call "update_direction" ;;
-  retire-direction)     _call "retire_direction" ;;
-  stage-direction)      _call "stage_direction" ;;
-  approve-direction)    _call "approve_direction" ;;
-  reject-direction)     _call "reject_direction" ;;
-  create-message)            _call "create_message" ;;
-  resolve-message)           _call "resolve_message" ;;
-  spawn-task)                _call "spawn_task" ;;
-  spawn-fix)                 _call "spawn_fix" ;;
-  dispose-completion-debt)   _call "dispose_completion_debt" ;;
-  set-retirement-critiques)  _call "set_retirement_critiques" ;;
-  set-evidence-progress)     _call "set_evidence_progress" ;;
-  set-acceptance-criteria)   _call "set_acceptance_criteria" ;;
+${caseBody}
   *) echo "Unknown op: $OP" >&2; exit 1 ;;
 esac
 echo ""
@@ -402,6 +414,7 @@ const _PORTFOLIO_OP_ALIASES: Record<string, string> = {
   stage: 'stage_direction',
   approve: 'approve_direction',
   reject: 'reject_direction',
+  activate: 'activate_direction',
 };
 const _VALID_PORTFOLIO_OPS = new Set<string>(Object.values(_PORTFOLIO_OP_ALIASES));
 const _VALID_PORTFOLIO_VERDICTS = new Set<string>(['approved', 'rejected', 'warned', 'uncertain']);
@@ -414,6 +427,7 @@ const _HARD_BLOCK_PORTFOLIO_OPS = new Set<string>([
   'stage_direction',
   'approve_direction',
   'reject_direction',
+  'activate_direction',
 ]);
 
 export interface ChallengePortfolioOperationVerdict {

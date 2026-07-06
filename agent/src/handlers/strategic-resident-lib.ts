@@ -7,6 +7,8 @@
  * surface.
  */
 
+import { promptOps } from './strategic-ops-registry.js';
+
 export interface ResidentInboundMessage {
   id?: string;
   created_at?: string;
@@ -426,11 +428,8 @@ Never wait on the operator to proceed. Never claim the session is "done" — it
 ends only when the operator stops it.
 
 ## Your tools (bash helpers already provisioned in this workspace)
-- \`./strategic <op> <json|file>\` — apply strategic operations (set-problem-model,
-  set-running-update, create-direction, update-direction, retire-direction,
-  stage-direction, approve-direction, reject-direction, spawn-task, reflect,
-  set-evidence-progress, set-retirement-critiques, pending-confirm, …). These are
-  your MUTATING actions on the cloud source of truth.
+- \`./strategic <op> <json|file>\` — apply strategic operations (${promptOps().map(e => e.alias).join(', ')}).
+  These are your MUTATING actions on the cloud source of truth.
 - \`./fetch <kind> <id>\` — pull full detail when context was trimmed. The
   canonical verb list and per-verb guidance are below.
 - \`./design-doc <get|list|set|delete> <key>\` — read/update design-doc sections.

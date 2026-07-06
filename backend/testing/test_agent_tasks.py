@@ -477,3 +477,190 @@ async def test_list_tasks_cross_project_isolation(client: AsyncClient, db_sessio
         task = await db_session.get(Task, uuid.UUID(item_id))
         assert task is not None
         assert task.project_id == project1.id
+
+
+# ---------------------------------------------------------------------------
+# Parent_task_id lineage visibility — GET single task
+# ---------------------------------------------------------------------------
+
+
+async def _make_child_task(
+    db_session,
+    project,
+    parent_task: Task,
+    *,
+    created_by: str = "ORCHESTRATOR",
+    title: str = "Child task",
+    status: TaskStatus = TaskStatus.IN_PROGRESS,
+) -> Task:
+    """Create a task whose parent_task_id points to parent_task."""
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        title=title,
+        status=status,
+        created_by=created_by,
+        parent_task_id=parent_task.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    return task
+
+
+@pytest.mark.asyncio
+async def test_get_task_visible_for_direct_child_of_strategic_task(
+    client: AsyncClient, db_session
+):
+    """Direct child of a STRATEGIC_AGENT task (created_by=ORCHESTRATOR) is visible."""
+    project, calling_task = await _make_project_and_task(db_session, name="Child Visibility")
+    strategic = await _make_strategic_task(db_session, project, task_type="plan")
+    child = await _make_child_task(db_session, project, strategic, title="Impl task")
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{child.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert data["id"] == str(child.id)
+    assert data["title"] == "Impl task"
+
+
+@pytest.mark.asyncio
+async def test_get_task_visible_for_grandchild_of_strategic_task(
+    client: AsyncClient, db_session
+):
+    """Grandchild (strategist -> plan -> impl) is visible via multi-level ancestor walk."""
+    project, calling_task = await _make_project_and_task(db_session, name="Grandchild Vis")
+    strategic = await _make_strategic_task(db_session, project, task_type="plan")
+    plan_child = await _make_child_task(
+        db_session, project, strategic, created_by="ORCHESTRATOR", title="Plan child"
+    )
+    impl_grandchild = await _make_child_task(
+        db_session, project, plan_child, created_by="ORCHESTRATOR", title="Impl grandchild"
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{impl_grandchild.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["id"] == str(impl_grandchild.id)
+
+
+@pytest.mark.asyncio
+async def test_get_task_404_for_unrelated_non_strategic_task(
+    client: AsyncClient, db_session
+):
+    """Task with no parent_task_id and created_by=ORCHESTRATOR stays invisible (404)."""
+    project, calling_task = await _make_project_and_task(db_session, name="Unrelated 404")
+    orphan = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        title="Orphan task",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(orphan)
+    await db_session.commit()
+    await db_session.refresh(orphan)
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{orphan.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_task_404_for_descendant_of_cross_project_strategic_task(
+    client: AsyncClient, db_session
+):
+    """Child of a strategist task in another project is not visible from this project."""
+    project1, calling_task = await _make_project_and_task(db_session, name="XP Desc P1")
+    project2 = Project(name="XP Desc P2", user_id="other-user-xp")
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    strategic2 = await _make_strategic_task(db_session, project2, task_type="plan")
+    # Create a child that incorrectly claims to live in project1 but whose parent is in project2
+    # In practice, parent must be in same project — this tests the project_id guard during walk.
+    child_p2 = await _make_child_task(
+        db_session, project2, strategic2, title="Child in project2"
+    )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    # Request child_p2 with project1 in path — must 404 (project_id mismatch).
+    res = await client.get(
+        f"/api/agent/projects/{project1.id}/tasks/{child_p2.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Parent_task_id lineage visibility — list endpoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_includes_transitive_descendants(
+    client: AsyncClient, db_session
+):
+    """List returns the strategist task AND its direct child and grandchild."""
+    project, calling_task = await _make_project_and_task(db_session, name="List Descendants")
+    strategic = await _make_strategic_task(db_session, project, title="Root strategic")
+    child = await _make_child_task(db_session, project, strategic, title="Child task")
+    grandchild = await _make_child_task(db_session, project, child, title="Grandchild task")
+    # Unrelated non-strategic task — must not appear
+    orphan = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        title="Orphan",
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(orphan)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    ids = {item["id"] for item in res.json()["data"]}
+    assert str(strategic.id) in ids
+    assert str(child.id) in ids
+    assert str(grandchild.id) in ids
+    assert str(orphan.id) not in ids
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_descendants_do_not_leak_cross_project(
+    client: AsyncClient, db_session
+):
+    """Descendants of a strategist task in another project are absent from this project's list."""
+    project1, calling_task = await _make_project_and_task(db_session, name="XP List P1")
+    project2 = Project(name="XP List P2", user_id="other-user-xplist")
+    db_session.add(project2)
+    await db_session.commit()
+    await db_session.refresh(project2)
+
+    strategic2 = await _make_strategic_task(db_session, project2, title="Other project root")
+    child2 = await _make_child_task(db_session, project2, strategic2, title="Other project child")
+    own_strategic = await _make_strategic_task(db_session, project1, title="My root")
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project1.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    ids = {item["id"] for item in res.json()["data"]}
+    assert str(own_strategic.id) in ids
+    assert str(strategic2.id) not in ids
+    assert str(child2.id) not in ids

@@ -1426,3 +1426,269 @@ async def test_patch_direction_to_staged_stamps_staged_at(
     assert project.directions[0]["status"] == "staged"
     assert project.directions[0]["staged_for_version"] == 4
     assert "staged_at" in project.directions[0]
+
+
+# ---------------------------------------------------------------------------
+# 9. activate_direction strategist op
+# ---------------------------------------------------------------------------
+
+
+def _paused_direction(did: str, *, auto_paused: bool = True, **extra) -> dict:
+    d = {
+        "id": did,
+        "text": f"Paused work {did}",
+        "status": "paused",
+        "auto_paused": auto_paused,
+        "paused_at": "2026-01-01T00:00:00",
+        "paused_reason": "stalled",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+    d.update(extra)
+    return d
+
+
+@pytest.mark.asyncio
+async def test_activate_direction_op_from_staged(client: AsyncClient, db_session):
+    """POST activate_direction on a staged direction flips it to active and clears
+    all staging markers (staged_for_version, staged_at)."""
+    project = Project(
+        name="Activate-Staged",
+        user_id="activate-user",
+        autonomous_enabled=True,
+        directions=[
+            _staged_direction(
+                "d-activate-staged",
+                staged_for_version=3,
+                staged_at="2026-01-01T00:00:00",
+            )
+        ],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-activate-staged")
+    token = create_agent_token(
+        str(task.id), "agent-vm-activate-staged", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {
+                "direction_id": "d-activate-staged",
+                "rationale": "expediting to this version",
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["op"] == "activate_direction"
+    assert body["direction_id"] == "d-activate-staged"
+
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert "staged_for_version" not in d, "staged_for_version must be cleared"
+    assert "staged_at" not in d, "staged_at must be cleared"
+    assert "staged_activated_at" not in d
+
+    # Normalized mirror row reflects active status.
+    row = (
+        await db_session.execute(
+            select(Direction).where(
+                Direction.project_id == project.id,
+                Direction.direction_key == "d-activate-staged",
+            )
+        )
+    ).scalar_one()
+    assert row.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_activate_direction_op_from_paused(client: AsyncClient, db_session):
+    """POST activate_direction on an auto-paused direction flips it to active and
+    stamps auto_recovered_at so the direction gets a health-check grace window."""
+    project = Project(
+        name="Activate-Paused",
+        user_id="activate-user2",
+        autonomous_enabled=True,
+        directions=[_paused_direction("d-activate-paused", auto_paused=True)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-activate-paused")
+    token = create_agent_token(
+        str(task.id), "agent-vm-activate-paused", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {"direction_id": "d-activate-paused"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["status"] == "ok"
+
+    await db_session.refresh(project)
+    d = project.directions[0]
+    assert d["status"] == "active"
+    assert "auto_recovered_at" in d, "paused→active must stamp auto_recovered_at grace marker"
+    assert "paused_at" not in d
+    assert "auto_paused" not in d
+
+
+@pytest.mark.asyncio
+async def test_activate_direction_op_user_paused_allowed(
+    client: AsyncClient, db_session
+):
+    """POST activate_direction on a user-paused (not auto-paused) direction is
+    allowed — this is the sanctioned explicit reactivation path."""
+    project = Project(
+        name="Activate-UserPaused",
+        user_id="activate-user3",
+        autonomous_enabled=True,
+        directions=[_paused_direction("d-user-paused", auto_paused=False)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-activate-userpause")
+    token = create_agent_token(
+        str(task.id), "agent-vm-activate-userpause", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {"direction_id": "d-user-paused", "rationale": "operator approved resume"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "ok"
+
+    await db_session.refresh(project)
+    assert project.directions[0]["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_activate_direction_op_cap_reached(
+    client: AsyncClient, db_session, monkeypatch
+):
+    """POST activate_direction when the active-direction cap is already reached
+    returns a 409 skipped response and leaves the direction unchanged."""
+    from app import shared_state
+
+    monkeypatch.setitem(shared_state.runtime_config, "max_active_directions", 2)
+    at_cap = [_active_direction(f"d-cap-{i}") for i in range(2)]
+    project = Project(
+        name="Activate-Cap",
+        user_id="activate-user4",
+        autonomous_enabled=True,
+        directions=at_cap + [_staged_direction("d-staged-cap", staged_for_version=1)],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-activate-cap")
+    token = create_agent_token(
+        str(task.id), "agent-vm-activate-cap", task_type="strategic_review"
+    )
+
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {"direction_id": "d-staged-cap"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 409, resp.text
+    body = resp.json()
+    assert body["status"] == "skipped"
+    assert "cap reached" in body["reason"]
+
+    await db_session.refresh(project)
+    still_staged = next(d for d in project.directions if d["id"] == "d-staged-cap")
+    assert still_staged["status"] == "staged", "direction must remain staged when cap is hit"
+
+
+@pytest.mark.asyncio
+async def test_activate_direction_op_wrong_status(client: AsyncClient, db_session):
+    """POST activate_direction on an already-active direction returns 409 skipped;
+    on a terminal (retired) direction also returns 409 skipped."""
+    active_dir = _active_direction("d-already-active")
+    retired_dir = {
+        "id": "d-retired",
+        "text": "Retired work",
+        "status": "retired",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-01T00:00:00",
+    }
+    project = Project(
+        name="Activate-WrongStatus",
+        user_id="activate-user5",
+        autonomous_enabled=True,
+        directions=[active_dir, retired_dir],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _strategic_task(db_session, project.id, "agent-vm-activate-wrong")
+    token = create_agent_token(
+        str(task.id), "agent-vm-activate-wrong", task_type="strategic_review"
+    )
+
+    # already active → 409 skipped
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {"direction_id": "d-already-active"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["status"] == "skipped"
+    assert "already active" in resp.json()["reason"]
+
+    # retired (terminal) → 409 skipped
+    resp2 = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "activate_direction",
+            "data": {"direction_id": "d-retired"},
+        },
+        headers={"x-agent-token": token},
+    )
+    assert resp2.status_code == 409, resp2.text
+    assert resp2.json()["status"] == "skipped"
+    assert "terminal" in resp2.json()["reason"]

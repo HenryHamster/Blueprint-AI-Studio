@@ -105,7 +105,10 @@ describe('writeStrategicHelpers', () => {
 
     const content = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
     expect(content).toContain('set-acceptance-criteria');
-    expect(content).toContain('set-acceptance-criteria)   _call "set_acceptance_criteria"');
+    // The case arms are now derived from the canonical registry with uniform
+    // single-space padding (was hand-aligned columns); the alias→op mapping is
+    // unchanged.
+    expect(content).toContain('set-acceptance-criteria) _call "set_acceptance_criteria"');
   });
 
   it('embeds projectId in fetch script safely', () => {

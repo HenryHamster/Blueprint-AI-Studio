@@ -19,6 +19,7 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -33,6 +34,7 @@ router = APIRouter(prefix="/api/agent", tags=["agent"])
 _STRATEGIC_AGENT_CREATED_BY = "STRATEGIC_AGENT"
 _LIST_LIMIT_DEFAULT = 20
 _LIST_LIMIT_MAX = 100
+_ANCESTOR_WALK_MAX_DEPTH = 20
 
 # Terminal statuses that warrant fetching artifact/failure detail.
 _TERMINAL_STATUSES = frozenset(
@@ -107,12 +109,26 @@ async def agent_get_task(
         raise HTTPException(status_code=404, detail="Task not found")
 
     task = await session.get(Task, tid)
-    if (
-        task is None
-        or task.project_id != project_id
-        or task.created_by != _STRATEGIC_AGENT_CREATED_BY
-    ):
+    if task is None or task.project_id != project_id:
         raise HTTPException(status_code=404, detail="Task not found")
+
+    # Allow visibility when the task itself is strategist-authored, OR any
+    # ancestor reachable via parent_task_id (within this project) is.
+    if task.created_by != _STRATEGIC_AGENT_CREATED_BY:
+        current = task
+        strategist_ancestor_found = False
+        for _ in range(_ANCESTOR_WALK_MAX_DEPTH):
+            if current.parent_task_id is None:
+                break
+            parent = await session.get(Task, current.parent_task_id)
+            if parent is None or parent.project_id != project_id:
+                break
+            if parent.created_by == _STRATEGIC_AGENT_CREATED_BY:
+                strategist_ancestor_found = True
+                break
+            current = parent
+        if not strategist_ancestor_found:
+            raise HTTPException(status_code=404, detail="Task not found")
 
     pr_url: str | None = None
     error_summary: str | None = None
@@ -163,17 +179,41 @@ async def agent_list_tasks(
     """
     await _resolve_agent_project(project_id, token, session)
 
-    rows = (
-        await session.execute(
-            select(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
+    # Fetch all strategist-authored tasks and their transitive descendants
+    # within this project using a single recursive CTE.
+    cte_result = await session.execute(
+        text("""
+            WITH RECURSIVE task_tree AS (
+                SELECT id, created_at
+                FROM task
+                WHERE project_id = :project_id AND created_by = :created_by
+                UNION ALL
+                SELECT t.id, t.created_at
+                FROM task t
+                INNER JOIN task_tree tt ON t.parent_task_id = tt.id
+                WHERE t.project_id = :project_id
             )
-            .order_by(Task.created_at.desc())
-            .limit(limit)
-        )
+            SELECT id FROM task_tree
+            ORDER BY created_at DESC
+            LIMIT :limit
+        """),
+        {
+            "project_id": project_id,
+            "created_by": _STRATEGIC_AGENT_CREATED_BY,
+            "limit": limit,
+        },
+    )
+    task_ids = [row[0] for row in cte_result.fetchall()]
+
+    if not task_ids:
+        return {"status": "success", "data": [], "count": 0}
+
+    rows_unordered = (
+        await session.execute(select(Task).where(Task.id.in_(task_ids)))
     ).scalars().all()
+    # Re-sort to match CTE ordering (IN query does not preserve order).
+    id_order = {tid: idx for idx, tid in enumerate(task_ids)}
+    rows = sorted(rows_unordered, key=lambda t: id_order.get(t.id, len(task_ids)))
 
     # Fetch PR artifacts for terminal tasks in one query to avoid N+1.
     terminal_ids = [t.id for t in rows if t.status in _TERMINAL_STATUSES]
