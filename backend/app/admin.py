@@ -216,6 +216,22 @@ TERMINAL_STATUSES = [TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELL
 ADMIN_TASKS_MAX_LIMIT = 500
 ADMIN_TASKS_DIRECTION_SCAN_BATCH = 500
 
+# Columns loaded for the task list endpoint. Excludes the three JSONB blobs that
+# are only accessed in the detail endpoint: attempt_history_db, api_call_summary,
+# format_compliance_summary.
+_TASK_LIST_COLS = [
+    Task.id, Task.project_id, Task.title, Task.description, Task.status,
+    Task.payloads, Task.vm_instance_id, Task.latest_status_message, Task.status_log,
+    Task.created_by, Task.requires_approval, Task.parent_task_id, Task.depends_on,
+    Task.plan_output, Task.created_at, Task.started_at, Task.last_heartbeat,
+    Task.last_metrics_json, Task.last_tool_use_at, Task.attempt_count,
+    Task.blocker_kind, Task.blocked_reason, Task.blocked_at, Task.recheck_after,
+    Task.parked_at, Task.park_reason, Task.context, Task.archived,
+    Task.vm_runtime_cost_banked_db, Task.vm_provisioned_at, Task.vm_stopped_at,
+    Task.fix_loop_history, Task.post_commit_pending, Task.updated_at,
+    Task.vm_machine_type, Task.vm_spot, Task.prompt_fingerprint,
+]
+
 
 @router.get("/tasks")
 async def get_all_tasks(
@@ -325,7 +341,11 @@ async def get_all_tasks(
         page_task_ids = matching_task_ids[offset : offset + limit]
         if page_task_ids:
             page_order = {task_id: index for index, task_id in enumerate(page_task_ids)}
-            page_query = select(Task).where(Task.id.in_(page_task_ids))
+            page_query = (
+                select(Task)
+                .options(load_only(*_TASK_LIST_COLS, raiseload=True))
+                .where(Task.id.in_(page_task_ids))
+            )
             result = await session.execute(page_query)
             tasks = sorted(result.scalars().all(), key=lambda task: page_order[task.id])
         else:
@@ -336,7 +356,13 @@ async def get_all_tasks(
             count_query = count_query.where(f)
         total = (await session.execute(count_query)).scalar() or 0
 
-        query = select(Task).order_by(Task.created_at.desc()).offset(offset).limit(limit)
+        query = (
+            select(Task)
+            .options(load_only(*_TASK_LIST_COLS, raiseload=True))
+            .order_by(Task.created_at.desc())
+            .offset(offset)
+            .limit(limit)
+        )
         for f in filters:
             query = query.where(f)
 

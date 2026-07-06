@@ -203,11 +203,6 @@ async def _task_focus_bucket(
         Task.archived.is_(False),
         *filters,
     ]
-    total = (
-        await session.execute(
-            select(func.count()).select_from(Task).where(*base_filters)
-        )
-    ).scalar() or 0
     direction_id_expr = func.coalesce(
         Task.context["direction_id"].as_string(),
         Task.context["current_direction_id"].as_string(),
@@ -217,35 +212,38 @@ async def _task_focus_bucket(
         Task.payloads[0]["target_direction_id"].as_string(),
     ).label("direction_id")
     task_type_expr = Task.payloads[0]["type"].as_string().label("task_type")
-    rows = (
-        await session.execute(
-            select(Task, task_type_expr, direction_id_expr)
-            .where(*base_filters)
-            .options(
-                load_only(
-                    Task.id,
-                    Task.status,
-                    Task.title,
-                    Task.latest_status_message,
-                    Task.requires_approval,
-                    Task.parent_task_id,
-                    Task.created_at,
-                    Task.started_at,
-                    Task.completed_at,
-                    Task.depends_on,
-                    Task.blocker_kind,
-                    Task.blocked_reason,
-                    Task.blocked_at,
-                    Task.recheck_after,
-                    Task.park_reason,
-                    Task.parked_at,
-                    raiseload=True,
-                )
+    count_result = await session.execute(
+        select(func.count()).select_from(Task).where(*base_filters)
+    )
+    rows_result = await session.execute(
+        select(Task, task_type_expr, direction_id_expr)
+        .where(*base_filters)
+        .options(
+            load_only(
+                Task.id,
+                Task.status,
+                Task.title,
+                Task.latest_status_message,
+                Task.requires_approval,
+                Task.parent_task_id,
+                Task.created_at,
+                Task.started_at,
+                Task.completed_at,
+                Task.depends_on,
+                Task.blocker_kind,
+                Task.blocked_reason,
+                Task.blocked_at,
+                Task.recheck_after,
+                Task.park_reason,
+                Task.parked_at,
+                raiseload=True,
             )
-            .order_by(*order_by)
-            .limit(limit)
         )
-    ).all()
+        .order_by(*order_by)
+        .limit(limit)
+    )
+    total = count_result.scalar() or 0
+    rows = rows_result.all()
     return {
         "total": int(total),
         "limit": limit,
@@ -274,57 +272,62 @@ async def _build_task_focus(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     )
+    needs_judgment_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="needs_judgment",
+        filters=[
+            Task.requires_approval.is_(True),
+            Task.status.in_(nonterminal),
+        ],
+        order_by=[Task.created_at.asc(), Task.id.asc()],
+    )
+    active_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="active",
+        filters=[
+            Task.status.in_(
+                [
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]
+            )
+        ],
+        order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+    )
+    friction_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="friction",
+        filters=[
+            Task.status.in_(
+                [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
+            )
+        ],
+        order_by=[Task.created_at.desc(), Task.id.desc()],
+    )
+    queued_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="queued",
+        filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
+        order_by=[Task.created_at.asc(), Task.id.asc()],
+    )
+    recent_completed_result = await _task_focus_bucket(
+        session,
+        project_id,
+        bucket="recent_completed",
+        filters=[Task.status == TaskStatus.COMPLETED],
+        order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+    )
     buckets = {
-        "needs_judgment": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="needs_judgment",
-            filters=[
-                Task.requires_approval.is_(True),
-                Task.status.in_(nonterminal),
-            ],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "active": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="active",
-            filters=[
-                Task.status.in_(
-                    [
-                        TaskStatus.PROVISIONING,
-                        TaskStatus.IN_PROGRESS,
-                        TaskStatus.EVALUATING,
-                    ]
-                )
-            ],
-            order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
-        "friction": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="friction",
-            filters=[
-                Task.status.in_(
-                    [TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]
-                )
-            ],
-            order_by=[Task.created_at.desc(), Task.id.desc()],
-        ),
-        "queued": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="queued",
-            filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
-            order_by=[Task.created_at.asc(), Task.id.asc()],
-        ),
-        "recent_completed": await _task_focus_bucket(
-            session,
-            project_id,
-            bucket="recent_completed",
-            filters=[Task.status == TaskStatus.COMPLETED],
-            order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
-        ),
+        "needs_judgment": needs_judgment_result,
+        "active": active_result,
+        "friction": friction_result,
+        "queued": queued_result,
+        "recent_completed": recent_completed_result,
     }
     return {
         "version": 1,

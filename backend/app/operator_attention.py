@@ -89,6 +89,26 @@ _STUCK_ACCEPTANCE_CRITERIA_PREVIEW_LIMIT = 4
 _STALE_COMPLETION_DEBT_AFTER = timedelta(hours=24)
 _STALE_COMPLETION_DEBT_PREVIEW_LIMIT = 4
 
+# Scalar columns consumed by _task_attention_item / build_task_movement_explanation.
+# Used with load_only(..., raiseload=True) on every bare select(Task) for attention
+# item builders to avoid transferring large JSONB blobs that are never read there.
+_TASK_ATTENTION_COLS = (
+    Task.id,
+    Task.project_id,
+    Task.status,
+    Task.title,
+    Task.latest_status_message,
+    Task.blocked_reason,
+    Task.park_reason,
+    Task.description,
+    Task.requires_approval,
+    Task.blocker_kind,
+    Task.depends_on,
+    Task.priority,
+    Task.created_at,
+    Task.updated_at,
+)
+
 _ATTENTION_VISIBLE_PRIORITY: dict[tuple[str, str], int] = {
     ("needs_operator", "approval_required"): 10,
     ("needs_operator", "hand_merge_required"): 15,
@@ -712,6 +732,14 @@ async def _load_stale_runner_pins(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*_runner_pin_filter(project_id))
                 .order_by(Task.priority.asc(), Task.created_at.asc())
             )
@@ -921,6 +949,19 @@ async def _load_stale_provisioning_tasks(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        Task.last_heartbeat,
+                        Task.last_tool_use_at,
+                        Task.vm_provisioned_at,
+                        Task.started_at,
+                        Task.payloads,
+                        raiseload=True,
+                    )
+                )
                 .where(
                     Task.project_id == project_id,
                     Task.archived.is_(False),
@@ -1363,14 +1404,21 @@ async def build_operator_attention(
         )
     ).scalar_one_or_none()
 
+    _common_message_filters = [
+        ProjectMessage.project_id == project.id,
+        ProjectMessage.status == OPEN_STATUS,
+        ProjectMessage.from_type != "user",
+    ]
+    # Use UNION ALL with per-type LIMITs so that BLOCKER/QUESTION previews are
+    # always fetched independently of watch-message volume.  A single combined
+    # query with one global LIMIT loses high-priority blockers/questions whenever
+    # a burst of BUG_REPORT/FEEDBACK messages fills the recency window.
     blocker_message_rows = list(
         (
             await session.execute(
                 select(ProjectMessage)
                 .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
+                    *_common_message_filters,
                     ProjectMessage.message_type == MessageType.BLOCKER,
                 )
                 .order_by(ProjectMessage.created_at.desc())
@@ -1385,9 +1433,7 @@ async def build_operator_attention(
             await session.execute(
                 select(ProjectMessage)
                 .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
+                    *_common_message_filters,
                     ProjectMessage.message_type == MessageType.QUESTION,
                 )
                 .order_by(ProjectMessage.created_at.desc())
@@ -1402,9 +1448,7 @@ async def build_operator_attention(
             await session.execute(
                 select(ProjectMessage)
                 .where(
-                    ProjectMessage.project_id == project.id,
-                    ProjectMessage.status == OPEN_STATUS,
-                    ProjectMessage.from_type != "user",
+                    *_common_message_filters,
                     ProjectMessage.message_type.in_(
                         [MessageType.BUG_REPORT, MessageType.FEEDBACK]
                     ),
@@ -1527,28 +1571,20 @@ async def build_operator_attention(
     parked_count = int(task_count_result.parked or 0)
 
     handmerge_preserved_filters = _handmerge_preserved_task_filter(project.id)
-    handmerge_preserved_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(Task)
-                .where(*handmerge_preserved_filters)
-            )
-        ).scalar()
-        or 0
-    )
-    handmerge_preserved_tasks = list(
+    _handmerge_all = list(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(*handmerge_preserved_filters)
                 .order_by(Task.updated_at.desc())
-                .limit(_STALE_TASK_PREVIEW_LIMIT)
             )
         )
         .scalars()
         .all()
     )
+    handmerge_preserved_count = len(_handmerge_all)
+    handmerge_preserved_tasks = _handmerge_all[:_STALE_TASK_PREVIEW_LIMIT]
     # Keep preserved hand-merge PRs visible as their own operator item rather
     # than letting the generic FAILED-task watch preview consume the signal.
     generic_failed_count = max(failed_count - handmerge_preserved_count, 0)
@@ -1557,28 +1593,35 @@ async def build_operator_attention(
     strategic_local_runner_hold_filters = strategic_local_runner_hold_task_filters(
         project.id
     )
-    local_runner_hold_count = int(
-        (
-            await session.execute(
-                select(func.count()).select_from(Task).where(*local_runner_hold_filters)
+    _hold_counts = (
+        await session.execute(
+            select(
+                func.count().filter(and_(*local_runner_hold_filters)).label("local"),
+                func.count().filter(and_(*strategic_local_runner_hold_filters)).label("strategic"),
             )
-        ).scalar()
-        or 0
-    )
-    strategic_local_runner_hold_count = int(
-        (
-            await session.execute(
-                select(func.count())
-                .select_from(Task)
-                .where(*strategic_local_runner_hold_filters)
+            .select_from(Task)
+            .where(
+                Task.project_id == project.id,
+                Task.archived.is_(False),
+                Task.status == TaskStatus.QUEUED,
+                Task.requires_approval.is_not(True),
             )
-        ).scalar()
-        or 0
-    )
+        )
+    ).one()
+    local_runner_hold_count = int(_hold_counts.local or 0)
+    strategic_local_runner_hold_count = int(_hold_counts.strategic or 0)
     compute_local_runner_hold_tasks = list(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*local_runner_hold_filters)
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -1591,6 +1634,14 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        *_TASK_ATTENTION_COLS,
+                        Task.vm_instance_id,
+                        Task.context,
+                        raiseload=True,
+                    )
+                )
                 .where(*strategic_local_runner_hold_filters)
                 .order_by(Task.priority.asc(), Task.created_at.asc())
                 .limit(4)
@@ -1668,6 +1719,19 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.project_id,
+                        Task.status,
+                        Task.title,
+                        Task.latest_status_message,
+                        Task.created_at,
+                        Task.updated_at,
+                        Task.plan_output,
+                        raiseload=True,
+                    )
+                )
                 .where(*experiment_outcome_filters)
                 .order_by(Task.completed_at.desc())
                 .limit(_EXPERIMENT_OUTCOME_PREVIEW_LIMIT)
@@ -1698,6 +1762,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
@@ -1715,6 +1780,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),
@@ -1732,6 +1798,7 @@ async def build_operator_attention(
         (
             await session.execute(
                 select(Task)
+                .options(load_only(*_TASK_ATTENTION_COLS, raiseload=True))
                 .where(
                     Task.project_id == project.id,
                     Task.archived.is_(False),

@@ -448,13 +448,13 @@ async def build_workbench_event_feed(
         Task.created_at,
     )
     task_activity_source_limit = max(source_limit, min(200, bounded_limit * 4))
+    _first_payload_col = Task.payloads[0].label("_projected_first_payload")
     task_base_query = (
-        select(Task)
+        select(Task, _first_payload_col)
         .options(
             load_only(
                 Task.id,
                 Task.project_id,
-                Task.payloads,
                 Task.status,
                 Task.title,
                 Task.latest_status_message,
@@ -468,20 +468,35 @@ async def build_workbench_event_feed(
         )
         .where(Task.project_id == project_id, Task.archived.is_(False))
     )
-    task_lifecycle_rows = (
-        await session.execute(
-            task_base_query
-            .order_by(task_occurred_at.desc())
-            .limit(source_limit)
-        )
-    ).scalars().all()
-    task_activity_rows = (
-        await session.execute(
-            task_base_query
-            .order_by(task_recent_activity.desc())
-            .limit(task_activity_source_limit)
-        )
-    ).scalars().all()
+
+    def _unpack_task_rows(rows: list) -> list[Task]:
+        result = []
+        for row in rows:
+            task, fp = row[0], row[1]
+            # Always stash so task.first_payload never falls back to Task.payloads
+            # (which is excluded from load_only and raises under raiseload=True).
+            object.__setattr__(task, "_projected_first_payload", fp if isinstance(fp, dict) else {})
+            result.append(task)
+        return result
+
+    task_lifecycle_rows = _unpack_task_rows(
+        (
+            await session.execute(
+                task_base_query
+                .order_by(task_occurred_at.desc())
+                .limit(source_limit)
+            )
+        ).all()
+    )
+    task_activity_rows = _unpack_task_rows(
+        (
+            await session.execute(
+                task_base_query
+                .order_by(task_recent_activity.desc())
+                .limit(task_activity_source_limit)
+            )
+        ).all()
+    )
     task_rows_by_id: dict[str, Task] = {}
     for row in [*task_lifecycle_rows, *task_activity_rows]:
         task_rows_by_id[str(row.id)] = row
