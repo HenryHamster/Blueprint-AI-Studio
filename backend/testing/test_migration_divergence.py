@@ -117,32 +117,60 @@ def test_revision_present_on_only_one_side_is_not_a_divergence():
 # ===========================================================================
 
 
-def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> AsyncMock:
-    """Branch-keyed ``github.list_versions_at_ref``: deployed target vs candidate."""
+def _versions_by_ref(
+    *,
+    main_list: list[str],
+    candidate_list: list[str],
+    changed: set[str] | None = None,
+) -> AsyncMock:
+    """Branch-keyed ``github.list_version_shas_at_ref``: deployed target (main) vs
+    candidate, returned as ``{filename: git blob sha}`` maps.
+
+    A filename shared across the two refs gets the SAME blob sha by default, so
+    the body-immutability check content-addresses it as unchanged and skips the
+    per-file body fetch (the storm-avoidance the gate now relies on). Basenames
+    in *changed* get a ref-distinct sha so the gate still fetches and compares
+    their bodies — used by the in-place-edit and body-fetch-failure tests that
+    exercise that path.
+    """
+    changed = changed or set()
+
+    def _sha(name: str, ref: str) -> str:
+        return f"sha-{name}@{ref}" if name in changed else f"sha-{name}"
 
     async def _side(token, owner, repo, ref, project_id=None):
-        return list(main_list) if ref == "main" else list(candidate_list)
+        names = list(main_list) if ref == "main" else list(candidate_list)
+        return {n: _sha(n, ref) for n in names}
 
     return AsyncMock(side_effect=_side)
+
+
+def _shas(names: list[str]) -> dict[str, str]:
+    """Same ``{filename: blob sha}`` map for both refs (all bodies identical)."""
+    return {n: f"sha-{n}" for n in names}
 
 
 @pytest.mark.asyncio
 async def test_qualification_gate_ok_when_refs_agree(mocker):
     """Identical migration sets on both refs → ('ok', None)."""
-    src = _migration_source("0143", "0142")
     mocker.patch(
-        "app.github.list_versions_at_ref",
-        new=AsyncMock(return_value=["0142_parent.py", "0143_vm_contact.py"]),
+        "app.github.list_version_shas_at_ref",
+        new=AsyncMock(
+            return_value=_shas(["0142_parent.py", "0143_vm_contact.py"])
+        ),
     )
-    mocker.patch(
+    body = mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=src),
+        new=AsyncMock(return_value=_migration_source("0143", "0142")),
     )
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
     )
     assert verdict == "ok"
     assert detail is None
+    # Every shared migration is byte-identical (same blob sha), so the gate must
+    # NOT fetch any body — this is the fetch-storm avoidance the fix introduces.
+    assert body.await_count == 0
 
 
 @pytest.mark.asyncio
@@ -155,7 +183,7 @@ async def test_qualification_gate_authorizes_reconciled_0143_divergence(mocker):
     never promote and the divergence could never clear (permanent deadlock)."""
     src_0142 = _migration_source("0142", "0141")
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
             candidate_list=[
@@ -192,7 +220,7 @@ async def test_qualification_gate_still_blocks_unrelated_divergence(mocker):
     hard-block → ('block', reason). The authorization is exact, not a blanket
     waiver of all migration-identity collisions."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0138_digest_cache_table.py"],
             candidate_list=["0138_task_blocked_state_fields.py"],
@@ -213,7 +241,7 @@ async def test_qualification_gate_blocks_partial_0143_identity_mismatch(mocker):
     NOT authorized — exact matching means a different identity pair still
     blocks."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0142_parent.py", "0143_vm_contact_last_tool_use.py"],
             candidate_list=[
@@ -234,7 +262,7 @@ async def test_qualification_gate_defers_when_candidate_fetch_fails(mocker):
     """A failure fetching the candidate's migration list HOLDS the release —
     ('defer', reason) — never ('ok', None). A fetch error is not 'no collision'."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
     )
     verdict, detail = await check_qualification_migration_identity(
@@ -252,9 +280,11 @@ async def test_qualification_gate_defers_when_target_fetch_fails(mocker):
     async def _side(token, owner, repo, ref, project_id=None):
         if ref == "main":
             raise RuntimeError("GitHub 500 on target")
-        return ["0142_parent.py", "0143_x.py"]
+        return _shas(["0142_parent.py", "0143_x.py"])
 
-    mocker.patch("app.github.list_versions_at_ref", new=AsyncMock(side_effect=_side))
+    mocker.patch(
+        "app.github.list_version_shas_at_ref", new=AsyncMock(side_effect=_side)
+    )
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
     )
@@ -273,10 +303,13 @@ async def test_qualification_gate_blocks_inplace_body_edit_of_deployed_migration
     tampered_src = deployed_src + "# tampered by candidate\n"
 
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
             candidate_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
+            # A real in-place body edit changes the blob sha, so the gate fetches
+            # and compares this migration's body (identical-sha files are skipped).
+            changed={"0309_computejob_heartbeat.py"},
         ),
     )
 
@@ -298,23 +331,51 @@ async def test_qualification_gate_blocks_inplace_body_edit_of_deployed_migration
 async def test_qualification_gate_ok_when_shared_migration_body_identical(mocker):
     """A shared migration with IDENTICAL body on both refs stays ('ok', None)
     — no false positive from the body-immutability check."""
-    src = _migration_source("0309", "0308")
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
             candidate_list=["0308_parent.py", "0309_computejob_heartbeat.py"],
         ),
     )
-    mocker.patch(
+    body = mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=src),
+        new=AsyncMock(return_value=_migration_source("0309", "0308")),
     )
     verdict, detail = await check_qualification_migration_identity(
         "tok", "acme", "widget", "cand-sha", "main"
     )
     assert verdict == "ok"
     assert detail is None
+    # Identical blob sha ⇒ provably unchanged ⇒ no body fetch (no false positive
+    # AND no wasted GitHub call).
+    assert body.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_qualification_gate_does_not_fetch_bodies_for_unchanged_migrations(
+    mocker,
+):
+    """Regression guard for the GitHub-403 fetch-storm wedge: a candidate sharing
+    a large, unchanged deployed migration set with the target must be cleared by
+    comparing blob shas alone, issuing ZERO per-file body fetches. Before the fix
+    the gate fetched every shared migration's body (2 contents calls each, ~200
+    files) on every qualification attempt, draining the token's 5000/hr budget
+    into a synthetic-403 → 'defer' loop that held the release indefinitely."""
+    shared = [f"{i:04d}_migration.py" for i in range(1, 216)]  # 215 shared files
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        # Same list (same blob shas) on both refs — deployed migrations are
+        # immutable, so the candidate carries them forward byte-for-byte.
+        new=_versions_by_ref(main_list=shared, candidate_list=shared),
+    )
+    body = mocker.patch("app.github.get_file_text_at_ref", new=AsyncMock())
+    verdict, detail = await check_qualification_migration_identity(
+        "tok", "acme", "widget", "cand-sha", "main"
+    )
+    assert verdict == "ok"
+    assert detail is None
+    assert body.await_count == 0  # not one body pulled across 215 shared files
 
 
 @pytest.mark.asyncio
@@ -322,7 +383,7 @@ async def test_qualification_gate_ok_when_no_shared_basenames(mocker):
     """When the candidate adds brand-new migrations not present on the target,
     there are no shared basenames and no body fetch is triggered — ('ok', None)."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0308_parent.py"],
             candidate_list=["0308_parent.py", "0309_new_feature.py"],
@@ -346,10 +407,12 @@ async def test_qualification_gate_defers_when_deployed_file_fetch_fails(mocker):
     """Fail-safe: if fetching the deployed body of a shared migration raises,
     the gate returns ('defer', reason) — never ('ok') or ('block')."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0309_computejob_heartbeat.py"],
             candidate_list=["0309_computejob_heartbeat.py"],
+            # Differing blob sha forces the body fetch this defer-path exercises.
+            changed={"0309_computejob_heartbeat.py"},
         ),
     )
 
@@ -371,10 +434,12 @@ async def test_qualification_gate_defers_when_deployed_file_empty(mocker):
     """Fail-safe: an empty body from the deployed ref is treated as an unknown
     state and returns ('defer', reason) — not ('ok') or ('block')."""
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0309_computejob_heartbeat.py"],
             candidate_list=["0309_computejob_heartbeat.py"],
+            # Differing blob sha forces the body fetch this defer-path exercises.
+            changed={"0309_computejob_heartbeat.py"},
         ),
     )
 
@@ -397,10 +462,12 @@ async def test_qualification_gate_defers_when_candidate_body_fetch_fails(mocker)
     the gate returns ('defer', reason) — never ('ok') or ('block')."""
     deployed_src = _migration_source("0309", "0308")
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0309_computejob_heartbeat.py"],
             candidate_list=["0309_computejob_heartbeat.py"],
+            # Differing blob sha forces the body fetch this defer-path exercises.
+            changed={"0309_computejob_heartbeat.py"},
         ),
     )
 

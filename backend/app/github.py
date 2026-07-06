@@ -513,6 +513,61 @@ async def get_file_content_at_ref(
         return None, None
 
 
+async def _list_versions_dir_entries(
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> list[dict] | None:
+    """Fetch the ``alembic/versions`` directory listing at *ref*.
+
+    Returns the list of file entries (each a GitHub contents dict carrying at
+    least ``name`` and its git blob ``sha``) on HTTP 200, or ``None`` when the
+    directory does not exist (HTTP 404 — a greenfield repo with no migrations).
+    RAISES on any other non-200 status, non-list payload, or transport error so
+    callers can defer (never wave a merge/qualification through on an unreadable
+    target). Shared by :func:`list_versions_at_ref` and
+    :func:`list_version_shas_at_ref` so both go through one request and one
+    fail-safe contract.
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    versions_dir = "backend/alembic/versions"
+    encoded_path = quote(versions_dir, safe="/")
+    encoded_ref = quote(ref, safe="")
+    url = (
+        f"https://api.github.com/repos/{owner}/{repo}/contents/"
+        f"{encoded_path}?ref={encoded_ref}"
+    )
+    response = await _github_request(
+        "GET", url, headers, max_retries=2, project_id=project_id
+    )
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"GitHub contents listing for {versions_dir} on "
+            f"{owner}/{repo}@{ref} returned HTTP {response.status_code}"
+        )
+    payload = response.json()
+    if not isinstance(payload, list):
+        raise RuntimeError(
+            f"GitHub contents listing for {versions_dir} on "
+            f"{owner}/{repo}@{ref} did not return a directory listing"
+        )
+    return [
+        entry
+        for entry in payload
+        if isinstance(entry, dict)
+        and entry.get("type") == "file"
+        and isinstance(entry.get("name"), str)
+    ]
+
+
 async def list_versions_at_ref(
     token: str,
     owner: str,
@@ -536,41 +591,48 @@ async def list_versions_at_ref(
     or transport error so the caller defers (never waves a merge through on
     an inability to read the target branch's migrations).
     """
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github.v3+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    versions_dir = "backend/alembic/versions"
-    encoded_path = quote(versions_dir, safe="/")
-    encoded_ref = quote(ref, safe="")
-    url = (
-        f"https://api.github.com/repos/{owner}/{repo}/contents/"
-        f"{encoded_path}?ref={encoded_ref}"
+    entries = await _list_versions_dir_entries(
+        token, owner, repo, ref, project_id=project_id
     )
-    response = await _github_request(
-        "GET", url, headers, max_retries=2, project_id=project_id
-    )
-    if response.status_code == 404:
+    if entries is None:
         return []
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"GitHub contents listing for {versions_dir} on "
-            f"{owner}/{repo}@{ref} returned HTTP {response.status_code}"
-        )
-    payload = response.json()
-    if not isinstance(payload, list):
-        raise RuntimeError(
-            f"GitHub contents listing for {versions_dir} on "
-            f"{owner}/{repo}@{ref} did not return a directory listing"
-        )
-    return [
-        entry["name"]
-        for entry in payload
-        if isinstance(entry, dict)
-        and entry.get("type") == "file"
-        and isinstance(entry.get("name"), str)
-    ]
+    return [entry["name"] for entry in entries]
+
+
+async def list_version_shas_at_ref(
+    token: str,
+    owner: str,
+    repo: str,
+    ref: str,
+    project_id: str | None = None,
+) -> dict[str, str]:
+    """Like :func:`list_versions_at_ref` but return ``{filename: git blob sha}``.
+
+    Uses the SAME single directory-listing call — the GitHub contents API
+    already returns each entry's git blob ``sha`` — so this carries no request
+    cost over listing the names alone. The blob sha is git's content address:
+    two refs that share a filename with an identical sha have byte-identical
+    bodies, which lets the migration-identity gates skip a per-file body fetch
+    for every unchanged migration (the overwhelming common case, since deployed
+    migrations are immutable) instead of pulling all ~200 files on every attempt
+    — the fetch storm that drains the token's rate-limit budget and wedges
+    release qualification into a ``defer`` loop.
+
+    Same fail-safe contract as :func:`list_versions_at_ref`: ``{}`` on 404,
+    RAISES on any other unreadable outcome. Entries missing a string ``sha`` are
+    dropped, so a caller comparing shas treats an absent entry as "unknown →
+    fetch to be safe" rather than "unchanged".
+    """
+    entries = await _list_versions_dir_entries(
+        token, owner, repo, ref, project_id=project_id
+    )
+    if entries is None:
+        return {}
+    return {
+        entry["name"]: entry["sha"]
+        for entry in entries
+        if isinstance(entry.get("sha"), str)
+    }
 
 
 async def get_file_text_at_ref(

@@ -1054,6 +1054,10 @@ class TestSchemaRevisionSync:
         #   get_pull_request — read PR metadata (head SHA) for the patch-absent fallback
         #   get_pull_request_diff — kept for back-merge planner path
         #   list_versions_at_ref — list alembic/versions filenames at a ref
+        #   list_version_shas_at_ref — same single listing call, also returns each
+        #     file's git blob sha so the identity gate can skip body fetches for
+        #     unchanged (byte-identical) migrations; a GET of the contents dir,
+        #     strictly read-only, cannot push to a branch
         #   get_file_text_at_ref — fetch a single migration file's source at a ref
         # No branch-write helper may appear: the planner computes a renumber plan,
         # it never applies one to a live branch.
@@ -1063,6 +1067,7 @@ class TestSchemaRevisionSync:
             "get_pull_request_diff",
             "get_pull_request",
             "list_versions_at_ref",
+            "list_version_shas_at_ref",
             "get_file_text_at_ref",
         }
         used = set(re.findall(r"\bgithub\.(\w+)\b", content))
