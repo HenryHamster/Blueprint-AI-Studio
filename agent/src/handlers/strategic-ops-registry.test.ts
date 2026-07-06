@@ -140,3 +140,42 @@ describe('resident bootstrap prompt derives from the registry', () => {
     }
   });
 });
+
+describe('API reference docs derive from the registry', () => {
+  const API_REFERENCE_PATH = path.resolve(
+    process.cwd(),
+    '..',
+    'docs/API_REFERENCE.md',
+  );
+  const apiDoc = readFileSync(API_REFERENCE_PATH, 'utf8');
+
+  // Extract the op union string from the POST /api/agent/strategic request body
+  // example. Scoped to the `/api/agent/strategic` section to avoid matching op
+  // fields in other endpoint examples. The format is: "op": "<op1> | <op2> | ..."
+  function extractDocumentedOps(doc: string): Set<string> {
+    const sectionMatch = doc.match(/POST \/api\/agent\/strategic[\s\S]*?"op":\s*"([^"]+)"/);
+    if (!sectionMatch) return new Set();
+    return new Set(sectionMatch[1].split('|').map(s => s.trim()).filter(Boolean));
+  }
+
+  const documentedOps = extractDocumentedOps(apiDoc);
+
+  it('documents every non-internal op in the op union string', () => {
+    const surfacedOps = STRATEGIC_OPS_REGISTRY.filter(e => e.cli || e.prompt);
+    for (const e of surfacedOps) {
+      expect(
+        documentedOps,
+        `API_REFERENCE.md op union missing non-internal op: ${e.op}`,
+      ).toContain(e.op);
+    }
+  });
+
+  it('does not include internal-only ops in the op union string', () => {
+    for (const e of STRATEGIC_OPS_REGISTRY.filter(x => !x.cli && !x.prompt)) {
+      expect(
+        documentedOps,
+        `API_REFERENCE.md op union should not list internal op: ${e.op}`,
+      ).not.toContain(e.op);
+    }
+  });
+});

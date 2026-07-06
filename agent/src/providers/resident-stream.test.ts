@@ -61,6 +61,16 @@ describe('isStrategicMutation', () => {
   it('detects a strategic op mid-pipeline', () => {
     expect(isStrategicMutation('cd /tmp && ./strategic spawn-task \'{}\'')).toBe(true);
   });
+
+  it('detects ops previously missing from the hand-maintained set', () => {
+    expect(isStrategicMutation('./strategic activate-direction d-abc123')).toBe(true);
+    expect(isStrategicMutation('./strategic dispose-completion-debt cd-abc123')).toBe(true);
+  });
+
+  it('rejects internal-only ops that are not CLI-surfaced', () => {
+    expect(isStrategicMutation('./strategic cite-memos \'{}\'')).toBe(false);
+    expect(isStrategicMutation('./strategic set-strategic-challenge \'{}\'')).toBe(false);
+  });
 });
 
 describe('isMessageSend', () => {

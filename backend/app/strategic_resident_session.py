@@ -39,7 +39,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -47,7 +47,6 @@ from sqlmodel import select
 from app.database import AsyncSessionLocal, get_session
 from app.failure_classification import ADMIN_CANCEL
 from app.models import (
-    TASK_OUTCOME_TERMINAL_STATUSES,
     Direction,
     Project,
     ProjectMessage,
@@ -152,6 +151,12 @@ _EXAM_LEDGER_MAX_BYTES = 20_000
 # terminal status counts toward ``work_state_summary.terminal_since`` — i.e.
 # "how many of my spawned tasks just landed." Advisory only.
 _WORK_STATE_TERMINAL_WINDOW_SECONDS = 3600
+
+# Depth limit for the recursive CTE that walks STRATEGIC_AGENT task descendants
+# in ``_compute_resident_work_state``. Matches the identical guard in
+# ``agent_tasks._ANCESTOR_WALK_MAX_DEPTH`` — parent_task_id is admin-mutable
+# so an explicit cap prevents cycle-induced infinite recursion.
+_WORK_STATE_ANCESTOR_WALK_MAX_DEPTH = 20
 
 # The resident task must be one of these (non-terminal) statuses to host / keep
 # hosting a session. Mirrors ``strategic_state_read_model._LIVE_STRATEGIC_TASK_STATUSES``.
@@ -417,12 +422,13 @@ async def _compute_resident_work_state(
 
     * ``work_state_rev`` — a monotonic marker: the newest ISO-8601 timestamp
       across the change sources the strategist cares about — STRATEGIC_AGENT-
-      created tasks' latest status transition (``Task.updated_at`` advances on
-      every transition via ``onupdate``), operator-authored ``ProjectMessage``
-      arrivals, and ``StrategicCycle`` mutation stamps. The agent compares this
-      against the rev it recorded at its last autonomous turn to decide whether
-      the world moved. ``None`` when the project has no such activity yet, in
-      which case an older agent degrades to floor-tick pacing.
+      created tasks' and their descendant tasks' latest status transitions
+      (``Task.updated_at`` advances on every transition via ``onupdate``),
+      operator-authored ``ProjectMessage`` arrivals, and ``StrategicCycle``
+      mutation stamps. The agent compares this against the rev it recorded at
+      its last autonomous turn to decide whether the world moved. ``None`` when
+      the project has no such activity yet, in which case an older agent
+      degrades to floor-tick pacing.
     * ``work_state_summary`` — advisory ``{in_flight, terminal_since,
       new_operator_messages}`` counts feeding the agent's tick context.
 
@@ -432,15 +438,55 @@ async def _compute_resident_work_state(
     the heartbeat cannot extend the dead-man's switch (contract pinned by
     ``test_heartbeat_liveness_only_does_not_extend_lease``).
     """
-    # work_state_rev: max() over the strategist-relevant change sources.
-    task_max = (
+    # A single recursive CTE finds the entire strategist subtree (roots +
+    # transitive descendants) bounded at _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH
+    # levels, then aggregates max(updated_at), in-flight count, and
+    # terminal-since count in the same query — no Python-side BFS, no
+    # unbounded loop, no cycle risk.
+    terminal_cutoff = _utcnow() - timedelta(
+        seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS
+    )
+    tree_row = (
         await session.execute(
-            select(func.max(Task.updated_at)).where(
-                Task.project_id == project_id,
-                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
-            )
+            text("""
+                WITH RECURSIVE task_tree AS (
+                    SELECT id, updated_at, archived, status, 0 AS depth
+                    FROM task
+                    WHERE project_id = :project_id
+                      AND created_by = :created_by
+                    UNION ALL
+                    SELECT t.id, t.updated_at, t.archived, t.status,
+                           tt.depth + 1
+                    FROM task t
+                    INNER JOIN task_tree tt ON t.parent_task_id = tt.id
+                    WHERE t.project_id = :project_id
+                      AND tt.depth < :max_depth
+                )
+                SELECT
+                    max(updated_at) AS max_updated,
+                    count(*) FILTER (
+                        WHERE NOT archived
+                          AND status NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                    ) AS in_flight,
+                    count(*) FILTER (
+                        WHERE status IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                          AND updated_at >= :terminal_cutoff
+                    ) AS terminal_since
+                FROM task_tree
+            """),
+            {
+                "project_id": project_id,
+                "created_by": _STRATEGIC_AGENT_CREATED_BY,
+                "max_depth": _WORK_STATE_ANCESTOR_WALK_MAX_DEPTH,
+                "terminal_cutoff": terminal_cutoff,
+            },
         )
-    ).scalar_one_or_none()
+    ).fetchone()
+
+    task_max = tree_row[0] if tree_row else None
+    in_flight: int = int(tree_row[1] or 0) if tree_row else 0
+    terminal_since: int = int(tree_row[2] or 0) if tree_row else 0
+
     msg_max = (
         await session.execute(
             select(func.max(ProjectMessage.created_at)).where(
@@ -459,35 +505,6 @@ async def _compute_resident_work_state(
     stamps = [dt for dt in (task_max, msg_max, cycle_max) if dt is not None]
     work_state_rev = max(stamps).isoformat() if stamps else None
 
-    # work_state_summary: advisory counts for the agent's tick context.
-    _terminal = tuple(TASK_OUTCOME_TERMINAL_STATUSES)
-    in_flight = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.archived.is_(False),
-                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
-                Task.status.notin_(_terminal),
-            )
-        )
-    ).scalar() or 0
-    terminal_cutoff = _utcnow() - timedelta(
-        seconds=_WORK_STATE_TERMINAL_WINDOW_SECONDS
-    )
-    terminal_since = (
-        await session.execute(
-            select(func.count())
-            .select_from(Task)
-            .where(
-                Task.project_id == project_id,
-                Task.created_by == _STRATEGIC_AGENT_CREATED_BY,
-                Task.status.in_(_terminal),
-                Task.updated_at >= terminal_cutoff,
-            )
-        )
-    ).scalar() or 0
     new_operator_messages = (
         await session.execute(
             select(func.count())

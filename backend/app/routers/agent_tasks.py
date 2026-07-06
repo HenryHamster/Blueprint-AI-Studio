@@ -1,17 +1,22 @@
 """Agent-facing task-status fetch endpoints.
 
 Lets the strategic agent inspect the status and outcome of tasks it spawned
-via spawn_task/spawn_fix, closing the zero-visibility gap that existed after
-spawning: the agent had no way to tell if a task was queued, running, blocked,
-completed, or failed.
+via spawn_task/spawn_fix, as well as transitive descendants of those tasks
+(children spawned by the orchestrator on behalf of the strategist).
 
 Auth/scoping follows the same ``_resolve_agent_project`` pattern used in
 ``agent_strategic_fetch``: the agent JWT carries the calling task-id, and we
 confirm the calling task belongs to the requested project (cross-project access
 returns 404, not 403, to prevent project enumeration).
 
-Only tasks with ``created_by == 'STRATEGIC_AGENT'`` are visible through this
-surface. The response is a compact, agent-safe subset of the admin task detail:
+Tasks are visible when (a) created_by == 'STRATEGIC_AGENT', or (b) reachable
+via parent_task_id links from a STRATEGIC_AGENT root within the same project.
+The recursive CTE is bounded to ``_ANCESTOR_WALK_MAX_DEPTH`` generations so
+admin-mutable parent links cannot trigger unbounded recursion. Each response
+item includes ``parent_task_id`` so the strategist can map a failing descendant
+back to the task it spawned.
+
+The response is a compact, agent-safe subset of the admin task detail:
 no cost, no billing, no other users' data.
 """
 
@@ -61,6 +66,7 @@ def _build_task_response(
     status_val = getattr(task.status, "value", str(task.status)) if task.status else None
     resp: dict[str, Any] = {
         "id": str(task.id),
+        "parent_task_id": str(task.parent_task_id) if task.parent_task_id else None,
         "status": status_val,
         "task_type": _task_type(task),
         "title": task.title,
@@ -96,10 +102,14 @@ async def agent_get_task(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ) -> dict[str, Any]:
-    """Return status and outcome for a single STRATEGIC_AGENT-spawned task.
+    """Return status and outcome for a single task visible to the strategic agent.
 
-    Returns 404 when the task does not exist, does not belong to this project,
-    or was not created by the strategic agent (prevents cross-type enumeration).
+    Visible tasks include any STRATEGIC_AGENT-authored task and any transitive
+    descendant reachable via parent_task_id within the same project (bounded to
+    _ANCESTOR_WALK_MAX_DEPTH generations). Returns 404 when the task does not
+    exist, does not belong to this project, or has no STRATEGIC_AGENT ancestor
+    (prevents cross-type enumeration). Response includes parent_task_id so the
+    agent can map descendants back to the task it spawned.
     """
     await _resolve_agent_project(project_id, token, session)
 
@@ -171,27 +181,33 @@ async def agent_list_tasks(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ) -> dict[str, Any]:
-    """List recent STRATEGIC_AGENT-spawned tasks for a project.
+    """List recent tasks visible to the strategic agent for a project.
 
-    Returns tasks ordered by ``created_at`` descending (most recent first),
-    capped at ``limit`` (default 20, max 100). Only tasks created by the
-    strategic agent are visible.
+    Returns STRATEGIC_AGENT-authored tasks and their transitive descendants
+    (children spawned by the orchestrator on behalf of the strategist), ordered
+    by ``created_at`` descending (most recent first), capped at ``limit``
+    (default 20, max 100). The recursive CTE is bounded to
+    ``_ANCESTOR_WALK_MAX_DEPTH`` generations. Each item includes
+    ``parent_task_id`` (null for strategist roots) so the agent can map
+    descendants back to the task it spawned.
     """
     await _resolve_agent_project(project_id, token, session)
 
     # Fetch all strategist-authored tasks and their transitive descendants
-    # within this project using a single recursive CTE.
+    # within this project using a single recursive CTE, bounded by
+    # _ANCESTOR_WALK_MAX_DEPTH to prevent unbounded recursion via
+    # admin-mutable parent links.
     cte_result = await session.execute(
         text("""
             WITH RECURSIVE task_tree AS (
-                SELECT id, created_at
+                SELECT id, created_at, 0 AS depth
                 FROM task
                 WHERE project_id = :project_id AND created_by = :created_by
                 UNION ALL
-                SELECT t.id, t.created_at
+                SELECT t.id, t.created_at, tt.depth + 1
                 FROM task t
                 INNER JOIN task_tree tt ON t.parent_task_id = tt.id
-                WHERE t.project_id = :project_id
+                WHERE t.project_id = :project_id AND tt.depth < :max_depth
             )
             SELECT id FROM task_tree
             ORDER BY created_at DESC
@@ -201,6 +217,7 @@ async def agent_list_tasks(
             "project_id": project_id,
             "created_by": _STRATEGIC_AGENT_CREATED_BY,
             "limit": limit,
+            "max_depth": _ANCESTOR_WALK_MAX_DEPTH,
         },
     )
     task_ids = [row[0] for row in cte_result.fetchall()]

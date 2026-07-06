@@ -97,3 +97,72 @@ def test_dispatch_accepts_exactly_the_manifest_ops():
         f"canonical registry and regenerate the manifest): {sorted(silent_addition)}"
     )
     assert manifest_ops == dispatch_ops
+
+
+_SC_PATH = _BACKEND_ROOT / "app" / "strategic_completion.py"
+
+
+def _extract_fallback_op_loop_body(source: str) -> str:
+    """Slice the fallback ``for op_entry in direction_ops:`` loop body."""
+    lines = source.splitlines()
+    start = next(
+        (i for i, ln in enumerate(lines) if "for op_entry in direction_ops:" in ln),
+        None,
+    )
+    assert start is not None, "could not locate fallback op loop in strategic_completion.py"
+    for_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if not ln.strip():
+            continue
+        ln_indent = len(ln) - len(ln.lstrip())
+        if ln_indent <= for_indent:
+            end = i
+            break
+    return "\n".join(lines[start:end])
+
+
+def _fallback_dispatch_ops(body: str) -> set[str]:
+    return set(re.findall(r'\bop\s*==\s*"([a-z_]+)"', body))
+
+
+def test_fallback_dispatch_accepts_exactly_the_portfolio_ops():
+    """The fallback op loop must handle exactly _VALID_PORTFOLIO_OPS — every
+    portfolio op has a live branch, and no op is silently dropped."""
+    from app.strategic_completion import _VALID_PORTFOLIO_OPS
+
+    source = _SC_PATH.read_text(encoding="utf-8")
+    body = _extract_fallback_op_loop_body(source)
+    dispatch_ops = _fallback_dispatch_ops(body)
+
+    missing = _VALID_PORTFOLIO_OPS - dispatch_ops
+    extra = dispatch_ops - _VALID_PORTFOLIO_OPS
+    assert not missing, (
+        "portfolio ops with no handler in fallback op loop "
+        f"(add elif op == '<op>': branch in strategic_completion.py): {sorted(missing)}"
+    )
+    assert not extra, (
+        "fallback op loop branches not declared in _VALID_PORTFOLIO_OPS: "
+        f"{sorted(extra)}"
+    )
+
+
+def test_challenge_vocabulary_covers_activate_direction():
+    """activate_direction must be in the backend challenge portfolio-op vocabulary
+    so the challenge gate fails closed (not open) for a rejected activation."""
+    from app.strategic_completion import _VALID_PORTFOLIO_OPS, _HARD_BLOCK_PORTFOLIO_OPS, _PORTFOLIO_OP_ALIASES
+
+    assert "activate_direction" in _VALID_PORTFOLIO_OPS, (
+        "activate_direction missing from _VALID_PORTFOLIO_OPS — challenge gate always passes"
+    )
+    assert "activate_direction" in _HARD_BLOCK_PORTFOLIO_OPS, (
+        "activate_direction missing from _HARD_BLOCK_PORTFOLIO_OPS — a rejected challenge cannot block it"
+    )
+    assert _PORTFOLIO_OP_ALIASES.get("activate") == "activate_direction", (
+        "activate alias missing from _PORTFOLIO_OP_ALIASES — short form never resolves"
+    )
+    manifest_ops = {e["op"] for e in _load_manifest()}
+    assert "activate_direction" in manifest_ops, (
+        "activate_direction not found in strategic_ops_manifest.json — coherence gap"
+    )

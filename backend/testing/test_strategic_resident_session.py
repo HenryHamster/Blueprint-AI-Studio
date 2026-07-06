@@ -2404,6 +2404,69 @@ async def test_heartbeat_work_state_does_not_extend_lease(db_session):
     assert r2["work_state_rev"] is not None
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_work_state_notices_descendant_task_transitions(db_session):
+    """The work-state signal must advance when descendant tasks (children of
+    strategist-spawned tasks) transition, not just direct STRATEGIC_AGENT tasks.
+    When a plan child or follow-up fix blocks/completes, the wake signal advances
+    so the resident reacts promptly, not waiting for the root task."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Create a root task spawned by the strategist
+    root = await _make_strategic_agent_task(
+        db_session, project, status=TaskStatus.IN_PROGRESS
+    )
+
+    # Create a descendant (child) task with a different created_by
+    child = Task(
+        project_id=project.id,
+        parent_task_id=root.id,
+        title="child of strategist spawn",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.IN_PROGRESS,
+        created_by="ORCHESTRATOR",
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+
+    # First heartbeat: capture the initial work_state_rev
+    project = await db_session.get(Project, project.id)
+    r1 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev1 = r1["work_state_rev"]
+    # Root is in-flight, child is in-flight → 2 in-flight descendant-aware tasks
+    assert r1["work_state_summary"]["in_flight"] >= 1
+
+    # Transition the child task (not a STRATEGIC_AGENT task, but a descendant)
+    child.status = TaskStatus.COMPLETED
+    db_session.add(child)
+    await db_session.commit()
+
+    # Second heartbeat: work_state_rev must advance because child transitioned
+    project = await db_session.get(Project, project.id)
+    r2 = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=False,
+    )
+    rev2 = r2["work_state_rev"]
+
+    # The rev must have advanced (descendant transition detected).
+    assert rev2 is not None
+    assert rev2 > rev1, (
+        f"work_state_rev should advance when descendant transitions: {rev1} → {rev2}"
+    )
+    # Child no longer in-flight; summary should reflect it (fewer in-flight).
+    assert r2["work_state_summary"]["terminal_since"] >= 1
+
+
 # ---------------------------------------------------------------------------
 # Finding 1 (this review) — lease lapse / unattended cap END the session so the
 # resident task goes terminal and the legacy cadence reclaims (no indefinite

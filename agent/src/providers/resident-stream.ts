@@ -23,6 +23,8 @@
  * treats a nested `result` as sub-progress, never as the turn's completion.
  */
 
+import { STRATEGIC_OPS_REGISTRY } from '../handlers/strategic-ops-registry.js';
+
 export type ResidentEventKind = 'text' | 'tool' | 'tool_result' | 'result' | 'error' | 'system' | 'other';
 
 /**
@@ -231,13 +233,11 @@ export function extractDeltaText(obj: Record<string, unknown>): string | undefin
   return undefined;
 }
 
-const STRATEGIC_MUTATING_VERBS = new Set([
-  'set-problem-model', 'set-running-update', 'reflect', 'pending-confirm', 'set-vision',
-  'create-direction', 'update-direction', 'retire-direction', 'stage-direction',
-  'approve-direction', 'reject-direction', 'create-message', 'resolve-message',
-  'spawn-task', 'spawn-fix', 'set-retirement-critiques', 'set-evidence-progress',
-  'set-acceptance-criteria', 'cite-memos', 'set-strategic-challenge',
-]);
+const STRATEGIC_MUTATING_VERBS = new Set(
+  STRATEGIC_OPS_REGISTRY
+    .filter(e => e.cli && e.alias !== null)
+    .map(e => e.alias as string),
+);
 
 /**
  * True when a Bash command invokes a MUTATING `./strategic <verb>` op. Reads

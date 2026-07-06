@@ -976,6 +976,10 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 # direction, stage it by id below. For a NEW next-version idea, do NOT
 # create-then-stage — pass "staged": true on create-direction (one atomic op).
 ./strategic stage-direction '{"direction_id": "d-xxx", "rationale": "why this belongs to the next version"}'
+./strategic approve-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+./strategic reject-direction '{"direction_id": "d-xxx", "rationale": "..."}'
+# Reactivate a staged or user-paused direction back to active.
+./strategic activate-direction '{"direction_id": "d-xxx", "rationale": "why reactivating now"}'
 
 # REQUIRED: Submit the retired-direction critique from Section 3.5.
 # Pass a JSON array of critique objects (or the no-eligible sentinel).
@@ -1060,6 +1064,14 @@ Do NOT analyze code. Do NOT explore the codebase. Think briefly about each opera
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "criterion_ids": ["c-key-1", "c-key-2"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py", "test_id": "test_bar"}}'
 # Direction spawn with explicit extra criterion coverage (merged with direction's own keys):
 ./strategic spawn-task '{"type": "research", "title": "...", "prompt": "...", "direction_id": "d-xxx", "criterion_ids": ["c-key-extra"], "acceptance_evidence": {"kind": "named_test", "test_path": "testing/test_foo.py"}}'
+
+# One-time fix: spawn a PR-producing task with NO direction (create/refactor/qa).
+# Fires once and lands a PR; no direction lifecycle.
+./strategic spawn-fix '{"type": "create|refactor|qa", "title": "...", "prompt": "Full implementation prompt..."}'
+
+# Dispose an open completion-debt ledger entry.
+# disposition: "resolved" (requires evidence) or "dismissed" (requires reason).
+./strategic dispose-completion-debt '{"debt_id": "...", "disposition": "resolved|dismissed", "reason": "evidence or reason"}'
 
 # Pull full detail for items the strategic packer trimmed (see "Context not
 # shipped this cycle" section in your prompt). Use only when you actually

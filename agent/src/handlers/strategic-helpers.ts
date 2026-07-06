@@ -224,8 +224,8 @@ export const FETCH_VERB_HELP: Record<FetchVerb, string> = {
   'ci-compliance':       '`./fetch ci-compliance` — CI compliance status for the current integration branch HEAD: module-size breaches and branch-literal violations (no id)',
   'capability-trials':   '`./fetch capability-trials` — capability-trial verdicts keyed by cap_name: verdict, lift, n_with/n_without, and accrual projection (no id)',
   'sections':            '`./fetch sections <name>` — freshly-built payload section by name (self_reflection_log, anomaly_summary, playbook_summary, retired_directions_summary, rejected_proposals, past_retirement_critiques, previous_decision_outcomes, outcome_evaluation); use when that section was dropped under budget pressure',
-  'task':                '`./fetch task <task_id>` — status and outcome for a single strategic-agent-spawned task by id (status, created_at, progress message, pr_url/failure_reason for terminal tasks)',
-  'tasks':               '`./fetch tasks` — list of recent strategic-agent-spawned tasks for this project (most recent first, default limit 20)',
+  'task':                '`./fetch task <task_id>` — status and outcome for a single task by id; visible for any STRATEGIC_AGENT-spawned task or its transitive descendants (fields: id, parent_task_id, status, created_at, progress message, pr_url/failure_reason for terminal tasks)',
+  'tasks':               '`./fetch tasks` — list of recent tasks for this project (most recent first, default limit 20); includes STRATEGIC_AGENT-spawned tasks AND their transitive descendants; each item carries parent_task_id (null for strategist roots) to map failing descendants back to the spawned task',
 };
 
 function generateFetchScript(projectIdRaw: string, verbs: FetchVerb[]): string {
@@ -692,7 +692,7 @@ You are an INDEPENDENT adversarial reviewer. A strategist ("thinker") just produ
 2. **retirement_approvals** — for EVERY direction the thinker proposes to retire, judge whether the retirement reasoning names a real, evidenced pattern (approve) or is shallow/boilerplate/unsupported (reject). When in doubt, REJECT — approving an unsupported retirement is the costly error. If the thinker proposes no retirements, emit an empty array.
 3. **retirement_critique_quality** — whether the thinker's retirement critiques name a real pattern + lesson (solid) or are shallow/boilerplate.
 4. **portfolio_shape_risk** — whether the resulting active-direction portfolio is over-concentrated, has coverage gaps, or is over capacity.
-5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
+5. **portfolio_operations** — each concrete portfolio MUTATION the thinker proposed: create / update / retire / stage / approve / reject / activate of a direction. Judge each one and its NET effect on the active portfolio (capacity, concentration, fan-out, coverage). Be STRICT on destructive or fan-out-sensitive moves: REJECT a retire / stage / approve / reject / activate / lane-removing update when the analysis does NOT present a real, evidenced reason. A create can also be rejected when it is genuinely unsafe to commit. Use "warned"/"uncertain" for advisory, subjective concerns that should NOT block; reserve "rejected" for moves that are genuinely unsafe to commit.
 
 You do NOT commit anything. You ONLY emit a verdict record. Be terse and skeptical.
 
@@ -714,14 +714,14 @@ Output ONLY a single JSON object — no markdown, no code fences, no preamble �
   "retirement_critique_quality": {"verdict": "solid|shallow|not_assessed", "rationale": "one line"},
   "portfolio_shape_risk": {"verdict": "low|elevated|high", "rationale": "one line"},
   "portfolio_operations": [
-    {"op": "create_direction|update_direction|retire_direction|stage_direction|approve_direction|reject_direction", "direction_id": "d-xxx", "text": "<proposed text — creates only>", "verdict": "approved|warned|uncertain|rejected", "rationale": "one line"}
+    {"op": "create_direction|update_direction|retire_direction|stage_direction|approve_direction|reject_direction|activate_direction", "direction_id": "d-xxx", "text": "<proposed text — creates only>", "verdict": "approved|warned|uncertain|rejected", "rationale": "one line"}
   ]
 }
 Rules:
 - Add an evidence_progress entry for EVERY direction the thinker rated advancing or met (verdict "approved" only with concrete evidence, otherwise "rejected"). Directions the thinker called stalled need no entry — stalled is advisory and never gated. If the thinker rated none, emit an empty array.
 - Add a retirement_approvals entry for EVERY direction the thinker proposes to retire (verdict "approved" only when the reasoning names a real evidenced pattern, otherwise "rejected"). When in doubt, REJECT. If the thinker proposes no retirements, emit an empty array.
 - "retirement_critique_quality" and "portfolio_shape_risk" are REQUIRED keys even when there is little to say.
-- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). A NEW direction the thinker proposes to STAGE for the next version is op "create_direction" (set "text", no "direction_id") — it executes as a staged create; "stage_direction" is only for an EXISTING direction (set "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
+- Add a portfolio_operations entry for EVERY concrete create/update/retire/stage/approve/reject/activate the thinker proposed. For ops on an existing direction set "direction_id" (its id); for a create set "text" to the proposed direction text (omit/empty "direction_id"). A NEW direction the thinker proposes to STAGE for the next version is op "create_direction" (set "text", no "direction_id") — it executes as a staged create; "stage_direction" is only for an EXISTING direction (set "direction_id"). Use "rejected" ONLY for destructive/fan-out-sensitive moves that are unsafe to commit; "warned"/"uncertain" for advisory subjective concerns; "approved" for clean moves.
 - Output the JSON object and nothing else.`;
 }
 

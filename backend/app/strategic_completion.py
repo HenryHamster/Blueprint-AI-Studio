@@ -479,6 +479,7 @@ _PORTFOLIO_OP_ALIASES = {
     "stage": "stage_direction",
     "approve": "approve_direction",
     "reject": "reject_direction",
+    "activate": "activate_direction",
 }
 _VALID_PORTFOLIO_OPS = frozenset(
     {
@@ -488,6 +489,7 @@ _VALID_PORTFOLIO_OPS = frozenset(
         "stage_direction",
         "approve_direction",
         "reject_direction",
+        "activate_direction",
     }
 )
 _VALID_PORTFOLIO_VERDICTS = frozenset({"approved", "rejected", "warned", "uncertain"})
@@ -501,6 +503,7 @@ _HARD_BLOCK_PORTFOLIO_OPS = frozenset(
         "stage_direction",
         "approve_direction",
         "reject_direction",
+        "activate_direction",
     }
 )
 STRATEGIC_RETIREMENT_CHALLENGE_GATE_MODE_KEY = (
@@ -4822,6 +4825,14 @@ async def _handle_strategic_completion(
     # Applied once after the loop, in the same locked transaction as the
     # directions write.
     _pending_gap_reconciles: list = []
+    # Delta tracking for the post-loop directions write.  Each op mutates the
+    # in-memory ``directions`` snapshot; capturing those mutations here lets the
+    # locked write apply only what changed against the FRESH DB list, so a
+    # direction added concurrently between snapshot and write is preserved rather
+    # than silently overwritten.
+    _delta_mutated: dict = {}   # str(id) -> final dict for any modified existing dir
+    _delta_removed: set = set() # str(ids) removed with no tombstone (reject, no text)
+    _delta_created: list = []   # new direction dicts appended this batch
     if direction_ops and isinstance(direction_ops, list):
         if len(direction_ops) > MAX_DIRECTION_OPS:
             logger.warning(
@@ -5121,6 +5132,7 @@ async def _handle_strategic_completion(
                     )
                     new_dir["paused_at"] = _utcnow().isoformat()
                 directions.append(new_dir)
+                _delta_created.append(new_dir)
                 # Stage the gap this fresh active direction staffs (active_moves
                 # + clear deferral). Mirror the HTTP create_direction path: only a
                 # live active direction staffs a gap (a pause-translated direction
@@ -5447,6 +5459,7 @@ async def _handle_strategic_completion(
                                     _pre_status_fb,
                                 )
                             )
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Updated direction {dir_id} for project {project.id}: {list(changes.keys())}"
@@ -5494,6 +5507,7 @@ async def _handle_strategic_completion(
                                     f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
                                 )
                             d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         retires_applied += 1
                         retired_ids_fb.append(dir_id)
@@ -5576,6 +5590,7 @@ async def _handle_strategic_completion(
                                     _pre_status_fb,
                                 )
                             )
+                        _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         logger.info(
                             f"[STRATEGIC] Staged direction {dir_id} for project {project.id}"
@@ -5661,6 +5676,7 @@ async def _handle_strategic_completion(
                 }
                 flag_modified(task, "context")
                 session.add(task)
+                _delta_mutated[str(dir_id)] = target
                 ops_applied += 1
                 logger.info(
                     f"[STRATEGIC] Approved direction {dir_id} for project {project.id}"
@@ -5739,12 +5755,10 @@ async def _handle_strategic_completion(
                     if t.vm_instance_id:
                         vm_ids_to_delete.append(t.vm_instance_id)
                 directions = remaining
-                _d = directions
-                from app.task_locking import (
-                    with_directions_locked as _with_directions_locked,
-                )
-
-                await _with_directions_locked(session, task.project_id, lambda _: _d)
+                if rejected_text:
+                    _delta_mutated[str(dir_id)] = tombstone
+                else:
+                    _delta_removed.add(str(dir_id))
                 ctx = task.context or {}
                 task.context = {
                     **ctx,
@@ -5772,11 +5786,131 @@ async def _handle_strategic_completion(
                     f"[STRATEGIC] Rejected direction {dir_id} for project {project.id}"
                 )
 
+            elif op == "activate_direction":
+                dir_id = op_entry.get("direction_id")
+                if not dir_id:
+                    continue
+                target = next((d for d in directions if d.get("id") == dir_id), None)
+                if not target:
+                    continue
+                cur_status = target.get("status")
+                _TERMINAL_STATUSES_FB = frozenset(
+                    {"retired", "expired", "superseded", "completed", "rejected"}
+                )
+                if cur_status == "active":
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because already active",
+                        task.id,
+                        dir_id,
+                    )
+                    continue
+                if cur_status in _TERMINAL_STATUSES_FB:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because terminal status=%s",
+                        task.id,
+                        dir_id,
+                        cur_status,
+                    )
+                    continue
+                blocked, why = challenge_rejects_portfolio_op(
+                    fallback_challenge_record,
+                    op,
+                    direction_id=str(dir_id),
+                )
+                if blocked:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback portfolio challenge blocked activate_direction for %s: %s",
+                        task.id,
+                        dir_id,
+                        why or "challenge rejected this activate_direction",
+                    )
+                    continue
+                active_count = sum(1 for d in directions if d.get("status") == "active")
+                max_active = _runtime_config.get("max_active_directions", 5)
+                if active_count >= max_active:
+                    logger.info(
+                        "[STRATEGIC] Task %s: fallback activate_direction skipped for %s because active count %s/%s reached cap",
+                        task.id,
+                        dir_id,
+                        active_count,
+                        max_active,
+                    )
+                    continue
+                from app.direction_lifecycle import reactivate_paused_direction as _reactivate_fb
+                _reactivate_fb(target, allow_user_paused=True)
+                target.pop("staged_at", None)
+                if rationale:
+                    notes = target.get("notes", [])
+                    notes.append(
+                        {
+                            "text": f"Reactivated by strategic op: {rationale}",
+                            "added_at": _utcnow().isoformat(),
+                        }
+                    )
+                    target["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                _gap_id_activate_fb = target.get("gap_id")
+                if _gap_id_activate_fb:
+                    _pending_gap_reconciles.append(
+                        (
+                            str(dir_id),
+                            _gap_id_activate_fb,
+                            _gap_id_activate_fb,
+                            "active",
+                            cur_status,
+                        )
+                    )
+                _delta_mutated[str(dir_id)] = target
+                ctx = task.context or {}
+                task.context = {
+                    **ctx,
+                    "_strategic_dirs_updated": ctx.get("_strategic_dirs_updated", 0) + 1,
+                    "_strategic_updated_ids": list(
+                        ctx.get("_strategic_updated_ids", [])
+                    ) + [dir_id],
+                }
+                flag_modified(task, "context")
+                session.add(task)
+                ops_applied += 1
+                logger.info(
+                    f"[STRATEGIC] Reactivated direction {dir_id} for project {project.id}"
+                )
+
         if ops_applied > 0:
             from app.task_locking import with_directions_locked
 
-            _dirs = list(directions)
-            await with_directions_locked(session, task.project_id, lambda _: _dirs)
+            _fb_mutated = dict(_delta_mutated)
+            _fb_removed = set(_delta_removed)
+            _fb_created = list(_delta_created)
+
+            def _apply_fb_delta(fresh: list) -> list:
+                result = []
+                for d in fresh:
+                    did = str(d.get("id") or "")
+                    if did in _fb_removed:
+                        continue
+                    if did in _fb_mutated:
+                        result.append(_fb_mutated[did])
+                    else:
+                        result.append(d)
+                fresh_ids = {str(d.get("id") or "") for d in fresh}
+                for new_dir in _fb_created:
+                    if str(new_dir.get("id") or "") not in fresh_ids:
+                        result.append(new_dir)
+                # Enforce the 20-tombstone cap on "rejected" entries so the
+                # fallback path stays consistent with the HTTP reject path
+                # (admin_agent_ops.py) and rejected entries never accumulate
+                # unboundedly via repeated fallback writes.
+                rejected_entries = [
+                    d for d in result if d.get("status") == "rejected"
+                ]
+                if len(rejected_entries) > 20:
+                    non_rejected = [
+                        d for d in result if d.get("status") != "rejected"
+                    ]
+                    result = non_rejected + rejected_entries[-20:]
+                return result
+
+            await with_directions_locked(session, task.project_id, _apply_fb_delta)
 
         # Reconcile problem-model gaps for any create/re-ground that carried a
         # gap_id, in the same locked transaction as the directions write (the

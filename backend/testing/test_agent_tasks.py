@@ -640,6 +640,106 @@ async def test_list_tasks_includes_transitive_descendants(
 
 
 @pytest.mark.asyncio
+async def test_get_task_includes_parent_task_id(client: AsyncClient, db_session):
+    """Single-task GET returns parent_task_id: populated for a child, null for root."""
+    project, calling_task = await _make_project_and_task(db_session, name="ParentId GET")
+    root = await _make_strategic_task(db_session, project, title="Root strategic")
+    child = await _make_child_task(db_session, project, root, title="Child task")
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+
+    # Root strategic task: parent_task_id must be null
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{root.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["parent_task_id"] is None
+
+    # Child task: parent_task_id must equal the root's id
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{child.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["parent_task_id"] == str(root.id)
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_descendants_carry_parent_task_id(
+    client: AsyncClient, db_session
+):
+    """List items carry parent_task_id: null for strategist roots, populated for descendants."""
+    project, calling_task = await _make_project_and_task(db_session, name="List ParentId")
+    root = await _make_strategic_task(db_session, project, title="Root strategic")
+    child = await _make_child_task(db_session, project, root, title="Child task")
+    grandchild = await _make_child_task(db_session, project, child, title="Grandchild task")
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    items = {item["id"]: item for item in res.json()["data"]}
+
+    # Root has no parent
+    assert items[str(root.id)]["parent_task_id"] is None
+    # Child points to root
+    assert items[str(child.id)]["parent_task_id"] == str(root.id)
+    # Grandchild points to child
+    assert items[str(grandchild.id)]["parent_task_id"] == str(child.id)
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_depth_bound_does_not_recurse_past_max(
+    client: AsyncClient, db_session
+):
+    """A chain deeper than _ANCESTOR_WALK_MAX_DEPTH (20) is safely truncated."""
+    from app.routers.agent_tasks import _ANCESTOR_WALK_MAX_DEPTH
+
+    project, calling_task = await _make_project_and_task(db_session, name="Depth Bound")
+    root = await _make_strategic_task(db_session, project, title="Root")
+
+    # Build a chain of 25 tasks (exceeds _ANCESTOR_WALK_MAX_DEPTH=20)
+    current = root
+    for i in range(25):
+        current = await _make_child_task(
+            db_session, project, current, title=f"Depth {i + 1}"
+        )
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks?limit=100",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    # At most max_depth + 1 generations (root + max_depth children)
+    assert res.json()["count"] <= _ANCESTOR_WALK_MAX_DEPTH + 1
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_limit_truncates_mixed_tree(client: AsyncClient, db_session):
+    """limit=4 returns exactly 4 items from two strategist roots each with 3 children."""
+    project, calling_task = await _make_project_and_task(db_session, name="Limit Mixed")
+    root1 = await _make_strategic_task(db_session, project, title="Root1")
+    root2 = await _make_strategic_task(db_session, project, title="Root2")
+    for i in range(3):
+        await _make_child_task(db_session, project, root1, title=f"R1-child-{i}")
+        await _make_child_task(db_session, project, root2, title=f"R2-child-{i}")
+
+    token = create_agent_token(str(calling_task.id), "agent-vm-tasks")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks?limit=4",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["count"] == 4
+    assert len(body["data"]) == 4
+
+
+@pytest.mark.asyncio
 async def test_list_tasks_descendants_do_not_leak_cross_project(
     client: AsyncClient, db_session
 ):

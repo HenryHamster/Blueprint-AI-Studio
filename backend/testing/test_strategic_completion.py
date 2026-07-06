@@ -11456,6 +11456,38 @@ class TestChallengeRejectsPortfolioOp:
             rec, "create_direction", text="Stand up a local-GPU runner lane"
         ) == (False, "")
 
+    def test_rejected_activate_direction_blocks(self):
+        rec = self._rec(
+            [{"op": "activate_direction", "direction_id": "d-5", "verdict": "rejected"}]
+        )
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        )
+        assert blocked is True
+        assert isinstance(why, str)
+
+    def test_approved_activate_direction_does_not_block(self):
+        rec = self._rec(
+            [{"op": "activate_direction", "direction_id": "d-5", "verdict": "approved"}]
+        )
+        assert challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        ) == (False, "")
+
+    def test_absent_verdict_for_activate_direction_blocks(self):
+        # No matching portfolio_operations entry → hard-block op fails closed.
+        rec = self._rec([])
+        blocked, why = challenge_rejects_portfolio_op(
+            rec, "activate_direction", direction_id="d-5"
+        )
+        assert blocked is True
+
+    def test_activate_alias_canonicalizes(self):
+        from app.strategic_completion import _canonical_portfolio_op
+
+        assert _canonical_portfolio_op("activate") == "activate_direction"
+        assert _canonical_portfolio_op("activate_direction") == "activate_direction"
+
 
 class TestStrategicChallengeSummary:
     def test_non_dict_returns_none(self):
@@ -18626,4 +18658,273 @@ async def test_unparseable_strategic_failure_counter_is_atomic(db_session, mocke
     )
     assert vision.get("_strategic_failures_at") is not None, (
         "_strategic_failures_at must be stamped after unparseable failure"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_activate_direction_applied(db_session, mocker):
+    """Fallback must transition a paused direction to active via activate_direction op."""
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="FallbackActivate",
+        user_id="u-fallback-activate",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-paused",
+                "text": "Paused direction",
+                "status": "paused",
+                "auto_paused": True,
+                "paused_reason": "churn",
+                "paused_at": "2026-01-01T00:00:00",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "activate_direction",
+                    "direction_id": "d-paused",
+                    "rationale": "ready to proceed",
+                }
+            ],
+        }
+    )
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    activated = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-paused"), None
+    )
+    assert activated is not None, "d-paused must still be present after activate_direction"
+    assert activated["status"] == "active", (
+        f"activate_direction must set status=active; got {activated.get('status')!r}"
+    )
+    assert not activated.get("auto_paused"), (
+        "activate_direction must clear auto_paused flag"
+    )
+    await db_session.refresh(task)
+    updated_ids = (task.context or {}).get("_strategic_updated_ids", [])
+    assert "d-paused" in updated_ids, (
+        f"task context must record d-paused in _strategic_updated_ids; got {updated_ids}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_reject_direction_no_mid_loop_write(db_session, mocker):
+    """reject_direction must use the single end-of-loop with_directions_locked call,
+    not a separate mid-loop write — one call total, direction properly tombstoned."""
+    import app.task_locking as _task_locking_mod
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="FallbackRejectSingleWrite",
+        user_id="u-reject-single-write",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-reject",
+                "text": "Reject me",
+                "status": "proposed",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "reject_direction",
+                    "direction_id": "d-reject",
+                    "rationale": "not worthwhile",
+                }
+            ],
+        }
+    )
+
+    wdl_call_count = 0
+    real_wdl = _task_locking_mod.with_directions_locked
+
+    async def counting_wdl(session, project_id, mutate_fn, **kwargs):
+        nonlocal wdl_call_count
+        wdl_call_count += 1
+        return await real_wdl(session, project_id, mutate_fn, **kwargs)
+
+    mocker.patch.object(_task_locking_mod, "with_directions_locked", new=counting_wdl)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    assert wdl_call_count == 1, (
+        "reject_direction must not make a mid-loop with_directions_locked call; "
+        f"expected 1 total call, got {wdl_call_count}"
+    )
+    await db_session.refresh(project)
+    tombstone = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-reject"), None
+    )
+    assert tombstone is not None, "tombstone must remain in directions after reject"
+    assert tombstone["status"] == "rejected", (
+        f"rejected direction must have status=rejected; got {tombstone.get('status')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_fallback_directions_write_preserves_concurrent_add(db_session, mocker):
+    """Delta-based write must not overwrite a direction added concurrently during the
+    fallback; the concurrent direction must survive the locked write."""
+    import app.task_locking as _task_locking_mod
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    concurrent_dir = {
+        "id": "d-concurrent",
+        "text": "Added concurrently",
+        "status": "active",
+        "priority": "medium",
+        "paths": [],
+        "added_at": "2026-01-02T00:00:00",
+        "research_history": [],
+        "notes": [],
+    }
+
+    project = Project(
+        name="FallbackDeltaPreserve",
+        user_id="u-delta-preserve",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-retire",
+                "text": "To be retired",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+        ],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    import json
+
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-retire",
+                    "rationale": "done",
+                }
+            ],
+        }
+    )
+
+    real_wdl = _task_locking_mod.with_directions_locked
+
+    async def wdl_inject_concurrent(session, project_id, mutate_fn, **kwargs):
+        # Simulate a concurrent writer inserting d-concurrent into the DB
+        # before the delta callback fires.  The delta callback must preserve it.
+        def injecting_fn(fresh: list) -> list:
+            return mutate_fn(fresh + [concurrent_dir])
+
+        return await real_wdl(session, project_id, injecting_fn, **kwargs)
+
+    mocker.patch.object(_task_locking_mod, "with_directions_locked", new=wdl_inject_concurrent)
+
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    dir_ids = {d.get("id") for d in (project.directions or [])}
+    assert "d-concurrent" in dir_ids, (
+        "Delta write must preserve a concurrently-added direction; "
+        f"got direction ids: {sorted(dir_ids)}"
+    )
+    retired = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-retire"), None
+    )
+    assert retired is not None and retired["status"] == "retired", (
+        f"d-retire must be retired after fallback retire_direction; got {retired}"
     )
