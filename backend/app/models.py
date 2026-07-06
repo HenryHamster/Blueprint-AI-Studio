@@ -562,7 +562,7 @@ class Project(SQLModel, table=True):
     is_self_repo: bool = Field(default=False)
     # Archived flag: durable, reversible "set aside" state so a project can be
     # hidden without deletion. Server default false backfills existing rows.
-    archived: bool = Field(default=False)
+    archived: bool = Field(default=False, index=True)
     # Build configuration: onboarding seeds repo-derived defaults here, and
     # admin PATCH / re-detect preserves operator-owned branch/cleanup overrides.
     build_config: Dict[str, Any] | None = Field(
@@ -1537,6 +1537,16 @@ class Task(SQLModel, table=True):
         # test_model_indexes_covered_by_migrations.
         Index("ix_task_created_at", "created_at"),
         Index("ix_task_started_at", "started_at"),
+        # Partial index on vm_stopped_at for anomaly_detection cost-window queries
+        # that filter vm_stopped_at IS NOT NULL and order by vm_stopped_at.
+        # Without this, the query full-scans all task history linearly.
+        # Postgres-only predicate; alembic 0381 creates it CONCURRENTLY.
+        Index(
+            "ix_task_vm_stopped_at",
+            "vm_stopped_at",
+            postgresql_where=text("vm_stopped_at IS NOT NULL"),
+            sqlite_where=text("vm_stopped_at IS NOT NULL"),
+        ),
     )
 
     # Optimistic concurrency: ``version_id_col`` mapper arg was dropped in

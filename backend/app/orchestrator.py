@@ -257,19 +257,17 @@ async def _reconcile_active_per_account(session: AsyncSession) -> Dict[str, int]
     dispatch cycle (see reference_load_only_event_listeners.md /
     reference_load_only_lazy_load_trap.md).
     """
-    active_per_account: Dict[str, int] = {}
     rows = (
         await session.execute(
-            select(Task.id, Task.llm_account_id).where(
+            select(Task.llm_account_id, _func.count(Task.id))
+            .where(
                 Task.status.in_([TaskStatus.PROVISIONING, TaskStatus.IN_PROGRESS]),
+                Task.llm_account_id.is_not(None),
             )
+            .group_by(Task.llm_account_id)
         )
     ).all()
-    for row in rows:
-        acct_id = row[1]
-        if acct_id:
-            active_per_account[acct_id] = active_per_account.get(acct_id, 0) + 1
-    return active_per_account
+    return {row[0]: row[1] for row in rows}
 
 
 async def _lock_task_for_mutation(
