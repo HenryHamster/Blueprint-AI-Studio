@@ -6870,7 +6870,7 @@ async def _spawn_strategic_review(
                     if _resolved is not None:
                         _gh_token, _gh_owner, _gh_repo = _resolved
                         _bootstrap_sha = await _github.get_branch_sha(
-                            _gh_token, _gh_owner, _gh_repo, _integration_branch
+                            _gh_token, _gh_owner, _gh_repo, _integration_branch, live=True
                         )
                 except Exception:
                     logger.exception(

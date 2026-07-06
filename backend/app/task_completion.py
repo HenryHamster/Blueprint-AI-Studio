@@ -1298,7 +1298,7 @@ async def _ensure_branch(
             gh_token, owner, repo = await get_github_token_for_task(
                 parent_id_local, session, force_refresh=(_attempt > 0)
             )
-            sha = await get_branch_sha(gh_token, owner, repo, source_branch)
+            sha = await get_branch_sha(gh_token, owner, repo, source_branch, live=True)
             await create_branch(gh_token, owner, repo, branch_name, sha)
             logger.info(f"[{label}] Created branch {branch_name} from {source_branch}")
             branch_created = True

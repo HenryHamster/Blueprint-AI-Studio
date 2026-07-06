@@ -931,8 +931,7 @@ async def _nudge_sibling_rollup_prs(
             repo,
             target_branch,
             project_id=project_id_str,
-            allow_cached=True,
-        )
+        )  # behind-detection base tip — cached-by-default (staleness-tolerant)
     except Exception as tip_exc:
         # Tip fetch is an optimization; per-sibling checks degrade gracefully
         # without it (pr_is_not_behind_for fetches per-call).
@@ -2280,7 +2279,7 @@ async def _check_and_trigger_rollup(
                 # already landed on the target branch and we can complete.
                 staging_branch_missing = False
                 try:
-                    await get_branch_sha(gh_token, owner, repo, staging_branch)
+                    await get_branch_sha(gh_token, owner, repo, staging_branch, live=True)
                 except HTTPException as http_err:
                     if http_err.status_code == 404:
                         # Use `parent_id_local` (captured pre-release) instead

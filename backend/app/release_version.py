@@ -1447,7 +1447,7 @@ async def _resolve_integration_head_sha(
             return None
         token, owner, repo = resolved
         branch = get_project_integration_branch(project)
-        return await get_branch_sha(token, owner, repo, branch)
+        return await get_branch_sha(token, owner, repo, branch, live=True)
     except Exception as exc:  # noqa: BLE001 — SHA resolution is best-effort
         logger.warning(
             "[RELEASE_VERSION] abandon: could not resolve integration HEAD for "
