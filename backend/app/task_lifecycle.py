@@ -3440,9 +3440,13 @@ async def _process_post_commit(
                                 _pre_rollup_mig_guard: (
                                     tuple[bool, str | None] | None
                                 ) = None
+                                _pre_rollup_size_cap: (
+                                    tuple[str, str | None] | None
+                                ) = None
                                 if _orig_peek_loop.get("ci_passed"):
                                     _peek_pr_num = _orig_peek_loop.get("pr_number")
                                     _peek_base = _orig_peek_loop.get("base_branch", "")
+                                    _peek_branch = _orig_peek_loop.get("branch", "")
                                     try:
                                         (
                                             _pre_rollup_gh,
@@ -3473,6 +3477,31 @@ async def _process_post_commit(
                                                     else None
                                                 ),
                                             )
+                                        # Hoist size-cap preflight before the lock for
+                                        # direct (non-rollup) task PRs, mirroring the
+                                        # migration guard pattern above.  Rollup parents
+                                        # have rollup_pr_number in context — skip there.
+                                        if (
+                                            _peek_pr_num
+                                            and _peek_branch
+                                            and not (_orig_peek or {}).get(
+                                                "rollup_pr_number"
+                                            )
+                                        ):
+                                            from app.rollup_size_preflight import (
+                                                preflight_rollup_size_caps as _sc_pre,
+                                            )
+
+                                            _pre_rollup_size_cap = await _sc_pre(
+                                                _pre_rollup_gh,
+                                                _pre_rollup_own,
+                                                _pre_rollup_rep,
+                                                _peek_pr_num,
+                                                _peek_branch,
+                                                project_id=str(task.project_id)
+                                                if task.project_id
+                                                else None,
+                                            )
                                     except Exception as _pre_exc:
                                         logger.debug(
                                             "[REVIEW PIPELINE] Pre-lock token/guard "
@@ -3483,6 +3512,7 @@ async def _process_post_commit(
                                         )
                                         _pre_rollup_gh = None
                                         _pre_rollup_mig_guard = None
+                                        _pre_rollup_size_cap = None
 
                                 # Phase A1: skip_locked + bounded retry. If the parent
                                 # task row is held by a peer, defer the handoff —
@@ -3569,6 +3599,7 @@ async def _process_post_commit(
                                                 session,
                                                 source="review_approval",
                                                 precomputed_migration_guard=_pre_rollup_mig_guard,
+                                                precomputed_size_cap=_pre_rollup_size_cap,
                                             )
                                         except Exception as _gate_e:
                                             logger.error(

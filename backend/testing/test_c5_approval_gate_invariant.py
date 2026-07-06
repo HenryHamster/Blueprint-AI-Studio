@@ -24,6 +24,9 @@ import uuid
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import sessionmaker
 
 from app import shared_state
 from app.models import Project, Task, TaskStatus
@@ -32,6 +35,27 @@ from app.models import Project, Task, TaskStatus
 # ---------------------------------------------------------------------------
 # Fixtures / helpers
 # ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _patch_dedicated_sessions_to_test_engine(mocker, db_session):
+    """Patch AsyncSessionLocal to use the shared test engine.
+
+    ``_attempt_merge_with_retry_and_escalation`` opens dedicated
+    ``AsyncSessionLocal`` scopes for per-task accounting.  In the test
+    environment the production engine is unavailable; this fixture redirects
+    those scopes to the same SQLite/Postgres engine that ``db_session`` uses,
+    preventing cross-engine connection failures and ensuring the post-merge
+    state is visible within the same transaction context.
+    """
+    dedicated_session_local = sessionmaker(
+        bind=db_session.bind,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    mocker.patch("app.database.AsyncSessionLocal", dedicated_session_local)
 
 
 @pytest.fixture(autouse=True)
@@ -45,6 +69,22 @@ def _default_no_migration_pr(mocker):
     guard to ``ok`` so the gate behavior under test is what is exercised.
     """
     mocker.patch("app.github.get_pr_files", AsyncMock(return_value=[{"filename": "README.md"}]))
+
+
+@pytest.fixture(autouse=True)
+def _default_size_cap_ok(mocker):
+    """Default size-cap preflight to 'ok' so gate tests are unaffected.
+
+    ``_attempt_merge_with_retry_and_escalation`` now runs
+    ``preflight_rollup_size_caps`` for direct task PRs. These gate tests do
+    not mock the GitHub calls that preflight makes; without this default the
+    unmocked call issues a real network request and returns 'defer', causing
+    the merge to return False and failing 'assert result is True'.
+    """
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("ok", None)),
+    )
 
 
 @pytest.fixture
@@ -212,7 +252,10 @@ async def test_merge_primitive_merges_normally_when_no_gate(
 
     assert result is True
     merge_mock.assert_awaited()
-    await db_session.refresh(task)
+    # _attempt_merge_with_retry_and_escalation mutates task in place; the caller
+    # commits.  Check the in-memory state directly — a DB refresh here would
+    # reload EVALUATING (the function sets COMPLETED but the caller has not yet
+    # committed), making the assertion Postgres-only (SQLite loads uncached rows).
     assert task.status == TaskStatus.COMPLETED
 
 

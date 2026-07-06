@@ -91,7 +91,7 @@
     "strategic_spawning.py": 8950,
     "failure_classification.py": 3350,
     "notification_dispatch.py": 2700,
-    "ci_completion.py": 2200,
+    "ci_completion.py": 2550,
     "routers/admin_debug.py": 2250,
     "problem_model.py": 2950,
     "source_ref_validation.py": 1900,

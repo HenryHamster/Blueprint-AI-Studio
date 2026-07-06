@@ -89,6 +89,7 @@ async def _attempt_merge_with_retry_and_escalation(
     *,
     source: str,
     precomputed_migration_guard: tuple[bool, str | None] | None = None,
+    precomputed_size_cap: tuple[str, str | None] | None = None,
 ) -> bool:
     """Both gates are open — try to merge. Mutates ``task`` in place; caller commits.
 
@@ -287,6 +288,59 @@ async def _attempt_merge_with_retry_and_escalation(
             )[:500]
             session.add(task)
             return False
+
+    # Size-cap preflight for direct (non-rollup) task PRs.  Rollup parents
+    # run this check in rollup_management.py before reaching this path; skip
+    # here to avoid redundant GitHub I/O and a double-bump risk.
+    if ci_pr_number and ci_branch and not (task.context or {}).get("rollup_pr_number"):
+        from app.rollup_size_preflight import preflight_rollup_size_caps
+        from app.task_completion import _reset_review_loop_pr_head_cache
+
+        if precomputed_size_cap is not None:
+            _sc_verdict, _sc_reason = precomputed_size_cap
+        else:
+            _sc_verdict, _sc_reason = await preflight_rollup_size_caps(
+                gh_token,
+                owner,
+                repo,
+                ci_pr_number,
+                ci_branch,
+                project_id=str(task.project_id) if task.project_id else None,
+            )
+        from app.shared_state import runtime_config as _rt_cfg
+
+        _gates_on = _rt_cfg.get("require_approval_gates", True)
+        if _sc_verdict == "hold":
+            if _gates_on:
+                task.requires_approval = True
+            task.latest_status_message = (
+                f"Merge held — size-cap: {_sc_reason}"
+            )[:500]
+            session.add(task)
+            return False
+        if _sc_verdict == "bumped":
+            _sc_loop = _reset_review_loop_pr_head_cache(ci_loop)
+            arm_ci_wait(_sc_loop, pr_number=ci_pr_number, now_iso=_utcnow().isoformat())
+            _sc_loop["ci_passed"] = False
+            task.context = {
+                **(task.context or {}),
+                "_size_cap_bumped": _sc_reason,
+                "review_loop": _sc_loop,
+            }
+            flag_modified(task, "context")
+            task.latest_status_message = (
+                f"Merge deferred — size-cap bumped: {_sc_reason}; awaiting fresh CI"
+            )[:500]
+            session.add(task)
+            return False
+        if _sc_verdict == "defer":
+            logger.info(
+                "[CI] PR #%s size-cap preflight transient error — deferring: %s",
+                ci_pr_number,
+                _sc_reason,
+            )
+            return False
+        # "ok" → fall through to merge
 
     # Round 4 W1: capture a content snapshot BEFORE releasing the lock.
     # ``parent_id_local`` mirrors the snapshot-stale convention from
