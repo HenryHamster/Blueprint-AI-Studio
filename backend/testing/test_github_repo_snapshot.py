@@ -380,19 +380,15 @@ def test_looks_like_file_path_rejects_globs_and_whitespace():
 
 
 @pytest.mark.asyncio
-async def test_get_branch_sha_allow_cached_serves_from_cache(mocker):
-    """allow_cached=True serves the 2nd read from the shared ~60s branch-tip
-    cache — collapses the repeated identical git/ref reads (the #2 quota
-    consumer after token minting)."""
+async def test_get_branch_sha_caches_by_default(mocker):
+    """Cache-by-default: the 2nd read serves from the shared ~60s branch-tip
+    cache — collapses the repeated identical git/ref reads that dominate quota
+    burn (no per-call opt-in needed anymore)."""
     from app.github import get_branch_sha
 
     calls = _patch_requests(mocker, [_ref_response()])
-    sha1 = await get_branch_sha(
-        "ghs_test", "acme", "widget", "automain", allow_cached=True
-    )
-    sha2 = await get_branch_sha(
-        "ghs_test", "acme", "widget", "automain", allow_cached=True
-    )
+    sha1 = await get_branch_sha("ghs_test", "acme", "widget", "automain")
+    sha2 = await get_branch_sha("ghs_test", "acme", "widget", "automain")
     assert sha1 == sha2 == COMMIT_SHA
     ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
     assert len(ref_calls) == 1
@@ -479,15 +475,16 @@ async def test_list_dir_children_unavailable_snapshot_returns_none(mocker):
 
 
 @pytest.mark.asyncio
-async def test_get_branch_sha_default_observes_live_tip(mocker):
-    """Default (allow_cached=False) re-fetches every time and never populates
-    the cache — SHA-critical callers (promotion/merge verification, ref
-    updates) must observe the live tip, never a stale cached SHA."""
+async def test_get_branch_sha_live_observes_live_tip(mocker):
+    """live=True re-fetches every time and never populates the cache — SHA-
+    critical callers (promotion/merge verification, ref/branch anchors) must
+    observe the live tip, never a stale cached SHA, and must not pollute the
+    shared cache with a value other reads would then treat as the tip."""
     from app.github import get_branch_sha
 
     calls = _patch_requests(mocker, [_ref_response()])
-    await get_branch_sha("ghs_test", "acme", "widget", "automain")
-    await get_branch_sha("ghs_test", "acme", "widget", "automain")
+    await get_branch_sha("ghs_test", "acme", "widget", "automain", live=True)
+    await get_branch_sha("ghs_test", "acme", "widget", "automain", live=True)
     ref_calls = [c for c in calls if "/git/ref/heads/automain" in c[1]]
     assert len(ref_calls) == 2
     assert ("acme", "widget", "automain") not in snapshot._branch_sha_cache

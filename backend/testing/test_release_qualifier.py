@@ -5969,7 +5969,7 @@ def _branch_sha_mock(
     HEAD (the real merge commit, not the candidate).
     """
 
-    async def _impl(token, owner, repo, branch):
+    async def _impl(token, owner, repo, branch, project_id=None, *, live=False):
         if branch == "automain":
             return automain
         if branch == "main":
@@ -14202,7 +14202,7 @@ async def test_promote_end_to_end_over_custom_branch_pair(db_session, mocker):
     )
     merge_sha = "release" * 5 + "00000"
 
-    async def _branch_sha(token, owner, repo, branch):
+    async def _branch_sha(token, owner, repo, branch, **kwargs):
         # promote() re-resolves the promotion target's HEAD after the merge —
         # it MUST ask for 'release', never the hardcoded 'main'.
         assert branch == "release", f"unexpected branch {branch!r}"
@@ -14591,7 +14591,7 @@ async def test_promote_merged_but_main_sha_unresolvable_degrades_to_candidate(
     _project, version = await _make_project_and_version(db_session)
     candidate = "fallback" * 5
 
-    async def _sha(token, owner, repo, branch):
+    async def _sha(token, owner, repo, branch, **kwargs):
         if branch == "main":
             # Post-merge resolution fails (e.g. transient GitHub 502).
             raise HTTPException(status_code=502, detail="GitHub 502")

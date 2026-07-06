@@ -1690,7 +1690,7 @@ async def run_qualification(
     integration_branch, promotion_target = _lts_branch_names(project)
     try:
         candidate_sha = await github.get_branch_sha(
-            token, owner, repo, integration_branch
+            token, owner, repo, integration_branch, live=True
         )
     except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
         logger.warning(
@@ -2768,7 +2768,7 @@ async def _guard_ci_unresolved_promotion_in_flight(
         promoted_sha: str | None = None
         try:
             promoted_sha = await github.get_branch_sha(
-                token, owner, repo, promotion_target
+                token, owner, repo, promotion_target, live=True
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning(
@@ -5205,7 +5205,7 @@ async def force_promote_current_version(
     if not candidate_sha:
         try:
             candidate_sha = await github.get_branch_sha(
-                token, owner, repo, integration_branch
+                token, owner, repo, integration_branch, live=True
             )
         except Exception as exc:  # noqa: BLE001 — a missing branch / API error is recoverable
             return {"status": "sha_error", "detail": f"{type(exc).__name__}: {exc}"[:300]}
