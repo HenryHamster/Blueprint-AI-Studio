@@ -469,6 +469,7 @@ github_cache_hits: Dict[str, int] = {
     "scan_pr": 0,
     "pr_merge_negative": 0,
     "bucket_short_circuit": 0,
+    "read_singleflight": 0,
 }
 
 # NOTE: ``last_github_success`` is a *rebindable* scalar written/read through

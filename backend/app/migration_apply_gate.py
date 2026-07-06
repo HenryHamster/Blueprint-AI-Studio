@@ -701,32 +701,54 @@ async def _fetch_candidate_sources(
     candidate_ref: str,
     project_id: str | None,
 ) -> dict[str, str] | None:
-    """Fetch the candidate's Alembic migration sources at *candidate_ref*.
+    """Read the candidate's Alembic migration sources at *candidate_ref*.
 
-    Returns ``None`` (=> ``defer``) on ANY fetch failure or an empty/undecodable
-    file — a fetch error is never "no migrations". ``list_versions_at_ref`` raises
-    on a non-404 listing failure (propagated to the caller's ``defer``);
-    ``get_file_text_at_ref`` returns ``None`` on failure, which we treat as defer.
+    Sources come from ONE repo tarball (the same archive endpoint the
+    reference-schema builder uses, :func:`_download_candidate_repo_archive`)
+    instead of a contents-API call per migration file. The old per-file loop
+    issued ``1 + N`` (~215) GitHub contents requests on every finalize attempt —
+    the twin of the identity-gate fetch storm — which drained the install
+    token's rate-limit budget and wedged qualification into a
+    ``migration_apply_check_unavailable`` defer loop.
+
+    Returns ``None`` (=> ``defer``) on ANY download/unpack/read failure or an
+    empty result — a fetch error is never "no migrations".
     """
-    filenames = await github.list_versions_at_ref(
-        gh_token, owner, repo, candidate_ref, project_id=project_id
+    archive = await _download_candidate_repo_archive(
+        gh_token, owner, repo, candidate_ref, project_id
     )
-    sources: dict[str, str] = {}
-    for filename in filenames:
-        if not _is_migration_source(filename):
-            continue
-        text = await github.get_file_text_at_ref(
-            f"{_ALEMBIC_VERSIONS_DIR}/{filename}",
-            token=gh_token,
-            owner=owner,
-            repo=repo,
-            ref=candidate_ref,
-            project_id=project_id,
-        )
-        if not text:
-            return None
-        sources[filename] = text
-    return sources or None
+    if not archive:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            with tarfile.open(fileobj=io.BytesIO(archive), mode="r:*") as tar:
+                tar.extractall(tmp)
+            # GitHub archives always unpack to a single top-level repo dir.
+            extracted_roots = [
+                os.path.join(tmp, name)
+                for name in os.listdir(tmp)
+                if os.path.isdir(os.path.join(tmp, name))
+            ]
+            if not extracted_roots:
+                return None
+            versions_dir = os.path.join(extracted_roots[0], _ALEMBIC_VERSIONS_DIR)
+            if not os.path.isdir(versions_dir):
+                return None
+            sources: dict[str, str] = {}
+            for filename in sorted(os.listdir(versions_dir)):
+                if not _is_migration_source(filename):
+                    continue
+                full_path = os.path.join(versions_dir, filename)
+                if not os.path.isfile(full_path):
+                    continue
+                with open(full_path, encoding="utf-8") as fh:
+                    text = fh.read()
+                if not text:
+                    return None
+                sources[filename] = text
+            return sources or None
+    except Exception:  # noqa: BLE001 — unpack/read failure HOLDS (=> defer)
+        return None
 
 
 async def run_migration_apply_gate(
