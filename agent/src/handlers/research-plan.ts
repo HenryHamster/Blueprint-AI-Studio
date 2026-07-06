@@ -53,8 +53,12 @@ import { resolveMigrationLayout } from './specialized.js';
 import { setPromptSizeTelemetry } from '../telemetry.js';
 
 export const PR_INELIGIBLE_TASK_TYPES = [
-  'research', 'investigate', 'audit', 'memo',
-  'web_research', 'design', 'compute_experiment',
+  'compute_experiment', 'debug', 'design', 'design_doc_update',
+  'investigate', 'memo', 'panel_review', 'perf', 'plan',
+  'release_audit', 'release_audit_challenge', 'release_merge_grade',
+  'repo_bootstrap', 'research', 'review', 'security_audit',
+  'self_audit', 'smoketest', 'strategic_review', 'verify_tests',
+  'web_research',
 ] as const;
 export {
   formatCochangeHints,

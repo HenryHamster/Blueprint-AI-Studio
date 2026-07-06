@@ -26478,3 +26478,140 @@ async def test_direction_created_during_gated_op_survives_commit(
     assert "d-preexisting" in ids, f"pre-existing direction lost; got ids={ids}"
     assert "d-concurrent" in ids, f"concurrent direction overwritten; got ids={ids}"
     assert new_dir_id in ids, f"new direction missing; got ids={ids}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# pending_confirm op — dedup + cap
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestStrategicPendingConfirmDedup:
+    """pending_confirm op: same-id idempotency and size-cap enforcement."""
+
+    async def _setup(self, db_session):
+        from app.auth import create_agent_token
+        from app import strategic_cycle
+        from app.models import Task, TaskStatus
+
+        project = Project(
+            name="PC Dedup Test",
+            user_id=TEST_USER_ID,
+            vision={"purpose": "test", "revision": 1},
+            directions=[],
+        )
+        db_session.add(project)
+        await db_session.commit()
+        await db_session.refresh(project)
+
+        cycle = await strategic_cycle.create(db_session, project_id=project.id)
+        task = Task(
+            project_id=project.id,
+            status=TaskStatus.IN_PROGRESS,
+            vm_instance_id="vm-pc-dedup-test",
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+            ],
+            context={"strategic_cycle_id": cycle.id},
+            strategic_cycle_id=cycle.id,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+
+        token = create_agent_token(str(task.id), "vm-pc-dedup-test", task_type="strategic_review")
+        return project, task, token
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_same_id_is_idempotent(self, db_session):
+        """Submitting pending_confirm twice with the same caller-supplied id returns ok
+        both times but stores only one item in pending_user_confirmation."""
+        project, task, token = await self._setup(db_session)
+        headers = {"x-agent-token": token}
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            first = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-fixed-id-001",
+                        "type": "credentials_needed",
+                        "proposal": "Need API key.",
+                    },
+                },
+            )
+            assert first.status_code == 200, first.text
+            first_body = first.json()
+            assert first_body["status"] == "ok"
+            assert first_body["id"] == "p-fixed-id-001"
+
+            second = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-fixed-id-001",
+                        "type": "credentials_needed",
+                        "proposal": "Need API key (retry).",
+                    },
+                },
+            )
+        assert second.status_code == 200, second.text
+        second_body = second.json()
+        assert second_body["status"] == "ok"
+        assert second_body["id"] == "p-fixed-id-001"
+
+        await db_session.refresh(project)
+        pending = (project.problem_model or {}).get("pending_user_confirmation", [])
+        ids = [p["id"] for p in pending]
+        assert ids.count("p-fixed-id-001") == 1, f"expected exactly 1 entry, got: {ids}"
+
+    @pytest.mark.asyncio
+    async def test_pending_confirm_cap_returns_429(self, db_session):
+        """When pending_user_confirmation already has PENDING_USER_CONFIRMATION_MAX items,
+        a new op with a fresh id returns 429."""
+        from app.problem_model import PENDING_USER_CONFIRMATION_MAX
+        from sqlalchemy.orm.attributes import flag_modified
+
+        project, task, token = await self._setup(db_session)
+
+        # Pre-seed the project with the maximum number of pending confirmations.
+        existing = [
+            {
+                "id": f"p-seed-{i:03d}",
+                "type": "credentials_needed",
+                "proposal": f"Seed item {i}",
+                "rationale": "",
+                "created_at": "2026-01-01T00:00:00",
+            }
+            for i in range(PENDING_USER_CONFIRMATION_MAX)
+        ]
+        project.problem_model = {"pending_user_confirmation": existing}
+        flag_modified(project, "problem_model")
+        db_session.add(project)
+        await db_session.commit()
+
+        headers = {"x-agent-token": token}
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as ac:
+            resp = await ac.post(
+                "/api/agent/strategic",
+                headers=headers,
+                json={
+                    "task_id": str(task.id),
+                    "op": "pending_confirm",
+                    "data": {
+                        "id": "p-new-over-cap",
+                        "type": "access_needed",
+                        "proposal": "Need repo access.",
+                    },
+                },
+            )
+        assert resp.status_code == 429, resp.text
+        assert "cap" in resp.text.lower() or str(PENDING_USER_CONFIRMATION_MAX) in resp.text

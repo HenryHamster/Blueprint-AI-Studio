@@ -3617,6 +3617,7 @@ async def strategic_operation(
         from pydantic import ValidationError as _PcValidationError
 
         from app.problem_model import (
+            PENDING_USER_CONFIRMATION_MAX,
             PendingConfirmation,
             parse_problem_model,
         )
@@ -3638,6 +3639,25 @@ async def strategic_operation(
                 status_code=400, detail=f"Invalid pending_confirmation: {ve}"
             ) from None
         current_model = parse_problem_model(project.problem_model)
+        # Idempotent: same caller-supplied id on a retry is a no-op.
+        if any(
+            p.id == pending.id
+            for p in current_model.pending_user_confirmation
+        ):
+            ctx = task.context or {}
+            task.context = {**ctx, "_strategic_api_called": True}
+            flag_modified(task, "context")
+            session.add(task)
+            await session.commit()
+            return _resp({"status": "ok", "op": "pending_confirm", "id": pending.id})
+        if len(current_model.pending_user_confirmation) >= PENDING_USER_CONFIRMATION_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    f"pending_user_confirmation is at the cap "
+                    f"({PENDING_USER_CONFIRMATION_MAX}); resolve existing items before adding more"
+                ),
+            )
         current_model.pending_user_confirmation.append(pending)
         project.problem_model = current_model.model_dump()
         flag_modified(project, "problem_model")

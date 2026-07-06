@@ -7665,6 +7665,34 @@ async def test_scope_breakdown_skips_ineligible_task_types(db_session: AsyncSess
     assert tb["compute_experiment"]["created"] == 1
 
 
+def test_pr_ineligible_types_match_registry_read_only_set():
+    """PR_INELIGIBLE_TASK_TYPES must equal READ_ONLY_TASK_TYPES from the registry.
+
+    This test enforces that the conversion-rate denominator exclusion list stays
+    in sync with the canonical task-capability registry rather than drifting as a
+    hand-maintained literal.  Adding a new read_only capability to the registry
+    automatically extends PR_INELIGIBLE_TASK_TYPES; removing one shrinks it.
+    No manual edit to direction_outcomes.py is ever needed.
+    """
+    from app.direction_outcomes import PR_INELIGIBLE_TASK_TYPES
+    from app.task_capabilities import READ_ONLY_TASK_TYPES
+
+    assert PR_INELIGIBLE_TASK_TYPES == READ_ONLY_TASK_TYPES, (
+        f"PR_INELIGIBLE_TASK_TYPES diverged from READ_ONLY_TASK_TYPES.\n"
+        f"  In registry but missing from PR_INELIGIBLE: {sorted(READ_ONLY_TASK_TYPES - PR_INELIGIBLE_TASK_TYPES)}\n"
+        f"  In PR_INELIGIBLE but not in registry:       {sorted(PR_INELIGIBLE_TASK_TYPES - READ_ONLY_TASK_TYPES)}"
+    )
+    # Spot-check a few known read_only types to guard against an accidentally empty set.
+    assert "research" in PR_INELIGIBLE_TASK_TYPES
+    assert "memo" in PR_INELIGIBLE_TASK_TYPES
+    assert "web_research" in PR_INELIGIBLE_TASK_TYPES
+    assert "verify_tests" in PR_INELIGIBLE_TASK_TYPES
+    assert "release_merge_grade" in PR_INELIGIBLE_TASK_TYPES
+    assert "repo_bootstrap" in PR_INELIGIBLE_TASK_TYPES
+    # "audit" was a stale entry that was never registered — must not appear.
+    assert "audit" not in PR_INELIGIBLE_TASK_TYPES
+
+
 # ---------------------------------------------------------------------------
 # reachable_prs_merged tests
 # ---------------------------------------------------------------------------

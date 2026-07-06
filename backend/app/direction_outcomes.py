@@ -50,25 +50,16 @@ from app.models import (
     TaskStatus,
     get_task_cost_by_provider_model,
 )
-from app.task_capabilities import PRODUCT_TASK_TYPES, WRITE_TASK_TYPES
+from app.task_capabilities import PRODUCT_TASK_TYPES, READ_ONLY_TASK_TYPES, WRITE_TASK_TYPES
 from app.task_locking import with_design_doc_locked, with_directions_locked
 
-# Task types that never open a PR. Used as the shared source of truth for the
-# conversion-rate denominator across backend surfaces (digest_direction_progress,
-# pipeline_health) and the agent-side stats renderer.  Ineligible tasks are
-# excluded from per-scope and per-direction conversion denominators so that
+# Task types that never open a PR. Derived directly from the registry so that
+# newly-registered read_only types are automatically excluded from the
+# conversion-rate denominator without requiring a manual edit here.  Used as
+# the shared source of truth across backend surfaces (digest_direction_progress,
+# pipeline_health) and the agent-side stats renderer so that
 # knowledge/compute outputs don't deflate the merged-PR rate.
-PR_INELIGIBLE_TASK_TYPES = frozenset(
-    {
-        "research",
-        "investigate",
-        "audit",
-        "memo",
-        "web_research",
-        "design",
-        "compute_experiment",
-    }
-)
+PR_INELIGIBLE_TASK_TYPES: frozenset[str] = READ_ONLY_TASK_TYPES
 
 
 def _is_cascade_cancelled(task: Task) -> bool:

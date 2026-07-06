@@ -469,6 +469,18 @@ GAP_APPEND_ONLY_GC_FLOOR = 12
 """Per-active-gap floor kept by the byte GC for ``history`` / ``past_moves``."""
 
 
+PENDING_USER_CONFIRMATION_MAX = 25
+"""Hard cap on the durable ``pending_user_confirmation`` list.
+
+The ``pending_confirm`` strategic op appends to this list; without a cap a
+retried op or a runaway strategist can grow the list without bound and bloat
+the ``problem_model`` JSONB column. 25 is generous for real use (the list
+represents external blockers waiting for human attention, not a log), and
+mirrors the finite-but-generous caps on other append-only collections. Active
+confirmations are never evicted here — the list is capped at the WRITE side
+by the op endpoint, not by GC."""
+
+
 ARCHIVED_GAPS_DURABLE_MAX = 200
 """Hard cap on the durable ``archived_gaps`` collection — the only durable
 collection that grows without limit forever.
