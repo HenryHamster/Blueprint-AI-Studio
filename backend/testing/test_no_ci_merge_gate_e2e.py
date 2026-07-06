@@ -2995,9 +2995,16 @@ async def test_no_ci_kill_switch_off_bypass_merges_unverified_with_kill_switch_r
 def _orchestrator_source() -> str:
     import inspect
 
-    from app import orchestrator
+    from app import orchestrator, orchestrator_ci_monitor
 
-    return inspect.getsource(orchestrator)
+    # The EVALUATING/CI-waiting monitor sweep (the no-CI verify-tests gate,
+    # deferral-cap escalation, redetect wiring, etc.) was extracted verbatim
+    # from orchestrator_worker into app.orchestrator_ci_monitor. These wiring
+    # assertions scan the combined source of both modules so they keep
+    # covering the CI-gate state machine regardless of which file hosts it.
+    return inspect.getsource(orchestrator) + "\n" + inspect.getsource(
+        orchestrator_ci_monitor
+    )
 
 
 def test_orchestrator_no_ci_gate_verdict_state_wiring():

@@ -2761,7 +2761,7 @@ class TestOrchestratorRunnerRouting:
         await db_session.commit()
 
         with patch(
-            "app.orchestrator.emit_workbench_refetch",
+            "app.orchestrator_runner_dispatch.emit_workbench_refetch",
             new=AsyncMock(),
         ) as emit:
             await orch._deactivate_stale_runners(db_session)

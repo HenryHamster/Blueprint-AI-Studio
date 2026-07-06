@@ -129,6 +129,10 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # E402: re-exports symbols extracted to app.orchestrator_health via deferred mid-module
 # imports (circular-dependency / load-order) — the same intentional pattern as main.py.
 "app/orchestrator.py" = ["BLE001", "E402"]
+# orchestrator_ci_monitor.py is the EVALUATING/CI-waiting monitor sweep lifted
+# verbatim out of orchestrator_worker. Same log-and-continue policy (BLE001):
+# a crash in per-task CI polling must never abort the whole leader cycle.
+"app/orchestrator_ci_monitor.py" = ["BLE001"]
 # routers/agent.py re-exports the GitHub-token cache helpers extracted to
 # app.github_token_resolver via a deferred mid-module import (keeps the 15+
 # `from app.routers.agent import get_github_token_for_task` call sites working).

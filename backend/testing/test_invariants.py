@@ -6988,9 +6988,12 @@ class TestBehindRecoveryUpdateBranchGuard:
             # check). The pre-merge SHA-mismatch check was removed in PR #6188
             # as part of dropping the redundant pre-merge behind path.
             "rollup_management.py",
-            # Guarded call in orchestrator.py inside orchestrator_worker for
-            # the CI polling behind path.
-            "orchestrator.py",
+            # Guarded call in orchestrator_ci_monitor.py inside
+            # _monitor_evaluating_tasks for the CI polling behind path (the
+            # EVALUATING/CI-waiting monitor sweep was extracted verbatim out
+            # of orchestrator_worker; the pr_is_not_behind_for guard moved
+            # with it).
+            "orchestrator_ci_monitor.py",
         }
         guarded_files = {rel for rel, _fn in guarded}
         missing = expected_subset - guarded_files
@@ -7001,7 +7004,8 @@ class TestBehindRecoveryUpdateBranchGuard:
         )
 
         # At least three guarded call sites must be present (1 in
-        # ci_completion + 1 in rollup_management + 1 in orchestrator).
+        # ci_completion + 1 in rollup_management + 1 in
+        # orchestrator_ci_monitor).
         assert len(guarded) >= 3, (
             f"Expected at least 3 guarded update_branch sites, "
             f"detected {len(guarded)}: {guarded}"

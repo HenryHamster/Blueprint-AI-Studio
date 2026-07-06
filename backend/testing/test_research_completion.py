@@ -3630,11 +3630,13 @@ class TestRecomputeLaunchStaleness:
 
     def _patch_ctx(self, mocker, *, verdict):
         mocker.patch(
-            "app.research_completion.resolve_branch_verification_context",
+            "app.research_provenance_validation.resolve_branch_verification_context",
             new=AsyncMock(return_value={}),
         )
         m = AsyncMock(return_value=verdict)
-        mocker.patch("app.research_completion.cited_paths_changed_since", new=m)
+        mocker.patch(
+            "app.research_provenance_validation.cited_paths_changed_since", new=m
+        )
         return m
 
     @_pytest.mark.asyncio
@@ -3733,7 +3735,7 @@ class TestRecomputeLaunchStaleness:
         from app.research_completion import recompute_launch_staleness
 
         mocker.patch(
-            "app.research_completion.resolve_branch_verification_context",
+            "app.research_provenance_validation.resolve_branch_verification_context",
             new=AsyncMock(side_effect=RuntimeError("boom")),
         )
         task = self._task(

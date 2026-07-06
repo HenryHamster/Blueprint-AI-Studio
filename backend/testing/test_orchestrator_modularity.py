@@ -53,6 +53,27 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "cap_pipeline_slots",
         "reserve_slots_for_types",
     ),
+    "app.orchestrator_runner_dispatch": (
+        # Local-runner + compute-experiment dispatch cluster.
+        "RunnerDispatchSnapshot",
+        "_runner_handles_task_type",
+        "_runner_at_capacity",
+        "_load_active_runners_cache",
+        "_try_runner_dispatch",
+        "_task_requires_strategic_local_runner",
+        "_hold_strategic_local_runner_task",
+        "_try_strategic_local_required_runner_path",
+        "_num_or_none",
+        "_select_eligible_runner",
+        "_build_compute_launch_kwargs",
+        "_fail_compute_experiment_task",
+        "_dispatch_compute_experiment_directly",
+        "_deactivate_stale_runners",
+        "_fail_stale_local_runner_holds",
+        "_emit_all_accounts_blocked_stall",
+        "_RUNNER_LIVENESS_SECONDS",
+        "_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS",
+    ),
 }
 
 

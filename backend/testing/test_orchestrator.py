@@ -75,6 +75,93 @@ def test_resolved_red_ci_status_handoff_falls_back_to_check_names():
     assert result["failed_logs"] == "CI checks failed: CI / Backend, CI / Frontend"
 
 
+@pytest.mark.asyncio
+async def test_ci_monitor_extraction_contract(db_session, mocker):
+    """Contract for the EVALUATING/CI-waiting monitor extraction.
+
+    The sweep formerly inlined in ``orchestrator_worker`` now lives in
+    ``app.orchestrator_ci_monitor._monitor_evaluating_tasks``. This test pins
+    the extraction so a future edit cannot silently regress it:
+
+    (1) Every extracted symbol is re-exported from ``app.orchestrator`` with
+        *identical object identity* (so ``from app.orchestrator import X``
+        keeps working for callers and tests), and ``_monitor_evaluating_tasks``
+        is genuinely owned by the new module.
+    (2) ``orchestrator_worker`` delegates to the extracted sweep rather than
+        re-inlining the loop.
+    (3) The extracted sweep actually RUNS against a live session: given an
+        ``EVALUATING`` row armed with ``review_loop.ci_waiting``, it selects
+        the row through the extracted ``_ci_waiting_sql_filter`` prefilter and
+        locks it via ``_lock_task_for_mutation`` — exercising the moved
+        production code end-to-end (not just introspecting it).
+    """
+    import inspect
+
+    import app.orchestrator as orch
+    import app.orchestrator_ci_monitor as cim
+
+    # (1) re-export identity — same objects, new home.
+    reexported = (
+        "_VERIFY_TESTS_MAX_RETRIES",
+        "_VERIFY_TESTS_SPAWN_DEFERRAL_CAP",
+        "_apply_ci_merged_landed_signal",
+        "_capture_ci_polling_snapshot",
+        "_ci_result_from_resolved_pr_ci_status",
+        "_ci_waiting_sql_filter",
+        "_clear_retry_after_state",
+        "_monitor_evaluating_tasks",
+        "_resolve_ci_fix_branch",
+    )
+    for name in reexported:
+        assert getattr(orch, name) is getattr(cim, name), (
+            f"{name} must be re-exported from app.orchestrator with identical "
+            "identity"
+        )
+    assert (
+        cim._monitor_evaluating_tasks.__module__ == "app.orchestrator_ci_monitor"
+    )
+
+    # (2) the worker delegates to the extracted sweep.
+    worker_src = inspect.getsource(orch.orchestrator_worker)
+    assert "_monitor_evaluating_tasks(session)" in worker_src
+
+    # (3) drive the extracted sweep against a live session. A ci_waiting row
+    # with no resolvable PR number locks and short-circuits before any GitHub
+    # I/O, so we exercise the moved SELECT + lock path without the network.
+    ci_filter_spy = mocker.spy(cim, "_ci_waiting_sql_filter")
+    lock_spy = mocker.spy(orch, "_lock_task_for_mutation")
+
+    project = make_project(name="ci-monitor-contract", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = make_task(
+        project_id=project.id,
+        status=TaskStatus.EVALUATING,
+        payloads=[{"type": "review", "prompt": "p"}],
+        context={"review_loop": {"ci_waiting": True}},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    await cim._monitor_evaluating_tasks(db_session)
+
+    assert ci_filter_spy.called, (
+        "the extracted sweep must run the ci_waiting SQL prefilter"
+    )
+    assert lock_spy.await_count >= 1, (
+        "the extracted sweep must lock the ci_waiting EVALUATING row it found"
+    )
+    # The no-PR row is left intact (locked, inspected, rolled back) — the sweep
+    # is behaviour-preserving and does not mutate it out of EVALUATING.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed is not None
+    assert refreshed.status == TaskStatus.EVALUATING
+
+
 # ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
 
 
@@ -8695,11 +8782,15 @@ class TestDispatchCrashContainment:
         coroutine races the cycle and the consecutive-error assertion is
         deterministic."""
         import app.orchestrator as _orch_module
+        import app.orchestrator_ci_monitor as _ci_monitor_module
 
         self._mock_dispatch_runtime(mocker)
         self._set_slots(_orch_module)
         _orch_module._orchestrator_consecutive_errors = 0
-        ci_filter_spy = mocker.spy(_orch_module, "_ci_waiting_sql_filter")
+        # The EVALUATING/CI-waiting monitor sweep was extracted to
+        # app.orchestrator_ci_monitor; the ci_waiting SQL prefilter now
+        # resolves as a local of that module, so spy it there.
+        ci_filter_spy = mocker.spy(_ci_monitor_module, "_ci_waiting_sql_filter")
 
         async with orch_crash_db() as session:
             project = make_project(name="CI Poll Survives", user_id=_TEST_USER)
@@ -9464,3 +9555,154 @@ class TestCloudRunAllowlistValidation:
             assert _ss.runtime_config.get("cloud_run_task_type_allowlist") == []
         finally:
             _ss.runtime_config["cloud_run_task_type_allowlist"] = original
+
+
+class TestRunnerDispatchExtractionContract:
+    """Guards the ``app.orchestrator_runner_dispatch`` extraction seam.
+
+    The local-runner + compute-experiment dispatch cluster was lifted out of
+    ``app.orchestrator`` into ``app.orchestrator_runner_dispatch`` (a pure,
+    behaviour-preserving refactor). This exercises the facade contract AND the
+    runtime behaviour of the moved helpers so a regression that reverts the
+    move, breaks the re-export, or changes the moved logic is caught:
+
+      1. Each moved symbol is re-exported from ``app.orchestrator`` and is the
+         *same object* as the canonical definition in the new module.
+      2. The moved helpers are no longer defined at ``orchestrator.py``
+         top-level (no shadowing, monolith does not re-grow).
+      3. The moved pure helpers still compute the correct result via BOTH the
+         re-exported binding and the canonical binding — proving the extracted
+         production code actually runs.
+    """
+
+    MOVED_SYMBOLS = (
+        "RunnerDispatchSnapshot",
+        "_runner_handles_task_type",
+        "_runner_active_task_count",
+        "_runner_active_compute_job_count",
+        "_runner_active_work_count",
+        "_runner_agent_available",
+        "_runner_at_capacity",
+        "_load_active_runners_cache",
+        "_load_runner_compute_job_assignments",
+        "_try_runner_dispatch",
+        "_task_requires_strategic_local_runner",
+        "_hold_strategic_local_runner_task",
+        "_try_strategic_local_required_runner_path",
+        "_num_or_none",
+        "_select_eligible_runner",
+        "_build_compute_launch_kwargs",
+        "_fail_compute_experiment_task",
+        "_dispatch_compute_experiment_directly",
+        "_deactivate_stale_runners",
+        "_parse_local_runner_hold_timestamp",
+        "_create_strategic_local_cloud_fallback_alert",
+        "_strategic_local_hold_timeout_seconds",
+        "_fail_stale_local_runner_holds",
+        "_emit_all_accounts_blocked_stall",
+        "_RUNNER_LIVENESS_SECONDS",
+        "_LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS",
+    )
+
+    def test_moved_symbols_reexported_and_identical(self):
+        import app.orchestrator as orch
+        import app.orchestrator_runner_dispatch as rd
+
+        for name in self.MOVED_SYMBOLS:
+            assert hasattr(rd, name), (
+                f"{name} missing from app.orchestrator_runner_dispatch — the "
+                f"canonical home for the extracted symbol no longer defines it."
+            )
+            assert hasattr(orch, name), (
+                f"app.orchestrator.{name} is no longer importable. Add the "
+                f"re-export: from app.orchestrator_runner_dispatch import {name}."
+            )
+            assert getattr(orch, name) is getattr(rd, name), (
+                f"app.orchestrator.{name} is not the same object as "
+                f"app.orchestrator_runner_dispatch.{name} — the orchestrator is "
+                f"shadowing the canonical implementation."
+            )
+
+    def test_moved_functions_not_redefined_in_orchestrator(self):
+        import ast
+        import os
+
+        orch_path = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "app", "orchestrator.py"
+        )
+        with open(orch_path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read())
+        top_level_defs: set[str] = set()
+        for node in tree.body:
+            if isinstance(
+                node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+            ):
+                top_level_defs.add(node.name)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        top_level_defs.add(target.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(
+                node.target, ast.Name
+            ):
+                top_level_defs.add(node.target.id)
+
+        redefined = sorted(top_level_defs & set(self.MOVED_SYMBOLS))
+        assert not redefined, (
+            "orchestrator.py re-defines extracted runner-dispatch symbols "
+            f"(shadowing app.orchestrator_runner_dispatch): {redefined}. Move "
+            "the definition into the sibling module and rely on the re-export."
+        )
+
+    def test_moved_pure_helpers_behave_identically(self):
+        """The extracted pure helpers still compute correct results via both
+        the re-exported and canonical bindings — proving the moved code runs."""
+        import app.orchestrator as orch
+        import app.orchestrator_runner_dispatch as rd
+
+        # _num_or_none: coercion + rejection semantics preserved.
+        for fn in (orch._num_or_none, rd._num_or_none):
+            assert fn(3) == 3.0
+            assert fn("2.5") == 2.5
+            assert fn(True) is None  # bools are not numbers
+            assert fn(None) is None
+            assert fn("not-a-number") is None
+            assert fn(float("nan")) is None
+            assert fn(float("inf")) is None
+
+        # _runner_handles_task_type over a RunnerDispatchSnapshot: policy
+        # allowlist (ceiling) intersected with declared agent floor.
+        allow_all = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(), project_id=uuid.uuid4(), capabilities={"task_types": "all"}
+        )
+        restricted = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={"task_types": ["research"]},
+        )
+        assert orch._runner_handles_task_type(allow_all, "fix") is True
+        assert orch._runner_handles_task_type(restricted, "fix") is False
+        assert orch._runner_handles_task_type(restricted, "research") is True
+        # compute_experiment is exempt from the agent-declared floor.
+        docker_only = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={
+                "task_types": "all",
+                "supported_agent_task_types": ["research"],
+            },
+        )
+        assert orch._runner_handles_task_type(docker_only, "fix") is False
+        assert orch._runner_handles_task_type(docker_only, "compute_experiment") is True
+
+        # _runner_active_work_count = agent tasks + compute jobs (heartbeat view).
+        busy = orch.RunnerDispatchSnapshot(
+            id=uuid.uuid4(),
+            project_id=uuid.uuid4(),
+            capabilities={
+                "active_task_ids": ["a", "b"],
+                "active_compute_job_ids": ["c"],
+            },
+        )
+        assert orch._runner_active_work_count(busy) == 3
+        assert rd._runner_active_work_count(busy) == 3
