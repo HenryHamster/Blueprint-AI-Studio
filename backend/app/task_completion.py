@@ -3216,6 +3216,36 @@ async def _maybe_spawn_sweep_aggregate_followon(
     )
 
     # Collect durable artifact pointers from all arms (Pillar 5 spawn-forward).
+    # Batch-load the arms' artifacts once (was one session.get per sibling) and
+    # look them up in-memory; the per-sibling UUID parse + None-handling below is
+    # preserved exactly so invalid/missing ids skip just as before.
+    _sweep_artifact_uuids: set[uuid.UUID] = set()
+    for sibling in sibling_rows:
+        sibling_result = (
+            (sibling.plan_output or {}).get("compute_result")
+            if isinstance(sibling.plan_output, dict)
+            else None
+        )
+        if sibling_result:
+            artifact_id = sibling_result.get("artifact_id")
+            if artifact_id:
+                try:
+                    _sweep_artifact_uuids.add(uuid.UUID(str(artifact_id)))
+                except (ValueError, TypeError):
+                    pass
+    artifacts_by_id: dict[uuid.UUID, Artifact] = {}
+    if _sweep_artifact_uuids:
+        _artifact_rows = (
+            (
+                await session.execute(
+                    select(Artifact).where(Artifact.id.in_(_sweep_artifact_uuids))
+                )
+            )
+            .scalars()
+            .all()
+        )
+        artifacts_by_id = {a.id: a for a in _artifact_rows}
+
     artifact_prereqs: list[dict] = []
     for sibling in sibling_rows:
         sibling_result = (
@@ -3227,7 +3257,7 @@ async def _maybe_spawn_sweep_aggregate_followon(
             artifact_id = sibling_result.get("artifact_id")
             if artifact_id:
                 try:
-                    artifact = await session.get(Artifact, uuid.UUID(str(artifact_id)))
+                    artifact = artifacts_by_id.get(uuid.UUID(str(artifact_id)))
                 except (ValueError, TypeError):
                     artifact = None
                 if artifact is not None:

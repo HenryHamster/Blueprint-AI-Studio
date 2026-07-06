@@ -666,6 +666,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   addToastRef.current = addToast;
   const notifyOnHighSignalMessageRef = useRef(notifyOnHighSignalMessage);
   notifyOnHighSignalMessageRef.current = notifyOnHighSignalMessage;
+  // Stable ref for the direction convert-form so the memoized convert handler
+  // does not churn on the form hook's per-render object identity.
+  const convertFormRef = useRef(convertForm);
+  convertFormRef.current = convertForm;
 
   // Track seen messages to detect new arrivals and avoid initial-load toast spam
   const seenMessageIdsRef = useRef<Set<string>>(new Set());
@@ -1023,7 +1027,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     setShowTempMuteMenu(false);
   }
 
-  function getTop3NoisyEventTypes(): Array<[string, number]> {
+  const getTop3NoisyEventTypes = useCallback((): Array<[string, number]> => {
     if (routineOpen.length === 0) return [];
     const now = Date.now();
     const oneHourAgo = now - 3600000;
@@ -1035,7 +1039,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       }
     }
     return Object.entries(eventTypeCounts).sort((a, b) => b[1] - a[1]).slice(0, 3);
-  }
+  }, [routineOpen]);
 
   const activeView = useMemo(
     () => savedViews.find(v => v.id === activeViewId) ?? null,
@@ -1618,7 +1622,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  async function handleResolve(msgId: string, resolution: string) {
+  const handleResolve = useCallback(async (msgId: string, resolution: string) => {
     setResolvingId(null);
     setResolveInput('');
     try {
@@ -1630,22 +1634,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchMessages();
     } catch {
-      addToast('Failed to resolve message', 'error');
+      addToastRef.current('Failed to resolve message', 'error');
     }
-  }
+  }, [fetchMessages]);
 
-  async function handleDelete(msgId: string) {
+  const handleDelete = useCallback(async (msgId: string) => {
     setDeletingIds(prev => new Set(prev).add(msgId));
     try {
       const res = await apiFetch(`${API_BASE_URL}/api/admin/messages/${msgId}`, { method: 'DELETE' });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       await fetchMessages();
     } catch {
-      addToast('Failed to delete message', 'error');
+      addToastRef.current('Failed to delete message', 'error');
     } finally {
       setDeletingIds(prev => { const next = new Set(prev); next.delete(msgId); return next; });
     }
-  }
+  }, [fetchMessages]);
 
   async function handleCreateDirection(msg: ProjectMessage, silent = false): Promise<boolean> {
     if (!selectedProjectId) return false;
@@ -1689,10 +1693,10 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  function handleOpenConvertModal(msg: ProjectMessage) {
-    convertForm.seedFromMessage(msg.content);
+  const handleOpenConvertModal = useCallback((msg: ProjectMessage) => {
+    convertFormRef.current.seedFromMessage(msg.content);
     setPendingConvertMsg(msg);
-  }
+  }, []);
 
   async function handleSubmitConvertForm() {
     if (!selectedProjectId || !pendingConvertMsg || !convertForm.newText.trim()) return;
@@ -1743,7 +1747,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  async function handleCreateInvestigation(msg: ProjectMessage): Promise<boolean> {
+  const handleCreateInvestigation = useCallback(async (msg: ProjectMessage): Promise<boolean> => {
     if (!selectedProjectId || !githubRepo) return false;
     setInvestigatingIds(prev => new Set(prev).add(msg.id));
     try {
@@ -1767,15 +1771,15 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         throw new Error(errData?.detail || errData?.error?.message || `HTTP ${res.status}`);
       }
       setInvestigatingId(null);
-      addToast('Investigation task created', 'success');
+      addToastRef.current('Investigation task created', 'success');
       return true;
     } catch (err) {
-      addToast(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
+      addToastRef.current(`Failed to create investigation: ${err instanceof Error ? err.message : 'Unknown error'}`, 'error');
       return false;
     } finally {
       setInvestigatingIds(prev => { const next = new Set(prev); next.delete(msg.id); return next; });
     }
-  }
+  }, [selectedProjectId, githubRepo, defaultBranch]);
 
   const KEEP_RESOLVED = 20;
 
@@ -1802,13 +1806,13 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     await fetchMessages();
   }
 
-  function toggleSelect(msgId: string) {
+  const toggleSelect = useCallback((msgId: string) => {
     setSelectedIds(prev => {
       const next = new Set(prev);
       if (next.has(msgId)) next.delete(msgId); else next.add(msgId);
       return next;
     });
-  }
+  }, []);
 
   async function handleBatchCreateDirections() {
     const msgs = openFeedbackMessages.filter(m => selectedIds.has(m.id));
@@ -1840,7 +1844,22 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }
   }
 
-  const bubbleProps = {
+  // Stable per-bubble handlers so `bubbleProps` keeps a stable identity across
+  // renders (see React.memo on MessageBubble). Setters/refs are stable, so most
+  // carry an empty dependency array; the rest depend only on their (already
+  // memoized) target handler.
+  const onCreateInvestigation = useCallback((msg: ProjectMessage) => { void handleCreateInvestigation(msg); }, [handleCreateInvestigation]);
+  const onDelete = useCallback((msgId: string) => { void handleDelete(msgId); }, [handleDelete]);
+  const onStartResolve = useCallback((msgId: string) => { setResolvingId(msgId); setResolveInput(''); }, []);
+  const onCancelResolve = useCallback(() => setResolvingId(null), []);
+  const onStartInvestigate = useCallback((msgId: string) => setInvestigatingId(msgId), []);
+  const onCancelInvestigate = useCallback(() => setInvestigatingId(null), []);
+  const onReply = useCallback((replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
+    setReplyTo(replyTo);
+    textareaRef.current?.focus();
+  }, []);
+
+  const bubbleProps = useMemo(() => ({
     actionMode: conversationMode ? 'reply-only' as const : 'full' as const,
     resolvingId,
     resolveInput,
@@ -1852,21 +1871,41 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     selectedIds,
     onOpenTask,
     onToggleSelect: toggleSelect,
-    onCreateDirection: (msg: ProjectMessage) => { handleOpenConvertModal(msg); },
-    onCreateInvestigation: (msg: ProjectMessage) => { void handleCreateInvestigation(msg); },
+    onCreateDirection: handleOpenConvertModal,
+    onCreateInvestigation,
     onResolve: handleResolve,
-    onDelete: (msgId: string) => { void handleDelete(msgId); },
-    onStartResolve: (msgId: string) => { setResolvingId(msgId); setResolveInput(''); },
-    onCancelResolve: () => setResolvingId(null),
+    onDelete,
+    onStartResolve,
+    onCancelResolve,
     onSetResolveInput: setResolveInput,
-    onStartInvestigate: (msgId: string) => setInvestigatingId(msgId),
-    onCancelInvestigate: () => setInvestigatingId(null),
-    onReply: (replyTo: { id: string; content: string; from: string; message_type: string; status: string }) => {
-      setReplyTo(replyTo);
-      textareaRef.current?.focus();
-    },
+    onStartInvestigate,
+    onCancelInvestigate,
+    onReply,
     onOpenStrategicContext: conversationMode ? (onOpenStrategicContextWorkspace ?? onOpenStrategicContextCommands) : undefined,
-  };
+  }), [
+    conversationMode,
+    resolvingId,
+    resolveInput,
+    deletingIds,
+    creatingDirectionIds,
+    investigatingId,
+    investigatingIds,
+    selectMode,
+    selectedIds,
+    onOpenTask,
+    toggleSelect,
+    handleOpenConvertModal,
+    onCreateInvestigation,
+    handleResolve,
+    onDelete,
+    onStartResolve,
+    onCancelResolve,
+    onStartInvestigate,
+    onCancelInvestigate,
+    onReply,
+    onOpenStrategicContextWorkspace,
+    onOpenStrategicContextCommands,
+  ]);
 
   return (
     <div className="flex-1 overflow-hidden flex flex-col min-h-0">

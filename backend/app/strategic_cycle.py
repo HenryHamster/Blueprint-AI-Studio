@@ -823,6 +823,23 @@ async def find_stalled(
         .limit(limit * 4)  # over-fetch so phase-2 stall checks find candidates
     )
     candidates = (await session.execute(stmt)).scalars().all()
+    # Batch-load the phase-1/phase-2 linked tasks once (was one session.get per
+    # candidate per phase) and look them up in-memory; a missing id resolves to
+    # None exactly as session.get would, preserving the hold-check semantics.
+    _linked_task_ids: set = set()
+    for c in candidates:
+        if c.phase1_task_id is not None:
+            _linked_task_ids.add(c.phase1_task_id)
+        if c.phase2_task_id is not None:
+            _linked_task_ids.add(c.phase2_task_id)
+    linked_tasks_by_id: dict = {}
+    if _linked_task_ids:
+        _linked_task_rows = (
+            (await session.execute(select(Task).where(Task.id.in_(_linked_task_ids))))
+            .scalars()
+            .all()
+        )
+        linked_tasks_by_id = {t.id: t for t in _linked_task_rows}
     stalled: list[StrategicCycle] = []
     for c in candidates:
         if c.outcome in (
@@ -836,7 +853,7 @@ async def find_stalled(
                 and c.phase2_started_at is None
             ):
                 if c.phase1_task_id is not None:
-                    linked_task = await session.get(Task, c.phase1_task_id)
+                    linked_task = linked_tasks_by_id.get(c.phase1_task_id)
                     if task_is_strategic_local_runner_hold(linked_task):
                         continue
                 stalled.append(c)
@@ -844,7 +861,7 @@ async def find_stalled(
             ref = c.phase2_started_at or c.phase1_started_at
             if ref and ref < phase2_cutoff:
                 if c.phase2_task_id is not None:
-                    linked_task = await session.get(Task, c.phase2_task_id)
+                    linked_task = linked_tasks_by_id.get(c.phase2_task_id)
                     if task_is_strategic_local_runner_hold(linked_task):
                         continue
                 stalled.append(c)
