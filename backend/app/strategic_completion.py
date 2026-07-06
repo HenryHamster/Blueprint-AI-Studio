@@ -4371,18 +4371,27 @@ async def _handle_strategic_completion(
         parsed = None
 
     if not parsed or not isinstance(parsed, dict):
-        # No API calls and no parseable output — record failure
-        project = await session.get(Project, task.project_id)
-        if project:
-            current_vision = project.vision or {}
-            failures = current_vision.get("_strategic_failures", 0) + 1
-            current_vision["_strategic_failures"] = failures
-            current_vision["_strategic_failures_at"] = _utcnow().isoformat()
-            project.vision = current_vision
-            flag_modified(project, "vision")
-            cycle_id = task.strategic_cycle_id or (task.context or {}).get(
-                "strategic_cycle_id"
-            )
+        # No API calls and no parseable output — record failure under a row lock.
+        # skip_locked=False: wait for the lock rather than silently drop a count.
+        from app.task_locking import with_vision_locked
+
+        cycle_id = task.strategic_cycle_id or (task.context or {}).get(
+            "strategic_cycle_id"
+        )
+        _now_iso = _utcnow().isoformat()
+        _failure_num: list[int] = []
+
+        def _bump_failures(vision: dict) -> None:
+            failures = vision.get("_strategic_failures", 0) + 1
+            vision["_strategic_failures"] = failures
+            vision["_strategic_failures_at"] = _now_iso
+            _failure_num.append(failures)
+
+        project_found = await with_vision_locked(
+            session, task.project_id, _bump_failures
+        )
+        if project_found:
+            project = await session.get(Project, task.project_id)
             if cycle_id:
                 # Audit W2: failure recorded on the StrategicCycle row.
                 failed_cycle = await strategic_cycle.mark_failure(
@@ -4393,8 +4402,8 @@ async def _handle_strategic_completion(
                 )
             else:
                 failed_cycle = None
-            session.add(project)
         else:
+            project = None
             failed_cycle = None
         task.latest_status_message = "Strategic output could not be parsed"
         session.add(task)
@@ -4416,7 +4425,7 @@ async def _handle_strategic_completion(
                 failure_reason="strategic_review unparseable output",
             ),
         )
-        failure_num = current_vision.get("_strategic_failures", "?") if project else "?"
+        failure_num = _failure_num[0] if _failure_num else "?"
         logger.warning(
             f"[STRATEGIC] Task {task.id}: unparseable output (failure #{failure_num})"
         )

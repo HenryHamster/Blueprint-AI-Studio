@@ -18466,3 +18466,65 @@ async def test_spawn_retirement_memos_failure_does_not_abort_commit(db_session, 
     # The project must still be committable (no session in error state) and reachable.
     await db_session.refresh(project)
     assert project.id is not None, "Project must still be readable after memo-spawn failure"
+
+
+@pytest.mark.asyncio
+async def test_unparseable_strategic_failure_counter_is_atomic(db_session, mocker):
+    """Two sequential unparseable-output failures both increment _strategic_failures.
+
+    Regression test for the unlocked RMW race: before the fix, two concurrent
+    (or sequential) failures could both read the same baseline and write back the
+    same +1, silently losing an increment. with_vision_locked serializes the
+    counter bump so both increments are recorded.
+    """
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # First failure: empty logs -> unparseable -> increments _strategic_failures to 1
+    task1 = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+
+    await _handle_strategic_completion(task1, "", db_session)
+
+    # Second failure: another task, empty logs -> unparseable -> increments to 2
+    task2 = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+
+    await _handle_strategic_completion(task2, "", db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    assert vision.get("_strategic_failures") == 2, (
+        f"Two sequential unparseable failures must each increment _strategic_failures; "
+        f"expected 2, got {vision.get('_strategic_failures')!r}"
+    )
+    assert vision.get("_strategic_failures_at") is not None, (
+        "_strategic_failures_at must be stamped after unparseable failure"
+    )
