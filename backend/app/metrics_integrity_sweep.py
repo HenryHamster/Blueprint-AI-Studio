@@ -34,9 +34,13 @@ Registered checks: ``landed_vs_reported_merges``, ``playbook_confirmation_integr
 ``completion_debt_completeness`` (recomputes the currently-expected
 completion-debt obligations — seed/dormant-knob inventory, per-project
 continue/trial capability verdicts, per-project no-CI gate fall-opens — and flags
-ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row), and
-``problem_model_duplicate_id_sweep`` (scans id-keyed problem_model JSONB collections
-for duplicate ids, flagging per-project when ``len(items) > len({item["id"] for item in items})``).
+ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row),
+``rollup_child_landing_credit``, ``near_cap_size_warning`` (scans capped
+backend modules for files at >=95% of their size cap, pre-classified with the
+chronic-offender policy, so decomposition can be staged before a hard breach),
+and ``problem_model_duplicate_id_sweep`` (scans id-keyed problem_model JSONB
+collections for duplicate ids, flagging per-project when
+``len(items) > len({item["id"] for item in items})``).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -51,6 +55,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import os
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -462,6 +467,14 @@ async def run_metrics_integrity_sweep(
             ),
         )
     return tick
+
+
+# Near-cap warning constants — patchable in tests.
+_NEAR_CAP_RATIO: float = 0.95
+_NEAR_CAP_LIMITS_PATH: str = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "testing", "module_size_limits.json")
+)
+_NEAR_CAP_BACKEND_ROOT: str = os.path.dirname(__file__)  # backend/app/
 
 
 # =============================================================================
@@ -1498,6 +1511,139 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
                 detail="no rollup children to audit against landed parents in sample",
             )
         ]
+    return results
+
+
+@register_check(
+    "near_cap_size_warning",
+    "Scan capped backend modules for files at >=95% of their size cap and flag "
+    "them pre-classified with the chronic-offender policy, so decomposition can "
+    "be staged before a hard breach.",
+)
+async def check_near_cap_size_warning(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: disk-resident line count of each capped backend module vs
+    its cap in ``module_size_limits.json``.  Modules at >= ``_NEAR_CAP_RATIO`` of
+    their cap (but not yet breached) are flagged; chronic offenders escalate to
+    ``severity=error``.  No DB interaction — reads disk only.
+
+    Returns SKIPPED when the limits JSON is absent/unreadable OR when the
+    backend source tree is not present in the current environment (e.g., a test
+    VM that only has partial tree layout).  Already-breached files (count > cap)
+    are skipped — the hard-breach guardrail already catches those.
+    """
+    import json as _json
+
+    from app.size_limit_policy import _is_chronic_offender, parse_bump_history
+
+    # 1. Load caps from the tracked JSON.
+    try:
+        with open(_NEAR_CAP_LIMITS_PATH) as fh:
+            all_limits = _json.load(fh)
+    except (OSError, ValueError):
+        return [
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="module_size_limits.json absent or unreadable",
+            )
+        ]
+
+    backend_caps = all_limits.get("backend")
+    if not isinstance(backend_caps, dict) or not backend_caps:
+        return [
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no backend section in module_size_limits.json",
+            )
+        ]
+
+    # 2. Verify the backend source tree exists.
+    if not os.path.isdir(_NEAR_CAP_BACKEND_ROOT):
+        return [
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="backend source tree absent in current environment",
+            )
+        ]
+
+    # 3. Line-count each capped file and classify.
+    results: List[CheckResult] = []
+    ok_count = 0
+
+    for rel, cap in backend_caps.items():
+        if not isinstance(cap, int) or cap <= 0:
+            continue
+        path = os.path.join(_NEAR_CAP_BACKEND_ROOT, rel)
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                count = len(fh.readlines())
+        except OSError:
+            continue
+
+        if count > cap:
+            # Already breached — the hard-breach guardrail owns these.
+            continue
+
+        ratio = count / cap
+        if ratio < _NEAR_CAP_RATIO:
+            ok_count += 1
+            continue
+
+        # Near-cap: apply chronic classification.
+        try:
+            history = parse_bump_history(rel, "backend")
+            is_chronic = _is_chronic_offender(history)
+        except Exception:  # noqa: BLE001 — classification is advisory; never propagate
+            is_chronic = False
+
+        severity = "error" if is_chronic else "warn"
+        pct = int(ratio * 100)
+        results.append(
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.FLAGGED,
+                self_reported=count,
+                ground_truth=cap,
+                delta=cap - count,
+                severity=severity,
+                subject=rel,
+                detail=(
+                    f"{rel}: {count}/{cap} lines ({pct}% of cap)"
+                    + (" [chronic offender]" if is_chronic else "")
+                ),
+            )
+        )
+
+    if not results and ok_count == 0:
+        return [
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no countable capped backend files found",
+            )
+        ]
+
+    if not results:
+        return [
+            CheckResult(
+                check="near_cap_size_warning",
+                status=CheckStatus.OK,
+                subject="global",
+                detail=(
+                    f"all {ok_count} capped backend module(s) are below "
+                    f"{int(_NEAR_CAP_RATIO * 100)}% of cap"
+                ),
+            )
+        ]
+
     return results
 
 

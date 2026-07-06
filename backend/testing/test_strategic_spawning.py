@@ -5207,6 +5207,54 @@ def test_agent_view_problem_model_drops_rejected_agent_edits():
     assert "rejected_agent_edits" in pm
 
 
+def test_agent_view_problem_model_cluster_reexported_from_sibling_module():
+    """The agent-view problem_model builder cluster was peeled into the sibling
+    module ``app.strategic_problem_view`` to keep ``strategic_spawning`` under its
+    size cap. ``strategic_spawning`` must re-export every moved name so existing
+    ``from app.strategic_spawning import ...`` call sites and tests keep resolving
+    the SAME object — this guards the extraction contract against a future edit
+    that shadows a re-export with a divergent local copy."""
+    from app import strategic_problem_view, strategic_spawning
+
+    for name in (
+        "_agent_view_problem_model",
+        "_agent_view_problem_model_packed",
+        "_agent_view_problem_model_floor",
+        "_compute_model_health",
+        "_shrink_pm_to_floor",
+        "_skeletonize_caps_friction",
+        "_serialized_bytes",
+        "_GAP_HISTORY_KEEP",
+        "_GAP_PAST_MOVES_KEEP",
+        "_GAP_EVIDENCE_KEEP",
+        "_AGENT_VIEW_FLOOR_BYTES",
+    ):
+        assert hasattr(strategic_problem_view, name), (
+            f"{name} must be defined in the sibling module"
+        )
+        assert getattr(strategic_spawning, name) is getattr(
+            strategic_problem_view, name
+        ), f"strategic_spawning.{name} must re-export the sibling module's object"
+
+    # Behaviour is preserved end-to-end through the re-export: the moved trim
+    # still drops archived_gaps and bounds per-gap history to the keep window.
+    pm = {
+        "archived_gaps": [{"id": "old"}],
+        "gaps": [
+            {
+                "id": "g",
+                "history": [
+                    {"e": i}
+                    for i in range(strategic_problem_view._GAP_HISTORY_KEEP + 3)
+                ],
+            }
+        ],
+    }
+    view = strategic_spawning._agent_view_problem_model(pm)
+    assert "archived_gaps" not in view
+    assert len(view["gaps"][0]["history"]) == strategic_problem_view._GAP_HISTORY_KEEP
+
+
 def test_build_operator_overrides_summary_consolidates_both_ledgers():
     """Both reconciliation ledgers (vision + problem_model) are consolidated
     into one normalized list, newest-first, with document/value mapping."""
@@ -18998,3 +19046,181 @@ class TestReconciliationSectionsContract:
             f"Add them to backend/testing/__fixtures__/reconciliation_sections.json "
             f"AND add a renderer in agent/src/handlers/strategic-sections.ts."
         )
+
+
+# ---------------------------------------------------------------------------
+# _maybe_spawn_ci_compliance_cap_bump_fix — chronic vs routine classification
+# ---------------------------------------------------------------------------
+
+from app.strategic_spawning import _maybe_spawn_ci_compliance_cap_bump_fix  # noqa: E402
+
+
+def _chronic_history():
+    """Return a 3-bump history that trips the chronic-offender threshold."""
+    from app.size_limit_policy import BumpRecord
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    return [
+        BumpRecord(
+            commit_sha="aaa",
+            commit_date=(now - timedelta(days=150)).isoformat(),
+            old_cap=3500,
+            new_cap=4050,
+        ),
+        BumpRecord(
+            commit_sha="bbb",
+            commit_date=(now - timedelta(days=90)).isoformat(),
+            old_cap=4050,
+            new_cap=4500,
+        ),
+        BumpRecord(
+            commit_sha="ccc",
+            commit_date=(now - timedelta(days=30)).isoformat(),
+            old_cap=4500,
+            new_cap=4700,
+        ),
+    ]
+
+
+def _make_gate(violations, *, head_sha="a" * 40):
+    return {
+        "blocked": True,
+        "head_sha": head_sha,
+        "violations": violations,
+        "branch_literal_violations": [],
+        "violation_count": len(violations),
+    }
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_decomposes_chronic_offender(db_session, mocker):
+    """When a violation is on a chronic offender, the spawned task must direct
+    decomposition and must NOT instruct a blind cap bump (--fix) for that file.
+
+    This is the acceptance test named by the task:
+    test_strategic_spawning.py::test_cap_bump_task_decomposes_chronic_offender
+    """
+    project = Project(
+        name="chronic-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test chronic spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "orchestrator.py", "count": 9200, "cap": 9000}]
+    )
+
+    with patch(
+        "app.size_limit_policy.parse_bump_history",
+        return_value=_chronic_history(),
+    ):
+        spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+
+    # Must direct decomposition, not a cap bump.
+    assert "decompos" in prompt.lower(), (
+        "Expected prompt to mention decomposition for a chronic offender"
+    )
+    assert "orchestrator.py" in prompt, (
+        "Expected prompt to name the chronic offender file"
+    )
+    # Must NOT tell the agent to run --fix on the chronic file.
+    assert "python3 backend/testing/check_size_limits.py --fix" not in prompt, (
+        "Prompt must not instruct --fix for a chronic offender"
+    )
+    # Title should signal decomposition, not a cap bump.
+    assert "decompos" in title.lower() or "chronic" in title.lower(), (
+        f"Task title should indicate decomposition, got: {title!r}"
+    )
+    # Context keys preserved.
+    assert spawned.context["spawned_by"] == "ci_compliance_cap_bump_gate"
+    assert spawned.context["head_sha"] == "a" * 40
+    assert spawned.context["ci_compliance_cap_bump"] is True
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_routine_violation_keeps_fix_instruction(db_session, mocker):
+    """When all violations are routine (no chronic history), the spawned task
+    must still instruct `check_size_limits.py --fix` as before.
+    """
+    project = Project(
+        name="routine-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test routine spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "new_module.py", "count": 1600, "cap": 1500}]
+    )
+
+    with patch("app.size_limit_policy.parse_bump_history", return_value=[]):
+        spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    assert spawned is not None
+    prompt = spawned.first_payload["prompt"]
+    title = spawned.first_payload["title"]
+
+    assert "python3 backend/testing/check_size_limits.py --fix" in prompt, (
+        "Routine violation must still instruct --fix"
+    )
+    assert "bump" in title.lower() or "fix" in title.lower(), (
+        f"Routine task title should reference bump/fix, got: {title!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_cap_bump_task_uncapped_violation_treated_as_routine(db_session, mocker):
+    """Violations with cap=None (new files) are never chronic and must keep the
+    --fix instruction regardless of git history.
+    """
+    project = Project(
+        name="uncapped-test",
+        user_id="test-user",
+        github_owner="owner",
+        github_repo="repo",
+        integration_branch="automain",
+        promotion_target="main",
+        autonomous_enabled=True,
+        directions=[],
+        vision={"purpose": "test uncapped spawn"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    gate = _make_gate(
+        [{"section": "backend", "rel": "brand_new.py", "count": 2000, "cap": None}]
+    )
+
+    classify_breach_mock = mocker.patch("app.size_limit_policy.classify_breach")
+    spawned = await _maybe_spawn_ci_compliance_cap_bump_fix(db_session, project, gate)
+    await db_session.commit()
+
+    # classify_breach must NOT be called for uncapped violations.
+    classify_breach_mock.assert_not_called()
+    assert spawned is not None
+    assert "python3 backend/testing/check_size_limits.py --fix" in spawned.first_payload["prompt"]

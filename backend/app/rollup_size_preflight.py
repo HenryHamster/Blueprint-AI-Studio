@@ -19,7 +19,7 @@ import json
 import logging
 
 from app.github import commit_file_changes, get_file_text_at_ref, get_pr_files
-from app.size_limit_policy import bump_size_limit
+from app.size_limit_policy import classify_breach
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +88,8 @@ async def preflight_rollup_size_caps(
     # 3. For each capped file that appears in the rollup, fetch content at the
     #    staging-branch tip and check against its cap.
     breaches: list[tuple[str, str, int, int, int]] = []  # (section, key, count, cap, new_cap)
+    # Chronic offenders: (section, key, bump_count) — must hold without bumping.
+    chronic_holders: list[tuple[str, str, int]] = []
     for section, prefix in _SECTION_PREFIXES.items():
         section_caps = caps_data.get(section)
         if not isinstance(section_caps, dict):
@@ -131,16 +133,42 @@ async def preflight_rollup_size_caps(
                 return ("defer", f"no content returned for {full_path} at {staging_branch}")
             line_count = len(content.splitlines())
             if line_count > cap:
-                new_cap = bump_size_limit(line_count)
-                breaches.append((section, key, line_count, cap, new_cap))
-                logger.info(
-                    "[ROLLUP-SIZE] PR #%s: %s has %d lines (cap %d) — bumping to %d",
-                    rollup_pr_number,
-                    full_path,
-                    line_count,
-                    cap,
-                    new_cap,
+                verdict = classify_breach(
+                    module_key=key, current_size=line_count, section=section
                 )
+                if verdict["is_chronic"] and verdict["suggested_new_limit"] is None:
+                    chronic_holders.append((section, key, verdict["bump_count"]))
+                    logger.warning(
+                        "[ROLLUP-SIZE] PR #%s: %s is a chronic offender (%d bumps)"
+                        " — holding for operator decomposition",
+                        rollup_pr_number,
+                        full_path,
+                        verdict["bump_count"],
+                    )
+                else:
+                    new_cap = verdict["suggested_new_limit"]
+                    breaches.append((section, key, line_count, cap, new_cap))
+                    logger.info(
+                        "[ROLLUP-SIZE] PR #%s: %s has %d lines (cap %d) — bumping to %d",
+                        rollup_pr_number,
+                        full_path,
+                        line_count,
+                        cap,
+                        new_cap,
+                    )
+
+    # Any chronic offender blocks ALL auto-bumps — never partially commit caps
+    # while an operator decomposition decision is pending.
+    if chronic_holders:
+        names = ", ".join(
+            f"{key} ({count} bumps)" for _, key, count in chronic_holders
+        )
+        logger.warning(
+            "[ROLLUP-SIZE] PR #%s: holding for operator — chronic offender(s): %s",
+            rollup_pr_number,
+            names,
+        )
+        return ("hold", f"chronic offender(s) require decomposition: {names}")
 
     if not breaches:
         return ("ok", None)

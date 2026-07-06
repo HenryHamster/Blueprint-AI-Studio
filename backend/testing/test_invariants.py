@@ -1296,6 +1296,31 @@ class TestSchemaRevisionSync:
             "crash on startup with UndefinedColumnError."
         )
 
+        # Facade completeness: ``app.models`` is the canonical import surface for
+        # every table model. Domain clusters may be peeled into sibling modules
+        # (e.g. ``app.release_models``) with ``app.models`` importing and
+        # re-exporting them. If such a re-export is dropped, two things break at
+        # once: ``from app.models import X`` stops resolving, AND — because the
+        # sibling module is no longer imported — its tables silently disappear
+        # from ``SQLModel.metadata`` above, so the column-coverage check would
+        # stop protecting them while the backend still creates those tables at
+        # runtime. Assert every mapped table class is reachable through the
+        # ``app.models`` facade so a peeled-out module can never go un-imported.
+        _models_owned_modules = {"app.models", "app.release_models"}
+        facade_missing = sorted(
+            mapper.class_.__name__
+            for mapper in SQLModel._sa_registry.mappers
+            if mapper.class_.__module__ in _models_owned_modules
+            and not hasattr(models, mapper.class_.__name__)
+        )
+        assert not facade_missing, (
+            "Table model classes not re-exported from app.models (facade "
+            "incomplete — a peeled-out sibling module is not imported and "
+            "re-exported by app.models, so `from app.models import <name>` "
+            "breaks and the table vanishes from SQLModel.metadata):\n"
+            + "\n".join(f"  - {n}" for n in facade_missing)
+        )
+
     def test_migration_column_types_match_models(self):
         """Migration column types must be compatible with SQLModel definitions.
 

@@ -6,6 +6,11 @@ outcome window accounting), enforce-mode deduped enrollment, error isolation,
 the skipped/inconclusive contract, and the bounded observability snapshot.
 """
 
+import json
+import os
+import tempfile
+from unittest.mock import patch
+
 import pytest
 import pytest_asyncio
 from datetime import timedelta
@@ -159,6 +164,7 @@ def test_registry_contains_initial_checks():
         "direction_acceptance_metric_invariant",
         "completion_debt_completeness",
         "rollup_child_landing_credit",
+        "near_cap_size_warning",
         "problem_model_duplicate_id_sweep",
     } <= names
 
@@ -1225,6 +1231,166 @@ async def test_rollup_child_landing_credit_counts_multiple_under_credited(db):
     flagged = [r for r in results if r.flagged]
     assert len(flagged) == 1
     assert flagged[0].delta == 3
+
+
+# --- Check: near_cap_size_warning -------------------------------------------
+
+
+def _near_cap_ctx(db=None):
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+def _write_lines(path: str, n: int) -> None:
+    """Write a file with exactly n lines."""
+    with open(path, "w") as f:
+        f.writelines(f"x = {i}\n" for i in range(n))
+
+
+@pytest.fixture()
+def near_cap_env():
+    """Temporary source tree + limits JSON for near-cap tests.
+
+    Yields (tmpdir, json_path, set_caps_fn) where set_caps_fn(caps_dict)
+    rewrites the JSON to use the given caps and returns the root.
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        json_path = os.path.join(tmpdir, "module_size_limits.json")
+
+        def set_caps(caps: dict):
+            with open(json_path, "w") as f:
+                json.dump({"backend": caps}, f)
+            return tmpdir
+
+        yield tmpdir, json_path, set_caps
+
+
+def test_registry_contains_near_cap_check():
+    names = {c.name for c in registered_checks()}
+    assert "near_cap_size_warning" in names
+
+
+@pytest.mark.asyncio
+async def test_near_cap_check_flags_module_at_threshold(near_cap_env):
+    """A module at 95% of its cap is flagged with severity='warn'."""
+    tmpdir, json_path, set_caps = near_cap_env
+    cap = 100
+    count = 95  # exactly 95% of cap
+    fname = "mymodule.py"
+    _write_lines(os.path.join(tmpdir, fname), count)
+    set_caps({fname: cap})
+
+    ctx = _near_cap_ctx()
+    with (
+        patch.object(mis, "_NEAR_CAP_LIMITS_PATH", json_path),
+        patch.object(mis, "_NEAR_CAP_BACKEND_ROOT", tmpdir),
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+        patch("app.size_limit_policy._is_chronic_offender", return_value=False),
+    ):
+        results = await mis.check_near_cap_size_warning(ctx)
+
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.check == "near_cap_size_warning"
+    assert f.self_reported == count
+    assert f.ground_truth == cap
+    assert f.delta == cap - count
+    assert f.severity == "warn"
+    assert f.subject == fname
+    assert fname in f.detail
+    assert "95%" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_near_cap_check_flags_chronic_as_error(near_cap_env):
+    """A near-cap module flagged as a chronic offender uses severity='error'."""
+    tmpdir, json_path, set_caps = near_cap_env
+    cap = 200
+    count = 195  # ~97.5% of cap
+    fname = "chronic.py"
+    _write_lines(os.path.join(tmpdir, fname), count)
+    set_caps({fname: cap})
+
+    ctx = _near_cap_ctx()
+    fake_history = [
+        {"commit_sha": "a" * 40, "commit_date": "2026-01-01T00:00:00Z", "old_cap": 100, "new_cap": 150},
+        {"commit_sha": "b" * 40, "commit_date": "2026-02-01T00:00:00Z", "old_cap": 150, "new_cap": 180},
+        {"commit_sha": "c" * 40, "commit_date": "2026-03-01T00:00:00Z", "old_cap": 180, "new_cap": 200},
+    ]
+    with (
+        patch.object(mis, "_NEAR_CAP_LIMITS_PATH", json_path),
+        patch.object(mis, "_NEAR_CAP_BACKEND_ROOT", tmpdir),
+        patch("app.size_limit_policy.parse_bump_history", return_value=fake_history),
+        patch("app.size_limit_policy._is_chronic_offender", return_value=True),
+    ):
+        results = await mis.check_near_cap_size_warning(ctx)
+
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.severity == "error"
+    assert "[chronic offender]" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_near_cap_check_ok_when_below_threshold(near_cap_env):
+    """A module at 90% of its cap is not flagged; returns OK."""
+    tmpdir, json_path, set_caps = near_cap_env
+    cap = 100
+    count = 90  # 90% — below the 95% threshold
+    fname = "under.py"
+    _write_lines(os.path.join(tmpdir, fname), count)
+    set_caps({fname: cap})
+
+    ctx = _near_cap_ctx()
+    with (
+        patch.object(mis, "_NEAR_CAP_LIMITS_PATH", json_path),
+        patch.object(mis, "_NEAR_CAP_BACKEND_ROOT", tmpdir),
+    ):
+        results = await mis.check_near_cap_size_warning(ctx)
+
+    assert not any(r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_near_cap_check_skips_when_no_limits_file():
+    """A missing limits JSON returns a single SKIPPED result."""
+    ctx = _near_cap_ctx()
+    with (
+        patch.object(mis, "_NEAR_CAP_LIMITS_PATH", "/nonexistent/path/limits.json"),
+        patch.object(mis, "_NEAR_CAP_BACKEND_ROOT", "/nonexistent/root"),
+    ):
+        results = await mis.check_near_cap_size_warning(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "absent or unreadable" in results[0].detail
+
+
+@pytest.mark.asyncio
+async def test_near_cap_check_skips_when_section_root_absent(near_cap_env):
+    """A valid limits JSON but missing backend root returns SKIPPED."""
+    tmpdir, json_path, set_caps = near_cap_env
+    set_caps({"somemodule.py": 100})
+
+    ctx = _near_cap_ctx()
+    with (
+        patch.object(mis, "_NEAR_CAP_LIMITS_PATH", json_path),
+        patch.object(mis, "_NEAR_CAP_BACKEND_ROOT", "/nonexistent/backend/app"),
+    ):
+        results = await mis.check_near_cap_size_warning(ctx)
+
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "absent" in results[0].detail
 
 
 # --- Check: problem_model_duplicate_id_sweep --------------------------------
