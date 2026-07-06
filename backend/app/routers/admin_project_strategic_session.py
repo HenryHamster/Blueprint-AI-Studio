@@ -19,7 +19,7 @@ from typing import Dict, Any
 import uuid
 from sqlalchemy.orm.attributes import flag_modified
 
-from app.database import get_session
+from app.database import AsyncSessionLocal, get_session
 from app.broadcast import broadcast_to_project
 from app.shared_state import limiter
 from app.models import (
@@ -126,6 +126,9 @@ logger = logging.getLogger(__name__)
 # Value: (result_dict, expires_monotonic)
 _CURRENCY_CACHE: dict[tuple[str, str, str], tuple[dict, float]] = {}
 _CURRENCY_CACHE_TTL_S = 60.0
+# Holds strong references to background currency-resolve tasks so they are not
+# garbage-collected before they complete. Entries are discarded on completion.
+_BG_TASKS: set[asyncio.Task] = set()
 
 # In-process TTL cache for project cumulative cost aggregation.
 # Key: project_id_str
@@ -133,10 +136,45 @@ _CURRENCY_CACHE_TTL_S = 60.0
 _COST_CACHE: dict[str, tuple[float, float]] = {}
 _COST_CACHE_TTL_S = 90.0
 
-# Timeout for the GitHub API call in the strategic-state hot path.
-# On cache miss this call can block up to 15 s (bounded retries + HTTP timeout);
-# cap it at 3 s so a slow or unreachable GitHub degrades to 'unknown' quickly.
-_CURRENCY_RESOLVE_TIMEOUT_S = 3.0
+async def _currency_resolve_and_cache(
+    project_id: uuid.UUID,
+    last_qual: dict,
+    integration_branch: str,
+    cache_key: tuple[str, str, str],
+) -> None:
+    """Resolve candidate currency off the request path and populate _CURRENCY_CACHE.
+
+    Opens its own short-lived session so it is independent of the
+    request-scoped session that closes when the response is sent.
+    Failure is logged and silently swallowed — a background resolution
+    error must never surface to the caller.
+    api_unreachable verdicts are not cached (transient GitHub blip should
+    not pin a stale banner for the full TTL).
+    """
+    from app.strategic_spawning import _resolve_candidate_currency
+
+    try:
+        async with AsyncSessionLocal() as bg_session:
+            _proj = (
+                await bg_session.execute(select(Project).where(Project.id == project_id))
+            ).scalars().first()
+            if _proj is None:
+                return
+            currency = await _resolve_candidate_currency(
+                bg_session, _proj, last_qual, integration_branch
+            )
+        _verdict = currency.get("verdict") if isinstance(currency, dict) else None
+        if _verdict != "api_unreachable":
+            _now = time.monotonic()
+            _expired = [k for k, v in _CURRENCY_CACHE.items() if v[1] <= _now]
+            for _k in _expired:
+                del _CURRENCY_CACHE[_k]
+            _CURRENCY_CACHE[cache_key] = (currency, _now + _CURRENCY_CACHE_TTL_S)
+    except Exception:
+        logger.exception(
+            "[STRATEGIC_STATE] background currency resolve failed for project %s",
+            project_id,
+        )
 
 
 def _build_work_session_summary(
@@ -1178,7 +1216,6 @@ async def get_project_strategic_state(
     from app.strategic_spawning import (
         _build_payload_staleness_block,
         _build_unknown_freshness_block,
-        _resolve_candidate_currency,
         get_project_integration_branch,
     )
 
@@ -1191,35 +1228,28 @@ async def get_project_strategic_state(
             _now = time.monotonic()
             _cached = _CURRENCY_CACHE.get(_cache_key)
             if _cached is not None and _cached[1] > _now:
-                currency = _cached[0]
+                # Warm cache: serve last resolved verdict without waiting on GitHub.
+                sha_freshness = {
+                    **_build_payload_staleness_block(_cached[0]),
+                    "integration_branch": _integration_branch,
+                }
             else:
-                currency = await asyncio.wait_for(
-                    _resolve_candidate_currency(
-                        session, project, _last_qual, _integration_branch
-                    ),
-                    timeout=_CURRENCY_RESOLVE_TIMEOUT_S,
+                # Cold cache: return unknown immediately and resolve off the request path.
+                # The background task writes to _CURRENCY_CACHE for the next request.
+                _task = asyncio.create_task(
+                    _currency_resolve_and_cache(
+                        project.id, _last_qual, _integration_branch, _cache_key
+                    )
                 )
-                # Don't cache transient api_unreachable verdicts — a GitHub blip
-                # should not pin a stale banner for the full TTL.
-                _verdict = currency.get("verdict") if isinstance(currency, dict) else None
-                if _verdict != "api_unreachable":
-                    # Purge expired entries on write to prevent unbounded growth
-                    # (key includes candidate_sha which rotates each cycle).
-                    _expired = [k for k, v in _CURRENCY_CACHE.items() if v[1] <= _now]
-                    for _k in _expired:
-                        del _CURRENCY_CACHE[_k]
-                    _CURRENCY_CACHE[_cache_key] = (currency, _now + _CURRENCY_CACHE_TTL_S)
-            # Typed block: fresh/stale carry SHA detail; api_unreachable and
-            # unknown carry their verdict/reason WITHOUT a stale flag so the
-            # dashboard distinguishes a transient GitHub outage from genuine
-            # indeterminacy.
-            sha_freshness = {
-                **_build_payload_staleness_block(currency),
-                "integration_branch": _integration_branch,
-            }
+                _BG_TASKS.add(_task)
+                _task.add_done_callback(_BG_TASKS.discard)
+                sha_freshness = {
+                    **_build_unknown_freshness_block(),
+                    "integration_branch": _integration_branch,
+                }
         except Exception:
             logger.exception(
-                "[STRATEGIC_STATE] sha_freshness resolve failed for project %s",
+                "[STRATEGIC_STATE] sha_freshness build failed for project %s",
                 project.id,
             )
             sha_freshness = _build_unknown_freshness_block()

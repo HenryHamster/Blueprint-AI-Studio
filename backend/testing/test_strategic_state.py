@@ -6184,7 +6184,12 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
 
     This is the acceptance-criteria test: non-trivial mock + real merge-test
     verdict path (candidate != head_sha → current=False → verdict=stale).
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the stale verdict
+    without awaiting GitHub (non-blocking design).
     """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     candidate_sha = "abc1234" * 5
     head_sha = "def5678" * 5
@@ -6199,18 +6204,15 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": False,
-                "candidate_sha": candidate_sha,
-                "head_sha": head_sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", candidate_sha)
+    currency = {"current": False, "candidate_sha": candidate_sha, "head_sha": head_sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6226,7 +6228,14 @@ async def test_strategic_state_exposes_sha_freshness_verdict_when_candidate_behi
 async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
     client: AsyncClient, db_session, mocker
 ):
-    """Open version where candidate == integration HEAD → verdict fresh."""
+    """Open version where candidate == integration HEAD → verdict fresh.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the fresh verdict
+    without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     sha = "aabbccdd" * 5
     version = ReleaseVersion(
@@ -6240,18 +6249,15 @@ async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": True,
-                "candidate_sha": sha,
-                "head_sha": sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", sha)
+    currency = {"current": True, "candidate_sha": sha, "head_sha": sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6267,7 +6273,7 @@ async def test_strategic_state_sha_freshness_fresh_when_candidate_matches_head(
 async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
     client: AsyncClient, db_session, mocker
 ):
-    """When _resolve_candidate_currency raises, sha_freshness.verdict is unknown.
+    """On cold cache, sha_freshness.verdict is unknown (resolve runs off-path).
     Endpoint must still return 200 (GitHub failure must not break the read model)."""
     project = await _make_project(db_session)
     version = ReleaseVersion(
@@ -6281,12 +6287,14 @@ async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(side_effect=RuntimeError("GitHub API timeout")),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    # Cold cache → endpoint returns unknown immediately without awaiting GitHub.
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6299,7 +6307,14 @@ async def test_strategic_state_sha_freshness_unknown_when_resolve_fails(
 async def test_strategic_state_sha_freshness_includes_checked_at(
     client: AsyncClient, db_session, mocker
 ):
-    """Freshness block for a fresh verdict carries a checked_at ISO timestamp."""
+    """Freshness block for a fresh verdict carries a checked_at ISO timestamp.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the fresh
+    verdict without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     sha = "ccddee11" * 5
     version = ReleaseVersion(
@@ -6313,18 +6328,15 @@ async def test_strategic_state_sha_freshness_includes_checked_at(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": True,
-                "candidate_sha": sha,
-                "head_sha": sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
+    )
+    cache_key = (str(project.id), "main", sha)
+    currency = {"current": True, "candidate_sha": sha, "head_sha": sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6341,7 +6353,14 @@ async def test_strategic_state_sha_freshness_includes_checked_at(
 async def test_strategic_state_sha_freshness_includes_integration_branch(
     client: AsyncClient, db_session, mocker
 ):
-    """Stale freshness block carries the integration_branch name used for comparison."""
+    """Stale freshness block carries the integration_branch name used for comparison.
+
+    Pre-populates _CURRENCY_CACHE so the warm-cache path returns the stale
+    verdict without awaiting GitHub (non-blocking design).
+    """
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE_TTL_S
+
     project = await _make_project(db_session)
     candidate_sha = "aabb1122" * 5
     head_sha = "ccdd3344" * 5
@@ -6356,18 +6375,15 @@ async def test_strategic_state_sha_freshness_includes_integration_branch(
     await db_session.commit()
 
     mocker.patch(
-        "app.strategic_spawning._resolve_candidate_currency",
-        new=AsyncMock(
-            return_value={
-                "current": False,
-                "candidate_sha": candidate_sha,
-                "head_sha": head_sha,
-            }
-        ),
-    )
-    mocker.patch(
         "app.strategic_spawning.get_project_integration_branch",
         return_value="automain",
+    )
+    cache_key = (str(project.id), "automain", candidate_sha)
+    currency = {"current": False, "candidate_sha": candidate_sha, "head_sha": head_sha}
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {cache_key: (currency, time.monotonic() + _CURRENCY_CACHE_TTL_S)},
+        clear=True,
     )
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
@@ -6397,9 +6413,18 @@ async def test_strategic_state_sha_freshness_unknown_includes_checked_at(
 async def test_strategic_state_sha_freshness_api_unreachable_distinct_from_unknown(
     client: AsyncClient, db_session, mocker
 ):
-    """A transient GitHub failure surfaces sha_freshness.verdict='api_unreachable'
-    on the admin strategic-state read model — distinct from 'unknown' — without a
-    stale flag, and the endpoint still returns 200."""
+    """api_unreachable background results are NOT written to _CURRENCY_CACHE.
+
+    With the non-blocking design, currency is resolved off the request path.
+    A transient GitHub failure (api_unreachable) must not be cached — the next
+    request should still trigger a fresh background resolution attempt rather
+    than serving a pinned api_unreachable verdict for the full TTL.
+    """
+    from app.routers.admin_project_strategic_session import (
+        _CURRENCY_CACHE,
+        _currency_resolve_and_cache,
+    )
+
     project = await _make_project(db_session)
     candidate = "abc1234" * 5
     version = ReleaseVersion(
@@ -6427,15 +6452,116 @@ async def test_strategic_state_sha_freshness_api_unreachable_distinct_from_unkno
         "app.strategic_spawning.get_project_integration_branch",
         return_value="main",
     )
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
+    )
 
+    # Cold cache → endpoint returns unknown immediately (GitHub not awaited).
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
     assert resp.status_code == 200
     freshness = resp.json()["sha_freshness"]
-    assert freshness["verdict"] == "api_unreachable"
-    assert freshness["verdict"] != "unknown"
-    assert freshness.get("stale") is None, "stale must not be set on api_unreachable"
-    assert freshness.get("integration_branch") == "main"
-    _assert_generated_at_iso_utc(freshness)
+    assert freshness["verdict"] == "unknown"
+
+    # Run the background coroutine directly to verify api_unreachable is not cached.
+    cache_key = (str(project.id), "main", candidate)
+    last_qual = {"candidate_sha": candidate, "status": "not_promoted"}
+    await _currency_resolve_and_cache(project.id, last_qual, "main", cache_key)
+
+    # api_unreachable must NOT be written to the cache.
+    assert cache_key not in _CURRENCY_CACHE, (
+        "api_unreachable verdict must not be cached; found in _CURRENCY_CACHE"
+    )
+
+
+@pytest.mark.asyncio
+async def test_strategic_state_currency_is_non_blocking(
+    client: AsyncClient, db_session, mocker
+):
+    """GET /strategic-state must return promptly on a cold currency cache.
+
+    Acceptance test: with _resolve_candidate_currency patched to sleep 2 s the
+    endpoint must return 'unknown' (or a previously-cached verdict) immediately
+    instead of blocking.  After the background task runs, _CURRENCY_CACHE is
+    populated for subsequent callers.
+    """
+    import asyncio
+    import time
+    from app.routers.admin_project_strategic_session import _CURRENCY_CACHE
+
+    project = await _make_project(db_session)
+    sha = "deadbeef" * 5
+    version = ReleaseVersion(
+        project_id=project.id,
+        version_number=1,
+        status="open",
+        opened_at=_utcnow(),
+        last_qualification={"candidate_sha": sha, "status": "not_promoted"},
+    )
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.strategic_spawning.get_project_integration_branch",
+        return_value="main",
+    )
+
+    resolved_event = asyncio.Event()
+
+    async def _slow_resolve(*args, **kwargs):
+        await asyncio.sleep(2)
+        resolved_event.set()
+        return {"current": True, "candidate_sha": sha, "head_sha": sha}
+
+    mocker.patch(
+        "app.strategic_spawning._resolve_candidate_currency",
+        new=_slow_resolve,
+    )
+    # Ensure cold cache for this project/branch/sha combination.
+    mocker.patch.dict(
+        "app.routers.admin_project_strategic_session._CURRENCY_CACHE",
+        {},
+        clear=True,
+    )
+
+    # Capture background tasks so we can await them after the response.
+    bg_tasks: list[asyncio.Task] = []
+    original_create_task = asyncio.create_task
+
+    def _capture_create_task(coro, **kw):
+        t = original_create_task(coro, **kw)
+        bg_tasks.append(t)
+        return t
+
+    mocker.patch("asyncio.create_task", side_effect=_capture_create_task)
+
+    # --- BEFORE measurement ---
+    t0 = time.monotonic()
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
+    elapsed = time.monotonic() - t0
+
+    assert resp.status_code == 200
+    freshness = resp.json()["sha_freshness"]
+    # Cold cache → endpoint returns unknown without waiting on GitHub.
+    assert freshness["verdict"] == "unknown", (
+        f"Expected 'unknown' on cold cache, got {freshness['verdict']!r}"
+    )
+    # Must return well under the 2 s mock sleep — proves it is non-blocking.
+    assert elapsed < 1.0, (
+        f"Endpoint took {elapsed:.2f}s; expected non-blocking return under 1s"
+    )
+    # A background task must have been scheduled.
+    assert bg_tasks, "asyncio.create_task was not called — background resolution not scheduled"
+
+    # --- AFTER: wait for background task, then verify cache is populated ---
+    await asyncio.gather(*bg_tasks, return_exceptions=True)
+    cache_key = (str(project.id), "main", sha)
+    assert cache_key in _CURRENCY_CACHE, (
+        "Background resolution did not populate _CURRENCY_CACHE"
+    )
+    cached_currency, _ = _CURRENCY_CACHE[cache_key]
+    assert cached_currency.get("current") is True
 
 
 @pytest.mark.asyncio
