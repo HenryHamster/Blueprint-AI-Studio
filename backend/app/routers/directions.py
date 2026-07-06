@@ -13,7 +13,6 @@ from pydantic import BaseModel, Field
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
-from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
 from app.database import get_session
@@ -532,22 +531,29 @@ async def add_direction(
             headers={"Retry-After": "2"},
         )
     if not existing_direction and direction.get("gap_id") and not payload.staged:
-        reconciliation = reconcile_gap_staffing_raw_result(
-            project.problem_model,
-            direction["id"],
-            direction["gap_id"],
-            None,
-            new_status=direction.get("status"),
-            now_iso=_utcnow().isoformat(),
-        )
-        if reconciliation.get("problem_model") is not None:
-            project.problem_model = reconciliation["problem_model"]
-            flag_modified(project, "problem_model")
-        _log_gap_staffing_reconcile_result(
-            source="operator_create_direction",
-            project_id=project.id,
-            result=reconciliation,
-        )
+        _reconcile_holder: list[dict] = []
+        _dir_id = direction["id"]
+        _gap_id = direction["gap_id"]
+        _dir_status = direction.get("status")
+        _now_iso = _utcnow().isoformat()
+
+        def _reconcile_pm_add(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, _dir_id, _gap_id, None,
+                new_status=_dir_status, now_iso=_now_iso,
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_add)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_create_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
 
@@ -1186,23 +1192,30 @@ async def update_direction(
         )
     if staffing_transition:
         transition = staffing_transition[0]
-        reconciliation = reconcile_gap_staffing_raw_result(
-            project.problem_model,
-            direction_id,
-            transition.get("new_gap_id"),
-            transition.get("prior_gap_id"),
-            new_status=transition.get("new_status"),
-            prior_status=transition.get("prior_status"),
-            now_iso=_utcnow().isoformat(),
-        )
-        if reconciliation.get("problem_model") is not None:
-            project.problem_model = reconciliation["problem_model"]
-            flag_modified(project, "problem_model")
-        _log_gap_staffing_reconcile_result(
-            source="operator_update_direction",
-            project_id=project.id,
-            result=reconciliation,
-        )
+        _reconcile_holder: list[dict] = []
+        _new_gap_id = transition.get("new_gap_id")
+        _prior_gap_id = transition.get("prior_gap_id")
+        _new_status = transition.get("new_status")
+        _prior_status = transition.get("prior_status")
+        _now_iso = _utcnow().isoformat()
+
+        def _reconcile_pm_update(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, direction_id, _new_gap_id, _prior_gap_id,
+                new_status=_new_status, prior_status=_prior_status, now_iso=_now_iso,
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_update)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_update_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)
     return {"direction": updated_direction[0]}
@@ -1364,24 +1377,30 @@ async def resurrect_direction_endpoint(
     # operator PATCH status/gap_id path runs).
     if staffing_holder:
         transition = staffing_holder[0]
-        reconciliation = reconcile_gap_staffing_raw_result(
-            project.problem_model,
-            direction_id,
-            transition.get("new_gap_id"),
-            transition.get("prior_gap_id"),
-            new_status=transition.get("new_status"),
-            prior_status=transition.get("prior_status"),
-            now_iso=now_iso,
-            rationale="direction resurrected",
-        )
-        if reconciliation.get("problem_model") is not None:
-            project.problem_model = reconciliation["problem_model"]
-            flag_modified(project, "problem_model")
-        _log_gap_staffing_reconcile_result(
-            source="operator_resurrect_direction",
-            project_id=project.id,
-            result=reconciliation,
-        )
+        _reconcile_holder: list[dict] = []
+        _new_gap_id = transition.get("new_gap_id")
+        _prior_gap_id = transition.get("prior_gap_id")
+        _new_status = transition.get("new_status")
+        _prior_status = transition.get("prior_status")
+
+        def _reconcile_pm_resurrect(pm: dict) -> None:
+            _r = reconcile_gap_staffing_raw_result(
+                pm, direction_id, _new_gap_id, _prior_gap_id,
+                new_status=_new_status, prior_status=_prior_status,
+                now_iso=now_iso, rationale="direction resurrected",
+            )
+            _reconcile_holder.append(_r)
+            if _r.get("problem_model") is not None:
+                pm.clear()
+                pm.update(_r["problem_model"])
+
+        await with_problem_model_locked(session, project.id, _reconcile_pm_resurrect)
+        if _reconcile_holder:
+            _log_gap_staffing_reconcile_result(
+                source="operator_resurrect_direction",
+                project_id=project.id,
+                result=_reconcile_holder[0],
+            )
 
     await session.commit()
     await emit_strategic_updated(project.id, STRATEGIC_KIND_DIRECTIONS)

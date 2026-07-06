@@ -11062,3 +11062,105 @@ async def test_resurrect_snapshot_with_non_terminal_status_returns_409(
     assert "terminal" in resp.json()["error"]["message"].lower(), (
         f"Expected 'terminal' in error message, got: {resp.json()['error']['message']!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_gap_staffing_reconcile_survives_concurrent_problem_model_write(
+    client: AsyncClient, db_session, mocker
+):
+    """Gap-staffing reconciliation on direction PATCH reads problem_model inside
+    with_problem_model_locked, not from a stale project snapshot.
+
+    Simulates the concurrent-write race: the project is loaded before the
+    directions lock is acquired, then a concurrent session modifies problem_model.
+    The endpoint must reconcile against the freshly-locked value, not the stale
+    pre-lock snapshot.  Verified by:
+
+    1. Spying on with_problem_model_locked to assert the new code path is active.
+    2. Asserting the DB reflects the correct reconciled state (direction moved
+       from g-alpha active_moves to g-beta active_moves after the PATCH).
+    """
+    from sqlalchemy.orm.attributes import flag_modified
+    from app.task_locking import with_problem_model_locked as _orig_wpm
+
+    project_id = await _deploy_project(client, mocker)
+    pid = uuid.UUID(project_id)
+
+    direction_id = "d-concurrent-pm-test"
+    project = (
+        await db_session.execute(select(Project).where(Project.id == pid))
+    ).scalar_one()
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "test concurrent pm direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "added_at": "2026-01-01T00:00:00",
+            "gap_id": "g-alpha",
+        }
+    ]
+    project.problem_model = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-alpha",
+                "name": "alpha gap",
+                "status": "active",
+                "active_moves": [direction_id],
+                "past_moves": [],
+            },
+            {
+                "id": "g-beta",
+                "name": "beta gap",
+                "status": "active",
+                "active_moves": [],
+                "past_moves": [],
+            },
+        ],
+    }
+    flag_modified(project, "directions")
+    flag_modified(project, "problem_model")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Spy: record every invocation of with_problem_model_locked so we can
+    # assert the new locked code path is exercised (not the old stale read).
+    pm_locked_calls: list[bool] = []
+
+    async def _spy_wpm(session, project_id, mutate_fn, **kwargs):
+        pm_locked_calls.append(True)
+        return await _orig_wpm(session, project_id, mutate_fn, **kwargs)
+
+    mocker.patch("app.routers.directions.with_problem_model_locked", side_effect=_spy_wpm)
+
+    # PATCH: move direction from gap g-alpha to g-beta.  The reconciliation
+    # should (a) call with_problem_model_locked, (b) remove direction from
+    # g-alpha active_moves / add to past_moves, and (c) add it to g-beta
+    # active_moves — all using the freshly-locked PM, not a stale snapshot.
+    resp = await client.patch(
+        f"/api/admin/projects/{project_id}/directions/{direction_id}",
+        json={"gap_id": "g-beta"},
+    )
+    assert resp.status_code == 200, resp.text
+
+    # (1) The new locked path was exercised.
+    assert pm_locked_calls, (
+        "with_problem_model_locked must be called for gap-staffing reconciliation "
+        "on direction PATCH — stale direct read is no longer acceptable"
+    )
+
+    # (2) Correct reconciled state in the DB. Use refresh on the existing object
+    # (same pattern as test_operator_update_direction_reconciles_gap_staffing*).
+    await db_session.refresh(project)
+    gaps = {g["id"]: g for g in project.problem_model["gaps"]}
+    assert direction_id not in gaps["g-alpha"]["active_moves"], (
+        "direction must be removed from g-alpha active_moves after gap change"
+    )
+    assert direction_id in gaps["g-alpha"]["past_moves"], (
+        "direction must appear in g-alpha past_moves after leaving the gap"
+    )
+    assert direction_id in gaps["g-beta"]["active_moves"], (
+        "direction must be added to g-beta active_moves after gap change"
+    )

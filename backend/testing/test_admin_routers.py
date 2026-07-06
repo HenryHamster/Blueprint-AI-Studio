@@ -11088,6 +11088,105 @@ class TestAcceptPendingConfirmation:
         assert resp.status_code == 422
 
 
+class TestPendingConfirmationLockedRMW:
+    """Regression: accept/dismiss must hold the project lock before reading
+    problem_model to prevent a lost-update race against the strategist."""
+
+    _PENDING_PM: dict = {
+        "revision": 1,
+        "last_updated": "2026-01-01T00:00:00",
+        "last_updated_by": "agent",
+        "intent": {"purpose": "p", "current_focus": "", "user_purpose": "p"},
+        "context": {},
+        "constraints": [],
+        "capabilities": [],
+        "gaps": [],
+        "archived_gaps": [],
+        "friction": [],
+        "pending_user_confirmation": [
+            {
+                "id": "p-lock001",
+                "type": "major_decision",
+                "proposal": "Lock test proposal",
+                "created_at": "2026-01-01T00:00:00",
+            }
+        ],
+        "revision_log": [],
+    }
+
+    @pytest.mark.asyncio
+    async def test_pending_confirmation_accept_dismiss_locked_rmw(
+        self, client: AsyncClient, db_session
+    ):
+        """Both dismiss and accept acquire lock_project_or_429 before reading
+        problem_model so concurrent writes are not lost.
+
+        We verify this by spying on lock_project_or_429 (delegating to the real
+        implementation so the transaction is valid) and asserting it is called
+        with the expected project id.  The test also exercises the real mutation
+        path and verifies the 200 response and correct problem_model state.
+        """
+        import copy
+        from unittest.mock import patch
+
+        from app.routers import admin_projects as _mod
+
+        orig_lock = _mod.lock_project_or_429
+
+        # ---- dismiss path ----
+        project_d = await _make_project(db_session)
+        project_d.problem_model = copy.deepcopy(self._PENDING_PM)
+        db_session.add(project_d)
+        await db_session.commit()
+
+        lock_calls_d: list = []
+
+        async def spy_lock_d(session, project_id):
+            lock_calls_d.append(project_id)
+            return await orig_lock(session, project_id)
+
+        with patch.object(_mod, "lock_project_or_429", side_effect=spy_lock_d):
+            resp = await client.post(
+                f"/api/admin/projects/{project_d.id}/pending-confirm/p-lock001/dismiss"
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert project_d.id in lock_calls_d, (
+            f"dismiss did not call lock_project_or_429 with project id; calls={lock_calls_d}"
+        )
+        await db_session.refresh(project_d)
+        assert project_d.problem_model["pending_user_confirmation"] == [], (
+            "dismiss did not remove the pending item from problem_model"
+        )
+
+        # ---- accept path ----
+        project_a = await _make_project(db_session)
+        project_a.problem_model = copy.deepcopy(self._PENDING_PM)
+        db_session.add(project_a)
+        await db_session.commit()
+
+        lock_calls_a: list = []
+
+        async def spy_lock_a(session, project_id):
+            lock_calls_a.append(project_id)
+            return await orig_lock(session, project_id)
+
+        with patch.object(_mod, "lock_project_or_429", side_effect=spy_lock_a):
+            resp = await client.post(
+                f"/api/admin/projects/{project_a.id}/pending-confirm/p-lock001/accept",
+                json={"answer": "confirmed"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert project_a.id in lock_calls_a, (
+            f"accept did not call lock_project_or_429 with project id; calls={lock_calls_a}"
+        )
+        await db_session.refresh(project_a)
+        assert project_a.problem_model["pending_user_confirmation"] == [], (
+            "accept did not remove the pending item from problem_model"
+        )
+
+
 class TestBuildDeployStatePayload:
     """Regression: WS broadcasts use websocket.send_json which lacks FastAPI's
     JSON encoder, so any datetime in the payload raised

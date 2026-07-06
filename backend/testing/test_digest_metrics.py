@@ -27,6 +27,7 @@ from app.digest_metrics import (
     compute_migration_slot_contention_summary,
     _MIGRATION_SLOT_HOLD_ALERT_SECONDS,
     compute_narrative_summary,
+    compute_outer_loop_convergence,
     compute_dependency_health_signals,
     compute_recurring_error_clusters,
     compute_release_qualifier_infra_metrics,
@@ -2410,6 +2411,42 @@ def test_compute_non_code_outcomes_includes_window_straddling_terminal_task():
     assert result["successes"] == 1
     assert result["neutrals"] == 0
     assert result["failures"] == 0
+
+
+def test_outer_loop_convergence_non_code_outcomes_includes_straddling_task():
+    """compute_outer_loop_convergence counts non-code tasks that straddle the window.
+
+    A task created before window_start but completing within the window must appear
+    in non_code_outcomes. This validates that the DB query layer must supply tasks
+    with a wider lookback (created_at < window_start) so _compute_non_code_outcomes
+    (which correctly windows on completion time) can count them.
+    """
+    now = _utcnow()
+    window_start = now - timedelta(hours=24)
+    # Created well before the window but completed within it
+    created_before_window = window_start - timedelta(hours=12)
+    completed_in_window = window_start + timedelta(hours=2)
+
+    straddling_task = make_task(
+        status=TaskStatus.COMPLETED,
+        payloads=[{"type": "research"}],
+        plan_output=[{"title": "Finding", "actionability_grade": "HIGH"}],
+        created_at=created_before_window,
+        status_log=[{"s": "COMPLETED", "t": completed_in_window.isoformat()}],
+    )
+
+    result = compute_outer_loop_convergence(
+        all_tasks=[straddling_task],
+        escalation_alerts=[],
+        window_start=window_start,
+    )
+
+    non_code = result.get("non_code_outcomes", {})
+    assert non_code.get("total") == 1, (
+        "Straddling non-code task (created before window, completed within) must "
+        "appear in non_code_outcomes; DB layer must use a wider lookback_cutoff"
+    )
+    assert non_code.get("successes") == 1
 
 
 class TestComputeRetryAnalytics:

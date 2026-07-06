@@ -914,6 +914,8 @@ async def dismiss_pending_confirmation(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["problem_model"])
     current_model = parse_problem_model(project.problem_model)
     matched = next(
         (p for p in current_model.pending_user_confirmation if p.id == pending_id),
@@ -973,6 +975,8 @@ async def accept_pending_confirmation(
     project = await _get_user_project_with_role(
         project_id, current_user["user_id"], session, "member"
     )
+    project = await lock_project_or_429(session, project.id)
+    await session.refresh(project, attribute_names=["problem_model"])
     current_model = parse_problem_model(project.problem_model)
 
     matched = next(

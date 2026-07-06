@@ -535,6 +535,17 @@ async def _record_remediation_outcome(
                 direction_id=str(direction_id),
             )
             return None
+        # Dedup: the rollup merge flow calls this function twice for the same
+        # task (intermediate merge + rollup landing). Skip any repeat recording
+        # for the same task_id to prevent inflated attempt counts and duplicate
+        # history entries.
+        task_id_str = str(task.id)
+        if any(
+            e.get("task_id") == task_id_str
+            for e in (target.get("remediation_history") or [])
+        ):
+            recorded["v"] = True
+            return None
         proj_shim = SimpleNamespace(directions=directions)
         fingerprint = ctx.get("diagnosis_fingerprint") or ctx.get("error_fingerprint")
         prior_fingerprint = target.get("last_remediation_fingerprint")
@@ -832,6 +843,10 @@ async def _record_project_remediation_outcome(
         entry["failure_class"] = failure_class
         entry["error_summary"] = error_summary
     history = list(state.get("history") or [])
+    # Dedup: skip if this task_id was already recorded in the project history.
+    task_id_str = str(task.id)
+    if any(e.get("task_id") == task_id_str for e in history):
+        return True
     history.append(entry)
     state["history"] = history[-_PROJECT_REMEDIATION_HISTORY_MAX:]
     state["attempts"] = int(state.get("attempts") or 0) + 1

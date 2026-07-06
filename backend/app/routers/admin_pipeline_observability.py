@@ -752,6 +752,7 @@ async def _fetch_outer_loop_tasks(
     project_id: uuid.UUID | None,
     limit: int,
     order_desc: bool = False,
+    lookback_cutoff: "datetime | None" = None,
 ) -> List[Task]:
     """Fetch the outer-loop window's terminal tasks with their payload type.
 
@@ -763,15 +764,23 @@ async def _fetch_outer_loop_tasks(
     just ``payloads[0]['type']`` and stash it for ``first_payload``; SQLite
     (tests/local) lacks usable JSON-path projection semantics and falls back to
     loading the column, mirroring ``admin_digest._compute_digest``.
+
+    ``lookback_cutoff`` controls the ``created_at >=`` DB filter. When wider than
+    ``cutoff`` (e.g. ``cutoff - hours`` to match the digest's 2x lookback), tasks
+    created before the window but completing within it become visible to
+    ``_compute_non_code_outcomes``, which windows on completion time not
+    creation time. Defaults to ``cutoff`` (unchanged behaviour for callers that
+    don't need the wider scan).
     """
     from app.sr_review_quality_metrics import (  # noqa: PLC0415
         _stash_projected_task_fields,
     )
 
+    db_cutoff = lookback_cutoff if lookback_cutoff is not None else cutoff
     use_projection = resolve_dialect_name(session) == "postgresql"
     where_clauses = [
         Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-        Task.created_at >= cutoff,
+        Task.created_at >= db_cutoff,
     ]
     if project_id is not None:
         where_clauses.append(Task.project_id == project_id)
@@ -874,6 +883,10 @@ async def get_outer_loop_convergence(
     from app.digest_metrics import compute_outer_loop_convergence  # noqa: PLC0415
 
     cutoff = _utcnow() - timedelta(hours=hours)
+    # Widen the DB scan by 1x hours so tasks created before the window but
+    # completing within it are visible to _compute_non_code_outcomes (which
+    # windows on completion time). Mirrors the 2x-lookback the digest uses.
+    lookback_cutoff = cutoff - timedelta(hours=hours)
 
     tasks = await _fetch_outer_loop_tasks(
         session,
@@ -881,6 +894,7 @@ async def get_outer_loop_convergence(
         project_id=project_id,
         limit=_OUTER_LOOP_TASK_CAP,
         order_desc=True,
+        lookback_cutoff=lookback_cutoff,
     )
     if len(tasks) >= _OUTER_LOOP_TASK_CAP:
         logger.warning(
