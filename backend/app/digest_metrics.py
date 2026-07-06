@@ -3942,7 +3942,7 @@ def compute_retry_analytics(
         _attempt = (t.context or {}).get("_attempt_number") or 0
         if _attempt > 1:
             _retry_task_count += 1
-            _retry_attempt_sum += _attempt
+            _retry_attempt_sum += _attempt - 1
             _task_retry_cost = 0.0
             if (
                 t.vm_provisioned_at

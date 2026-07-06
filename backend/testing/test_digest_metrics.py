@@ -2588,6 +2588,41 @@ class TestComputeRetryAnalytics:
         assert result["retry_success_count"] == 2
         assert result["retry_wasted_rate"] == round(1 / 3, 4)
 
+    def test_avg_retries_before_failure_correct(self):
+        """avg_retries_before_failure counts actual retries (attempt_number - 1), not attempt ordinal.
+
+        _attempt_number is 1-indexed: 1=first attempt, 2=second attempt (1 retry), 3=third (2 retries).
+        The average should reflect the number of retries, not the attempt number.
+        """
+        now = _utcnow()
+        window_start = now - timedelta(hours=24)
+        failed = [
+            # _attempt_number=2 → 1 retry (second attempt)
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+            # _attempt_number=3 → 2 retries (third attempt)
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 3},
+            ),
+            # _attempt_number=2 → 1 retry
+            make_task(
+                status=TaskStatus.FAILED,
+                context={"_attempt_number": 2},
+            ),
+        ]
+        result = compute_retry_analytics(
+            failed_tasks=failed,
+            completed_tasks=[],
+            dir_id_to_text={},
+            window_start=window_start,
+        )
+        # 3 retried failed tasks: (1 + 2 + 1) retries / 3 tasks = 4 / 3 ≈ 1.33
+        assert result["retry_task_count"] == 3
+        assert result["avg_retries_before_failure"] == round(4 / 3, 2)
+
 
 @pytest.mark.asyncio
 async def test_release_qualifier_infra_metrics_no_versions(db_session):

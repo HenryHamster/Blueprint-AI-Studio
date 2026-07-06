@@ -33,6 +33,7 @@ from app.models import (
     SystemMaturity,
     Task,
 )
+from app.strategic_constants import STRATEGIC_NOTES_HISTORY_MAX
 from app.task_locking import with_directions_locked
 from app.time_utils import _utcnow
 from app.json_extract import _extract_json_array
@@ -48,27 +49,42 @@ _PROPAGATION_RECORD_MAX_ENTRIES = 200
 def _record_skipped_propagation_note(
     direction: dict, proposed_mode: str, reason: str
 ) -> None:
-    """Append a bounded note when self-audit propagation is skipped for a direction.
+    """Append a bounded, deduplicated note when self-audit propagation is skipped for a direction.
 
     Records what mode was proposed and why propagation was skipped so the decision
     is visible in the task record and to operators rather than silently dropped.
+    Deduplicates identical skip notes to prevent unbounded growth when recurring
+    audits encounter the same operator-pinned mode repeatedly.
     """
     notes = list(direction.get("notes") or [])
-    notes.append(
-        {
-            "text": (
-                f"Self-audit propagation skipped: proposed mode '{proposed_mode}' — {reason}"
-            ),
-            "source": "self_audit_skip",
-            "proposed_mode": proposed_mode,
-            "created_at": _utcnow().isoformat(),
-        }
+    new_note_text = f"Self-audit propagation skipped: proposed mode '{proposed_mode}' — {reason}"
+
+    # Dedup: check if an identical skip note already exists
+    existing_skip_note = next(
+        (n for n in notes
+         if n.get("source") == "self_audit_skip"
+         and n.get("proposed_mode") == proposed_mode
+         and n.get("text") == new_note_text),
+        None
     )
-    direction["notes"] = notes
+
+    # Only append if no identical note exists
+    if not existing_skip_note:
+        notes.append(
+            {
+                "text": new_note_text,
+                "source": "self_audit_skip",
+                "proposed_mode": proposed_mode,
+                "created_at": _utcnow().isoformat(),
+            }
+        )
+
+    # Cap to max history size, keeping newest entries
+    direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
 def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> None:
-    """Append an explanatory note to a direction dict when its mode is auto-cleared.
+    """Append a bounded note to a direction dict when its mode is auto-cleared.
 
     Called by ``_maybe_auto_clear_direction_mode`` when a system's health has
     recovered. Re-homed here from the deleted ``app.self_audit_dispatch`` (the
@@ -86,7 +102,8 @@ def _record_auto_clear_note(direction: dict, cleared_from: str, count: int) -> N
             "created_at": _utcnow().isoformat(),
         }
     )
-    direction["notes"] = notes
+    # Cap to max history size, keeping newest entries
+    direction["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
 
 
 # Allowed values for SystemMaturity.recommended_mode. Rows with a value outside

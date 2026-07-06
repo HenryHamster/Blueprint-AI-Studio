@@ -4671,8 +4671,8 @@ async def test_digest_retry_overhead_cost_computation(client: AsyncClient, db_se
     body = response.json()
 
     assert body["retry_task_count"] == 3  # attempts 2, 3, 4 (attempt 1 excluded)
-    # avg = (2 + 3 + 4) / 3 = 3.0
-    assert body["avg_retries_before_failure"] == pytest.approx(3.0)
+    # avg retries = (1 + 2 + 3) / 3 = 2.0 (attempt_number - 1 for each)
+    assert body["avg_retries_before_failure"] == pytest.approx(2.0)
 
     expected_cost = ON_DEMAND_RATE * 3600 + SPOT_RATE * 1800
     assert body["retry_overhead_cost_usd"] == pytest.approx(round(expected_cost, 4))
