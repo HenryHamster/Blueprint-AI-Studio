@@ -3259,6 +3259,10 @@ async def strategic_operation(
             NEW_VERSION_GOAL_CONTEXT_KEY,
             QUALIFY_REQUEST_CONTEXT_KEY,
             VERSION_PHASE_DECISION_CONTEXT_KEY,
+            _apply_new_acceptance_criteria,
+            _apply_new_version_goal,
+            _apply_qualify_request,
+            _apply_version_phase_decision,
             extract_new_version_goal,
             extract_qualify_request,
             extract_version_phase_decision,
@@ -3391,6 +3395,11 @@ async def strategic_operation(
             "_strategic_api_called": True,
             "_strategic_problem_model_set": True,
         }
+        # Stash keys transiently so _handle_strategic_completion can still read
+        # them if something prevents the synchronous apply below from running.
+        # They are popped after the synchronous apply so the completion-time
+        # handler is a no-op (prevents double-application for non-resident tasks
+        # that complete normally after this call).
         if version_phase_decision is not None:
             new_ctx[VERSION_PHASE_DECISION_CONTEXT_KEY] = version_phase_decision
         if qualify_request is not None:
@@ -3402,6 +3411,34 @@ async def strategic_operation(
         task.context = new_ctx
         flag_modified(task, "context")
         session.add(task)
+        # Apply synchronously within this handler so resident sessions (where the
+        # task stays open for the entire conversation) get immediate effect rather
+        # than waiting for task completion. The apply helpers only call
+        # session.add(); the single commit below persists everything atomically.
+        await _apply_version_phase_decision(
+            version_phase_decision, task, project, session, path="api_inline"
+        )
+        await _apply_qualify_request(
+            qualify_request, task, project, session, path="api_inline"
+        )
+        await _apply_new_version_goal(
+            new_version_goal, task, project, session, path="api_inline"
+        )
+        await _apply_new_acceptance_criteria(
+            new_acceptance_criteria, task, project, session, path="api_inline"
+        )
+        # Pop the context keys now that they have been applied so
+        # _handle_strategic_completion's completion-time apply path is a no-op
+        # for each key that was handled here (idempotency guard).
+        for _applied_key in (
+            VERSION_PHASE_DECISION_CONTEXT_KEY,
+            QUALIFY_REQUEST_CONTEXT_KEY,
+            NEW_VERSION_GOAL_CONTEXT_KEY,
+            NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+        ):
+            new_ctx.pop(_applied_key, None)
+        task.context = new_ctx
+        flag_modified(task, "context")
         await session.commit()
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
@@ -3413,28 +3450,26 @@ async def strategic_operation(
         )
         if version_phase_decision is not None:
             logger.info(
-                "[STRATEGIC API] version_phase_decision (phase=%s) routed to "
-                "task.context for task %s — applied at strategic completion",
+                "[STRATEGIC API] version_phase_decision (phase=%s) applied "
+                "synchronously for task %s",
                 version_phase_decision["phase"],
                 task.id,
             )
         if qualify_request is not None:
             logger.info(
-                "[STRATEGIC API] qualify_request routed to task.context for "
-                "task %s — release qualifier runs at strategic completion if "
-                "the open version is in stabilize",
+                "[STRATEGIC API] qualify_request applied synchronously for "
+                "task %s — release qualifier ran if open version is in stabilize",
                 task.id,
             )
         if new_version_goal is not None:
             logger.info(
-                "[STRATEGIC API] new_version_goal routed to task.context for "
-                "task %s — applied to open version at strategic completion",
+                "[STRATEGIC API] new_version_goal applied synchronously for task %s",
                 task.id,
             )
         if new_acceptance_criteria is not None:
             logger.info(
-                "[STRATEGIC API] new_acceptance_criteria (%d items) routed to task.context "
-                "for task %s — criteria created at strategic completion",
+                "[STRATEGIC API] new_acceptance_criteria (%d items) applied "
+                "synchronously for task %s",
                 len(new_acceptance_criteria),
                 task.id,
             )

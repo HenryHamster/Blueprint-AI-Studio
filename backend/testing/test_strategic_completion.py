@@ -8662,14 +8662,13 @@ async def test_strategic_completion_appends_routine_digest_to_running_update(
 @pytest.mark.asyncio
 async def test_version_phase_decision_flows_end_to_end(client, db_session, mocker):
     """End-to-end: a version_phase_decision embedded in a set_problem_model call
-    rides task.context through to strategic completion and flips the open
-    ReleaseVersion's phase.
+    is applied synchronously within the API handler and flips the open
+    ReleaseVersion's phase immediately — not deferred to task completion.
 
-    This is the seam Phase 2b connects: the agent embeds version_phase_decision
-    as a top-level sibling of the problem_model; the /api/agent/strategic
-    endpoint must lift it out (ProblemModel is extra="forbid"), stash it on
-    task.context, and the completion handler must apply it to the open version.
-    The test exercises the REAL HTTP transport, not a mocked context write.
+    The agent embeds version_phase_decision as a top-level sibling of the
+    problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
+    is extra="forbid"), applies it synchronously, and pops the context key so
+    _handle_strategic_completion is a no-op. Exercises the REAL HTTP transport.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -8745,23 +8744,22 @@ async def test_version_phase_decision_flows_end_to_end(client, db_session, mocke
         "Ship the thing"
     )
 
-    # It rides task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get("_strategic_version_phase_decision")
-    assert stored == {
-        "phase": "stabilize",
-        "reasoning": "Enough features landed; time to harden.",
-    }
-
-    # Completion handler's API path applies the decision to the open version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: phase flip happened during set_problem_model itself.
     await db_session.refresh(version)
     assert version.phase == "stabilize", (
-        f"Expected open ReleaseVersion to flip to stabilize, got {version.phase!r}"
+        f"Expected open ReleaseVersion to flip to stabilize during set_problem_model, got {version.phase!r}"
     )
     assert version.phase_changed_at is not None
     assert version.phase_reasoning == "Enough features landed; time to harden."
+
+    # Context key is consumed and popped — not stored for the completion handler.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_version_phase_decision") is None
+
+    # Completion handler is a no-op for version_phase (key already applied).
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.phase == "stabilize"  # unchanged — no second flip
 
     # Sanity: still exactly one open version, still v1.
     open_ver = await rv.current_open_version(db_session, project.id)
@@ -9025,18 +9023,20 @@ async def test_handle_strategic_completion_preserves_collections_on_bootstrap(
 
 @pytest.mark.asyncio
 async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
-    """End-to-end: a qualify_request embedded in a set_problem_model call rides
-    task.context through to strategic completion and triggers the release
-    qualifier when the open ReleaseVersion is in the stabilize phase.
+    """End-to-end: a qualify_request embedded in a set_problem_model call is
+    applied synchronously within the API handler so resident sessions (where the
+    task stays open for the entire conversation) get immediate effect.
 
-    This is the seam Phase 3 batch 3b connects: the strategic agent embeds
-    qualify_request as a top-level sibling of the problem_model; the
-    /api/agent/strategic endpoint must lift it out (ProblemModel is
-    extra="forbid"), stash it on task.context, and the completion handler must
-    call release_qualifier.run_qualification on the open version. The test
-    exercises the REAL HTTP transport, not a mocked context write — the absence
-    of exactly this kind of end-to-end test let the version_phase_decision seam
-    silently break earlier.
+    The strategic agent embeds qualify_request as a top-level sibling of the
+    problem_model; the /api/agent/strategic endpoint lifts it out (ProblemModel
+    is extra="forbid"), applies it synchronously by calling _apply_qualify_request
+    directly, and pops the context key so _handle_strategic_completion is a
+    no-op — no double-application for non-resident tasks that also complete
+    normally.
+
+    Regression for fr-resident-qualify-request-application-timing: a qualify_request
+    submitted mid-session can no longer sit queued for the entire remaining duration
+    of the resident conversation.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9122,25 +9122,22 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
         "Ship the thing"
     )
 
-    # It rides task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get("_strategic_qualify_request")
-    assert stored == {
-        "reason": "Hardening is sufficient; the version is release-ready.",
-    }
-
-    # The qualifier has not run yet — only set_problem_model has been called.
-    run_qualification.assert_not_called()
-
-    # Completion handler's API path triggers qualification on the open version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: run_qualification fired during set_problem_model itself —
+    # not deferred to task completion. This is the resident-session fix.
     run_qualification.assert_awaited_once()
     call_args = run_qualification.await_args.args
-    # run_qualification(session, project_id, version)
-    assert call_args[0] is db_session
+    # run_qualification(session, project_id, version) — the handler's own session
+    # is used (not db_session), so check project_id and version identity only.
     assert call_args[1] == project.id
     assert call_args[2].id == version.id
+
+    # The context key is consumed and popped — no stale key left over.
+    await db_session.refresh(task)
+    assert (task.context or {}).get("_strategic_qualify_request") is None
+
+    # Completion handler does NOT trigger a second qualification (idempotency).
+    await _handle_strategic_completion(task, "", db_session)
+    run_qualification.assert_awaited_once()  # still exactly once
 
 
 @pytest.mark.asyncio
@@ -9150,8 +9147,9 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
     """A qualify_request is dropped (qualifier not run) when the open version is
     still in the build phase — qualification only runs from stabilize.
 
-    The transport still works (the field is stripped + stashed), but the
-    completion handler's phase gate blocks run_qualification.
+    The field is stripped from problem_model and the synchronous apply path
+    no-ops (phase gate). The context key is popped regardless so the completion
+    handler is also a no-op.
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -9214,14 +9212,15 @@ async def test_qualify_request_skipped_when_version_not_in_stabilize(
         headers={"x-agent-token": token},
     )
     assert resp.status_code == 200, resp.text
-    # The transport works — the field is received and stashed.
+    # The field is received (reported in the response).
     assert resp.json()["qualify_request_received"] is True
+    # Phase gate blocks the qualifier — run_qualification not called.
+    run_qualification.assert_not_awaited()
+    # Context key is consumed and popped, not left in task.context.
     await db_session.refresh(task)
-    assert (task.context or {}).get("_strategic_qualify_request") == {
-        "reason": "premature ask"
-    }
+    assert (task.context or {}).get("_strategic_qualify_request") is None
 
-    # But the completion handler's stabilize gate blocks the qualifier.
+    # Completion handler is also a no-op (key already popped).
     await _handle_strategic_completion(task, "", db_session)
     run_qualification.assert_not_awaited()
 
@@ -9423,7 +9422,7 @@ async def test_handle_strategic_completion_applies_new_acceptance_criteria_from_
 async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     client, db_session
 ):
-    """The API seam must strip, stow, and later apply new_acceptance_criteria."""
+    """The API seam must strip and apply new_acceptance_criteria synchronously."""
     from app import acceptance_criteria as ac
     from app import release_version as rv
     from app.auth import create_agent_token
@@ -9491,15 +9490,19 @@ async def test_set_problem_model_lifts_new_acceptance_criteria_api_path(
     await db_session.refresh(project)
     assert "new_acceptance_criteria" not in (project.problem_model or {})
 
-    await db_session.refresh(task)
-    stored = (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY)
-    assert stored == criteria_texts
-
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: criteria created during set_problem_model, not deferred.
     fetched = await ac.get_criteria_for_version(db_session, version.id)
     assert [c.text for c in fetched] == criteria_texts
     assert all(c.created_by == "strategist" for c in fetched)
+
+    # Context key is consumed and popped — completion handler is a no-op.
+    await db_session.refresh(task)
+    assert (task.context or {}).get(NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY) is None
+
+    # Completion handler does not create duplicate criteria.
+    await _handle_strategic_completion(task, "", db_session)
+    fetched2 = await ac.get_criteria_for_version(db_session, version.id)
+    assert len(fetched2) == len(criteria_texts)  # no duplicates
 
 
 # ── _compute_lifetime_burn_metrics ───────────────────────────────────────────
@@ -17664,12 +17667,12 @@ async def test_handle_strategic_completion_rejects_contentless_new_version_goal(
 async def test_set_problem_model_lifts_new_version_goal_api_path(
     client, db_session, mocker
 ):
-    """Full API-path regression: new_version_goal lifts past ProblemModel extra=forbid,
-    stows in task.context, and the completion handler applies it to a null-goal version.
+    """Full API-path regression: new_version_goal lifts past ProblemModel extra=forbid
+    and is applied synchronously within the API handler to the open version.
 
     Exercises the seam end-to-end using the real HTTP transport (not a mocked
-    context write) so that a future regression in any of the three layers
-    (endpoint strip, context stow, completion apply) will fail this test.
+    context write). The context key is popped after synchronous apply so the
+    completion handler is a no-op (idempotency guard for non-resident tasks).
     """
     from unittest.mock import AsyncMock
     from app.auth import create_agent_token
@@ -17751,25 +17754,24 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         "Ship the thing"
     )
 
-    # It must ride task.context to the completion handler.
-    await db_session.refresh(task)
-    stored = (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY)
-    assert stored == goal_text, (
-        f"Expected new_version_goal stowed in task.context[{NEW_VERSION_GOAL_CONTEXT_KEY!r}]; "
-        f"got {stored!r}"
-    )
-
-    # Completion handler's API path must apply the goal to the null-goal version.
-    await _handle_strategic_completion(task, "", db_session)
-
+    # Synchronous apply: goal is set during set_problem_model, not deferred.
     await db_session.refresh(version)
     assert version.goal == goal_text, (
-        f"Expected open version goal to be set to {goal_text!r}; got {version.goal!r}"
+        f"Expected open version goal to be set during set_problem_model; got {version.goal!r}"
     )
     assert version.goal_editor_info is not None
     assert version.goal_editor_info.startswith("[strategist:"), (
         f"goal_editor_info must use source='strategist'; got {version.goal_editor_info!r}"
     )
+
+    # Context key is consumed and popped — not stowed for the completion handler.
+    await db_session.refresh(task)
+    assert (task.context or {}).get(NEW_VERSION_GOAL_CONTEXT_KEY) is None
+
+    # Completion handler is a no-op (key already applied).
+    await _handle_strategic_completion(task, "", db_session)
+    await db_session.refresh(version)
+    assert version.goal == goal_text  # unchanged
 
     # A second call with a different goal from the strategist IS allowed —
     # the strategist can correct its own previously-authored goal.
@@ -17789,8 +17791,7 @@ async def test_set_problem_model_lifts_new_version_goal_api_path(
         headers={"x-agent-token": token},
     )
     assert resp2.status_code == 200, resp2.text
-    await db_session.refresh(task)
-    await _handle_strategic_completion(task, "", db_session)
+    # Second synchronous apply sets corrected goal immediately.
     await db_session.refresh(version)
     assert version.goal == corrected_goal, (
         f"Strategist must be able to correct its own goal; got {version.goal!r}"
