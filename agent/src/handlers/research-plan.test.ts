@@ -1575,6 +1575,12 @@ describe('buildVersionPhaseSection', () => {
     expect(result).not.toContain('Error: `');
   });
 
+  it('renders failure advisory when build_unavailable is true (without lifecycle_signal)', () => {
+    const result = buildVersionPhaseSection({ build_unavailable: true });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('infrastructure failure');
+  });
+
   it('does not trigger failure marker for normal payloads lacking lifecycle_signal', () => {
     const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
     // Normal path — should render normally, not as a failure marker.

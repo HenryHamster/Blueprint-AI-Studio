@@ -7011,6 +7011,7 @@ async def _spawn_strategic_review(
             _version_phase_block = {
                 "lifecycle_signal": "unavailable",
                 "signal_status": "build_failed",
+                "build_unavailable": True,
                 "error": repr(_vpb_exc)[:240],
                 "integration_branch": _integration_branch,
                 "promotion_target": _promotion_target,

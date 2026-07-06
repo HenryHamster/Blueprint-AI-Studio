@@ -830,7 +830,7 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
 
   // Failure marker — the backend assembly failed; surface as an explicit advisory
   // so the strategist knows the omission is a build error, not missing lifecycle.
-  if (versionPhase.lifecycle_signal === 'unavailable') {
+  if (versionPhase.lifecycle_signal === 'unavailable' || versionPhase.build_unavailable === true) {
     const signalStatus = typeof versionPhase.signal_status === 'string' ? versionPhase.signal_status : 'build_failed';
     const integrationBranch = typeof versionPhase.integration_branch === 'string' ? versionPhase.integration_branch : null;
     const promotionTarget = typeof versionPhase.promotion_target === 'string' ? versionPhase.promotion_target : null;
@@ -838,9 +838,10 @@ export function buildVersionPhaseSection(versionPhase: Record<string, unknown> |
     const branchCtx = integrationBranch && promotionTarget
       ? ` (integration: \`${integrationBranch}\` → promotion: \`${promotionTarget}\`)`
       : integrationBranch ? ` (integration: \`${integrationBranch}\`)` : '';
+    const lifecycleSignal = typeof versionPhase.lifecycle_signal === 'string' ? versionPhase.lifecycle_signal : 'unavailable';
     const lines: string[] = [
       '\n## Version Phase',
-      `**lifecycle_signal: ${versionPhase.lifecycle_signal} / ${signalStatus}**${branchCtx}`,
+      `**lifecycle_signal: ${lifecycleSignal} / ${signalStatus}**${branchCtx}`,
       'The version-phase lifecycle block could not be assembled this cycle due to a backend error. ' +
       'This is an infrastructure failure — not evidence that no release lifecycle exists. ' +
       'Do not treat the absence of version-phase data as a signal to change phase or qualification strategy.',

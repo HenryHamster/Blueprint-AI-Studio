@@ -384,6 +384,7 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     for key in (
         "lifecycle_signal",
         "signal_status",
+        "build_unavailable",
         "error",
         "integration_branch",
         "promotion_target",
