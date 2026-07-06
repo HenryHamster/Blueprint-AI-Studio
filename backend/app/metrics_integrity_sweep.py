@@ -31,10 +31,12 @@ Hard invariants (mirrors ``structural_health_audit.py``):
 
 Registered checks: ``landed_vs_reported_merges``, ``playbook_confirmation_integrity``,
 ``direction_acceptance_metric_invariant``, ``noncode_outcome_window_accounting``,
-and ``completion_debt_completeness`` (recomputes the currently-expected
+``completion_debt_completeness`` (recomputes the currently-expected
 completion-debt obligations — seed/dormant-knob inventory, per-project
 continue/trial capability verdicts, per-project no-CI gate fall-opens — and flags
-ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row).
+ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row), and
+``problem_model_duplicate_id_sweep`` (scans id-keyed problem_model JSONB collections
+for duplicate ids, flagging per-project when ``len(items) > len({item["id"] for item in items})``).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -1056,23 +1058,25 @@ async def check_noncode_outcome_window_accounting(
             return cast(datetime, created_at.replace(tzinfo=None))
         return cast(datetime, created_at)
 
-    naive_in_window = 0
-    terminal_in_window = 0
-    mismatches = 0
+    # Per-project counters: pid -> {naive, terminal, mismatches}
+    per_project: Dict[str, Dict[str, int]] = {}
     considered = 0
     for t in tasks:
         # Non-code == not part of a PR review chain (mirrors _compute_non_code_outcomes).
         if isinstance((t.context or {}).get("review_loop"), dict):
             continue
         considered += 1
+        pid = str(t.project_id)
+        if pid not in per_project:
+            per_project[pid] = {"naive": 0, "terminal": 0, "mismatches": 0}
         created = _created_naive(t)
         completed = _derive_completed_at(t)
         in_naive = created is not None and created >= window_start
         in_terminal = completed >= window_start
-        naive_in_window += 1 if in_naive else 0
-        terminal_in_window += 1 if in_terminal else 0
+        per_project[pid]["naive"] += 1 if in_naive else 0
+        per_project[pid]["terminal"] += 1 if in_terminal else 0
         if in_naive != in_terminal:
-            mismatches += 1
+            per_project[pid]["mismatches"] += 1
 
     if considered == 0:
         return [
@@ -1084,33 +1088,40 @@ async def check_noncode_outcome_window_accounting(
             )
         ]
 
-    if mismatches > 0:
-        return [
+    results: List[CheckResult] = []
+    any_mismatch = False
+    for pid, counts in per_project.items():
+        if counts["mismatches"] > 0:
+            any_mismatch = True
+            results.append(
+                CheckResult(
+                    check="noncode_outcome_window_accounting",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=counts["naive"],
+                    ground_truth=counts["terminal"],
+                    delta=counts["mismatches"],
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{counts['mismatches']} non-code terminal task(s) fall in a "
+                        "different reporting window under created-at vs terminal-time "
+                        "accounting"
+                    ),
+                )
+            )
+    if not any_mismatch:
+        results.append(
             CheckResult(
                 check="noncode_outcome_window_accounting",
-                status=CheckStatus.FLAGGED,
-                self_reported=naive_in_window,
-                ground_truth=terminal_in_window,
-                delta=mismatches,
-                severity="warn",
+                status=CheckStatus.OK,
+                self_reported=considered,
+                ground_truth=considered,
+                delta=0,
                 subject="global",
-                detail=(
-                    f"{mismatches} non-code terminal task(s) fall in a different "
-                    "reporting window under created-at vs terminal-time accounting"
-                ),
+                detail=f"{considered} non-code terminal task(s) window-consistent",
             )
-        ]
-    return [
-        CheckResult(
-            check="noncode_outcome_window_accounting",
-            status=CheckStatus.OK,
-            self_reported=naive_in_window,
-            ground_truth=terminal_in_window,
-            delta=0,
-            subject="global",
-            detail=f"{considered} non-code terminal task(s) window-consistent",
         )
-    ]
+    return results
 
 
 @register_check(
@@ -1487,4 +1498,125 @@ async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResu
                 detail="no rollup children to audit against landed parents in sample",
             )
         ]
+    return results
+
+
+@register_check(
+    "problem_model_duplicate_id_sweep",
+    "Scan id-keyed problem_model JSONB collections for duplicate ids and flag "
+    "projects where any collection contains repeated ids (self_reported=raw_len, "
+    "ground_truth=distinct_id_count, delta=duplicates).",
+)
+async def check_problem_model_duplicate_id_sweep(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: every id-keyed list in a project's problem_model must contain
+    unique ids. Duplicates silently inflate list lengths without adding distinct
+    items, and indicate a write path that appended without dedup (e.g.
+    ``pending_user_confirmation`` append on replay, ``gaps`` re-open without
+    dedup). The check is purely structural — it does NOT parse or validate any
+    business rules, only checks ``item["id"]`` uniqueness within each collection.
+
+    Collections audited: ``pending_user_confirmation``, ``gaps``,
+    ``archived_gaps``, and ``friction`` (all carry a top-level ``"id"`` field).
+
+    Flag-only: never mutates the audited collections. Bounded to
+    ``max_projects`` projects.
+    """
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="problem_model_duplicate_id_sweep",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    # Collections within problem_model that carry a top-level "id" on each item.
+    _ID_KEYED_COLLECTIONS = (
+        "pending_user_confirmation",
+        "gaps",
+        "archived_gaps",
+        "friction",
+    )
+
+    results: List[CheckResult] = []
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        if not pm:
+            results.append(
+                CheckResult(
+                    check="problem_model_duplicate_id_sweep",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="problem_model absent or empty",
+                )
+            )
+            continue
+
+        total_raw = 0
+        total_distinct = 0
+        dup_collections: List[str] = []
+        for coll_name in _ID_KEYED_COLLECTIONS:
+            items = pm.get(coll_name)
+            if not isinstance(items, list) or not items:
+                continue
+            ids = [item.get("id") for item in items if isinstance(item, dict)]
+            raw_len = len(ids)
+            distinct_len = len({i for i in ids if i is not None})
+            total_raw += raw_len
+            total_distinct += distinct_len
+            if distinct_len < raw_len:
+                dup_collections.append(coll_name)
+
+        if total_raw == 0:
+            results.append(
+                CheckResult(
+                    check="problem_model_duplicate_id_sweep",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no id-keyed collections with items found",
+                )
+            )
+            continue
+
+        duplicates = total_raw - total_distinct
+        if duplicates > 0:
+            results.append(
+                CheckResult(
+                    check="problem_model_duplicate_id_sweep",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_raw,
+                    ground_truth=total_distinct,
+                    delta=duplicates,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{duplicates} duplicate id(s) across "
+                        f"{len(dup_collections)} collection(s): "
+                        + ", ".join(dup_collections)
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="problem_model_duplicate_id_sweep",
+                    status=CheckStatus.OK,
+                    self_reported=total_raw,
+                    ground_truth=total_distinct,
+                    delta=0,
+                    subject=pid,
+                    detail="all id-keyed collections have unique ids",
+                )
+            )
     return results

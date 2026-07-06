@@ -159,6 +159,7 @@ def test_registry_contains_initial_checks():
         "direction_acceptance_metric_invariant",
         "completion_debt_completeness",
         "rollup_child_landing_credit",
+        "problem_model_duplicate_id_sweep",
     } <= names
 
 
@@ -1224,3 +1225,112 @@ async def test_rollup_child_landing_credit_counts_multiple_under_credited(db):
     flagged = [r for r in results if r.flagged]
     assert len(flagged) == 1
     assert flagged[0].delta == 3
+
+
+# --- Check: problem_model_duplicate_id_sweep --------------------------------
+
+
+@pytest.mark.asyncio
+async def test_problem_model_dup_id_ok_when_unique(db):
+    """A problem_model with all-unique ids in every collection → OK."""
+    project = await _project(db)
+    project.problem_model = {
+        "pending_user_confirmation": [
+            {"id": "pc-1", "type": "credentials", "proposal": "a", "rationale": ""},
+            {"id": "pc-2", "type": "credentials", "proposal": "b", "rationale": ""},
+        ],
+        "gaps": [
+            {"id": "g-1", "title": "gap1"},
+            {"id": "g-2", "title": "gap2"},
+        ],
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_problem_model_duplicate_id_sweep(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 0
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) >= 1
+    assert ok[0].subject == str(project.id)
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_problem_model_dup_id_flagged_on_duplicate(db):
+    """A duplicate id in pending_user_confirmation → FLAGGED with correct delta and per-project subject."""
+    project = await _project(db)
+    project.problem_model = {
+        "pending_user_confirmation": [
+            {"id": "pc-dup", "type": "credentials", "proposal": "first", "rationale": ""},
+            {"id": "pc-dup", "type": "credentials", "proposal": "replay", "rationale": ""},
+            {"id": "pc-3", "type": "credentials", "proposal": "unique", "rationale": ""},
+        ],
+    }
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_problem_model_duplicate_id_sweep(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "problem_model_duplicate_id_sweep"
+    assert f.subject == str(project.id)  # per-project, not "global"
+    assert f.subject != "global"
+    assert f.self_reported == 3   # raw length
+    assert f.ground_truth == 2   # distinct ids: pc-dup + pc-3
+    assert f.delta == 1           # one duplicate
+    assert "pending_user_confirmation" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_problem_model_dup_id_skipped_when_empty(db):
+    """A project with an empty or absent problem_model → SKIPPED."""
+    await _project(db)
+    # problem_model stays None/default
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_problem_model_duplicate_id_sweep(ctx)
+    assert all(r.status in (CheckStatus.SKIPPED,) for r in results)
+
+
+@pytest.mark.asyncio
+async def test_problem_model_dup_id_is_flag_only(db):
+    """The check never mutates the problem_model collections it audits."""
+    project = await _project(db)
+    pm = {
+        "pending_user_confirmation": [
+            {"id": "dup", "type": "credentials", "proposal": "a", "rationale": ""},
+            {"id": "dup", "type": "credentials", "proposal": "b", "rationale": ""},
+        ],
+    }
+    project.problem_model = pm
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "problem_model")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    await mis.check_problem_model_duplicate_id_sweep(ctx)
+
+    await db.refresh(project)
+    # Collection unchanged — both duplicates still present.
+    assert len(project.problem_model["pending_user_confirmation"]) == 2

@@ -1440,8 +1440,8 @@ def compute_anomaly_adjustment_summary() -> Dict[str, Any]:
 # measurable without changing resume or conflict-resolution behavior.
 
 # Code-change ("write") task types — the ones that produce a PR and can build a
-# foundation. Mirrors ``sr_review_quality_metrics._SR_CODE_CHANGE_TYPES``.
-_WRITE_TASK_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
+# foundation. Imported from sr_analytics_common to avoid re-literal drift.
+_WRITE_TASK_TYPES = frozenset(_SR_CODE_CHANGE_TYPES)
 # Two active write-tasks under DIFFERENT parents whose related-file sets overlap
 # by at least this Jaccard ratio are surfaced as a candidate duplicated
 # foundation. Deliberately conservative (strong overlap only) so the signal

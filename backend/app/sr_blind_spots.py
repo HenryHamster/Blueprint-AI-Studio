@@ -348,8 +348,6 @@ async def aggregate_sr_blind_spot_envelope(
     }
 
 
-_SR_CODE_CHANGE_TYPES = frozenset({"create", "fix", "refactor", "migrate"})
-
 _EXECUTION_EVIDENCE_CATEGORIES = (
     "tests_executed_cleanly",
     "lint_executed_cleanly",
@@ -379,6 +377,20 @@ _REVIEWER_ORIGINS = frozenset(
         "operator_requested_recovery",
     )
 )
+
+# Lazy-loaded canonical SR code-change type filter to avoid circular import.
+# sr_analytics_common imports from this module, so we defer the import until first use.
+_SR_CODE_CHANGE_TYPES = None
+
+
+def _get_sr_code_change_types():
+    """Load canonical SR code-change types on first use, avoiding circular import."""
+    global _SR_CODE_CHANGE_TYPES
+    if _SR_CODE_CHANGE_TYPES is None:
+        from app.sr_analytics_common import _SR_CODE_CHANGE_TYPES as imported
+        _SR_CODE_CHANGE_TYPES = frozenset(imported)
+    return _SR_CODE_CHANGE_TYPES
+
 
 _SEVERITY_LEVELS = ("CRITICAL", "HIGH", "MEDIUM", "LOW")
 
@@ -412,7 +424,7 @@ def _count_reviewer_disagreement_directions(tasks) -> Dict[tuple, dict]:
     )
     for t in tasks:
         task_type = (t.first_payload or {}).get("type", "")
-        if task_type not in _SR_CODE_CHANGE_TYPES:
+        if task_type not in _get_sr_code_change_types():
             continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
@@ -629,7 +641,7 @@ def aggregate_sr_false_attestation_rates(
     }
 
     for t in tasks:
-        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+        if (t.first_payload or {}).get("type") not in _get_sr_code_change_types():
             continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
@@ -691,7 +703,7 @@ def aggregate_sr_co_failure_pairs(
     pair_counts: Dict[tuple, int] = defaultdict(int)
 
     for t in tasks:
-        if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+        if (t.first_payload or {}).get("type") not in _get_sr_code_change_types():
             continue
         ctx = t.context or {}
         sro = ctx.get("_self_review_outcome")
@@ -775,7 +787,7 @@ def compute_persistent_sr_blind_spot_hint(
     def _qualifying(window_tasks):
         out = []
         for t in window_tasks:
-            if (t.first_payload or {}).get("type") not in _SR_CODE_CHANGE_TYPES:
+            if (t.first_payload or {}).get("type") not in _get_sr_code_change_types():
                 continue
             sro = (t.context or {}).get("_self_review_outcome")
             if not sro or is_skipped_sr_outcome(sro):

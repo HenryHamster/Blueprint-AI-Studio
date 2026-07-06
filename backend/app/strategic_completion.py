@@ -4780,7 +4780,10 @@ async def _handle_strategic_completion(
             logger.exception("[STRATEGIC] Failed to append self_reflection (non-fatal)")
 
     if not new_vision or not isinstance(new_vision, dict):
-        # No vision produced — increment failure counter to prevent infinite strategic loops
+        # No vision produced — increment failure counter to prevent infinite strategic loops.
+        # `project` is already locked by lock_project_for_strategic_transition (or held by
+        # the caller via caller_holds_lock), so the RMW below is safe without re-acquiring
+        # with_vision_locked — a double-acquire would deadlock.
         current_vision = dict(project.vision or {})
         failures = current_vision.get("_strategic_failures", 0) + 1
         current_vision["_strategic_failures"] = failures

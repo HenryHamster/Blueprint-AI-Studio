@@ -1991,6 +1991,105 @@ class TestThinkerArtifactsMissingOutcome:
         assert cycle.outcome == sc.OUTCOME_FAILED_PHASE2
 
 
+# ── vision-lock discipline on failure paths ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unparseable_output_increments_failures_preserves_vision_keys(
+    db_session, mocker
+):
+    """Unparseable-output path increments _strategic_failures via
+    with_vision_locked so that sibling vision keys are NOT clobbered and the
+    increment is not lost to a concurrent stale-read race."""
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "keep-me", "_strategic_failures": 1},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 0}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Pass unparseable logs so the function takes the failure branch
+    await _handle_strategic_completion(task, "{{not valid json", db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    # Counter must have been incremented (was 1, now 2)
+    assert vision.get("_strategic_failures") == 2, (
+        f"Expected _strategic_failures=2, got {vision.get('_strategic_failures')!r}"
+    )
+    # Sibling key must NOT have been clobbered
+    assert vision.get("purpose") == "keep-me", (
+        f"vision lock must preserve sibling vision keys; got purpose={vision.get('purpose')!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_no_vision_produced_increments_failures_under_held_lock(
+    db_session, mocker
+):
+    """No-vision path must increment _strategic_failures on the already-locked
+    project object without re-acquiring with_vision_locked (which would deadlock).
+    Other vision keys must be preserved."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._check_direction_starvation", new_callable=AsyncMock
+    )
+
+    project = Project(
+        name="P",
+        user_id="u1",
+        vision={"purpose": "keep-me", "revision": 1, "_strategic_failures": 0},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "strategic_review", "prompt": "p", "vision": {"revision": 1}}],
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # Logs parse successfully but contain no "vision" key — triggers the no-vision path
+    logs = json.dumps({"problem_model": {}})
+    await _handle_strategic_completion(task, logs, db_session)
+
+    await db_session.refresh(project)
+    vision = project.vision or {}
+    assert vision.get("_strategic_failures") == 1, (
+        f"Expected _strategic_failures=1, got {vision.get('_strategic_failures')!r}"
+    )
+    # Sibling key must be preserved
+    assert vision.get("purpose") == "keep-me", (
+        f"no-vision path must preserve sibling vision keys; got purpose={vision.get('purpose')!r}"
+    )
+
+
 # ── _check_direction_starvation ──────────────────────────────────────────────
 
 
