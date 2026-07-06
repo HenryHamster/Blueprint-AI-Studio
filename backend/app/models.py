@@ -2447,9 +2447,65 @@ def _stamp_task_provider_floor(mapper, connection, target: Task):
         logger.warning("[MODELS] before_insert provider-floor stamp failed: %s", exc)
 
 
+def _terminal_time_from_status_log(target: Task) -> datetime | None:
+    """Best-effort terminal timestamp from the last ``status_log`` entry.
+
+    Mirrors ``admin_analytics._derive_completed_at``'s status_log tail read so a
+    task inserted already-terminal records the SAME instant those helpers would
+    otherwise derive from the log. Returns a naive-UTC datetime, or None when the
+    log is empty/malformed.
+    """
+    log = target.status_log
+    if not log:
+        return None
+    last = log[-1]
+    if not isinstance(last, dict):
+        return None
+    ts = last.get("t")
+    if not isinstance(ts, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)
+    except (TypeError, ValueError):
+        return None
+    return parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+
+
+@event.listens_for(Task, "before_insert")
+def _stamp_task_completed_at_on_insert(mapper, connection, target: Task):
+    """Persist completion time for terminal tasks constructed already-terminal.
+
+    Derives the stamp from the task's own terminal signal — the last
+    ``status_log`` entry's timestamp, else ``created_at`` — rather than
+    wall-clock now, so a task inserted already-terminal (a backfill, a replayed
+    row, or a backdated test fixture) records its ACTUAL completion time. This
+    mirrors the transition path, where ``_on_status_set`` stamps ``completed_at``
+    with the same instant it appends to ``status_log``, keeping the durable
+    column and the log tail consistent for downstream terminal-time helpers.
+    """
+    try:
+        if (
+            target.status in TASK_OUTCOME_TERMINAL_STATUSES
+            and target.completed_at is None
+        ):
+            target.completed_at = (
+                _terminal_time_from_status_log(target)
+                or target.created_at
+                or _utcnow()
+            )
+    except Exception as exc:  # noqa: BLE001 — never block the flush
+        logger.warning(
+            "[MODELS] before_insert completed_at stamp failed: %s",
+            exc,
+        )
+
+
 @event.listens_for(Task.status, "set")
 def _on_status_set(target: Task, value, oldvalue, initiator):
-    if value and isinstance(oldvalue, str) and value != oldvalue:
+    is_terminal = value in TASK_OUTCOME_TERMINAL_STATUSES
+    was_terminal = oldvalue in TASK_OUTCOME_TERMINAL_STATUSES
+    status_changed = bool(value and isinstance(oldvalue, str) and value != oldvalue)
+    if status_changed:
         now = _utcnow()
         entry = {
             "t": now.isoformat(),
@@ -2476,31 +2532,53 @@ def _on_status_set(target: Task, value, oldvalue, initiator):
                 "[MODELS] _on_status_set: skipped updated_at stamp (%s)",
                 e,
             )
-        task_id = str(target.id)
-        # Notify JWT revocation when task reaches a resource-releasing state.
-        # BLOCKED/PARKED are recoverable, but both release the active agent/VM
-        # binding and must revoke the old token until a fresh QUEUED claim revives it.
-        if task_status_releases_agent_resources(value):
-            for cb in _on_task_terminal_callbacks:
-                try:
-                    cb(task_id)
-                except Exception as e:  # noqa: PERF203
-                    logger.error(
-                        f"[MODELS] Terminal callback failed for task {task_id}: {e}",
-                        exc_info=True,
-                    )
-        else:
-            # Non-terminal status set (QUEUED, PROVISIONING, IN_PROGRESS,
-            # EVALUATING). Fire revive callbacks so any deny-list entries
-            # populated by an earlier terminal transition are cleared.
-            for cb in _on_task_revive_callbacks:
-                try:
-                    cb(task_id)
-                except Exception as e:  # noqa: PERF203
-                    logger.error(
-                        f"[MODELS] Revive callback failed for task {task_id}: {e}",
-                        exc_info=True,
-                    )
+    else:
+        now = _utcnow()
+    if is_terminal:
+        try:
+            if target.completed_at is None:
+                target.completed_at = now
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped completed_at stamp (%s)",
+                e,
+            )
+    elif was_terminal:
+        try:
+            if target.completed_at is not None:
+                target.completed_at = None
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "[MODELS] _on_status_set: skipped completed_at clear (%s)",
+                e,
+            )
+    if not status_changed:
+        return
+    task_id = str(target.id)
+    # Notify JWT revocation when task reaches a resource-releasing state.
+    # BLOCKED/PARKED are recoverable, but both release the active agent/VM
+    # binding and must revoke the old token until a fresh QUEUED claim revives it.
+    if task_status_releases_agent_resources(value):
+        for cb in _on_task_terminal_callbacks:
+            try:
+                cb(task_id)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Terminal callback failed for task {task_id}: {e}",
+                    exc_info=True,
+                )
+    else:
+        # Non-terminal status set (QUEUED, PROVISIONING, IN_PROGRESS,
+        # EVALUATING). Fire revive callbacks so any deny-list entries
+        # populated by an earlier terminal transition are cleared.
+        for cb in _on_task_revive_callbacks:
+            try:
+                cb(task_id)
+            except Exception as e:  # noqa: PERF203
+                logger.error(
+                    f"[MODELS] Revive callback failed for task {task_id}: {e}",
+                    exc_info=True,
+                )
 
 
 class AlertSeverity(str, Enum):

@@ -398,6 +398,31 @@ async def test_playbook_does_not_mutate_source_counter(db):
     assert project.design_doc["playbook/x"]["reference_count"] == 1
 
 
+@pytest.mark.asyncio
+async def test_playbook_flags_confirmed_over_followed(db):
+    project = await _project(db)
+    project.design_doc = {
+        # confirmed=7 > followed=5 with reference=10 — passes reference check, fails followed check
+        "playbook/over_followed": {"confirmed_count": 7, "reference_count": 10, "followed_count": 5},
+        # clean entry — should not be flagged
+        "playbook/ok": {"confirmed_count": 2, "reference_count": 5, "followed_count": 3},
+    }
+    flag_modified(project, "design_doc")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe", max_projects=25,
+        sample_limit=200, window_days=14,
+    )
+    results = await mis.check_playbook_confirmation_integrity(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert f.delta >= 1
+    assert "followed" in f.detail
+
+
 # --- Check: direction_acceptance_metric_invariant ---------------------------
 
 
@@ -503,6 +528,7 @@ async def test_direction_acceptance_metric_check_skips_legacy_entries(db):
 
 @pytest.mark.asyncio
 async def test_noncode_window_flags_misclassified_task(db):
+    import uuid as _uuid
     project = await _project(db)
     now = _utcnow()
     window_start = now - timedelta(days=14)
@@ -528,6 +554,53 @@ async def test_noncode_window_flags_misclassified_task(db):
     flagged = [r for r in results if r.flagged]
     assert len(flagged) == 1
     assert flagged[0].delta == 1
+    # subject must be the owning project UUID — not "global" — so enforce-mode
+    # enrollment can create a per-project EvergreenBacklogItem.
+    assert flagged[0].subject != "global"
+    assert str(_uuid.UUID(flagged[0].subject)) == flagged[0].subject
+
+
+@pytest.mark.asyncio
+async def test_noncode_window_enforce_enrolls_project_finding(db):
+    """Enforce mode must create an EvergreenBacklogItem for the owning project.
+
+    Previously subject="global" caused _enroll_flag_finding to return False
+    unconditionally, so no backlog item was ever created even with real drift.
+    """
+    _rc["metrics_integrity_sweep_mode"] = "enforce"
+    project = await _project(db)
+    now = _utcnow()
+    window_start = now - timedelta(days=14)
+    old_created = window_start - timedelta(days=2)
+    # A task created before but completed inside the window: produces a mismatch.
+    db.add(
+        Task(
+            project_id=project.id,
+            payloads=[{"type": "research"}],
+            status=TaskStatus.COMPLETED,
+            created_at=old_created,
+            status_log=[{"t": (now - timedelta(days=1)).isoformat(), "s": "COMPLETED"}],
+            context={},
+        )
+    )
+    await db.commit()
+
+    tick = await run_metrics_integrity_sweep(db, now=now)
+    assert tick is not None
+    assert tick["flagged"] >= 1
+    assert tick["enrolled"] >= 1
+
+    rows = (
+        await db.execute(
+            select(EvergreenBacklogItem).where(
+                EvergreenBacklogItem.project_id == project.id
+            )
+        )
+    ).scalars().all()
+    assert any(
+        r.finding_key.startswith("metrics-integrity:noncode_outcome_window_accounting:")
+        for r in rows
+    ), f"expected a noncode_outcome_window_accounting backlog item, got {[r.finding_key for r in rows]}"
 
 
 @pytest.mark.asyncio

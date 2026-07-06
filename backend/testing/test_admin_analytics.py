@@ -250,6 +250,57 @@ class TestTaskDurationStats:
         assert phase["provisioning"] == {"p50_seconds": 20.0, "sample_size": 3}
         assert phase["execution"] == {"p50_seconds": 200.0, "sample_size": 3}
 
+    @pytest.mark.asyncio
+    async def test_task_duration_stats_windows_by_terminal_time_not_created_at(
+        self, client: AsyncClient, db_session
+    ):
+        """Tasks created before the 7-day cutoff but completed inside it must be included.
+
+        This is the primary regression: the old code filtered by created_at >= cutoff,
+        which excluded long-running tasks created >7 days ago but completed recently.
+        The correct window is terminal time (completed_at / status_log fallback).
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+
+        now = _utcnow()
+        # Task created 8 days ago (outside 7-day window by created_at)
+        # but completed 1 hour ago (inside the 7-day window by terminal time).
+        old_created = now - timedelta(days=8)
+        started_at = now - timedelta(hours=3)
+
+        # Add 3 such tasks so the minimum sample floor (3) is cleared.
+        for dur_s in (100, 200, 300):
+            t_completed = started_at + timedelta(seconds=dur_s)
+            db_session.add(
+                make_task(
+                    project_id=project.id,
+                    status=TaskStatus.COMPLETED,
+                    payloads=[{"type": "create", "prompt": "x"}],
+                    context={"scope": "medium"},
+                    started_at=started_at,
+                    completed_at=t_completed,
+                    status_log=[{"s": "COMPLETED", "t": t_completed.isoformat()}],
+                    created_at=old_created,
+                )
+            )
+        await db_session.commit()
+
+        resp = await client.get("/api/admin/task-duration-stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        # The 3 tasks must appear in scope_duration_stats under "medium".
+        # If windowing were still by created_at, all 3 would be excluded and the
+        # dict would be empty.
+        scope_stats = data["scope_duration_stats"]
+        assert "medium" in scope_stats, (
+            "Tasks completed inside the 7-day window should be included even if "
+            "created_at is older than 7 days"
+        )
+        assert scope_stats["medium"]["sample_size"] == 3
+        assert scope_stats["medium"]["p50_seconds"] == 200.0
+
 
 class TestLaneDiag:
     @staticmethod
@@ -1648,6 +1699,95 @@ class TestTaskCostBreakdown:
         assert body["total_estimated_cost_usd"] == pytest.approx(
             round(3600 * admin_analytics.ON_DEMAND_RATE, 2)
         )
+
+    @pytest.mark.asyncio
+    async def test_post_terminal_status_log_write_does_not_move_task_into_window(
+        self, client: AsyncClient, db_session
+    ):
+        """A durable ``completed_at`` OUTSIDE the window keeps the task excluded even
+        when a LATER ``status_log`` entry (simulating a post-terminal
+        ``latest_status_message`` write) falls INSIDE the window.
+
+        Regression guard for the bug this change fixes: deriving from the
+        ``status_log`` tail would wrongly pull the task into the window.
+        """
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=90)  # OUTSIDE the 1h window
+        started_at = completed_at - timedelta(seconds=1800)
+        post_terminal_msg_at = now - timedelta(minutes=5)  # INSIDE the window
+        db_session.add(
+            make_task(
+                project_id=project.id,
+                title="Completed then messaged",
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                payloads=[{"type": "create", "prompt": "x"}],
+                started_at=started_at,
+                created_at=started_at,
+                completed_at=completed_at,
+                status_log=[
+                    {"s": "COMPLETED", "t": completed_at.isoformat()},
+                    # Mirrors latest_status_message appending a row post-terminal.
+                    {"t": post_terminal_msg_at.isoformat(), "msg": "operator note"},
+                ],
+                vm_provisioned_at=started_at,
+                vm_stopped_at=completed_at,
+                vm_spot=False,
+            )
+        )
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Durable completed_at (90m ago) governs windowing; the later audit row
+        # is ignored, so the task stays out of the 1h window.
+        assert body["task_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_legacy_null_completed_at_windows_by_status_log_tail(
+        self, client: AsyncClient, db_session
+    ):
+        """Legacy rows whose durable ``completed_at`` was never stamped still derive
+        window membership from the ``status_log`` tail (unchanged fallback)."""
+        project = make_project()
+        db_session.add(project)
+        await db_session.commit()
+        now = _utcnow()
+        completed_at = now - timedelta(minutes=20)  # INSIDE the 1h window
+        started_at = completed_at - timedelta(seconds=1800)
+        task = make_task(
+            project_id=project.id,
+            title="Legacy completed",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            payloads=[{"type": "create", "prompt": "x"}],
+            started_at=started_at,
+            created_at=now - timedelta(hours=3),  # OUTSIDE the window
+            status_log=[{"s": "COMPLETED", "t": completed_at.isoformat()}],
+            vm_provisioned_at=started_at,
+            vm_stopped_at=completed_at,
+            vm_spot=False,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        # Simulate a legacy row whose durable column was never populated.
+        task.completed_at = None
+        await db_session.commit()
+
+        resp = await client.get(
+            f"/api/admin/task-cost-breakdown?project_id={project.id}&window=1h"
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        # Falls back to the status_log tail (20m ago, in-window) — NOT created_at
+        # (3h ago, out-of-window) — so the task is counted.
+        assert body["task_count"] == 1
 
     @pytest.mark.asyncio
     async def test_old_created_task_completed_in_window_is_included(

@@ -683,6 +683,10 @@ async def _load_outer_loop_original_tasks(
                 Task.status,
                 Task.context,
                 Task.created_at,
+                # The convergence reducer walks these via _derive_completed_at,
+                # which reads the durable terminal timestamp; a deferred read
+                # under raiseload=True raises, so load it eagerly.
+                Task.completed_at,
                 # Hydrated originals are appended to the task list the
                 # convergence reducer walks, and an in-window original can be
                 # CANCELLED (outside the COMPLETED/FAILED window query), so the
@@ -733,6 +737,10 @@ _OUTER_LOOP_TASK_COLUMNS = (
     Task.status,
     Task.context,
     Task.created_at,
+    # compute_outer_loop_convergence -> _derive_completed_at reads the durable
+    # terminal timestamp; a deferred read under raiseload=True raises, so it
+    # must be eagerly loaded here.
+    Task.completed_at,
     Task.latest_status_message,
 )
 

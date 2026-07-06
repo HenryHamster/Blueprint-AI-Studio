@@ -325,7 +325,15 @@ async def count_merged_since(
     ]
     stmt = (
         select(Task)
-        .options(load_only(Task.id, Task.status_log, Task.created_at, raiseload=True))
+        .options(
+            load_only(
+                Task.id,
+                Task.status_log,
+                Task.created_at,
+                Task.completed_at,
+                raiseload=True,
+            )
+        )
         .where(*filters)
     )
     rows = (await session.execute(stmt)).scalars().all()
@@ -368,6 +376,7 @@ async def list_merged_tasks_for_version(
                 Task.payloads,
                 Task.status_log,
                 Task.created_at,
+                Task.completed_at,
                 raiseload=True,
             )
         )
@@ -466,14 +475,27 @@ async def compute_version_acceptance_aggregate(
 def _task_completed_at(task: Task) -> datetime:
     """Return the stable terminal timestamp for a task.
 
-    Uses the last status-transition entry in ``status_log`` when available;
-    falls back to ``created_at`` for legacy rows with no durable completion
-    entry. Message-only writes append to ``status_log`` too, so the cutoff must
-    ignore those audit entries.
+    Prefers the durable ``Task.completed_at`` column, which is centrally stamped
+    on terminal status transitions and cleared on revive (see models.py). It is
+    immune to post-terminal ``latest_status_message`` writes, which append audit
+    rows to ``status_log`` and would otherwise move the version window forward.
+
+    IMPORTANT: ``task.completed_at`` must be present in the ``load_only(...)``
+    column list of every query whose rows flow here; under ``raiseload=True`` an
+    unloaded column raises rather than lazy-loading.
+
+    When ``completed_at`` is null (legacy rows never stamped), falls back to the
+    prior behavior: the last ``Status changed: `` transition entry in
+    ``status_log`` when available, else ``created_at``. Message-only writes append
+    to ``status_log`` too, so the legacy cutoff must ignore those audit entries.
     """
 
     def _strip_tz(dt: datetime) -> datetime:
         return dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+
+    durable = task.completed_at
+    if durable is not None:
+        return _strip_tz(durable)
 
     for entry in reversed(task.status_log or []):
         if not isinstance(entry, dict):

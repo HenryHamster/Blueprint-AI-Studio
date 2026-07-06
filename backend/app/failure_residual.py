@@ -306,9 +306,25 @@ def record_residual_fingerprint(task: "Task", logs: str | None = None) -> None:
     project_id = getattr(task, "project_id", None)
     if project_id is not None:
         now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        mem_entry = _residual_store[fp]
         _schedule_residual_db_upsert(
-            project_id, fp, now_dt, trimmed_sample or trimmed_status
+            project_id,
+            fp,
+            now_dt,
+            trimmed_sample or trimmed_status,
+            sample_messages=mem_entry.get("sample_messages", []),
+            sample_statuses=mem_entry.get("sample_statuses", []),
+            task_ids=mem_entry.get("task_ids", []),
         )
+
+
+def _merge_sample_list(existing: list[str], incoming: list[str], cap: int = 5) -> list[str]:
+    """Merge incoming items into existing list, deduplicating and capping."""
+    merged = list(existing)
+    for item in incoming:
+        if item and item not in merged and len(merged) < cap:
+            merged.append(item)
+    return merged
 
 
 async def _upsert_residual_case_async(
@@ -316,13 +332,17 @@ async def _upsert_residual_case_async(
     fingerprint: str,
     now_dt: datetime,
     sample_message: str,
+    sample_messages: list[str] | None = None,
+    sample_statuses: list[str] | None = None,
+    task_ids: list[str] | None = None,
 ) -> None:
     """Upsert a ResidualRemediationCase row for durability across restarts.
 
-    - New fingerprint → INSERT ACTIVE row, hit_count=1.
+    - New fingerprint → INSERT ACTIVE row, hit_count=1, with sample lists.
     - Existing ACTIVE / CLOSED_ORGANICALLY → bump hit_count + last_seen_at;
-      reopen CLOSED_ORGANICALLY to ACTIVE.
-    - IGNORED / RESOLVED → bump hit_count + last_seen_at; leave status alone.
+      reopen CLOSED_ORGANICALLY to ACTIVE; merge sample lists (dedup, cap 5).
+    - IGNORED / RESOLVED → bump hit_count + last_seen_at; leave status alone;
+      merge sample lists.
     IntegrityError (concurrent INSERT race) is handled by retrying as an UPDATE.
     """
     from app.database import AsyncSessionLocal
@@ -331,7 +351,13 @@ async def _upsert_residual_case_async(
     from sqlalchemy.exc import IntegrityError
     from sqlmodel import select
 
-    async def _atomic_increment(session, row_id, reopen: bool) -> None:
+    _sample_messages = sample_messages or []
+    _sample_statuses = sample_statuses or []
+    _task_ids = task_ids or []
+
+    async def _atomic_increment(
+        session, row_id, reopen: bool, extra_vals: dict | None = None
+    ) -> None:
         """Increment hit_count atomically at the SQL layer (no read-modify-write)."""
         vals: dict = {
             "hit_count": ResidualRemediationCase.hit_count + 1,
@@ -340,6 +366,8 @@ async def _upsert_residual_case_async(
         }
         if reopen:
             vals["status"] = ResidualCaseStatus.ACTIVE
+        if extra_vals:
+            vals.update(extra_vals)
         await session.execute(
             sa_update(ResidualRemediationCase)
             .where(ResidualRemediationCase.id == row_id)
@@ -384,7 +412,7 @@ async def _upsert_residual_case_async(
                     fingerprint,
                 )
                 return False
-            # Genuinely missing — INSERT.
+            # Genuinely missing — INSERT with all sample lists.
             session.add(
                 ResidualRemediationCase(
                     project_id=project_id,
@@ -394,13 +422,27 @@ async def _upsert_residual_case_async(
                     last_seen_at=now_dt,
                     hit_count=1,
                     sample_message=sample_message or None,
+                    sample_messages=list(_sample_messages),
+                    sample_statuses=list(_sample_statuses),
+                    task_ids=list(_task_ids),
                 )
             )
             return True
+        # UPDATE path — row is locked; merge sample lists into existing values.
+        merged_extra: dict = {
+            "sample_messages": _merge_sample_list(
+                existing.sample_messages or [], _sample_messages
+            ),
+            "sample_statuses": _merge_sample_list(
+                existing.sample_statuses or [], _sample_statuses
+            ),
+            "task_ids": _merge_sample_list(existing.task_ids or [], _task_ids),
+        }
         await _atomic_increment(
             session,
             existing.id,
             reopen=existing.status == ResidualCaseStatus.CLOSED_ORGANICALLY,
+            extra_vals=merged_extra,
         )
         return True
 
@@ -422,11 +464,23 @@ async def _upsert_residual_case_async(
                     )
                     existing = (await session.execute(stmt)).scalars().first()
                     if existing is not None:
+                        merged_extra = {
+                            "sample_messages": _merge_sample_list(
+                                existing.sample_messages or [], _sample_messages
+                            ),
+                            "sample_statuses": _merge_sample_list(
+                                existing.sample_statuses or [], _sample_statuses
+                            ),
+                            "task_ids": _merge_sample_list(
+                                existing.task_ids or [], _task_ids
+                            ),
+                        }
                         await _atomic_increment(
                             session,
                             existing.id,
                             reopen=existing.status
                             == ResidualCaseStatus.CLOSED_ORGANICALLY,
+                            extra_vals=merged_extra,
                         )
                     # If still None here, the contending writer is mid-INSERT;
                     # leave it — they'll commit and our next hit will see it.
@@ -442,10 +496,21 @@ def _schedule_residual_db_upsert(
     fingerprint: str,
     now_dt: datetime,
     sample_message: str,
+    sample_messages: list[str] | None = None,
+    sample_statuses: list[str] | None = None,
+    task_ids: list[str] | None = None,
 ) -> None:
     """Schedule a fire-and-forget DB upsert when an event loop is running."""
     _spawn_bg_task(
-        _upsert_residual_case_async(project_id, fingerprint, now_dt, sample_message)
+        _upsert_residual_case_async(
+            project_id,
+            fingerprint,
+            now_dt,
+            sample_message,
+            sample_messages=sample_messages,
+            sample_statuses=sample_statuses,
+            task_ids=task_ids,
+        )
     )
 
 

@@ -118,19 +118,35 @@ async def _compute_shadow_lane_health(
 
 
 def _derive_completed_at(t: "Task") -> datetime:
-    """Return the completion timestamp from the last status_log entry, or task.created_at.
+    """Return the durable completion timestamp, falling back to status_log/created_at.
 
     Always returns a naive UTC datetime — `task.created_at` may be TIMESTAMPTZ
     (migration 0061) and the JSON `t` strings are written without tz, so callers
     of this function must not mix the two without normalization.
 
-    If the caller projected `status_log[-1]->>'t'` SQL-side and stashed it on
-    `t._projected_completed_at_ts` (see admin_digest.py), use that instead of
-    materializing the heavy `status_log` JSONB column.
+    Prefers the durable `Task.completed_at` column, which is centrally stamped on
+    terminal status transitions and cleared on revive (see models.py). Unlike the
+    `status_log` tail, it is immune to post-terminal `latest_status_message` writes
+    that append audit rows to `status_log` — those cannot silently move a completed
+    task's derived time forward across a reporting window.
+
+    IMPORTANT: `t.completed_at` must be present in the `load_only(...)` column list
+    of every query whose rows flow here; under `raiseload=True` an unloaded column
+    raises rather than lazy-loading.
+
+    When `completed_at` is null (legacy rows never stamped), falls back to the prior
+    behavior: if the caller projected `status_log[-1]->>'t'` SQL-side and stashed it
+    on `t._projected_completed_at_ts` (see admin_digest.py) use that (so the heavy
+    `status_log` JSONB column is not materialized), else the `status_log` tail, else
+    `task.created_at`.
     """
 
     def _strip_tz(d: datetime) -> datetime:
         return d.replace(tzinfo=None) if d.tzinfo is not None else d
+
+    durable = t.completed_at
+    if durable is not None:
+        return _strip_tz(durable)
 
     if hasattr(t, "_projected_completed_at_ts"):
         cached_ts = t._projected_completed_at_ts
@@ -535,6 +551,7 @@ async def get_task_cost_breakdown(
                         Task.title,
                         Task.status,
                         Task.created_at,
+                        Task.completed_at,
                         Task.status_log,
                         Task.payloads,
                         Task.context,
@@ -693,6 +710,7 @@ async def get_spend_burn_rate(
                         Task.id,
                         Task.status,
                         Task.created_at,
+                        Task.completed_at,
                         Task.status_log,
                         Task.context,
                         Task.vm_provisioned_at,
@@ -830,6 +848,7 @@ async def get_lane_diag(
         Task.project_id,
         Task.status,
         Task.created_at,
+        Task.completed_at,
         Task.started_at,
         Task.updated_at,
         Task.status_log,
@@ -1016,7 +1035,6 @@ async def get_task_duration_stats(
         filters = [
             Task.status == TaskStatus.COMPLETED,
             Task.started_at.is_not(None),
-            Task.created_at >= cutoff,
         ]
         if project_id:
             filters.append(Task.project_id == project_id)
@@ -1028,6 +1046,7 @@ async def get_task_duration_stats(
                         load_only(
                             Task.status_log,
                             Task.created_at,
+                            Task.completed_at,
                             Task.started_at,
                             Task.payloads,
                             Task.context,
@@ -1047,15 +1066,16 @@ async def get_task_duration_stats(
         type_durations: dict = defaultdict(list)
         scope_durations: dict = defaultdict(list)
         for t in completed:
-            try:
-                cat = (
-                    datetime.fromisoformat(t.status_log[-1]["t"])
-                    if t.status_log
-                    else t.created_at
-                )
-            except Exception:
-                cat = t.created_at
-            dur = (cat - t.started_at).total_seconds()
+            # Use the durable terminal time (message-immune) rather than the
+            # raw status_log tail so a post-terminal message write cannot
+            # inflate the computed duration.
+            cat = _derive_completed_at(t)
+            if cat < cutoff:
+                continue
+            started = t.started_at
+            if started is not None and started.tzinfo is not None:
+                started = started.replace(tzinfo=None)
+            dur = (cat - started).total_seconds()
             if dur > 0:
                 type_durations[(t.first_payload).get("type", "create")].append(dur)
                 scope = (t.context or {}).get("scope")
@@ -1087,6 +1107,8 @@ async def get_task_duration_stats(
         provisioning_durs: list = []
         execution_durs: list = []
         for t in completed:
+            if _derive_completed_at(t) < cutoff:
+                continue
             if t.vm_provisioned_at and t.vm_started_at and t.vm_stopped_at:
                 prov = (t.vm_started_at - t.vm_provisioned_at).total_seconds()
                 execd = (t.vm_stopped_at - t.vm_started_at).total_seconds()
@@ -1119,11 +1141,14 @@ async def get_task_duration_stats(
                         THEN context ->> 'scope'
                 END AS scope,
                 EXTRACT(EPOCH FROM (
-                    CASE
-                        WHEN status_log -> -1 ->> 't' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}'
-                            THEN (status_log -> -1 ->> 't')::timestamp
-                        ELSE created_at
-                    END
+                    COALESCE(
+                        completed_at,
+                        CASE
+                            WHEN status_log -> -1 ->> 't' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}'
+                                THEN (status_log -> -1 ->> 't')::timestamp
+                            ELSE created_at
+                        END
+                    )
                     - started_at
                 )) AS dur,
                 EXTRACT(EPOCH FROM (vm_started_at - vm_provisioned_at)) AS prov_dur,
@@ -1134,7 +1159,14 @@ async def get_task_duration_stats(
             FROM task
             WHERE status = 'COMPLETED'
               AND started_at IS NOT NULL
-              AND created_at >= :cutoff
+              AND COALESCE(
+                    completed_at,
+                    CASE
+                        WHEN status_log -> -1 ->> 't' ~ '^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}'
+                            THEN (status_log -> -1 ->> 't')::timestamp
+                        ELSE created_at
+                    END
+                  ) >= :cutoff
               AND (CAST(:project_id AS uuid) IS NULL OR project_id = CAST(:project_id AS uuid))
         ),
         type_agg AS (

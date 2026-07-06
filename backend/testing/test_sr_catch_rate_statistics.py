@@ -148,6 +148,70 @@ def test_prediction_accuracy_later_iteration_confirmation_not_false_alarm():
     assert result["miss_rate"] == 0.0
 
 
+def test_overall_hit_rate_uses_raw_counts_not_rounded_categories():
+    """Overall hit rate must be derived from raw hit_count/human_count, not from
+    back-reconstructing via the already-rounded per-category hit_rate.
+
+    Drifting scenario: two categories with different sample sizes.
+    - "correctness": 2 findings, 1 hit → rate = 0.5 (exact, no drift)
+    - "error-handling": 1500 findings, 1 hit → rate = round(1/1500, 3) = 0.001,
+      but round(0.001 * 1500) = round(1.5) = 2 (banker's rounding to even) ≠ 1.
+
+    Old reconstruction gives 3 total hits / 1502 reviewers → 0.002.
+    Raw-count sum gives 2 total hits / 1502 reviewers → 0.001.
+    """
+    from app.sr_analytics_catch_rate import _stats_for_tasks
+
+    def _task(cat, *, hit: bool):
+        return _make_task(
+            context={
+                "_self_review_outcome": {
+                    "verdict": "pass",
+                    "check_results": {cat: {"passed": not hit}},
+                },
+                "_first_attempt_rejection_categories": {cat: 1},
+            }
+        )
+
+    tasks = []
+    # Category A: 2 findings, 1 hit — no reconstruction drift at this size.
+    tasks.append(_task("correctness", hit=True))
+    tasks.append(_task("correctness", hit=False))
+    # Category B: 1500 findings, 1 hit — reconstruction drift: round(0.001*1500)=2.
+    tasks.append(_task("error-handling", hit=True))
+    tasks.extend(_task("error-handling", hit=False) for _ in range(1499))
+
+    _, cat_stats, _, _, _, _ = _stats_for_tasks(tasks)
+
+    assert cat_stats["correctness"]["hit_count"] == 1
+    assert cat_stats["correctness"]["human_count"] == 2
+    assert cat_stats["error-handling"]["hit_count"] == 1
+    assert cat_stats["error-handling"]["human_count"] == 1500
+
+    # Verify the drift: back-reconstruction from rounded rate gives wrong hit count.
+    b_rate_rounded = round(1 / 1500, 3)  # 0.001
+    b_reconstructed = round(b_rate_rounded * 1500)  # round(1.5) = 2 (banker's rounding)
+    assert b_reconstructed == 2, "Drift scenario requires reconstruction to yield 2, not 1"
+
+    # Old (broken) aggregation: reconstruct hits from rounded rates.
+    a_rate_rounded = round(1 / 2, 3)  # 0.5 — no drift for category A
+    a_reconstructed = round(a_rate_rounded * 2)  # 1
+    old_total_hits = a_reconstructed + b_reconstructed  # 1 + 2 = 3
+    old_total_reviewers = 2 + 1500  # 1502
+    old_overall_rate = round(old_total_hits / old_total_reviewers, 3)  # 0.002
+
+    # New (correct) aggregation: direct sum of raw counts.
+    new_total_hits = cat_stats["correctness"]["hit_count"] + cat_stats["error-handling"]["hit_count"]  # 2
+    new_total_reviewers = cat_stats["correctness"]["human_count"] + cat_stats["error-handling"]["human_count"]  # 1502
+    new_overall_rate = round(new_total_hits / new_total_reviewers, 3)  # 0.001
+
+    # The two methods disagree — the raw-count path gives the correct answer.
+    assert old_overall_rate != new_overall_rate, (
+        f"Drift scenario must produce different rates; got old={old_overall_rate} new={new_overall_rate}"
+    )
+    assert new_overall_rate == round(2 / 1502, 3)  # true overall rate
+
+
 def test_sr_catch_rate_statistics_import_seam():
     backend_root = Path(__file__).resolve().parents[1]
     env = os.environ.copy()

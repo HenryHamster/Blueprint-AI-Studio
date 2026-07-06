@@ -2253,6 +2253,43 @@ async def test_agent_status_complete_with_artifacts_creates_artifact_record(
 
 
 @pytest.mark.asyncio
+async def test_terminal_status_transition_stamps_completed_at(
+    client: AsyncClient, db_session, mocker
+):
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=None)
+    mocker.patch("app.broadcast.broadcast_to_project", new_callable=AsyncMock)
+
+    project = Project(name="Terminal Stamp Test", user_id="test-user-123")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "cmd": "run"}],
+        vm_instance_id="agent-vm-terminal-stamp",
+        status=TaskStatus.IN_PROGRESS,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    before = _utcnow()
+    token = create_agent_token(str(task.id), "agent-vm-terminal-stamp")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task.id), "status": "COMPLETED"},
+        headers={"x-agent-token": token},
+    )
+
+    assert resp.status_code == 200
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED
+    assert task.completed_at is not None
+    assert task.completed_at >= before
+
+
+@pytest.mark.asyncio
 async def test_agent_claim_includes_project_metadata(client: AsyncClient, db_session):
     """
     Tests that the claim response includes project_metadata with build_config.

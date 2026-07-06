@@ -799,6 +799,7 @@ async def check_playbook_confirmation_integrity(
         total_confirmed = 0
         total_reference = 0
         over_credit_keys: List[str] = []
+        over_followed_keys: List[str] = []
         negative_keys: List[str] = []
         for key, entry in entries.items():
             confirmed = int(entry.get("confirmed_count", 0) or 0)
@@ -811,14 +812,22 @@ async def check_playbook_confirmation_integrity(
             # confirmed can never exceed the number of times the entry was shown.
             elif confirmed > reference:
                 over_credit_keys.append(key)
+            # confirmed can never exceed the number of times the entry was followed.
+            elif followed > 0 and confirmed > followed:
+                over_followed_keys.append(key)
 
-        if negative_keys or over_credit_keys:
-            bad = len(negative_keys) + len(over_credit_keys)
+        if negative_keys or over_credit_keys or over_followed_keys:
+            bad = len(negative_keys) + len(over_credit_keys) + len(over_followed_keys)
             note_parts = []
             if over_credit_keys:
                 note_parts.append(
                     f"{len(over_credit_keys)} entry(ies) confirmed more than referenced "
                     f"(e.g. {over_credit_keys[0]})"
+                )
+            if over_followed_keys:
+                note_parts.append(
+                    f"{len(over_followed_keys)} entry(ies) confirmed more than followed "
+                    f"(e.g. {over_followed_keys[0]})"
                 )
             if negative_keys:
                 note_parts.append(

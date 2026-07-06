@@ -857,6 +857,13 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
         created_at=base_time + timedelta(days=1),
         completed_at=base_time + timedelta(days=1, hours=1),
     )
+    listener_completed_task = Task(
+        project_id=project.id,
+        title="Listener-stamped completed task",
+        payloads=[{"type": "create", "direction_id": "d-done"}],
+        status=TaskStatus.COMPLETED,
+        created_at=base_time + timedelta(days=3),
+    )
     newer_routine_tasks = [
         Task(
             project_id=project.id,
@@ -873,9 +880,11 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
         old_queued_task,
         recently_completed_task,
         older_completed_task,
+        listener_completed_task,
         *newer_routine_tasks,
     ])
     await db_session.commit()
+    await db_session.refresh(listener_completed_task)
 
     resp = await client.get(f"/api/admin/projects/{project.id}/strategic-state")
 
@@ -915,9 +924,11 @@ async def test_strategic_state_task_focus_uses_full_project_scope(
     assert all(row["id"] != str(approval_task.id) for row in queued["items"])
 
     completed = focus["buckets"]["recent_completed"]
-    assert completed["total"] == 2
-    assert completed["items"][0]["id"] == str(recently_completed_task.id)
-    assert completed["items"][0]["completed_at"] == recently_completed_task.completed_at.isoformat()
+    assert completed["total"] == 3
+    assert completed["items"][0]["id"] == str(listener_completed_task.id)
+    assert completed["items"][0]["completed_at"] == listener_completed_task.completed_at.isoformat()
+    assert completed["items"][1]["id"] == str(recently_completed_task.id)
+    assert completed["items"][2]["id"] == str(older_completed_task.id)
     assert completed["items"][0]["direction_id"] == "d-done"
 
 
@@ -4217,7 +4228,7 @@ async def test_strategic_state_counts_changes_since_last_check_in(
     assert since_state["messages"]["needs_operator"] == 1
     assert since_state["tasks"]["created"] == 1
     assert since_state["tasks"]["updated"] == 3
-    assert since_state["tasks"]["completed"] == 1
+    assert since_state["tasks"]["completed"] == 3
     assert since_state["tasks"]["failed"] == 1
     assert since_state["tasks"]["blocked"] == 1
     assert since_state["alerts"]["raised"] == 1
@@ -5290,7 +5301,7 @@ async def test_operator_attention_surfaces_stuck_acceptance_criteria(
 
     assert attention["level"] == "needs_operator"
     assert attention["counts"]["stuck_acceptance_criteria"] == 2
-    assert attention["counts"]["needs_operator"] == 2
+    assert attention["counts"]["needs_operator"] == 3
     item_ids = {item["id"] for item in attention["items"]}
     no_map_id = f"version:{version.id}:acceptance_criterion:{c_no_map.criterion_key}"
     retired_id = f"version:{version.id}:acceptance_criterion:{c_retired.criterion_key}"
@@ -6468,7 +6479,6 @@ async def test_operator_attention_surfaces_unmet_experiment_outcome(
         payloads=[{"type": "compute_experiment"}],
         status=TaskStatus.COMPLETED,
         archived=False,
-        completed_at=now - timedelta(hours=1),
         plan_output={
             "compute_result": {
                 "criterion": {
@@ -6523,6 +6533,8 @@ async def test_operator_attention_surfaces_unmet_experiment_outcome(
     )
     db_session.add_all([unmet_task, met_task, old_task, archived_task])
     await db_session.commit()
+    await db_session.refresh(unmet_task)
+    assert unmet_task.completed_at is not None
 
     resp = await client.get(f"/api/admin/operator-attention?project_id={project.id}")
     assert resp.status_code == 200
