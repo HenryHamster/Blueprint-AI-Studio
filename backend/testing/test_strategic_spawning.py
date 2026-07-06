@@ -7921,6 +7921,50 @@ async def test_stabilize_hint_names_lower_dimension_when_audit_not_binding(
     assert "the audit sub-score is the binding constraint on promotion" not in suffix
 
 
+@pytest.mark.asyncio
+async def test_version_phase_unavailable_marker_on_build_failure(
+    db_session, mocker, _lts_split_active
+):
+    """When the version_phase block assembly encounters an exception, a minimal
+    version_phase block with build_unavailable=True is included in the payload,
+    so the strategist can distinguish 'build failed' from 'no version exists'."""
+    await _ensure_releaseversion_table(db_session)
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    # Force the version_phase block build to fail by mocking
+    # current_open_version to raise an exception.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        new=AsyncMock(side_effect=RuntimeError("version_phase build boom")),
+    )
+
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, "version_phase block should be present even on build failure"
+    assert (
+        vp.get("build_unavailable") is True
+    ), "version_phase should have build_unavailable=True marker"
+
+
 def _patch_candidate_currency(mocker, *, resolved, head_sha):
     """Mock the GitHub resolution path used by _resolve_candidate_currency.
 

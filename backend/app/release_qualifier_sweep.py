@@ -401,9 +401,16 @@ async def _redrive_error_qualification(
 
     This re-driver fires for open, stabilize-phase versions whose
     ``last_qualification.status == "error"`` AND whose ``error`` code is in
-    ``_TRANSIENT_ERROR_CODES`` AND whose ``qualification_attempts`` is below
-    ``_MAX_ERROR_REDRIVE_ATTEMPTS``.  The attempt cap prevents a permanently
-    broken credential path from retrying forever.
+    ``_TRANSIENT_ERROR_CODES`` AND whose ``last_qualification["error_redrive_count"]``
+    is below ``_MAX_ERROR_REDRIVE_ATTEMPTS``.  The attempt cap prevents a
+    permanently broken credential path from retrying forever.
+
+    The cap is tracked in ``last_qualification["error_redrive_count"]`` (a
+    per-error-episode counter), NOT in the lifetime ``qualification_attempts``
+    column.  Using the lifetime counter was a bug: any version with 5+ prior
+    qualification attempts of ANY kind would be blocked from all transient-error
+    re-drives, stranding it silently at status=error regardless of how many
+    error episodes it had actually seen.
 
     Returns True only when the re-entry actually STARTED a new qualification
     (``status == "spawned"``).  Any guard no-op returns False.
@@ -428,31 +435,45 @@ async def _redrive_error_qualification(
         ):
             return False
         # Bounded attempts: do not retry a permanently broken path.
-        if (version.qualification_attempts or 0) >= _MAX_ERROR_REDRIVE_ATTEMPTS:
+        # Use the per-episode counter stored in last_qualification, NOT the
+        # lifetime qualification_attempts column.  The lifetime counter accrues
+        # across all qualification episodes (spawns, not just error re-drives),
+        # so a long-lived version with many prior attempts would be incorrectly
+        # blocked from transient-error re-drives on its very first error episode.
+        error_redrive_count = qual.get("error_redrive_count", 0)
+        if error_redrive_count >= _MAX_ERROR_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
         )
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         #
-        # Unlike the deferred_unsynced re-drive (which rolls back to protect the
-        # accruing ``first_deferred_at`` clock), the error re-drive MUST persist
-        # whatever run_qualification wrote, because the transient-error early
-        # returns (``sha_error`` / ``no_credentials``) bump ``qualification_attempts``
-        # via an atomic UPDATE on THIS session.  Rolling back on a non-spawned
-        # result discards that increment, so the ``>= _MAX_ERROR_REDRIVE_ATTEMPTS``
-        # cap above never advances and a permanently broken path (e.g. missing
-        # credentials) would be re-driven — and hit the GitHub API — every sweep
-        # forever.  Committing is safe here because the version STARTS in an
-        # ``error`` state that is meant to be overwritten:
+        # The transient-error early returns (``sha_error`` / ``no_credentials``)
+        # write a new last_qualification and bump ``qualification_attempts`` via
+        # an atomic UPDATE on THIS session.  Rolling back would discard both.
+        # Committing is safe because the version STARTS in an ``error`` state
+        # that is meant to be overwritten:
         #   * a repeated transient error rewrites last_qualification to a fresh
         #     ``sha_error`` / ``no_credentials`` (still in _TRANSIENT_ERROR_CODES,
-        #     so it stays eligible for the next sweep) with attempts now +1, so
-        #     the cap converges and the retry loop is bounded; and
+        #     so it stays eligible for the next sweep); and
         #   * any genuine transition (spawned / deferred_unsynced / not_promoted /
         #     a self-defending guard no-op) is a legitimate new state we want to
         #     keep, not revert to a stale ``error``.
         await redrive_session.commit()
+        # If still in a transient-error state, persist the per-episode retry
+        # counter so the cap advances across sweeps.  A spawned result naturally
+        # resets the counter (the new last_qualification won't carry
+        # error_redrive_count, so the next error episode starts fresh at 0).
+        if result and result.get("status") in _TRANSIENT_ERROR_CODES:
+            await redrive_session.refresh(version)
+            new_qual = version.last_qualification
+            if isinstance(new_qual, dict):
+                version.last_qualification = {
+                    **new_qual,
+                    "error_redrive_count": error_redrive_count + 1,
+                }
+                flag_modified(version, "last_qualification")
+                await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
 
 
@@ -1125,6 +1146,83 @@ async def _redrive_promotion_failed_qualification(
         return False
 
 
+async def _redrive_dry_run_candidate(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``dry_run`` candidate once promotion is enabled.
+
+    When a stabilize-phase version qualifies while ``promotion_enabled=False``, the
+    verdict is recorded as ``dry_run`` with ``would_promote=True``.  That verdict is
+    conclusive: ``run_qualification`` caches it by candidate SHA and will not re-run.
+    Stall alerts intentionally treat ``dry_run`` as healthy (the operator disabled
+    promotion deliberately), and nothing re-drives the version when the operator later
+    enables promotion.
+
+    This is the missing trigger.  For each sweep it checks an open, stabilize-phase
+    version whose ``last_qualification.status == "dry_run"`` and
+    ``last_qualification.would_promote == True``:
+
+      1. Calls ``resolve_project_promotion_enabled``.  If promotion is STILL
+         disabled, returns False immediately — the condition has not changed.
+      2. Rewrites ``last_qualification`` to a non-conclusive placeholder
+         (``status="requalification_requested", previous_status="dry_run"``) so the
+         cached-verdict guard in ``run_qualification`` is cleared for this one
+         re-entry, then re-invokes ``run_qualification`` under its own ``FOR UPDATE``
+         lock with ``allow_synchronous_reuse_promote=True``.
+      3. Commits on ``spawned`` or ``reused_audit``; rolls back otherwise so
+         ``last_qualification`` is not left in a corrupt placeholder state.
+
+    Returns True only when the re-entry actually started a new qualification
+    or a passing-audit reuse-promote fired.  Any guard no-op returns False.
+    """
+    from app import release_qualifier
+    from app.shared_state import resolve_project_promotion_enabled
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "dry_run"
+            or not qual.get("would_promote")
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Guard: only fire when the operator has since enabled promotion.
+        if not resolve_project_promotion_enabled(version.project_id):
+            return False
+        # Clear the cached-verdict guard by writing a non-conclusive placeholder.
+        # run_qualification's FOR UPDATE lock serializes the actual re-entry; a
+        # concurrent caller that wins the lock will either spawn or return a
+        # self-defending guard status, both of which are safe.
+        version.last_qualification = {
+            **qual,
+            "status": "requalification_requested",
+            "previous_status": "dry_run",
+        }
+        flag_modified(version, "last_qualification")
+        redrive_session.add(version)
+        result = await release_qualifier.run_qualification(
+            redrive_session,
+            version.project_id,
+            version,
+            session_factory=session_factory,
+            allow_synchronous_reuse_promote=True,
+        )
+        if result and (
+            result.get("status") == "spawned" or result.get("reused_audit")
+        ):
+            await redrive_session.commit()
+            return True
+        await redrive_session.rollback()
+        return False
+
+
 async def sweep_stuck_qualifications(
     session: AsyncSession,
     *,
@@ -1506,6 +1604,37 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove promotion_failed version %s "
                 "(re-qualification spawned after automain advanced)",
+                version_id,
+            )
+
+    # Re-drive open ``dry_run`` candidates once the operator enables promotion.
+    # A candidate that passes qualification while ``promotion_enabled=False``
+    # records a conclusive ``dry_run`` verdict (``would_promote=True``).  When
+    # the operator later enables promotion, nothing acts on it: stall alerts
+    # treat ``dry_run`` as healthy, and the same-SHA ``qualify_request`` no-ops
+    # via the cached-verdict guard.  This loop is the scheduled trigger: once
+    # ``resolve_project_promotion_enabled`` returns True for the project, clear
+    # the cached-verdict guard and re-enter ``run_qualification``.  Runs AFTER
+    # the ``promotion_failed`` re-driver so a version that exited ``dry_run``
+    # via another path is handled there first.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_dry_run_candidate(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: dry_run re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove dry_run version %s "
+                "(promotion enabled — re-qualification spawned)",
                 version_id,
             )
 

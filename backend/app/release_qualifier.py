@@ -234,6 +234,7 @@ from app.release_qualifier_sweep import (
     _parse_started_at,
     _reconcile_if_criterion_coverage_now_complete,  # noqa: F401 — re-exported for tests
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
+    _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests
     _redrive_not_promoted_qualification,  # noqa: F401 — re-exported for tests
     sweep_stuck_qualifications,  # noqa: F401 — re-exported for reaper + tests
 )

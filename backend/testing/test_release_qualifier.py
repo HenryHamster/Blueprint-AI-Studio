@@ -17679,9 +17679,9 @@ async def test_sweep_redrives_transient_sha_error_version(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_sweep_error_redrive_respects_attempt_cap(db_session, mocker):
-    """A stabilize version at status=error is NOT re-driven once qualification_attempts
-    reaches _MAX_ERROR_REDRIVE_ATTEMPTS, preventing infinite retries on a
-    permanently broken path."""
+    """A stabilize version at status=error is NOT re-driven once
+    last_qualification["error_redrive_count"] reaches _MAX_ERROR_REDRIVE_ATTEMPTS,
+    preventing infinite retries on a permanently broken path."""
     from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -17690,8 +17690,8 @@ async def test_sweep_error_redrive_respects_attempt_cap(db_session, mocker):
         "error": "sha_error",
         "detail": "HTTPException: connection refused",
         "started_at": "2026-07-05T10:00:00",
+        "error_redrive_count": _MAX_ERROR_REDRIVE_ATTEMPTS,
     }
-    version.qualification_attempts = _MAX_ERROR_REDRIVE_ATTEMPTS
     db_session.add(version)
     await db_session.commit()
 
@@ -17716,17 +17716,12 @@ async def test_sweep_error_redrive_accumulates_attempts_until_capped(
     db_session, mocker
 ):
     """A persistently-failing transient path is re-driven only a BOUNDED number
-    of times: qualification_attempts must ACCUMULATE across sweeps and converge
-    on _MAX_ERROR_REDRIVE_ATTEMPTS, at which point re-drive stops.
+    of times: last_qualification["error_redrive_count"] must ACCUMULATE across
+    sweeps and converge on _MAX_ERROR_REDRIVE_ATTEMPTS, at which point re-drive stops.
 
-    This is the regression proof for the rollback-defeats-the-cap bug: the
-    transient-error early returns in run_qualification bump qualification_attempts
-    on the re-drive session, so if that session is rolled back on the (non-spawned)
-    error result, the increment is discarded and the cap NEVER advances — a broken
-    path (e.g. a permanently unreachable GitHub) is re-driven, hitting the API,
-    every sweep forever.  Here get_branch_sha ALWAYS raises, so every re-drive
-    returns sha_error; the counter must still stop climbing at the cap and the
-    GitHub call count must be bounded, not unbounded.
+    Here get_branch_sha ALWAYS raises, so every re-drive returns sha_error; the
+    per-episode counter must stop climbing at the cap and the GitHub call count
+    must be bounded, not unbounded.
     """
     from app.release_qualifier_sweep import _MAX_ERROR_REDRIVE_ATTEMPTS
 
@@ -17759,16 +17754,81 @@ async def test_sweep_error_redrive_accumulates_attempts_until_capped(
         await db_session.commit()
 
     await db_session.refresh(version)
-    # The increment PERSISTED across sweeps (not rolled back) and converged on the
-    # cap exactly — never exceeding it, never stalling below it.
-    assert version.qualification_attempts == _MAX_ERROR_REDRIVE_ATTEMPTS
+    # The per-episode counter persisted across sweeps and converged on the cap
+    # exactly — never exceeding it, never stalling below it.
+    assert version.last_qualification.get("error_redrive_count") == _MAX_ERROR_REDRIVE_ATTEMPTS
     # GitHub was hit at most once per re-drive and re-drive stopped at the cap:
-    # the API call count is bounded, not unbounded (the bug would loop forever).
+    # the API call count is bounded, not unbounded.
     assert sha_mock.call_count == _MAX_ERROR_REDRIVE_ATTEMPTS
     # Never spawned (every attempt failed) and stays in the transient-error state.
     spawn_mock.assert_not_called()
     assert version.last_qualification["status"] == "error"
     assert version.last_qualification["error"] == "sha_error"
+
+
+@pytest.mark.asyncio
+async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
+    db_session, mocker
+):
+    """A version with many lifetime qualification_attempts is still re-driven on
+    its first error episode — the cap must be per-episode (error_redrive_count in
+    last_qualification), NOT the lifetime qualification_attempts column.
+
+    Regression test for the v22 bug: the deployed re-driver used
+    qualification_attempts >= _MAX_ERROR_REDRIVE_ATTEMPTS as its guard, so any
+    version that had accumulated 5+ prior spawn attempts of ANY kind was silently
+    blocked from ALL transient-error re-drives and stranded at status=error
+    indefinitely, regardless of how many times it had actually been re-driven for
+    the current error episode.
+    """
+    sha = "aabbcc" * 6 + "aabb"
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "error": "sha_error",
+        "detail": "ReadTimeout: ",
+        "started_at": "2026-07-05T11:00:00",
+        # No error_redrive_count — this is the first error episode.
+    }
+    # Many lifetime attempts from previous qualification episodes (the bug trigger).
+    version.qualification_attempts = 10
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-long-lived",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-longv",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The version MUST have been re-driven despite high lifetime attempts.
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
 
 
 @pytest.mark.asyncio
@@ -31220,3 +31280,153 @@ async def test_observe_mode_records_enforce_preview_without_changing_confidence(
     api_view = format_qualification_for_api(qual)
     assert api_view["debt_enforce_confidence_preview"] == pytest.approx(preview_confidence)
     assert api_view["debt_enforce_weight_preview"] == pytest.approx(preview_weight)
+
+
+# ===========================================================================
+# _redrive_dry_run_candidate — post-dry-run candidate trigger on promotion enable
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_triggers_when_promotion_enabled(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must rewrite last_qualification to non-conclusive
+    and call run_qualification when the version is dry_run+would_promote=True and
+    promotion has since been enabled."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "dryc0de0" * 5,
+        "would_promote": True,
+        "confidence": 0.95,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is True
+    run_qual.assert_awaited_once()
+    # run_qualification was called with the version carrying the placeholder status.
+    call_version = run_qual.call_args[0][2]
+    assert call_version.last_qualification["status"] == "requalification_requested"
+    assert call_version.last_qualification["previous_status"] == "dry_run"
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_noop_when_promotion_still_disabled(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must return False without touching run_qualification
+    when promotion is still disabled for the project."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "beef0000" * 5,
+        "would_promote": True,
+        "confidence": 0.91,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_redrive_dry_run_candidate_noop_when_would_promote_false(
+    db_session, mocker
+):
+    """_redrive_dry_run_candidate must return False when would_promote is absent/False —
+    the candidate did not pass the confidence threshold even before the dry-run gate."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _redrive_dry_run_candidate
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "cafe0000" * 5,
+        "would_promote": False,
+        "confidence": 0.55,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    result = await _redrive_dry_run_candidate(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
+    db_session, mocker
+):
+    """Integration: sweep_stuck_qualifications re-drives a dry_run+would_promote version
+    once promotion is enabled, increments the finalized count, and spawns qualification."""
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "candidate_sha": "0a1b2c3d" * 5,
+        "would_promote": True,
+        "confidence": 0.93,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    # At least the dry_run re-drive must have contributed to the finalized count.
+    assert count >= 1

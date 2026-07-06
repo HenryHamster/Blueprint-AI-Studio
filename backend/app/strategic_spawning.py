@@ -6940,6 +6940,9 @@ async def _spawn_strategic_review(
                 )
         except Exception:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
+            # Surface the build failure in the payload so the strategist can
+            # distinguish 'build failed' from 'no version exists'.
+            _version_phase_block = {"build_unavailable": True}
     # Deployment-state block — only under an LTS split (integration branch !=
     # promotion target). Grounds the deploy-model framing in concrete numbers:
     # what is actually DEPLOYED (running live on the promotion target) vs what
