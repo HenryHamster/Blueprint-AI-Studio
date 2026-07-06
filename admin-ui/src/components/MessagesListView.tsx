@@ -1006,9 +1006,12 @@ function TriageVirtualList(props: TriageVirtualListProps) {
   ]);
 
   const handleTriageScrollToBottom = useCallback(() => {
-    if (items.length === 0) return;
-    listRef.current?.scrollToRow({ index: items.length - 1, align: 'end', behavior: 'smooth' });
-  }, [items.length, listRef]);
+    const el = listRef.current?.element;
+    if (!el) return;
+    // Use scrollHeight directly rather than scrollToRow so the scroll lands at
+    // the real bottom regardless of dynamic row-height estimates (audit 71833e6b).
+    el.scrollTo({ top: el.scrollHeight, behavior: 'smooth' });
+  }, [listRef]);
 
   return (
     <div className="relative flex-1 overflow-hidden bg-workbench-surface">
@@ -1019,7 +1022,8 @@ function TriageVirtualList(props: TriageVirtualListProps) {
         rowHeight={rowHeight}
         overscanCount={6}
         listRef={listRef}
-        className="h-full custom-scrollbar"
+        defaultHeight={600}
+        className="h-full custom-scrollbar overflow-y-auto"
         onRowsRendered={(visible) => handleRowsRenderedRef.current(visible)}
       />
       {showScrollDown && (

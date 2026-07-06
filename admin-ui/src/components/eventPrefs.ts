@@ -58,6 +58,9 @@ export const HIGH_SIGNAL_NOTE_BADGE_LABELS: Readonly<Record<string, string>> = {
   capability_trial_stalled: 'Trial Stalled',
   capability_verdict_decided: 'Verdict Decided',
   capability_trial_ambiguous_lift_escalation: 'Ambiguous Lift',
+  question_answer: 'Question Answered',
+  criterion_retracted: 'Criterion Retracted',
+  criterion_superseded: 'Criterion Superseded',
 };
 
 export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
@@ -67,6 +70,7 @@ export const HIGH_SIGNAL_NOTE_EVENTS: ReadonlySet<string> = new Set([
   'promotion_readiness_reached', 'strategic_steering_deferred', 'strategic_steering_acted',
   'direction_staged_activated', 'capability_trial_stalled', 'capability_verdict_decided',
   'capability_trial_ambiguous_lift_escalation',
+  'question_answer', 'criterion_retracted', 'criterion_superseded',
   ...ESCALATION_EVENT_TYPES,
 ]);
 
@@ -93,7 +97,6 @@ export const ROUTINE_EVENT_LABELS: Record<string, string> = {
   issue_implementation_spawned: 'issue spawns',
   review_feedback: 'review feedback',
   feedback_acknowledgment: 'feedback acks',
-  question_answer: 'question answers',
 };
 
 export type EventPref = 'mute' | 'routine' | 'surfaced';

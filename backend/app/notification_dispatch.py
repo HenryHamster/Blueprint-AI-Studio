@@ -84,6 +84,7 @@ HIGH_SIGNAL_NOTE_EVENT_TYPES: frozenset[str] = frozenset(
         "capability_trial_ambiguous_lift_escalation",  # raise_ambiguous_lift_escalation_notice
         "criterion_retracted",  # post_criterion_retracted_message
         "criterion_superseded",  # post_criterion_superseded_message
+        "question_answer",  # post_question_answer
     }
 )
 
