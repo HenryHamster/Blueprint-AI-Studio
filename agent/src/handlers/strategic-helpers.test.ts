@@ -216,6 +216,18 @@ describe('writeStrategicHelpers', () => {
       expect(s).toContain('"$body" >&2');
     });
 
+    it('_call retries a curl transport failure (http_code 000) instead of treating it as permanent', () => {
+      writeStrategicHelpers('t', 'p', testWorkspace);
+      const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');
+      // curl reports http_code "000" on a connect timeout / DNS / TLS / dropped
+      // connection — no HTTP response. It must be retried alongside 429/5xx, not
+      // fall through to the non-retryable else branch (which would make a network
+      // blip a permanent failure).
+      expect(s).toContain('[ "$http_code" = "000" ]');
+      // The 000 check shares the SAME retry condition as 429 (one `if` line).
+      expect(s).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
+    });
+
     it('_call honors Retry-After header on 429 contention', () => {
       writeStrategicHelpers('t', 'p', testWorkspace);
       const s = fs.readFileSync(`${testWorkspace}/strategic`, 'utf-8');

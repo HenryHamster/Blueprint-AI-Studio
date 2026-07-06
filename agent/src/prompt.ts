@@ -650,7 +650,11 @@ _post_with_retry() {
     fi
     attempt=$((attempt + 1))
     if [ $attempt -ge $max ]; then break; fi
-    if [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
+    # curl emits http_code "000" on a transport-level failure (connect timeout,
+    # DNS failure, TLS handshake, dropped connection) — no HTTP response at all.
+    # Treat it as a transient failure and retry alongside 429/5xx so a network
+    # blip (or a token-budget hiccup) is not booked as a permanent failure.
+    if [ "$http_code" = "000" ] || [ "$http_code" = "429" ] || { [ "$http_code" -ge 500 ] && [ "$http_code" -lt 600 ]; }; then
       if [ -z "$delay" ]; then
         if [ $attempt -eq 1 ]; then delay=5
         elif [ $attempt -eq 2 ]; then delay=15

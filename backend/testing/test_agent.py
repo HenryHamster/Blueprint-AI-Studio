@@ -3308,6 +3308,97 @@ async def test_git_read_token_no_installation(client: AsyncClient, db_session, m
     assert resp.json()["error"]["message"] == "github_token_unavailable"
 
 
+@pytest.mark.asyncio
+async def test_git_read_token_rejects_inactive_status_task(
+    client: AsyncClient, db_session, mocker
+):
+    """git-read-token must reach authorization parity with /refresh-token: a
+    task in a non-terminal-but-non-active status (EVALUATING) passes
+    verify_agent_token (it is not in _AGENT_INACTIVE_TASK_STATUSES) but must NOT
+    be able to mint a fresh GitHub read token. Regression for the audit finding
+    that a stale-but-unexpired JWT for a requeued/finished task kept minting
+    read tokens until JWT expiry.
+    """
+    project = Project(
+        name="Git Token Stale Status",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id="agent-vm-git-stale",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    # A token mint here would be the bug; assert we never reach the GitHub call.
+    gh_mock = mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_should_not_be_minted",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git-stale")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"].startswith("task_not_active")
+    gh_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_git_read_token_rejects_requeued_cleared_vm(
+    client: AsyncClient, db_session, mocker
+):
+    """git-read-token must reject a requeued task whose vm_instance_id was
+    cleared. verify_agent_token's mismatch guard short-circuits when
+    task.vm_instance_id is falsy, so this liveness gap is closed only by the
+    endpoint's own vm_instance_id match (parity with /refresh-token).
+    """
+    project = Project(
+        name="Git Token Requeued VM",
+        user_id="test-user-123",
+        github_owner="testowner",
+        github_repo="testrepo",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"cmd": "run"}],
+        vm_instance_id=None,
+        status=TaskStatus.QUEUED,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    gh_mock = mocker.patch(
+        "app.github_auth.get_repo_installation_token",
+        return_value="ghs_should_not_be_minted",
+    )
+
+    agent_token = create_agent_token(str(task.id), "agent-vm-git-requeued")
+    resp = await client.get(
+        "/api/agent/git-read-token",
+        headers={"x-agent-token": agent_token},
+    )
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["error"]["message"] == "vm_instance_mismatch"
+    gh_mock.assert_not_called()
+
+
 def _agent_auth_body(endpoint: str, task_id: str, vm_instance_id: str) -> dict:
     if endpoint == "status":
         return {"task_id": task_id, "status": "COMPLETED"}

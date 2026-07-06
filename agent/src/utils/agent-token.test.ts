@@ -1,10 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+
+// Mock the two token-persistence modules the GitHub-token refresh callback
+// touches so the refresh path can be exercised without writing real files or
+// shelling out to git. Only the symbols agent-token.ts imports need to exist.
+vi.mock('../token-file.js', () => ({
+  writeGithubTokenFile: vi.fn(),
+}));
+vi.mock('../git-credential.js', () => ({
+  writeGitTokenFile: vi.fn(),
+  setupGitCredentialHelper: vi.fn(),
+}));
+
 import {
   computeRefreshDelayMs, isBootstrapToken,
   initTokenModule,
   scheduleGithubTokenRefresh, stopGithubTokenRefresh,
 } from './agent-token.js';
 import * as agentTokenModule from './agent-token.js';
+import { writeGithubTokenFile } from '../token-file.js';
+import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 import {
   TOKEN_REFRESH_FLOOR_MS,
   TOKEN_REFRESH_CEILING_MS,
@@ -156,5 +170,65 @@ describe('scheduleGithubTokenRefresh / stopGithubTokenRefresh lifecycle', () => 
     stopGithubTokenRefresh();
     scheduleGithubTokenRefresh('task-rw', '/tmp/ws', 'owner', 'repo', false);
     expect(agentTokenModule.githubTokenRefreshTimer).not.toBeNull();
+  });
+});
+
+// ── GitHub token refresh callback: credential-exposure hardening ──────────────
+// Finding 11: the refresh must NOT re-embed the installation token in the git
+// remote URL (which persists it in .git/config and briefly in the git argv). It
+// keeps the origin URL clean and delegates auth to the credential helper.
+describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)', () => {
+  // The local const in agent-token.ts (not exported); mirrored here.
+  const GITHUB_TOKEN_REFRESH_MS = 45 * 60 * 1000;
+  const FRESH_TOKEN = 'ghs_fresh_write_token';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopGithubTokenRefresh();
+    vi.mocked(writeGithubTokenFile).mockReset();
+    vi.mocked(writeGitTokenFile).mockReset();
+    vi.mocked(setupGitCredentialHelper).mockReset();
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ data: { token: FRESH_TOKEN } }),
+    })));
+  });
+  afterEach(() => {
+    stopGithubTokenRefresh();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('write task: refreshes token file + credential helper, never embeds token in a remote URL', async () => {
+    scheduleGithubTokenRefresh('task-rw', '/tmp/ws', 'owner', 'repo', false);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+    stopGithubTokenRefresh(); // cancel the self-reschedule before assertions
+
+    // Fresh token mirrored to both on-disk token files (helper reads the git one).
+    expect(vi.mocked(writeGithubTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
+    expect(vi.mocked(writeGitTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
+    // Auth delegated to the credential helper against a CLEAN origin URL — the
+    // token is never written into .git/config nor passed on the git command line.
+    expect(vi.mocked(setupGitCredentialHelper)).toHaveBeenCalledWith('owner', 'repo', '/tmp/ws');
+    // Regression guard: the raw token must never appear in any git-remote argument.
+    expect(vi.mocked(setupGitCredentialHelper).mock.calls.flat().join(' ')).not.toContain(FRESH_TOKEN);
+  });
+
+  it('read-only task: refreshes the token file only, touches no git auth config', async () => {
+    scheduleGithubTokenRefresh('task-ro', '/tmp/ws', 'owner', 'repo', true);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+    stopGithubTokenRefresh();
+
+    expect(vi.mocked(writeGithubTokenFile)).toHaveBeenCalledWith(FRESH_TOKEN);
+    expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
+    expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
   });
 });

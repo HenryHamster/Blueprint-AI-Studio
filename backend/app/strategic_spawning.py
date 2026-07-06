@@ -57,6 +57,8 @@ from app.release_artifacts import (
     version_serving_summary as _version_serving_summary,
 )
 from app.autonomous_spawn_budget import (
+    DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE,
+    autonomous_spawn_budget_config_from_runtime,
     build_autonomous_spawn_budget_guard,
     compute_autonomous_spawn_budget_snapshot,
 )
@@ -1559,8 +1561,11 @@ def _build_cycle_start_reconciliation(
             "last_qualification_candidate_currency"
         )
 
-        # Disagreement 1: candidate currency says stale while last_qual presents
-        # a passing/promotable candidate
+        # Disagreement 1: candidate currency says stale AND last_qual carries a
+        # 'promotion_failed' status. A pending+stale candidate is deliberately
+        # NOT flagged (integration-branch drift during an active qualification
+        # is expected); the conflict fires only when a *failed* promotion left
+        # the recorded candidate pinned to a now-stale SHA instead of advancing.
         if isinstance(vpb_candidate_currency, dict) and isinstance(
             vpb_last_qual, dict
         ):
@@ -1576,12 +1581,14 @@ def _build_cycle_start_reconciliation(
             ):
                 qualification_surface_conflicts.append(
                     {
-                        "conflict_type": "stale_candidate_with_pending_status",
+                        "conflict_type": "stale_candidate_with_promotion_failed_status",
                         "description": (
                             "Candidate currency says the pinned SHA is stale/behind "
-                            f"HEAD, but last_qualification.status is '{candidate_status}' "
-                            "(not disqualified). The version may be advancing when its "
-                            "candidate is no longer the integration branch HEAD."
+                            f"HEAD, but last_qualification.status is '{candidate_status}'. "
+                            "After a failed promotion the recorded candidate should "
+                            "have advanced past the now-stale SHA; a stale candidate "
+                            "still carrying a promotion_failed status means the "
+                            "qualification surface was not refreshed."
                         ),
                     }
                 )
@@ -3841,9 +3848,37 @@ async def _strategic_spawn_budget_guard(
             "[AUTONOMOUS] Spawn budget snapshot: %s",
             snapshot.as_log_fields(),
         )
-    except Exception as exc:  # noqa: BLE001 - fail open if the snapshot cannot be read
+    except Exception as exc:  # snapshot read failed; fail posture is mode-dependent
+        # A persistent snapshot/DB failure must NOT silently disable an
+        # operator-enabled 'enforce' budget (that would be the exact opposite
+        # of enforcement). The configured mode comes from runtime_config and
+        # needs no DB, so we can still read it here. Fail CLOSED under enforce
+        # (block the spawn) and preserve fail-open for the observational
+        # off/observe modes where the guard is only advisory.
+        try:
+            mode = autonomous_spawn_budget_config_from_runtime(_runtime_config).mode
+        except Exception:  # noqa: BLE001 - malformed config; stay observational
+            mode = DEFAULT_AUTONOMOUS_SPAWN_BUDGET_MODE
+        if mode == "enforce":
+            logger.exception(
+                "[AUTONOMOUS] Spawn budget snapshot failed in enforce mode; "
+                "failing CLOSED (blocking %s spawn)",
+                spawn_category,
+            )
+            return {
+                "guard": "budget_snapshot_unavailable",
+                "reason": (
+                    "Autonomous spawn-budget snapshot could not be computed in "
+                    "enforce mode; failing closed to block unbounded spawns: "
+                    f"{exc}"
+                ),
+                "mode": mode,
+                "scope": "global",
+                "category": spawn_category,
+            }
         logger.warning(
-            "[AUTONOMOUS] Spawn budget calculation failed open: %s",
+            "[AUTONOMOUS] Spawn budget calculation failed open (mode=%s): %s",
+            mode,
             exc,
         )
         return None

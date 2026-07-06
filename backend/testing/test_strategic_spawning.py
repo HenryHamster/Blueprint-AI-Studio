@@ -2642,6 +2642,58 @@ async def test_spawn_strategic_review_respects_global_backstop(db_session, mocke
 
 
 @pytest.mark.asyncio
+async def test_strategic_spawn_budget_guard_fails_closed_in_enforce_mode(
+    db_session, mocker
+):
+    """A snapshot-computation failure must BLOCK the spawn under enforce mode.
+
+    Fail-open on a persistent snapshot/DB error would silently disable an
+    operator-enabled budget — the exact opposite of enforcement.
+    """
+    from app.strategic_spawning import _strategic_spawn_budget_guard
+
+    mocker.patch(
+        "app.strategic_spawning.compute_autonomous_spawn_budget_snapshot",
+        new=AsyncMock(side_effect=RuntimeError("snapshot db down")),
+    )
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    try:
+        guard = await _strategic_spawn_budget_guard(db_session, "initiative")
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+    assert guard is not None
+    assert guard["guard"] == "budget_snapshot_unavailable"
+    assert guard["mode"] == "enforce"
+    assert guard["category"] == "initiative"
+
+
+@pytest.mark.asyncio
+async def test_strategic_spawn_budget_guard_fails_open_in_observe_mode(
+    db_session, mocker
+):
+    """In observe mode the guard is advisory, so a snapshot failure preserves
+    fail-open behavior (returns None => spawn proceeds)."""
+    from app.strategic_spawning import _strategic_spawn_budget_guard
+
+    mocker.patch(
+        "app.strategic_spawning.compute_autonomous_spawn_budget_snapshot",
+        new=AsyncMock(side_effect=RuntimeError("snapshot db down")),
+    )
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+    try:
+        guard = await _strategic_spawn_budget_guard(db_session, "initiative")
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+    assert guard is None
+
+
+@pytest.mark.asyncio
 async def test_spawn_design_doc_update_proceeds_when_no_active_strategic(db_session):
     """_spawn_design_doc_update returns True and creates a task when no strategic task is active."""
     project = _make_project(vision={"purpose": "test purpose"})
@@ -13737,7 +13789,7 @@ class TestBuildCycleStartReconciliation:
         stale_conflicts = [
             c
             for c in conflicts
-            if c.get("conflict_type") == "stale_candidate_with_pending_status"
+            if c.get("conflict_type") == "stale_candidate_with_promotion_failed_status"
         ]
         # pending + stale is normal during active qualification; NOT a conflict
         assert len(stale_conflicts) == 0
@@ -13778,7 +13830,7 @@ class TestBuildCycleStartReconciliation:
         stale_conflicts = [
             c
             for c in conflicts
-            if c.get("conflict_type") == "stale_candidate_with_pending_status"
+            if c.get("conflict_type") == "stale_candidate_with_promotion_failed_status"
         ]
         assert len(stale_conflicts) == 1
         assert "stale" in stale_conflicts[0]["description"].lower()

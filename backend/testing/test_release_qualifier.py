@@ -18167,17 +18167,21 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
 
 @pytest.mark.asyncio
 async def test_redrive_infra_failure_respects_attempt_cap(db_session, mocker):
-    """A stabilize version at status=infra_failure is NOT re-driven once
-    last_qualification["infra_failure_redrive_count"] reaches
-    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS, preventing infinite retries."""
+    """A stabilize version at status=infra_failure is NOT re-driven once the
+    PERSISTED last_qualification["consecutive_infra_errors"] streak reaches
+    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS, preventing infinite retries.
+
+    Regression for audit acaa610d: the cap must key on the streak the finalize
+    path maintains, NOT the dead ``infra_failure_redrive_count`` field (deliberately
+    absent here — the old code read it, defaulting to 0, and would re-drive)."""
     from app.release_qualifier_sweep import _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
     version.last_qualification = {
         "status": "infra_failure",
-        "blocker": "qualification_timeout",
-        "detail": "qualification pending 361 min (> 360 min limit)",
-        "infra_failure_redrive_count": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        "candidate_sha": "capca0de" * 5,
+        "error": "migration_identity_check_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
     }
     db_session.add(version)
     await db_session.commit()
@@ -18227,15 +18231,21 @@ async def test_redrive_infra_failure_noop_when_not_stabilize_phase(db_session, m
 
 
 @pytest.mark.asyncio
-async def test_redrive_infra_failure_increments_counter_on_repeated_failure(
+async def test_redrive_infra_failure_cap_keyed_on_persisted_streak(
     db_session, mocker
 ):
-    """When run_qualification returns infra_failure again (persistent infra
-    problem), the per-episode counter is incremented so the cap converges
-    across sweeps and the re-driver does not retry forever.
+    """The infra-failure circuit-breaker keys on the PERSISTED
+    ``consecutive_infra_errors`` streak (which ``_handle_infra_failure`` maintains
+    on the finalized verdict), NOT on a re-driver-local counter and NOT on the
+    synchronous ``run_qualification`` return value.
 
-    run_qualification is mocked to always return infra_failure — simulating
-    a persistent infrastructure outage that each re-drive re-encounters.
+    Regression for audit acaa610d: the old code only incremented
+    ``infra_failure_redrive_count`` when ``run_qualification`` synchronously
+    returned status=='infra_failure' — which it NEVER does (that verdict is only
+    written asynchronously at finalize).  So the counter stayed 0, the cap never
+    tripped, and re-drives were unbounded.  Here ``run_qualification`` returns the
+    realistic ``spawned`` and we assert the cap is driven purely by the persisted
+    streak: a stale/dead ``infra_failure_redrive_count`` is ignored.
     """
     from app.release_qualifier_sweep import (
         _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
@@ -18243,36 +18253,37 @@ async def test_redrive_infra_failure_increments_counter_on_repeated_failure(
     )
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Real streak BELOW the cap, but a stale/dead infra_failure_redrive_count ABOVE
+    # the cap.  The old code (keyed on infra_failure_redrive_count) would have
+    # blocked; the fixed code ignores that field and re-drives because the persisted
+    # consecutive_infra_errors streak is below the cap.
     version.last_qualification = {
         "status": "infra_failure",
-        "blocker": "migration_identity_check_unavailable",
-        "detail": "GitHub unreachable during migration identity check",
-        "started_at": "2026-07-06T00:00:00",
+        "candidate_sha": "5treakab" * 5,
+        "error": "migration_identity_check_unavailable",
+        "consecutive_infra_errors": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS - 1,
+        "infra_failure_redrive_count": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS + 5,
     }
     version.qualification_attempts = 1
     db_session.add(version)
     await db_session.commit()
     await db_session.refresh(version)
 
-    # Mock run_qualification to always return infra_failure — persistent outage.
+    # run_qualification returns the realistic "spawned" — it NEVER synchronously
+    # returns infra_failure.
     run_qual = mocker.patch(
         "app.release_qualifier.run_qualification",
-        new=AsyncMock(return_value={"status": "infra_failure", "blocker": "qualification_timeout"}),
+        new=AsyncMock(return_value={"status": "spawned"}),
     )
 
-    # Drive the re-driver directly more times than the cap allows.
-    factory = _shared_session_factory(db_session)
-    for _ in range(_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS + 2):
-        await _redrive_infra_failure_qualification(version.id, session_factory=factory)
-        await db_session.commit()
+    result = await _redrive_infra_failure_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
 
-    await db_session.refresh(version)
-    # run_qualification was called at most _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS times —
-    # the cap stopped further re-drives after it was reached.
-    assert run_qual.await_count == _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
-    # The per-episode counter reached the cap (never exceeded).
-    lq = version.last_qualification
-    assert lq.get("infra_failure_redrive_count") == _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+    # Below the persisted-streak cap → the re-driver fires (proves the dead
+    # infra_failure_redrive_count field no longer gates the breaker).
+    assert result is True
+    run_qual.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -31152,6 +31163,67 @@ async def test_sweep_promotes_dry_run_pass_after_promotion_enabled(db_session, m
     force_promote_spy.assert_awaited_once()
     call_kwargs = force_promote_spy.call_args
     assert call_kwargs.args[1] == candidate_sha
+
+
+@pytest.mark.asyncio
+async def test_sweep_current_dry_run_uses_cheap_promote_not_requalify(
+    db_session, mocker
+):
+    """For a dry-run-pass candidate that is STILL the integration-branch HEAD, the
+    sweep must promote it via the cheap deterministic direct-promote path and MUST
+    NOT also trigger the expensive non-deterministic full re-qualification.
+
+    Regression for audit 8989794e: the two dry_run triggers overlapped for the
+    identical state, with the expensive ``_redrive_dry_run_candidate`` running
+    before (and shadowing) the purpose-built cheap ``_promote_dry_run_pass_if_enabled``.
+    They must be mutually exclusive with the cheap path taking precedence for a
+    current candidate — so ``run_qualification`` (the expensive re-audit) is never
+    invoked for a candidate the direct-promote already handled.
+    """
+    from app import shared_state
+
+    candidate_sha = "cur12345" * 5  # 40-char placeholder SHA (still == HEAD)
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": "hashvalue",
+        "confidence": 0.94,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # Cheap direct-promote fired exactly once for the current candidate...
+    force_promote_spy.assert_awaited_once()
+    assert force_promote_spy.call_args.args[1] == candidate_sha
+    # ...and the expensive re-qualification was NOT run (mutual exclusion).
+    run_qual.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,7 @@ from app.auth import require_admin
 from app.task_locking import (
     DESIGN_DOC_MAX_BYTES,
     lock_project_or_429 as _lock_project_or_429,
+    task_lock,
     with_directions_locked as _with_directions_locked,
     with_vision_locked as _with_vision_locked,
 )
@@ -801,6 +802,32 @@ async def strategic_operation(
 
     # Lock project for atomic update (skip_locked + 429 avoids lock_timeout cascade)
     project = await _lock_project_or_429(session, task.project_id)
+
+    # Re-acquire the task row FRESH under FOR UPDATE now that we hold the project
+    # lock (canonical Project→Task order — see task_locking.lock_project_then_task).
+    # ``task`` was loaded above WITHOUT a lock and BEFORE the project lock, so its
+    # in-memory ``context`` can be stale relative to a concurrent whole-column
+    # writer — specifically the resident-session heartbeat mirror in
+    # ``strategic_resident_session.renew_resident_session_lease``, which stamps
+    # durable restart keys (``_exam_ledger`` / ``message_cursor``). Every
+    # ``task.context = {**ctx, ...}`` read-modify-write in this endpoint would
+    # otherwise overwrite the whole column from that stale read and drop the
+    # heartbeat's keys (lost update), and vice versa. Re-reading FOR UPDATE with
+    # populate_existing refreshes the SHARED Task object with the current
+    # committed context and holds the row until this request commits, so all
+    # downstream context RMWs are serialized and race-free. Since we already hold
+    # the project lock, no Project→Task writer can be holding this task lock; a
+    # None here means a non-project task-locker (dispatch/reaper) holds it —
+    # surface a retryable 429 (matching the project 429 contract) rather than
+    # block on the 30s lock_timeout and risk a Cloud Run container-fault.
+    async with task_lock(session, task.id, skip_locked=True) as _locked_task:
+        if _locked_task is None:
+            raise HTTPException(
+                status_code=429,
+                detail="Task row locked by concurrent write, retry",
+                headers={"Retry-After": "2"},
+            )
+        task = _locked_task
 
     data = payload.data
     warnings: List[str] = []

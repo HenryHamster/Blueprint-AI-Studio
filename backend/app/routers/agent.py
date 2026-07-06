@@ -592,6 +592,43 @@ async def agent_task_capabilities(
     return {"task_capabilities": task_capability_contract()}
 
 
+async def _load_active_agent_task(session: AsyncSession, token: dict) -> Task:
+    """Load the task named by the agent JWT and assert it is still the live,
+    same-VM active task before minting fresh credentials for it.
+
+    Shared authorization for the credential-minting agent endpoints
+    (``/refresh-token`` and ``/git-read-token``). ``verify_agent_token`` already
+    rejects a JWT whose task reached an ``_AGENT_INACTIVE_TASK_STATUSES``
+    terminal state or was reassigned to a *different* VM, but that leaves two
+    liveness gaps a fresh credential must not slip through:
+
+    * a task in a non-terminal-but-non-active status (e.g. ``EVALUATING``) that
+      is no longer executing agent work, and
+    * a requeued task whose ``vm_instance_id`` was cleared (the
+      ``verify_agent_token`` mismatch guard short-circuits when either side is
+      falsy).
+
+    Enforcing the same ``vm_instance_id`` match + active-status allowlist the
+    refresh endpoint has used since the 2026-04-25 W3/E1/E2 audit closes both,
+    so a stale-but-unexpired JWT for a requeued/completed task cannot keep
+    minting credentials.
+    """
+    task_id = token["sub"]
+    vm_id = token["vm_instance_id"]
+    task = await session.get(Task, uuid.UUID(task_id))
+    if task is None:
+        raise HTTPException(status_code=404, detail="task_not_found")
+    if task.vm_instance_id != vm_id:
+        raise HTTPException(status_code=409, detail="vm_instance_mismatch")
+    if task.status not in (
+        TaskStatus.PROVISIONING,
+        TaskStatus.IN_PROGRESS,
+        TaskStatus.QUEUED,
+    ):
+        raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    return task
+
+
 @router.post("/refresh-token")
 @limiter.limit("120/minute")
 async def agent_refresh_token(
@@ -610,17 +647,7 @@ async def agent_refresh_token(
     """
     task_id = token["sub"]
     vm_id = token["vm_instance_id"]
-    task = await session.get(Task, uuid.UUID(task_id))
-    if task is None:
-        raise HTTPException(status_code=404, detail="task_not_found")
-    if task.vm_instance_id != vm_id:
-        raise HTTPException(status_code=409, detail="vm_instance_mismatch")
-    if task.status not in (
-        TaskStatus.PROVISIONING,
-        TaskStatus.IN_PROGRESS,
-        TaskStatus.QUEUED,
-    ):
-        raise HTTPException(status_code=409, detail=f"task_not_active:{task.status}")
+    task = await _load_active_agent_task(session, token)
     # A successful refresh PROVES the agent is refresh-capable. Stamping
     # last_token_refresh_at marks this task — and, via the VM-level lookup in
     # _vm_is_refresh_capable, every subsequent warm handoff on this VM — as
@@ -658,11 +685,13 @@ async def agent_git_read_token(
 
     Uses `get_repo_installation_token` (cached 50 min per repo) so a warm
     cache costs zero GitHub API calls.
+
+    Authorization is at parity with `/refresh-token`: both mint a fresh
+    credential, so both require the JWT's task to still be the same-VM active
+    task via `_load_active_agent_task`. Without it a stale-but-unexpired JWT for
+    a requeued/completed task could keep minting read tokens until JWT expiry.
     """
-    task_id = uuid.UUID(token["sub"])
-    task = await session.get(Task, task_id)
-    if task is None:
-        raise HTTPException(status_code=404, detail="task_not_found")
+    task = await _load_active_agent_task(session, token)
     project = await session.get(Project, task.project_id)
     if project is None:
         raise HTTPException(status_code=404, detail="project_not_found")

@@ -26,6 +26,7 @@ from app.task_locking import (
     task_lock,
     with_design_doc_locked,
     with_directions_locked,
+    with_task_context_locked,
     with_vision_locked,
 )
 
@@ -1201,6 +1202,108 @@ async def test_with_vision_locked_serializes_concurrent_writers(db_session):
         vision = result.scalar_one().vision
     assert vision.get("key_a") == "v", f"key_a missing from {vision}"
     assert vision.get("key_b") == "v", f"key_b missing from {vision}"
+
+
+# ── with_task_context_locked ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_with_task_context_locked_preserves_disjoint_keys(db_session):
+    """with_task_context_locked must atomically apply the mutate_fn and PRESERVE
+    pre-existing keys owned by another writer — the lost-update property.
+
+    Regression for finding 8ff6c48f: the resident-session heartbeat mirror
+    (``renew_resident_session_lease``) writes ``_exam_ledger`` / ``message_cursor``
+    into ``task.context`` while the strategic-API paths in admin_agent_ops.py
+    write ``_strategic_api_called`` — each via a whole-column overwrite. Loading
+    the context INSIDE the FOR UPDATE lock and merging must keep the other
+    side's key rather than clobbering it.
+    """
+    project = Project(name="task-ctx-lock", user_id="user")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Simulate a strategic-API write already present on the row.
+    task = Task(
+        project_id=project.id,
+        title="resident session task",
+        status=TaskStatus.IN_PROGRESS,
+        context={"_strategic_api_called": True},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    # The heartbeat mirror re-applies only its own durable restart keys.
+    def _mirror(ctx: dict) -> None:
+        ctx["_exam_ledger"] = "ledger-blob-v1"
+        ctx["message_cursor"] = "cursor-42"
+
+    applied = await with_task_context_locked(db_session, task.id, _mirror)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    assert applied is True
+    # Both the pre-existing strategic-API flag AND the mirrored keys survive.
+    assert task.context == {
+        "_strategic_api_called": True,
+        "_exam_ledger": "ledger-blob-v1",
+        "message_cursor": "cursor-42",
+    }, f"lost update on task.context: {task.context}"
+
+
+@pytest.mark.asyncio
+async def test_with_task_context_locked_returns_false_when_task_missing(db_session):
+    """A missing task row yields False (no crash), mirroring the sibling helpers."""
+    result = await with_task_context_locked(
+        db_session, uuid.uuid4(), lambda ctx: ctx.update({"x": 1})
+    )
+    assert result is False
+
+
+@pytest.mark.skipif(not USE_POSTGRES, reason="row-lock concurrency requires PostgreSQL")
+@pytest.mark.asyncio
+async def test_with_task_context_locked_serializes_concurrent_writers(db_session):
+    """Two concurrent callers writing disjoint keys via with_task_context_locked
+    must both survive — the second must see the first's committed write.
+
+    This is the exact race in finding 8ff6c48f: the heartbeat ledger mirror
+    (``_exam_ledger``) and a strategic-API write (``_strategic_api_called``)
+    targeting the SAME task row. Without the FOR UPDATE re-read inside the
+    helper, whichever commits second drops the other's key."""
+    project = Project(name="task-ctx-concurrent", user_id="user")
+    db_session.add(project)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        title="contended resident task",
+        status=TaskStatus.IN_PROGRESS,
+        context={},
+    )
+    db_session.add(task)
+    await db_session.commit()
+
+    Session = sessionmaker(
+        bind=db_session.bind, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async def write_key(key: str) -> None:
+        async with Session() as s:
+            await with_task_context_locked(s, task.id, lambda ctx: ctx.update({key: "v"}))
+            await s.commit()
+
+    await asyncio.gather(
+        write_key("_exam_ledger"),
+        write_key("_strategic_api_called"),
+    )
+
+    async with Session() as verify:
+        result = await verify.execute(select(Task).where(Task.id == task.id))
+        ctx = result.scalar_one().context
+    assert ctx.get("_exam_ledger") == "v", f"_exam_ledger missing from {ctx}"
+    assert ctx.get("_strategic_api_called") == "v", (
+        f"_strategic_api_called missing from {ctx}"
+    )
 
 
 # ── post_auto_fix_result_message concurrent writers ─────────────────────────

@@ -692,12 +692,12 @@ describe('buildCycleStartReconciliationSection', () => {
       ungrounded_directions: [],
       direction_pipeline: [],
       qualification_surface_conflicts: [
-        { conflict_type: 'stale_candidate_with_pending_status', description: 'Candidate currency says the pinned SHA is stale/behind HEAD, but last_qualification.status is pending.' },
+        { conflict_type: 'stale_candidate_with_promotion_failed_status', description: 'Candidate currency says the pinned SHA is stale/behind HEAD, but last_qualification.status is promotion_failed.' },
       ],
       counts: { qualification_surface_conflicts: 4 },
     });
     expect(result).toContain('Qualification surface conflicts — coherence disagreements (4)');
-    expect(result).toContain('[stale_candidate_with_pending_status]');
+    expect(result).toContain('[stale_candidate_with_promotion_failed_status]');
     expect(result).toContain('- +3 more not shown');
   });
 });

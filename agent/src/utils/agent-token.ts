@@ -1,9 +1,9 @@
-import { execFileSync } from 'node:child_process';
 import {
   TOKEN_REFRESH_FRACTION, TOKEN_REFRESH_FLOOR_MS, TOKEN_REFRESH_CEILING_MS,
   BOOTSTRAP_TOKEN_THRESHOLD_MS, BOOTSTRAP_CONFIRMATION_DELAY_MS, API_TIMEOUT,
 } from '../constants.js';
 import { writeGithubTokenFile } from '../token-file.js';
+import { writeGitTokenFile, setupGitCredentialHelper } from '../git-credential.js';
 
 // Dependencies injected by index.ts at startup to avoid a circular import.
 interface TokenModuleConfig {
@@ -150,8 +150,12 @@ export let githubTokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
  *   1. Calls GET /api/agent/github/token?task_id=<taskId> (hits backend cache —
  *      zero GitHub API calls when the 50-min backend cache is warm).
  *   2. Writes the fresh token to GITHUB_TOKEN_FILE via writeGithubTokenFile.
- *   3. If NOT read-only: rewrites git remote set-url origin with the fresh token
- *      (parallel to what workspacePrep.ts does at role start).
+ *   3. If NOT read-only: refreshes the on-disk git token file and (re)configures
+ *      the credential helper that serves it, keeping the persisted origin URL
+ *      clean (https://github.com/owner/repo.git) so the installation token is
+ *      never written into .git/config nor exposed in the git process argv.
+ *      Reuses git-credential.ts — the same mechanism the strategic resident
+ *      installs at role start — rather than embedding the token in the URL.
  *   4. Reschedules itself.
  */
 export function scheduleGithubTokenRefresh(
@@ -182,9 +186,20 @@ export function scheduleGithubTokenRefresh(
           if (newToken) {
             writeGithubTokenFile(newToken);
             if (!isReadOnly) {
+              // Keep the installation token OUT of the persisted remote URL /
+              // .git/config and out of the git process argv. Rather than
+              // `git remote set-url origin https://x-access-token:<token>@…`
+              // (which lands the secret in .git/config for the task lifetime and
+              // briefly in the git argv), refresh the on-disk token file and
+              // (re)configure the credential helper that reads it, leaving the
+              // origin URL clean. Git then fetches fresh credentials from the
+              // helper on every network call. Reuses the same mechanism the
+              // strategic resident installs (git-credential.ts) instead of
+              // inventing a divergent one. Best-effort: a failure here just
+              // leaves the previously-configured auth in place.
               try {
-                execFileSync('git', ['-C', workspace, 'remote', 'set-url', 'origin',
-                  `https://x-access-token:${newToken}@github.com/${owner}/${repo}.git`]);
+                writeGitTokenFile(newToken);
+                setupGitCredentialHelper(owner, repo, workspace);
               } catch { /* best effort */ }
             }
             log('GitHub token refresh: succeeded');

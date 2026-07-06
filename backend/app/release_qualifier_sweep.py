@@ -1371,17 +1371,50 @@ async def sweep_stuck_qualifications(
                 version_id,
             )
 
-    # Re-drive open ``dry_run`` candidates once the operator enables promotion.
-    # A candidate that passes qualification while ``promotion_enabled=False``
-    # records a conclusive ``dry_run`` verdict (``would_promote=True``).  When
-    # the operator later enables promotion, nothing acts on it: stall alerts
-    # treat ``dry_run`` as healthy, and the same-SHA ``qualify_request`` no-ops
-    # via the cached-verdict guard.  This loop is the scheduled trigger: once
-    # ``resolve_project_promotion_enabled`` returns True for the project, clear
-    # the cached-verdict guard and re-enter ``run_qualification``.  Runs AFTER
-    # the ``promotion_failed`` re-driver so a version that exited ``dry_run``
+    # Dry-run-pass candidates, once the operator enables promotion.  A candidate
+    # that passes qualification while ``promotion_enabled=False`` records a
+    # conclusive ``dry_run`` verdict (``would_promote=True``); nothing acts on it
+    # when promotion is later enabled (stall alerts treat ``dry_run`` as healthy,
+    # and the same-SHA ``qualify_request`` no-ops via the cached-verdict guard).
+    # Two triggers cover this state and MUST NOT both fire for the same version
+    # (audit 8989794e): the cheap, deterministic direct-promote path
+    # (``_promote_dry_run_pass_if_enabled``) handles a candidate that is STILL the
+    # integration-branch HEAD — it already passed every gate, so it only needs
+    # promoting — while the expensive, non-deterministic full re-qualification
+    # (``_redrive_dry_run_candidate``) is reserved for the genuine re-qualification
+    # case where automain has advanced past the candidate SHA.  The cheap path
+    # runs FIRST and records which versions it promoted; the expensive re-driver
+    # then SKIPS those, so a still-current candidate is never needlessly (and
+    # non-deterministically) re-audited after it was already promoted.  Both run
+    # AFTER the ``promotion_failed`` re-driver so a version that exited ``dry_run``
     # via another path is handled there first.
+    dry_run_promoted_ids: set = set()
     for version_id in version_ids:
+        try:
+            promoted = await _promote_dry_run_pass_if_enabled(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: dry_run promote failed for version %s",
+                version_id,
+            )
+            continue
+        if promoted:
+            dry_run_promoted_ids.add(version_id)
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep promoted dry-run-pass version %s "
+                "(promotion now enabled — candidate current)",
+                version_id,
+            )
+    for version_id in version_ids:
+        # Skip any candidate the cheap direct-promote path already handled this
+        # cycle — re-qualifying a still-current candidate is wasteful and risks a
+        # non-deterministic audit flipping a previously-passing candidate to fail.
+        if version_id in dry_run_promoted_ids:
+            continue
         try:
             redriven = await _redrive_dry_run_candidate(
                 version_id,
@@ -1661,34 +1694,6 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep recovered deploy-failed version %s "
                 "(promoted SHA confirmed serving after a prior latch)",
-                version_id,
-            )
-
-    # Promote dry-run-pass candidates now that promotion is enabled.  When
-    # _finalize_qualification records status='dry_run' (promotion was disabled),
-    # and the operator subsequently enables promotion, nothing automatically
-    # acts — the version strands open indefinitely.  This loop fires when a
-    # stabilize-phase version's dry-run verdict has would_promote=True and
-    # resolve_project_promotion_enabled now returns True, provided the stored
-    # candidate SHA still matches the current integration-branch HEAD (stale
-    # candidates are skipped so they re-qualify on the new HEAD instead).
-    for version_id in version_ids:
-        try:
-            promoted = await _promote_dry_run_pass_if_enabled(
-                version_id,
-                session_factory=session_factory,
-            )
-        except Exception:
-            logger.exception(
-                "[RELEASE_QUALIFIER] sweep: dry_run promote failed for version %s",
-                version_id,
-            )
-            continue
-        if promoted:
-            finalized += 1
-            logger.info(
-                "[RELEASE_QUALIFIER] sweep promoted dry-run-pass version %s "
-                "(promotion now enabled — candidate current)",
                 version_id,
             )
 

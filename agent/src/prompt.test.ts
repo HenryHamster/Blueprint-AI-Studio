@@ -4785,6 +4785,20 @@ describe('writeDesignDocHelper', () => {
     expect(script).toContain('sleep "$delay"');
   });
 
+  it('retries curl transport failures (http_code 000) alongside 429/5xx', () => {
+    writeDesignDocHelper('task-xyz');
+    const script = capturedScripts['/tmp/workspace/design-doc'];
+    // curl reports http_code "000" on a transport-level failure (connect
+    // timeout, DNS, TLS, dropped connection) — no HTTP response. The shared
+    // _post_with_retry wrapper must treat it as transient and retry, not fall
+    // through to the non-retryable else branch (which would book a network blip
+    // as a permanent write failure and silently drop the write).
+    expect(script).toContain('[ "$http_code" = "000" ]');
+    // The 000 check shares the SAME retry condition as 429 (one `if` line) so it
+    // reuses the existing backoff/sleep path rather than a separate branch.
+    expect(script).toMatch(/\[ "\$http_code" = "000" \] \|\| \[ "\$http_code" = "429" \]/);
+  });
+
   it('keeps read ops (list/get) fail-fast with no retry', () => {
     writeDesignDocHelper('task-xyz');
     const script = capturedScripts['/tmp/workspace/design-doc'];

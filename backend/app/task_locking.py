@@ -612,6 +612,68 @@ async def with_vision_locked(
     return True
 
 
+async def with_task_context_locked(
+    session: AsyncSession,
+    task_id,
+    mutate_fn: Callable[[dict], None],
+    *,
+    skip_locked: bool = False,
+    timeout: float = 30.0,
+) -> bool:
+    """Atomic read-modify-write of ``Task.context`` under a task row lock.
+
+    Mirror of :func:`with_vision_locked` for the per-task ``context`` JSON
+    column. Acquires SELECT FOR UPDATE on the task row (via :func:`task_lock`),
+    hands ``mutate_fn`` the current ``context`` dict loaded *inside* the lock,
+    then writes the result back via ``flag_modified``. Caller commits.
+
+    ``Task.context`` is a whole-column JSON blob written from several
+    strategic-API paths (``routers/admin_agent_ops.py``) and the
+    resident-session heartbeat ledger/cursor mirror
+    (``strategic_resident_session.renew_resident_session_lease``). Each writer
+    sets a *disjoint* set of keys (``_strategic_api_called`` /
+    ``_strategic_vision_set`` on one side, ``_exam_ledger`` /
+    ``message_cursor`` on the other) but did so via a stale-read whole-column
+    overwrite, so two concurrent writers dropped each other's keys (lost
+    update). Loading the dict *inside* the FOR UPDATE lock is what serializes
+    them and forces a fresh read — the same lost-update class already
+    eliminated for ``vision`` / ``design_doc`` / ``directions``.
+
+    CANONICAL LOCK ORDER: this helper takes ONLY the task row lock. Callers that
+    also need the project row lock MUST acquire the project lock FIRST
+    (Project→Task — see :func:`lock_project_then_task`); taking the task lock
+    first risks the C1 cross-table deadlock. The resident-heartbeat caller
+    already holds the project lock (via :func:`with_vision_locked`) when it
+    invokes this, so ordering is preserved.
+
+    Args:
+        session: AsyncSession to issue the lock against. Lock is held until
+            the caller commits/rolls back.
+        task_id: UUID or str of the task.
+        mutate_fn: Called with the freshly-loaded ``context`` dict; mutate it
+            in place (add/overwrite keys).
+        skip_locked: When False (default), wait up to ``timeout`` for the row
+            (durable callers that must not silently drop the write); when True,
+            return False immediately if the row is held by another session.
+        timeout: Max seconds to wait when ``skip_locked=False``.
+
+    Returns:
+        True if ``mutate_fn`` was applied, False if the row was held
+        (``skip_locked=True``) or the task is missing.
+    """
+    async with task_lock(
+        session, task_id, skip_locked=skip_locked, timeout=timeout
+    ) as task:
+        if task is None:
+            return False
+        ctx = dict(task.context or {})
+        mutate_fn(ctx)
+        task.context = ctx
+        flag_modified(task, "context")
+        session.add(task)
+    return True
+
+
 async def with_problem_model_locked(
     session: AsyncSession,
     project_id,

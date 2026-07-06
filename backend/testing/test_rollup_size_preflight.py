@@ -1,6 +1,7 @@
 """Unit tests for rollup_size_preflight.preflight_rollup_size_caps."""
 
 import json
+import httpx
 import pytest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, patch
@@ -90,18 +91,27 @@ async def test_preflight_breach_auto_bumps_and_returns_bumped():
 
 
 @pytest.mark.asyncio
-async def test_preflight_commit_failure_returns_hold():
-    """Commit raises → hold verdict."""
+async def test_preflight_genuine_commit_failure_returns_hold():
+    """A genuine (non-retryable) commit failure → hold verdict.
+
+    A GitHub contract error like HTTP 400 is not a rate limit, not a
+    non-fast-forward, and not a transport blip — it will not clear on retry, so
+    the preflight must escalate (hold) rather than loop forever on defer.
+    """
     file_content = "line\n" * 600
 
     with (
         patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
         patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
         patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
     ):
         mock_pr_files.return_value = _pr_files("backend/app/models.py")
         mock_fetch.side_effect = [_CAPS_JSON, file_content]
-        mock_commit.side_effect = RuntimeError("GitHub 422")
+        mock_commit.side_effect = RuntimeError(
+            "GitHub Git Data API create-blob on owner/repo@staging "
+            "returned HTTP 400 (expected 201)"
+        )
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"
@@ -109,7 +119,58 @@ async def test_preflight_commit_failure_returns_hold():
 
     assert verdict == "hold"
     assert reason is not None
-    assert "422" in reason
+    assert "400" in reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "commit_error",
+    [
+        # Non-fast-forward: the staging tip moved between read and PATCH.
+        RuntimeError(
+            "GitHub Git Data API update-ref on owner/repo@staging "
+            "returned HTTP 422 (expected 200)"
+        ),
+        # Primary rate limit (5000/hr bucket exhausted).
+        RuntimeError(
+            "GitHub Git Data API create-blob on owner/repo@staging "
+            "returned HTTP 403 (expected 201)"
+        ),
+        # Secondary/abuse rate limit.
+        RuntimeError(
+            "GitHub Git Data API create-tree on owner/repo@staging "
+            "returned HTTP 429 (expected 201)"
+        ),
+        # GitHub server-side error.
+        RuntimeError(
+            "GitHub Git Data API create-commit on owner/repo@staging "
+            "returned HTTP 502 (expected 201)"
+        ),
+        # Transport-layer/network failure re-raised by _github_request.
+        httpx.ConnectError("connection reset by peer"),
+    ],
+)
+async def test_preflight_transient_commit_failure_returns_defer(commit_error):
+    """A transient/retryable commit failure → defer (retry next cycle), not hold."""
+    file_content = "line\n" * 600
+
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock) as mock_pr_files,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
+        patch("app.size_limit_policy.parse_bump_history", return_value=[]),
+    ):
+        mock_pr_files.return_value = _pr_files("backend/app/models.py")
+        mock_fetch.side_effect = [_CAPS_JSON, file_content]
+        mock_commit.side_effect = commit_error
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "defer"
+    assert reason is not None
+    mock_commit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -173,13 +234,45 @@ async def test_preflight_uncapped_file_ignored():
 
 
 @pytest.mark.asyncio
-async def test_preflight_caps_json_missing_returns_defer():
-    """Caps JSON not found at ref (returns None) → defer."""
+async def test_preflight_caps_json_genuinely_absent_returns_ok():
+    """Repo has no module_size_limits.json at all (unambiguous 404) → ok.
+
+    A managed project repo not shaped like Blueprint simply has no size
+    governance file; the preflight must let the rollup proceed rather than
+    livelock it on defer every cycle.
+    """
     with (
         patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
         patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock),
+        patch("app.rollup_size_preflight.get_file_content_at_ref", new_callable=AsyncMock) as mock_exists,
+        patch("app.rollup_size_preflight.commit_file_changes", new_callable=AsyncMock) as mock_commit,
     ):
-        mock_fetch.return_value = None  # file not found
+        mock_fetch.return_value = None  # text fetch cannot read (404 or transient)
+        mock_exists.return_value = (False, None)  # tri-state: unambiguous 404
+
+        verdict, reason = await preflight_rollup_size_caps(
+            "tok", "owner", "repo", 42, "staging/branch-1"
+        )
+
+    assert verdict == "ok"
+    assert reason is None
+    mock_commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_caps_json_unreadable_returns_defer():
+    """Caps JSON read is indeterminate (transient, not a definite 404) → defer.
+
+    A transient GitHub blip must never be mistaken for 'no governance file' —
+    otherwise a real breach could slip through unchecked.
+    """
+    with (
+        patch("app.rollup_size_preflight.get_file_text_at_ref", new_callable=AsyncMock) as mock_fetch,
+        patch("app.rollup_size_preflight.get_pr_files", new_callable=AsyncMock),
+        patch("app.rollup_size_preflight.get_file_content_at_ref", new_callable=AsyncMock) as mock_exists,
+    ):
+        mock_fetch.return_value = None  # text fetch cannot read
+        mock_exists.return_value = (None, None)  # tri-state: indeterminate/transient
 
         verdict, reason = await preflight_rollup_size_caps(
             "tok", "owner", "repo", 42, "staging/branch-1"

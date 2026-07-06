@@ -243,23 +243,31 @@ async def _redrive_infra_failure_qualification(
     outage.
 
     This is the missing scheduled re-driver.  For an open, stabilize-phase version
-    whose ``last_qualification.status == "infra_failure"`` and whose
-    ``last_qualification["infra_failure_redrive_count"]`` is below
+    whose ``last_qualification.status == "infra_failure"`` and whose PERSISTED
+    ``last_qualification["consecutive_infra_errors"]`` streak is below
     ``_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``, re-invokes ``run_qualification``.
     ``run_qualification`` already treats ``infra_failure`` as non-conclusive (it does
     not serve a cached verdict for that status), so a fresh qualification spawns on the
     current integration-branch HEAD.
 
-    The attempt cap is tracked in ``last_qualification["infra_failure_redrive_count"]``
-    (a per-infra-failure-episode counter), NOT the lifetime ``qualification_attempts``
-    column, for the same reason as the error re-driver: using the lifetime counter
-    would silently block re-drives for long-lived versions.
+    The attempt cap keys on the PERSISTED ``last_qualification["consecutive_infra_errors"]``
+    streak that the finalize path (``_handle_infra_failure``) maintains — a
+    per-infra-failure-episode counter that resets to 0 when the candidate SHA
+    changes or a non-infra verdict lands — NOT the lifetime ``qualification_attempts``
+    column (which would silently block re-drives for long-lived versions) and NOT
+    the synchronous ``run_qualification`` return value (which never reports
+    ``infra_failure``: that verdict is only ever written asynchronously at finalize,
+    when the qualifier children terminate).  Because the streak is SHA-scoped, a
+    candidate whose HEAD keeps advancing is never blocked (each new SHA resets the
+    streak to 0); the cap trips only when the SAME candidate fails infra repeatedly.
 
     Commit behavior: COMMIT on every outcome (same as ``_redrive_error_qualification``).
     ``run_qualification`` writes a new ``last_qualification`` on every path it takes,
     and a rollback would discard that write plus any ``qualification_attempts`` bump.
-    When the result is still ``infra_failure`` the counter is incremented post-commit
-    so the cap advances across sweeps.
+    The streak is carried forward across the spawn→finalize cycle by
+    ``run_qualification`` (``prior_infra_streak``) and re-incremented by the next
+    infra_failure finalize, so the cap advances across sweeps with no post-commit
+    bookkeeping here.
 
     Returns True only when the re-entry actually STARTED a new qualification
     (``status == "spawned"``).  Any guard no-op or cap hit returns False.
@@ -279,8 +287,23 @@ async def _redrive_infra_failure_qualification(
         ):
             return False
         # Bounded attempts: stop re-driving a persistently broken infra path.
-        infra_failure_redrive_count = qual.get("infra_failure_redrive_count", 0)
-        if infra_failure_redrive_count >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+        # The source of truth is the PERSISTED consecutive-infra streak that the
+        # finalize path (``_handle_infra_failure``) maintains on the infra_failure
+        # record — NOT a re-driver-local counter.  ``run_qualification`` never
+        # synchronously RETURNS status=="infra_failure" (that verdict is only ever
+        # written asynchronously at finalize, when the qualifier children
+        # terminate), so the old post-commit increment keyed on the synchronous
+        # return value was dead code and the cap never advanced (unbounded
+        # redrives).  ``consecutive_infra_errors`` is incremented on each
+        # infra_failure finalize and reset to 0 when the candidate SHA changes or a
+        # non-infra verdict lands — exactly the per-episode semantics this cap
+        # wants: a genuinely new candidate is never blocked, but a persistently
+        # broken infra path at a stable HEAD halts once the streak reaches the cap.
+        # The streak is carried forward across the spawn→finalize cycle by
+        # ``run_qualification`` (``prior_infra_streak``), so no post-commit
+        # bookkeeping is needed here.
+        consecutive_infra_errors = int(qual.get("consecutive_infra_errors") or 0)
+        if consecutive_infra_errors >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
             return False
         result = await release_qualifier.run_qualification(
             redrive_session, version.project_id, version
@@ -288,22 +311,9 @@ async def _redrive_infra_failure_qualification(
         # COMMIT on every outcome — do NOT roll back the non-spawned paths.
         # run_qualification writes a new last_qualification (and bumps
         # qualification_attempts) on every path it takes; rolling back would
-        # discard both those writes and leave the version in the old infra_failure
-        # state with a stale counter.
+        # discard those writes and leave the version in the old infra_failure
+        # state.
         await redrive_session.commit()
-        # If still infra_failure, persist the per-episode retry counter so the cap
-        # advances across sweeps.  A spawned result naturally resets the counter
-        # (the new last_qualification won't carry infra_failure_redrive_count).
-        if result and result.get("status") == "infra_failure":
-            await redrive_session.refresh(version)
-            new_qual = version.last_qualification
-            if isinstance(new_qual, dict):
-                version.last_qualification = {
-                    **new_qual,
-                    "infra_failure_redrive_count": infra_failure_redrive_count + 1,
-                }
-                flag_modified(version, "last_qualification")
-                await redrive_session.commit()
         return bool(result and result.get("status") == "spawned")
 
 

@@ -61,6 +61,7 @@ from app.shared_state import limiter, runtime_config
 from app.task_locking import (
     project_lock,
     task_lock,
+    with_task_context_locked,
     with_vision_locked,
 )
 from app.workbench_state import (
@@ -2178,18 +2179,39 @@ async def renew_resident_session_lease(
     _need_ctx_update = exam_ledger_str is not None or bool(message_cursor)
     if _need_ctx_update:
         try:
-            ledger_task = await session.get(Task, uuid.UUID(task_id))
-            if ledger_task is not None:
-                ctx = dict(ledger_task.context or {})
+            _ledger_task_id = uuid.UUID(task_id)
+        except (ValueError, TypeError):
+            _ledger_task_id = None
+        if _ledger_task_id is not None:
+
+            def _mirror_ledger(ctx: dict) -> None:
+                # Only these two keys are the resident-heartbeat's durable
+                # restart state; every OTHER key in ``ctx`` (e.g. the
+                # strategic-API ``_strategic_api_called`` / ``_strategic_vision_set``
+                # flags) belongs to another writer and is preserved untouched.
                 if exam_ledger_str is not None:
                     ctx["_exam_ledger"] = exam_ledger_str
                 if message_cursor:
                     ctx["message_cursor"] = message_cursor
-                ledger_task.context = ctx
-                flag_modified(ledger_task, "context")
-                session.add(ledger_task)
-        except (ValueError, TypeError):
-            pass
+
+            # Re-read Task.context FRESH under FOR UPDATE (populate_existing)
+            # before the read-modify-write so a concurrent strategic-API
+            # whole-column write cannot be clobbered (lost update), and vice
+            # versa. We already hold the project row lock here (``with_vision_locked``
+            # above holds it until this session commits), so acquiring the task
+            # lock now is the canonical Project→Task order and cannot deadlock.
+            # skip_locked=False so this durable restart-state mirror waits for
+            # (rather than silently drops) the row; the wait is bounded and, since
+            # we hold the project lock, the row is effectively uncontended by the
+            # strategic-API paths (they cannot hold the task lock without first
+            # holding the project lock we own).
+            await with_task_context_locked(
+                session,
+                _ledger_task_id,
+                _mirror_ledger,
+                skip_locked=False,
+                timeout=10.0,
+            )
     # Mark inbound operator messages as handled so a restart does not re-answer
     # them and so they stop counting as open backlog. Scoped to the project and
     # session to avoid touching rows that belong to another session's conversation.
