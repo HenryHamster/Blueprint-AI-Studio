@@ -1005,6 +1005,113 @@ async def _auto_stale_not_promoted_findings(
 
 
 _MAX_PROMOTION_FAILURE_REQUALIFY_ATTEMPTS = 3
+
+async def _promote_dry_run_pass_if_enabled(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Promote a dry-run-pass candidate once promotion is enabled for the project.
+
+    When ``_finalize_qualification`` records ``status='dry_run'`` with
+    ``would_promote=True``, promotion was disabled at finalize time.  If the
+    operator subsequently enables promotion (fleet-wide or per-project), nothing
+    automatically acts on the standing dry-run pass — the version strands open in
+    the stabilize phase indefinitely.
+
+    This re-driver fires for open, stabilize-phase versions whose
+    ``last_qualification.status == 'dry_run'`` and ``would_promote=True`` when
+    ``resolve_project_promotion_enabled`` now returns True.  It verifies the
+    stored candidate SHA still equals the current integration-branch HEAD —
+    stale candidates (automain has advanced) are skipped and will re-qualify via
+    normal paths.  When the candidate is current it enters the normal promotion
+    machinery via ``_force_promote_in_dedicated_session``, which preserves all
+    promotion-in-flight idempotency guards.
+
+    Returns True when a promotion was initiated, False otherwise.
+    """
+    from app import github, release_qualifier
+    from app.runtime_config_state import resolve_project_promotion_enabled
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        version = await session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "dry_run"
+            or not qual.get("would_promote")
+            or version.phase != "stabilize"
+            or version.status != "open"
+        ):
+            return False
+
+        # Only act when promotion is now enabled for this project.
+        if not resolve_project_promotion_enabled(version.project_id):
+            return False
+
+        candidate_sha = qual.get("candidate_sha")
+        if not candidate_sha:
+            return False
+
+        project = await session.get(Project, version.project_id)
+        if project is None:
+            return False
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            logger.warning(
+                "[RELEASE_QUALIFIER] dry_run promote: no GitHub credentials "
+                "for v%d — skipping",
+                version.version_number,
+            )
+            return False
+        token, owner, repo = resolved
+        integration_branch, _promotion_target = release_qualifier._lts_branch_names(
+            project
+        )
+        try:
+            head_sha = await github.get_branch_sha(token, owner, repo, integration_branch)
+        except Exception:
+            logger.warning(
+                "[RELEASE_QUALIFIER] dry_run promote: failed to resolve %s HEAD "
+                "for v%d — skipping",
+                integration_branch,
+                version.version_number,
+            )
+            return False
+
+        if head_sha != candidate_sha:
+            logger.info(
+                "[RELEASE_QUALIFIER] dry_run promote: v%d candidate %s is stale "
+                "(automain HEAD is %s) — skipping, will re-qualify on new HEAD",
+                version.version_number,
+                candidate_sha[:8],
+                head_sha[:8] if head_sha else "unknown",
+            )
+            return False
+
+        candidate_diff_hash = qual.get("candidate_diff_hash")
+        version_number = version.version_number
+
+    result = await release_qualifier._force_promote_in_dedicated_session(
+        version_id,
+        candidate_sha,
+        candidate_diff_hash,
+        "sweep_dry_run_promote",
+        session_factory=session_factory,
+    )
+    promoted = result.get("status") not in release_qualifier._FORCE_PROMOTE_NOOP_STATUSES
+    if promoted:
+        logger.info(
+            "[RELEASE_QUALIFIER] dry_run promote: initiated promotion for v%d "
+            "candidate %s (result=%s)",
+            version_number,
+            candidate_sha[:8],
+            result.get("status"),
+        )
+    return promoted
 """Circuit-breaker cap on autonomous re-qualify attempts after a promotion_failed.
 
 When a version's ``last_qualification.promotion_failure_count`` reaches this cap
@@ -1897,6 +2004,34 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep recovered deploy-failed version %s "
                 "(promoted SHA confirmed serving after a prior latch)",
+                version_id,
+            )
+
+    # Promote dry-run-pass candidates now that promotion is enabled.  When
+    # _finalize_qualification records status='dry_run' (promotion was disabled),
+    # and the operator subsequently enables promotion, nothing automatically
+    # acts — the version strands open indefinitely.  This loop fires when a
+    # stabilize-phase version's dry-run verdict has would_promote=True and
+    # resolve_project_promotion_enabled now returns True, provided the stored
+    # candidate SHA still matches the current integration-branch HEAD (stale
+    # candidates are skipped so they re-qualify on the new HEAD instead).
+    for version_id in version_ids:
+        try:
+            promoted = await _promote_dry_run_pass_if_enabled(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: dry_run promote failed for version %s",
+                version_id,
+            )
+            continue
+        if promoted:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep promoted dry-run-pass version %s "
+                "(promotion now enabled — candidate current)",
                 version_id,
             )
 

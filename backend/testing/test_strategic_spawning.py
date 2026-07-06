@@ -7750,6 +7750,90 @@ async def test_version_phase_block_carries_criterion_coverage(
 
 
 @pytest.mark.asyncio
+async def test_version_phase_build_failure_surfaces_in_payload(
+    db_session, mocker, _lts_split_active
+):
+    """When the outer version_phase block assembly fails, the payload must carry a
+    compact failure-marker dict (lifecycle_signal='unavailable', signal_status=
+    'build_failed') rather than silently omitting the block entirely.
+
+    This is the regression test required by the acceptance gate:
+    test_version_phase_build_failure_surfaces_in_payload must run green under a
+    real merge-test verdict, and the PR must change non-test production code that
+    the test exercises.
+    """
+    from app.strategic_payload_compaction import (
+        _summarize_version_phase,
+        _version_phase_floor,
+    )
+
+    # Patch current_open_version to raise so the outer try/except fires.
+    mocker.patch(
+        "app.release_version.current_open_version",
+        side_effect=RuntimeError("simulated version_phase build failure"),
+    )
+
+    project = _make_project(
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    _patch_spawning_deps(mocker)
+    spawned = await _spawn_strategic_review(project, db_session)
+
+    assert spawned is True
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = [
+        t
+        for t in result.scalars().all()
+        if t.first_payload.get("type") == "strategic_review"
+    ]
+    assert tasks, "Expected a strategic_review task"
+    payload = tasks[0].payloads[0]
+
+    vp = payload.get("version_phase")
+    assert vp is not None, (
+        "version_phase must be present even when assembly fails — "
+        "the failure-marker dict should be set, not None"
+    )
+    assert vp.get("lifecycle_signal") == "unavailable", (
+        f"lifecycle_signal must be 'unavailable' on build failure; got {vp!r}"
+    )
+    assert vp.get("signal_status") == "build_failed", (
+        f"signal_status must be 'build_failed'; got {vp.get('signal_status')!r}"
+    )
+    assert isinstance(vp.get("error"), str) and len(vp["error"]) > 0, (
+        "error must be a non-empty bounded string"
+    )
+    assert len(vp["error"]) <= 240, "error must be bounded to 240 chars"
+    assert vp.get("integration_branch") == "automain", (
+        "integration_branch must be preserved in the failure marker"
+    )
+    assert vp.get("promotion_target") == "main", (
+        "promotion_target must be preserved in the failure marker"
+    )
+
+    # Failure marker must survive both compaction paths so it is not silently
+    # dropped under budget pressure.
+    normal = _summarize_version_phase(vp)
+    assert normal.get("lifecycle_signal") == "unavailable", (
+        "lifecycle_signal must survive _summarize_version_phase"
+    )
+    assert normal.get("signal_status") == "build_failed"
+    assert normal.get("integration_branch") == "automain"
+    assert normal.get("promotion_target") == "main"
+
+    floor_out = _version_phase_floor(vp)
+    assert floor_out.get("lifecycle_signal") == "unavailable", (
+        "lifecycle_signal must survive _version_phase_floor"
+    )
+    assert floor_out.get("signal_status") == "build_failed"
+
+
+@pytest.mark.asyncio
 async def test_version_phase_recent_versions_use_aggregate_pending_truth(
     db_session, mocker, _lts_split_active
 ):

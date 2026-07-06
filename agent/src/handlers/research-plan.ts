@@ -823,6 +823,28 @@ function formatCriterionCoverage(versionPhase: Record<string, unknown>): string[
  */
 export function buildVersionPhaseSection(versionPhase: Record<string, unknown> | undefined): string {
   if (!versionPhase || typeof versionPhase !== 'object') return '';
+
+  // Failure marker — the backend assembly failed; surface as an explicit advisory
+  // so the strategist knows the omission is a build error, not missing lifecycle.
+  if (versionPhase.lifecycle_signal === 'unavailable') {
+    const signalStatus = typeof versionPhase.signal_status === 'string' ? versionPhase.signal_status : 'build_failed';
+    const integrationBranch = typeof versionPhase.integration_branch === 'string' ? versionPhase.integration_branch : null;
+    const promotionTarget = typeof versionPhase.promotion_target === 'string' ? versionPhase.promotion_target : null;
+    const errorSnippet = typeof versionPhase.error === 'string' ? versionPhase.error : null;
+    const branchCtx = integrationBranch && promotionTarget
+      ? ` (integration: \`${integrationBranch}\` → promotion: \`${promotionTarget}\`)`
+      : integrationBranch ? ` (integration: \`${integrationBranch}\`)` : '';
+    const lines: string[] = [
+      '\n## Version Phase',
+      `**lifecycle_signal: ${versionPhase.lifecycle_signal} / ${signalStatus}**${branchCtx}`,
+      'The version-phase lifecycle block could not be assembled this cycle due to a backend error. ' +
+      'This is an infrastructure failure — not evidence that no release lifecycle exists. ' +
+      'Do not treat the absence of version-phase data as a signal to change phase or qualification strategy.',
+    ];
+    if (errorSnippet) lines.push(`Error: \`${errorSnippet}\``);
+    return lines.join('\n');
+  }
+
   const versionNumber = typeof versionPhase.version_number === 'number' ? versionPhase.version_number : null;
   const phase = typeof versionPhase.phase === 'string' ? versionPhase.phase : null;
   if (versionNumber === null || (phase !== 'build' && phase !== 'stabilize')) return '';

@@ -382,6 +382,11 @@ def _compact_version_phase(block: dict, *, floor: bool = False) -> dict:
     out: dict[str, Any] = {}
     text_cap = _VERSION_PHASE_TEXT_FLOOR_CAP if floor else _VERSION_PHASE_TEXT_CAP
     for key in (
+        "lifecycle_signal",
+        "signal_status",
+        "error",
+        "integration_branch",
+        "promotion_target",
         "version_number",
         "phase",
         "goal",

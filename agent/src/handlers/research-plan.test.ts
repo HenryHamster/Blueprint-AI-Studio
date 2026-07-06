@@ -1544,6 +1544,45 @@ describe('buildVersionPhaseSection', () => {
     expect(buildVersionPhaseSection({ version_number: 1, phase: 'unknown' })).toBe('');
   });
 
+  it('renders failure marker block when lifecycle_signal is unavailable', () => {
+    const result = buildVersionPhaseSection({
+      lifecycle_signal: 'unavailable',
+      signal_status: 'build_failed',
+      error: "RuntimeError('simulated failure')",
+      integration_branch: 'automain',
+      promotion_target: 'main',
+    });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('unavailable');
+    expect(result).toContain('build_failed');
+    expect(result).toContain('automain');
+    expect(result).toContain('main');
+    expect(result).toContain("RuntimeError('simulated failure')");
+    // Must explain this is an infrastructure failure, not a lifecycle omission.
+    expect(result).toContain('infrastructure failure');
+  });
+
+  it('failure marker block renders without error field when error is absent', () => {
+    const result = buildVersionPhaseSection({
+      lifecycle_signal: 'unavailable',
+      signal_status: 'build_failed',
+      integration_branch: 'automain',
+      promotion_target: 'main',
+    });
+    expect(result).toContain('Version Phase');
+    expect(result).toContain('unavailable');
+    // Should not crash with no error field.
+    expect(result).not.toContain('Error: `');
+  });
+
+  it('does not trigger failure marker for normal payloads lacking lifecycle_signal', () => {
+    const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
+    // Normal path — should render normally, not as a failure marker.
+    expect(result).toContain('v3');
+    expect(result).toContain('BUILD');
+    expect(result).not.toContain('infrastructure failure');
+  });
+
   it('renders build phase with version number', () => {
     const result = buildVersionPhaseSection({ version_number: 3, phase: 'build' });
     expect(result).toContain('v3');

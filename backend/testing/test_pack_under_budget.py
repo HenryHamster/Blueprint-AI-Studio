@@ -2413,3 +2413,35 @@ def test_compact_last_qualification_includes_qualify_request_blocked():
     assert out_floor is not None
     assert out_floor["qualify_request_blocked_at"] == "2026-07-05T10:00:00"
     assert out_floor["qualify_request_blocked"]["blocker"] == "ci_compliance"
+
+
+def test_compact_version_phase_passes_failure_marker_through():
+    """_compact_version_phase must preserve the failure-marker keys
+    (lifecycle_signal, signal_status, error, integration_branch, promotion_target)
+    on both the normal and floor paths so the strategist always sees why the
+    block is absent rather than receiving a silently empty section."""
+    from app.strategic_payload_compaction import _compact_version_phase
+
+    marker = {
+        "lifecycle_signal": "unavailable",
+        "signal_status": "build_failed",
+        "error": "RuntimeError('simulated failure')",
+        "integration_branch": "automain",
+        "promotion_target": "main",
+    }
+
+    # Normal path
+    out = _compact_version_phase(marker)
+    assert out.get("lifecycle_signal") == "unavailable"
+    assert out.get("signal_status") == "build_failed"
+    assert out.get("error") == "RuntimeError('simulated failure')"
+    assert out.get("integration_branch") == "automain"
+    assert out.get("promotion_target") == "main"
+
+    # Floor path must also preserve all five marker keys.
+    out_floor = _compact_version_phase(marker, floor=True)
+    assert out_floor.get("lifecycle_signal") == "unavailable"
+    assert out_floor.get("signal_status") == "build_failed"
+    assert out_floor.get("error") == "RuntimeError('simulated failure')"
+    assert out_floor.get("integration_branch") == "automain"
+    assert out_floor.get("promotion_target") == "main"

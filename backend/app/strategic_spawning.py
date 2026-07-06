@@ -7006,11 +7006,15 @@ async def _spawn_strategic_review(
                 logger.exception(
                     "[STRATEGIC] criterion_coverage fetch failed; continuing"
                 )
-        except Exception:
+        except Exception as _vpb_exc:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
-            # Surface the build failure in the payload so the strategist can
-            # distinguish 'build failed' from 'no version exists'.
-            _version_phase_block = {"build_unavailable": True}
+            _version_phase_block = {
+                "lifecycle_signal": "unavailable",
+                "signal_status": "build_failed",
+                "error": repr(_vpb_exc)[:240],
+                "integration_branch": _integration_branch,
+                "promotion_target": _promotion_target,
+            }
     # Deployment-state block — only under an LTS split (integration branch !=
     # promotion target). Grounds the deploy-model framing in concrete numbers:
     # what is actually DEPLOYED (running live on the promotion target) vs what

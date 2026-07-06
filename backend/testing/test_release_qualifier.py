@@ -30525,6 +30525,134 @@ async def test_redrive_promotion_failed_defers_when_remediation_in_flight(db_ses
 
 
 @pytest.mark.asyncio
+async def test_sweep_promotes_dry_run_pass_after_promotion_enabled(db_session, mocker):
+    """sweep_stuck_qualifications promotes a dry-run-pass candidate once promotion
+    is enabled and the candidate SHA is still the current integration-branch HEAD.
+
+    Scenario: _finalize_qualification recorded status='dry_run' with
+    would_promote=True while promotion was disabled.  The operator later enables
+    promotion.  The sweep must detect the open dry-run-pass version and invoke
+    the force-promote path, incrementing the finalized count.
+    """
+    from app import shared_state
+
+    candidate_sha = "d7e5ca11" * 5  # 40-char placeholder SHA
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "candidate_diff_hash": "hashvalue",
+        "confidence": 0.92,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=candidate_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    force_promote_spy.assert_awaited_once()
+    call_kwargs = force_promote_spy.call_args
+    assert call_kwargs.args[1] == candidate_sha
+
+
+@pytest.mark.asyncio
+async def test_promote_dry_run_pass_noop_when_promotion_still_disabled(
+    db_session, mocker
+):
+    """_promote_dry_run_pass_if_enabled must return False when promotion is
+    still disabled — the dry-run verdict stays untouched."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _promote_dry_run_pass_if_enabled
+
+    candidate_sha = "fa115afe" * 5
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "confidence": 0.91,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    result = await _promote_dry_run_pass_if_enabled(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    force_promote_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_promote_dry_run_pass_noop_when_candidate_stale(db_session, mocker):
+    """_promote_dry_run_pass_if_enabled must return False when automain has
+    advanced past the dry-run candidate SHA — a stale candidate must not promote."""
+    from app import shared_state
+    from app.release_qualifier_sweep import _promote_dry_run_pass_if_enabled
+
+    candidate_sha = "0ldcand1" * 5
+    new_head_sha = "newhead1" * 5
+    shared_state.runtime_config["promotion_enabled"] = True
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "dry_run",
+        "would_promote": True,
+        "candidate_sha": candidate_sha,
+        "confidence": 0.95,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    mocker.patch(
+        "app.github.get_repo_installation_token",
+        new=AsyncMock(return_value="gh-token"),
+    )
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=new_head_sha),
+    )
+    force_promote_spy = mocker.patch(
+        "app.release_qualifier._force_promote_in_dedicated_session",
+        new=AsyncMock(return_value={"status": "promotion_pending"}),
+    )
+
+    result = await _promote_dry_run_pass_if_enabled(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    force_promote_spy.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_record_promotion_failure_increments_count(db_session, mocker):
     """_record_promotion_failure must increment promotion_failure_count from
     the previous last_qualification, starting at 1 for a fresh version."""
