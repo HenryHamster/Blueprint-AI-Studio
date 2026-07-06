@@ -505,7 +505,7 @@ async def check_landed_vs_reported_merges(ctx: SweepContext) -> List[CheckResult
         await ctx.session.execute(
             select(Artifact.task_id)
             .where(Artifact.artifact_type == ArtifactType.PULL_REQUEST)
-            .order_by(Artifact.id.desc())
+            .order_by(Artifact.created_at.desc())
             .limit(ctx.sample_limit)
         )
     ).all()

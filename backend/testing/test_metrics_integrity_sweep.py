@@ -255,6 +255,76 @@ async def test_landed_vs_reported_ok_when_all_landed(db):
 
 
 @pytest.mark.asyncio
+async def test_landed_vs_reported_samples_newest_by_created_at(db):
+    """Verify the sweep samples by created_at (newest first), not by uuid (random).
+
+    Creates MORE PR artifacts than sample_limit, spreads them across distinct
+    created_at times, and places ghost merges among the newest. Asserts the
+    sweep flags the newest ghost merges, proving created_at ordering is used.
+    """
+    from datetime import timedelta as td
+
+    project = await _project(db)
+    now = _utcnow()
+    sample_limit = 5
+
+    # Create 10 PR-artifact tasks spread across different created_at times
+    # (twice the sample limit).
+    # Older tasks (created_at earlier) are all landed.
+    for i in range(6):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=100 - i),  # older: hours 100, 99, ..., 95
+            context={"landed_on_integration": True, "pr_merged": True},
+        )
+        db.add(t)
+        await db.commit()
+        await db.refresh(t)
+        art = Artifact(task_id=t.id, artifact_type=ArtifactType.PULL_REQUEST, created_at=t.created_at)
+        db.add(art)
+        await db.commit()
+
+    # Newest tasks (created_at later) are ghost merges: PR artifact but NOT landed.
+    # These should be sampled because they are newest (by created_at).
+    for i in range(4):
+        t = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=10 - i),  # newer: hours 10, 9, 8, 7
+            context={"landed_on_integration": False},  # NOT landed
+        )
+        db.add(t)
+        await db.commit()
+        await db.refresh(t)
+        art = Artifact(task_id=t.id, artifact_type=ArtifactType.PULL_REQUEST, created_at=t.created_at)
+        db.add(art)
+        await db.commit()
+
+    # Run the sweep with sample_limit=5. If it orders by created_at correctly,
+    # it should sample the 4 newest ghost merges + 1 older landed task (newest of that batch).
+    # The result should flag the 4 ghost merges.
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=25,
+        sample_limit=sample_limit,
+        window_days=14,
+    )
+    results = await mis.check_landed_vs_reported_merges(ctx)
+    flagged = [r for r in results if r.flagged]
+
+    # Should find at least one FLAGGED result indicating ghost merges.
+    assert len(flagged) >= 1, f"expected flagged result for ghost merges, got {results}"
+    f = flagged[0]
+    # Delta should reflect the 4 ghost merges (the newest ones that were sampled).
+    assert f.delta >= 4, f"expected delta >= 4 ghost merges, got delta={f.delta} in {f}"
+
+
+@pytest.mark.asyncio
 async def test_landed_vs_reported_skips_with_no_pr_tasks(db):
     ctx = SweepContext(
         session=db, now=_utcnow(), mode="observe", max_projects=25,

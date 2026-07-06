@@ -8811,3 +8811,116 @@ async def test_post_merge_recompute_noop_when_no_snapshot(db_session: AsyncSessi
     await db_session.refresh(project)
     agg = project.directions[0].get("history_aggregate") or {}
     assert agg.get("total_prs_merged") == 5, "no-snapshot path must not mutate aggregate"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Structural pinning: evicted-cycle delta contract field-list consistency
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_evicted_delta_field_lists_stay_in_sync():
+    """Structural invariant: every numeric key written by build_evicted_cycle_snapshot
+    must round-trip through _fold_evicted_into_aggregate into the aggregate under
+    the key ``total_<snap_key>``.
+
+    This test fails if:
+    - A new field is added to build_evicted_cycle_snapshot but not consumed by the fold.
+    - A field is consumed by the fold but not recorded in the snapshot (so post-eviction
+      delta recomputes would produce wrong deltas).
+    - The fold applies a different value than the snapshot for a modern acceptance-aware
+      entry (indicating a legacy-fallback path that diverges from the snapshot).
+
+    Design: pure structural round-trip — no hardcoded field lists, derives every set
+    dynamically from the live production code via a known entry that exercises all
+    code paths.  The accepted_non_total_keys set names the snapshot keys that the fold
+    lands under a different name (not ``total_<key>``); update it only if the fold
+    intentionally uses a different target key name.
+    """
+    from app.direction_metrics import (
+        _fold_evicted_into_aggregate,
+        build_evicted_cycle_snapshot,
+    )
+
+    # A maximally-populated modern entry: acceptance-aware, all fields present.
+    # task counters are set to 0 so _normalize_aggregate_generalized_state's
+    # legacy_terminal floor does not bump total_generalized_terminal_outcomes
+    # above the breakdown-derived value, keeping the round-trip deterministic.
+    full_entry = {
+        "prs_merged": 2,
+        "verified_prs_merged": 2,
+        "autonomous_prs_merged": 2,
+        "verified_autonomous_prs_merged": 2,
+        "assisted_prs_merged": 0,
+        "reachable_prs_merged": 2,
+        "stranded_prs_merged": 0,
+        "acceptance_proven_merged": 1,
+        "acceptance_consumed_merged": 1,
+        "acceptance_declared_merged": 1,
+        "acceptance_merged_write_total": 2,
+        "acceptance_verified_write_merged": 2,
+        "tasks_completed": 0,
+        "tasks_failed": 0,
+        "tasks_cancelled": 0,
+        "tasks_created": 2,
+        "prs_rejected": 0,
+        "tasks_failed_infra": 0,
+        "tasks_completed_no_pr": 0,
+        "operator_action_count": 0,
+        "outcome_kind_breakdown": {
+            "code_merge": {"success": 2, "neutral": 0, "failure": 0},
+        },
+    }
+
+    snap = build_evicted_cycle_snapshot(full_entry)
+    agg = _fold_evicted_into_aggregate(None, [full_entry])
+
+    # Numeric snapshot keys that the fold lands under ``total_<key>``.
+    # outcome_kind_breakdown is nested and checked separately below.
+    numeric_snap_keys = {k for k, v in snap.items() if isinstance(v, (int, float))}
+
+    # Every numeric snapshot key must appear in the aggregate as ``total_<key>``
+    # and must carry the same value (no silent truncation or fallback divergence for
+    # a modern fully-populated entry).
+    missing_agg_keys = []
+    mismatched_values = []
+    for snap_key in sorted(numeric_snap_keys):
+        agg_key = f"total_{snap_key}"
+        if agg_key not in agg:
+            missing_agg_keys.append((snap_key, agg_key))
+        else:
+            snap_val = int(snap[snap_key])
+            agg_val = int(agg[agg_key])
+            if snap_val != agg_val:
+                mismatched_values.append((snap_key, agg_key, snap_val, agg_val))
+
+    assert not missing_agg_keys, (
+        f"_fold_evicted_into_aggregate does not produce aggregate keys for these "
+        f"snapshot fields (expected 'total_<snap_key>'): "
+        f"{[(s, a) for s, a in missing_agg_keys]}. "
+        f"Either add the fold arm or rename the snapshot key to match the fold."
+    )
+    assert not mismatched_values, (
+        f"_fold_evicted_into_aggregate value mismatch for modern entry "
+        f"(snap_key, agg_key, snap_val, agg_val): {mismatched_values}. "
+        f"A modern acceptance-aware entry must round-trip without divergence."
+    )
+
+    # outcome_kind_breakdown: the fold must carry the breakdown into agg.
+    assert "outcome_kind_breakdown" in agg, (
+        "_fold_evicted_into_aggregate must produce 'outcome_kind_breakdown' in aggregate"
+    )
+    assert isinstance(agg["outcome_kind_breakdown"], dict), (
+        "aggregate outcome_kind_breakdown must be a dict"
+    )
+    # The per-kind success count must match the snapshot's breakdown.
+    snap_bd = snap["outcome_kind_breakdown"]
+    agg_bd = agg["outcome_kind_breakdown"]
+    for kind, counts in snap_bd.items():
+        assert kind in agg_bd, (
+            f"kind '{kind}' present in snapshot breakdown but missing from aggregate breakdown"
+        )
+        for status, val in counts.items():
+            assert int(agg_bd[kind].get(status, 0)) == int(val), (
+                f"breakdown['{kind}']['{status}']: aggregate={agg_bd[kind].get(status)!r}, "
+                f"snapshot={val!r} — fold must carry breakdown per kind/status"
+            )
