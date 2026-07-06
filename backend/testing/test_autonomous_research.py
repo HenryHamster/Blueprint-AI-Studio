@@ -14149,7 +14149,12 @@ async def _add_directed_research(
     session.add(t)
     await session.commit()
     if age_minutes:
-        t.created_at = datetime.utcnow() - timedelta(minutes=age_minutes)
+        backdated = datetime.utcnow() - timedelta(minutes=age_minutes)
+        t.created_at = backdated
+        # _on_status_set auto-stamps completed_at=now() for terminal tasks;
+        # backdate it too so _derive_completed_at returns the intended age.
+        if t.completed_at is not None:
+            t.completed_at = backdated
         session.add(t)
         await session.commit()
     return t
@@ -14498,7 +14503,11 @@ async def test_spawn_allowed_when_completed_directed_research_outside_cooldown(
         )
         db_session.add(old_completed)
         await db_session.commit()
-        old_completed.created_at = datetime.utcnow() - timedelta(minutes=90)
+        backdated = datetime.utcnow() - timedelta(minutes=90)
+        old_completed.created_at = backdated
+        # Backdate completed_at too — _on_status_set stamps it at now() on init,
+        # but _derive_completed_at prefers completed_at over created_at.
+        old_completed.completed_at = backdated
         db_session.add(old_completed)
         await db_session.commit()
 
