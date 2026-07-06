@@ -128,6 +128,74 @@ def _review_approved(review_loop: dict) -> bool:
     return review_loop.get("verdict") == "APPROVE"
 
 
+def effective_pr_number(task_or_ctx) -> int | None:
+    """Canonical PR-number accessor for a CI-waiting rollup task.
+
+    Resolves ``review_loop.pr_number or context.rollup_pr_number`` — the SAME
+    fallback the recovery sweeps already use (recovery_evaluating_pr_check.py,
+    recovery_evaluating_approval.py, recovery_evaluating_strand.py, admin.py).
+
+    Why this exists: the merge-critical reads (the orchestrator CI-poll loop and
+    ``handle_ci_completion`` / ``_attempt_merge_with_retry_and_escalation``)
+    historically read ONLY ``review_loop.pr_number``. A rollup parked with
+    ``ci_waiting=True`` but its PR identity living only at
+    ``context.rollup_pr_number`` (a re-arm path that never co-stamped
+    ``review_loop.pr_number``) was therefore SKIPPED by the merger while the
+    recovery sweeps still saw it — a PR-identity split-brain where the merger and
+    the reaper disagree on whether a task even has a PR, so such rows only drain
+    slowly out-of-band. Routing every merge-critical read through this accessor
+    makes them agree with the recovery paths.
+
+    Accepts a ``Task`` (reads ``.context``) or a bare context dict.
+    """
+    ctx = getattr(task_or_ctx, "context", None)
+    if ctx is None and isinstance(task_or_ctx, dict):
+        ctx = task_or_ctx
+    ctx = ctx or {}
+    review_loop = ctx.get("review_loop") or {}
+    return review_loop.get("pr_number") or ctx.get("rollup_pr_number")
+
+
+def arm_ci_wait(
+    review_loop: dict,
+    *,
+    pr_number: int,
+    head_sha: str | None = None,
+    base_branch: str | None = None,
+    now_iso: str,
+    pause_baseline: float = 0.0,
+) -> dict:
+    """Arm a ``review_loop`` for the orchestrator's CI-wait / merge poll, in place.
+
+    Every CI-wait arm site MUST co-stamp the PR identity and the wait-start
+    clock together. Two failure shapes motivated this helper:
+
+      * ``ci_waiting=True`` written WITHOUT ``pr_number`` is SKIPPED by the
+        merge-critical poll loop (the PR-identity split-brain — see
+        :func:`effective_pr_number`), so the rollup only drains out-of-band.
+      * ``ci_waiting=True`` written WITHOUT ``ci_wait_started`` silently disables
+        the CI-wait timeout (the poll loop carries a defensive backfill for
+        exactly this — evidence some path armed without it).
+
+    Routing arm sites through this helper guarantees both are present, so no arm
+    site can reintroduce the identity-less ``{ci_waiting, iteration}`` shape.
+    Returns the same dict for chaining.
+
+    ``pr_number`` is asserted truthy: arming a CI-wait with no PR to poll is
+    always a bug — resolve it (via :func:`effective_pr_number` or a local) first.
+    """
+    assert pr_number, "arm_ci_wait requires a resolved pr_number"
+    review_loop["ci_waiting"] = True
+    review_loop["pr_number"] = pr_number
+    review_loop["ci_wait_started"] = now_iso
+    review_loop["ci_wait_pause_baseline"] = pause_baseline
+    if head_sha is not None:
+        review_loop["head_sha"] = head_sha
+    if base_branch is not None:
+        review_loop["base_branch"] = base_branch
+    return review_loop
+
+
 async def _post_merge_summary(
     gh_token: str,
     owner: str,

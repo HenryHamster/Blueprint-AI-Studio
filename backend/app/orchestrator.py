@@ -6576,21 +6576,35 @@ async def orchestrator_worker():
                     ):
                         await session.rollback()
                         continue
-                    ci_pr_number = ci_loop.get("pr_number")
+                    # PR-identity split-brain fix: resolve via the canonical
+                    # accessor (review_loop.pr_number OR context.rollup_pr_number),
+                    # the SAME fallback the recovery sweeps use — a rollup whose
+                    # identity lived only at context.rollup_pr_number was previously
+                    # SKIPPED here and drained only out-of-band.
+                    from app.ci_merge_helpers import effective_pr_number
+
+                    ci_pr_number = effective_pr_number(ci_task)
                     if not ci_pr_number:
                         await session.rollback()
                         continue
 
-                    # Ensure ci_wait_started is always set — some paths set ci_waiting=True
-                    # without setting ci_wait_started, which silently disables the timeout.
-                    # Commit immediately, then reacquire task_lock before more mutations below.
-                    if not ci_loop.get("ci_wait_started"):
+                    # Ensure ci_wait_started AND pr_number are always co-present:
+                    # some paths arm ci_waiting without ci_wait_started (silently
+                    # disables the timeout), and when the number came from the
+                    # rollup_pr_number fallback, stamp it into review_loop.pr_number
+                    # so the backfill + every downstream read stay consistent.
+                    # Commit, then reacquire task_lock before more mutations below.
+                    _needs_pr_stamp = not ci_loop.get("pr_number")
+                    if not ci_loop.get("ci_wait_started") or _needs_pr_stamp:
                         from app import pause_clock
 
-                        ci_loop["ci_wait_started"] = _utcnow().isoformat()
-                        ci_loop[
-                            "ci_wait_pause_baseline"
-                        ] = await pause_clock.current_baseline(session)
+                        if _needs_pr_stamp:
+                            ci_loop["pr_number"] = ci_pr_number
+                        if not ci_loop.get("ci_wait_started"):
+                            ci_loop["ci_wait_started"] = _utcnow().isoformat()
+                            ci_loop[
+                                "ci_wait_pause_baseline"
+                            ] = await pause_clock.current_baseline(session)
                         ci_task.context = {
                             **(ci_task.context or {}),
                             "review_loop": ci_loop,

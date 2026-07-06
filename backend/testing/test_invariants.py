@@ -10127,3 +10127,67 @@ def test_pytest_filterwarnings_includes_httpx_error_guard():
         "This guard ensures httpx deprecation warnings surface as test failures "
         "before they become hard removals in the next version bump."
     )
+
+
+def _ci_wait_true_literals_missing_pr_number(app_dir: str) -> list[str]:
+    """Return "file:line" sites where a dict LITERAL sets ``"ci_waiting": True``
+    but does NOT co-stamp a ``"pr_number"`` key.
+
+    The orchestrator's merge-critical CI-poll loop resolves a parked rollup's PR
+    via ``review_loop.pr_number`` (with a ``context.rollup_pr_number`` fallback,
+    ``ci_merge_helpers.effective_pr_number``). A ``ci_waiting=True`` armed as a
+    dict literal WITHOUT ``pr_number`` reintroduces the identity-less
+    ``{ci_waiting, iteration}`` shape that the merger SKIPS — the PR-identity
+    split-brain. Every CI-wait arm literal must therefore also carry
+    ``pr_number`` (or route through ``ci_merge_helpers.arm_ci_wait``, which
+    co-stamps it and asserts it is non-None).
+    """
+    import ast
+    import glob as globmod
+
+    offenders: list[str] = []
+    for py_file in globmod.glob(os.path.join(app_dir, "**", "*.py"), recursive=True):
+        with open(py_file, encoding="utf-8") as fh:
+            source = fh.read()
+        try:
+            tree = ast.parse(source, filename=py_file)
+        except SyntaxError:
+            continue
+        rel = os.path.relpath(py_file, app_dir).replace(os.sep, "/")
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            const_keys = {
+                k.value for k in node.keys if isinstance(k, ast.Constant)
+            }
+            arms_ci_wait = any(
+                isinstance(k, ast.Constant)
+                and k.value == "ci_waiting"
+                and isinstance(v, ast.Constant)
+                and v.value is True
+                for k, v in zip(node.keys, node.values)
+            )
+            if arms_ci_wait and "pr_number" not in const_keys:
+                offenders.append(f"{rel}:{node.lineno}")
+    return offenders
+
+
+def test_ci_wait_arm_literals_costamp_pr_number():
+    """Tripwire: no dict literal may arm ``ci_waiting=True`` without ``pr_number``.
+
+    Guards the PR-identity split-brain fix: an identity-less CI-wait arm is
+    skipped by the merge-critical poll loop and only drains out-of-band. New arm
+    sites must either include ``"pr_number"`` in the same literal or route
+    through ``ci_merge_helpers.arm_ci_wait``.
+    """
+    app_dir = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "app"))
+    offenders = _ci_wait_true_literals_missing_pr_number(app_dir)
+    assert not offenders, (
+        "Dict literal(s) arm ci_waiting=True without co-stamping pr_number "
+        "(identity-less shape the merge poll loop SKIPS):\n  "
+        + "\n  ".join(offenders)
+        + "\n\nInclude \"pr_number\" in the same literal, or route the arm site "
+        "through ci_merge_helpers.arm_ci_wait(review_loop, pr_number=..., "
+        "now_iso=...) which co-stamps pr_number + ci_wait_started and asserts "
+        "pr_number is non-None."
+    )

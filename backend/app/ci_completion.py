@@ -42,6 +42,8 @@ from app.ci_merge_helpers import (  # noqa: F401
     _pr_number_match,
     _relock_merge_task,
     _review_approved,
+    arm_ci_wait,
+    effective_pr_number,
 )
 from app.models import Task, TaskStatus, _utcnow
 
@@ -159,7 +161,16 @@ async def _attempt_merge_with_retry_and_escalation(
         return False
 
     ci_loop = (task.context or {}).get("review_loop", {})
-    ci_pr_number = ci_loop.get("pr_number")
+    # PR-identity split-brain fix: resolve via the canonical accessor
+    # (review_loop.pr_number OR context.rollup_pr_number) so a rollup parked with
+    # its identity only at context.rollup_pr_number still merges here, and stamp
+    # it back onto the loop so every downstream read (the merge call below) and
+    # the recovery sweeps agree. Caller commits.
+    ci_pr_number = effective_pr_number(task)
+    if ci_pr_number and not ci_loop.get("pr_number"):
+        ci_loop["pr_number"] = ci_pr_number
+        task.context = {**(task.context or {}), "review_loop": ci_loop}
+        flag_modified(task, "context")
     ci_payload = task.first_payload
     ci_orig_id = ci_loop.get("original_task_id", "") or ci_payload.get(
         "original_task_id", ""
@@ -244,7 +255,15 @@ async def _attempt_merge_with_retry_and_escalation(
                     from app.task_completion import _reset_review_loop_pr_head_cache
 
                     review_loop = _reset_review_loop_pr_head_cache(ci_loop)
-                    review_loop.update({"ci_waiting": True, "ci_passed": False})
+                    # Re-arm the CI wait on the rewritten PR head. arm_ci_wait
+                    # co-stamps pr_number + a fresh ci_wait_started so the merge
+                    # poll never sees the identity-less {ci_waiting} shape.
+                    arm_ci_wait(
+                        review_loop,
+                        pr_number=ci_pr_number,
+                        now_iso=_utcnow().isoformat(),
+                    )
+                    review_loop["ci_passed"] = False
                     task.context = {
                         **(task.context or {}),
                         "_migration_finalization": finalization,
@@ -1592,7 +1611,15 @@ async def handle_ci_completion(
         return False
 
     ci_loop = (task.context or {}).get("review_loop", {})
-    ci_pr_number = ci_loop.get("pr_number")
+    # Canonical PR-identity resolve (review_loop.pr_number OR
+    # context.rollup_pr_number). Stamp it back so the merge path below and the
+    # recovery sweeps agree — a rollup whose identity lived only at
+    # context.rollup_pr_number is no longer skipped by the merger.
+    ci_pr_number = effective_pr_number(task)
+    if ci_pr_number and not ci_loop.get("pr_number"):
+        ci_loop["pr_number"] = ci_pr_number
+        task.context = {**(task.context or {}), "review_loop": ci_loop}
+        flag_modified(task, "context")
     ci_payload = task.first_payload
     ci_branch = ci_loop.get("branch", "") or ci_payload.get("branch", "")
     _ci_project = (

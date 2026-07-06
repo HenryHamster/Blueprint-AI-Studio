@@ -1576,12 +1576,19 @@ async def _maybe_release_safeguard_gate(
     orig_ctx = dict(orig.context or {})
     _fire_completed_orig_merge = False
     if orig.status == TaskStatus.EVALUATING and pr_num:
-        # Review already approved while safeguard was pending; hand off to CI polling loop.
-        orig_ctx["review_loop"] = {
-            **(orig_ctx.get("review_loop") or {}),
-            "ci_waiting": True,
-            "pr_number": pr_num,
-        }
+        # Review already approved while safeguard was pending; hand off to CI
+        # polling loop. arm_ci_wait co-stamps pr_number + a fresh ci_wait_started
+        # so this re-arm never parks the identity-less {ci_waiting} shape that the
+        # merge poll would skip / that would silently disable the CI-wait timeout.
+        from app.ci_merge_helpers import arm_ci_wait  # noqa: PLC0415
+
+        _rearm_loop = dict(orig_ctx.get("review_loop") or {})
+        arm_ci_wait(
+            _rearm_loop,
+            pr_number=pr_num,
+            now_iso=_utcnow().isoformat(),
+        )
+        orig_ctx["review_loop"] = _rearm_loop
         orig.context = orig_ctx
         flag_modified(orig, "context")
     elif (

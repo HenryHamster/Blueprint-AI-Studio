@@ -5166,3 +5166,76 @@ async def test_direct_merge_unproven_verdict_records_no_proven_evidence(
     assert coverage == "uncovered", (
         f"Coverage must stay 'uncovered' when verdict is absent, got '{coverage}'"
     )
+
+
+# ---------------------------------------------------------------------------
+# effective_pr_number / arm_ci_wait — PR-identity split-brain accessors
+# ---------------------------------------------------------------------------
+from app.ci_completion import arm_ci_wait, effective_pr_number  # noqa: E402
+
+
+class _CtxHolder:
+    """Minimal Task-like stand-in exposing a ``.context`` attribute."""
+
+    def __init__(self, context):
+        self.context = context
+
+
+def test_effective_pr_number_prefers_review_loop_pr_number():
+    holder = _CtxHolder({"review_loop": {"pr_number": 111}, "rollup_pr_number": 222})
+    assert effective_pr_number(holder) == 111
+
+
+def test_effective_pr_number_falls_back_to_rollup_pr_number():
+    # The split-brain shape: ci_waiting armed with no review_loop.pr_number, the
+    # PR identity living only at context.rollup_pr_number.
+    holder = _CtxHolder({"review_loop": {"ci_waiting": True}, "rollup_pr_number": 222})
+    assert effective_pr_number(holder) == 222
+
+
+def test_effective_pr_number_none_when_absent():
+    assert effective_pr_number(_CtxHolder({"review_loop": {}})) is None
+    assert effective_pr_number(_CtxHolder(None)) is None
+
+
+def test_effective_pr_number_accepts_bare_context_dict():
+    assert effective_pr_number({"review_loop": {"pr_number": 5}}) == 5
+    assert effective_pr_number({"rollup_pr_number": 9}) == 9
+    assert effective_pr_number({}) is None
+
+
+def test_arm_ci_wait_costamps_identity_and_clock():
+    review_loop = {"iteration": 3}
+    now = "2026-07-05T00:00:00"
+    out = arm_ci_wait(review_loop, pr_number=42, now_iso=now)
+    assert out is review_loop  # mutates in place
+    assert review_loop["ci_waiting"] is True
+    assert review_loop["pr_number"] == 42
+    assert review_loop["ci_wait_started"] == now
+    assert review_loop["ci_wait_pause_baseline"] == 0.0
+    assert review_loop["iteration"] == 3  # unrelated fields preserved
+    # Optional identity fields are omitted when not supplied.
+    assert "head_sha" not in review_loop
+    assert "base_branch" not in review_loop
+
+
+def test_arm_ci_wait_sets_optional_head_and_base():
+    review_loop = {}
+    arm_ci_wait(
+        review_loop,
+        pr_number=1,
+        head_sha="abc123",
+        base_branch="automain",
+        now_iso="t",
+        pause_baseline=12.5,
+    )
+    assert review_loop["head_sha"] == "abc123"
+    assert review_loop["base_branch"] == "automain"
+    assert review_loop["ci_wait_pause_baseline"] == 12.5
+
+
+def test_arm_ci_wait_asserts_pr_number_present():
+    with pytest.raises(AssertionError):
+        arm_ci_wait({}, pr_number=0, now_iso="t")
+    with pytest.raises(AssertionError):
+        arm_ci_wait({}, pr_number=None, now_iso="t")
