@@ -1295,7 +1295,7 @@ async def promote(
             merged_sha_retry: str | None = None
             try:
                 merged_sha_retry = await github.get_branch_sha(
-                    token, owner, repo, promotion_target
+                    token, owner, repo, promotion_target, live=True
                 )
             except Exception:  # noqa: BLE001 — best-effort; degrade to candidate
                 logger.warning(
@@ -1512,7 +1512,9 @@ async def promote(
     #    successful promotion.
     merged_sha: str | None = None
     try:
-        merged_sha = await github.get_branch_sha(token, owner, repo, promotion_target)
+        merged_sha = await github.get_branch_sha(
+            token, owner, repo, promotion_target, live=True
+        )
     except Exception as exc:  # noqa: BLE001 — merge already succeeded; SHA read is best-effort
         logger.warning(
             "[RELEASE_QUALIFIER] promote: merged PR #%s for v%d but could not "

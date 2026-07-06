@@ -54,7 +54,9 @@ async def create_branch(
         from app import github as _gh
 
         try:
-            existing_sha = await _gh.get_branch_sha(token, owner, repo, branch_name)
+            existing_sha = await _gh.get_branch_sha(
+                token, owner, repo, branch_name, live=True
+            )
             logger.info(
                 f"Branch '{branch_name}' already exists (sha: {existing_sha[:8]}), reusing"
             )
@@ -266,25 +268,30 @@ async def get_branch_sha(
     branch: str,
     project_id: str | None = None,
     *,
-    allow_cached: bool = False,
+    live: bool = False,
 ) -> str:
     """Gets the latest commit SHA of a branch.
 
-    ``allow_cached`` (default False) serves from / populates the short-TTL
+    Cache-by-default: the result is served from / populated into the short-TTL
     branch-tip cache shared with the repo-snapshot layer
-    (``github_repo_snapshot._branch_sha_cache``, ~60s). It is ONLY safe for
-    STALENESS-TOLERANT reads — behind-detection ("is this PR behind its
-    base?"), where a ≤60s-old base tip is fine because GitHub still enforces
-    mergeability at merge time. NEVER pass ``allow_cached`` for SHA-CRITICAL
-    reads (promotion / merge-SHA verification, ref updates): those must observe
-    the live tip. A cache MISS still does the live request and raises on
-    failure, preserving the str-or-raise contract.
+    (``github_repo_snapshot._branch_sha_cache``, ~60s). This is safe for the
+    overwhelming majority of reads — behind-detection ("is this PR behind its
+    base?"), grounding/provenance, observability sweeps — where a ≤60s-old tip
+    is fine (GitHub still enforces mergeability at merge time), and it removes
+    the repeated identical ``git/ref/heads/{base}`` reads (every concurrent
+    PR/sweep checks the same base tip) that dominate GitHub-quota burn.
 
-    Wiring behind-detection through this cache removes the repeated identical
-    ``git/ref/heads/{base}`` reads (every concurrent PR checks the same base
-    tip) that were the #2 GitHub-quota consumer after token minting.
+    Pass ``live=True`` for SHA-CRITICAL reads that MUST observe the current tip:
+    recording a promoted/merged SHA, pinning the canonical candidate SHA, or
+    anchoring a branch create/reset. ``live=True`` skips the cache on BOTH read
+    and write-back, so an anchor read neither trusts nor pollutes the shared tip
+    cache. The read-only allowlist test ``TestGitHubRefReadCaching`` enforces
+    that every ``live=True`` site is a reviewed member of the must-be-live set.
+
+    A cache MISS still does the live request and raises on failure, preserving
+    the str-or-raise contract.
     """
-    if allow_cached:
+    if not live:
         from app.github_repo_snapshot import (
             _BRANCH_SHA_TTL_S,
             _branch_sha_cache,
@@ -322,7 +329,7 @@ async def get_branch_sha(
             detail=f"GitHub API error getting branch '{branch}' SHA (HTTP {response.status_code}).",
         )
     sha = response.json()["object"]["sha"]
-    if allow_cached:
+    if not live:
         from app.github_repo_snapshot import _branch_sha_cache
 
         _branch_sha_cache[(owner, repo, branch)] = (sha, time.monotonic())

@@ -779,6 +779,7 @@ async def _reconcile_if_promotion_failed_landed(
                     repo,
                     promotion_target,
                     project_id=str(version.project_id),
+                    live=True,
                 )
             except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
                 logger.warning(
@@ -941,6 +942,7 @@ async def _reconcile_if_not_promoted_but_pr_merged(
                     repo,
                     promotion_target,
                     project_id=str(version.project_id),
+                    live=True,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
@@ -1297,6 +1299,7 @@ async def _reconcile_if_pending_auto_merge_landed(
                         repo,
                         promotion_target,
                         project_id=str(version.project_id),
+                        live=True,
                     )
                 except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
                     logger.warning(
@@ -1847,6 +1850,7 @@ async def _reconcile_if_managed_check_wait(
                         repo,
                         promotion_target,
                         project_id=str(version.project_id),
+                        live=True,
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
@@ -2497,6 +2501,7 @@ async def _reconcile_if_managed_check_wait(
                     repo,
                     promotion_target,
                     project_id=str(version.project_id),
+                    live=True,
                 )
             except Exception as exc:  # noqa: BLE001 — fallback to candidate_sha
                 logger.warning(

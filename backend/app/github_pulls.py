@@ -123,8 +123,7 @@ async def pr_is_not_behind_for(
                 repo,
                 base_branch,
                 project_id=project_id,
-                allow_cached=True,
-            )
+            )  # behind-detection base tip — cached-by-default (staleness-tolerant)
         except Exception as exc:  # noqa: BLE001 — mirrors caller-site behavior: any get_branch_sha failure (network, 404, auth) must fall through to pr_is_not_behind with base_tip_sha=None so it can decide based on mergeable_state alone.
             logger.warning(
                 f"[PR_IS_NOT_BEHIND] get_branch_sha({base_branch}) failed for "

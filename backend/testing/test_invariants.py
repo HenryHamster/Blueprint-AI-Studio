@@ -10132,3 +10132,116 @@ def test_pytest_filterwarnings_includes_httpx_error_guard():
         "This guard ensures httpx deprecation warnings surface as test failures "
         "before they become hard removals in the next version bump."
     )
+
+
+# ---------------------------------------------------------------------------
+# Cache-by-default guardrail for github_refs.get_branch_sha
+# ---------------------------------------------------------------------------
+# get_branch_sha caches by default (short-TTL branch-tip cache) — safe for the
+# overwhelming majority of reads. The ONLY way to (re)introduce an uncached
+# hot-path ref read is `live=True`, so every live=True site must be a reviewed
+# member of this allowlist. Keyed "<file>:<enclosing function>". Each is
+# SHA-critical: it records a promoted/merged SHA, pins the canonical
+# candidate/base SHA, or anchors a branch create — where a <=60s-stale cached
+# tip would be a data-integrity bug. Adding an entry is a deliberate act.
+_LIVE_REF_READ_ALLOWLIST = frozenset(
+    {
+        "release_promotion.py:promote",
+        "release_qualifier.py:run_qualification",
+        "release_qualifier.py:_guard_ci_unresolved_promotion_in_flight",
+        "release_qualifier.py:force_promote_current_version",
+        "release_reconciliation.py:_reconcile_if_promotion_failed_landed",
+        "release_reconciliation.py:_reconcile_if_not_promoted_but_pr_merged",
+        "release_reconciliation.py:_reconcile_if_pending_auto_merge_landed",
+        "release_reconciliation.py:_reconcile_if_managed_check_wait",
+        "release_version.py:_resolve_integration_head_sha",
+        "strategic_spawning.py:_spawn_strategic_review",
+        "task_completion.py:_ensure_branch",
+        "rollup_management.py:_check_and_trigger_rollup",
+    }
+)
+
+# github.py defines get_branch_sha; github_refs.py's own live=True is inside
+# create_branch's conflict-retry (branch-write context, not a hot read path).
+_LIVE_REF_SCAN_SKIP_FILES = frozenset({"github.py", "github_refs.py"})
+
+
+def _live_true_get_branch_sha_sites(tree, rel_path):
+    """Yield ``"<rel_path>:<function>"`` for each get_branch_sha(..., live=True)."""
+    parent = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parent[child] = node
+
+    def _enclosing_fn(node):
+        cur = parent.get(node)
+        while cur is not None:
+            if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                return cur.name
+            cur = parent.get(cur)
+        return "<module>"
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        callee = node.func
+        name = (
+            callee.attr
+            if isinstance(callee, ast.Attribute)
+            else callee.id
+            if isinstance(callee, ast.Name)
+            else None
+        )
+        if name != "get_branch_sha":
+            continue
+        for kw in node.keywords:
+            if (
+                kw.arg == "live"
+                and isinstance(kw.value, ast.Constant)
+                and kw.value.value is True
+            ):
+                yield f"{rel_path}:{_enclosing_fn(node)}"
+
+
+def test_get_branch_sha_live_true_is_allowlisted():
+    """Every ``get_branch_sha(..., live=True)`` in backend/app must be a reviewed
+    member of the must-be-live allowlist. This is what makes cache-by-default
+    safe: a future caller can't silently reintroduce an uncached hot-path ref
+    read (the class of bug that drained the GitHub install-token budget) without
+    tripping this guard."""
+    import glob
+
+    app_dir = os.path.join(os.path.dirname(__file__), "..", "app")
+    offenders = []
+    for path in glob.glob(os.path.join(app_dir, "*.py")):
+        rel = os.path.basename(path)
+        if rel in _LIVE_REF_SCAN_SKIP_FILES:
+            continue
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=rel)
+        for site in _live_true_get_branch_sha_sites(tree, rel):
+            if site not in _LIVE_REF_READ_ALLOWLIST:
+                offenders.append(site)
+    assert not offenders, (
+        "get_branch_sha(..., live=True) at un-allowlisted site(s): "
+        f"{sorted(offenders)}. live=True bypasses the branch-tip cache and must be "
+        "a reviewed SHA-critical read (records a promoted/merged SHA, pins the "
+        "canonical candidate/base SHA, or anchors a branch create). If genuinely "
+        "SHA-critical, add '<file>:<function>' to _LIVE_REF_READ_ALLOWLIST with a "
+        "justification; otherwise drop live=True (cached is the safe default)."
+    )
+
+
+def test_get_branch_sha_live_guard_scanner_flags_injected_site():
+    """Self-test: the scanner actually detects a live=True call, so the guard
+    above can't silently pass by matching nothing."""
+    import textwrap
+
+    src = textwrap.dedent(
+        """
+        async def _bad():
+            return await github.get_branch_sha(t, o, r, b, live=True)
+        """
+    )
+    tree = ast.parse(src)
+    assert list(_live_true_get_branch_sha_sites(tree, "fake.py")) == ["fake.py:_bad"]
