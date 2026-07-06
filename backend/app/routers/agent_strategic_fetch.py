@@ -1146,6 +1146,7 @@ SECTION_FETCH_INVENTORY: dict[str, str | None] = {
     "prediction_calibration_factor": None,
     "prediction_calibration_note": None,
     "system_maturity": None,
+    "resident_exam_leads": None,    # exempt (never dropped); session-scoped, no fetch path
     # Low — dedicated fetch verb; tiny persisted trend across recent cycles
     "integrity_conflict_trend": "integrity-conflict-trend",
 }

@@ -384,3 +384,69 @@ async def test_poll_max_created_at_cursor_redelivers_boundary(
     assert second.status_code == 200, second.text
     # Inclusive re-scan of the boundary instant returns the newest again.
     assert [m["id"] for m in second.json()["messages"]] == [str(newest.id)]
+
+
+@pytest.mark.asyncio
+async def test_poll_session_id_scoping(client: AsyncClient, db_session):
+    """Passing session_id to the poll endpoint:
+    - Returns messages stamped for that session (resident_session_id == session_id).
+    - Returns NULL-session messages (backward-compat / cadence messages).
+    - Excludes messages stamped for a DIFFERENT session.
+    Verifies the or_(resident_session_id==session_id, resident_session_id IS NULL)
+    filter on the agent_poll_messages endpoint.
+    """
+    project, task = await _make_project_task(db_session)
+
+    SESSION_A = "ss-poll-scope-A"
+    SESSION_B = "ss-poll-scope-B"
+
+    # Message scoped to session A — must be visible when polling with session_id=A.
+    msg_a = await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="session A msg",
+        created_at=_BASE,
+    )
+    # Stamp resident_session_id directly (column added by this PR).
+    msg_a.resident_session_id = SESSION_A
+    db_session.add(msg_a)
+
+    # NULL-session (legacy/cadence) message — must always be visible.
+    msg_null = await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="unscoped legacy msg",
+        created_at=_BASE + timedelta(minutes=1),
+    )
+
+    # Message scoped to session B — must be excluded when polling with session_id=A.
+    msg_b = await _add_message(
+        db_session, project, from_type="user", status="open",
+        message_type=MessageType.NOTE, content="session B msg",
+        created_at=_BASE + timedelta(minutes=2),
+    )
+    msg_b.resident_session_id = SESSION_B
+    db_session.add(msg_b)
+
+    await db_session.commit()
+
+    # Poll with session_id=A — should see msg_a and msg_null, not msg_b.
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        params={"session_id": SESSION_A},
+        headers=_headers(task),
+    )
+    assert res.status_code == 200, res.text
+    ids = [m["id"] for m in res.json()["messages"]]
+    assert str(msg_a.id) in ids, "session-A message must be visible to session-A poll"
+    assert str(msg_null.id) in ids, "NULL-session message must always be visible"
+    assert str(msg_b.id) not in ids, "session-B message must be excluded from session-A poll"
+
+    # Poll without session_id — project-wide; all three messages are visible.
+    res_wide = await client.get(
+        f"/api/agent/projects/{project.id}/messages",
+        headers=_headers(task),
+    )
+    assert res_wide.status_code == 200, res_wide.text
+    ids_wide = [m["id"] for m in res_wide.json()["messages"]]
+    assert str(msg_a.id) in ids_wide
+    assert str(msg_null.id) in ids_wide
+    assert str(msg_b.id) in ids_wide

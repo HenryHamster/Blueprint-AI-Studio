@@ -1412,7 +1412,7 @@ async def test_start_spawn_then_finalize_failure_compensates(db_session, monkeyp
 
     created: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
         # Mimic the canonical spawn: create + commit a strategic_review task.
         t = Task(
             project_id=proj.id,
@@ -1477,7 +1477,7 @@ async def test_start_compensation_receives_plain_snapshotted_project_id(
     # Snapshot the expected id while ``project`` is still loaded (before the run).
     expected_id = project.id
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
         t = Task(
             project_id=proj.id,
             title="spawned resident",
@@ -2255,13 +2255,20 @@ async def test_heartbeat_liveness_only_does_not_extend_lease(db_session):
 # ---------------------------------------------------------------------------
 
 
-async def _make_operator_message(db_session, project, *, content="hi", created_at=None):
-    """Insert an operator-authored (from_type='user') open ProjectMessage."""
+async def _make_operator_message(
+    db_session, project, *, content="hi", created_at=None, resident_session_id=None
+):
+    """Insert an operator-authored (from_type='user') open ProjectMessage.
+
+    ``resident_session_id`` stamps the row with the session it was sent into
+    (``None`` = legacy/cadence, always treated as unscoped/visible).
+    """
     msg = ProjectMessage(
         project_id=project.id,
         from_type="user",
         content=content,
         status="open",
+        resident_session_id=resident_session_id,
     )
     db_session.add(msg)
     await db_session.commit()
@@ -2577,6 +2584,131 @@ async def test_heartbeat_operator_return_before_cap_keeps_session_alive(
     ).total_seconds() < 60
 
 
+# ---------------------------------------------------------------------------
+# Session-scope isolation (design b182b46e / migration 0396): a message stamped
+# for a DIFFERENT resident session must not re-arm THIS session's unattended cap
+# or pollute its pacing signal, while legacy/cadence NULL-session rows stay
+# visible so no pre-migration backlog is silently dropped.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_unattended_cap_ignores_other_session_message(db_session, monkeypatch):
+    """A FRESH operator message stamped for a DIFFERENT resident session must NOT
+    re-arm this session's unattended cap. Without session scoping the cross-session
+    message would keep the clock hot (the bleed this feature eliminates); with it,
+    the message is invisible here so the aged clock still fires and the session
+    ends."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Fresh message addressed to ANOTHER session — must not re-arm our clock.
+    await _make_operator_message(
+        db_session, project, content="for session A", resident_session_id="ss-other"
+    )
+
+    project = await db_session.get(Project, project.id)
+    capped = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    assert capped["stop_requested"] is True
+    assert capped["status"] == "ended"
+
+
+@pytest.mark.asyncio
+async def test_unattended_cap_rearmed_by_null_session_message(db_session, monkeypatch):
+    """A FRESH legacy/cadence NULL-session operator message REMAINS visible and
+    re-arms this session's unattended cap (backward compat: NULL is never hidden),
+    so the session keeps its authority instead of ending."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    monkeypatch.setitem(runtime_config, STRATEGIC_SESSION_MAX_UNATTENDED_SETTING, 60)
+    project = await db_session.get(Project, project.id)
+    vision = dict(project.vision or {})
+    blob = dict(vision[RESIDENT_SESSION_KEY])
+    blob["last_operator_interaction_at"] = (
+        _utcnow() - timedelta(hours=2)
+    ).isoformat()
+    vision[RESIDENT_SESSION_KEY] = blob
+    project.vision = vision
+    flag_modified(project, "vision")
+    db_session.add(project)
+    await db_session.commit()
+
+    # Fresh NULL-session (legacy/cadence) message — visible, re-arms the clock.
+    await _make_operator_message(
+        db_session, project, content="unstamped", resident_session_id=None
+    )
+
+    project = await db_session.get(Project, project.id)
+    reengaged = await renew_resident_session_lease(
+        db_session, project, session_id=snap["session_id"],
+        task_id=snap["task_id"], progress=True,
+    )
+    assert reengaged["authority_held"] is True
+    assert reengaged["stop_requested"] is False
+    assert reengaged["status"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_work_state_pacing_scoped_to_session(db_session):
+    """``new_operator_messages`` counts only messages addressed to THIS session
+    (its own stamp) plus unstamped NULL rows — a message stamped for another
+    session is excluded so it cannot drive this session's pacing / work_state."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    this_session = snap["session_id"]
+
+    # One for us, one NULL (legacy/cadence), one for another session.
+    await _make_operator_message(
+        db_session, project, resident_session_id=this_session
+    )
+    await _make_operator_message(db_session, project, resident_session_id=None)
+    await _make_operator_message(
+        db_session, project, resident_session_id="ss-other"
+    )
+
+    _, summary = await srs._compute_resident_work_state(
+        db_session, project.id, resident_session_id=this_session
+    )
+    # Our stamp + the NULL row are counted; the other-session row is not.
+    assert summary["new_operator_messages"] == 2
+
+    # A None scope (older caller / cadence path) still counts every message
+    # project-wide — the backward-compatible behaviour is unchanged.
+    _, summary_all = await srs._compute_resident_work_state(
+        db_session, project.id
+    )
+    assert summary_all["new_operator_messages"] == 3
+
+
 @pytest.mark.asyncio
 async def test_heartbeat_lease_lapse_stale_ends_session(db_session):
     """A genuinely LAPSED lease (freshness anchor elapsed past the TTL, i.e. no
@@ -2708,7 +2840,7 @@ async def test_start_revalidates_adopt_candidate_and_spawns_fresh(
     # cadence spawn path in a standalone test).
     fresh_holder: dict = {}
 
-    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None):
+    async def fake_spawn(session, proj, runner_id, *, session_id, exam_ledger=None, message_cursor=None):
         # The real spawn wrapper BIRTHS the task with the resident context flags
         # (via extra_context); mirror that here so the fresh task carries them in
         # its first committed state, exactly as start now relies on (no post-spawn
@@ -3429,3 +3561,206 @@ async def test_cycle_completion_retries_workday_auto_start(
     assert blob.get("task_id") == str(adoptable_task.id)
     # The blocked reason is cleared on a successful start.
     assert read_resident_session_blocked_reason(vision_after) is None
+
+
+# ---------------------------------------------------------------------------
+# message_cursor + handled_message_ids (durable resident message state)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_message_cursor_in_session_blob_and_task_context(db_session):
+    """A heartbeat carrying ``message_cursor`` writes it to both the session blob
+    (``_message_cursor``) and ``task.context["message_cursor"]``, so a restarted
+    agent restores the high-water mark instead of re-delivering answered messages."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    cursor = "2026-07-06T12:34:56.789000"
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+        message_cursor=cursor,
+    )
+
+    # The heartbeat itself succeeds.
+    assert result["stop_requested"] is False
+
+    # The cursor is persisted in the session blob.
+    fresh_project = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh_project.vision)
+    assert blob is not None
+    assert blob.get("_message_cursor") == cursor
+
+    # The cursor is mirrored into task.context so the agent reads it on restart.
+    fresh_task = await db_session.get(Task, task.id)
+    assert fresh_task is not None
+    assert (fresh_task.context or {}).get("message_cursor") == cursor
+
+    # The cursor must NOT appear in the operator-facing session snapshot.
+    snap_dict = resident_session_snapshot(fresh_project.vision)
+    assert snap_dict is not None
+    assert "_message_cursor" not in snap_dict
+
+
+@pytest.mark.asyncio
+async def test_start_carries_message_cursor_forward_across_restart(db_session):
+    """A cursor persisted by the session-1 heartbeat is carried into the NEW
+    task's ``context["message_cursor"]`` when a second session starts — the same
+    round-trip the exam ledger uses."""
+    project = await _make_project_with_member(db_session)
+    task1 = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap1 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    cursor = "2026-07-06T10:00:00.000000"
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap1["session_id"],
+        task_id=snap1["task_id"],
+        progress=False,
+        message_cursor=cursor,
+    )
+
+    # Drive session-1 task to terminal and queue a fresh task for adoption.
+    task1 = await db_session.get(Task, task1.id)
+    task1.status = TaskStatus.COMPLETED
+    db_session.add(task1)
+    task2 = await _make_strategic_review_task(db_session, project)
+    await db_session.commit()
+
+    # Start session 2 → adopts task2; cursor should be carried forward.
+    project = await db_session.get(Project, project.id)
+    snap2 = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    assert snap2["session_id"] != snap1["session_id"]
+
+    # The new task carries the cursor in its context (delivery path on restart).
+    fresh_task2 = await db_session.get(Task, task2.id)
+    assert fresh_task2 is not None
+    assert (fresh_task2.context or {}).get("message_cursor") == cursor
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_marks_handled_message_ids(db_session):
+    """A heartbeat carrying ``handled_message_ids`` updates those messages'
+    ``status`` from ``'open'`` to ``'handled'``, scoped to the project and session."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Insert two messages scoped to THIS session.
+    msg1 = await _make_operator_message(
+        db_session, project, content="hello", resident_session_id=session_id
+    )
+    msg2 = await _make_operator_message(
+        db_session, project, content="world", resident_session_id=session_id
+    )
+
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(msg1.id), str(msg2.id)],
+    )
+    assert result["stop_requested"] is False
+
+    # Both messages are now marked handled.
+    fresh_msg1 = await db_session.get(ProjectMessage, msg1.id)
+    fresh_msg2 = await db_session.get(ProjectMessage, msg2.id)
+    assert fresh_msg1 is not None and fresh_msg1.status == "handled"
+    assert fresh_msg2 is not None and fresh_msg2.status == "handled"
+
+
+@pytest.mark.asyncio
+async def test_handled_messages_excluded_from_work_state_new_operator_messages_count(db_session):
+    """Messages marked ``handled`` are excluded from
+    ``work_state_summary.new_operator_messages`` so the strategist's inbox count
+    reflects only genuinely-unread messages, not ones it already answered."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Insert one open and one to-be-handled message.
+    await _make_operator_message(
+        db_session, project, content="open", resident_session_id=session_id
+    )
+    handled_msg = await _make_operator_message(
+        db_session, project, content="answered", resident_session_id=session_id
+    )
+
+    # Mark the second message handled via a progress heartbeat.
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(handled_msg.id)],
+    )
+
+    # A subsequent heartbeat must count only the open message.
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=False,
+    )
+    summary = result.get("work_state_summary", {})
+    assert summary.get("new_operator_messages") == 1, (
+        f"Expected 1 open (the handled one must be excluded), got {summary}"
+    )
+    # Verify the handled message really has status=handled.
+    fresh_handled = await db_session.get(ProjectMessage, handled_msg.id)
+    assert fresh_handled is not None and fresh_handled.status == "handled"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_handled_ids_only_affect_own_session(db_session):
+    """Handled-id updates are scoped to the session: a message from a DIFFERENT
+    session is NOT affected even if its id appears in ``handled_message_ids``."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+    session_id = snap["session_id"]
+
+    # Message without a resident_session_id (legacy/cadence row — no session scope).
+    unscoped_msg = await _make_operator_message(db_session, project, content="no-session")
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=session_id,
+        task_id=snap["task_id"],
+        progress=True,
+        handled_message_ids=[str(unscoped_msg.id)],
+    )
+
+    # The unscoped message is NOT marked handled (different session_id / None).
+    fresh_msg = await db_session.get(ProjectMessage, unscoped_msg.id)
+    assert fresh_msg is not None and fresh_msg.status == "open"

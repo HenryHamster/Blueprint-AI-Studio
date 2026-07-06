@@ -452,7 +452,11 @@ export async function handleStrategicResident(
     try {
       for (let page = 0; page < MAX_POLL_PAGES; page++) {
         const prevCursor = cursor;
-        const q = `since=${encodeURIComponent(cursor)}&from_type=user&status=open&limit=${MESSAGE_POLL_LIMIT}`;
+        // session_id scopes the poll to THIS session's conversation server-side
+        // (messages stamped for another session are excluded; legacy/cadence
+        // NULL-session rows stay visible). Omitted-value degrades to project-wide.
+        const sessionScope = sessionId ? `&session_id=${encodeURIComponent(sessionId)}` : '';
+        const q = `since=${encodeURIComponent(cursor)}&from_type=user&status=open&limit=${MESSAGE_POLL_LIMIT}${sessionScope}`;
         const resp = await apiGet(`/api/agent/projects/${projectId}/messages?${q}`) as MessagesPollResponse;
         const raw = Array.isArray(resp.messages) ? resp.messages : [];
         collected.push(...dedupNewMessages(raw, seen));
@@ -473,7 +477,12 @@ export async function handleStrategicResident(
 
   // progress=true renews the authority lease (applied op / operator interaction);
   // progress=false is bare liveness (keeps the session fresh for the reaper only).
-  const heartbeat = async (progress: boolean): Promise<SessionHeartbeatResponse | null> => {
+  // handledIds: message ids consumed by the resident turn — marked handled on the
+  // backend so they stop counting as open backlog and aren't re-delivered on restart.
+  const heartbeat = async (
+    progress: boolean,
+    handledIds?: string[],
+  ): Promise<SessionHeartbeatResponse | null> => {
     // A heartbeat is proof the loop is alive — reset the warm session's idle
     // ceiling so a chat-only / monitor session (which issues no turns to reset
     // it) never self-terminates while the loop keeps polling.
@@ -481,10 +490,18 @@ export async function handleStrategicResident(
     // Serialize the current exam ledger into the note so the backend persists it;
     // a restart will restore it from task.context._exam_ledger.
     const note = serializeLedger(examRecords, examTick, correctiveNextTick);
+    const body: Record<string, unknown> = {
+      session_id: sessionId, task_id: taskId, progress, note,
+      // Send the current cursor so the backend persists it; a restart will
+      // restore it from task.context.message_cursor instead of falling back to
+      // the 2-minute window that re-delivers already-answered messages.
+      message_cursor: cursor,
+    };
+    if (handledIds && handledIds.length > 0) {
+      body.handled_message_ids = handledIds;
+    }
     try {
-      const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, {
-        session_id: sessionId, task_id: taskId, progress, note,
-      }) as SessionHeartbeatResponse;
+      const resp = await apiPost(`/api/agent/projects/${projectId}/strategic-session/heartbeat`, body) as SessionHeartbeatResponse;
       // Fold the lease state so the loop's autonomous gate tracks the backend.
       authorityHeld = nextAuthorityHeld(authorityHeld, resp);
       // Track the work-state revision (when the backend ships it) so state-gated
@@ -586,7 +603,11 @@ export async function handleStrategicResident(
         const r = await runTurn(combineOperatorMessages(msgs), true);
         if (turnWedgedSession(r)) break;
         await persistReply(r);
-        const hb = await heartbeat(true); // operator interaction always renews the lease
+        // Collect the ids of the messages we just consumed so the backend can
+        // mark them handled — they stop counting as open backlog and won't be
+        // re-delivered to a restarted session.
+        const consumedIds = msgs.map(m => m.id).filter((id): id is string => typeof id === 'string' && id.length > 0);
+        const hb = await heartbeat(true, consumedIds); // operator interaction always renews the lease
         if (hb?.stop_requested) break;
         if (r.processGone) { stopReason = 'session_process_exited'; break; }
         // A just-finished operator turn arms one autonomous follow-through tick.

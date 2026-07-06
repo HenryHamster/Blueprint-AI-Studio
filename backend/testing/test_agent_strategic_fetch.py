@@ -15,6 +15,8 @@ from httpx import AsyncClient
 from sqlalchemy import select
 
 from app.models import (
+    Artifact,
+    ArtifactType,
     AuditFindingResolution,
     MessageType,
     Project,
@@ -5336,3 +5338,230 @@ def test_recoverable_sections_carry_actionable_fetch_verbs():
         if d.get("status") == "rejected" and (d.get("rejected_at") or "") >= cutoff
     ]
     assert isinstance(rows, list), "rejected_proposals filter must return a list"
+
+
+# ---------------------------------------------------------------------------
+# Spawned-task children visibility
+# ---------------------------------------------------------------------------
+
+
+async def _make_strategic_parent(db_session, project, *, vm: str = "agent-vm-sc"):
+    """Create a STRATEGIC_AGENT task that will act as a parent."""
+    parent = Task(
+        project_id=project.id,
+        payloads=[{"type": "research"}],
+        vm_instance_id=vm,
+        created_by="STRATEGIC_AGENT",
+        title="Strategic parent task",
+    )
+    db_session.add(parent)
+    await db_session.commit()
+    await db_session.refresh(parent)
+    return parent
+
+
+async def _make_child_task(
+    db_session,
+    project,
+    parent,
+    *,
+    vm: str = "child-vm",
+    status: TaskStatus = TaskStatus.IN_PROGRESS,
+    title: str = "Child task",
+    created_by: str = "ORCHESTRATOR",
+):
+    """Create a pipeline-spawned child task linked by parent_task_id."""
+    child = Task(
+        project_id=project.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id=vm,
+        parent_task_id=parent.id,
+        status=status,
+        title=title,
+        created_by=created_by,
+    )
+    db_session.add(child)
+    await db_session.commit()
+    await db_session.refresh(child)
+    return child
+
+
+@pytest.mark.asyncio
+async def test_get_task_includes_empty_children_when_no_children(
+    client: AsyncClient, db_session
+):
+    """GET /tasks/{id} returns children: [] when the parent has no child tasks."""
+    project = Project(name="Children Empty", user_id="u-ce")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    calling_task = Task(project_id=project.id, payloads=[{}], vm_instance_id="vm-ce")
+    db_session.add(calling_task)
+    await db_session.commit()
+    await db_session.refresh(calling_task)
+
+    parent = await _make_strategic_parent(db_session, project, vm="vm-ce-parent")
+
+    token = create_agent_token(str(calling_task.id), "vm-ce")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{parent.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    assert "children" in data
+    assert data["children"] == []
+
+
+@pytest.mark.asyncio
+async def test_get_task_includes_direct_children(client: AsyncClient, db_session):
+    """GET /tasks/{id} includes direct children with id/status/task_type/title."""
+    project = Project(name="Children Visible", user_id="u-cv")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    calling_task = Task(project_id=project.id, payloads=[{}], vm_instance_id="vm-cv")
+    db_session.add(calling_task)
+    await db_session.commit()
+    await db_session.refresh(calling_task)
+
+    parent = await _make_strategic_parent(db_session, project, vm="vm-cv-parent")
+    child1 = await _make_child_task(
+        db_session, project, parent, vm="vm-cv-c1", title="Child one"
+    )
+    child2 = await _make_child_task(
+        db_session, project, parent, vm="vm-cv-c2", title="Child two",
+        status=TaskStatus.COMPLETED,
+    )
+
+    token = create_agent_token(str(calling_task.id), "vm-cv")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{parent.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    data = res.json()["data"]
+    children = data["children"]
+    assert len(children) == 2
+    child_ids = {c["id"] for c in children}
+    assert str(child1.id) in child_ids
+    assert str(child2.id) in child_ids
+    for c in children:
+        assert "id" in c
+        assert "status" in c
+        assert "task_type" in c
+        assert "title" in c
+
+
+@pytest.mark.asyncio
+async def test_get_task_children_include_pr_url_for_completed_child(
+    client: AsyncClient, db_session
+):
+    """Terminal child task surfaces pr_url from its PR artifact in its child dict."""
+    project = Project(name="Children PR", user_id="u-cpr")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    calling_task = Task(project_id=project.id, payloads=[{}], vm_instance_id="vm-cpr")
+    db_session.add(calling_task)
+    await db_session.commit()
+    await db_session.refresh(calling_task)
+
+    parent = await _make_strategic_parent(db_session, project, vm="vm-cpr-p")
+    child = await _make_child_task(
+        db_session, project, parent, vm="vm-cpr-c",
+        status=TaskStatus.COMPLETED, title="PR child",
+    )
+
+    artifact = Artifact(
+        task_id=child.id,
+        artifact_type=ArtifactType.PULL_REQUEST,
+        pr_url="https://github.com/example/repo/pull/42",
+    )
+    db_session.add(artifact)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "vm-cpr")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks/{parent.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    children = res.json()["data"]["children"]
+    assert len(children) == 1
+    assert children[0]["pr_url"] == "https://github.com/example/repo/pull/42"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_includes_children_inline(client: AsyncClient, db_session):
+    """GET /tasks list response: each item has a children key; parent with one child shows it."""
+    project = Project(name="Children List", user_id="u-cl")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    calling_task = Task(project_id=project.id, payloads=[{}], vm_instance_id="vm-cl")
+    db_session.add(calling_task)
+    await db_session.commit()
+    await db_session.refresh(calling_task)
+
+    parent = await _make_strategic_parent(db_session, project, vm="vm-cl-p")
+    child = await _make_child_task(
+        db_session, project, parent, vm="vm-cl-c", title="List child"
+    )
+
+    token = create_agent_token(str(calling_task.id), "vm-cl")
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/tasks",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    items = res.json()["data"]
+    assert len(items) == 1
+    item = items[0]
+    assert "children" in item
+    assert len(item["children"]) == 1
+    assert item["children"][0]["id"] == str(child.id)
+    assert item["children"][0]["title"] == "List child"
+
+
+@pytest.mark.asyncio
+async def test_get_task_children_scoped_to_project(client: AsyncClient, db_session):
+    """Children belonging to another project are not included (cross-project isolation)."""
+    project_a = Project(name="ProjA Children", user_id="u-pca")
+    project_b = Project(name="ProjB Children", user_id="u-pcb")
+    db_session.add_all([project_a, project_b])
+    await db_session.commit()
+    await db_session.refresh(project_a)
+    await db_session.refresh(project_b)
+
+    calling_task = Task(
+        project_id=project_a.id, payloads=[{}], vm_instance_id="vm-pca"
+    )
+    db_session.add(calling_task)
+    await db_session.commit()
+    await db_session.refresh(calling_task)
+
+    parent_a = await _make_strategic_parent(db_session, project_a, vm="vm-pca-p")
+
+    # A child in project B that references parent_a.id — should not appear.
+    cross_child = Task(
+        project_id=project_b.id,
+        payloads=[{"type": "fix"}],
+        vm_instance_id="vm-pcb-c",
+        parent_task_id=parent_a.id,
+        title="Cross-project child",
+    )
+    db_session.add(cross_child)
+    await db_session.commit()
+
+    token = create_agent_token(str(calling_task.id), "vm-pca")
+    res = await client.get(
+        f"/api/agent/projects/{project_a.id}/tasks/{parent_a.id}",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    assert res.json()["data"]["children"] == []

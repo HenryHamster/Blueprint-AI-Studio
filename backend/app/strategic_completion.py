@@ -6252,13 +6252,24 @@ async def _handle_strategic_completion(
                             from app.notification_dispatch import (
                                 post_question_answer,
                             )
+                            from app.strategic_resident_session import (
+                                read_resident_session,
+                                resident_session_is_active,
+                            )
 
+                            _resident_blob = read_resident_session(project.vision)
                             await post_question_answer(
                                 session,
                                 project.id,
                                 msg.id,
                                 msg.resolution or "Addressed by strategic review",
                                 task.id,
+                                resident_session_id=(
+                                    _resident_blob.get("session_id")
+                                    if isinstance(_resident_blob, dict)
+                                    and resident_session_is_active(_resident_blob)
+                                    else None
+                                ),
                             )
                         except Exception as _e:  # noqa: BLE001
                             logger.warning(

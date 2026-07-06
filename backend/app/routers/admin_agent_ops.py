@@ -133,6 +133,34 @@ _RESERVED_DESIGN_DOC_KEYS = frozenset(
 ADMIN_AGENT_OPS_MODULE = __name__
 STRATEGIC_MESSAGE_CONTEXT_MAX_BYTES = 50_000
 
+# Canonical set of strategic ops the agent script advertises and dispatches.
+# Derived from the same inventory as the agent-side STRATEGIC_OP_INVENTORY
+# (agent/src/handlers/strategic-op-inventory.ts). The parity test in
+# backend/testing/test_admin_routers.py asserts every name here has a real
+# elif handler in this module, so adding an op to the inventory and forgetting
+# the backend handler produces a CI failure rather than a silent no-op.
+STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
+    "set_problem_model",
+    "set_running_update",
+    "reflect",
+    "pending_confirm",
+    "set_vision",
+    "create_direction",
+    "update_direction",
+    "retire_direction",
+    "stage_direction",
+    "approve_direction",
+    "reject_direction",
+    "create_message",
+    "resolve_message",
+    "spawn_task",
+    "spawn_fix",
+    "dispose_completion_debt",
+    "set_retirement_critiques",
+    "set_evidence_progress",
+    "set_acceptance_criteria",
+})
+
 
 def _cap_str(
     value: Any, max_len: int, field_name: str, warnings: List[str] | None = None
@@ -2592,6 +2620,21 @@ async def strategic_operation(
                         "message_id": str(existing.id),
                     }
                 )
+        # Stamp the resident reply with the live session id (NULL when none is
+        # active) so it is addressed to the same conversation as the operator
+        # messages it answers — matching the session-identity scoping used by the
+        # poll / unattended-cap / pacing queries.
+        from app.strategic_resident_session import (
+            read_resident_session,
+            resident_session_is_active,
+        )
+
+        _resident_blob = read_resident_session(project.vision)
+        _resident_session_id = (
+            _resident_blob.get("session_id")
+            if isinstance(_resident_blob, dict) and resident_session_is_active(_resident_blob)
+            else None
+        )
         new_msg = ProjectMessage(
             project_id=project.id,
             message_type=msg_type,
@@ -2600,6 +2643,7 @@ async def strategic_operation(
             content=content,
             context=msg_ctx,
             idempotency_key=idem_key,
+            resident_session_id=_resident_session_id,
         )
         session.add(new_msg)
         # Snapshot project.id before commit: the IntegrityError rollback below

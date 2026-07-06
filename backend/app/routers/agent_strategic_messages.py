@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import or_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -111,6 +112,7 @@ async def agent_poll_messages(
     since: str | None = Query(default=None),
     from_type: str = Query(default="user"),
     status: str = Query(default="open"),
+    session_id: str | None = Query(default=None),
     limit: int = Query(
         default=_MESSAGES_POLL_DEFAULT_LIMIT,
         ge=1,
@@ -150,6 +152,20 @@ async def agent_poll_messages(
         # instant closes both the >limit truncation skip and the commit-race
         # skip a strict > would open (see module docstring).
         conditions.append(ProjectMessage.created_at >= since_dt)
+    if session_id:
+        # Session scoping: a resident session sees only messages stamped for it,
+        # PLUS legacy/cadence NULL-session rows (never hidden — backward compat so
+        # pre-migration backlog and out-of-session sends stay visible). A message
+        # stamped for a DIFFERENT session is excluded, so session A's chat does
+        # not bleed into session B's poll. An absent session_id (older agents)
+        # degrades to the project-wide behaviour unchanged. Served by the
+        # ix_projectmessage_project_session_created composite index.
+        conditions.append(
+            or_(
+                ProjectMessage.resident_session_id == session_id,
+                ProjectMessage.resident_session_id.is_(None),
+            )
+        )
 
     rows = (
         (

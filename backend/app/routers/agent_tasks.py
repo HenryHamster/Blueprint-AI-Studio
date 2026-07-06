@@ -93,6 +93,61 @@ def _build_task_response(
     return resp
 
 
+async def _fetch_children(
+    parent_ids: list[uuid.UUID],
+    project_id: uuid.UUID,
+    session: AsyncSession,
+) -> dict[uuid.UUID, list[dict[str, Any]]]:
+    """Return direct children of each parent_id, keyed by parent_id.
+
+    Children are scoped to the same project (cross-project isolation).
+    No created_by filter — child tasks are spawned by the pipeline, not
+    directly by the strategic agent.
+    """
+    result: dict[uuid.UUID, list[dict[str, Any]]] = {pid: [] for pid in parent_ids}
+    if not parent_ids:
+        return result
+
+    child_rows = (
+        await session.execute(
+            select(Task)
+            .where(
+                Task.parent_task_id.in_(parent_ids),
+                Task.project_id == project_id,
+            )
+            .order_by(Task.created_at.asc())
+        )
+    ).scalars().all()
+
+    if not child_rows:
+        return result
+
+    terminal_child_ids = [c.id for c in child_rows if c.status in _TERMINAL_STATUSES]
+    child_pr_map: dict[uuid.UUID, str] = {}
+    if terminal_child_ids:
+        art_rows = (
+            await session.execute(
+                select(Artifact)
+                .where(
+                    Artifact.task_id.in_(terminal_child_ids),
+                    Artifact.artifact_type == ArtifactType.PULL_REQUEST,
+                    Artifact.pr_url.isnot(None),
+                )
+                .order_by(Artifact.created_at.asc())
+            )
+        ).scalars().all()
+        for a in art_rows:
+            child_pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
+
+    for child in child_rows:
+        pr_url = child_pr_map.get(child.id) if child.status in _TERMINAL_STATUSES else None
+        child_dict = _build_task_response(child, pr_url=pr_url)
+        if child.parent_task_id in result:
+            result[child.parent_task_id].append(child_dict)
+
+    return result
+
+
 @router.get("/projects/{project_id}/tasks/{task_id}")
 @limiter.limit("60/minute")
 async def agent_get_task(
@@ -109,7 +164,9 @@ async def agent_get_task(
     _ANCESTOR_WALK_MAX_DEPTH generations). Returns 404 when the task does not
     exist, does not belong to this project, or has no STRATEGIC_AGENT ancestor
     (prevents cross-type enumeration). Response includes parent_task_id so the
-    agent can map descendants back to the task it spawned.
+    agent can map descendants back to the task it spawned, plus a ``children``
+    list of direct child tasks (spawned by the pipeline under this parent), so
+    the strategist can inspect descendant progress.
     """
     await _resolve_agent_project(project_id, token, session)
 
@@ -169,7 +226,10 @@ async def agent_get_task(
         if task.status == TaskStatus.FAILED and not error_summary:
             error_summary = task.latest_status_message
 
-    return {"status": "success", "data": _build_task_response(task, pr_url, error_summary)}
+    children_map = await _fetch_children([task.id], project_id, session)
+    data = _build_task_response(task, pr_url, error_summary)
+    data["children"] = children_map.get(task.id, [])
+    return {"status": "success", "data": data}
 
 
 @router.get("/projects/{project_id}/tasks")
@@ -250,9 +310,14 @@ async def agent_list_tasks(
         for a in art_rows:
             pr_map.setdefault(a.task_id, a.pr_url)  # type: ignore[arg-type]
 
+    parent_ids = [t.id for t in rows]
+    children_map = await _fetch_children(parent_ids, project_id, session)
+
     items = []
     for t in rows:
         pr_url = pr_map.get(t.id) if t.status in _TERMINAL_STATUSES else None
-        items.append(_build_task_response(t, pr_url=pr_url))
+        item = _build_task_response(t, pr_url=pr_url)
+        item["children"] = children_map.get(t.id, [])
+        items.append(item)
 
     return {"status": "success", "data": items, "count": len(items)}

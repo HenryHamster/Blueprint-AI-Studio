@@ -6260,6 +6260,67 @@ class TestMessages:
         assert marker["reason"] == "operator_message"
         assert marker["excerpt"] == "Prioritize the release blocker."
 
+    @pytest.mark.asyncio
+    async def test_create_message_stamps_resident_session_id_when_active(
+        self, client: AsyncClient, db_session
+    ):
+        """A message created during an active resident session is stamped with
+        the session's ID (resident_session_id column). Verifies the write path
+        in create_operator_project_message that reads resident_blob and sets
+        resident_session_id on the new ProjectMessage row."""
+        from sqlalchemy.orm.attributes import flag_modified
+
+        SESSION_ID = "ss-stamp-test-001"
+        project = await _make_project(db_session)
+        project.vision = {
+            "_resident_strategic_session": {
+                "session_id": SESSION_ID,
+                "status": "active",
+                "stop_requested": False,
+            }
+        }
+        flag_modified(project, "vision")
+        db_session.add(project)
+        await db_session.commit()
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Message sent during active session.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        assert msg.resident_session_id == SESSION_ID, (
+            f"expected resident_session_id={SESSION_ID!r}, got {msg.resident_session_id!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_message_no_stamp_when_no_active_session(
+        self, client: AsyncClient, db_session
+    ):
+        """A message created without an active resident session has
+        resident_session_id=None (cadence / legacy path)."""
+        project = await _make_project(db_session)
+
+        resp = await client.post(
+            "/api/admin/messages",
+            json={
+                "project_id": str(project.id),
+                "message_type": "NOTE",
+                "content": "Cadence message, no active session.",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        msg = await db_session.get(ProjectMessage, uuid.UUID(resp.json()["id"]))
+        assert msg is not None
+        assert msg.resident_session_id is None, (
+            f"expected resident_session_id=None (no active session), got {msg.resident_session_id!r}"
+        )
+
 
 class TestMessagesLastSeen:
     @pytest.mark.asyncio
@@ -26752,3 +26813,52 @@ class TestStrategicPendingConfirmDedup:
             )
         assert resp.status_code == 429, resp.text
         assert "cap" in resp.text.lower() or str(PENDING_USER_CONFIRMATION_MAX) in resp.text
+
+
+# ── Strategic op inventory parity test ────────────────────────────────────────
+# Asserts that every op in STRATEGIC_AGENT_OPS has a real elif handler in
+# admin_agent_ops.py. This is a standalone (no-DB) test so it can run in the
+# fast standalone suite.
+
+def _parse_strategic_op_handlers() -> set[str]:
+    """Return the set of payload.op strings that have elif branches in strategic_operation."""
+    import ast
+    import inspect
+    import app.routers.admin_agent_ops as _mod
+
+    src = inspect.getsource(_mod.strategic_operation)
+    tree = ast.parse(src)
+    ops: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Compare):
+            continue
+        # Match: payload.op == "some_op"
+        left = node.left
+        if (
+            isinstance(left, ast.Attribute)
+            and left.attr == "op"
+            and isinstance(left.value, ast.Name)
+            and left.value.id == "payload"
+            and len(node.ops) == 1
+            and isinstance(node.ops[0], ast.Eq)
+            and len(node.comparators) == 1
+            and isinstance(node.comparators[0], ast.Constant)
+        ):
+            ops.add(node.comparators[0].value)
+    return ops
+
+
+def test_strategic_agent_ops_all_have_real_handlers():
+    """STRATEGIC_AGENT_OPS is a subset of the actual elif handlers in strategic_operation.
+
+    Fails when an op is listed in STRATEGIC_AGENT_OPS but has no elif branch in the
+    handler — i.e., the inventory and backend dispatch have diverged.
+    """
+    from app.routers.admin_agent_ops import STRATEGIC_AGENT_OPS
+
+    real_handlers = _parse_strategic_op_handlers()
+    missing = STRATEGIC_AGENT_OPS - real_handlers
+    assert not missing, (
+        f"STRATEGIC_AGENT_OPS lists ops with no elif handler in strategic_operation: {sorted(missing)}. "
+        "Add the handler or remove the op from STRATEGIC_AGENT_OPS."
+    )

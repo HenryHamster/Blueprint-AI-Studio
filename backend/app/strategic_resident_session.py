@@ -39,7 +39,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import func, text
+from sqlalchemy import func, or_, text, update as sa_update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
@@ -395,26 +395,57 @@ def _start_claim_is_stale(blob: dict[str, Any] | None, now: datetime) -> bool:
     return (now - started).total_seconds() > _RESIDENT_START_CLAIM_STALE_SECONDS
 
 
+def _session_scope_conditions(resident_session_id: str | None) -> list:
+    """WHERE fragments scoping operator messages to a resident session.
+
+    When ``resident_session_id`` is provided, only messages stamped for THAT
+    session — plus legacy/cadence NULL-session rows (never hidden: backward
+    compat so pre-migration backlog is not silently dropped) — are matched. A
+    message stamped for a DIFFERENT session is excluded, so session A's messages
+    do not re-arm session B's unattended cap or pollute B's pacing signal. When
+    ``resident_session_id`` is None (older callers / cadence path) the scope is
+    empty and the query behaves project-wide exactly as before.
+    """
+    if resident_session_id is None:
+        return []
+    return [
+        or_(
+            ProjectMessage.resident_session_id == resident_session_id,
+            ProjectMessage.resident_session_id.is_(None),
+        )
+    ]
+
+
 async def _latest_operator_interaction_at(
-    session: AsyncSession, project_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    resident_session_id: str | None = None,
 ) -> datetime | None:
     """Return the newest operator-authored message time for the project (or None).
 
     Operator messages are the durable "operator interaction" signal the
-    unattended cap resets on. Naive-UTC ``created_at`` is returned directly.
+    unattended cap resets on. Naive-UTC ``created_at`` is returned directly. When
+    ``resident_session_id`` is given, only messages addressed to THIS session (or
+    unstamped legacy/cadence rows) reset the clock — see
+    ``_session_scope_conditions``.
     """
     return (
         await session.execute(
             select(func.max(ProjectMessage.created_at)).where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                *_session_scope_conditions(resident_session_id),
             )
         )
     ).scalar_one_or_none()
 
 
 async def _compute_resident_work_state(
-    session: AsyncSession, project_id: uuid.UUID
+    session: AsyncSession,
+    project_id: uuid.UUID,
+    *,
+    resident_session_id: str | None = None,
 ) -> tuple[str | None, dict[str, int]]:
     """READ-ONLY snapshot of strategist-relevant world state for the heartbeat.
 
@@ -492,6 +523,7 @@ async def _compute_resident_work_state(
             select(func.max(ProjectMessage.created_at)).where(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
+                *_session_scope_conditions(resident_session_id),
             )
         )
     ).scalar_one_or_none()
@@ -513,6 +545,7 @@ async def _compute_resident_work_state(
                 ProjectMessage.project_id == project_id,
                 ProjectMessage.from_type.in_(_OPERATOR_MESSAGE_FROM_TYPES),
                 ProjectMessage.status == "open",
+                *_session_scope_conditions(resident_session_id),
             )
         )
     ).scalar() or 0
@@ -628,6 +661,7 @@ async def _spawn_resident_strategic_task(
     *,
     session_id: str,
     exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> Task | None:
     """Spawn a fresh ``strategic_review`` task via the canonical spawn path.
 
@@ -673,7 +707,7 @@ async def _spawn_resident_strategic_task(
         # this stays None and the task is born QUEUED (degraded cloud fallback).
         runner_pin_id=str(runner_id) if runner_id else None,
         extra_context=_resident_born_context(
-            session_id, runner_id, exam_ledger=exam_ledger
+            session_id, runner_id, exam_ledger=exam_ledger, message_cursor=message_cursor
         ),
         # Spawn MINIMALLY: skip the ~2-minute synchronous strategic-context build
         # (design-doc grounding + capability backing-path verification GitHub
@@ -843,7 +877,11 @@ async def build_resident_runner_options(
 
 
 def _resident_born_context(
-    session_id: str, runner_id: str | None, *, exam_ledger: str | None = None
+    session_id: str,
+    runner_id: str | None,
+    *,
+    exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> dict[str, Any]:
     """Build the resident-session context flags a SPAWNED task is BORN with.
 
@@ -877,11 +915,21 @@ def _resident_born_context(
     # context byte-identical to before.
     if exam_ledger:
         context["_exam_ledger"] = exam_ledger
+    # Carry the message cursor forward so the agent's poll window doesn't regress
+    # to the 2-minute fallback on restart (which re-delivers already-answered
+    # messages). Absent on first-ever start — no cursor has been established yet.
+    if message_cursor:
+        context["message_cursor"] = message_cursor
     return context
 
 
 def _stamp_resident_context(
-    task: Task, *, session_id: str, runner_id: str | None, exam_ledger: str | None = None
+    task: Task,
+    *,
+    session_id: str,
+    runner_id: str | None,
+    exam_ledger: str | None = None,
+    message_cursor: str | None = None,
 ) -> None:
     """Stamp the shared resident-session flags + AUTHORITATIVE runner pin onto *task*.
 
@@ -922,6 +970,9 @@ def _stamp_resident_context(
     # restart. Absent leaves the merged context unchanged.
     if exam_ledger:
         context["_exam_ledger"] = exam_ledger
+    # Carry the message cursor forward so the poll window survives a restart.
+    if message_cursor:
+        context["message_cursor"] = message_cursor
     if runner_id:
         context["preferred_runner_target_id"] = str(runner_id)
         # Hard local-runner intent so dispatch pins the warm session to the
@@ -1076,12 +1127,18 @@ async def start_resident_session(
     # the same byte cap the heartbeat enforces; a malformed/oversized value is
     # dropped (best-effort — a lost ledger only costs one rotation reset).
     carried_exam_ledger: str | None = None
+    carried_message_cursor: str | None = None
     if isinstance(existing, dict):
         _raw_ledger = existing.get("_exam_ledger")
         if isinstance(_raw_ledger, str) and 0 < len(
             _raw_ledger.encode()
         ) <= _EXAM_LEDGER_MAX_BYTES:
             carried_exam_ledger = _raw_ledger
+        # Carry the message cursor forward so a restarted session resumes from the
+        # high-water mark instead of falling back to the 2-minute window.
+        _raw_cursor = existing.get("_message_cursor")
+        if isinstance(_raw_cursor, str) and _raw_cursor:
+            carried_message_cursor = _raw_cursor
     if resident_session_is_active(existing):
         task_id = existing.get("task_id")
         live = None
@@ -1196,6 +1253,10 @@ async def start_resident_session(
         # ledger to carry forward (the heartbeat mirror re-writes it thereafter).
         if carried_exam_ledger:
             vision[RESIDENT_SESSION_KEY]["_exam_ledger"] = carried_exam_ledger
+        # Preserve the message cursor on the new session blob so a restart BEFORE
+        # the first heartbeat still restores the high-water mark correctly.
+        if carried_message_cursor:
+            vision[RESIDENT_SESSION_KEY]["_message_cursor"] = carried_message_cursor
         decision["mode"] = "adopt" if adopt_task is not None else "spawn"
 
     await with_vision_locked(session, project.id, _claim, skip_locked=False)
@@ -1266,6 +1327,7 @@ async def start_resident_session(
                             session_id=session_id,
                             runner_id=effective_runner_id,
                             exam_ledger=carried_exam_ledger,
+                            message_cursor=carried_message_cursor,
                         )
                         session.add(task)
                         workbench_state = (
@@ -1316,6 +1378,7 @@ async def start_resident_session(
                 effective_runner_id,
                 session_id=session_id,
                 exam_ledger=carried_exam_ledger,
+                message_cursor=carried_message_cursor,
             )
             if task is None:
                 raise HTTPException(
@@ -1594,6 +1657,27 @@ async def stop_resident_session(
         task_id,
     )
 
+    # Best-effort: resolve open messages from the ending session so they don't
+    # re-appear as fresh inbox items in later strategic payloads.
+    _session_id = (blob or {}).get("session_id")
+    if _session_id:
+        try:
+            from app.session_message_handoff import handoff_session_messages
+
+            _handed_off = await handoff_session_messages(session, project.id, _session_id)
+            if _handed_off:
+                await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff raised for session %s — stop still committed",
+                _session_id,
+                exc_info=True,
+            )
+
     if cancelled_task_id is not None:
         try:
             await _run_resident_completion_on_stop(cancelled_task_id)
@@ -1816,6 +1900,8 @@ async def renew_resident_session_lease(
     task_id: str,
     progress: bool = False,
     note: str | None = None,
+    message_cursor: str | None = None,
+    handled_message_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -1880,7 +1966,7 @@ async def renew_resident_session_lease(
     # test_heartbeat_liveness_only_does_not_extend_lease). Older agents ignore
     # the extra fields.
     work_state_rev, work_state_summary = await _compute_resident_work_state(
-        session, project.id
+        session, project.id, resident_session_id=session_id
     )
 
     # Parse the agent's serialized exam-ledger from the heartbeat note (JSON,
@@ -1941,7 +2027,9 @@ async def renew_resident_session_lease(
     last_op_dt = _parse_iso_naive(
         blob.get("last_operator_interaction_at")
     ) or _parse_iso_naive(blob.get("started_at"))
-    latest_msg_dt = await _latest_operator_interaction_at(session, project.id)
+    latest_msg_dt = await _latest_operator_interaction_at(
+        session, project.id, resident_session_id=session_id
+    )
     op_reengaged = latest_msg_dt is not None and (
         last_op_dt is None or latest_msg_dt > last_op_dt
     )
@@ -2077,23 +2165,65 @@ async def renew_resident_session_lease(
         # an opaque blob the agent reads back via ``task.context`` on startup.
         if exam_ledger_str is not None:
             updated["_exam_ledger"] = exam_ledger_str
+        # Persist the advancing message cursor so a restart resumes from the
+        # high-water mark rather than re-delivering already-answered messages.
+        if message_cursor:
+            updated["_message_cursor"] = message_cursor
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
-    # Mirror the exam ledger into task.context so a runner restart can read it
-    # back via task.context._exam_ledger on startup (the agent reads that path;
-    # project.vision is not visible to the agent at pull time).
-    if exam_ledger_str is not None:
+    # Mirror the exam ledger and message cursor into task.context so a runner
+    # restart can read them back on startup (the agent reads task.context at pull
+    # time; project.vision is not visible to the agent).
+    _need_ctx_update = exam_ledger_str is not None or bool(message_cursor)
+    if _need_ctx_update:
         try:
             ledger_task = await session.get(Task, uuid.UUID(task_id))
             if ledger_task is not None:
                 ctx = dict(ledger_task.context or {})
-                ctx["_exam_ledger"] = exam_ledger_str
+                if exam_ledger_str is not None:
+                    ctx["_exam_ledger"] = exam_ledger_str
+                if message_cursor:
+                    ctx["message_cursor"] = message_cursor
                 ledger_task.context = ctx
                 flag_modified(ledger_task, "context")
                 session.add(ledger_task)
         except (ValueError, TypeError):
             pass
+    # Mark inbound operator messages as handled so a restart does not re-answer
+    # them and so they stop counting as open backlog. Scoped to the project and
+    # session to avoid touching rows that belong to another session's conversation.
+    if handled_message_ids:
+        # Wrap in a SAVEPOINT so a DB error here only rolls back the
+        # handled-ids UPDATE, leaving the outer transaction (the vision lease
+        # renewal + task-context mirror) intact and committed below.
+        try:
+            safe_ids: list[uuid.UUID] = []
+            for uid in handled_message_ids:
+                if not isinstance(uid, str) or not uid:
+                    continue
+                try:
+                    safe_ids.append(uuid.UUID(uid))
+                except ValueError:
+                    pass
+            if safe_ids:
+                async with session.begin_nested():
+                    await session.execute(
+                        sa_update(ProjectMessage)
+                        .where(
+                            ProjectMessage.project_id == project.id,
+                            ProjectMessage.id.in_(safe_ids),
+                            ProjectMessage.resident_session_id == session_id,
+                            ProjectMessage.status == "open",
+                        )
+                        .values(status="handled")
+                    )
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] handled_message_ids update failed for session %s — ignored",
+                session_id,
+                exc_info=True,
+            )
     await session.commit()
     await session.refresh(project)
 
@@ -2120,6 +2250,23 @@ async def renew_resident_session_lease(
         # stamped ended + lease released) so the resident task can go terminal
         # and the legacy cadence reclaims strategic authority. Signal the agent
         # to wind down.
+        # Best-effort: resolve session messages so they don't re-enter the inbox.
+        try:
+            from app.session_message_handoff import handoff_session_messages
+
+            _handed_off = await handoff_session_messages(session, project.id, session_id)
+            if _handed_off:
+                await session.commit()
+        except Exception:
+            try:
+                await session.rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "[RESIDENT_SESSION] message handoff raised for session %s (cap/lapse) — ignored",
+                session_id,
+                exc_info=True,
+            )
         return {
             "authority_held": False,
             "leased_until": cont.get("expires_at"),
@@ -2154,6 +2301,8 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     task_id: str
     progress: bool | None = None
     note: str | None = None
+    message_cursor: str | None = None
+    handled_message_ids: list[str] | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2182,4 +2331,6 @@ async def resident_session_heartbeat(
         task_id=payload.task_id,
         progress=bool(payload.progress),
         note=payload.note,
+        message_cursor=payload.message_cursor,
+        handled_message_ids=payload.handled_message_ids,
     )

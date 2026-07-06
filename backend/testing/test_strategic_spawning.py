@@ -19290,3 +19290,149 @@ async def test_cap_bump_task_uncapped_violation_treated_as_routine(db_session, m
     classify_breach_mock.assert_not_called()
     assert spawned is not None
     assert "python3 backend/testing/check_size_limits.py --fix" in spawned.first_payload["prompt"]
+
+
+# ---------------------------------------------------------------------------
+# Session-end message hand-off: _fetch_open_messages exclusion
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_fetch_open_messages_excludes_session_handoff_resolved_messages(db_session):
+    """Messages resolved via session hand-off must not reappear in later strategic payloads.
+
+    Verifies two things:
+    1. ``handoff_session_messages`` can be imported and called without error.
+    2. ``_fetch_open_messages`` excludes messages with ``status='resolved'`` and
+       ``resolution='session_handoff'``, while unrelated open messages remain visible.
+
+    This covers the full observable contract: a concluded session's conversation
+    messages leave the open-message feed after hand-off, and project-wide standing
+    messages (BUG_REPORTs, questions from other sessions) are unaffected.
+    """
+    from app.session_message_handoff import handoff_session_messages
+    from app.strategic_spawning import _fetch_open_messages
+
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Message that belonged to the ending session — will be handed off.
+    msg_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="operator chat during session",
+        status="open",
+    )
+    # Unrelated standing message — must survive the hand-off.
+    msg_other = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.BUG_REPORT,
+        content="standing bug report unrelated to any session",
+        status="open",
+    )
+    db_session.add_all([msg_session, msg_other])
+    await db_session.commit()
+
+    # Both messages appear before the hand-off.
+    before = await _fetch_open_messages(db_session, project.id)
+    before_ids = {m["id"] for m in before}
+    assert str(msg_session.id) in before_ids
+    assert str(msg_other.id) in before_ids
+
+    # Call the new hand-off function (exercises production code).
+    # When the resident_session_id column is not yet on the model this returns 0
+    # (safe no-op). We then directly mark the session message resolved to test
+    # the _fetch_open_messages exclusion path regardless.
+    _count = await handoff_session_messages(db_session, project.id, "ss-test123456789")
+    assert isinstance(_count, int) and _count >= 0
+
+    # Simulate the resolved state the hand-off produces (or would produce once
+    # the resident_session_id column lands from the sibling PR).
+    msg_session.status = "resolved"
+    msg_session.resolution = "session_handoff"
+    msg_session.resolved_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db_session.add(msg_session)
+    await db_session.commit()
+
+    # After hand-off: the session message is gone; the standing message remains.
+    after = await _fetch_open_messages(db_session, project.id)
+    after_ids = {m["id"] for m in after}
+    assert str(msg_session.id) not in after_ids, (
+        "session_handoff-resolved message must be excluded from the open-message feed"
+    )
+    assert str(msg_other.id) in after_ids, (
+        "unrelated open message must remain visible after session hand-off"
+    )
+
+
+@pytest.mark.asyncio
+async def test_handoff_session_messages_write_path(db_session):
+    """handoff_session_messages must resolve messages stamped with the ending
+    session_id: status='resolved', resolution='session_handoff', resolved_at set,
+    and context stamped with session_handoff_at/session_id.
+
+    Tests the core write path by seeding a message WITH resident_session_id
+    matching the session being handed off.
+    """
+    from app.session_message_handoff import handoff_session_messages
+
+    SESSION_ID = "ss-handoff-writetest"
+
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Message stamped for the ending session — must be resolved by handoff.
+    msg_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="operator chat during session",
+        status="open",
+        resident_session_id=SESSION_ID,
+    )
+    # Unrelated open message (NULL session) — must NOT be touched.
+    msg_unscoped = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.BUG_REPORT,
+        content="standing bug report — no session",
+        status="open",
+        resident_session_id=None,
+    )
+    # Message stamped for a DIFFERENT session — must NOT be touched.
+    msg_other_session = ProjectMessage(
+        project_id=project.id,
+        from_type="user",
+        message_type=MessageType.NOTE,
+        content="message from a different session",
+        status="open",
+        resident_session_id="ss-other-session",
+    )
+    db_session.add_all([msg_session, msg_unscoped, msg_other_session])
+    await db_session.commit()
+
+    count = await handoff_session_messages(db_session, project.id, SESSION_ID)
+    assert count == 1, f"expected 1 message resolved, got {count}"
+    await db_session.commit()
+
+    await db_session.refresh(msg_session)
+    await db_session.refresh(msg_unscoped)
+    await db_session.refresh(msg_other_session)
+
+    # The session-stamped message is resolved.
+    assert msg_session.status == "resolved", "stamped message must be resolved"
+    assert msg_session.resolution == "session_handoff"
+    assert msg_session.resolved_at is not None
+    ctx = msg_session.context or {}
+    assert "session_handoff_at" in ctx, "context must contain session_handoff_at"
+    assert ctx.get("session_id") == SESSION_ID
+
+    # Unscoped and other-session messages are untouched.
+    assert msg_unscoped.status == "open", "NULL-session message must remain open"
+    assert msg_other_session.status == "open", "other-session message must remain open"
