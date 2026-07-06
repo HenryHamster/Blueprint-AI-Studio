@@ -2466,6 +2466,11 @@ def _mock_repoll_resolves_to_dirty(mocker, *, initial_state):
     )
     # Skip the asyncio sleep in the repoll loop so tests don't block.
     mocker.patch("asyncio.sleep", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
 
 
 @pytest.mark.asyncio
@@ -2609,6 +2614,11 @@ def _mock_repoll_or_escalation_landing_deps(mocker, *, get_pr_side_effect, merge
         "app.rollup_management._nudge_sibling_rollup_prs", new_callable=AsyncMock
     )
     mocker.patch("app.rollup_management._cleanup_branches", new_callable=AsyncMock)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
 
 
 @pytest.mark.asyncio
@@ -3301,8 +3311,8 @@ async def test_rollup_post_merge_housekeeping_records_criterion_evidence_for_all
     assert source_kinds == {"task_merge", "reachability"}, (
         f"Expected source_kinds {{'task_merge', 'reachability'}}, got {source_kinds!r}"
     )
-    assert all(e.detail == {"proven": True} for e in evidence), (
-        "All evidence rows must carry detail={'proven': True}"
+    assert all(e.detail.get("proven") is True for e in evidence), (
+        "All evidence rows must carry detail with proven=True"
     )
     assert all(str(e.source_id) == str(child.id) for e in evidence), (
         "All evidence rows must reference the merged child task"

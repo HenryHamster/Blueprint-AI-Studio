@@ -197,6 +197,10 @@ def _patch_github(mocker):
     )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("ok", None)),
+    )
 
 
 # Fixed timestamp so the persisted runtime record is deterministic — the

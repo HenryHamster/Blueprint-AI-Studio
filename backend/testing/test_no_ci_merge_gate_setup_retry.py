@@ -152,6 +152,8 @@ def _is_verify_crash(outcome: str, verdict: dict | None) -> bool:
 
 
 def _patch_github(mocker):
+    from unittest.mock import AsyncMock
+
     mocker.patch("app.broadcast.broadcast_to_project", return_value=None)
     mocker.patch("app.review_pipeline.broadcast_to_project", return_value=None)
     mocker.patch("app.alert_dispatch.broadcast_to_project", return_value=None)
@@ -160,6 +162,10 @@ def _patch_github(mocker):
     )
     mocker.patch("app.github.create_pr_comment", return_value=None)
     mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        AsyncMock(return_value=("ok", None)),
+    )
 
 
 async def _unverified_merge_alerts(db_session, project_id):

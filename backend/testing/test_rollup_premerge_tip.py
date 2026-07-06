@@ -78,6 +78,11 @@ def _mock_clean_premerge_deps(mocker, *, head_sha, base_tip_sha):
             },
         ],
     )
+    mocker.patch(
+        "app.rollup_size_preflight.preflight_rollup_size_caps",
+        new_callable=AsyncMock,
+        return_value=("ok", None),
+    )
     return mock_tip
 
 

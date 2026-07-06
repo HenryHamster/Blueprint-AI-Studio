@@ -1593,7 +1593,7 @@ async def _make_rollup_parent_with_completed_child(
         payloads=[{"type": "research", "prompt": "parent"}],
         status=TaskStatus.EVALUATING,
         context={
-            "plan_branch": "research/abc12345",
+            "plan_branch": "research/rollup-stg",
             "parent_base": target_branch,
         },
     )

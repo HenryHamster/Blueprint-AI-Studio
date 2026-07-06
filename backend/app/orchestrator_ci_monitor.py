@@ -216,6 +216,10 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
     from app.review_pipeline import _spawn_pipeline_task
     from app.broadcast import broadcast_to_project
     from app.routers.agent import get_github_token_for_task
+    # Imported at function entry (not module level) to avoid a load-time cycle:
+    # agent_status → orchestrator → orchestrator_ci_monitor. Placing it here
+    # ensures all code paths in this function see it as a bound local variable.
+    from app.routers.agent_status import record_task_result
     from app.github import (
         close_pull_request,
         get_check_runs_cached,
