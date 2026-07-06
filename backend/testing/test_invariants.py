@@ -1663,6 +1663,18 @@ class TestSchemaRevisionSync:
             ("0138", "ix_task_blocked_recheck"),
             ("0236", "ix_task_project_status_updated"),
             ("0237", "ix_task_project_status_updated"),
+            # 0374 created ix_direction_event_project_key with 2 columns; 0377
+            # dropped and re-created it with 3 columns (project_id, direction_key,
+            # recorded_at). Both creates are unguarded but represent a legitimate
+            # drop-and-recreate pattern — migration 0408 reasserts the 3-column
+            # form with if_not_exists=True to close the schema-coverage gap.
+            ("0374", "ix_direction_event_project_key"),
+            ("0377", "ix_direction_event_project_key"),
+            # 0381 created ix_task_vm_stopped_at without a guard; 0383 rechecked
+            # via runtime pg_indexes query instead of if_not_exists=True; 0384
+            # re-issued it with IF NOT EXISTS (guarded). Pre-date the invariant.
+            ("0381", "ix_task_vm_stopped_at"),
+            ("0383", "ix_task_vm_stopped_at"),
         }
 
         migrations_dir = os.path.join(
