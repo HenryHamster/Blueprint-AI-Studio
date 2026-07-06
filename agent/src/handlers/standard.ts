@@ -58,6 +58,7 @@ import { extractReservedMigrationRevision, buildReservedRevisionGuidance } from 
 import { resolveMigrationLayout } from './specialized.js';
 import { SCOPE_OVERFLOW_THRESHOLDS, MEDIUM_ANALYSIS_PLAN_FILE_LIMIT, DEFAULT_CLONE_DEPTH, ANALYSIS_CONTEXT_CHAR_CAP } from '../constants.js';
 import { prepareWorkspaceForRole } from '../workspacePrep.js';
+import { writeGitTokenFile, ensureGitCredentialHelperScript } from '../git-credential.js';
 import { runCodeChangeTask } from './code-change.js';
 import { consumeAndCommitArtifacts } from './artifact-consume.js';
 import { isBlueprintSelfRepo } from '../prompts/code-change-helpers.js';
@@ -1033,14 +1034,18 @@ export async function handleCreate(
   if (operatorReviewFor) {
     const prBranch = validateBranchName(strVal(payload.branch), 'branch');
     const prBaseBranch = validateBranchName(resolveBaseBranch(payload, task), 'base_branch');
-    const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
+    const cleanRepoUrl = `https://github.com/${owner}/${repo}.git`;
 
     // Check the branch still exists before cloning — auto-delete-on-merge removes
     // the head branch as soon as the PR is merged, making clone fatal. This is a
     // permanent state (not a transient error), so short-circuit cleanly.
+    // Write the token to the credential-helper file and pass the helper via -c
+    // so git ls-remote can authenticate without embedding the token in the URL.
+    writeGitTokenFile(ghToken);
+    const lsHelperPath = ensureGitCredentialHelperScript();
     let branchExists = false;
     try {
-      const lsOut = execFileSync('git', ['ls-remote', '--heads', cloneUrl, prBranch], { timeout: 30000 });
+      const lsOut = execFileSync('git', ['-c', `credential.https://github.com.helper=${lsHelperPath}`, 'ls-remote', '--heads', cleanRepoUrl, prBranch], { timeout: 30000 });
       branchExists = lsOut.toString().trim().length > 0;
     } catch {
       // ls-remote itself failed (auth error, network, etc.) — let the clone attempt
@@ -1061,7 +1066,7 @@ export async function handleCreate(
     }
 
     sendLog(ws, `[FreshReview] Operator-requested pass — cloning ${owner}/${repo} branch ${prBranch}\n`);
-    await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cloneUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
+    await prepareWorkspaceForRole({ workspace: WORKSPACE, repoUrl: cleanRepoUrl, githubToken: ghToken, branch: prBranch, baseBranch: prBaseBranch, depth: DEFAULT_CLONE_DEPTH });
     try { git(['fetch', 'origin', `+refs/heads/${prBaseBranch}:refs/remotes/origin/${prBaseBranch}`, '--depth', String(DEFAULT_CLONE_DEPTH)]); } catch { /* ok */ }
     try {
       const mergeBase = git(['merge-base', 'HEAD', `origin/${prBaseBranch}`]).trim();

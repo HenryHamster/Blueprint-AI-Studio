@@ -35,6 +35,26 @@ vi.mock('./index.js', () => ({
   registerSizeCapMergeDriver: registerSizeCapMergeDriverMock,
 }));
 
+// Mock git-credential helpers so tests don't touch the filesystem or git config.
+// MOCK_HELPER_PATH must be a plain const (not used inside vi.hoisted callbacks —
+// those run before module-level initializers so they use the inlined literal).
+const MOCK_HELPER_PATH = '/home/test/.blueprint/git-credential-helper';
+const writeGitTokenFileMock = vi.hoisted(() => vi.fn().mockReturnValue(true));
+const setupGitCredentialHelperMock = vi.hoisted(() => vi.fn());
+const ensureGitCredentialHelperScriptMock = vi.hoisted(() =>
+  vi.fn().mockReturnValue('/home/test/.blueprint/git-credential-helper'),
+);
+const gitCredentialHelperPathMock = vi.hoisted(() =>
+  vi.fn().mockReturnValue('/home/test/.blueprint/git-credential-helper'),
+);
+
+vi.mock('./git-credential.js', () => ({
+  writeGitTokenFile: writeGitTokenFileMock,
+  setupGitCredentialHelper: setupGitCredentialHelperMock,
+  ensureGitCredentialHelperScript: ensureGitCredentialHelperScriptMock,
+  gitCredentialHelperPath: gitCredentialHelperPathMock,
+}));
+
 // ── Imports (after mocks) ────────────────────────────────────────────────────
 import {
   prepareWorkspaceForRole, resolveReferenceRepo,
@@ -52,6 +72,13 @@ describe('prepareWorkspaceForRole', () => {
     fsMocks.existsSync.mockReturnValue(false);
     logMock.mockReset();
     registerSizeCapMergeDriverMock.mockReset();
+    writeGitTokenFileMock.mockReset();
+    writeGitTokenFileMock.mockReturnValue(true);
+    setupGitCredentialHelperMock.mockReset();
+    ensureGitCredentialHelperScriptMock.mockReset();
+    ensureGitCredentialHelperScriptMock.mockReturnValue(MOCK_HELPER_PATH);
+    gitCredentialHelperPathMock.mockReset();
+    gitCredentialHelperPathMock.mockReturnValue(MOCK_HELPER_PATH);
     delete process.env.BLUEPRINT_WARM_HANDOFF;
     resetWorkspacePrepOutcome();
   });
@@ -77,15 +104,20 @@ describe('prepareWorkspaceForRole', () => {
     expect(rmCall).toBeDefined();
     expect(rmCall?.[1]).toEqual(['-rf', '/ws']);
 
-    // cloneWithRetry called with the canonical args.
+    // cloneWithRetry called with clean URL (no embedded token) and -c credential helper.
     expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
     expect(cloneWithRetryMock).toHaveBeenCalledWith([
+      '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
       'clone', '--depth', '50', '--branch', 'feature/x',
-      'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      'https://github.com/o/r.git', '/ws',
     ]);
-    // No git invocations on the cold path.
+    // No raw git invocations on the cold path (setupGitCredentialHelper is mocked).
     const gitCalls = execFileSyncMock.mock.calls.filter(c => c[0] === 'git');
     expect(gitCalls.length).toBe(0);
+    // Token written to credential file and helper configured after clone.
+    expect(writeGitTokenFileMock).toHaveBeenCalledWith('tok');
+    expect(ensureGitCredentialHelperScriptMock).toHaveBeenCalled();
+    expect(setupGitCredentialHelperMock).toHaveBeenCalledWith('o', 'r', '/ws');
     // The sizecap merge driver is registered after the clone so the
     // .gitattributes mapping is actually active.
     expect(registerSizeCapMergeDriverMock).toHaveBeenCalledWith('/ws');
@@ -115,8 +147,9 @@ describe('prepareWorkspaceForRole', () => {
       depth: 0,
     });
     expect(cloneWithRetryMock).toHaveBeenCalledWith([
+      '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
       'clone', '--branch', 'main',
-      'https://x-access-token:tok@github.com/o/r.git', '/ws',
+      'https://github.com/o/r.git', '/ws',
     ]);
   });
 
@@ -159,15 +192,14 @@ describe('prepareWorkspaceForRole', () => {
     // No cloneWithRetry call.
     expect(cloneWithRetryMock).not.toHaveBeenCalled();
 
+    // Token written to credential file and helper configured (no embedded token).
+    expect(writeGitTokenFileMock).toHaveBeenCalledWith('NEW');
+    expect(setupGitCredentialHelperMock).toHaveBeenCalledWith('o', 'r', '/ws');
     // Verify the warm-path git commands ran in the expected order.
     const gitArgsList = execFileSyncMock.mock.calls
       .filter(c => c[0] === 'git')
       .map(c => (c[1] as string[]).join(' '));
-    // Remote URL rotated:
-    expect(gitArgsList.some(a =>
-      a.includes('remote') && a.includes('set-url') && a.includes('origin')
-        && a.includes('https://x-access-token:NEW@github.com/o/r.git'),
-    )).toBe(true);
+    // Remote URL set to clean HTTPS (no embedded token) via setupGitCredentialHelper mock.
     // Branch fetch:
     expect(gitArgsList.some(a => a.startsWith('-C /ws fetch origin feature/x'))).toBe(true);
     // Base-branch fetch (different from branch):
@@ -248,14 +280,13 @@ describe('prepareWorkspaceForRole', () => {
     process.env.BLUEPRINT_WARM_HANDOFF = '1';
     fsMocks.existsSync.mockReturnValue(true);
 
-    // First git invocation (remote set-url) succeeds; the second (fetch
-    // origin <branch>) throws. The implementation should catch and fall
-    // through to the cold-path rm + clone.
+    // setupGitCredentialHelper is mocked (no direct git calls). The first
+    // direct git call is the fetch, which throws. The implementation should
+    // catch and fall through to the cold-path rm + clone.
     let gitCallIdx = 0;
     execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
       if (cmd === 'git') {
         gitCallIdx += 1;
-        // 1st git call = set-url; 2nd = fetch — throw on the fetch.
         const arg0 = args.includes('-C') ? args[2] : args[0];
         if (arg0 === 'fetch') {
           throw new Error('network unreachable');
@@ -282,8 +313,9 @@ describe('prepareWorkspaceForRole', () => {
     // We logged the warning about the warm path failure.
     const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
     expect(logged).toMatch(/warm path failed/i);
-    // gitCallIdx was incremented at least twice (set-url + fetch).
-    expect(gitCallIdx).toBeGreaterThanOrEqual(2);
+    // setupGitCredentialHelper called once during warm attempt and once after cold clone.
+    expect(setupGitCredentialHelperMock).toHaveBeenCalledTimes(2);
+    expect(gitCallIdx).toBeGreaterThanOrEqual(1);
   });
 
   it('warm path: when branch === baseBranch, baseBranch fetch is skipped', async () => {
@@ -526,8 +558,9 @@ describe('prepareWorkspaceForRole', () => {
       expect(rmCall).toBeDefined();
       expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
       expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
         'clone', '--branch', 'main',
-        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+        'https://github.com/o/r.git', '/ws',
       ]);
       // The warm-path failure was logged.
       const logged = logMock.mock.calls.map(c => String(c[0])).join('\n');
@@ -551,8 +584,9 @@ describe('prepareWorkspaceForRole', () => {
       const gitCalls = execFileSyncMock.mock.calls.filter(c => c[0] === 'git');
       expect(gitCalls.length).toBe(0); // no git fetch/unshallow on the cold path
       expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
         'clone', '--branch', 'main',
-        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+        'https://github.com/o/r.git', '/ws',
       ]);
     });
   });
@@ -583,9 +617,10 @@ describe('prepareWorkspaceForRole', () => {
 
       expect(cloneWithRetryMock).toHaveBeenCalledTimes(1);
       expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
         'clone', '--depth', '50', '--branch', 'feature/x',
         '--reference-if-able', '/opt/agent-cache/git/o/r.git',
-        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+        'https://github.com/o/r.git', '/ws',
       ]);
     });
 
@@ -602,9 +637,10 @@ describe('prepareWorkspaceForRole', () => {
       });
 
       expect(cloneWithRetryMock).toHaveBeenCalledWith([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
         'clone', '--branch', 'main',
         '--reference-if-able', '/opt/agent-cache/git/o/r.git',
-        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+        'https://github.com/o/r.git', '/ws',
       ]);
     });
 
@@ -623,8 +659,9 @@ describe('prepareWorkspaceForRole', () => {
       const cloneArgs = cloneWithRetryMock.mock.calls[0][0] as string[];
       expect(cloneArgs).not.toContain('--reference-if-able');
       expect(cloneArgs).toEqual([
+        '-c', `credential.https://github.com.helper=${MOCK_HELPER_PATH}`,
         'clone', '--depth', '50', '--branch', 'feature/x',
-        'https://x-access-token:tok@github.com/o/r.git', '/ws',
+        'https://github.com/o/r.git', '/ws',
       ]);
     });
   });
@@ -935,14 +972,14 @@ describe('prepareWorkspaceForRole', () => {
       process.env.BLUEPRINT_WARM_HANDOFF = '1';
       fsMocks.existsSync.mockReturnValue(true);
 
-      execFileSyncMock.mockImplementation((cmd: string, args: string[]) => {
-        if (cmd === 'git' && Array.isArray(args) && args.includes('remote')) {
-          throw new Error(
-            'Command failed: git -C /ws remote set-url origin https://x-access-token:tok@github.com/o/r.git\n'
-              + 'fatal: authentication failed',
-          );
-        }
-        return '';
+      // setupGitCredentialHelper is called first on the warm path; simulate it
+      // throwing an error that contains a token-embedded URL (the kind that
+      // bubbles up from a git subprocess it invokes internally).
+      setupGitCredentialHelperMock.mockImplementationOnce(() => {
+        throw new Error(
+          'Command failed: git -C /ws remote set-url origin https://x-access-token:tok@github.com/o/r.git\n'
+            + 'fatal: authentication failed',
+        );
       });
 
       await prepareWorkspaceForRole({

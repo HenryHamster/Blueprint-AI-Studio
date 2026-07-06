@@ -1932,6 +1932,139 @@ async def test_agent_fetch_qualification_goal_alignment_in_fallback(
 
 
 @pytest.mark.asyncio
+async def test_agent_fetch_qualification_surfaces_promotion_failure_context(
+    client: AsyncClient, db_session
+):
+    """agent_fetch_qualification surfaces promotion-failure context fields
+    (would_promote, promotion_pr_url, promotion_conflict, promotion_error_detail,
+    promotion_failure_count, promotion_pending) from both verdict and fallback paths."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-promo-fail"
+    )
+
+    sha = "d" * 40
+    verdict = QualificationVerdict(
+        id=uuid.uuid4(),
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=sha,
+        confidence=0.85,
+        sub_scores={"audit": 0.9},
+        terminal_status="promotion_failed",
+        finalized_at=datetime(2026, 6, 22, 14, 30, 0),
+        audit_findings=[],
+        would_promote=True,
+        promotion_pr_url="https://github.com/example/repo/pull/42",
+        promotion_conflict=True,
+        promotion_error_detail="merge conflict: both sides modified auth.py",
+    )
+    db_session.add(verdict)
+
+    # last_qualification carries promotion_pending sub-record showing in-flight state
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": sha,
+        "confidence": 0.85,
+        "would_promote": True,
+        "promotion_pr_url": "https://github.com/example/repo/pull/42",
+        "promotion_conflict": True,
+        "promotion_error_detail": "merge conflict: both sides modified auth.py",
+        "promotion_failure_count": 1,
+        "promotion_pending": {
+            "pr_number": 42,
+            "pr_url": "https://github.com/example/repo/pull/42",
+            "auto_merge_enabled": False,
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    # Verify promotion-failure context is surfaced
+    assert body["status"] == "promotion_failed"
+    assert body["would_promote"] is True
+    assert body["promotion_pr_url"] == "https://github.com/example/repo/pull/42"
+    assert body["promotion_conflict"] is True
+    assert (
+        body["promotion_error_detail"]
+        == "merge conflict: both sides modified auth.py"
+    )
+    assert body["promotion_failure_count"] == 1
+
+    # Verify promotion_pending sub-record
+    promotion_pending = body.get("promotion_pending")
+    assert promotion_pending is not None
+    assert promotion_pending["pr_number"] == 42
+    assert promotion_pending["pr_url"] == "https://github.com/example/repo/pull/42"
+    assert promotion_pending["auto_merge_enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_agent_fetch_qualification_promotion_context_in_fallback(
+    client: AsyncClient, db_session
+):
+    """agent_fetch_qualification surfaces promotion-failure context in fallback
+    (last_qualification) path when QualificationVerdict is absent."""
+    from sqlalchemy.orm.attributes import flag_modified
+
+    project, task, version = await _make_project_with_version(
+        db_session, vm="agent-vm-qa-promo-fb"
+    )
+
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": "e" * 40,
+        "confidence": 0.72,
+        "would_promote": True,
+        "promotion_pr_url": "https://github.com/example/repo/pull/99",
+        "promotion_conflict": False,
+        "promotion_error_detail": "CI checks still pending",
+        "promotion_failure_count": 2,
+        "promotion_pending": {
+            "pr_number": 99,
+            "pr_url": "https://github.com/example/repo/pull/99",
+            "auto_merge_enabled": True,
+            "migration_carrying": True,
+        },
+    }
+    flag_modified(version, "last_qualification")
+    db_session.add(version)
+    await db_session.commit()
+
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    res = await client.get(
+        f"/api/agent/projects/{project.id}/qualification",
+        headers={"x-agent-token": token},
+    )
+    assert res.status_code == 200, res.text
+    body = res.json()
+
+    assert body["source"] == "last_qualification"
+    assert body["status"] == "promotion_failed"
+    assert body["would_promote"] is True
+    assert body["promotion_pr_url"] == "https://github.com/example/repo/pull/99"
+    assert body["promotion_conflict"] is False
+    assert body["promotion_error_detail"] == "CI checks still pending"
+    assert body["promotion_failure_count"] == 2
+
+    promotion_pending = body.get("promotion_pending")
+    assert promotion_pending is not None
+    assert promotion_pending["pr_number"] == 99
+    assert promotion_pending["auto_merge_enabled"] is True
+    assert promotion_pending["migration_carrying"] is True
+
+
+@pytest.mark.asyncio
 async def test_agent_fetch_version_phase_returns_compact_lifecycle_context(
     client: AsyncClient, db_session
 ):

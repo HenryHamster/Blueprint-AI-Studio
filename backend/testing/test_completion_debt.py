@@ -246,6 +246,57 @@ async def test_link_task_to_debt_not_found_and_not_open(db_session):
         )
 
 
+@pytest.mark.asyncio
+async def test_link_task_to_debt_locked_read_sees_committed_state(db_session):
+    """link_task_to_debt reads the latest committed detail (not a stale cache).
+
+    The for-update lock forces a fresh DB read, so a second call always sees the
+    first call's committed linked_tasks instead of caching the pre-commit snapshot.
+    This is the guard against the lost-update defect where two concurrent callers
+    both read detail, compute independent merged lists, and the later writer
+    silently drops the earlier one's linked-task record.
+    """
+    project = Project(name="LockedRead", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Entry starts with no linked tasks.
+    entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind=cd.KIND_NO_CI_GATE,
+        title="Gate fell open",
+        detail=None,
+    )
+    db_session.add(entry)
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    # First link: initialises detail from None via the for-update read path.
+    await cd.link_task_to_debt(
+        db_session, entry.id, project_id=project.id, task_id="task-X", note="first"
+    )
+    await db_session.commit()
+
+    # Second link: must see the committed state from the first call, not a stale
+    # cached snapshot, so both task_ids end up in the linked_tasks list.
+    await cd.link_task_to_debt(
+        db_session, entry.id, project_id=project.id, task_id="task-Y"
+    )
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    linked = (entry.detail or {}).get("linked_tasks", [])
+    task_ids = [x.get("task_id") for x in linked]
+    assert task_ids == ["task-X", "task-Y"], (
+        f"both task_ids must be present — lost-update would yield only one: {task_ids}"
+    )
+    assert linked[0].get("note") == "first"
+    assert entry.status == cd.STATUS_OPEN
+    # updated_at must be stamped by the for-update write path.
+    assert entry.updated_at is not None
+
+
 # ── Seed idempotency (repeated seed → no duplicates) ─────────────────────────
 
 

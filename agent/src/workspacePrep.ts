@@ -25,6 +25,12 @@ import { cloneWithRetry, log, GIT_REFERENCE_CACHE_ROOT, registerSizeCapMergeDriv
 import type { FailureCategory } from './index.js';
 import { DEFAULT_CLONE_DEPTH } from './constants.js';
 import { sanitize } from './utils/sanitize.js';
+import {
+  writeGitTokenFile,
+  setupGitCredentialHelper,
+  ensureGitCredentialHelperScript,
+  gitCredentialHelperPath,
+} from './git-credential.js';
 
 /**
  * Resolve the pre-baked git object mirror path for an authenticated clone URL,
@@ -66,13 +72,16 @@ export function resolveReferenceRepo(repoUrl: string): string | null {
 
 export interface PrepareWorkspaceOptions {
   workspace: string;
-  /** Authenticated clone URL (caller embeds the ghToken). */
+  /**
+   * Repo URL — may be a plain `https://github.com/owner/repo.git` or a
+   * legacy token-embedded `https://x-access-token:<tok>@github.com/…` form.
+   * Owner/repo are extracted from the URL; the embedded token (if any) is
+   * never forwarded to git — authentication goes through the credential helper.
+   */
   repoUrl: string;
   /**
-   * Raw GitHub token — currently unused but kept in the signature so the
-   * helper can rotate the token-less remote URL on the warm path if a future
-   * change separates authentication from the URL. Callers always pass it for
-   * forward compatibility.
+   * Raw GitHub token written to the on-disk credential-helper token file
+   * so git operations can authenticate without embedding the secret in the URL.
    */
   githubToken: string;
   branch: string;
@@ -146,6 +155,25 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
     ? opts.depth
     : DEFAULT_CLONE_DEPTH;
 
+  // Extract owner/repo from the URL (handles both clean and legacy token-embedded forms).
+  // Fall back to the original repoUrl if parsing fails so no existing path breaks.
+  let cleanRepoUrl = repoUrl;
+  let ownerRepo: { owner: string; repo: string } | null = null;
+  try {
+    const pathname = new URL(repoUrl).pathname; // '/owner/repo.git' (ignores userinfo)
+    const parts = pathname.replace(/^\/+/, '').replace(/\.git$/, '').split('/');
+    if (parts.length === 2 && parts[0] && parts[1]) {
+      ownerRepo = { owner: parts[0], repo: parts[1] };
+      cleanRepoUrl = `https://github.com/${parts[0]}/${parts[1]}.git`;
+    }
+  } catch { /* malformed URL — use repoUrl as-is */ }
+
+  // Write the GitHub token to the on-disk credential-helper file before any
+  // git network operation so the helper always finds a valid token.
+  if (opts.githubToken) {
+    writeGitTokenFile(opts.githubToken);
+  }
+
   // lane_phase is meaningful for both warm and cold paths — computed upfront.
   const allowLaneResume = opts.allowLaneResume !== false;
   const lanePhase = allowLaneResume && process.env.BLUEPRINT_LANE_MODE === '1';
@@ -158,12 +186,18 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
 
   if (warmHandoff && gitDirExists) {
     try {
-      // Update remote URL so we use the freshly minted GitHub token (the prior
-      // role's token may have expired) without leaking the old one in the
-      // working tree's git config.
-      execFileSync('git', ['-C', workspace, 'remote', 'set-url', 'origin', repoUrl], {
-        encoding: 'utf-8', timeout: 30_000,
-      });
+      // Rotate credentials without embedding the token in the remote URL:
+      // configure the credential helper in the workspace git config and set
+      // the remote to a plain HTTPS URL. The helper reads the fresh token
+      // written above on every git network call.
+      if (ownerRepo) {
+        setupGitCredentialHelper(ownerRepo.owner, ownerRepo.repo, workspace);
+      } else {
+        // Fallback: could not parse owner/repo — update URL as before.
+        execFileSync('git', ['-C', workspace, 'remote', 'set-url', 'origin', repoUrl], {
+          encoding: 'utf-8', timeout: 30_000,
+        });
+      }
       execFileSync('git', ['-C', workspace, 'fetch', 'origin', branch], {
         encoding: 'utf-8', timeout: 120_000,
       });
@@ -311,21 +345,35 @@ export async function prepareWorkspaceForRole(opts: PrepareWorkspaceOptions): Pr
   // specialized / research / design-doc) get the clone speedup, not just
   // setupWorkspace's standard path.
   execFileSync('rm', ['-rf', workspace], { encoding: 'utf-8' });
-  const cloneArgs = depthOpt > 0
-    ? ['clone', '--depth', String(depthOpt), '--branch', branch]
-    : ['clone', '--branch', branch];
-  const referenceRepo = resolveReferenceRepo(repoUrl);
+  // Write the credential helper script before the clone so the `-c` option
+  // below can point git at it for authentication during the clone itself.
+  const helperPath = ownerRepo ? ensureGitCredentialHelperScript() : gitCredentialHelperPath();
+  const cloneArgs: string[] = ownerRepo
+    ? ['-c', `credential.https://github.com.helper=${helperPath}`]
+    : [];
+  if (depthOpt > 0) {
+    cloneArgs.push('clone', '--depth', String(depthOpt), '--branch', branch);
+  } else {
+    cloneArgs.push('clone', '--branch', branch);
+  }
+  const referenceRepo = resolveReferenceRepo(cleanRepoUrl);
   if (referenceRepo) {
     cloneArgs.push('--reference-if-able', referenceRepo);
     log(`prepareWorkspaceForRole: using pre-baked git object cache at ${referenceRepo}`);
   }
-  cloneArgs.push(repoUrl, workspace);
+  cloneArgs.push(cleanRepoUrl, workspace);
   try {
     await cloneWithRetry(cloneArgs);
   } catch (e) {
     const err = e instanceof Error ? e : new Error(String(e));
     (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
     throw err;
+  }
+  // Configure the credential helper and clean remote URL in the workspace git
+  // config so all subsequent operations (fetch, push, ls-remote) authenticate
+  // via the helper and never embed the token in .git/config.
+  if (ownerRepo) {
+    setupGitCredentialHelper(ownerRepo.owner, ownerRepo.repo, workspace);
   }
   // A fresh clone does NOT carry .git/config, so the .gitattributes sizecap
   // mapping is inert until the driver command is registered here.

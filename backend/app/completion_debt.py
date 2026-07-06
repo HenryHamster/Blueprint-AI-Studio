@@ -368,27 +368,36 @@ async def link_task_to_debt(
     """
     from app.models import CompletionDebtEntry
 
-    entry = await session.get(CompletionDebtEntry, debt_id)
-    if entry is None or (
-        entry.project_id is not None and entry.project_id != project_id
-    ):
-        raise ValueError("not_found")
-    if entry.status != STATUS_OPEN:
-        raise ValueError("not_open")
     task_ref = str(task_id).strip()
     if not task_ref:
         raise ValueError("invalid_task")
-    detail = dict(entry.detail) if isinstance(entry.detail, dict) else {}
-    linked = detail.get("linked_tasks")
-    linked = [x for x in linked if isinstance(x, dict)] if isinstance(linked, list) else []
-    if not any(x.get("task_id") == task_ref for x in linked):
-        record: dict[str, Any] = {"task_id": task_ref}
-        note_text = str(note).strip() if note else ""
-        if note_text:
-            record["note"] = note_text[:_MAX_TITLE_LEN]
-        linked.append(record)
-    detail["linked_tasks"] = linked[-_MAX_LINKED_TASKS:]
+    # Use SELECT ... FOR UPDATE inside the savepoint so concurrent callers
+    # serialize on this row.  Without the lock, two concurrent links to the same
+    # entry both read detail, compute their own merged list, and the later writer
+    # silently discards the earlier one's linked-task record.
     async with session.begin_nested():
+        result = await session.execute(
+            select(CompletionDebtEntry)
+            .where(CompletionDebtEntry.id == debt_id)
+            .with_for_update()
+        )
+        entry = result.scalar_one_or_none()
+        if entry is None or (
+            entry.project_id is not None and entry.project_id != project_id
+        ):
+            raise ValueError("not_found")
+        if entry.status != STATUS_OPEN:
+            raise ValueError("not_open")
+        detail = dict(entry.detail) if isinstance(entry.detail, dict) else {}
+        linked = detail.get("linked_tasks")
+        linked = [x for x in linked if isinstance(x, dict)] if isinstance(linked, list) else []
+        if not any(x.get("task_id") == task_ref for x in linked):
+            record: dict[str, Any] = {"task_id": task_ref}
+            note_text = str(note).strip() if note else ""
+            if note_text:
+                record["note"] = note_text[:_MAX_TITLE_LEN]
+            linked.append(record)
+        detail["linked_tasks"] = linked[-_MAX_LINKED_TASKS:]
         entry.detail = _bound_detail(detail)
         entry.updated_at = _utcnow()
         flag_modified(entry, "detail")

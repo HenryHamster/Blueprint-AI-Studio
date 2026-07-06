@@ -41,6 +41,11 @@ import {
   computeRefreshDelayMs, isBootstrapToken,
 } from './utils/agent-token.js';
 import { ensureAgentTokenFileEnv, writeAgentTokenFile, ensureGithubTokenFileEnv, writeGithubTokenFile } from './token-file.js';
+import {
+  writeGitTokenFile,
+  setupGitCredentialHelper,
+  ensureGitCredentialHelperScript,
+} from './git-credential.js';
 import { sanitize, sanitizeError } from './utils/sanitize.js';
 import {
   type StaleResultEnvelope,
@@ -2856,23 +2861,30 @@ export function gitAsync(args: string[], cwd = WORKSPACE, timeoutMs = 300_000): 
 const GIT_CLONE_AUTH_ERROR = /Invalid username or token|Password authentication is not supported|Authentication failed|remote: (?:Invalid|Repository not found)|returned error:\s*40[13]\b|HTTP\s*40[13]\b/i;
 
 /** Re-mint a fresh GitHub installation token (force_refresh busts the backend's
- *  ~50min cache) and rewrite the `x-access-token:<tok>@github.com` segment of
- *  the matching clone-arg in place. Returns true if a URL arg was rewritten. */
+ *  ~50min cache), write it to the credential-helper token file, and also rewrite
+ *  any `x-access-token:<tok>@github.com` segment in-place for legacy callers
+ *  that still embed the token in the URL. Returns true if a fresh token was
+ *  obtained (regardless of whether a URL was rewritten). */
 async function refreshCloneToken(args: string[], taskId: string): Promise<boolean> {
   if (!taskId) return false;
-  const urlIdx = args.findIndex(a => /https:\/\/x-access-token:[^@]+@github\.com\//.test(a));
-  if (urlIdx === -1) return false;
   const freshRes = await apiGet(
     `/api/agent/github/token?task_id=${taskId}&force_refresh=true`,
     API_MAX_RETRIES, 180_000,
   ) as { data?: { token?: string } };
   const freshToken = freshRes.data?.token;
   if (!freshToken) return false;
-  // Replace only the token segment; keep host/path untouched.
-  args[urlIdx] = args[urlIdx].replace(
-    /(https:\/\/x-access-token:)[^@]+(@github\.com\/)/,
-    `$1${freshToken}$2`,
-  );
+  // Persist the fresh token so the credential helper reads it on the retry.
+  writeGitTokenFile(freshToken);
+  // Also rewrite any legacy token-embedded URL in the args array so old-style
+  // callers that still build `x-access-token:<tok>@github.com` URLs also get
+  // the fresh token on their retry attempt.
+  const urlIdx = args.findIndex(a => /https:\/\/x-access-token:[^@]+@github\.com\//.test(a));
+  if (urlIdx !== -1) {
+    args[urlIdx] = args[urlIdx].replace(
+      /(https:\/\/x-access-token:)[^@]+(@github\.com\/)/,
+      `$1${freshToken}$2`,
+    );
+  }
   return true;
 }
 
@@ -2949,8 +2961,15 @@ export async function setupWorkspace(
   sendLog(ws, `Cloning ${owner}/${repo}...\n`);
   sendHeartbeatSync(taskId, `Cloning ${owner}/${repo}...`);
   execFileSync('rm', ['-rf', WORKSPACE], { encoding: 'utf-8' });
-  const cloneUrl = `https://x-access-token:${ghToken}@github.com/${owner}/${repo}.git`;
-  const cloneArgs = ['clone', '--depth', '100', '--branch', baseBranch];
+  // Write the token to the credential-helper file and ensure the helper script
+  // exists before the clone so git can authenticate without an embedded token.
+  writeGitTokenFile(ghToken);
+  const helperPath = ensureGitCredentialHelperScript();
+  const cleanCloneUrl = `https://github.com/${owner}/${repo}.git`;
+  const cloneArgs = [
+    '-c', `credential.https://github.com.helper=${helperPath}`,
+    'clone', '--depth', '100', '--branch', baseBranch,
+  ];
   // Reuse the pre-baked git object cache when the image seeded a mirror for
   // this repo. `--reference-if-able` borrows objects from the local mirror and
   // silently falls back to a normal fetch if the path is missing or invalid,
@@ -2960,7 +2979,7 @@ export async function setupWorkspace(
     cloneArgs.push('--reference-if-able', referenceRepo);
     sendLog(ws, `Using pre-baked git object cache at ${referenceRepo}\n`);
   }
-  cloneArgs.push(cloneUrl, WORKSPACE);
+  cloneArgs.push(cleanCloneUrl, WORKSPACE);
   try {
     await cloneWithRetry(cloneArgs);
   } catch (e) {
@@ -2968,6 +2987,9 @@ export async function setupWorkspace(
     (err as Error & { failureCategory?: FailureCategory }).failureCategory = 'clone_failed';
     throw err;
   }
+  // Configure the credential helper and clean remote URL in the workspace git
+  // config so all subsequent operations authenticate via the helper.
+  setupGitCredentialHelper(owner, repo, WORKSPACE);
   sendHeartbeatSync(taskId, `Clone complete, configuring workspace...`);
   git(['config', 'user.email', buildConfig?.git_user_email || 'blueprint-agent@automated.dev']);
   git(['config', 'user.name', buildConfig?.git_user_name || 'Blueprint Agent']);
@@ -3051,8 +3073,12 @@ export async function pushAndCreatePR(
   // keeps firing during the push, preventing the reaper from killing us mid-push.
   sendHeartbeatSync(taskId, `Pushing ${workBranch}...`);
   const freshGhRes = await apiGet(`/api/agent/github/token?task_id=${taskId}`) as { data: { token: string } };
-  const pushUrl = `https://x-access-token:${freshGhRes.data.token}@github.com/${owner}/${repo}.git`;
-  execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', pushUrl], { encoding: 'utf-8' });
+  // Refresh the token file and ensure the remote URL is clean (no embedded secret).
+  // The credential helper configured in .git/config at clone time will supply the
+  // fresh token to git push without it appearing in the URL or .git/config.
+  writeGitTokenFile(freshGhRes.data.token);
+  const cleanPushUrl = `https://github.com/${owner}/${repo}.git`;
+  execFileSync('git', ['-C', WORKSPACE, 'remote', 'set-url', 'origin', cleanPushUrl], { encoding: 'utf-8' });
   await gitAsync(['push', 'origin', workBranch]);
   sendLog(ws, `Pushed to branch: ${workBranch}\n`);
 

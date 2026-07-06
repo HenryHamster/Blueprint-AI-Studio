@@ -1,4 +1,4 @@
-import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef, useCallback } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
 import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
@@ -672,9 +672,8 @@ export function buildTriageItems(p: BuildParams): { items: TriageItem[]; section
   if (p.routineOpen.length > 0) {
     sec.routine = items.length;
     items.push({ kind: 'routine_head' });
+    if (p.muteActive) items.push({ kind: 'mute_active_banner' });
     if (p.routineExpanded) {
-      if (p.muteActive) items.push({ kind: 'mute_active_banner' });
-
       // Interleave time dividers with routine rows
       const firstMsgs = p.remainingRoutineRows.map(row =>
         row.kind === 'single' ? row.msg : row.msgs[0]
@@ -912,7 +911,6 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     getTop3NoisyEventTypes,
     handleResolveGroup,
     handleBulkDeleteResolved,
-    scrollToBottom,
   } = props;
   const listRef = useListRef(null);
 
@@ -1007,6 +1005,11 @@ function TriageVirtualList(props: TriageVirtualListProps) {
     handleBulkDeleteResolved,
   ]);
 
+  const handleTriageScrollToBottom = useCallback(() => {
+    if (items.length === 0) return;
+    listRef.current?.scrollToRow({ index: items.length - 1, align: 'end', behavior: 'smooth' });
+  }, [items.length, listRef]);
+
   return (
     <div className="relative flex-1 overflow-hidden bg-workbench-surface">
       <List
@@ -1021,7 +1024,7 @@ function TriageVirtualList(props: TriageVirtualListProps) {
       />
       {showScrollDown && (
         <button
-          onClick={scrollToBottom}
+          onClick={handleTriageScrollToBottom}
           className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
           aria-label="Scroll to latest message"
         >

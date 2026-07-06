@@ -139,6 +139,34 @@ describe('MessagesListView — viewport regression', () => {
       await renderView(baseProps({ showScrollDown: true, hiddenResolvedCount: 3 }));
     });
   });
+
+  test('scroll-to-bottom button appears when showScrollDown=true in triage mode', async () => {
+    const msg = makeMsg({ id: 'n1', message_type: 'NOTE', content: 'test message' });
+    let button: HTMLButtonElement | null = null;
+    await act(async () => {
+      await renderView(baseProps({
+        presentation: 'triage',
+        messages: [msg],
+        otherHighSignal: [msg],
+        showScrollDown: true,
+      }));
+      button = host?.querySelector('button[aria-label="Scroll to latest message"]') as HTMLButtonElement | null;
+    });
+    expect(button).toBeTruthy();
+  });
+
+  test('mute_active_banner renders in collapsed routine without breaking layout', async () => {
+    const msg = makeMsg({ id: 'r1', message_type: 'NOTE', content: 'routine message' });
+    await expectNoOverflowAt(375, async () => {
+      await renderView(baseProps({
+        presentation: 'triage',
+        messages: [msg],
+        routineOpen: [msg],
+        muteActive: true,
+        routineExpanded: false,
+      }));
+    });
+  });
 });
 
 // ─── buildTriageItems unit tests ──────────────────────────────────────────────
@@ -284,5 +312,57 @@ describe('buildTriageItems — section indices and item ordering', () => {
       otherHighSignal: [msg],
     }));
     expect(sectionIndices.routine).toBe(-1);
+  });
+
+  test('mute_active_banner appears when muteActive=true and routineExpanded=false (collapsed routine)', () => {
+    const msg = makeMsg({ id: 'r1' });
+    const { items } = buildTriageItems(makeParams({
+      messages: [msg],
+      routineOpen: [msg],
+      muteActive: true,
+      routineExpanded: false,
+    }));
+    const bannerItem = items.find(item => item.kind === 'mute_active_banner');
+    expect(bannerItem).toBeDefined();
+    expect(bannerItem?.kind).toBe('mute_active_banner');
+  });
+
+  test('mute_active_banner appears when muteActive=true and routineExpanded=true (expanded routine)', () => {
+    const msg = makeMsg({ id: 'r1' });
+    const { items } = buildTriageItems(makeParams({
+      messages: [msg],
+      routineOpen: [msg],
+      muteActive: true,
+      routineExpanded: true,
+    }));
+    const bannerItem = items.find(item => item.kind === 'mute_active_banner');
+    expect(bannerItem).toBeDefined();
+    expect(bannerItem?.kind).toBe('mute_active_banner');
+  });
+
+  test('mute_active_banner does not appear when muteActive=false', () => {
+    const msg = makeMsg({ id: 'r1' });
+    const { items } = buildTriageItems(makeParams({
+      messages: [msg],
+      routineOpen: [msg],
+      muteActive: false,
+      routineExpanded: false,
+    }));
+    const bannerItem = items.find(item => item.kind === 'mute_active_banner');
+    expect(bannerItem).toBeUndefined();
+  });
+
+  test('mute_active_banner positioned after routine_head in collapsed state', () => {
+    const msg = makeMsg({ id: 'r1' });
+    const { items } = buildTriageItems(makeParams({
+      messages: [msg],
+      routineOpen: [msg],
+      muteActive: true,
+      routineExpanded: false,
+    }));
+    const routineHeadIdx = items.findIndex(item => item.kind === 'routine_head');
+    const bannerIdx = items.findIndex(item => item.kind === 'mute_active_banner');
+    expect(routineHeadIdx).toBeGreaterThanOrEqual(0);
+    expect(bannerIdx).toBeGreaterThan(routineHeadIdx);
   });
 });

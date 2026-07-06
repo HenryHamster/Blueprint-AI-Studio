@@ -76,28 +76,19 @@ export function writeGitTokenFile(token: string): boolean {
 }
 
 /**
- * Configure git in `workspace` to use a credential helper that reads the
- * token file, then rewrite the remote URL to remove the embedded token so
- * git delegates credential lookup to the helper on every fetch/pull/ls-remote.
+ * Write the git credential helper script to disk and publish the token-file
+ * path into `process.env`. Safe to call before a workspace exists (no git
+ * commands are run). Idempotent — subsequent calls overwrite the same file.
  *
- * Also publishes `GH_READ_TOKEN_FILE` into `process.env` so child processes
- * (the resident Claude session and git subprocesses it spawns) inherit the
- * token file path.
- *
- * Call this after the workspace is cloned and the initial token is written via
- * writeGitTokenFile(), so the helper immediately finds a valid token.
+ * Call this before any git clone that must authenticate without an embedded
+ * token. Pass the path returned by `gitCredentialHelperPath()` as the `-c
+ * credential.https://github.com.helper=<path>` option on the git clone
+ * command line so git resolves credentials via the helper during the clone.
  */
-export function setupGitCredentialHelper(
-  owner: string,
-  repo: string,
-  workspace: string,
-): void {
+export function ensureGitCredentialHelperScript(): string {
   const helperPath = gitCredentialHelperPath();
   const tokenFile = gitTokenFilePath();
 
-  // Build the credential helper script as an array of single-quoted lines
-  // joined with newlines — no bash $/{...} needs escaping through TypeScript
-  // template literals (following the project's multi-layer escape guidance).
   const helperLines = [
     '#!/bin/bash',
     '# Git credential helper for the strategic resident VM (read-only GitHub access).',
@@ -123,6 +114,32 @@ export function setupGitCredentialHelper(
   fs.mkdirSync(path.dirname(helperPath), { recursive: true, mode: 0o700 });
   fs.writeFileSync(helperPath, helperLines.join('\n') + '\n', { mode: 0o755 });
 
+  if (!process.env[GH_READ_TOKEN_FILE_ENV]) {
+    process.env[GH_READ_TOKEN_FILE_ENV] = tokenFile;
+  }
+
+  return helperPath;
+}
+
+/**
+ * Configure git in `workspace` to use a credential helper that reads the
+ * token file, then rewrite the remote URL to remove any embedded token so
+ * git delegates credential lookup to the helper on every fetch/pull/ls-remote.
+ *
+ * Also publishes `GH_READ_TOKEN_FILE` into `process.env` so child processes
+ * (the resident Claude session and git subprocesses it spawns) inherit the
+ * token file path.
+ *
+ * Call this after the workspace is cloned and the initial token is written via
+ * writeGitTokenFile(), so the helper immediately finds a valid token.
+ */
+export function setupGitCredentialHelper(
+  owner: string,
+  repo: string,
+  workspace: string,
+): void {
+  const helperPath = ensureGitCredentialHelperScript();
+
   // Configure git to use the helper for github.com HTTPS credentials.
   // Use the url-scoped form so other hosts are unaffected.
   execFileSync('git', [
@@ -130,7 +147,7 @@ export function setupGitCredentialHelper(
     'config', 'credential.https://github.com.helper', helperPath,
   ]);
 
-  // Replace the token-embedded remote URL with a plain HTTPS URL so git
+  // Replace any token-embedded remote URL with a plain HTTPS URL so git
   // always invokes the credential helper instead of using the stale baked-in
   // token. The helper provides fresh credentials on every git network call.
   execFileSync('git', [
@@ -138,10 +155,4 @@ export function setupGitCredentialHelper(
     'remote', 'set-url', 'origin',
     `https://github.com/${owner}/${repo}.git`,
   ]);
-
-  // Publish the token-file path into the environment so child processes
-  // (the resident Claude session and any git it spawns) inherit it.
-  if (!process.env[GH_READ_TOKEN_FILE_ENV]) {
-    process.env[GH_READ_TOKEN_FILE_ENV] = tokenFile;
-  }
 }

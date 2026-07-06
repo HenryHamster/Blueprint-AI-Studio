@@ -1308,9 +1308,18 @@ async def sweep_closed_handmerge_prs(session) -> int:
     except ImportError:
         return 0
 
+    # Snapshot the fields we need as plain Python values NOW.
+    # session.commit() and session.rollback() both expire every ORM instance
+    # (expire_on_commit=True by default), so a lazy-load in a later iteration
+    # fires a sync DB read inside the async session → MissingGreenlet, silently
+    # aborting the rest of the batch.  Plain locals never expire.
+    task_snapshots = [
+        (task, task.id, task.project_id, dict(task.context or {}))
+        for task in preserved_tasks
+    ]
+
     resolved = 0
-    for task in preserved_tasks:
-        ctx = dict(task.context or {})
+    for task, t_id, t_project_id, ctx in task_snapshots:
         pr_number = ctx.get("handmerge_pr_number")
         if not isinstance(pr_number, int):
             # Fall back to the PULL_REQUEST artifact for tasks preserved before
@@ -1318,7 +1327,7 @@ async def sweep_closed_handmerge_prs(session) -> int:
             artifact = (
                 await session.execute(
                     _select(_Artifact).where(
-                        _Artifact.task_id == task.id,
+                        _Artifact.task_id == t_id,
                         _Artifact.artifact_type == ArtifactType.PULL_REQUEST,
                     )
                 )
@@ -1332,15 +1341,15 @@ async def sweep_closed_handmerge_prs(session) -> int:
             continue
 
         try:
-            gh_token, owner, repo = await _get_token(task.id, session)
+            gh_token, owner, repo = await _get_token(t_id, session)
             pr = await _get_pull_request(
-                gh_token, owner, repo, pr_number, project_id=str(task.project_id)
+                gh_token, owner, repo, pr_number, project_id=str(t_project_id)
             )
         except Exception as _e:  # noqa: BLE001
             logger.warning(
                 "[REAPER] handmerge-sweep: failed to check PR #%s for task %s: %s",
                 pr_number,
-                task.id,
+                t_id,
                 _e,
             )
             continue
@@ -1357,7 +1366,7 @@ async def sweep_closed_handmerge_prs(session) -> int:
             except Exception as _e:  # noqa: BLE001
                 logger.warning(
                     "[REAPER] handmerge-sweep: failed to stamp last-checked for task %s: %s",
-                    task.id,
+                    t_id,
                     _e,
                 )
                 with _contextlib.suppress(Exception):
@@ -1374,11 +1383,11 @@ async def sweep_closed_handmerge_prs(session) -> int:
         session.add(task)
 
         # Resolve the associated operator-attention ProjectMessage if open.
-        ikey = f"handmerge:{task.id}"
+        ikey = f"handmerge:{t_id}"
         msg = (
             await session.execute(
                 _select(ProjectMessage).where(
-                    ProjectMessage.project_id == task.project_id,
+                    ProjectMessage.project_id == t_project_id,
                     ProjectMessage.idempotency_key == ikey,
                     ProjectMessage.status == "open",
                 )
@@ -1397,12 +1406,12 @@ async def sweep_closed_handmerge_prs(session) -> int:
                 "[REAPER] handmerge-sweep: cleared PR #%s (%s) for task %s",
                 pr_number,
                 resolution,
-                task.id,
+                t_id,
             )
         except Exception as _e:  # noqa: BLE001
             logger.warning(
                 "[REAPER] handmerge-sweep: commit failed for task %s: %s",
-                task.id,
+                t_id,
                 _e,
             )
             with _contextlib.suppress(Exception):

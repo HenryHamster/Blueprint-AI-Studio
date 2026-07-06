@@ -692,7 +692,7 @@ async def agent_fetch_qualification(
                 verdict.finalized_at.isoformat() if verdict.finalized_at else None
             )
 
-        return {
+        out = {
             "candidate_sha": lq.get("candidate_sha") or verdict.candidate_sha,
             "finalized_at": resolved_finalized_at,
             "status": resolved_status,
@@ -715,8 +715,39 @@ async def agent_fetch_qualification(
             **requalification_extra,
         }
 
+        # Surface promotion-failure context: would_promote, promotion_pr_url,
+        # promotion_conflict, promotion_error_detail, promotion_failure_count, and
+        # promotion_pending sub-record. Mirrors _compact_last_qualification logic.
+        if lq.get("would_promote") is not None:
+            out["would_promote"] = lq["would_promote"]
+        if lq.get("promotion_pr_url") is not None:
+            out["promotion_pr_url"] = lq["promotion_pr_url"]
+        if lq.get("promotion_conflict") is not None:
+            out["promotion_conflict"] = lq["promotion_conflict"]
+        if lq.get("promotion_error_detail") is not None:
+            out["promotion_error_detail"] = lq["promotion_error_detail"]
+        if lq.get("promotion_failure_count") is not None:
+            out["promotion_failure_count"] = lq["promotion_failure_count"]
+
+        promotion_pending = lq.get("promotion_pending")
+        if isinstance(promotion_pending, dict):
+            out["promotion_pending"] = {
+                key: promotion_pending.get(key)
+                for key in (
+                    "pr_number",
+                    "pr_url",
+                    "auto_merge_enabled",
+                    "managed_check_wait",
+                    "migration_carrying",
+                    "ci_state",
+                )
+                if promotion_pending.get(key) is not None
+            }
+
+        return out
+
     qual = open_row.last_qualification or {}
-    return {
+    out = {
         "candidate_sha": qual.get("candidate_sha"),
         "finalized_at": qual.get("finalized_at"),
         "status": qual.get("status"),
@@ -737,6 +768,37 @@ async def agent_fetch_qualification(
         "qualification_trigger_state": qualification_trigger_state,
         **requalification_extra,
     }
+
+    # Surface promotion-failure context: would_promote, promotion_pr_url,
+    # promotion_conflict, promotion_error_detail, promotion_failure_count, and
+    # promotion_pending sub-record. Mirrors _compact_last_qualification logic.
+    if qual.get("would_promote") is not None:
+        out["would_promote"] = qual["would_promote"]
+    if qual.get("promotion_pr_url") is not None:
+        out["promotion_pr_url"] = qual["promotion_pr_url"]
+    if qual.get("promotion_conflict") is not None:
+        out["promotion_conflict"] = qual["promotion_conflict"]
+    if qual.get("promotion_error_detail") is not None:
+        out["promotion_error_detail"] = qual["promotion_error_detail"]
+    if qual.get("promotion_failure_count") is not None:
+        out["promotion_failure_count"] = qual["promotion_failure_count"]
+
+    promotion_pending = qual.get("promotion_pending")
+    if isinstance(promotion_pending, dict):
+        out["promotion_pending"] = {
+            key: promotion_pending.get(key)
+            for key in (
+                "pr_number",
+                "pr_url",
+                "auto_merge_enabled",
+                "managed_check_wait",
+                "migration_carrying",
+                "ci_state",
+            )
+            if promotion_pending.get(key) is not None
+        }
+
+    return out
 
 
 @router.get("/projects/{project_id}/version_phase")

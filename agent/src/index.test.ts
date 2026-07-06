@@ -2585,7 +2585,7 @@ describe('setupWorkspace reference-cache reuse', () => {
 
   function findCloneArgs(): string[] {
     const cloneCall = vi.mocked(execFileSync).mock.calls.find(
-      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[])[0] === 'clone',
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('clone'),
     );
     expect(cloneCall).toBeDefined();
     return cloneCall?.[1] as string[];
@@ -2612,6 +2612,21 @@ describe('setupWorkspace reference-cache reuse', () => {
 
     const cloneArgs = findCloneArgs();
     expect(cloneArgs).not.toContain('--reference-if-able');
+  });
+
+  it('setupWorkspace does not embed token in clone URL', async () => {
+    vi.mocked(fs.existsSync).mockReturnValue(false);
+    stubExecFileSyncNoStaleBranch();
+
+    await setupWorkspace('owner', 'repo', 'ghtoken', 'main', 'prefix', 'task-id', null, { value: '' }, 'blueprint');
+
+    const cloneArgs = findCloneArgs();
+    // Clean URL — no x-access-token embedded.
+    const urlArg = cloneArgs[cloneArgs.length - 2]; // second-to-last is the URL
+    expect(urlArg).toBe('https://github.com/owner/repo.git');
+    expect(urlArg).not.toContain('x-access-token');
+    // Credential helper -c flag present.
+    expect(cloneArgs.some(a => a.startsWith('credential.https://github.com.helper='))).toBe(true);
   });
 
   it('registers the sizecap merge driver after configuring user.* git config', async () => {
@@ -2691,6 +2706,46 @@ describe('failure category classification', () => {
 
     expect(caughtError).toBeInstanceOf(Error);
     expect((caughtError as Error & { failureCategory?: string }).failureCategory).toBe('clone_failed');
+  });
+
+  it('pushAndCreatePR does not embed token in remote set-url', async () => {
+    vi.mocked(execFileSync).mockReturnValue('');
+    vi.mocked(spawn).mockImplementation(() => {
+      const proc = {
+        pid: 123,
+        stderr: { on: vi.fn() },
+        stdout: { on: vi.fn() },
+        on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+          if (event === 'close') setImmediate(() => { cb(0); });
+        }),
+        kill: vi.fn(),
+      };
+      return proc as unknown as ReturnType<typeof spawn>;
+    });
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: { token: 'fresh-push-token' } }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({ data: { pr_url: 'https://github.com/owner/repo/pull/1', pr_number: 1 } }),
+      }),
+    );
+
+    await pushAndCreatePR('owner', 'repo', 'task-id', 'blueprint/branch', 'main', 'Title', 'Body', null, { value: '' }, true);
+
+    const setUrlCalls = vi.mocked(execFileSync).mock.calls.filter(
+      c => c[0] === 'git' && Array.isArray(c[1]) && (c[1] as string[]).includes('set-url'),
+    );
+    expect(setUrlCalls.length).toBeGreaterThanOrEqual(1);
+    for (const call of setUrlCalls) {
+      const args = call[1] as string[];
+      const urlInCall = args[args.length - 1];
+      expect(urlInCall).toBe('https://github.com/owner/repo.git');
+      expect(urlInCall).not.toContain('x-access-token');
+      expect(urlInCall).not.toContain('fresh-push-token');
+    }
   });
 
   it('pushAndCreatePR attaches pr_creation_failed when GitHub PR creation returns 403', async () => {
