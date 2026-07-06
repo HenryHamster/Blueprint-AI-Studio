@@ -39,6 +39,14 @@ GITHUB_CLIENT_SECRET = os.getenv("GITHUB_CLIENT_SECRET")
 # connection per API call, which causes "All connection attempts failed" under load.
 _github_client: httpx.AsyncClient | None = None
 
+# Single-flight read coalescing: concurrent bodyless GETs to the identical URL
+# share ONE in-flight request (keyed by ("GET", url)) instead of each hitting
+# GitHub. Safe for every read — a coalesced waiter never sees anything staler
+# than a live request would. Collapses the ~50-VM fan-out that hammers a shared
+# ref (e.g. every rollup parent reading automain's tip in the same sweep), a
+# dominant install-token-budget drain.
+_inflight_reads: dict[tuple[str, str], "asyncio.Future[httpx.Response]"] = {}
+
 
 def _get_client() -> httpx.AsyncClient:
     global _github_client
@@ -132,6 +140,12 @@ async def probe_rate_limit() -> bool:
 # counter increment, no blocked worker, no JWT bucket re-drained.
 RATE_LIMIT_FAST_FAIL_THRESHOLD_S = 5
 
+# Alert once per hourly window when the install-token bucket first drops to this
+# fraction remaining — early warning before the bucket empties and stalls the
+# pipeline. Env-overridable to match the pipeline-health threshold style.
+GITHUB_BUDGET_ALERT_FRACTION = float(os.getenv("GITHUB_BUDGET_ALERT_FRACTION", "0.20"))
+_last_budget_alert_window: int | None = None
+
 
 def _relevant_bucket(url: str, headers: dict | None) -> dict:
     """Identify which shared_state bucket a request belongs to.
@@ -213,6 +227,65 @@ def _update_quota_state(
             _ss.github_call_counts_window_reset_at = reset_ts
     q["last_updated"] = now_iso
 
+    # Budget alert: warn ONCE per hourly window when the install bucket first
+    # crosses <=20% remaining, so an operator sees exhaustion coming instead of
+    # discovering it after the pipeline has already stalled. Window-keyed dedup
+    # (on reset_ts) is self-clearing — a new window can alert again.
+    if (
+        bucket_name == "install"
+        and limit
+        and remaining is not None
+        and reset_ts is not None
+    ):
+        global _last_budget_alert_window
+        if (
+            remaining <= limit * GITHUB_BUDGET_ALERT_FRACTION
+            and reset_ts != _last_budget_alert_window
+        ):
+            _last_budget_alert_window = reset_ts
+            _post_github_budget_alert(remaining, limit, reset_ts)
+
+
+def _post_github_budget_alert(remaining: int, limit: int, reset_ts: int) -> None:
+    """Emit a low-budget alert (structured log + fire-and-forget webhook).
+
+    The install token is a system-global resource (no project scope) and this
+    runs on the sync request hot path with no DB session, so this mirrors
+    ``pipeline_health_state._post_pipeline_alert`` — a structured ``alert`` log
+    plus a detached webhook — rather than a project-scoped ``Alert`` DB row.
+    All dispatch errors are swallowed; a failed alert must never break a request.
+    """
+    pct = (100 * remaining / limit) if limit else 0
+    title = "GitHub install-token budget low"
+    message = (
+        f"{remaining}/{limit} ({pct:.0f}%) install-token budget remaining; "
+        f"resets in {max(0, reset_ts - int(time.time()))}s. Top burn endpoints: "
+        f"see github_call_counts on /api/health/detailed."
+    )
+    logger.error(
+        title,
+        extra={
+            "alert": True,
+            "type": "github_budget",
+            "remaining": remaining,
+            "limit": limit,
+            "reset_at": reset_ts,
+        },
+    )
+    try:
+        from app.notification import _send_webhook_notification
+
+        # Detached — webhook is fire-and-forget; RuntimeError => no running loop
+        # (sync test), which correctly skips dispatch (log-only).
+        loop = asyncio.get_running_loop()
+        loop.create_task(  # noqa: RUF006
+            _send_webhook_notification("GITHUB_BUDGET_LOW", title, message)
+        )
+    except RuntimeError:
+        pass
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[GITHUB] budget alert webhook dispatch skipped: {e}")
+
 
 def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
     """Return a 403 rate-limited response without making a network call.
@@ -237,6 +310,54 @@ def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:
 
 
 async def _github_request(
+    method: str,
+    url: str,
+    headers: dict,
+    max_retries: int = 3,
+    project_id: str | None = None,
+    **kwargs,
+) -> httpx.Response:
+    """Coalescing dispatcher in front of :func:`_github_request_uncoalesced`.
+
+    Bodyless GETs (side-effect-free reads) to the identical URL collapse to ONE
+    in-flight request via ``_inflight_reads``; every other method — and any GET
+    carrying a body (json/data/content) — runs uncoalesced. The get-or-create of
+    the in-flight entry contains NO ``await``, so on the single-threaded event
+    loop two concurrent callers can never both launch the same read (the load-
+    bearing invariant). The shared task is detached (``ensure_future``), so a
+    caller cancelled by its own timeout does not cancel the request other waiters
+    depend on; the done-callback pops the key on success AND failure, so a failed
+    read is never memoized past its in-flight window.
+    """
+    if (
+        method.upper() != "GET"
+        or "json" in kwargs
+        or "data" in kwargs
+        or "content" in kwargs
+    ):
+        return await _github_request_uncoalesced(
+            method, url, headers, max_retries, project_id, **kwargs
+        )
+    key = ("GET", url)
+    existing = _inflight_reads.get(key)
+    if existing is not None:
+        import app.shared_state as _ss
+
+        _ss.github_cache_hits["read_singleflight"] = (
+            _ss.github_cache_hits.get("read_singleflight", 0) + 1
+        )
+        return await existing
+    task = asyncio.ensure_future(
+        _github_request_uncoalesced(
+            method, url, headers, max_retries, project_id, **kwargs
+        )
+    )
+    _inflight_reads[key] = task
+    task.add_done_callback(lambda t: _inflight_reads.pop(key, None))
+    return await task
+
+
+async def _github_request_uncoalesced(
     method: str,
     url: str,
     headers: dict,

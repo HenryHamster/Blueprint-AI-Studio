@@ -4508,3 +4508,124 @@ async def test_get_open_pull_requests_mid_pagination_error_returns_partial(mocke
     assert call_pages == [1, 2, 3], (
         f"expected 3 page requests (last fails), got {call_pages}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Single-flight read coalescing + install-token budget alert
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_singleflight_coalesces_concurrent_identical_gets(mocker):
+    """N concurrent bodyless GETs to the identical URL collapse to ONE underlying
+    request — the 50-VM-hit-the-same-ref fan-out that drains the token budget."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        await asyncio.sleep(0.02)  # hold the flight open so peers coalesce
+        return MockResponse(200, json_data={"sha": "abc"})
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    results = await asyncio.gather(
+        *[github._github_request("GET", "https://api.github.com/x", {}) for _ in range(6)]
+    )
+
+    assert calls["n"] == 1, "concurrent identical GETs must share one request"
+    assert all(r.status_code == 200 for r in results)
+    assert github._inflight_reads == {}, "in-flight key must be popped on completion"
+
+
+@pytest.mark.asyncio
+async def test_singleflight_distinct_urls_not_coalesced(mocker):
+    """Different URLs are different logical reads — each hits GitHub."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        await asyncio.sleep(0.01)
+        return MockResponse(200)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request("GET", "https://api.github.com/a", {}),
+        github._github_request("GET", "https://api.github.com/b", {}),
+    )
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_singleflight_non_get_not_coalesced(mocker):
+    """Mutating methods (and body-carrying GETs) are never coalesced."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+
+    async def _fake(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        await asyncio.sleep(0.01)
+        return MockResponse(201)
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _fake)
+    await asyncio.gather(
+        github._github_request("POST", "https://api.github.com/x", {}, json={"a": 1}),
+        github._github_request("POST", "https://api.github.com/x", {}, json={"a": 1}),
+    )
+    assert calls["n"] == 2
+
+
+@pytest.mark.asyncio
+async def test_singleflight_failure_pops_key_and_reissues(mocker):
+    """A failed read is never memoized: it re-raises, and the next call re-issues a
+    fresh request (the key is popped on failure too)."""
+    import app.github as github
+
+    github._inflight_reads.clear()
+    calls = {"n": 0}
+
+    async def _boom(method, url, headers, max_retries=3, project_id=None, **kw):
+        calls["n"] += 1
+        raise RuntimeError("network down")
+
+    mocker.patch.object(github, "_github_request_uncoalesced", _boom)
+    with pytest.raises(RuntimeError):
+        await github._github_request("GET", "https://api.github.com/x", {})
+    assert github._inflight_reads == {}
+    with pytest.raises(RuntimeError):
+        await github._github_request("GET", "https://api.github.com/x", {})
+    assert calls["n"] == 2, "failure must not be cached — second call re-issues"
+
+
+@pytest.mark.asyncio
+async def test_github_budget_alert_fires_once_per_window(mocker):
+    """The install-budget alert fires the first time <=20% is crossed in a window
+    and dedups within it; a new reset window can alert again."""
+    import app.github as github
+
+    github._last_budget_alert_window = None
+    spy = mocker.patch.object(github, "_post_github_budget_alert")
+
+    github._update_quota_state(750, 5000, 1000, bucket_name="install")  # 15%
+    github._update_quota_state(600, 5000, 1000, bucket_name="install")  # same window
+    assert spy.call_count == 1, "one alert per window despite repeated low reads"
+
+    github._update_quota_state(700, 5000, 2000, bucket_name="install")  # new window
+    assert spy.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_github_budget_alert_silent_above_threshold(mocker):
+    """No alert while budget is healthy (>20%)."""
+    import app.github as github
+
+    github._last_budget_alert_window = None
+    spy = mocker.patch.object(github, "_post_github_budget_alert")
+    github._update_quota_state(4000, 5000, 3000, bucket_name="install")  # 80%
+    assert spy.call_count == 0
