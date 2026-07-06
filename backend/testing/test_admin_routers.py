@@ -26815,6 +26815,151 @@ class TestStrategicPendingConfirmDedup:
         assert "cap" in resp.text.lower() or str(PENDING_USER_CONFIRMATION_MAX) in resp.text
 
 
+class TestRecordFindingResolutionViaStrategicOp:
+    """POST /api/agent/strategic op=record_finding_resolution — finding ledger write."""
+
+    async def _make_strategic_task(self, db_session, project, vm="vm-finding-res"):
+        task = Task(
+            project_id=project.id,
+            title="Strategic review for finding resolution",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "strategic_review", "prompt": "review"}],
+            vm_instance_id=vm,
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        from app.auth import create_agent_token
+
+        token = create_agent_token(str(task.id), vm, task_type="strategic_review")
+        return task, token
+
+    @pytest.mark.asyncio
+    async def test_strategic_op_records_finding_resolution(
+        self, client: AsyncClient, db_session
+    ):
+        """A strategic_review task posting record_finding_resolution writes an
+        AuditFindingResolution ledger row for the open version."""
+        from app.models import AuditFindingResolution
+
+        project = await _make_project(db_session)
+        version = await _make_open_version(db_session, project.id)
+        task, token = await self._make_strategic_task(db_session, project)
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "record_finding_resolution",
+                "data": {
+                    "finding_key": "acaa610d12345678",
+                    "state": "resolved",
+                    "severity": "medium",
+                    "note": "Fixed in PR #100",
+                    "resolving_ref": "abc123",
+                },
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["status"] == "ok"
+        assert body["op"] == "record_finding_resolution"
+        assert body["finding_key"] == "acaa610d12345678"
+        assert body["state"] == "resolved"
+        assert body["release_version_id"] == str(version.id)
+
+        row = (
+            (
+                await db_session.execute(
+                    select(AuditFindingResolution).where(
+                        AuditFindingResolution.release_version_id == version.id,
+                        AuditFindingResolution.finding_key == "acaa610d12345678",
+                    )
+                )
+            )
+            .scalars()
+            .first()
+        )
+        assert row is not None
+        assert row.state == "resolved"
+        assert row.note == "Fixed in PR #100"
+
+    @pytest.mark.asyncio
+    async def test_invalid_state_returns_400(self, client: AsyncClient, db_session):
+        """An unrecognized state value is rejected with 400."""
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+        task, token = await self._make_strategic_task(
+            db_session, project, vm="vm-bad-state"
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "record_finding_resolution",
+                "data": {"finding_key": "acaa610d12345678", "state": "bogus"},
+            },
+        )
+        assert resp.status_code == 400, resp.text
+        assert "state" in resp.text.lower() or "bogus" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_strategic_task_type_returns_403(
+        self, client: AsyncClient, db_session
+    ):
+        """A non-strategic task type (create) cannot call record_finding_resolution."""
+        from app.auth import create_agent_token
+
+        project = await _make_project(db_session)
+        await _make_open_version(db_session, project.id)
+        task = Task(
+            project_id=project.id,
+            title="Non-strategic task",
+            status=TaskStatus.IN_PROGRESS,
+            payloads=[{"type": "create", "prompt": "build"}],
+            vm_instance_id="vm-nonstrat-fr",
+        )
+        db_session.add(task)
+        await db_session.commit()
+        await db_session.refresh(task)
+        token = create_agent_token(
+            str(task.id), "vm-nonstrat-fr", task_type="create"
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "record_finding_resolution",
+                "data": {"finding_key": "acaa610d12345678", "state": "resolved"},
+            },
+        )
+        assert resp.status_code == 403, resp.text
+
+    @pytest.mark.asyncio
+    async def test_no_open_version_returns_409(self, client: AsyncClient, db_session):
+        """When no open release version exists, the op returns 409."""
+        project = await _make_project(db_session)
+        task, token = await self._make_strategic_task(
+            db_session, project, vm="vm-no-version"
+        )
+
+        resp = await client.post(
+            "/api/agent/strategic",
+            headers={"x-agent-token": token},
+            json={
+                "task_id": str(task.id),
+                "op": "record_finding_resolution",
+                "data": {"finding_key": "acaa610d12345678", "state": "stale"},
+            },
+        )
+        assert resp.status_code == 409, resp.text
+
+
 # ── Strategic op inventory parity test ────────────────────────────────────────
 # Asserts that every op in STRATEGIC_AGENT_OPS has a real elif handler in
 # admin_agent_ops.py. This is a standalone (no-DB) test so it can run in the

@@ -19378,6 +19378,165 @@ async def test_keyless_blocker_consumed_marker_does_not_block_new_head(
 
 
 @pytest.mark.asyncio
+async def test_auto_stale_file_anchored_finding_not_staled_when_file_unchanged(
+    db_session, mocker
+):
+    """File-anchored audit finding is NOT auto-staled when its file did not
+    change between the not_promoted candidate SHA and the new automain HEAD.
+
+    This is the acceptance test for the fix that prevents _auto_stale_not_promoted_findings
+    from blindly staleing every unresolved finding on any automain advance —
+    previously the sweep marked ALL findings stale even when the flagged file was
+    completely untouched by the new commits, triggering a needless re-audit cycle.
+
+    The test stores a real QualificationVerdict row (the 'merge-test verdict'
+    required by the acceptance gate) and exercises the production code path
+    through _auto_stale_not_promoted_findings without mocking that function.
+    """
+    from app.models import AuditFindingResolution, QualificationVerdict
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha9" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    # Seed a real QualificationVerdict row (the merge-test verdict).
+    verdict_row = QualificationVerdict(
+        project_id=project.id,
+        release_version_id=version.id,
+        candidate_sha=old_sha,
+        confidence=0.41,
+        would_promote=False,
+        promotion_enabled=False,
+        terminal_status="not_promoted",
+        blocker="below_threshold",
+        audit_findings=[
+            {
+                "key": "FILE_ANCHORED_FINDING",
+                "severity": "high",
+                "summary": "Leaked credential in config",
+                "file": "backend/app/config.py",
+            },
+        ],
+    )
+    db_session.add(verdict_row)
+    await db_session.commit()
+
+    # automain HEAD has advanced past the candidate SHA.
+    new_sha = "newhead9" * 5
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    # The changed files between old_sha and new_sha do NOT include the finding's file.
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(return_value=["backend/app/other_module.py", "README.md"]),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No stale row written: finding's file did not change, so it may still be live.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert ledger_rows == [], (
+        f"expected no stale rows when finding file unchanged; got {ledger_rows}"
+    )
+
+    # No re-drive: the finding was not cleared, so requalification is not ready.
+    assert count == 0
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "not_promoted"
+
+
+@pytest.mark.asyncio
+async def test_auto_stale_file_anchored_finding_staled_when_file_changed(
+    db_session, mocker
+):
+    """File-anchored audit finding IS auto-staled when its file changed between
+    the not_promoted candidate SHA and the new automain HEAD.
+
+    Companion test to test_auto_stale_file_anchored_finding_not_staled_when_file_unchanged:
+    when the finding's file IS in the changed-file set, the sweep must stale it
+    and re-drive the qualification as before.
+    """
+    from app.models import AuditFindingResolution
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    old_sha = "oldsha8" * 5 + "0000000"
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": old_sha,
+        "blocker": "below_threshold",
+        "audit_findings": [
+            {
+                "key": "FILE_CHANGED_FINDING",
+                "severity": "high",
+                "summary": "SQL injection in query builder",
+                "file": "backend/app/query.py",
+            },
+        ],
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    new_sha = "newhead8" * 5
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock(automain=new_sha))
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+    # The changed files include the finding's file.
+    mocker.patch(
+        "app.github.get_files_changed_between_refs",
+        new=AsyncMock(
+            return_value=["backend/app/query.py", "backend/app/other_module.py"]
+        ),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+
+    # Stale row written for the finding whose file changed.
+    ledger_rows = list(
+        (
+            await db_session.execute(
+                select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(ledger_rows) == 1
+    assert ledger_rows[0].finding_key == "FILE_CHANGED_FINDING"
+    assert ledger_rows[0].state == "stale"
+
+    # Re-drive fired: fresh qualification spawned.
+    assert count == 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_zero_gating_ready_version(db_session, mocker):
     """A stabilize-phase version with not_promoted verdict, a non-audit blocker,
     ZERO carried high/medium audit findings, and automain advanced to a new SHA
@@ -29787,11 +29946,16 @@ async def test_apply_finding_resolution_rejects_bad_state(db_session):
 
 
 @pytest.mark.asyncio
-async def test_requalification_truncated_findings_never_ready(db_session):
-    """When the carried list was clipped at the cap, readiness stays conservative.
+async def test_requalification_truncated_all_resolved_is_ready(db_session):
+    """A truncated list with every VISIBLE gating finding resolved is ready.
 
-    Even with every VISIBLE gating finding resolved, a truncated list cannot
-    assert ready — there may be unseen gating findings.
+    The carried list was clipped at the cap, but blocking forever on a
+    truncated-but-fully-resolved list permanently wedges the auto-redrive —
+    a fresh qualification run re-scores the full finding set anyway.  The
+    reason carries the re-score caveat, and ``audit_findings_truncated``
+    stays surfaced.  Truncated with UNRESOLVED visible gating findings
+    remains not-ready (unit-covered by test_truncated_partial_resolved_not_ready
+    in test_release_readiness.py).
     """
     from app import release_readiness as rr
 
@@ -29810,8 +29974,9 @@ async def test_requalification_truncated_findings_never_ready(db_session):
 
     out = await rr.compute_requalification_readiness(db_session, project.id)
     assert out["audit_findings_truncated"] is True
-    assert out["requalification_ready"] is False
+    assert out["requalification_ready"] is True
     assert "truncated" in out["reason"].lower()
+    assert "re-score" in out["reason"].lower()
 
 
 @pytest.mark.asyncio

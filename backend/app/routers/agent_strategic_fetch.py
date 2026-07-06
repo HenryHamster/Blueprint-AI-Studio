@@ -575,6 +575,10 @@ async def agent_fetch_qualification(
     requalification_extra: dict = {
         "requalification_ready": None,
         "finding_resolution": [],
+        "audit_findings_truncated": None,
+        "requalification_readiness_reason": None,
+        "gating_total": None,
+        "gating_resolved": None,
     }
     try:
         from app.release_readiness import (  # noqa: PLC0415
@@ -587,6 +591,12 @@ async def agent_fetch_qualification(
             # Per-finding resolution view: each gating carried finding's key,
             # severity, summary, and resolution state (resolved|stale|unresolved).
             "finding_resolution": readiness["findings"],
+            # Truncation and progress context so the strategist can understand
+            # why re-qualification is blocked (e.g. truncated + unresolved).
+            "audit_findings_truncated": readiness["audit_findings_truncated"],
+            "requalification_readiness_reason": readiness["reason"],
+            "gating_total": readiness["gating_total"],
+            "gating_resolved": readiness["gating_resolved"],
         }
     except Exception:
         logger.exception(

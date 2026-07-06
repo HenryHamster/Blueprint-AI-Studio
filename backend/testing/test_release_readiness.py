@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from app.release_readiness import (
     _annotate_regime,
+    _compute_requalification_decision,
     PROMOTION_READINESS_METRIC_MANIFEST,
     _READINESS_LIVE_REGIME_NOTE,
 )
@@ -160,3 +161,101 @@ class TestOpenVersionEnrichmentParity:
         assert dry["live_regime_calibration_artifact"] is False
         # A consumer can now tell them apart without any external lookup.
         assert live["live_regime_calibration_artifact"] != dry["live_regime_calibration_artifact"]
+
+
+class TestComputeRequalificationDecision:
+    """Unit tests for the pure requalification readiness decision function.
+
+    Exercises _compute_requalification_decision (sync, no DB) which is the
+    logic that was previously inlined in compute_requalification_readiness.
+    The key regression is the truncated-but-fully-resolved wedge (all visible
+    gating findings resolved, truncated=True) — this used to force ready=False
+    forever, permanently blocking the auto-redrive.
+    """
+
+    def _finding(self, key: str, severity: str = "medium") -> dict:
+        return {"key": key, "severity": severity, "summary": f"Finding {key}"}
+
+    # ── core wedge fix ──────────────────────────────────────────────────────
+
+    def test_truncated_all_resolved_is_ready(self):
+        """Truncated verdict + all visible gating findings resolved → ready=True.
+
+        This is the v22 wedge: 12 findings at the cap, all resolved in the
+        ledger, but truncated=True permanently blocked re-qualification.
+        """
+        carried = [self._finding("k1"), self._finding("k2", "high")]
+        ledger = {"k1": "resolved", "k2": "stale"}
+        result = _compute_requalification_decision(
+            carried, truncated=True, ledger_states=ledger, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is True
+        assert result["audit_findings_truncated"] is True
+        assert result["gating_total"] == 2
+        assert result["gating_resolved"] == 2
+        assert "re-qualification will re-score" in result["reason"]
+
+    def test_truncated_partial_resolved_not_ready(self):
+        """Truncated verdict with unresolved visible gating findings → ready=False."""
+        carried = [self._finding("k1"), self._finding("k2")]
+        ledger = {"k1": "resolved"}  # k2 missing → unresolved
+        result = _compute_requalification_decision(
+            carried, truncated=True, ledger_states=ledger, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is False
+        assert result["audit_findings_truncated"] is True
+        assert result["gating_resolved"] == 1
+        assert result["gating_total"] == 2
+        assert "partial list" in result["reason"]
+
+    # ── non-truncated behavior unchanged ────────────────────────────────────
+
+    def test_not_truncated_all_resolved_is_ready(self):
+        carried = [self._finding("k1", "high")]
+        result = _compute_requalification_decision(
+            carried, truncated=False, ledger_states={"k1": "resolved"}, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is True
+        assert result["audit_findings_truncated"] is False
+
+    def test_not_truncated_unresolved_not_ready(self):
+        carried = [self._finding("k1")]
+        result = _compute_requalification_decision(
+            carried, truncated=False, ledger_states={}, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is False
+        assert "unresolved" in result["reason"]
+
+    def test_no_gating_findings_ready(self):
+        """Low-severity findings only → gating_total=0 → ready regardless of truncation."""
+        carried = [{"key": "k", "severity": "low", "summary": "s"}]
+        result = _compute_requalification_decision(
+            carried, truncated=False, ledger_states={}, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is True
+        assert result["gating_total"] == 0
+
+    def test_keyless_finding_uses_sentinel(self):
+        """A finding without a key resolves via the __keyless__ sentinel."""
+        carried = [{"severity": "medium", "summary": "no key"}]
+        ledger = {"__keyless__": "resolved"}
+        result = _compute_requalification_decision(
+            carried, truncated=False, ledger_states=ledger, open_version_id="vid"
+        )
+        assert result["requalification_ready"] is True
+        assert result["findings"][0]["key"] == "__keyless__"
+
+    def test_result_shape(self):
+        """Return dict always carries all expected keys."""
+        result = _compute_requalification_decision([], False, {}, "test-version-id")
+        for key in (
+            "requalification_ready",
+            "open_version_id",
+            "audit_findings_truncated",
+            "gating_total",
+            "gating_resolved",
+            "reason",
+            "findings",
+        ):
+            assert key in result, f"missing key: {key}"
+        assert result["open_version_id"] == "test-version-id"

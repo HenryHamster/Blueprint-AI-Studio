@@ -89,6 +89,8 @@ export const STRATEGIC_OPS_REGISTRY: readonly StrategicOpEntry[] = [
     description: 'Record evidence-progress verdicts (gated by the challenge).' },
   { op: 'set_acceptance_criteria', alias: 'set-acceptance-criteria', cli: true, prompt: true, internalReason: null,
     description: 'Author acceptance criteria for a direction/task.' },
+  { op: 'record_finding_resolution', alias: 'record-finding-resolution', cli: true, prompt: true, internalReason: null,
+    description: 'Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.' },
   // ── Internal-only / auto-invoked backend ops (deliberately NOT on the CLI or
   //    resident prompt). They are accepted by the dispatch chain but are invoked
   //    programmatically by the one-shot cycle / operator seams, never as a

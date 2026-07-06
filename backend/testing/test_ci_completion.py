@@ -5423,3 +5423,231 @@ def test_arm_ci_wait_asserts_pr_number_present():
         arm_ci_wait({}, pr_number=0, now_iso="t")
     with pytest.raises(AssertionError):
         arm_ci_wait({}, pr_number=None, now_iso="t")
+
+
+# ---------------------------------------------------------------------------
+# Auto-resolve audit findings on merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolves_finding_keys_on_orig_task(db_session, mocker):
+    """When the original (fix) task carries resolving_finding_keys and a PR
+    merges, apply_finding_resolution must write resolved ledger rows for the
+    open ReleaseVersion.  Exercises the primary path inside _orig_session."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution, ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Auto-resolve finding merge test", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Open release version for the project (required for auto-resolve).
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    finding_key_a = "abcd1234abcd1234"
+    finding_key_b = "ef567890ef567890"
+
+    # Original fix task carries the finding keys to resolve on merge.
+    orig_task = Task(
+        project_id=project.id,
+        title="Fix task for audit findings",
+        payloads=[{"type": "fix", "prompt": "fix the finding"}],
+        context={"resolving_finding_keys": [finding_key_a, finding_key_b]},
+        vm_instance_id=f"agent-vm-orig-resolve-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    # CI parking task that will trigger the merge.
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # The auto-resolve writes run in the _orig_session (dedicated session).
+    # Read the committed rows back through the test session.
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    resolved_keys = {r.finding_key for r in rows}
+    assert finding_key_a in resolved_keys, (
+        "finding_key_a must be marked resolved after merge"
+    )
+    assert finding_key_b in resolved_keys, (
+        "finding_key_b must be marked resolved after merge"
+    )
+    for row in rows:
+        assert row.state == "resolved"
+        assert row.project_id == project.id
+        assert row.release_version_id == version.id
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolve_skips_when_no_open_version(db_session, mocker):
+    """When the orig task has resolving_finding_keys but no open ReleaseVersion
+    exists for the project, the auto-resolve silently skips without error."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="Auto-resolve no version", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # No open ReleaseVersion — auto-resolve must skip gracefully.
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Fix task — no open version",
+        payloads=[{"type": "fix", "prompt": "fix something"}],
+        context={"resolving_finding_keys": ["deadbeefdeadbeef"]},
+        vm_instance_id=f"agent-vm-orig-nov-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    # Merge must still succeed — no open version must not block the merge.
+    assert result is True
+    assert task.status == TaskStatus.COMPLETED
+
+    # No AuditFindingResolution rows should have been written.
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.project_id == project.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0, (
+        "No finding-resolution rows must be written when no open version exists"
+    )
+
+
+@pytest.mark.asyncio
+async def test_merge_auto_resolve_no_keys_writes_no_rows(db_session, mocker):
+    """When the orig task has no resolving_finding_keys, no AuditFindingResolution
+    rows are written — existing behavior is unchanged for ordinary fix tasks."""
+    from sqlmodel import select as _select
+
+    from app.ci_completion import _attempt_merge_with_retry_and_escalation
+    from app.models import AuditFindingResolution, ReleaseVersion
+
+    mocker.patch("app.alert_dispatch._maybe_create_failure_alert", return_value=None)
+    mocker.patch("app.github.create_pr_comment", return_value=None)
+    mocker.patch(
+        "app.github.merge_pull_request",
+        return_value={"merged": True},
+    )
+
+    project = Project(name="No keys — no rows", user_id="test-user")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = ReleaseVersion(
+        project_id=project.id, version_number=1, status="open"
+    )
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    orig_task = Task(
+        project_id=project.id,
+        title="Ordinary fix task (no finding keys)",
+        payloads=[{"type": "fix", "prompt": "fix something"}],
+        context={},  # No resolving_finding_keys
+        vm_instance_id=f"agent-vm-orig-nokeys-{uuid.uuid4().hex[:8]}",
+        status=TaskStatus.EVALUATING,
+    )
+    db_session.add(orig_task)
+    await db_session.commit()
+    await db_session.refresh(orig_task)
+
+    task = _make_task(
+        db_session,
+        project,
+        ci_loop_extra={"original_task_id": str(orig_task.id)},
+    )
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    result = await _attempt_merge_with_retry_and_escalation(
+        task, "fake-token", "owner", "repo", db_session, source="poll"
+    )
+
+    assert result is True
+    rows = (
+        (
+            await db_session.execute(
+                _select(AuditFindingResolution).where(
+                    AuditFindingResolution.release_version_id == version.id
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 0, "No AuditFindingResolution rows expected for task without keys"

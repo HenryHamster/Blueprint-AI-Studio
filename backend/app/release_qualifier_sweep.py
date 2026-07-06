@@ -714,6 +714,34 @@ async def _auto_stale_not_promoted_findings(
         if not gating_findings:
             return 0
 
+        # When HEAD has advanced and at least one gating finding is file-anchored,
+        # fetch the files changed between candidate_sha and head_sha.  We only
+        # auto-stale file-anchored findings whose file actually changed — staleing a
+        # finding whose file is untouched would force a needless re-audit cycle on
+        # every automain merge, burning audit tokens even when none of the flagged
+        # code was touched.  Findings without a file field have no code anchor so
+        # they are staled unconditionally when HEAD advances.
+        changed_files: "set[str] | None" = None
+        if head_advanced and any(
+            str(f.get("file") or "").strip() for f in gating_findings
+        ):
+            raw_files = await github.get_files_changed_between_refs(
+                token, owner, repo, candidate_sha, head_sha
+            )
+            if raw_files is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] auto_stale: cannot determine changed "
+                    "files between %s and %s for version %s — skipping "
+                    "file-anchored stales this cycle",
+                    candidate_sha[:12],
+                    head_sha[:12],
+                    version_id,
+                )
+                # Leave changed_files as None to signal: skip file-anchored
+                # findings this cycle; next sweep will retry.
+            else:
+                changed_files = set(raw_files)
+
         # Load existing ledger keys for this version (idempotency — skip any
         # finding that already has a row so operator 'resolved' entries are
         # never overwritten).
@@ -748,6 +776,16 @@ async def _auto_stale_not_promoted_findings(
             # the finding was a false positive.
             if not head_advanced and key != _KEYLESS_FINDING_SENTINEL:
                 continue
+            # File-anchored findings: only stale when the finding's specific file
+            # changed between candidate_sha and head_sha.  If we could not
+            # determine the changed-file set (API error), skip this cycle so the
+            # next sweep can retry rather than staling still-live findings.
+            finding_file = str(f.get("file") or "").strip()
+            if head_advanced and finding_file:
+                if changed_files is None:
+                    continue  # API error; retry next sweep
+                if finding_file not in changed_files:
+                    continue  # File unchanged; finding may still be live
             note = (
                 "auto-staled: automain advanced past not_promoted candidate SHA"
                 if head_advanced

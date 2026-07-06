@@ -159,6 +159,7 @@ STRATEGIC_AGENT_OPS: frozenset[str] = frozenset({
     "set_retirement_critiques",
     "set_evidence_progress",
     "set_acceptance_criteria",
+    "record_finding_resolution",
 })
 
 
@@ -4599,6 +4600,57 @@ async def strategic_operation(
             }
         )
 
+    elif payload.op == "record_finding_resolution":
+        if not isinstance(data, dict):
+            raise HTTPException(
+                status_code=400, detail="record_finding_resolution data must be an object"
+            )
+        finding_key = str(data.get("finding_key") or "").strip()
+        state = str(data.get("state") or "").strip()
+        # Coerce optional fields to str before they reach the model columns —
+        # the dedicated endpoint gets this typing from AuditFindingResolutionOp,
+        # but this arm receives untyped JSON (e.g. severity: 5).
+        severity = str(data.get("severity") or "").strip() or None
+        note = str(data.get("note") or "").strip() or None
+        resolving_ref = str(data.get("resolving_ref") or "").strip() or None
+        verified_against_sha = str(data.get("verified_against_sha") or "").strip() or None
+        task_type = token.get("task_type")
+        resolution_version_id = await _apply_finding_resolution_write(
+            session,
+            task,
+            project.id,
+            finding_key,
+            state,
+            task_type,
+            severity=severity,
+            note=note,
+            resolving_ref=resolving_ref,
+            verified_against_sha=verified_against_sha,
+        )
+        ctx = task.context or {}
+        task.context = {**ctx, "_strategic_api_called": True}
+        flag_modified(task, "context")
+        session.add(task)
+        await session.commit()
+        logger.info(
+            "[STRATEGIC API] record_finding_resolution: task %s marked finding '%s' as '%s' "
+            "for project %s version %s",
+            task.id,
+            finding_key,
+            state,
+            project.id,
+            resolution_version_id,
+        )
+        return _resp(
+            {
+                "status": "ok",
+                "op": "record_finding_resolution",
+                "finding_key": finding_key,
+                "state": state,
+                "release_version_id": str(resolution_version_id),
+            }
+        )
+
     else:
         raise HTTPException(status_code=400, detail=f"Unknown op: {payload.op}")
 
@@ -4625,6 +4677,82 @@ _VALID_RESOLUTION_STATES: frozenset[str] = frozenset({"resolved", "stale"})
 _AUDIT_BOUND_VERSION_TASK_TYPES: frozenset[str] = frozenset(
     {"release_audit", "release_audit_challenge"}
 )
+
+
+async def _apply_finding_resolution_write(
+    session: AsyncSession,
+    task: Task,
+    project_id: uuid.UUID,
+    finding_key: str,
+    state: str,
+    task_type: str | None,
+    severity: str | None = None,
+    note: str | None = None,
+    resolving_ref: str | None = None,
+    verified_against_sha: str | None = None,
+) -> uuid.UUID:
+    """Validate, version-bind, and apply an audit finding resolution.
+
+    Shared by both the dedicated ``/api/agent/audit-finding-resolution``
+    endpoint and the ``record_finding_resolution`` strategic op dispatch
+    branch. Raises HTTPException on validation or version-binding failure.
+    Returns the resolution_version_id on success; the caller must commit.
+    """
+    if state not in _VALID_RESOLUTION_STATES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid state '{state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
+        )
+    if not finding_key or len(finding_key) > 64:
+        raise HTTPException(
+            status_code=400,
+            detail="finding_key is required and must be at most 64 characters",
+        )
+    from app.release_version import current_open_version  # noqa: PLC0415
+
+    open_version = await current_open_version(session, project_id)
+    if open_version is None:
+        raise HTTPException(status_code=409, detail="No open release version")
+    resolution_version_id = open_version.id
+    # release_audit and release_audit_challenge tasks carry a stable
+    # release_version_id in their context (stamped at spawn time). Use that
+    # binding to attribute the resolution to the correct version, and reject
+    # the write if the task's bound version is no longer the open one — an
+    # older candidate must not mark findings resolved on a later open version.
+    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
+        bound_str = (task.context or {}).get("release_version_id")
+        if bound_str:
+            try:
+                bound_id = uuid.UUID(bound_str)
+            except (ValueError, AttributeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid release_version_id in task context",
+                )
+            if bound_id != open_version.id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Task is bound to release version {bound_id} "
+                        f"but the current open version is {open_version.id}; "
+                        "resolution rejected to prevent cross-version attribution"
+                    ),
+                )
+            resolution_version_id = bound_id
+    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
+
+    await apply_finding_resolution(
+        session,
+        project_id,
+        resolution_version_id,
+        finding_key,
+        state,
+        severity=severity,
+        note=note,
+        resolving_ref=resolving_ref,
+        verified_against_sha=verified_against_sha,
+    )
+    return resolution_version_id
 
 
 class AuditFindingResolutionOp(BaseModel):
@@ -4658,69 +4786,20 @@ async def agent_audit_finding_resolution(
             ),
         )
 
-    if payload.state not in _VALID_RESOLUTION_STATES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid state '{payload.state}'; must be one of {sorted(_VALID_RESOLUTION_STATES)}",
-        )
-
-    if not payload.finding_key or len(payload.finding_key) > 64:
-        raise HTTPException(
-            status_code=400,
-            detail="finding_key is required and must be at most 64 characters",
-        )
-
     task = await session.get(Task, payload.task_id)
     if not task:
         raise HTTPException(status_code=404, detail="Task not found")
 
     project = await _lock_project_or_429(session, task.project_id)
-
-    from app.release_version import current_open_version  # noqa: PLC0415
-
-    open_version = await current_open_version(session, project.id)
-    if open_version is None:
-        raise HTTPException(
-            status_code=409,
-            detail="No open release version",
-        )
-
-    # release_audit and release_audit_challenge tasks carry a stable
-    # release_version_id in their context (stamped at spawn time).  Use that
-    # binding to attribute the resolution to the correct version, and reject
-    # the write if the task's bound version is no longer the open one — an
-    # older candidate must not mark findings resolved on a later open version.
     task_type = token.get("task_type")
-    resolution_version_id = open_version.id
-    if task_type in _AUDIT_BOUND_VERSION_TASK_TYPES:
-        bound_str = (task.context or {}).get("release_version_id")
-        if bound_str:
-            try:
-                bound_id = uuid.UUID(bound_str)
-            except (ValueError, AttributeError):
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid release_version_id in task context",
-                )
-            if bound_id != open_version.id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Task is bound to release version {bound_id} "
-                        f"but the current open version is {open_version.id}; "
-                        "resolution rejected to prevent cross-version attribution"
-                    ),
-                )
-            resolution_version_id = bound_id
 
-    from app.release_readiness import apply_finding_resolution  # noqa: PLC0415
-
-    await apply_finding_resolution(
+    resolution_version_id = await _apply_finding_resolution_write(
         session,
+        task,
         project.id,
-        resolution_version_id,
         payload.finding_key,
         payload.state,
+        task_type,
         severity=payload.severity,
         note=payload.note,
         resolving_ref=payload.resolving_ref,

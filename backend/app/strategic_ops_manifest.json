@@ -160,6 +160,14 @@
     "internal_reason": null
   },
   {
+    "op": "record_finding_resolution",
+    "alias": "record-finding-resolution",
+    "description": "Record a carried audit finding as resolved or code-verified stale in the re-qualification resolution ledger.",
+    "cli": true,
+    "prompt": true,
+    "internal_reason": null
+  },
+  {
     "op": "decide_churn_retirement",
     "alias": null,
     "description": "Decide keep/retire for a direction the churn/zombie ladder paused pending review.",

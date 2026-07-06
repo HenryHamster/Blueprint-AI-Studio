@@ -938,6 +938,92 @@ async def _has_active_promotion_ci_remediation(
     return False
 
 
+def _compute_requalification_decision(
+    carried: list[dict[str, Any]],
+    truncated: bool,
+    ledger_states: dict[str, str],
+    open_version_id: str,
+) -> dict[str, Any]:
+    """Pure re-qualification readiness decision (no I/O; testable without a DB).
+
+    ``ledger_states`` maps finding_key → resolution state string (e.g. "resolved",
+    "stale"). Any key absent from the map is treated as "unresolved".
+
+    Truncation-safe: when ``truncated`` is True, the carried list was clipped at
+    the cap and hidden findings may exist. If ALL visible gating findings are
+    resolved we still allow re-qualification — a fresh run re-scores the full set.
+    Blocking forever on a truncated-but-fully-resolved list permanently wedges the
+    auto-redrive (see compute_requalification_readiness for context).
+    """
+    gating: list[dict[str, Any]] = []
+    for f in carried:
+        if not isinstance(f, dict):
+            continue
+        severity = str(f.get("severity") or "").lower()
+        if severity not in _REQUALIFICATION_GATING_SEVERITIES:
+            continue
+        key = f.get("key") or _KEYLESS_FINDING_SENTINEL
+        state_val = ledger_states.get(key)
+        state = state_val if state_val in _RESOLVED_LEDGER_STATES else "unresolved"
+        gating.append(
+            {
+                "key": key,
+                "severity": severity,
+                "summary": f.get("summary"),
+                "state": state,
+            }
+        )
+
+    gating_total = len(gating)
+    gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
+    all_resolved = gating_resolved == gating_total
+
+    if truncated and all_resolved:
+        # All visible gating findings resolved. Even though the carried list was
+        # clipped at the cap, allow re-qualification — the next run re-scores the
+        # full finding set. Blocking forever on truncated-but-resolved findings
+        # permanently wedges the auto-redrive.
+        ready = True
+        reason = (
+            f"all {gating_total} visible high/medium finding(s) resolved or "
+            "code-verified stale; note: carried list was truncated at the cap — "
+            "re-qualification will re-score the full finding set"
+        )
+    elif truncated:
+        # Truncated with unresolved visible gating findings.
+        ready = False
+        reason = (
+            "carried audit findings were truncated at the cap — readiness cannot "
+            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
+            "visible gating findings resolved)"
+        )
+    elif gating_total == 0:
+        ready = True
+        reason = "no carried high/medium audit findings — ready to re-qualify"
+    elif all_resolved:
+        ready = True
+        reason = (
+            f"all {gating_total} carried high/medium audit finding(s) resolved or "
+            "code-verified stale — ready to re-qualify"
+        )
+    else:
+        ready = False
+        reason = (
+            f"{gating_total - gating_resolved} of {gating_total} carried "
+            "high/medium audit finding(s) still unresolved"
+        )
+
+    return {
+        "requalification_ready": ready,
+        "open_version_id": open_version_id,
+        "audit_findings_truncated": truncated,
+        "gating_total": gating_total,
+        "gating_resolved": gating_resolved,
+        "reason": reason,
+        "findings": gating,
+    }
+
+
 async def compute_requalification_readiness(
     session: AsyncSession,
     project_id: uuid.UUID,
@@ -955,9 +1041,14 @@ async def compute_requalification_readiness(
     zero-gating-findings case: ready=True (nothing carried blocks re-qualification).
 
     Truncation-safe: if the carried list was clipped at the cap
-    (``audit_findings_truncated``), readiness is NOT claimed on the partial list —
-    ``requalification_ready`` is forced False and ``audit_findings_truncated`` is
-    surfaced so consumers can treat readiness conservatively.
+    (``audit_findings_truncated``) and any VISIBLE gating finding is unresolved,
+    readiness is NOT claimed on the partial list.  If every visible gating
+    finding is resolved, readiness IS claimed despite truncation (with a
+    re-score caveat in the reason) — the next qualification run re-scores the
+    full finding set, and blocking forever on a truncated-but-fully-resolved
+    list would permanently wedge the auto-redrive.
+    ``audit_findings_truncated`` is always surfaced so consumers can treat
+    readiness conservatively.
 
     Returns a dict shaped:
         {
@@ -1020,78 +1111,11 @@ async def compute_requalification_readiness(
         .scalars()
         .all()
     )
-    ledger_by_key: dict[str, AuditFindingResolution] = {
-        row.finding_key: row for row in ledger_rows
-    }
+    ledger_states: dict[str, str] = {row.finding_key: row.state for row in ledger_rows}
 
-    gating: list[dict[str, Any]] = []
-    for f in carried:
-        if not isinstance(f, dict):
-            continue
-        severity = str(f.get("severity") or "").lower()
-        if severity not in _REQUALIFICATION_GATING_SEVERITIES:
-            continue
-        key = f.get("key")
-        if not key:
-            # No content key (e.g. challenger-independent blocker persisted
-            # without a hash key).  Expose the sentinel so callers can pass
-            # it directly to the resolution endpoint without reading internals.
-            key = _KEYLESS_FINDING_SENTINEL
-            ledger = ledger_by_key.get(_KEYLESS_FINDING_SENTINEL)
-        else:
-            ledger = ledger_by_key.get(key)
-        state = (
-            ledger.state
-            if ledger is not None and ledger.state in _RESOLVED_LEDGER_STATES
-            else "unresolved"
-        )
-        gating.append(
-            {
-                "key": key,
-                "severity": severity,
-                "summary": f.get("summary"),
-                "state": state,
-            }
-        )
-
-    gating_total = len(gating)
-    gating_resolved = sum(1 for g in gating if g["state"] in _RESOLVED_LEDGER_STATES)
-    all_resolved = gating_resolved == gating_total
-
-    if truncated:
-        # The carried list was clipped at the cap: we cannot see every gating
-        # finding, so readiness must not be claimed on a partial list.
-        ready = False
-        reason = (
-            "carried audit findings were truncated at the cap — readiness cannot "
-            f"be asserted on a partial list ({gating_resolved}/{gating_total} "
-            "visible gating findings resolved)"
-        )
-    elif gating_total == 0:
-        ready = True
-        reason = "no carried high/medium audit findings — ready to re-qualify"
-    elif all_resolved:
-        ready = True
-        reason = (
-            f"all {gating_total} carried high/medium audit finding(s) resolved or "
-            "code-verified stale — ready to re-qualify"
-        )
-    else:
-        ready = False
-        reason = (
-            f"{gating_total - gating_resolved} of {gating_total} carried "
-            "high/medium audit finding(s) still unresolved"
-        )
-
-    return {
-        "requalification_ready": ready,
-        "open_version_id": str(version.id),
-        "audit_findings_truncated": truncated,
-        "gating_total": gating_total,
-        "gating_resolved": gating_resolved,
-        "reason": reason,
-        "findings": gating,
-    }
+    return _compute_requalification_decision(
+        carried, truncated, ledger_states, str(version.id)
+    )
 
 
 async def compute_qualification_trigger_state(
