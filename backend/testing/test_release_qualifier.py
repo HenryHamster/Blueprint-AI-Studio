@@ -6113,6 +6113,16 @@ def _qualifier_ci_resolves_green(mocker):
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=["0001_init.py", "0002_feature.py"]),
     )
+    # The identity gate reads blob shas (list_version_shas_at_ref) to skip body
+    # fetches for unchanged migrations. Default both refs to the SAME sha map so
+    # every shared file is byte-identical ('unchanged') and the gate stays 'ok'
+    # without any body fetch — mirrors the list_versions_at_ref default above.
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=AsyncMock(
+            return_value={"0001_init.py": "sha1", "0002_feature.py": "sha2"}
+        ),
+    )
     mocker.patch(
         "app.github.get_file_text_at_ref",
         new=AsyncMock(return_value="\"\"\"test migration body\"\"\"\n"),
@@ -9689,6 +9699,12 @@ def _patch_finalize_ci_test_incidental_gates(mocker):
         "app.github.list_versions_at_ref",
         new=AsyncMock(return_value=[]),
     )
+    # The migration-identity gate reads blob shas; empty ⇒ no shared migrations ⇒
+    # 'ok', keeping migration safety incidental for the CI-composite tests.
+    mocker.patch(
+        "app.github.list_version_shas_at_ref",
+        new=AsyncMock(return_value={}),
+    )
     # When list_pull_requests_for_commit returns [], the code makes a raw
     # _github_request to verify the result is not a transient API failure.
     # Return 200+[] so _resolve_candidate_ci reaches _CI_NO_CHECKS rather
@@ -11400,17 +11416,20 @@ async def test_finalize_not_promoted_on_blocker_sets_stabilize(db_session):
 
 
 def _versions_by_ref(*, main_list: list[str], candidate_list: list[str]) -> AsyncMock:
-    """Branch-keyed ``list_versions_at_ref``: deployed promotion target vs candidate.
+    """Branch-keyed ``list_version_shas_at_ref``: deployed promotion target vs
+    candidate, as ``{filename: blob sha}`` maps (the identity gate reads shas and
+    derives the filename list from the keys).
 
-    The finalize-time migration-identity gate lists the candidate's migrations
-    at ``candidate_sha`` and the deployed promotion target's at ``"main"`` — so
-    a ``ref == "main"`` request answers with the deployed list and everything
+    A ``ref == "main"`` request answers with the deployed list and everything
     else (the candidate SHA) answers with the candidate list. ``ref`` is the 4th
-    positional arg of ``list_versions_at_ref``.
+    positional arg of ``list_version_shas_at_ref``. Each filename gets a distinct
+    name-derived sha; collision/identity divergence is detected from the filenames
+    (keys), so the sha values only need to be present.
     """
 
     async def _side(token, owner, repo, ref, project_id=None):
-        return list(main_list) if ref == "main" else list(candidate_list)
+        names = list(main_list) if ref == "main" else list(candidate_list)
+        return {n: f"sha-{n}" for n in names}
 
     return AsyncMock(side_effect=_side)
 
@@ -11460,7 +11479,7 @@ async def test_finalize_blocks_on_migration_identity_collision(db_session, mocke
     # revision-identity collision the deterministic detector flags, and one NOT
     # on the authorized-reconciliation registry (so it still hard-blocks).
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=_versions_by_ref(
             main_list=["0138_digest_cache_table.py"],
             candidate_list=["0138_task_blocked_state_fields.py"],
@@ -11523,7 +11542,7 @@ async def test_finalize_holds_when_migration_listing_fetch_fails(db_session, moc
 
     # The migration listing fetch fails transiently — uncertainty must HOLD.
     mocker.patch(
-        "app.github.list_versions_at_ref",
+        "app.github.list_version_shas_at_ref",
         new=AsyncMock(side_effect=RuntimeError("GitHub 502")),
     )
     promote_spy = mocker.patch("app.release_qualifier.promote", new=AsyncMock())

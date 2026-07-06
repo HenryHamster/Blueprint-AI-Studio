@@ -545,7 +545,7 @@ async def check_qualification_migration_identity(
     ``"defer"``, never ``"ok"`` — a fetch error is not "no collision".
     """
     try:
-        candidate_filenames = await github.list_versions_at_ref(
+        candidate_shas = await github.list_version_shas_at_ref(
             gh_token, owner, repo, candidate_ref, project_id=project_id
         )
     except Exception as e:
@@ -555,7 +555,7 @@ async def check_qualification_migration_identity(
             f"check revision-identity safety: {_exc_detail(e)}",
         )
     try:
-        target_filenames = await github.list_versions_at_ref(
+        target_shas = await github.list_version_shas_at_ref(
             gh_token, owner, repo, promotion_target, project_id=project_id
         )
     except Exception as e:
@@ -565,6 +565,8 @@ async def check_qualification_migration_identity(
             f"migrations to check revision-identity safety: "
             f"{_exc_detail(e)}",
         )
+    candidate_filenames = list(candidate_shas.keys())
+    target_filenames = list(target_shas.keys())
 
     # Compare the deployed promotion target against the candidate. A divergence
     # means a revision id the deployed DB already applied maps to a DIFFERENT
@@ -609,12 +611,26 @@ async def check_qualification_migration_identity(
     # between the candidate and the promotion target; if any body differs, block.
     # A failed or empty fetch returns 'defer' (migration safety unknown) — never
     # 'ok'. Mirrors the identical block in _validate_rollup_migration_chain.
+    # Only a migration whose git blob sha DIFFERS between the two refs can be an
+    # in-place body edit; an identical blob sha is byte-identical content (git
+    # content addressing), so the body is provably unchanged and needs no fetch.
+    # Comparing shas — already returned by the two directory listings above at no
+    # extra request cost — collapses this check from ~2 fetches per shared
+    # migration (hundreds of GitHub contents calls per attempt, enough to drain
+    # the token's rate-limit budget and wedge the release into a defer loop) down
+    # to fetching only the migrations that actually changed. A missing sha on
+    # either side is treated as "unknown" and still fetched, preserving the
+    # fail-safe (never skip a body we could not content-address).
     target_basenames = {os.path.basename(fn) for fn in target_filenames}
-    shared_basenames = [
-        os.path.basename(fn)
-        for fn in candidate_filenames
-        if os.path.basename(fn) in target_basenames
-    ]
+    shared_basenames = []
+    for fn in candidate_filenames:
+        basename = os.path.basename(fn)
+        if basename not in target_basenames:
+            continue
+        cand_sha = candidate_shas.get(basename)
+        tgt_sha = target_shas.get(basename)
+        if cand_sha is None or tgt_sha is None or cand_sha != tgt_sha:
+            shared_basenames.append(basename)
     if shared_basenames:
         deployed_sources: dict[str, str] = {}
         candidate_sources: dict[str, str] = {}
