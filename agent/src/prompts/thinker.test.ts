@@ -646,7 +646,7 @@ describe('buildThinkerPrompt', () => {
     expect(prompt).toContain('Skip entirely if criteria already exist and are reasonably mapped');
     expect(prompt).toContain('Do NOT fabricate criteria when the version goal is unset');
     expect(prompt).toContain('/tmp/proposed_criteria_criteria-task-1.json');
-    expect(prompt).toContain('{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}]}');
+    expect(prompt).toContain('{"criteria":[{"text":"Users can complete the key workflow without manual operator intervention.","direction_keys":["d-xxx"]}],"retract":');
     expect(prompt).toContain('5-7 criteria maximum');
     expect(prompt).toContain('outcomes ("Users can X", "System handles Y"), not implementation steps');
 

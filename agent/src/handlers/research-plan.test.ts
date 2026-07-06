@@ -155,20 +155,25 @@ const {
   ],
   WORKSPACE_PREP_EXPORT_NAMES: [
     'getLastWorkspacePrepOutcome',
+    'listWorkspaceTopDirs',
     'prepareWorkspaceForRole',
     'resetWorkspacePrepOutcome',
     'resolveReferenceRepo',
   ],
 }));
 
-vi.mock('fs', () => ({
-  default: {
-    readFileSync: vi.fn().mockReturnValue(''),
-    writeFileSync: vi.fn(),
-    existsSync: vi.fn().mockReturnValue(false),
-    appendFileSync: vi.fn(),
-  },
-}));
+vi.mock('fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('fs')>();
+  return {
+    readFileSync: actual.readFileSync,
+    default: {
+      readFileSync: vi.fn().mockReturnValue(''),
+      writeFileSync: vi.fn(),
+      existsSync: vi.fn().mockReturnValue(false),
+      appendFileSync: vi.fn(),
+    },
+  };
+});
 
 vi.mock('../index.js', () => ({
   ...Object.fromEntries(INDEX_EXPORT_NAMES.map((name) => [name, vi.fn()])),
@@ -549,13 +554,13 @@ describe('aggregateDirectionStats', () => {
   });
 
   it('omits conversion when all tasks are ineligible types', () => {
-    // Only research tasks, no PR-eligible work
+    // Only ineligible task types (research, investigate) — no PR-eligible work
     const history = [{
       tasks_created: 2,
       prs_merged: 0,
       type_breakdown: {
         research: { created: 1, merged: 0, failed: 0 },
-        audit: { created: 1, merged: 0, failed: 0 },
+        investigate: { created: 1, merged: 0, failed: 0 },
       },
     }];
     const result = aggregateDirectionStats(history, {});
@@ -2595,8 +2600,8 @@ describe('buildVersionPhaseSection', () => {
       },
     });
     expect(result).toContain('qualification_state_disagreement');
-    expect(result).toContain("last_qualification_status='pending'");
-    expect(result).toContain("verdict_terminal_status='not_promoted'");
+    expect(result).toContain("last_qualification.status='pending'");
+    expect(result).toContain("finalized verdict reports 'not_promoted'");
     expect(result).toContain('finalized verdict');
   });
 
@@ -4120,8 +4125,8 @@ describe('strategic executor prompt — step 1 / step 5 sibling-field consistenc
     const script = helperCall ? helperCall[1] : '';
     expect(script).toContain('set-evidence-progress)');
     expect(script).toContain('_call "set_evidence_progress"');
-    // Usage string advertises the new op.
-    expect(script).toContain('set-evidence-progress|set-acceptance-criteria <json-or-file>');
+    // Usage string advertises the new op (record-finding-resolution is the last CLI op).
+    expect(script).toContain('set-evidence-progress|set-acceptance-criteria|record-finding-resolution <json-or-file>');
   });
 });
 

@@ -4997,23 +4997,22 @@ describe('writeMessagesHelper stdin-based send', () => {
     });
   });
 
-  it('reads content from stdin instead of $2, and MSG_TYPE from $2 instead of $3', () => {
+  it('reads content from stdin when --stdin flag is used, MSG_TYPE from $3', () => {
     writeMessagesHelper('task-stdin-test');
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toBeDefined();
-    // Content comes from stdin, not a positional argument
-    expect(script).toContain('CONTENT=$(cat)');
-    expect(script).not.toContain("CONTENT=\"${2:?");
-    // MSG_TYPE is now $2, not $3
-    expect(script).toContain('MSG_TYPE="${2:-NOTE}"');
-    expect(script).not.toContain('MSG_TYPE="${3:-NOTE}"');
+    // --stdin flag triggers stdin mode
+    expect(script).toContain('--stdin');
+    // Content is read from stdin with double-quoted command substitution
+    expect(script).toContain('CONTENT="$(cat)"');
+    // MSG_TYPE is $3 in --stdin mode (first positional after verb and --stdin flag)
+    expect(script).toContain('MSG_TYPE="${3:-NOTE}"');
   });
 
-  it('fails loud with a clear error when stdin is empty', () => {
+  it('fails loud with a clear error when content is empty', () => {
     writeMessagesHelper('task-stdin-test');
     const script = capturedScripts['/tmp/workspace/messages'];
-    expect(script).toContain('[ERROR] send: no content on stdin');
-    expect(script).toContain("printf '%s' 'msg' | ./messages send [TYPE]");
+    expect(script).toContain('Error: send requires message content');
   });
 
   it('captures jq-built payload into PAYLOAD variable and fails loud on jq errors', () => {
@@ -5021,8 +5020,8 @@ describe('writeMessagesHelper stdin-based send', () => {
     const script = capturedScripts['/tmp/workspace/messages'];
     expect(script).toContain('PAYLOAD=$(jq -n');
     expect(script).toContain('[ERROR] send: failed to serialize message payload');
-    // Sends the PAYLOAD (not raw jq pipe) to _post_strategic
-    expect(script).toContain('printf \'%s\' "$PAYLOAD" | _post_strategic');
+    // Sends the PAYLOAD (not raw jq pipe) via _post_with_retry
+    expect(script).toContain('printf \'%s\' "$PAYLOAD" | _post_with_retry');
   });
 
   it('sends content with single quotes end-to-end via stdin', async () => {
@@ -5059,7 +5058,7 @@ describe('writeMessagesHelper stdin-based send', () => {
     ].join('\n'), { mode: 0o755 });
     const contentWithQuote = "Everything's fine and \"quoted\"";
     try {
-      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'NOTE'], {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'NOTE'], {
         input: contentWithQuote,
         encoding: 'utf8',
         env: {
@@ -5106,7 +5105,7 @@ describe('writeMessagesHelper stdin-based send', () => {
     ].join('\n'), { mode: 0o755 });
     const contentWithNewlines = 'Line one\nLine two has an apostrophe\'s content\nLine three: "quoted"';
     try {
-      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'BUG_REPORT'], {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'BUG_REPORT'], {
         input: contentWithNewlines,
         encoding: 'utf8',
         env: {
@@ -5140,14 +5139,14 @@ describe('writeMessagesHelper stdin-based send', () => {
     const scriptPath = realPath.join(tmpDir, `messages_empty_test_${process.pid}.sh`);
     realFs.writeFileSync(scriptPath, script, { mode: 0o755 });
     try {
-      const result = realCp.spawnSync('bash', [scriptPath, 'send', 'NOTE'], {
+      const result = realCp.spawnSync('bash', [scriptPath, 'send', '--stdin', 'NOTE'], {
         input: '',
         encoding: 'utf8',
         env: { ...process.env, ORCHESTRATOR_URL: 'http://mock', AGENT_API_TOKEN: 'tok' },
         timeout: 5000,
       });
       expect(result.status).not.toBe(0);
-      expect(result.stderr).toContain('[ERROR] send: no content on stdin');
+      expect(result.stderr).toContain('Error: send requires message content');
     } finally {
       try { realFs.unlinkSync(scriptPath); } catch { /* ignore */ }
     }

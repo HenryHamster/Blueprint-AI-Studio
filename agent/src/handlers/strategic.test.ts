@@ -258,6 +258,7 @@ const {
     'buildPayloadStalenessSection',
     'buildPruneCandidatesSection',
     'buildQuestionSection',
+    'buildResidentExamLeadsSection',
     'buildSweepComparisonSection',
     'buildSystemMaturitySection',
     'fmtScalar',
