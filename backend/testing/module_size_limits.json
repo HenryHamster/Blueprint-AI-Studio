@@ -130,7 +130,8 @@
     "lifecycle.py": 1750,
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
-    "routers/admin_health.py": 1750
+    "routers/admin_health.py": 1750,
+    "metrics_integrity_sweep.py": 2050
   },
   "agent": {
     "index.ts": 4600,
