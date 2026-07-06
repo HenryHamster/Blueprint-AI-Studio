@@ -4357,31 +4357,38 @@ class TestOrchestratorClosureSafety:
     skipped → tasks stuck in PROVISIONING. Guard the names that matter."""
 
     def test_provision_and_handle_has_no_get_vm_zone_freevar(self):
-        """Static check: the inner _provision_and_handle closure must not
-        treat get_vm_zone as a free variable. If it does, orchestrator_worker
-        is locally re-importing get_vm_zone somewhere, and provisioning will
-        crash silently the moment the local import branch hasn't run."""
-        from app import orchestrator
+        """Static check: ``provision_and_handle`` must not treat ``get_vm_zone``
+        as a free variable.
 
-        # Find the nested _provision_and_handle code object inside orchestrator_worker
-        worker_code = orchestrator.orchestrator_worker.__code__
-        provision_code = None
-        for const in worker_code.co_consts:
-            if hasattr(const, "co_name") and const.co_name == "_provision_and_handle":
-                provision_code = const
-                break
-        assert provision_code is not None, (
-            "_provision_and_handle not found in orchestrator_worker"
+        ``provision_and_handle`` now lives at module level in
+        ``app.orchestrator_provision`` (re-exported via ``app.orchestrator``),
+        so ``get_vm_zone`` should resolve as that module's global. If it ever
+        shows up in ``co_freevars`` the function has been nested back inside a
+        scope that re-imports ``get_vm_zone`` as a local — the exact shape that
+        produced ``cannot access free variable 'get_vm_zone'`` in production
+        (vm_provisioned_at refresh skipped → tasks stuck in PROVISIONING)."""
+        from app import orchestrator, orchestrator_provision
+
+        # Same object via the facade re-export and the canonical home.
+        assert (
+            orchestrator.provision_and_handle
+            is orchestrator_provision.provision_and_handle
         )
 
-        # If get_vm_zone is in co_freevars, it's being captured from the
-        # enclosing scope as a closure cell — which means orchestrator_worker
-        # has it as a local. That's the bug.
+        provision_code = orchestrator_provision.provision_and_handle.__code__
+        assert provision_code.co_name == "provision_and_handle"
+
+        # A module-level function has no enclosing scope, so get_vm_zone must be
+        # a global (co_names), never a closure cell (co_freevars).
         assert "get_vm_zone" not in provision_code.co_freevars, (
-            "_provision_and_handle is capturing get_vm_zone as a closure variable, "
-            "which means orchestrator_worker has it as a local (likely from a "
-            "`from app.compute import get_vm_zone` somewhere). Move the import "
-            "to module level."
+            "provision_and_handle is capturing get_vm_zone as a closure variable, "
+            "which means it was nested inside a scope that has it as a local "
+            "(likely from a `from app.compute import get_vm_zone`). Keep the "
+            "import at module level."
+        )
+        assert "get_vm_zone" in provision_code.co_names, (
+            "provision_and_handle no longer references get_vm_zone as a module "
+            "global — the extraction's import wiring may have drifted."
         )
 
 

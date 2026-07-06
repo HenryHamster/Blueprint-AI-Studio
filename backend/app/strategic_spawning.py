@@ -37,16 +37,13 @@ from app.models import (
     MessageType,
     ProjectMessage,
     SystemMaturity,
-    LocalRunner,
 )
 from app.deploy_identity import project_matches_deploy_identity
 from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.strategic_payload_compaction import (
-    _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED,
     _OUTCOME_DIRECTION_OUTCOMES_KEEP,
     _VERSION_PHASE_RECENT_VERSIONS_CAP,
-    _bounded_text,
     _direction_activity_score,  # noqa: F401 — re-exported for test imports
     _directions_summary_floor,
     _enrich_drift_with_trend,
@@ -137,11 +134,90 @@ from app.vision_merge import REJECTED_EDITS_KEY
 from app.landed_signal import LANDED_ON_INTEGRATION_KEY, mark_stranded_non_landing
 from app.project_message_projection import agent_thread_message_dict
 from app.workbench_state import (
-    STRATEGIC_LOCAL_CONTINUATION_KEY,
     STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY,
     STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY,
-    strategic_local_continuation_status_from_vision,
 )
+
+from app.strategic_local_runner import (  # noqa: F401 — re-exported for callers/tests
+    _RUNNER_LIVENESS_SECONDS,
+    _load_local_runner_status,
+    _agent_visible_vision,
+    _local_runner_handles_task_type,
+    _local_runner_is_live,
+    _local_runner_agent_available,
+    _resolve_local_continuation_runner_affinity,
+    _resolve_local_continuation_runner_intent,
+)
+
+from app.strategic_payload_summaries import (  # noqa: F401 — re-exported for callers/tests
+    _summarize_conversation_thread,
+    _MEMO_CITATIONS_KEEP,
+    _MEMO_EXCERPT_MAX_CHARS,
+    _MEMO_HEAVY_FIELDS,
+    _MEMO_VERBOSE_FIELDS,
+    _strip_verbose_fields,
+    _cap_excerpt,
+    _summarize_memo_citations,
+    _OPEN_MESSAGES_FETCH_LIMIT,
+    _OPEN_MESSAGES_KEEP,
+    _OPEN_MESSAGES_KEEP_WHEN_TRIMMED,
+    _OPEN_MESSAGE_EXCERPT_MAX_CHARS,
+    _CRITICAL_OPEN_MESSAGE_TYPES,
+    _OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT,
+    _OPERATOR_CONTEXT_REQUESTS_KEEP,
+    _OPERATOR_CONTEXT_REFS_KEEP,
+    _OPERATOR_CONTEXT_REF_SCAN_LIMIT,
+    _OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT,
+    _OPERATOR_CONTEXT_FROM_TYPES,
+    _OPERATOR_CONTEXT_TARGET_KEYS,
+    _open_message_survival_key,
+    _bound_open_messages,
+    _summarize_open_messages,
+    _OPEN_MESSAGES_FLOOR_KEEP,
+    _OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS,
+    _floor_open_messages,
+    _operator_context_text,
+    _operator_context_ref,
+    _operator_context_target,
+    _operator_context_descriptor,
+    _operator_context_descriptor_map,
+    _operator_context_package_descriptor,
+    _operator_context_created_sort_value,
+    _build_operator_context_refs_from_messages,
+    _fetch_operator_context_refs,
+    _open_message_citation_summary,
+    _fetch_open_messages,
+    _summarize_recent_interventions,
+    _summarize_capability_trial_verdicts,
+    _OPERATOR_OVERRIDES_SUMMARIZE_KEEP,
+    _OVERRIDE_VALUE_SUMMARIZE_CAP,
+    _summarize_operator_overrides,
+    _KNOWLEDGE_INDEX_SUMMARIZE_KEEP,
+    _KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP,
+    _KNOWLEDGE_INDEX_HEAVY_FIELDS,
+    _KNOWLEDGE_INDEX_KEEP_KEYS,
+    _summarize_knowledge_index,
+    _PREV_OUTCOMES_ROLE_KEEP,
+    _PREV_OUTCOMES_TEXT_CAP,
+    _PREV_OUTCOMES_SUMMARY_TEXT_CAP,
+    _PREV_OUTCOMES_RATIONALE_CAP,
+    _PREV_OUTCOMES_HEAVY_FIELDS,
+    _summarize_previous_decision_outcome_entry,
+    _summarize_previous_decision_outcomes,
+    _PLAYBOOK_SUMMARY_ENTRIES_KEEP,
+    _PLAYBOOK_SUMMARY_CONTENT_CAP,
+    _PLAYBOOK_SUMMARY_DROP_FIELDS,
+    _summarize_playbook_summary,
+    _PAST_CRITIQUES_KEEP,
+    _PAST_CRITIQUE_TEXT_CAP,
+    _PAST_CRITIQUE_TEXT_FIELDS,
+    _summarize_past_retirement_critiques,
+    _SELF_REFLECTION_KEEP,
+    _SELF_REFLECTION_TEXT_CAP,
+    _SELF_REFLECTION_TEXT_FIELDS,
+    _summarize_self_reflection_log,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -157,179 +233,6 @@ _CHALLENGE_AGREEMENT_BUCKETS = (
     CHALLENGE_DISAGREES,
     CHALLENGE_INDETERMINATE,
 )
-
-# Mirrors ``orchestrator._RUNNER_LIVENESS_SECONDS`` (300): a registered runner is
-# considered live only if it heartbeated within this window. Replicated here
-# rather than imported to avoid an ``orchestrator -> autonomous_research ->
-# strategic_spawning`` import cycle (strategic_spawning is pulled in lazily by
-# the orchestrator's autonomous_research call chain; importing orchestrator at
-# this module's top would invert that order). Keep in sync with orchestrator.
-_RUNNER_LIVENESS_SECONDS = 300
-
-
-async def _load_local_runner_status(
-    session: AsyncSession, project_id: uuid.UUID
-) -> dict[str, Any]:
-    """Live self-hosted local-runner availability for the strategist's context.
-
-    Surfaces whether the operator's self-hosted GPU hardware is up so the
-    strategist can avoid authoring GPU ``compute_experiment`` tasks that would
-    otherwise silently fall back to billable cloud GPU while the hardware is
-    offline. Informational only — there is NO dispatch effect or hard block.
-
-    Returns ``{"ever_registered": bool, "active_total": int, "active_gpu": int}``:
-
-    * ``ever_registered`` — the project has >=1 non-deleted ``LocalRunner`` row
-      (operator set up local hardware at some point).
-    * ``active_total`` — runners with ``status=='active'`` that heartbeated within
-      the liveness window (mirrors the orchestrator dispatch-cache predicate).
-    * ``active_gpu`` — subset of ``active_total`` whose ``capabilities.has_gpu`` is
-      truthy.
-
-    One query (non-deleted runners for the project — a small set); the liveness
-    + GPU filtering is done in Python to stay dialect-agnostic over the JSONB
-    ``capabilities`` column.
-    """
-    rows = (
-        await session.execute(
-            select(LocalRunner).where(
-                LocalRunner.project_id == project_id,
-                LocalRunner.status != "deleted",
-            )
-        )
-    ).scalars().all()
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    active_total = 0
-    active_gpu = 0
-    for runner in rows:
-        last_seen = runner.last_seen_at
-        if runner.status == "active" and last_seen is not None and last_seen > cutoff:
-            active_total += 1
-            if (runner.capabilities or {}).get("has_gpu"):
-                active_gpu += 1
-    return {
-        "ever_registered": len(rows) > 0,
-        "active_total": active_total,
-        "active_gpu": active_gpu,
-    }
-
-
-def _agent_visible_vision(vision: dict[str, Any] | None) -> dict[str, Any]:
-    """Return project vision without backend-only operator session metadata."""
-
-    visible = dict(vision or {})
-    visible.pop(STRATEGIC_LOCAL_CONTINUATION_KEY, None)
-    return visible
-
-
-def _local_runner_handles_task_type(runner: LocalRunner, task_type: str) -> bool:
-    task_types = (runner.capabilities or {}).get("task_types", "all")
-    if task_types == "all":
-        return True
-    if isinstance(task_types, (list, tuple, set)):
-        return task_type in task_types
-    return False
-
-
-def _local_runner_is_live(runner: LocalRunner) -> bool:
-    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
-    return (
-        runner.status == "active"
-        and runner.last_seen_at is not None
-        and runner.last_seen_at > cutoff
-    )
-
-
-def _local_runner_agent_available(runner: LocalRunner) -> bool:
-    return (runner.capabilities or {}).get("agent_available") is not False
-
-
-async def _resolve_local_continuation_runner_affinity(
-    session: AsyncSession,
-    project_id: Any,
-    task_type: str,
-) -> str | None:
-    """Return advisory runner affinity for fresh continuous local Strategic mode."""
-
-    current_vision = (
-        await session.execute(select(Project.vision).where(Project.id == project_id))
-    ).scalar_one_or_none()
-    status = strategic_local_continuation_status_from_vision(current_vision or {})
-    if not status.get("enabled") or not status.get("fresh"):
-        return None
-
-    rows = (
-        await session.execute(
-            select(LocalRunner)
-            .where(
-                LocalRunner.project_id == project_id,
-                LocalRunner.status != "deleted",
-            )
-            .order_by(
-                LocalRunner.last_seen_at.desc(),
-                LocalRunner.created_at.desc(),
-            )
-        )
-    ).scalars().all()
-    live_capable = [
-        runner
-        for runner in rows
-        if _local_runner_is_live(runner)
-        and _local_runner_handles_task_type(runner, task_type)
-        and _local_runner_agent_available(runner)
-    ]
-    if not live_capable:
-        return None
-
-    preferred_runner_id = status.get("preferred_runner_id")
-    if isinstance(preferred_runner_id, str) and preferred_runner_id.strip():
-        preferred_runner_id = preferred_runner_id.strip()
-        for runner in live_capable:
-            if str(runner.id) == preferred_runner_id:
-                return preferred_runner_id
-
-    return str(live_capable[0].id)
-
-
-async def _resolve_local_continuation_runner_intent(
-    session: AsyncSession,
-    project_id: Any,
-    task_type: str,
-) -> dict[str, Any]:
-    """Return dispatch context for fresh continuous local Strategic mode.
-
-    A fresh continuation marker is a hard local intent, even when no runner is
-    live at spawn time. The runner id remains advisory within the local fleet;
-    the explicit required flag is what prevents cloud fallback later.
-
-    Freshness ("fresh") is resolved by
-    ``strategic_local_continuation_status_from_vision``, which reads the live
-    ``strategic_continuation_ttl_seconds`` runtime setting (default 1500s / 25
-    min) rather than the retired hardcoded 12h TTL — so a marker that stopped
-    renewing (no operator interaction / no applied strategic op) goes stale
-    within the short lease window and this hard-local intent is NOT applied,
-    letting the next spawn dispatch to cloud.
-    """
-
-    current_vision = (
-        await session.execute(select(Project.vision).where(Project.id == project_id))
-    ).scalar_one_or_none()
-    status = strategic_local_continuation_status_from_vision(current_vision or {})
-    if not status.get("enabled") or not status.get("fresh"):
-        return {}
-
-    context: dict[str, Any] = {
-        STRATEGIC_LOCAL_RUNNER_REQUIRED_CONTEXT_KEY: True,
-        STRATEGIC_LOCAL_RUNNER_REASON_CONTEXT_KEY: "workbench_continuous",
-    }
-    preferred_runner_target_id = await _resolve_local_continuation_runner_affinity(
-        session,
-        project_id,
-        task_type,
-    )
-    if preferred_runner_target_id:
-        context["preferred_runner_target_id"] = preferred_runner_target_id
-    return context
 
 
 def _empty_finding_challenge_summary() -> dict[str, Any]:
@@ -2218,808 +2121,6 @@ def _build_operator_steering_directive(
     )
 
 
-def _summarize_conversation_thread(thread: list) -> list:
-    """Keep the most recent N conversation messages."""
-    if (
-        not isinstance(thread, list)
-        or len(thread) <= _CONVERSATION_THREAD_KEEP_WHEN_TRIMMED
-    ):
-        return thread
-    return thread[-_CONVERSATION_THREAD_KEEP_WHEN_TRIMMED:]
-
-
-_MEMO_CITATIONS_KEEP = 5
-_MEMO_EXCERPT_MAX_CHARS = 400
-
-
-_MEMO_HEAVY_FIELDS = ("citations", "final_metrics")
-_MEMO_VERBOSE_FIELDS = ("rationale", "reasoning")
-
-
-def _strip_verbose_fields(m: dict) -> dict:
-    """Return a copy without heavy AND verbose optional fields."""
-    drop = set(_MEMO_HEAVY_FIELDS) | set(_MEMO_VERBOSE_FIELDS)
-    return {k: v for k, v in m.items() if k not in drop}
-
-
-def _cap_excerpt(m: dict) -> dict:
-    result = dict(m)
-    result["summary_excerpt"] = (m.get("summary_excerpt") or "")[
-        :_MEMO_EXCERPT_MAX_CHARS
-    ]
-    return result
-
-
-def _summarize_memo_citations(memos: list) -> list:
-    """Trim memo citations for inclusion in strategic-agent payloads.
-
-    Field-level trimming order (applied before entry-count capping):
-      1. Drop ``citations`` and ``final_metrics`` (largest optional fields).
-      2. Drop ``rationale`` and ``reasoning`` (verbose text fields; compact
-         ``*_excerpt`` variants are preserved).
-      3. Cap ``summary_excerpt`` to ``_MEMO_EXCERPT_MAX_CHARS``.
-    Then cap entry count to ``_MEMO_CITATIONS_KEEP`` (newest-first).
-
-    This ensures over-budget payloads degrade to a compact citable digest
-    rather than dropping the whole feed. ``task_id`` is always preserved.
-    """
-    if not isinstance(memos, list):
-        return memos
-    result = []
-    for m in memos:
-        if not isinstance(m, dict):
-            result.append(m)
-            continue
-        entry = _strip_verbose_fields(m)
-        entry = _cap_excerpt(entry)
-        result.append(entry)
-    return result[:_MEMO_CITATIONS_KEEP]
-
-
-# ── Open-message inbox (the strategist's authoritative feed) ──────────────────
-# The strategist's open-message inbox is its OWN status-filtered query — NOT a
-# slice of the capped conversation_thread. Without this, an OPEN BUG_REPORT or
-# BLOCKER older than the 15 newest messages ages out of the thread window and
-# the strategist never sees it, so it can never be acted on or resolved and
-# stays open forever. The feed is size-bounded two ways (a hard message count +
-# a per-message excerpt cap) and priority-ordered so unresolved
-# BUG_REPORT/BLOCKER items (then the oldest-open items) are the LAST to be
-# dropped under budget pressure, never the first.
-_OPEN_MESSAGES_FETCH_LIMIT = 200  # DB window over open-status rows
-_OPEN_MESSAGES_KEEP = 40  # count bound for the packed feed
-_OPEN_MESSAGES_KEEP_WHEN_TRIMMED = 20  # tighter bound for the summarize fallback
-_OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
-_CRITICAL_OPEN_MESSAGE_TYPES = (
-    MessageType.BUG_REPORT.value,
-    MessageType.BLOCKER.value,
-)
-_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT = 30
-_OPERATOR_CONTEXT_REQUESTS_KEEP = 6
-_OPERATOR_CONTEXT_REFS_KEEP = 12
-_OPERATOR_CONTEXT_REF_SCAN_LIMIT = 24
-_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT = 24
-_OPERATOR_CONTEXT_FROM_TYPES = ("user", "operator")
-_OPERATOR_CONTEXT_TARGET_KEYS = (
-    "surface",
-    "section",
-    "task_id",
-    "message_id",
-    "direction_id",
-    "document_id",
-    "artifact_id",
-    "cycle_id",
-)
-
-
-def _open_message_survival_key(msg: dict) -> tuple:
-    """Sort key ranking an open message's survival priority HIGH→LOW.
-
-    Critical types (BUG_REPORT/BLOCKER) rank first, with reproducing (non-stale)
-    ones ahead of stale (citation_state == "absent") ones; within each tier,
-    oldest-open items rank first (ascending created_at). The HEAD of the sorted
-    list survives when the feed must be bounded, so reproducing criticals are
-    last to be dropped, followed by stale criticals, then non-critical messages.
-    """
-    is_critical = msg.get("type") in _CRITICAL_OPEN_MESSAGE_TYPES
-    citation_state = msg.get("citation_state")
-    is_stale = citation_state == "absent"
-
-    # Tier 0: reproducing critical messages (highest priority)
-    # Tier 1: stale critical messages (lower than reproducing)
-    # Tier 2: non-critical messages
-    if is_critical and not is_stale:
-        tier = 0
-    elif is_critical and is_stale:
-        tier = 1
-    else:
-        tier = 2
-
-    return (tier, msg.get("created_at") or "")
-
-
-def _bound_open_messages(messages: list, keep: int) -> list:
-    """Bound *messages* to *keep* items and cap each message's excerpt length.
-
-    Lowest-priority survivors are dropped first: BUG_REPORT/BLOCKER (then the
-    oldest-open) items are the LAST to go. Survivors are returned in oldest-open
-    chronological order so the strategist reads a stable inbox regardless of
-    which items were trimmed.
-    """
-    if not isinstance(messages, list):
-        return messages
-    capped: list = []
-    for m in messages:
-        if isinstance(m, dict) and isinstance(m.get("content"), str):
-            content = m["content"]
-            if len(content) > _OPEN_MESSAGE_EXCERPT_MAX_CHARS:
-                m = {**m, "content": content[:_OPEN_MESSAGE_EXCERPT_MAX_CHARS]}
-        capped.append(m)
-    if len(capped) <= keep:
-        return capped
-    survivors = sorted(
-        (m for m in capped if isinstance(m, dict)),
-        key=_open_message_survival_key,
-    )[:keep]
-    # Re-sort survivors chronologically (oldest-open first) for a stable read.
-    survivors.sort(key=lambda m: m.get("created_at") or "")
-    return survivors
-
-
-def _summarize_open_messages(messages: list) -> list:
-    """Budget-pressure fallback for the open-message inbox.
-
-    Rather than dropping the entire inbox wholesale when the strategic payload
-    is over budget, trim it to a tighter bound that PRESERVES unresolved
-    BUG_REPORT/BLOCKER (and the oldest-open) items and drops the rest — so the
-    critical inbox items survive budget pressure instead of vanishing.
-    """
-    return _bound_open_messages(messages, _OPEN_MESSAGES_KEEP_WHEN_TRIMMED)
-
-
-# Guaranteed-minimum core floor for the open-message inbox: tighter than the
-# summarize fallback (fewer items, shorter excerpts) so the operator inbox
-# NEVER disappears entirely under extreme byte pressure. Fuller content is
-# fetchable on demand; the survival ordering keeps reproducing BUG_REPORT/
-# BLOCKER (then oldest-open) items as the last to be trimmed.
-_OPEN_MESSAGES_FLOOR_KEEP = 8
-_OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS = 200
-
-
-def _floor_open_messages(messages: list) -> list:
-    """Core floor callback for the ``open_messages`` pack key.
-
-    Keeps only the highest-survival-priority inbox items with a tight excerpt
-    cap so the strategist always sees the operator-inbox core even when the
-    fuller feed cannot fit. Distinct from :func:`_summarize_open_messages`,
-    which keeps a larger window — this is the last-resort minimum the packer
-    reserves off the top of the budget.
-    """
-    bounded = _bound_open_messages(messages, _OPEN_MESSAGES_FLOOR_KEEP)
-    if not isinstance(bounded, list):
-        return bounded
-    floored: list = []
-    for m in bounded:
-        if isinstance(m, dict) and isinstance(m.get("content"), str):
-            content = m["content"]
-            if len(content) > _OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS:
-                m = {**m, "content": content[:_OPEN_MESSAGE_FLOOR_EXCERPT_MAX_CHARS]}
-        floored.append(m)
-    return floored
-
-
-def _operator_context_text(
-    value: Any,
-    *,
-    max_chars: int,
-    raw_max_chars: int | None = None,
-) -> str | None:
-    if not isinstance(value, str):
-        return None
-    raw_max = raw_max_chars if raw_max_chars is not None else max_chars * 4
-    if len(value) > raw_max:
-        return None
-    text = " ".join(value.strip().split())
-    if not text:
-        return None
-    return text[:max_chars]
-
-
-def _operator_context_ref(raw: Any) -> dict[str, str] | None:
-    if not isinstance(raw, dict):
-        return None
-    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
-    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
-    if not kind or not ref_id:
-        return None
-    ref: dict[str, str] = {"kind": kind, "id": ref_id}
-    label = _operator_context_text(
-        raw.get("label"), max_chars=180, raw_max_chars=720
-    )
-    if label:
-        ref["label"] = label
-    return ref
-
-
-def _operator_context_target(raw: Any) -> dict[str, str] | None:
-    if not isinstance(raw, dict):
-        return None
-    target: dict[str, str] = {}
-    for key in _OPERATOR_CONTEXT_TARGET_KEYS:
-        value = _operator_context_text(
-            raw.get(key), max_chars=180, raw_max_chars=720
-        )
-        if value:
-            target[key] = value
-    return target or None
-
-
-def _operator_context_descriptor(raw: Any) -> dict[str, Any] | None:
-    if not isinstance(raw, dict):
-        return None
-    kind = _operator_context_text(raw.get("kind"), max_chars=40, raw_max_chars=160)
-    ref_id = _operator_context_text(raw.get("id"), max_chars=160, raw_max_chars=640)
-    if not kind or not ref_id:
-        return None
-
-    descriptor: dict[str, Any] = {"kind": kind, "id": ref_id}
-    label = _operator_context_text(
-        raw.get("label"), max_chars=180, raw_max_chars=720
-    )
-    if label:
-        descriptor["label"] = label
-    summary = _operator_context_text(
-        raw.get("summary"), max_chars=220, raw_max_chars=880
-    )
-    if summary:
-        descriptor["summary"] = summary
-    status = _operator_context_text(
-        raw.get("status"), max_chars=80, raw_max_chars=320
-    )
-    if status:
-        descriptor["status"] = status
-    target = _operator_context_target(raw.get("target"))
-    if target:
-        descriptor["target"] = target
-    return descriptor
-
-
-def _operator_context_descriptor_map(
-    snapshot: dict[str, Any],
-) -> dict[tuple[str, str], dict[str, Any]]:
-    raw_descriptors = snapshot.get("selected_ref_descriptors")
-    if not isinstance(raw_descriptors, list):
-        return {}
-    descriptors: dict[tuple[str, str], dict[str, Any]] = {}
-    for raw in raw_descriptors[:_OPERATOR_CONTEXT_DESCRIPTOR_SCAN_LIMIT]:
-        descriptor = _operator_context_descriptor(raw)
-        if not descriptor:
-            continue
-        key = (descriptor["kind"], descriptor["id"])
-        if key not in descriptors:
-            descriptors[key] = descriptor
-    return descriptors
-
-
-def _operator_context_package_descriptor(raw: Any) -> dict[str, Any] | None:
-    descriptor = _operator_context_descriptor(raw)
-    if descriptor:
-        return descriptor
-    if not isinstance(raw, dict):
-        return None
-    package_id = _operator_context_text(
-        raw.get("id") or raw.get("context_package_id"),
-        max_chars=180,
-        raw_max_chars=720,
-    )
-    if not package_id:
-        return None
-    result: dict[str, Any] = {"id": package_id}
-    label = _operator_context_text(
-        raw.get("label") or raw.get("title"),
-        max_chars=180,
-        raw_max_chars=720,
-    )
-    if label:
-        result["label"] = label
-    summary = _operator_context_text(
-        raw.get("summary"), max_chars=220, raw_max_chars=880
-    )
-    if summary:
-        result["summary"] = summary
-    status = _operator_context_text(
-        raw.get("status"), max_chars=80, raw_max_chars=320
-    )
-    if status:
-        result["status"] = status
-    return result
-
-
-def _operator_context_created_sort_value(message: ProjectMessage) -> tuple:
-    created_at = message.created_at or datetime.min
-    return (created_at, str(message.id))
-
-
-def _build_operator_context_refs_from_messages(
-    messages: list[ProjectMessage],
-) -> list[dict[str, Any]]:
-    """Promote recent operator-selected Strategic context into pointer entries.
-
-    The source snapshots were already sanitized when ProjectMessage rows were
-    created. This bridge still treats the JSON defensively because rows may be
-    legacy or manually inserted: it copies only pointer-shaped fields, caps all
-    strings/counts, dedupes repeated refs globally, and never includes bodies,
-    logs, or arbitrary nested context.
-    """
-    requests: list[dict[str, Any]] = []
-    seen_refs: set[tuple[str, str]] = set()
-    seen_packages: set[str] = set()
-    total_refs = 0
-
-    for message in sorted(
-        (
-            m
-            for m in messages
-            if getattr(m, "from_type", None) in _OPERATOR_CONTEXT_FROM_TYPES
-        ),
-        key=_operator_context_created_sort_value,
-        reverse=True,
-    ):
-        context = message.context if isinstance(message.context, dict) else {}
-        snapshot = context.get("strategic_session")
-        if not isinstance(snapshot, dict):
-            continue
-
-        descriptors = _operator_context_descriptor_map(snapshot)
-        selected_refs: list[dict[str, Any]] = []
-        raw_refs = snapshot.get("selected_refs")
-        if isinstance(raw_refs, list):
-            for raw_ref in raw_refs[:_OPERATOR_CONTEXT_REF_SCAN_LIMIT]:
-                if total_refs >= _OPERATOR_CONTEXT_REFS_KEEP:
-                    break
-                ref = _operator_context_ref(raw_ref)
-                if not ref:
-                    continue
-                key = (ref["kind"], ref["id"])
-                if key in seen_refs:
-                    continue
-                seen_refs.add(key)
-                descriptor = descriptors.get(key)
-                if descriptor:
-                    ref = {**ref, "descriptor": descriptor}
-                selected_refs.append(ref)
-                total_refs += 1
-
-        entry: dict[str, Any] = {
-            "source_message_id": str(message.id),
-            "created_at": message.created_at.isoformat()
-            if message.created_at
-            else None,
-            "selected_refs": selected_refs,
-        }
-        for source_key, output_key, max_chars in (
-            ("context_package_id", "context_package_id", 180),
-            ("session_id", "session_id", 180),
-            ("id", "session_id", 180),
-            ("session_started_at", "session_started_at", 80),
-            ("captured_at", "captured_at", 80),
-        ):
-            if output_key in entry:
-                continue
-            value = _operator_context_text(
-                snapshot.get(source_key),
-                max_chars=max_chars,
-                raw_max_chars=max_chars * 4,
-            )
-            if value:
-                entry[output_key] = value
-
-        package_descriptor = _operator_context_package_descriptor(
-            snapshot.get("context_package_descriptor") or snapshot.get("context_package")
-        )
-        if package_descriptor:
-            entry["context_package_descriptor"] = package_descriptor
-
-        package_id = entry.get("context_package_id")
-        has_new_package = isinstance(package_id, str) and package_id not in seen_packages
-        if isinstance(package_id, str):
-            seen_packages.add(package_id)
-
-        if selected_refs or has_new_package or package_descriptor:
-            requests.append(entry)
-        if len(requests) >= _OPERATOR_CONTEXT_REQUESTS_KEEP:
-            break
-
-    return requests
-
-
-async def _fetch_operator_context_refs(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-) -> list[dict[str, Any]]:
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.from_type.in_(_OPERATOR_CONTEXT_FROM_TYPES),
-        )
-        .order_by(ProjectMessage.created_at.desc(), ProjectMessage.id.desc())
-        .limit(_OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT)
-    )
-    return _build_operator_context_refs_from_messages(result.scalars().all())
-
-
-def _open_message_citation_summary(context: Any) -> dict:
-    """Promote a message's stored citation-grounding signal to a compact summary.
-
-    BUG_REPORT/BLOCKER ingestion stores a reproduce-on-HEAD citation signal under
-    ``context['_provenance_warnings']`` (the same key research findings use). This
-    surfaces it at the top level of the packed open-message dict so the strategist
-    sees the report's grounding state instead of trusting it blindly.
-
-    The signal is surfaced in two cases:
-
-    * ``citation_state == "absent"`` — the report is fully stale (cited code gone
-      on HEAD); the strategist must discount it.
-    * any state that still carries ``broken_refs``/``ungrounded_refs`` — the
-      report is only PARTIALLY grounded (mixed/indeterminate). The broken and
-      ungrounded references stay VISIBLE so the strategist can inspect them
-      during triage instead of having that detail stripped, while the non-absent
-      state keeps the report actionable (not discounted as stale).
-
-    Returns an empty dict (no key added) when there is no recorded warning, or
-    when a non-absent state carries no broken/ungrounded refs (nothing to flag).
-    """
-    if not isinstance(context, dict):
-        return {}
-    warnings = context.get("_provenance_warnings")
-    if not isinstance(warnings, dict):
-        return {}
-    state = warnings.get("citation_state")
-    broken = warnings.get("broken_refs")
-    broken_list = broken if isinstance(broken, list) and broken else []
-    ungrounded = warnings.get("ungrounded_refs")
-    ungrounded_list = ungrounded if isinstance(ungrounded, list) and ungrounded else []
-    # Surface when fully absent (stale) OR when a non-absent state still carries
-    # broken/ungrounded refs (mixed/partially grounded). A non-absent state with
-    # no refs has nothing to flag, so it is omitted (keeps the feed clean).
-    if state != "absent" and not broken_list and not ungrounded_list:
-        return {}
-    summary: dict = {}
-    if isinstance(state, str) and state:
-        summary["citation_state"] = state
-    if broken_list:
-        summary["broken_refs"] = broken_list
-    if ungrounded_list:
-        summary["ungrounded_refs"] = ungrounded_list
-    return summary
-
-
-async def _fetch_open_messages(
-    session: AsyncSession,
-    project_id: uuid.UUID,
-    *,
-    limit: int = _OPEN_MESSAGES_KEEP,
-) -> list[dict]:
-    """Authoritative open-message feed for a strategic spawn payload.
-
-    Queries messages whose status is open DIRECTLY (backed by
-    ``ix_projectmessage_project_status``), independent of the capped
-    conversation_thread, so an OPEN BUG_REPORT/BLOCKER stays visible to the
-    strategist until it is fixed or explicitly resolved no matter how many newer
-    messages have accumulated. The result is size-bounded: at most *limit*
-    messages, priority-ordered so BUG_REPORT/BLOCKER and oldest-open items
-    survive, with per-message excerpts capped.
-
-    Shared by every strategic spawn path (strategic_review + design_doc_update)
-    so the open-message access pattern stops drifting apart. Each row carries
-    its full ``id`` (UUID string) so the agent can resolve it by reference.
-    """
-    # status == "open" is the ONLY actionable status. Messages in "linked"
-    # state (bug-class messages whose fix is in-flight, owned by a direction
-    # or task) are intentionally excluded here — they already have an owner
-    # and the strategist should not act on them again. Messages with status
-    # "resolved" are terminal and also excluded. This filter is sufficient:
-    # no extra clause is needed to exclude linked messages.
-    result = await session.execute(
-        select(ProjectMessage)
-        .where(
-            ProjectMessage.project_id == project_id,
-            ProjectMessage.status == "open",
-        )
-        .order_by(ProjectMessage.created_at.asc())
-        .limit(_OPEN_MESSAGES_FETCH_LIMIT)
-    )
-    messages = [
-        {
-            **agent_thread_message_dict(m),
-            # Promote the reproduce-on-HEAD citation signal (stored on the
-            # message context at ingestion) to the top level so a stale or
-            # broken-citation bug report is VISIBLY discounted to the strategist
-            # rather than silently trusted. Absent when no warning was recorded.
-            **_open_message_citation_summary(m.context),
-        }
-        for m in result.scalars().all()
-    ]
-    return _bound_open_messages(messages, limit)
-
-
-def _summarize_recent_interventions(v: Any) -> dict:
-    """Keep rolling rates and per-direction deltas; truncate the raw merge list."""
-    if not isinstance(v, dict):
-        return v
-    out = {k: val for k, val in v.items() if k != "merges"}
-    merges = v.get("merges")
-    if isinstance(merges, list):
-        out["merges"] = merges[:5]
-        out["merges_total"] = len(merges)
-    return out
-
-
-def _summarize_capability_trial_verdicts(v: Any) -> dict:
-    """Under budget pressure, prefer decided verdicts (adopt/reject) over in-trial ones."""
-    if not isinstance(v, dict):
-        return v
-    decided = {k: e for k, e in v.items() if isinstance(e, dict) and e.get("verdict") not in (None, "continue_trial")}
-    return decided if decided else dict(list(v.items())[:8])
-
-
-# ── Long-tail section summarizers (budget-degradation fallbacks) ──────────────
-# These six sections were previously ``exempt`` (dropped WHOLESALE under byte
-# pressure). Each summarize_fn below degrades its section to a smaller-but-useful
-# form — fewer entries, tighter prose, verbose sub-bodies dropped — while keeping
-# the identifying keys/pointers so full detail stays reachable on demand via the
-# existing fetch verbs (``./fetch playbook|knowledge|direction``). Contract
-# (shared with every other summarize_fn the packer calls): PURE — build fresh
-# containers, never mutate the input; NEVER raise (a raising summarize is treated
-# as a drop); NEVER grow the serialized size; same top-level container type.
-
-_OPERATOR_OVERRIDES_SUMMARIZE_KEEP = 4
-_OVERRIDE_VALUE_SUMMARIZE_CAP = 80
-
-
-def _summarize_operator_overrides(v: Any) -> Any:
-    """Keep the newest few override entries; cut the before/after prose values.
-
-    Preserves the load-bearing routing keys (``document``, ``field``, ``kind``,
-    ``at``) so the agent still knows what it overrode where; the verbose
-    ``agent_value`` / ``operator_value`` bodies are truncated hard since the full
-    winning value is reconstructable from the live documents.
-    """
-    if not isinstance(v, list):
-        return v
-    out: list = []
-    for e in v[:_OPERATOR_OVERRIDES_SUMMARIZE_KEEP]:
-        if not isinstance(e, dict):
-            out.append(e)
-            continue
-        out.append(
-            {
-                "document": e.get("document"),
-                "field": e.get("field"),
-                "kind": e.get("kind"),
-                "agent_value": _bounded_text(
-                    e.get("agent_value"), _OVERRIDE_VALUE_SUMMARIZE_CAP
-                ),
-                "operator_value": _bounded_text(
-                    e.get("operator_value"), _OVERRIDE_VALUE_SUMMARIZE_CAP
-                ),
-                "at": e.get("at"),
-            }
-        )
-    return out
-
-
-_KNOWLEDGE_INDEX_SUMMARIZE_KEEP = 8
-_KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP = 120
-# Verbose / heavy optional sub-fields dropped from each knowledge entry under
-# budget pressure. The id/title/topic/direction pointers survive so the full
-# body stays fetchable via ``./fetch knowledge <id>``.
-_KNOWLEDGE_INDEX_HEAVY_FIELDS = (
-    "per_arm_verdicts",
-    "origin_provenance",
-    "knowledge_acceptance_evidence",
-    "compute_acceptance_reason",
-    "analysis_fallback_reason",
-    "criterion",
-)
-_KNOWLEDGE_INDEX_KEEP_KEYS = (
-    "id",
-    "title",
-    "topic",
-    "direction_id",
-    "source_kind",
-    "sweep_id",
-    "arm_label",
-    "criterion_met",
-    "compute_acceptance_grade",
-    "created_at",
-)
-
-
-def _summarize_knowledge_index(v: Any) -> Any:
-    """Keep the newest few knowledge entries; drop heavy sub-fields, trim summary.
-
-    Retains the navigation pointers (``id``, ``title``, ``topic``,
-    ``direction_id``, ``source_kind`` …) so the strategist can still fetch full
-    bodies via ``./fetch knowledge <id>``, while dropping the verbose per-arm
-    verdicts / provenance / acceptance-reason blobs and shortening the summary.
-    """
-    if not isinstance(v, list):
-        return v
-    out: list = []
-    for e in v[:_KNOWLEDGE_INDEX_SUMMARIZE_KEEP]:
-        if not isinstance(e, dict):
-            out.append(e)
-            continue
-        entry: dict[str, Any] = {
-            k: e[k] for k in _KNOWLEDGE_INDEX_KEEP_KEYS if k in e
-        }
-        summary = _bounded_text(
-            e.get("summary"), _KNOWLEDGE_INDEX_SUMMARIZE_SUMMARY_CAP
-        )
-        if summary is not None:
-            entry["summary"] = summary
-        out.append(entry)
-    return out
-
-
-_PREV_OUTCOMES_ROLE_KEEP = 6
-_PREV_OUTCOMES_TEXT_CAP = 100
-_PREV_OUTCOMES_SUMMARY_TEXT_CAP = 300
-_PREV_OUTCOMES_RATIONALE_CAP = 160
-# Heavy per-direction sub-fields dropped under budget pressure; the direction_id
-# pointer + headline metrics survive so the outcome is still legible and the full
-# direction is fetchable via ``./fetch direction <id>``.
-_PREV_OUTCOMES_HEAVY_FIELDS = ("prediction", "final_metrics", "research_context")
-
-
-def _summarize_previous_decision_outcome_entry(e: Any) -> Any:
-    if not isinstance(e, dict):
-        return e
-    out = {k: val for k, val in e.items() if k not in _PREV_OUTCOMES_HEAVY_FIELDS}
-    if "text" in out:
-        out["text"] = _bounded_text(out.get("text"), _PREV_OUTCOMES_TEXT_CAP)
-    if "rationale" in out:
-        out["rationale"] = _bounded_text(
-            out.get("rationale"), _PREV_OUTCOMES_RATIONALE_CAP
-        )
-    return out
-
-
-def _summarize_previous_decision_outcomes(v: Any) -> Any:
-    """Trim the prior cycle's decision-outcome digest to headline metrics.
-
-    Keeps ``cycle_id`` / ``phase2_completed_at`` and a bounded ``created`` /
-    ``retired`` list (newest few), dropping the verbose ``prediction`` /
-    ``final_metrics`` sub-bodies and long prose while preserving each
-    ``direction_id`` so the direction remains fetchable on demand.
-    """
-    if not isinstance(v, dict):
-        return v
-    out: dict[str, Any] = dict(v)
-    if "summary_text" in out:
-        out["summary_text"] = _bounded_text(
-            out.get("summary_text"), _PREV_OUTCOMES_SUMMARY_TEXT_CAP
-        )
-    # cycle_reasoning is the single verbose free-text field — drop it entirely
-    # under pressure (the compact summary_text carries the headline).
-    out.pop("cycle_reasoning", None)
-    for role in ("created", "retired"):
-        entries = out.get(role)
-        if isinstance(entries, list):
-            out[role] = [
-                _summarize_previous_decision_outcome_entry(e)
-                for e in entries[:_PREV_OUTCOMES_ROLE_KEEP]
-            ]
-    return out
-
-
-_PLAYBOOK_SUMMARY_ENTRIES_KEEP = 6
-_PLAYBOOK_SUMMARY_CONTENT_CAP = 160
-# Optional stat fields dropped from each playbook entry under budget pressure —
-# the key/content headline survives and the full entry is fetchable via
-# ``./fetch playbook <key>``.
-_PLAYBOOK_SUMMARY_DROP_FIELDS = (
-    "hit_count",
-    "confirmed_count",
-    "scope",
-    "learned_from_direction",
-    "rejection_count",
-    "source",
-)
-
-
-def _summarize_playbook_summary(v: Any) -> Any:
-    """Keep the newest few playbook entries; trim content, drop stat fields.
-
-    Preserves each entry ``key`` (the fetch pointer) and a shortened ``content``
-    headline so the strategist knows the lesson exists and can pull the full
-    entry via ``./fetch playbook <key>``.
-    """
-    if not isinstance(v, dict):
-        return v
-    entries = v.get("entries")
-    if not isinstance(entries, list):
-        return v
-    trimmed: list = []
-    for e in entries[:_PLAYBOOK_SUMMARY_ENTRIES_KEEP]:
-        if not isinstance(e, dict):
-            trimmed.append(e)
-            continue
-        item: dict[str, Any] = {"key": e.get("key")}
-        content = _bounded_text(e.get("content"), _PLAYBOOK_SUMMARY_CONTENT_CAP)
-        if content is not None:
-            item["content"] = content
-        if e.get("updated_at") is not None:
-            item["updated_at"] = e.get("updated_at")
-        trimmed.append(item)
-    out = dict(v)
-    out["entries"] = trimmed
-    return out
-
-
-_PAST_CRITIQUES_KEEP = 3
-_PAST_CRITIQUE_TEXT_CAP = 200
-_PAST_CRITIQUE_TEXT_FIELDS = (
-    "what_it_addressed",
-    "pattern_that_produced_it",
-    "lesson",
-)
-
-
-def _summarize_past_retirement_critiques(v: Any) -> Any:
-    """Keep the newest few retirement critiques; truncate the prose fields.
-
-    Preserves ``direction_id`` and the ``no_eligible_retirements`` sentinel;
-    truncates the free-text lesson fields so the digest degrades to headlines
-    rather than dropping wholesale.
-    """
-    if not isinstance(v, list):
-        return v
-    out: list = []
-    for e in v[:_PAST_CRITIQUES_KEEP]:
-        if not isinstance(e, dict):
-            out.append(e)
-            continue
-        if e.get("no_eligible_retirements"):
-            out.append({"no_eligible_retirements": True})
-            continue
-        item = dict(e)
-        for field in _PAST_CRITIQUE_TEXT_FIELDS:
-            if field in item:
-                item[field] = _bounded_text(item.get(field), _PAST_CRITIQUE_TEXT_CAP)
-        out.append(item)
-    return out
-
-
-_SELF_REFLECTION_KEEP = 3
-_SELF_REFLECTION_TEXT_CAP = 200
-_SELF_REFLECTION_TEXT_FIELDS = (
-    "what_was_hard",
-    "missing_context",
-    "proposed_self_improvement",
-)
-
-
-def _summarize_self_reflection_log(v: Any) -> Any:
-    """Keep the newest few self-reflection entries; truncate the prose fields.
-
-    Preserves the ``ts`` / ``cycle_task_id`` pointers and shortens the free-text
-    reflection fields so the log degrades to recent headlines under pressure.
-    """
-    if not isinstance(v, list):
-        return v
-    out: list = []
-    for e in v[-_SELF_REFLECTION_KEEP:]:
-        if not isinstance(e, dict):
-            out.append(e)
-            continue
-        item = dict(e)
-        for field in _SELF_REFLECTION_TEXT_FIELDS:
-            if field in item:
-                item[field] = _bounded_text(item.get(field), _SELF_REFLECTION_TEXT_CAP)
-        out.append(item)
-    return out
 
 
 # Schemas for pack_under_budget. Each key declares its priority tier and an

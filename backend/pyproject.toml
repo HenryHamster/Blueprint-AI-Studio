@@ -133,6 +133,11 @@ ignore = ["UP006", "UP007", "UP035", "B008"]
 # verbatim out of orchestrator_worker. Same log-and-continue policy (BLE001):
 # a crash in per-task CI polling must never abort the whole leader cycle.
 "app/orchestrator_ci_monitor.py" = ["BLE001"]
+# orchestrator_provision.py is the VM provisioning + provision-failure coroutine
+# lifted verbatim out of orchestrator_worker. Same log-and-continue policy
+# (BLE001): a crash mid-provision must be logged, the slot/VM cleaned up, and the
+# task requeued — never propagate out and abort the dispatch loop.
+"app/orchestrator_provision.py" = ["BLE001"]
 # routers/agent.py re-exports the GitHub-token cache helpers extracted to
 # app.github_token_resolver via a deferred mid-module import (keeps the 15+
 # `from app.routers.agent import get_github_token_for_task` call sites working).

@@ -53,6 +53,11 @@ EXTRACTED_SYMBOLS: dict[str, tuple[str, ...]] = {
         "cap_pipeline_slots",
         "reserve_slots_for_types",
     ),
+    "app.orchestrator_provision": (
+        # VM provisioning + provision-failure handling (the create_task target
+        # the dispatch loop fires once a task is committed to PROVISIONING).
+        "provision_and_handle",
+    ),
     "app.orchestrator_runner_dispatch": (
         # Local-runner + compute-experiment dispatch cluster.
         "RunnerDispatchSnapshot",
@@ -202,3 +207,22 @@ class TestOrchestratorHealthModuleExists:
     def test_module_importable(self):
         mod = importlib.import_module("app.orchestrator_health")
         assert mod is not None
+
+
+class TestOrchestratorProvisionModuleExists:
+    """The extracted provisioning module must exist and be importable.
+
+    Also guards the re-export cycle: importing the leaf module first must not
+    deadlock (``provision_and_handle`` imports ``app.orchestrator`` lazily, so a
+    leaf-first import is safe) and must expose the same object the facade does.
+    """
+
+    def test_module_importable(self):
+        mod = importlib.import_module("app.orchestrator_provision")
+        assert mod is not None
+        assert hasattr(mod, "provision_and_handle")
+
+    def test_facade_reexports_same_object(self):
+        prov = importlib.import_module("app.orchestrator_provision")
+        orch = importlib.import_module("app.orchestrator")
+        assert orch.provision_and_handle is prov.provision_and_handle
