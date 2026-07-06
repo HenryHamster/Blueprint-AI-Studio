@@ -6,7 +6,7 @@ extracted from routers/admin_project_strategic_session.py.
 
 import uuid
 from typing import Dict, Any
-from sqlalchemy import func
+from sqlalchemy import func, case, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -197,6 +197,7 @@ async def _task_focus_bucket(
     filters: list[Any],
     order_by: list[Any],
     limit: int = TASK_FOCUS_BUCKET_LIMIT,
+    total: int | None = None,
 ) -> Dict[str, Any]:
     base_filters = [
         Task.project_id == project_id,
@@ -212,9 +213,11 @@ async def _task_focus_bucket(
         Task.payloads[0]["target_direction_id"].as_string(),
     ).label("direction_id")
     task_type_expr = Task.payloads[0]["type"].as_string().label("task_type")
-    count_result = await session.execute(
-        select(func.count()).select_from(Task).where(*base_filters)
-    )
+    if total is None:
+        count_result = await session.execute(
+            select(func.count()).select_from(Task).where(*base_filters)
+        )
+        total = count_result.scalar() or 0
     rows_result = await session.execute(
         select(Task, task_type_expr, direction_id_expr)
         .where(*base_filters)
@@ -242,12 +245,12 @@ async def _task_focus_bucket(
         .order_by(*order_by)
         .limit(limit)
     )
-    total = count_result.scalar() or 0
+    total = int(total)
     rows = rows_result.all()
     return {
-        "total": int(total),
+        "total": total,
         "limit": limit,
-        "has_more": int(total) > limit,
+        "has_more": total > limit,
         "items": [
             _task_focus_item(
                 task,
@@ -272,6 +275,39 @@ async def _build_task_focus(
         TaskStatus.BLOCKED,
         TaskStatus.PARKED,
     )
+    # Single query replaces five individual COUNTs (10 → 6 round-trips total).
+    counts_row = (await session.execute(
+        select(
+            func.count(case((
+                and_(Task.requires_approval.is_(True), Task.status.in_(nonterminal)),
+                1,
+            ))).label("needs_judgment"),
+            func.count(case((
+                Task.status.in_([
+                    TaskStatus.PROVISIONING,
+                    TaskStatus.IN_PROGRESS,
+                    TaskStatus.EVALUATING,
+                ]),
+                1,
+            ))).label("active"),
+            func.count(case((
+                Task.status.in_([TaskStatus.FAILED, TaskStatus.BLOCKED, TaskStatus.PARKED]),
+                1,
+            ))).label("friction"),
+            func.count(case((
+                and_(Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)),
+                1,
+            ))).label("queued"),
+            func.count(case((
+                Task.status == TaskStatus.COMPLETED,
+                1,
+            ))).label("recent_completed"),
+        ).select_from(Task).where(
+            Task.project_id == project_id,
+            Task.archived.is_(False),
+        )
+    )).one()
+
     needs_judgment_result = await _task_focus_bucket(
         session,
         project_id,
@@ -281,6 +317,7 @@ async def _build_task_focus(
             Task.status.in_(nonterminal),
         ],
         order_by=[Task.created_at.asc(), Task.id.asc()],
+        total=int(counts_row.needs_judgment or 0),
     )
     active_result = await _task_focus_bucket(
         session,
@@ -296,6 +333,7 @@ async def _build_task_focus(
             )
         ],
         order_by=[Task.started_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.active or 0),
     )
     friction_result = await _task_focus_bucket(
         session,
@@ -307,6 +345,7 @@ async def _build_task_focus(
             )
         ],
         order_by=[Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.friction or 0),
     )
     queued_result = await _task_focus_bucket(
         session,
@@ -314,6 +353,7 @@ async def _build_task_focus(
         bucket="queued",
         filters=[Task.status == TaskStatus.QUEUED, Task.requires_approval.is_(False)],
         order_by=[Task.created_at.asc(), Task.id.asc()],
+        total=int(counts_row.queued or 0),
     )
     recent_completed_result = await _task_focus_bucket(
         session,
@@ -321,6 +361,7 @@ async def _build_task_focus(
         bucket="recent_completed",
         filters=[Task.status == TaskStatus.COMPLETED],
         order_by=[Task.completed_at.desc().nullslast(), Task.created_at.desc(), Task.id.desc()],
+        total=int(counts_row.recent_completed or 0),
     )
     buckets = {
         "needs_judgment": needs_judgment_result,

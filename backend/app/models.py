@@ -3351,6 +3351,7 @@ class Artifact(SQLModel, table=True):
             postgresql_ops={"pr_url": "gin_trgm_ops"},
         ),
         Index("ix_artifact_artifact_type", "artifact_type"),
+        Index("ix_artifact_task_type", "task_id", "artifact_type"),
     )
 
     # Git-based outputs
