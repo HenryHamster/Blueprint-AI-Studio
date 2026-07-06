@@ -656,9 +656,25 @@ async def trigger_rollup(
 
     gh_token, owner, repo = await get_github_token_for_task(task.id, session)
 
-    # Count children
+    # Count children — only load the fields needed by _build_rollup_pr_body.
     children = (
-        (await session.execute(select(Task).where(Task.parent_task_id == task.id)))
+        (
+            await session.execute(
+                select(Task)
+                .where(Task.parent_task_id == task.id)
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.payloads,
+                        Task.vm_provisioned_at,
+                        Task.vm_stopped_at,
+                        Task.vm_machine_type,
+                        Task.vm_spot,
+                        raiseload=True,
+                    )
+                )
+            )
+        )
         .scalars()
         .all()
     )

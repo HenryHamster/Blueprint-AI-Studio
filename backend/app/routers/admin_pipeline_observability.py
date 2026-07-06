@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -1829,3 +1830,47 @@ async def get_spawn_gate_census(
 
     census = compute_spawn_gate_census(tasks, window_start=cutoff)
     return {"window_hours": hours, **census}
+
+
+# ---------------------------------------------------------------------------
+# Admin-UI initial-load timing: in-memory ring buffer per surface
+# ---------------------------------------------------------------------------
+
+_UI_TIMING_LOCK = threading.Lock()
+_UI_TIMING_SAMPLES: Dict[str, deque] = {}
+_UI_TIMING_MAX_PER_SURFACE = 100
+
+
+@router.post("/ui-load-timing")
+async def record_ui_load_timing(
+    payload: Dict[str, Any],
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Record one admin-UI initial-load timing sample for a surface.
+
+    Stored in-memory (resets on restart).  The companion GET endpoint
+    returns recent samples per surface for before/after comparison.
+    """
+    surface = str(payload.get("surface") or "unknown")[:64]
+    ms_raw = payload.get("page_ready_ms")
+    if not isinstance(ms_raw, (int, float)) or ms_raw < 0 or ms_raw > 600_000:
+        raise HTTPException(status_code=400, detail="page_ready_ms must be a non-negative number ≤600000")
+    sample: Dict[str, Any] = {"ts": _utcnow().isoformat(), "page_ready_ms": int(ms_raw)}
+    with _UI_TIMING_LOCK:
+        q = _UI_TIMING_SAMPLES.setdefault(surface, deque(maxlen=_UI_TIMING_MAX_PER_SURFACE))
+        q.append(sample)
+    return {"ok": True}
+
+
+@router.get("/ui-load-timing")
+async def get_ui_load_timing(
+    current_user: dict = Depends(require_admin),  # noqa: ARG001
+) -> Dict[str, Any]:
+    """Return recent admin-UI initial-load timing samples grouped by surface.
+
+    Each surface entry is a list of {ts, page_ready_ms} objects ordered
+    oldest-first (up to 100 per surface).  Resets on process restart.
+    """
+    with _UI_TIMING_LOCK:
+        surfaces = {s: list(q) for s, q in _UI_TIMING_SAMPLES.items()}
+    return {"surfaces": surfaces}

@@ -596,3 +596,58 @@ async def test_pipeline_efficiency_breakdown_none_when_no_warm_starts(
     win = resp.json()["window_24h"]
     assert win["warm_start_origin_breakdown"] is None
     assert win["warm_reuse_rate"] == 0.0
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_round_trip(client, db_session):
+    """POST records a sample; GET returns it under the correct surface key."""
+    import app.routers.admin_pipeline_observability as obs_mod
+
+    # Reset in-memory store before test to avoid cross-test pollution.
+    with obs_mod._UI_TIMING_LOCK:
+        obs_mod._UI_TIMING_SAMPLES.clear()
+
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "chat", "page_ready_ms": 1234},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    resp = await client.get("/api/admin/ui-load-timing")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "chat" in data["surfaces"]
+    samples = data["surfaces"]["chat"]
+    assert len(samples) == 1
+    assert samples[0]["page_ready_ms"] == 1234
+    assert "ts" in samples[0]
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_rejects_invalid_ms(client, db_session):
+    """page_ready_ms out of valid range returns 400."""
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "pipeline", "page_ready_ms": -5},
+    )
+    assert resp.status_code == 400
+
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "pipeline", "page_ready_ms": 700_000},
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_get_empty(client, db_session):
+    """GET returns empty surfaces dict when no samples have been recorded."""
+    import app.routers.admin_pipeline_observability as obs_mod
+
+    with obs_mod._UI_TIMING_LOCK:
+        obs_mod._UI_TIMING_SAMPLES.clear()
+
+    resp = await client.get("/api/admin/ui-load-timing")
+    assert resp.status_code == 200
+    assert resp.json()["surfaces"] == {}

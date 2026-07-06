@@ -792,14 +792,18 @@ async def _qualification_in_flight(
         # still mid-spawn rather than risk a duplicate.
         return True
 
-    for task_id in child_ids:
-        task = await session.get(Task, task_id)
-        if task is None:
-            # The child row is not (yet) persisted — the spawning run is still
-            # in progress; treat as in flight.
-            return True
-        if task.status not in _TERMINAL_STATUSES:
-            return True
+    rows = (
+        await session.execute(
+            select(Task.id, Task.status).where(Task.id.in_(child_ids))
+        )
+    ).all()
+    found_ids = {r.id for r in rows}
+    if any(cid not in found_ids for cid in child_ids):
+        # A child row is not (yet) persisted — the spawning run is still
+        # in progress; treat as in flight.
+        return True
+    if any(r.status not in _TERMINAL_STATUSES for r in rows):
+        return True
     # status == "pending" but every child already terminated → not in flight.
     return False
 
