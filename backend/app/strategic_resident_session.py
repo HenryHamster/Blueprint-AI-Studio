@@ -1348,6 +1348,111 @@ async def start_resident_session(
     return resident_session_snapshot(project.vision) or {}
 
 
+async def _run_resident_completion_on_stop(
+    task_id: uuid.UUID,
+    *,
+    session_factory=None,
+) -> None:
+    """Run strategic completion processing for an operator-stopped resident task.
+
+    When an operator stops a resident session, the backing task is cancelled
+    server-side before the agent can post its terminal status, so the normal
+    post-commit completion pipeline never fires.  This helper bridges that gap:
+    it opens a fresh, dedicated session (the same isolation idiom as
+    ``_release_start_claim``), re-fetches the task, and calls
+    ``_handle_strategic_completion`` so cycle-closure events, pending playbook
+    entries, and retirement memos all run exactly once.
+
+    Only invoked when the task context holds stashed strategic work (a
+    qualify_request, version_phase_decision, new_version_goal, or
+    new_acceptance_criteria written by set_problem_model / set_vision, or
+    any api_was_used marker set during the session).  Skipping the handler for
+    tasks with no activity avoids false _strategic_failures increments: the
+    handler's fallback path (no API, no parseable logs) would otherwise record
+    a spurious failure and raise an alert.
+
+    When there IS work to process the project row is locked via
+    ``lock_project_for_strategic_transition`` before calling the handler,
+    satisfying the C3 locking invariant the api_was_used branch requires.
+
+    Best-effort: any exception is logged and swallowed — completion processing
+    must never mask or roll back the stop itself.
+    """
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as fresh_session:
+            task = await fresh_session.get(Task, task_id)
+            if task is None:
+                logger.warning(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: task %s not found",
+                    task_id,
+                )
+                return
+            from app.strategic_completion import (
+                QUALIFY_REQUEST_CONTEXT_KEY,
+                VERSION_PHASE_DECISION_CONTEXT_KEY,
+                NEW_VERSION_GOAL_CONTEXT_KEY,
+                NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+                _handle_strategic_completion,
+            )
+
+            ctx = task.context or {}
+            # Keys stashed by set_problem_model / set_vision API endpoints
+            _STASH_KEYS = (
+                QUALIFY_REQUEST_CONTEXT_KEY,
+                VERSION_PHASE_DECISION_CONTEXT_KEY,
+                NEW_VERSION_GOAL_CONTEXT_KEY,
+                NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+            )
+            # Counters / flags set by strategic API calls during the session
+            _API_MARKERS = (
+                "_strategic_vision_set",
+                "_strategic_dirs_created",
+                "_strategic_dirs_retired",
+                "_strategic_dirs_staged",
+                "_strategic_dirs_updated",
+                "_strategic_proposals_approved",
+                "_strategic_proposals_rejected",
+                "_strategic_tasks_spawned",
+                "_strategic_api_called",
+            )
+            has_strategic_work = any(ctx.get(k) for k in _STASH_KEYS) or any(
+                ctx.get(k) for k in _API_MARKERS
+            )
+            if not has_strategic_work:
+                logger.info(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: task %s has no stashed "
+                    "strategic work — skipping completion processing (operator stop with no API activity)",
+                    task_id,
+                )
+                return
+
+            # Acquire the project row lock before entering the handler.  The
+            # api_was_used branch inside _handle_strategic_completion assumes the
+            # caller pre-acquired the lock (C3 pair-locker); calling without it
+            # would run mark_phase2_completed and the _apply_* chain unlocked.
+            from app.task_locking import lock_project_for_strategic_transition
+
+            locked_project = await lock_project_for_strategic_transition(
+                fresh_session, task.project_id
+            )
+            if locked_project is None:
+                logger.warning(
+                    "[RESIDENT_SESSION] _run_resident_completion_on_stop: could not acquire project "
+                    "lock for task %s — skipping completion processing",
+                    task_id,
+                )
+                return
+
+            await _handle_strategic_completion(task, "", fresh_session, project=locked_project)
+    except Exception:
+        logger.warning(
+            "[RESIDENT_SESSION] _run_resident_completion_on_stop: completion processing failed for task %s",
+            task_id,
+            exc_info=True,
+        )
+
+
 async def stop_resident_session(
     session: AsyncSession,
     project: Project,
@@ -1393,6 +1498,7 @@ async def stop_resident_session(
 
     # Drive the resident task terminal (instant reclaim). Only touch a live task.
     task_id = (blob or {}).get("task_id")
+    cancelled_task_id: uuid.UUID | None = None
     if task_id:
         try:
             task = await session.get(Task, uuid.UUID(str(task_id)))
@@ -1406,6 +1512,7 @@ async def stop_resident_session(
             task.context = ctx
             flag_modified(task, "context")
             session.add(task)
+            cancelled_task_id = task.id
 
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
@@ -1433,6 +1540,17 @@ async def stop_resident_session(
         project.id,
         task_id,
     )
+
+    if cancelled_task_id is not None:
+        try:
+            await _run_resident_completion_on_stop(cancelled_task_id)
+        except Exception:
+            logger.warning(
+                "[RESIDENT_SESSION] stop-time completion processing raised for task %s — stop still committed",
+                cancelled_task_id,
+                exc_info=True,
+            )
+
     return resident_session_snapshot(project.vision) or {}
 
 

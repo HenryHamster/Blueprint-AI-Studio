@@ -871,6 +871,189 @@ async def test_stop_endpoint(client: AsyncClient, db_session, enable_strategic_s
 
 
 @pytest.mark.asyncio
+async def test_operator_stop_runs_strategic_completion_processing_exactly_once(
+    db_session, monkeypatch
+):
+    """Operator stop triggers _handle_strategic_completion exactly once on the
+    cancelled task via _run_resident_completion_on_stop, and the stop itself
+    still succeeds and returns the ended snapshot."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+    project = await db_session.get(Project, project.id)
+
+    calls = []
+
+    async def fake_completion_on_stop(task_id, *, session_factory=None):
+        calls.append(task_id)
+
+    monkeypatch.setattr(
+        srs, "_run_resident_completion_on_stop", fake_completion_on_stop
+    )
+
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # Stop returned the ended snapshot.
+    assert snapshot["status"] == "ended"
+    assert snapshot["stop_requested"] is True
+
+    # Completion processing was triggered exactly once with the right task id.
+    assert len(calls) == 1
+    assert calls[0] == task.id
+
+
+@pytest.mark.asyncio
+async def test_stop_completion_failure_does_not_mask_stop(db_session, monkeypatch):
+    """An exception inside _run_resident_completion_on_stop must not propagate —
+    stop_resident_session still returns the ended snapshot normally."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+    project = await db_session.get(Project, project.id)
+
+    async def failing_completion_on_stop(task_id, *, session_factory=None):
+        raise RuntimeError("simulated completion failure")
+
+    monkeypatch.setattr(
+        srs, "_run_resident_completion_on_stop", failing_completion_on_stop
+    )
+
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # The stop must still succeed despite the completion handler raising.
+    assert snapshot["status"] == "ended"
+    assert snapshot["stop_requested"] is True
+
+
+@pytest.mark.asyncio
+async def test_run_resident_completion_on_stop_skips_when_no_strategic_activity(
+    db_session, monkeypatch
+):
+    """_run_resident_completion_on_stop must NOT invoke _handle_strategic_completion
+    and must NOT increment _strategic_failures when the task has no stashed
+    strategic work and no API-activity markers — the false-failure case."""
+    from app.strategic_resident_session import _run_resident_completion_on_stop
+
+    from app.strategic_completion import (
+        QUALIFY_REQUEST_CONTEXT_KEY,
+        VERSION_PHASE_DECISION_CONTEXT_KEY,
+        NEW_VERSION_GOAL_CONTEXT_KEY,
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+    )
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    # No stashed strategic work keys or API-activity markers — only infra keys like
+    # provides_capability may be present, which are not checked by _run_resident_completion_on_stop.
+    ctx = task.context or {}
+    _stash_keys = (
+        QUALIFY_REQUEST_CONTEXT_KEY,
+        VERSION_PHASE_DECISION_CONTEXT_KEY,
+        NEW_VERSION_GOAL_CONTEXT_KEY,
+        NEW_ACCEPTANCE_CRITERIA_CONTEXT_KEY,
+    )
+    _api_markers = (
+        "_strategic_vision_set",
+        "_strategic_dirs_created",
+        "_strategic_dirs_retired",
+        "_strategic_dirs_staged",
+        "_strategic_dirs_updated",
+        "_strategic_proposals_approved",
+        "_strategic_proposals_rejected",
+        "_strategic_tasks_spawned",
+        "_strategic_api_called",
+    )
+    assert not any(ctx.get(k) for k in _stash_keys), f"Unexpected stash key in task context: {ctx}"
+    assert not any(ctx.get(k) for k in _api_markers), f"Unexpected API marker in task context: {ctx}"
+
+    completion_calls = []
+
+    async def fake_handle_completion(t, logs, session, *, project=None):
+        completion_calls.append({"task_id": t.id, "project": project})
+
+    monkeypatch.setattr(
+        "app.strategic_completion._handle_strategic_completion",
+        fake_handle_completion,
+    )
+
+    factory = _dedicated_session_factory(db_session)
+    await _run_resident_completion_on_stop(task.id, session_factory=factory)
+
+    # Handler must NOT have been called for a task with no strategic work.
+    assert completion_calls == [], (
+        "_handle_strategic_completion was called despite no strategic activity"
+    )
+
+    # _strategic_failures must not have been written.
+    fresh = await db_session.get(Project, project.id)
+    assert "_strategic_failures" not in (fresh.vision or {}), (
+        "_strategic_failures was incremented for an operator stop with no API activity"
+    )
+
+
+@pytest.mark.asyncio
+async def test_run_resident_completion_on_stop_applies_stashed_work(
+    db_session, monkeypatch
+):
+    """_run_resident_completion_on_stop must call _handle_strategic_completion with
+    a non-None locked project when the task carries stashed strategic work — e.g.
+    a qualify_request written by set_problem_model — and must re-fetch the task
+    via the injected session_factory."""
+    from app.strategic_resident_session import _run_resident_completion_on_stop
+    from app.strategic_completion import QUALIFY_REQUEST_CONTEXT_KEY
+
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+
+    # Stash a qualify_request in the task context (set by set_problem_model API).
+    ctx = dict(task.context or {})
+    ctx[QUALIFY_REQUEST_CONTEXT_KEY] = {"reason": "ready for qualification"}
+    task.context = ctx
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    completion_calls = []
+
+    async def fake_handle_completion(t, logs, session, *, project=None):
+        completion_calls.append({"task_id": t.id, "project": project})
+
+    monkeypatch.setattr(
+        "app.strategic_completion._handle_strategic_completion",
+        fake_handle_completion,
+    )
+
+    # Bypass the FOR UPDATE lock (Postgres-only) while preserving the project
+    # re-fetch so the test is runnable on SQLite.
+    async def fake_lock_project(session, project_id, *, max_retries=3):
+        return await session.get(Project, project_id)
+
+    monkeypatch.setattr(
+        "app.task_locking.lock_project_for_strategic_transition",
+        fake_lock_project,
+    )
+
+    factory = _dedicated_session_factory(db_session)
+    await _run_resident_completion_on_stop(task.id, session_factory=factory)
+
+    # Handler must have been called exactly once with a non-None project.
+    assert len(completion_calls) == 1, (
+        f"Expected exactly one _handle_strategic_completion call, got {len(completion_calls)}"
+    )
+    assert completion_calls[0]["task_id"] == task.id
+    assert completion_calls[0]["project"] is not None, (
+        "_handle_strategic_completion was called with project=None (missing project lock)"
+    )
+
+
+@pytest.mark.asyncio
 async def test_stop_noop_when_no_session_blob(db_session):
     """Fix 4: stopping a project with NO live session blob is a no-op — it must
     NOT synthesize a phantom ``{session_id: null, status: "ended"}`` record into
