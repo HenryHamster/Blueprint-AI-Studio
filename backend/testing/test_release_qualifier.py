@@ -11251,6 +11251,155 @@ async def test_finalize_holds_when_migration_apply_gate_defers(db_session, mocke
     assert version.last_qualification["status"] == "infra_failure"
 
 
+# ===========================================================================
+# Retry-on-defer: migration identity and apply gates retry once with a fresh
+# GitHub token before propagating the defer (covers token-expiry mid-run).
+# ===========================================================================
+
+
+@pytest.mark.asyncio
+async def test_migration_identity_gate_retries_on_defer_and_succeeds(
+    db_session, mocker
+):
+    """When the first check_qualification_migration_identity call raises (401-shaped
+    RuntimeError from github.py) the gate re-resolves credentials and retries.
+    If the retry succeeds (ok/block), that result is used — not infra_failure."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+
+    call_count = 0
+
+    async def _check_side_effect(token, owner, repo, candidate_sha, promo, **kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("GitHub API returned HTTP 401")
+        return ("ok", None)
+
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        side_effect=_check_side_effect,
+    )
+    # Fresh-token call on retry should succeed (returning a valid resolved tuple).
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("fresh-token", "acme", "widget"),
+    )
+
+    verdict, detail = await rq._resolve_migration_identity_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "ok"
+    assert detail is None
+    assert call_count == 2, "check must be called twice (first attempt + retry)"
+
+
+@pytest.mark.asyncio
+async def test_migration_identity_gate_retries_on_defer_both_fail(db_session, mocker):
+    """When both the first and the retry call return defer, the final verdict is
+    defer — no infinite retry, fails closed."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+
+    call_count = 0
+
+    async def _check_side_effect(token, owner, repo, candidate_sha, promo, **kw):
+        nonlocal call_count
+        call_count += 1
+        return ("defer", f"transient-error-attempt-{call_count}")
+
+    mocker.patch(
+        "app.release_qualifier.check_qualification_migration_identity",
+        side_effect=_check_side_effect,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("fresh-token", "acme", "widget"),
+    )
+
+    verdict, detail = await rq._resolve_migration_identity_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "defer"
+    assert call_count == 2, "must not retry more than once"
+
+
+@pytest.mark.asyncio
+async def test_migration_apply_gate_retries_on_defer_and_succeeds(db_session, mocker):
+    """When run_migration_apply_gate returns defer on the first attempt, the gate
+    re-resolves credentials and retries. If the retry succeeds (ok), that result
+    is used instead of infra_failure."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+
+    call_count = 0
+
+    async def _apply_side_effect(**kw):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return ("defer", "could not read production's recorded state")
+        return ("ok", None)
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        side_effect=_apply_side_effect,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("fresh-token", "acme", "widget"),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_async_engine",
+        return_value=object(),
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "ok"
+    assert detail is None
+    assert call_count == 2, "apply gate must be called twice (first attempt + retry)"
+
+
+@pytest.mark.asyncio
+async def test_migration_apply_gate_retries_on_defer_both_fail(db_session, mocker):
+    """When both the first and the retry call to run_migration_apply_gate return
+    defer, the final verdict is defer — fails closed, no infinite retry."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    candidate_sha = "abc1234" * 5 + "abcd1234"
+
+    call_count = 0
+
+    async def _apply_side_effect(**kw):
+        nonlocal call_count
+        call_count += 1
+        return ("defer", f"persistent-error-attempt-{call_count}")
+
+    mocker.patch(
+        "app.release_qualifier.run_migration_apply_gate",
+        side_effect=_apply_side_effect,
+    )
+    mocker.patch(
+        "app.release_qualifier._resolve_github_with_session",
+        return_value=("fresh-token", "acme", "widget"),
+    )
+    mocker.patch(
+        "app.release_qualifier.resolve_async_engine",
+        return_value=object(),
+    )
+
+    verdict, detail = await rq._resolve_migration_apply_at_finalize(
+        db_session, version, candidate_sha
+    )
+
+    assert verdict == "defer"
+    assert call_count == 2, "must not retry more than once"
+
+
 @pytest.mark.asyncio
 async def test_apply_gate_defer_with_duplicate_revision_blocks_instead_of_infra_retry():
     """Structural defect detection: when the candidate's migration chain has a

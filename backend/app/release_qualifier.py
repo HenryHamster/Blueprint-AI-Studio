@@ -2329,6 +2329,46 @@ async def _resolve_migration_identity_at_finalize(
             return ("ok", None)
         token, owner, repo = resolved
         _integration_branch, promotion_target = _lts_branch_names(project)
+        try:
+            verdict, detail = await check_qualification_migration_identity(
+                token,
+                owner,
+                repo,
+                candidate_sha,
+                promotion_target,
+                project_id=str(version.project_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize migration-identity gate failed for "
+                "v%d (attempt 1, retrying): %s",
+                version.version_number,
+                exc,
+            )
+            verdict, detail = "defer", f"migration-identity gate error: {exc}"
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate for v%d "
+            "candidate %s vs %s: %s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            promotion_target,
+            verdict,
+            detail or "no divergence",
+        )
+        if verdict != "defer":
+            return verdict, detail
+        # First attempt deferred — retry once with freshly-resolved credentials.
+        # _resolve_github_with_session returns a fresh token if the cache was
+        # invalidated by a 401 during the first attempt.
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-identity gate deferred for v%d "
+            "(attempt 1); retrying with fresh credentials",
+            version.version_number,
+        )
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return verdict, detail
+        token, owner, repo = resolved
         verdict, detail = await check_qualification_migration_identity(
             token,
             owner,
@@ -2338,7 +2378,7 @@ async def _resolve_migration_identity_at_finalize(
             project_id=str(version.project_id),
         )
         logger.info(
-            "[RELEASE_QUALIFIER] finalize migration-identity gate for v%d "
+            "[RELEASE_QUALIFIER] finalize migration-identity gate retry for v%d "
             "candidate %s vs %s: %s (%s)",
             version.version_number,
             candidate_sha[:8],
@@ -2404,6 +2444,43 @@ async def _resolve_migration_apply_at_finalize(
             return ("ok", None)
         token, owner, repo = resolved
         prod_engine = resolve_async_engine(session)
+        try:
+            verdict, detail = await run_migration_apply_gate(
+                prod_engine=prod_engine,
+                gh_token=token,
+                owner=owner,
+                repo=repo,
+                candidate_ref=candidate_sha,
+                project_id=str(version.project_id),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "[RELEASE_QUALIFIER] finalize migration-apply gate failed for "
+                "v%d (attempt 1, retrying): %s",
+                version.version_number,
+                exc,
+            )
+            verdict, detail = "defer", f"migration-apply gate error: {exc}"
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-apply gate for v%d "
+            "candidate %s: %s (%s)",
+            version.version_number,
+            candidate_sha[:8],
+            verdict,
+            detail or "applies cleanly",
+        )
+        if verdict != "defer":
+            return verdict, detail
+        # First attempt deferred — retry once with freshly-resolved credentials.
+        logger.info(
+            "[RELEASE_QUALIFIER] finalize migration-apply gate deferred for v%d "
+            "(attempt 1); retrying with fresh credentials",
+            version.version_number,
+        )
+        resolved = await _resolve_github_with_session(session, project)
+        if resolved is None:
+            return verdict, detail
+        token, owner, repo = resolved
         verdict, detail = await run_migration_apply_gate(
             prod_engine=prod_engine,
             gh_token=token,
@@ -2413,7 +2490,7 @@ async def _resolve_migration_apply_at_finalize(
             project_id=str(version.project_id),
         )
         logger.info(
-            "[RELEASE_QUALIFIER] finalize migration-apply gate for v%d "
+            "[RELEASE_QUALIFIER] finalize migration-apply gate retry for v%d "
             "candidate %s: %s (%s)",
             version.version_number,
             candidate_sha[:8],
