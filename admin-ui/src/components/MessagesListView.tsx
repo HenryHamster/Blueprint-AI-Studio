@@ -1,7 +1,8 @@
-import { type Dispatch, type SetStateAction, type RefObject, type ReactNode } from 'react';
+import { type Dispatch, type SetStateAction, type RefObject, type ReactNode, useMemo, useEffect, useRef } from 'react';
 import { MessageSquare, AlertTriangle, HelpCircle, ChevronDown, ArrowDown, ChevronUp, Check, MoreVertical } from 'lucide-react';
+import { List, useDynamicRowHeight, useListRef, type RowComponentProps, type ListImperativeAPI } from 'react-window';
 import { ROUTINE_EVENT_LABELS } from './eventPrefs';
-import { type RoutineRow, type MessageWithDivider, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
+import { type RoutineRow, routineSummary, formatDailyDigestSummary, outcomeBreakdown, insertTimeDividers, formatTimestamp, formatSinceTimestamp } from './messageGrouping';
 import { MessageBubble, type MessageBubbleProps } from './MessageBubble';
 import type { ProjectMessage } from '../types/messages';
 import { MessagesSummaryCard } from './MessagesSummaryCard';
@@ -19,6 +20,722 @@ function TimeDividerRow({ label, className }: { label: string; className?: strin
     </div>
   );
 }
+
+// ─── Virtual-list row item types ─────────────────────────────────────────────
+
+export type TriageItem =
+  | { kind: 'banner_new' }
+  | { kind: 'banner_caught_up' }
+  | { kind: 'loading' }
+  | { kind: 'empty'; emptyKind: 'no_messages' | 'no_new' | 'no_match' }
+  | { kind: 'time_divider'; label: string }
+  | { kind: 'section_sep' }
+  | { kind: 'section_head_blockers' }
+  | { kind: 'section_head_questions'; count: number }
+  | { kind: 'section_head_linked' }
+  | { kind: 'new_divider' }
+  | { kind: 'summary_card' }
+  | { kind: 'message'; msg: ProjectMessage; faded?: boolean; readOnly?: boolean }
+  | { kind: 'promo_group'; groupKey: string; label: string; msgs: ProjectMessage[]; isExpanded: boolean }
+  | { kind: 'routine_head' }
+  | { kind: 'mute_active_banner' }
+  | { kind: 'routine_group'; row: RoutineRow<ProjectMessage> & { kind: 'group' }; isExpanded: boolean }
+  | { kind: 'routine_digest'; digestKey: string; row: RoutineRow<ProjectMessage> & { kind: 'daily_digest' }; isExpanded: boolean }
+  | { kind: 'resolved_toggle'; hiddenCount: number }
+  | { kind: 'resolved_controls' };
+
+export interface SectionIndices {
+  blockers: number;
+  questions: number;
+  routine: number;
+  newDivider: number;
+}
+
+interface TriageRowData {
+  items: TriageItem[];
+  messages: ProjectMessage[];
+  dividerTime: number | null;
+  totalNewCount: number;
+  showTempMuteMenu: boolean;
+  routineExpanded: boolean;
+  tempMutes: TemporaryMutes;
+  topNoisyEventTypes: Array<[string, number]>;
+  searchQuery: string;
+  newMessageCounts: MessageSummaryCounts;
+  listRef: RefObject<ListImperativeAPI | null>;
+  sectionIndices: SectionIndices;
+  bubbleProps: BubbleProps;
+  highlightedMessageId?: string | null;
+  visibleRoutineCount: number;
+  mutedRoutineCount: number;
+  routineOpen: ProjectMessage[];
+  onDismissDivider: () => void;
+  onShowOnlyNew: () => void;
+  setExpandedGroupKeys: Dispatch<SetStateAction<Set<string>>>;
+  setRoutineExpanded: Dispatch<SetStateAction<boolean>>;
+  setShowResolved: Dispatch<SetStateAction<boolean>>;
+  setShowTempMuteMenu: Dispatch<SetStateAction<boolean>>;
+  addTemporaryMute: (eventType: string, durationMs: number) => void;
+  handleResolveGroup: (msgs: ProjectMessage[]) => void;
+  handleBulkDeleteResolved: () => void;
+}
+
+function TriageRow({
+  index,
+  style,
+  items,
+  messages,
+  dividerTime,
+  totalNewCount,
+  showTempMuteMenu,
+  routineExpanded,
+  tempMutes,
+  topNoisyEventTypes,
+  searchQuery,
+  newMessageCounts,
+  listRef,
+  sectionIndices,
+  bubbleProps,
+  highlightedMessageId,
+  visibleRoutineCount,
+  mutedRoutineCount,
+  routineOpen,
+  onDismissDivider,
+  onShowOnlyNew,
+  setExpandedGroupKeys,
+  setRoutineExpanded,
+  setShowResolved,
+  setShowTempMuteMenu,
+  addTemporaryMute,
+  handleResolveGroup,
+  handleBulkDeleteResolved,
+}: RowComponentProps<TriageRowData>) {
+  const item = items[index];
+  if (!item) return null;
+
+  if (item.kind === 'banner_new') {
+    if (!dividerTime) return null;
+    return (
+      <div style={style}>
+        <div className="mb-2.5 mx-3 md:mx-4 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-blue-300 truncate">
+              {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={onShowOnlyNew}
+              className="min-h-[44px] shrink-0 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 md:min-h-8"
+            >
+              Show only new
+            </button>
+            <button
+              onClick={onDismissDivider}
+              className="min-h-[44px] shrink-0 rounded-md border border-blue-500/50 px-3 py-2 text-xs font-medium text-blue-300 transition-colors hover:bg-blue-500/10 md:min-h-8"
+            >
+              Mark all read
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'banner_caught_up') {
+    if (!dividerTime) return null;
+    return (
+      <div style={style}>
+        <div className="mb-2.5 mx-3 md:mx-4 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="flex-1 min-w-0">
+            <div className="text-sm font-semibold text-emerald-300 truncate">
+              No new since {formatSinceTimestamp(dividerTime)}
+            </div>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button
+              onClick={onDismissDivider}
+              className="min-h-[44px] shrink-0 rounded-md border border-emerald-500/50 px-3 py-2 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/10 md:min-h-8"
+            >
+              Reset baseline
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'loading') {
+    return (
+      <div style={style}>
+        <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
+      </div>
+    );
+  }
+
+  if (item.kind === 'empty') {
+    if (item.emptyKind === 'no_messages') {
+      return (
+        <div style={style}>
+          <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
+            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+            <p className="text-sm">No messages yet</p>
+            <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
+          </div>
+        </div>
+      );
+    }
+    if (item.emptyKind === 'no_new') {
+      if (!dividerTime) return null;
+      return (
+        <div style={style}>
+          <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
+            <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+            <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
+            <p className="text-xs mt-1 opacity-70">You&apos;re all caught up!</p>
+          </div>
+        </div>
+      );
+    }
+    // no_match
+    return (
+      <div style={style}>
+        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
+          <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
+          <p className="text-sm">No matches for &quot;{searchQuery}&quot;</p>
+          <p className="text-xs mt-1 opacity-70">Try a different search term</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'time_divider') {
+    return (
+      <div style={style}>
+        <div className="px-3 md:px-4">
+          <TimeDividerRow label={item.label} />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'section_sep') {
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 border-t border-neutral-800/60" />
+      </div>
+    );
+  }
+
+  if (item.kind === 'section_head_blockers') {
+    return (
+      <div style={style}>
+        <div className="flex items-center gap-1.5 text-ui-md text-amber-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
+          <AlertTriangle className="w-3 h-3" />
+          <span>Pinned · Blockers</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'section_head_questions') {
+    return (
+      <div style={style}>
+        <div className="flex items-center gap-1.5 text-ui-md text-blue-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
+          <HelpCircle className="w-3 h-3" />
+          <span>Awaiting reply · Questions</span>
+          <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-ui-sm">{item.count} waiting</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'section_head_linked') {
+    return (
+      <div style={style}>
+        <div className="flex items-center gap-1.5 text-ui-md text-indigo-400/70 font-semibold uppercase tracking-wide px-4 md:px-5 py-1">
+          <span>Being addressed · Linked</span>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'new_divider') {
+    if (!dividerTime) return null;
+    return (
+      <div style={style} data-divider-marker>
+        <div className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
+          <div className="flex-1 border-t border-blue-500/40" />
+          <div className="flex items-center gap-2 whitespace-nowrap font-medium">
+            <span className="flex items-center gap-1">
+              <ChevronUp className="w-3 h-3" />
+              NEW since {formatTimestamp(dividerTime)}
+            </span>
+            <button
+              onClick={onDismissDivider}
+              className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
+              title="Mark all caught up and dismiss this divider"
+            >
+              All caught up
+            </button>
+          </div>
+          <div className="flex-1 border-t border-blue-500/40" />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'summary_card') {
+    return (
+      <div style={style}>
+        <div className="px-3 md:px-4 pb-2.5">
+          <MessagesSummaryCard
+            newMessageCounts={newMessageCounts}
+            onScrollToBlockers={() => {
+              if (sectionIndices.blockers >= 0) {
+                listRef.current?.scrollToRow({ index: sectionIndices.blockers, align: 'start', behavior: 'smooth' });
+              }
+            }}
+            onScrollToQuestions={() => {
+              if (sectionIndices.questions >= 0) {
+                listRef.current?.scrollToRow({ index: sectionIndices.questions, align: 'start', behavior: 'smooth' });
+              }
+            }}
+            onScrollToRoutine={() => {
+              if (sectionIndices.routine >= 0) {
+                listRef.current?.scrollToRow({ index: sectionIndices.routine, align: 'start', behavior: 'smooth' });
+              }
+            }}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'message') {
+    return (
+      <div style={style}>
+        <div className="px-3 md:px-4 pb-2.5">
+          <MessageBubble
+            msg={item.msg}
+            faded={item.faded}
+            readOnly={item.readOnly}
+            allMessages={messages}
+            highlighted={item.msg.id === highlightedMessageId}
+            {...bubbleProps}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'promo_group') {
+    const { groupKey, label, msgs, isExpanded } = item;
+    const bd = outcomeBreakdown(msgs);
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 pb-2.5 overflow-hidden rounded-md border border-red-800/50 bg-red-950/20">
+          <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
+            <button
+              onClick={() => setExpandedGroupKeys(prev => {
+                const next = new Set(prev);
+                if (next.has(groupKey)) next.delete(groupKey); else next.add(groupKey);
+                return next;
+              })}
+              className="flex-1 flex items-center gap-2 text-left"
+            >
+              <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+              <span className="text-xs text-red-300 font-medium">
+                {msgs.length} {label}
+              </span>
+              {bd && <span className="text-xs text-red-400">{bd}</span>}
+            </button>
+            <button
+              onClick={() => handleResolveGroup(msgs)}
+              title="Resolve all"
+              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+            >
+              <Check className="w-3 h-3" />
+            </button>
+          </div>
+          {isExpanded && (
+            <div className="space-y-2 p-2 border-t border-red-900/40">
+              {msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'routine_head') {
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
+          <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
+            <button
+              onClick={() => setRoutineExpanded(e => !e)}
+              className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
+            >
+              <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
+              <span className="text-xs text-neutral-500 font-medium shrink-0">
+                {visibleRoutineCount} routine ops
+                {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
+              </span>
+              <span className="text-ui-md text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
+            </button>
+            <div className="relative shrink-0 px-2">
+              <button
+                onClick={() => setShowTempMuteMenu(v => !v)}
+                className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+                title="Temporarily mute event types"
+              >
+                <MoreVertical className="w-4 h-4" />
+              </button>
+              {showTempMuteMenu && (
+                <>
+                  <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
+                  <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-workbench-layer p-2 shadow-xl">
+                    {topNoisyEventTypes.length > 0 ? (
+                      <>
+                        <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
+                        {topNoisyEventTypes.map(([eventType, count]) => {
+                          const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
+                          // eslint-disable-next-line react-hooks/purity -- render-time freshness check, unchanged from original
+                          const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();
+                          return (
+                            <div key={eventType} className="text-xs px-2 py-1 text-neutral-400">
+                              <div className="font-medium mb-1">{label} ({count})</div>
+                              <div className="flex gap-1 flex-wrap">
+                                {(
+                                  [
+                                    ['30m', 1800000, 'Mute 30m'] as const,
+                                    ['1h', 3600000, 'Mute 1h'] as const,
+                                    ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
+                                  ]
+                                ).map(([shortLabel, ms, title]) => (
+                                  <button
+                                    key={shortLabel}
+                                    onClick={() => addTemporaryMute(eventType, ms)}
+                                    title={title}
+                                    className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
+                                  >
+                                    {shortLabel}
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </>
+                    ) : (
+                      <p className="text-ui-sm text-neutral-500 px-2 py-2">No recent events to mute</p>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'mute_active_banner') {
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 px-4 py-2 bg-amber-950/30 border border-amber-800/30 rounded text-ui-md text-amber-400">
+          🔕 Mute active, but failing groups still surface
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'routine_group') {
+    const { row, isExpanded } = item;
+    const bd = outcomeBreakdown(row.msgs);
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
+          <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
+            <button
+              onClick={() => setExpandedGroupKeys(prev => {
+                const next = new Set(prev);
+                if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
+                return next;
+              })}
+              className="flex-1 flex items-center gap-2 text-left"
+            >
+              <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+              <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
+            </button>
+            <button
+              onClick={() => handleResolveGroup(row.msgs)}
+              title="Resolve all"
+              className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
+            >
+              <Check className="w-3 h-3" />
+            </button>
+          </div>
+          {isExpanded && (
+            <div className="space-y-2 p-2 border-t border-neutral-800/40">
+              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'routine_digest') {
+    const { digestKey, row, isExpanded } = item;
+    const summary = formatDailyDigestSummary(row.breakdown);
+    return (
+      <div style={style}>
+        <div className="mx-3 md:mx-4 pb-2 overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer opacity-60">
+          <button
+            onClick={() => setExpandedGroupKeys(prev => {
+              const next = new Set(prev);
+              if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey);
+              return next;
+            })}
+            className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
+          >
+            <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
+            <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
+          </button>
+          {isExpanded && (
+            <div className="space-y-2 p-2 border-t border-neutral-800/40">
+              {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'resolved_toggle') {
+    return (
+      <div style={style}>
+        <div className="flex justify-center gap-3 pt-1 pb-2">
+          <button
+            onClick={() => setShowResolved(true)}
+            className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+          >
+            Show {item.hiddenCount} older resolved
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'resolved_controls') {
+    return (
+      <div style={style}>
+        <div className="flex justify-center gap-3 pt-1 pb-2">
+          <button
+            onClick={() => setShowResolved(false)}
+            className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+          >
+            Hide older resolved
+          </button>
+          <button
+            onClick={handleBulkDeleteResolved}
+            className="text-ui-md text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
+          >
+            Clear all resolved
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
+}
+
+// ─── Item list builder ────────────────────────────────────────────────────────
+
+export interface BuildParams {
+  loading: boolean;
+  messages: ProjectMessage[];
+  dividerTime: number | null;
+  totalNewCount: number;
+  dividerDismissedCurrent: boolean;
+  showOnlyNew: boolean;
+  showResolved: boolean;
+  routineExpanded: boolean;
+  muteActive: boolean;
+  searchQuery: string;
+  pinnedBlockers: ProjectMessage[];
+  pinnedQuestions: ProjectMessage[];
+  otherHighSignal: ProjectMessage[];
+  promotedGroups: (RoutineRow<ProjectMessage> & { kind: 'group' })[];
+  remainingRoutineRows: RoutineRow<ProjectMessage>[];
+  autoExpandedKeys: Set<string>;
+  expandedGroupKeys: Set<string>;
+  routineOpen: ProjectMessage[];
+  linkedMessages: ProjectMessage[];
+  visibleResolved: ProjectMessage[];
+  hiddenResolvedCount: number;
+  resolvedMessages: ProjectMessage[];
+  newMessageCounts: MessageSummaryCounts;
+}
+
+// eslint-disable-next-line react-refresh/only-export-components -- exported for unit testing; not a component
+export function buildTriageItems(p: BuildParams): { items: TriageItem[]; sectionIndices: SectionIndices } {
+  const items: TriageItem[] = [];
+  const sec: SectionIndices = { blockers: -1, questions: -1, routine: -1, newDivider: -1 };
+
+  // Banners
+  if (p.dividerTime && p.totalNewCount > 0 && !p.dividerDismissedCurrent) {
+    items.push({ kind: 'banner_new' });
+  }
+  if (p.dividerTime && !p.dividerDismissedCurrent && p.totalNewCount === 0 && !p.showOnlyNew) {
+    items.push({ kind: 'banner_caught_up' });
+  }
+
+  if (p.loading) {
+    items.push({ kind: 'loading' });
+    return { items, sectionIndices: sec };
+  }
+
+  if (p.messages.length === 0) {
+    items.push({ kind: 'empty', emptyKind: 'no_messages' });
+    return { items, sectionIndices: sec };
+  }
+
+  const allEmpty =
+    p.pinnedBlockers.length === 0 && p.pinnedQuestions.length === 0 &&
+    p.otherHighSignal.length === 0 && p.promotedGroups.length === 0 &&
+    p.routineOpen.length === 0 && p.linkedMessages.length === 0 &&
+    p.visibleResolved.length === 0;
+
+  if (p.showOnlyNew && p.dividerTime && allEmpty) {
+    items.push({ kind: 'empty', emptyKind: 'no_new' });
+    return { items, sectionIndices: sec };
+  }
+
+  if (p.searchQuery.trim() && allEmpty) {
+    items.push({ kind: 'empty', emptyKind: 'no_match' });
+    return { items, sectionIndices: sec };
+  }
+
+  // Pinned blockers
+  if (p.pinnedBlockers.length > 0) {
+    sec.blockers = items.length;
+    items.push({ kind: 'section_head_blockers' });
+    for (const it of insertTimeDividers(p.pinnedBlockers)) {
+      if (it.kind === 'divider') items.push({ kind: 'time_divider', label: it.label });
+      else items.push({ kind: 'message', msg: it.msg });
+    }
+    if (p.pinnedQuestions.length > 0 || p.otherHighSignal.length > 0) {
+      items.push({ kind: 'section_sep' });
+    }
+  }
+
+  // Pinned questions
+  if (p.pinnedQuestions.length > 0) {
+    sec.questions = items.length;
+    items.push({ kind: 'section_head_questions', count: p.pinnedQuestions.length });
+    for (const it of insertTimeDividers(p.pinnedQuestions)) {
+      if (it.kind === 'divider') items.push({ kind: 'time_divider', label: it.label });
+      else items.push({ kind: 'message', msg: it.msg });
+    }
+    if (p.otherHighSignal.length > 0) items.push({ kind: 'section_sep' });
+  }
+
+  // NEW divider
+  if (p.dividerTime && p.totalNewCount > 0 && !p.dividerDismissedCurrent) {
+    sec.newDivider = items.length;
+    items.push({ kind: 'new_divider' });
+  }
+
+  // Summary card
+  const { blockers: nb, questions: nq, feedback: nf, bugReports: nbr, routine: nr, highSignalNotes: nhs } = p.newMessageCounts;
+  if (p.dividerTime && !p.dividerDismissedCurrent && (nb > 0 || nq > 0 || nf > 0 || nbr > 0 || nr > 0 || nhs > 0)) {
+    items.push({ kind: 'summary_card' });
+  }
+
+  // Other high-signal
+  for (const it of insertTimeDividers(p.otherHighSignal)) {
+    if (it.kind === 'divider') items.push({ kind: 'time_divider', label: it.label });
+    else items.push({ kind: 'message', msg: it.msg });
+  }
+
+  // Auto-promoted failing groups
+  for (const row of p.promotedGroups) {
+    const isExpanded = p.expandedGroupKeys.has(row.key) || p.autoExpandedKeys.has(row.key);
+    items.push({ kind: 'promo_group', groupKey: row.key, label: row.label, msgs: row.msgs, isExpanded });
+  }
+
+  // Routine section
+  if (p.routineOpen.length > 0) {
+    sec.routine = items.length;
+    items.push({ kind: 'routine_head' });
+    if (p.routineExpanded) {
+      if (p.muteActive) items.push({ kind: 'mute_active_banner' });
+
+      // Interleave time dividers with routine rows
+      const firstMsgs = p.remainingRoutineRows.map(row =>
+        row.kind === 'single' ? row.msg : row.msgs[0]
+      );
+      const withDividers = insertTimeDividers(firstMsgs);
+      const dividerBeforeId = new Map<string, string>();
+      for (let i = 0; i < withDividers.length; i++) {
+        const cur = withDividers[i];
+        const next = withDividers[i + 1];
+        if (cur?.kind === 'divider' && next?.kind === 'message') {
+          dividerBeforeId.set(next.msg.id, cur.label);
+        }
+      }
+
+      for (const row of p.remainingRoutineRows) {
+        const firstMsg = row.kind === 'single' ? row.msg : row.msgs[0];
+        const divLabel = dividerBeforeId.get(firstMsg.id);
+        if (divLabel) items.push({ kind: 'time_divider', label: divLabel });
+
+        if (row.kind === 'group') {
+          const isExpanded = p.expandedGroupKeys.has(row.key) || p.autoExpandedKeys.has(row.key);
+          items.push({ kind: 'routine_group', row, isExpanded });
+        } else if (row.kind === 'daily_digest') {
+          const digestKey = `digest-${row.day}`;
+          const isExpanded = p.expandedGroupKeys.has(digestKey);
+          items.push({ kind: 'routine_digest', digestKey, row, isExpanded });
+        } else {
+          items.push({ kind: 'message', msg: row.msg });
+        }
+      }
+    }
+  }
+
+  // Linked messages
+  if (p.linkedMessages.length > 0) {
+    items.push({ kind: 'section_head_linked' });
+    for (const it of insertTimeDividers(p.linkedMessages)) {
+      if (it.kind === 'divider') items.push({ kind: 'time_divider', label: it.label });
+      else items.push({ kind: 'message', msg: it.msg, readOnly: true });
+    }
+    if (p.visibleResolved.length > 0) items.push({ kind: 'section_sep' });
+  }
+
+  // Resolved messages
+  for (const it of insertTimeDividers(p.visibleResolved)) {
+    if (it.kind === 'divider') items.push({ kind: 'time_divider', label: it.label });
+    else items.push({ kind: 'message', msg: it.msg, faded: true });
+  }
+
+  // Resolved toggle / controls
+  if (p.hiddenResolvedCount > 0) {
+    items.push({ kind: 'resolved_toggle', hiddenCount: p.hiddenResolvedCount });
+  }
+  if (p.showResolved && p.resolvedMessages.length > 0) {
+    items.push({ kind: 'resolved_controls' });
+  }
+
+  return { items, sectionIndices: sec };
+}
+
+// ─── Public interface ─────────────────────────────────────────────────────────
 
 export interface MessagesListViewProps {
   presentation?: 'triage' | 'conversation';
@@ -38,9 +755,6 @@ export interface MessagesListViewProps {
   activityStrip?: ReactNode;
   // Refs
   scrollRef: RefObject<HTMLDivElement | null>;
-  blockersRefEl: RefObject<HTMLDivElement | null>;
-  questionsRefEl: RefObject<HTMLDivElement | null>;
-  routineRefEl: RefObject<HTMLDivElement | null>;
   dividerDismissedRef: RefObject<boolean>;
 
   // Raw + derived list state
@@ -49,7 +763,6 @@ export interface MessagesListViewProps {
   dividerTime: number | null;
   totalNewCount: number;
   newMessageCounts: MessageSummaryCounts;
-  highSignalOpen: ProjectMessage[];
   routineOpen: ProjectMessage[];
   linkedMessages: ProjectMessage[];
   pinnedBlockers: ProjectMessage[];
@@ -94,63 +807,16 @@ export interface MessagesListViewProps {
 }
 
 /**
- * Presentational scroll area for MessagesPanel: banners, caught-up/empty/no-match/loading
- * states, pinned sections, the NEW divider, summary card, other-high-signal, promoted
- * groups, the routine collapse/expand block, the resolved section + toggles, and the
- * scroll-down button. Renders entirely from props — owns no list-derivation logic.
+ * Presentational scroll area for MessagesPanel.
+ *
+ * The triage presentation uses react-window to virtualize the flat item list,
+ * keeping initial render fast even with 100-200 markdown bubbles.
  */
-export function MessagesListView({
-  presentation = 'triage',
-  streamingBubble,
-  activityStrip,
-  scrollRef,
-  blockersRefEl,
-  questionsRefEl,
-  routineRefEl,
-  dividerDismissedRef,
-  messages,
-  loading,
-  dividerTime,
-  totalNewCount,
-  newMessageCounts,
-  highSignalOpen,
-  routineOpen,
-  linkedMessages,
-  pinnedBlockers,
-  pinnedQuestions,
-  otherHighSignal,
-  promotedGroups,
-  remainingRoutineRows,
-  autoExpandedKeys,
-  visibleRoutineCount,
-  mutedRoutineCount,
-  visibleResolved,
-  hiddenResolvedCount,
-  resolvedMessages,
-  searchQuery,
-  showOnlyNew,
-  showResolved,
-  routineExpanded,
-  showScrollDown,
-  muteActive,
-  showTempMuteMenu,
-  expandedGroupKeys,
-  tempMutes,
-  bubbleProps,
-  highlightedMessageId,
-  onDismissDivider,
-  onShowOnlyNew,
-  setExpandedGroupKeys,
-  setRoutineExpanded,
-  setShowResolved,
-  setShowTempMuteMenu,
-  addTemporaryMute,
-  getTop3NoisyEventTypes,
-  handleResolveGroup,
-  handleBulkDeleteResolved,
-  scrollToBottom,
-}: MessagesListViewProps) {
+export function MessagesListView(props: MessagesListViewProps) {
+  const { presentation = 'triage', streamingBubble, activityStrip, ...triageProps } = props;
+
   if (presentation === 'conversation') {
+    const { scrollRef, loading, messages, bubbleProps, highlightedMessageId, showScrollDown, scrollToBottom } = triageProps;
     return (
       <div ref={scrollRef} className="relative flex-1 overflow-y-auto bg-workbench-base px-2 py-3 custom-scrollbar md:px-2.5 md:py-4">
         <div data-testid="strategic-conversation-column" className="mx-auto flex w-full max-w-[940px] flex-col gap-3">
@@ -178,9 +844,7 @@ export function MessagesListView({
                   />
                 ),
               )}
-              {/* Live streaming preview — always at the tail, below all durable messages. */}
               {streamingBubble}
-              {/* Live, ephemeral activity strip — below the streaming reply. */}
               {activityStrip}
             </>
           )}
@@ -198,442 +862,168 @@ export function MessagesListView({
     );
   }
 
-  // Compute the top-3 noisy event types once per render (used twice below: for
-  // the `.length` guard and the `.map`). getTop3NoisyEventTypes is memoized in
-  // MessagesPanel; binding its result here avoids invoking it twice.
+  return <TriageVirtualList {...triageProps} />;
+}
+
+// ─── Triage virtual list ──────────────────────────────────────────────────────
+
+type TriageVirtualListProps = Omit<MessagesListViewProps, 'presentation' | 'streamingBubble' | 'activityStrip'>;
+
+function TriageVirtualList(props: TriageVirtualListProps) {
+  const {
+    messages,
+    loading,
+    dividerTime,
+    totalNewCount,
+    newMessageCounts,
+    routineOpen,
+    linkedMessages,
+    pinnedBlockers,
+    pinnedQuestions,
+    otherHighSignal,
+    promotedGroups,
+    remainingRoutineRows,
+    autoExpandedKeys,
+    visibleRoutineCount,
+    mutedRoutineCount,
+    visibleResolved,
+    hiddenResolvedCount,
+    resolvedMessages,
+    searchQuery,
+    showOnlyNew,
+    showResolved,
+    routineExpanded,
+    showScrollDown,
+    muteActive,
+    showTempMuteMenu,
+    expandedGroupKeys,
+    tempMutes,
+    bubbleProps,
+    highlightedMessageId,
+    dividerDismissedRef,
+    scrollRef,
+    onDismissDivider,
+    onShowOnlyNew,
+    setExpandedGroupKeys,
+    setRoutineExpanded,
+    setShowResolved,
+    setShowTempMuteMenu,
+    addTemporaryMute,
+    getTop3NoisyEventTypes,
+    handleResolveGroup,
+    handleBulkDeleteResolved,
+    scrollToBottom,
+  } = props;
+  const listRef = useListRef(null);
+
+  // Sync the List's outer DOM element to scrollRef so MessagesPanel's scroll
+  // behaviors (auto-scroll, near-bottom detection, event listeners) work unchanged.
+  useEffect(() => {
+    scrollRef.current = listRef.current?.element ?? null;
+    return () => { scrollRef.current = null; };
+  });
+
   const topNoisyEventTypes = getTop3NoisyEventTypes();
 
+  const { items, sectionIndices } = useMemo(() => buildTriageItems({
+    loading,
+    messages,
+    dividerTime,
+    totalNewCount,
+    dividerDismissedCurrent: dividerDismissedRef.current,
+    showOnlyNew,
+    showResolved,
+    routineExpanded,
+    muteActive,
+    searchQuery,
+    pinnedBlockers,
+    pinnedQuestions,
+    otherHighSignal,
+    promotedGroups,
+    remainingRoutineRows,
+    autoExpandedKeys,
+    expandedGroupKeys,
+    routineOpen,
+    linkedMessages,
+    visibleResolved,
+    hiddenResolvedCount,
+    resolvedMessages,
+    newMessageCounts,
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }), [
+    loading, messages, dividerTime, totalNewCount, dividerDismissedRef.current,
+    showOnlyNew, showResolved, routineExpanded, muteActive, searchQuery,
+    pinnedBlockers, pinnedQuestions, otherHighSignal, promotedGroups,
+    remainingRoutineRows, autoExpandedKeys, expandedGroupKeys, routineOpen,
+    linkedMessages, visibleResolved, hiddenResolvedCount, resolvedMessages,
+    newMessageCounts,
+  ]);
+
+  const newDividerIndex = sectionIndices.newDivider;
+  const handleRowsRenderedRef = useRef<(visible: { startIndex: number }) => void>(() => { /* placeholder */ });
+  handleRowsRenderedRef.current = (visible: { startIndex: number }) => {
+    if (!dividerDismissedRef.current && newDividerIndex >= 0 && visible.startIndex > newDividerIndex) {
+      onDismissDivider();
+    }
+  };
+
+  const rowHeight = useDynamicRowHeight({ defaultRowHeight: 120 });
+
+  const rowProps: TriageRowData = useMemo(() => ({
+    items,
+    messages,
+    dividerTime,
+    totalNewCount,
+    showTempMuteMenu,
+    routineExpanded,
+    tempMutes,
+    topNoisyEventTypes,
+    searchQuery,
+    newMessageCounts,
+    listRef,
+    sectionIndices,
+    bubbleProps,
+    highlightedMessageId,
+    visibleRoutineCount,
+    mutedRoutineCount,
+    routineOpen,
+    onDismissDivider,
+    onShowOnlyNew,
+    setExpandedGroupKeys,
+    setRoutineExpanded,
+    setShowResolved,
+    setShowTempMuteMenu,
+    addTemporaryMute,
+    handleResolveGroup,
+    handleBulkDeleteResolved,
+  }), [
+    items, messages, dividerTime, totalNewCount,
+    showTempMuteMenu, routineExpanded,
+    tempMutes, topNoisyEventTypes, searchQuery, newMessageCounts, listRef,
+    sectionIndices, bubbleProps, highlightedMessageId,
+    visibleRoutineCount, mutedRoutineCount, routineOpen,
+    onDismissDivider, onShowOnlyNew, setExpandedGroupKeys, setRoutineExpanded,
+    setShowResolved, setShowTempMuteMenu, addTemporaryMute, handleResolveGroup,
+    handleBulkDeleteResolved,
+  ]);
+
   return (
-    <div ref={scrollRef} className="relative flex-1 space-y-2.5 overflow-y-auto bg-workbench-surface px-3 py-3 custom-scrollbar md:px-4">
-      {/* Prominent banner: X new since {time} with action buttons */}
-      {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-blue-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold text-blue-300 truncate">
-              {totalNewCount} new since {formatSinceTimestamp(dividerTime)}
-            </div>
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              onClick={onShowOnlyNew}
-              className="min-h-[44px] shrink-0 rounded-md bg-blue-600 px-3 py-2 text-xs font-medium text-white transition-colors hover:bg-blue-500 md:min-h-8"
-            >
-              Show only new
-            </button>
-            <button
-              onClick={onDismissDivider}
-              className="min-h-[44px] shrink-0 rounded-md border border-blue-500/50 px-3 py-2 text-xs font-medium text-blue-300 transition-colors hover:bg-blue-500/10 md:min-h-8"
-            >
-              Mark all read
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Caught-up indicator: when divider is set, not dismissed, and zero new messages of any kind */}
-      {dividerTime && !dividerDismissedRef.current && totalNewCount === 0 && !showOnlyNew && (
-        <div className="mb-2.5 flex flex-col gap-3 rounded-md border border-emerald-500/40 bg-workbench-layer p-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex-1 min-w-0">
-            <div className="text-sm font-semibold text-emerald-300 truncate">
-              No new since {formatSinceTimestamp(dividerTime)}
-            </div>
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <button
-              onClick={onDismissDivider}
-              className="min-h-[44px] shrink-0 rounded-md border border-emerald-500/50 px-3 py-2 text-xs font-medium text-emerald-300 transition-colors hover:bg-emerald-500/10 md:min-h-8"
-            >
-              Reset baseline
-            </button>
-          </div>
-        </div>
-      )}
-
-      {loading ? (
-        <p className="text-xs text-neutral-500 text-center py-8">Loading...</p>
-      ) : messages.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
-          <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-          <p className="text-sm">No messages yet</p>
-          <p className="text-xs mt-1 opacity-70">Send feedback, report bugs, or ask questions</p>
-        </div>
-      ) : showOnlyNew && dividerTime && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
-          <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-          <p className="text-sm">No new messages since {formatTimestamp(dividerTime)}</p>
-          <p className="text-xs mt-1 opacity-70">You're all caught up!</p>
-        </div>
-      ) : searchQuery.trim() && highSignalOpen.length === 0 && routineOpen.length === 0 && linkedMessages.length === 0 && visibleResolved.length === 0 ? (
-        <div className="flex flex-col items-center justify-center py-12 text-neutral-500">
-          <MessageSquare className="w-8 h-8 mb-3 opacity-40" />
-          <p className="text-sm">No matches for "{searchQuery}"</p>
-          <p className="text-xs mt-1 opacity-70">Try a different search term</p>
-        </div>
-      ) : (
-        <>
-          {/* Pinned BLOCKERs (importance mode only) */}
-          {pinnedBlockers.length > 0 && (
-            <>
-              <div className="flex items-center gap-1.5 text-ui-md text-amber-400/70 font-semibold uppercase tracking-wide px-1">
-                <AlertTriangle className="w-3 h-3" />
-                <span>Pinned · Blockers</span>
-              </div>
-              {insertTimeDividers(pinnedBlockers).map((item, idx) =>
-                item.kind === 'divider' ? (
-                  <TimeDividerRow key={`divider-pinned-${idx}`} label={item.label} />
-                ) : (
-                  <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-                )
-              )}
-              {(pinnedQuestions.length > 0 || otherHighSignal.length > 0) && <div className="border-t border-neutral-800/60" />}
-            </>
-          )}
-
-          {/* Pinned QUESTIONs (importance mode only) — awaiting operator reply */}
-          <div ref={questionsRefEl}>
-            {pinnedQuestions.length > 0 && (
-              <>
-                <div className="flex items-center gap-1.5 text-ui-md text-blue-400/70 font-semibold uppercase tracking-wide px-1">
-                  <HelpCircle className="w-3 h-3" />
-                  <span>Awaiting reply · Questions</span>
-                  <span className="ml-auto bg-blue-500/20 text-blue-300 border border-blue-500/40 rounded-full px-1.5 py-0.5 text-ui-sm">{pinnedQuestions.length} waiting</span>
-                </div>
-                {insertTimeDividers(pinnedQuestions).map((item, idx) =>
-                  item.kind === 'divider' ? (
-                    <TimeDividerRow key={`divider-questions-${idx}`} label={item.label} />
-                  ) : (
-                    <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-                  )
-                )}
-                {otherHighSignal.length > 0 && <div className="border-t border-neutral-800/60" />}
-              </>
-            )}
-          </div>
-
-          {/* Divider: show before first new message if divider time is set and not dismissed */}
-          {dividerTime && totalNewCount > 0 && !dividerDismissedRef.current && (
-            <div data-divider-marker className="flex items-center gap-2 px-2 py-3 text-ui-md text-blue-300/70">
-              <div className="flex-1 border-t border-blue-500/40" />
-              <div className="flex items-center gap-2 whitespace-nowrap font-medium">
-                <span className="flex items-center gap-1">
-                  <ChevronUp className="w-3 h-3" />
-                  NEW since {formatTimestamp(dividerTime)}
-                </span>
-                <button
-                  onClick={onDismissDivider}
-                  className="px-2 py-0.5 text-xs bg-blue-600/50 hover:bg-blue-600/70 rounded border border-blue-500/60 text-blue-200 transition-colors min-h-[44px] md:min-h-[28px] flex items-center"
-                  title="Mark all caught up and dismiss this divider"
-                >
-                  All caught up
-                </button>
-              </div>
-              <div className="flex-1 border-t border-blue-500/40" />
-            </div>
-          )}
-
-          {/* Summary card: show counts of new messages if divider is active */}
-          {dividerTime && !dividerDismissedRef.current && (newMessageCounts.blockers > 0 || newMessageCounts.questions > 0 || newMessageCounts.feedback > 0 || newMessageCounts.bugReports > 0 || newMessageCounts.routine > 0 || newMessageCounts.highSignalNotes > 0) && (
-            <MessagesSummaryCard
-              newMessageCounts={newMessageCounts}
-              onScrollToBlockers={() => {
-                blockersRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              }}
-              onScrollToQuestions={() => {
-                questionsRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              }}
-              onScrollToRoutine={() => {
-                routineRefEl.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-              }}
-            />
-          )}
-
-          {/* Other high-signal open messages */}
-          <div ref={blockersRefEl}>
-            {insertTimeDividers(otherHighSignal).map((item, idx) =>
-              item.kind === 'divider' ? (
-                <TimeDividerRow key={`divider-high-${idx}`} label={item.label} />
-              ) : (
-                <MessageBubble key={item.msg.id} msg={item.msg} allMessages={messages} {...bubbleProps} />
-              )
-            )}
-          </div>
-
-          {/* Auto-promoted failing routine groups */}
-          {promotedGroups.map(row => {
-            const bd = outcomeBreakdown(row.msgs);
-            const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
-            return (
-              <div key={row.key} className="overflow-hidden rounded-md border border-red-800/50 bg-red-950/20">
-                <div className="flex items-center gap-2 px-4 py-2.5 bg-red-950/30 min-h-[44px]">
-                  <button
-                    onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(row.key)) next.delete(row.key); else next.add(row.key); return next; })}
-                    className="flex-1 flex items-center gap-2 text-left"
-                  >
-                    <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                    <span className="text-xs text-red-300 font-medium">{row.msgs.length} {row.label}</span>
-                    {bd && <span className="text-xs text-red-400">{bd}</span>}
-                  </button>
-                  <button onClick={() => handleResolveGroup(row.msgs)} title="Resolve all" className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center">
-                    <Check className="w-3 h-3" />
-                  </button>
-                </div>
-                {isGroupExpanded && (
-                  <div className="space-y-2 p-2 border-t border-red-900/40">
-                    {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                  </div>
-                )}
-              </div>
-            );
-          })}
-
-          {/* Routine ops group — collapsed by default */}
-          {routineOpen.length > 0 && (
-            <div ref={routineRefEl} className="overflow-hidden rounded-md border border-neutral-800 bg-workbench-layer">
-              <div className="flex min-h-[44px] items-center bg-workbench-layer transition-colors hover:bg-neutral-900/70">
-                <button
-                  onClick={() => setRoutineExpanded(e => !e)}
-                  className="flex-1 flex items-center gap-2 px-4 py-2.5 text-left"
-                >
-                  <ChevronDown className={`w-3.5 h-3.5 text-neutral-600 shrink-0 transition-transform ${routineExpanded ? 'rotate-180' : ''}`} />
-                  <span className="text-xs text-neutral-500 font-medium shrink-0">
-                    {visibleRoutineCount} routine ops
-                    {mutedRoutineCount > 0 && <span className="text-neutral-600 ml-1">({mutedRoutineCount} muted)</span>}
-                  </span>
-                  <span className="text-ui-md text-neutral-600 truncate">{routineSummary(routineOpen)}</span>
-                </button>
-                <div className="relative shrink-0 px-2">
-                  <button
-                    onClick={() => setShowTempMuteMenu(v => !v)}
-                    className="text-neutral-500 hover:text-neutral-300 p-1.5 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                    title="Temporarily mute event types"
-                  >
-                    <MoreVertical className="w-4 h-4" />
-                  </button>
-                  {showTempMuteMenu && (
-                    <>
-                      <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
-                      <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-workbench-layer p-2 shadow-xl">
-                        {topNoisyEventTypes.length > 0 ? (
-                          <>
-                            <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
-                            {topNoisyEventTypes.map(([eventType, count]) => {
-                              const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
-                              // eslint-disable-next-line react-hooks/purity -- render-time freshness check, unchanged from the original inline MessagesPanel render
-                              const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();
-                              return (
-                                <div key={eventType} className="text-xs px-2 py-1 text-neutral-400">
-                                  <div className="font-medium mb-1">{label} ({count})</div>
-                                  <div className="flex gap-1 flex-wrap">
-                                    {(
-                                      [
-                                        ['30m', 1800000, 'Mute 30m'] as const,
-                                        ['1h', 3600000, 'Mute 1h'] as const,
-                                        ['Tomorrow', 86400000, 'Mute until tomorrow'] as const,
-                                      ]
-                                    ).map(([shortLabel, ms, title]) => (
-                                      <button
-                                        key={shortLabel}
-                                        onClick={() => addTemporaryMute(eventType, ms)}
-                                        title={title}
-                                        className={`text-ui-md px-2 py-1 rounded transition-colors min-h-[44px] md:min-h-auto flex items-center ${isActive ? 'bg-amber-500/20 text-amber-400' : 'bg-neutral-800 text-neutral-300 hover:bg-neutral-700'}`}
-                                      >
-                                        {shortLabel}
-                                      </button>
-                                    ))}
-                                  </div>
-                                </div>
-                              );
-                            })}
-                          </>
-                        ) : (
-                          <p className="text-ui-sm text-neutral-500 px-2 py-2">No recent events to mute</p>
-                        )}
-                      </div>
-                    </>
-                  )}
-                </div>
-              </div>
-              {muteActive && (
-                <div className="px-4 py-2 bg-amber-950/30 border-t border-amber-800/30 text-ui-md text-amber-400">
-                  🔕 Mute active, but failing groups still surface
-                </div>
-              )}
-              {routineExpanded && (
-                <div className="space-y-3 p-3 border-t border-neutral-800/40">
-                  {(() => {
-                    // Get first message date for each row (for single: the message, for group: first in group)
-                    const rowsWithDate = remainingRoutineRows.map(row => {
-                      const msg = row.kind === 'single' ? row.msg : row.msgs[0];
-                      return { row, firstMsg: msg };
-                    });
-
-                    // Create divider list for all messages in order
-                    const allMsgs = rowsWithDate.map(r => r.firstMsg);
-                    const msgWithDividers = insertTimeDividers(allMsgs);
-
-                    // Build a set of message IDs that have a divider before them
-                    const msgsWithDividerBefore = new Set<string>();
-                    msgWithDividers.forEach((item, idx) => {
-                      if (item.kind === 'message' && idx > 0 && msgWithDividers[idx - 1]?.kind === 'divider') {
-                        msgsWithDividerBefore.add(item.msg.id);
-                      }
-                    });
-
-                    // Also build a map of message ID to divider label
-                    const dividerLabels = new Map<string, string>();
-                    msgWithDividers.forEach((item, idx) => {
-                      if (item.kind === 'divider' && idx + 1 < msgWithDividers.length && msgWithDividers[idx + 1]?.kind === 'message') {
-                        dividerLabels.set((msgWithDividers[idx + 1] as MessageWithDivider<ProjectMessage> & { kind: 'message' }).msg.id, item.label);
-                      }
-                    });
-
-                    return rowsWithDate.map(({ row, firstMsg }) => {
-                      const hasDividerBefore = msgsWithDividerBefore.has(firstMsg.id);
-                      const dividerLabel = dividerLabels.get(firstMsg.id);
-
-                      if (row.kind === 'group') {
-                        const isGroupExpanded = expandedGroupKeys.has(row.key) || autoExpandedKeys.has(row.key);
-                        const bd = outcomeBreakdown(row.msgs);
-                        return (
-                          <div key={row.key}>
-                            {hasDividerBefore && dividerLabel && (
-                              <TimeDividerRow label={dividerLabel} className="mb-2" />
-                            )}
-                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer">
-                              <div className="flex items-center gap-2 bg-neutral-900/30 px-3 py-2">
-                                <button
-                                  onClick={() => setExpandedGroupKeys(prev => {
-                                    const next = new Set(prev);
-                                    if (next.has(row.key)) next.delete(row.key); else next.add(row.key);
-                                    return next;
-                                  })}
-                                  className="flex-1 flex items-center gap-2 text-left"
-                                >
-                                  <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isGroupExpanded ? 'rotate-180' : ''}`} />
-                                  <span className="text-xs text-neutral-500 font-medium">{row.msgs.length} {row.label}{bd ? ` ${bd}` : ''}</span>
-                                </button>
-                                <button
-                                  onClick={() => handleResolveGroup(row.msgs)}
-                                  title="Resolve all"
-                                  className="text-emerald-500/70 hover:text-emerald-400 p-1 rounded transition-colors min-h-[44px] min-w-[44px] md:min-h-auto md:min-w-auto flex items-center justify-center"
-                                >
-                                  <Check className="w-3 h-3" />
-                                </button>
-                              </div>
-                              {isGroupExpanded && (
-                                <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                                  {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      if (row.kind === 'daily_digest') {
-                        const digestKey = `digest-${row.day}`;
-                        const isExpanded = expandedGroupKeys.has(digestKey);
-                        const summary = formatDailyDigestSummary(row.breakdown);
-                        return (
-                          <div key={digestKey}>
-                            {hasDividerBefore && dividerLabel && (
-                              <TimeDividerRow label={dividerLabel} className="mb-2" />
-                            )}
-                            <div className="overflow-hidden rounded-md border border-neutral-800/60 bg-workbench-layer opacity-60">
-                              <button
-                                onClick={() => setExpandedGroupKeys(prev => { const next = new Set(prev); if (next.has(digestKey)) next.delete(digestKey); else next.add(digestKey); return next; })}
-                                className="w-full flex items-center gap-2 px-3 py-2 bg-neutral-900/30 text-left"
-                              >
-                                <ChevronDown className={`w-3 h-3 text-neutral-600 shrink-0 transition-transform ${isExpanded ? 'rotate-180' : ''}`} />
-                                <span className="text-xs text-neutral-500 font-medium">{row.count} stale routine{summary ? ` · ${summary}` : ''}</span>
-                              </button>
-                              {isExpanded && (
-                                <div className="space-y-2 p-2 border-t border-neutral-800/40">
-                                  {row.msgs.map(msg => <MessageBubble key={msg.id} msg={msg} readOnly allMessages={messages} {...bubbleProps} />)}
-                                </div>
-                              )}
-                            </div>
-                          </div>
-                        );
-                      }
-
-                      // Single message
-                      return (
-                        <div key={`single-${row.msg.id}`}>
-                          {hasDividerBefore && dividerLabel && (
-                            <TimeDividerRow label={dividerLabel} className="mb-2" />
-                          )}
-                          <MessageBubble key={row.msg.id} msg={row.msg} allMessages={messages} {...bubbleProps} />
-                        </div>
-                      );
-                    });
-                  })()}
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Linked messages (being addressed) */}
-          {linkedMessages.length > 0 && (
-            <>
-              <div className="flex items-center gap-1.5 text-ui-md text-indigo-400/70 font-semibold uppercase tracking-wide px-1">
-                <span>Being addressed · Linked</span>
-              </div>
-              {insertTimeDividers(linkedMessages).map((item, idx) =>
-                item.kind === 'divider' ? (
-                  <TimeDividerRow key={`divider-linked-${idx}`} label={item.label} />
-                ) : (
-                  <MessageBubble key={item.msg.id} msg={item.msg} readOnly allMessages={messages} {...bubbleProps} />
-                )
-              )}
-              {visibleResolved.length > 0 && <div className="border-t border-neutral-800/60" />}
-            </>
-          )}
-
-          {/* Resolved messages (faded) */}
-          {insertTimeDividers(visibleResolved).map((item, idx) =>
-            item.kind === 'divider' ? (
-              <TimeDividerRow key={`divider-resolved-${idx}`} label={item.label} />
-            ) : (
-              <MessageBubble key={item.msg.id} msg={item.msg} faded allMessages={messages} {...bubbleProps} />
-            )
-          )}
-
-          {/* Resolved toggle + clear */}
-          {hiddenResolvedCount > 0 && (
-            <div className="flex justify-center gap-3 pt-1">
-              <button
-                onClick={() => setShowResolved(true)}
-                className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-              >
-                Show {hiddenResolvedCount} older resolved
-              </button>
-            </div>
-          )}
-          {showResolved && resolvedMessages.length > 0 && (
-            <div className="flex justify-center gap-3 pt-1">
-              <button
-                onClick={() => setShowResolved(false)}
-                className="text-ui-md text-neutral-600 hover:text-neutral-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-              >
-                Hide older resolved
-              </button>
-              <button
-                onClick={handleBulkDeleteResolved}
-                className="text-ui-md text-neutral-600 hover:text-red-400 transition-colors px-2 py-1 min-h-[44px] md:min-h-auto flex items-center"
-              >
-                Clear all resolved
-              </button>
-            </div>
-          )}
-        </>
-      )}
-
-      {/* Scroll to bottom button */}
+    <div className="relative flex-1 overflow-hidden bg-workbench-surface">
+      <List
+        rowCount={items.length}
+        rowComponent={TriageRow}
+        rowProps={rowProps}
+        rowHeight={rowHeight}
+        overscanCount={6}
+        listRef={listRef}
+        className="h-full custom-scrollbar"
+        onRowsRendered={(visible) => handleRowsRenderedRef.current(visible)}
+      />
       {showScrollDown && (
         <button
           onClick={scrollToBottom}
-          className="sticky bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+          className="absolute bottom-2 left-1/2 -translate-x-1/2 bg-neutral-800 border border-neutral-700 text-neutral-400 hover:text-neutral-200 p-2 rounded-full shadow-lg transition-colors z-10 min-h-[44px] min-w-[44px] flex items-center justify-center"
+          aria-label="Scroll to latest message"
         >
           <ArrowDown className="w-4 h-4" />
         </button>

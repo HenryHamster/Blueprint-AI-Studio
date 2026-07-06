@@ -656,11 +656,6 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     }, 100);
   }, []);
 
-  // Refs for scrolling to sections from summary card
-  const blockersRefEl = useRef<HTMLDivElement>(null);
-  const questionsRefEl = useRef<HTMLDivElement>(null);
-  const routineRefEl = useRef<HTMLDivElement>(null);
-
   // Stable ref for addToast
   const addToastRef = useRef(addToast);
   addToastRef.current = addToast;
@@ -2122,16 +2117,12 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
         streamingBubble={streamingTurn ? <StrategicStreamingBubble key={streamingTurn.key} text={streamingTurn.text} /> : null}
         activityStrip={strategicTurnWorking ? <StrategicActivityStrip items={liveActivity.items} /> : null}
         scrollRef={scrollRef}
-        blockersRefEl={blockersRefEl}
-        questionsRefEl={questionsRefEl}
-        routineRefEl={routineRefEl}
         dividerDismissedRef={dividerDismissedRef}
         messages={conversationMode ? renderedConversationMessages : messages}
         loading={loading}
         dividerTime={dividerTime}
         totalNewCount={totalNewCount}
         newMessageCounts={newMessageCounts}
-        highSignalOpen={highSignalOpen}
         routineOpen={routineOpen}
         linkedMessages={linkedMessages}
         pinnedBlockers={pinnedBlockers}
