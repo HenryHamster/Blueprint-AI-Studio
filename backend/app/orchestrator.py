@@ -488,6 +488,7 @@ _last_post_commit_sweep: datetime = _utcnow()
 _last_sidecar_sweep: datetime = _utcnow()
 _last_bootstrap_recovery_sweep: datetime = _utcnow()
 _last_lane_baseline_backfill: datetime = _utcnow()
+_last_merge_credit_backfill: datetime = _utcnow()
 _last_runner_deactivation_sweep: datetime = _utcnow()
 _last_local_runner_hold_sweep: datetime = _utcnow()
 _last_deadlock_check: datetime | None = None
@@ -3243,6 +3244,7 @@ async def orchestrator_worker():
         _last_sidecar_sweep, \
         _last_bootstrap_recovery_sweep, \
         _last_lane_baseline_backfill, \
+        _last_merge_credit_backfill, \
         _last_runner_deactivation_sweep, \
         _last_local_runner_hold_sweep
     while True:
@@ -9131,6 +9133,28 @@ async def orchestrator_worker():
                 except Exception:
                     logger.exception(
                         "[ORCHESTRATOR] Lane-baseline backfill sweep error"
+                    )
+            # Merge-credit backfill sweep — every 600s. Retroactively re-stamps
+            # under-credited children of landed rollups (rollups that landed
+            # BEFORE PR #12971's forward-propagation fix left their children
+            # stamped landed_on_integration=False) and recomputes each affected
+            # direction's outcomes. Idempotent — a cheap no-op once converged;
+            # also self-heals any future stranding the forward path misses.
+            if _is_cadence_due(_last_merge_credit_backfill, 600):
+                _last_merge_credit_backfill = _utcnow()
+                try:
+                    from app.merge_credit_backfill import (
+                        _sweep_merge_credit_backfill,
+                    )
+
+                    await _bounded_leader_step(
+                        "merge_credit_backfill",
+                        _sweep_merge_credit_backfill(),
+                        budget=90,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[ORCHESTRATOR] Merge-credit backfill sweep error"
                     )
             # Stale-runner deactivation — every 300s. Marks registered fleet
             # runners that missed the heartbeat window as inactive so they drop

@@ -94,6 +94,14 @@ _DEPLOY_FAILED_RECOVERY_WINDOW_SECONDS = 24 * 3600
 # permanently broken credential path does not retry forever.
 _MAX_ERROR_REDRIVE_ATTEMPTS = 5
 
+# Maximum number of sweep-driven re-entries for a ``status=infra_failure`` version.
+# ``infra_failure`` is documented as non-conclusive — it records a transient
+# infrastructure problem (qualifier child timeout, unavailable GitHub check, etc.)
+# rather than a real quality verdict.  Cap at 3 to prevent a persistently broken
+# infrastructure path from retrying forever; an operator escalation is warranted
+# once this many consecutive re-drives still result in infra_failure.
+_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS = 3
+
 # Transient error codes the sweep is allowed to re-drive.  Permanent errors
 # (e.g. project misconfiguration) should not be blindly retried.
 _TRANSIENT_ERROR_CODES: frozenset[str] = frozenset({"sha_error", "no_credentials"})
@@ -471,6 +479,89 @@ async def _redrive_error_qualification(
                 version.last_qualification = {
                     **new_qual,
                     "error_redrive_count": error_redrive_count + 1,
+                }
+                flag_modified(version, "last_qualification")
+                await redrive_session.commit()
+        return bool(result and result.get("status") == "spawned")
+
+
+async def _redrive_infra_failure_qualification(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Re-enter the qualifier for a ``status=infra_failure`` version.
+
+    ``infra_failure`` is documented as non-conclusive: it records a transient
+    infrastructure problem (qualifier child timeout, unavailable migration-identity
+    gate, GitHub API unreachable, etc.) rather than a real quality verdict.  But it
+    has no scheduled re-entry — neither the strategist (which treats a standing
+    ``infra_failure`` as "re-qualify needed" but only emits ``qualify_request`` on a
+    fresh strategic cycle) nor the admin endpoint drives an automatic retry.  So a
+    version strands in ``infra_failure`` until the operator manually re-enters or the
+    strategist cycle fires.  Live v22 stranded exactly this way on 2026-07-06 when a
+    ``migration_identity_check_unavailable`` blocker was recorded during a GitHub
+    outage.
+
+    This is the missing scheduled re-driver.  For an open, stabilize-phase version
+    whose ``last_qualification.status == "infra_failure"`` and whose
+    ``last_qualification["infra_failure_redrive_count"]`` is below
+    ``_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS``, re-invokes ``run_qualification``.
+    ``run_qualification`` already treats ``infra_failure`` as non-conclusive (it does
+    not serve a cached verdict for that status), so a fresh qualification spawns on the
+    current integration-branch HEAD.
+
+    The attempt cap is tracked in ``last_qualification["infra_failure_redrive_count"]``
+    (a per-infra-failure-episode counter), NOT the lifetime ``qualification_attempts``
+    column, for the same reason as the error re-driver: using the lifetime counter
+    would silently block re-drives for long-lived versions.
+
+    Commit behavior: COMMIT on every outcome (same as ``_redrive_error_qualification``).
+    ``run_qualification`` writes a new ``last_qualification`` on every path it takes,
+    and a rollback would discard that write plus any ``qualification_attempts`` bump.
+    When the result is still ``infra_failure`` the counter is incremented post-commit
+    so the cap advances across sweeps.
+
+    Returns True only when the re-entry actually STARTED a new qualification
+    (``status == "spawned"``).  Any guard no-op or cap hit returns False.
+    """
+    from app import release_qualifier
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as redrive_session:
+        version = await redrive_session.get(release_version.ReleaseVersion, version_id)
+        if version is None:
+            return False
+        qual = version.last_qualification
+        if (
+            not isinstance(qual, dict)
+            or qual.get("status") != "infra_failure"
+            or version.phase != "stabilize"
+        ):
+            return False
+        # Bounded attempts: stop re-driving a persistently broken infra path.
+        infra_failure_redrive_count = qual.get("infra_failure_redrive_count", 0)
+        if infra_failure_redrive_count >= _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS:
+            return False
+        result = await release_qualifier.run_qualification(
+            redrive_session, version.project_id, version
+        )
+        # COMMIT on every outcome — do NOT roll back the non-spawned paths.
+        # run_qualification writes a new last_qualification (and bumps
+        # qualification_attempts) on every path it takes; rolling back would
+        # discard both those writes and leave the version in the old infra_failure
+        # state with a stale counter.
+        await redrive_session.commit()
+        # If still infra_failure, persist the per-episode retry counter so the cap
+        # advances across sweeps.  A spawned result naturally resets the counter
+        # (the new last_qualification won't carry infra_failure_redrive_count).
+        if result and result.get("status") == "infra_failure":
+            await redrive_session.refresh(version)
+            new_qual = version.last_qualification
+            if isinstance(new_qual, dict):
+                version.last_qualification = {
+                    **new_qual,
+                    "infra_failure_redrive_count": infra_failure_redrive_count + 1,
                 }
                 flag_modified(version, "last_qualification")
                 await redrive_session.commit()
@@ -1532,6 +1623,39 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove error version %s "
                 "(transient error cleared — qualification spawned)",
+                version_id,
+            )
+
+    # Re-drive qualifications stranded in ``infra_failure`` — the only
+    # non-conclusive outcome with no scheduled re-entry.  A transient
+    # infrastructure failure (qualifier child timeout, GitHub API unavailable,
+    # migration-identity gate unreachable) records ``status=infra_failure`` and
+    # parks the version indefinitely because the strategist treats it as
+    # "re-qualify needed" but only acts on a fresh strategic cycle; no
+    # automatic retry fires.  This loop re-enters run_qualification for each
+    # open, stabilize-phase ``infra_failure`` version, subject to a per-episode
+    # cap (_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS) so a persistently broken
+    # infra path does not retry forever.  Runs AFTER the error re-driver loop
+    # (``status=error`` re-drives above) because both are transient-outcome
+    # re-drivers operating on the same version_ids snapshot.
+    for version_id in version_ids:
+        try:
+            redriven = await _redrive_infra_failure_qualification(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: infra_failure re-drive failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if redriven:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
+                "(transient infra cleared — qualification spawned)",
                 version_id,
             )
 

@@ -7,7 +7,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm.attributes import flag_modified
 from unittest.mock import AsyncMock, MagicMock
 
-from app.models import TaskStatus
+from app.models import Task, TaskStatus
 
 # Reuse the in-memory DB fixture + rollup-parent/child builders.
 from testing.test_rollup_cleanup import (
@@ -3540,3 +3540,180 @@ async def test_multi_child_rollup_criterion_evidence_satisfies_release_scoring_g
     assert result["blocker"] is None, (
         f"No blocker expected for a fully-covered version; got {result['blocker']!r}"
     )
+
+
+# ── Retroactive merge-credit backfill for landed rollups ────────────────────
+#
+# PR #12971 fixed FORWARD propagation of merge credit; these tests cover the
+# RETROACTIVE, idempotent backfill (app.merge_credit_backfill) that heals
+# rollups which landed BEFORE that fix and left their credited children
+# stamped landed_on_integration=False forever.
+
+from app.landed_signal import (  # noqa: E402
+    has_landed_signal,
+    has_merge_unblock_signal,
+    mark_landed_on_integration,
+    mark_unblocked_non_merge,
+)
+from app.merge_credit_backfill import (  # noqa: E402
+    backfill_landed_rollup_merge_credit,
+)
+
+
+async def _setup_landed_rollup_with_undercredited_child(
+    session,
+    *,
+    child_reason: str = "merged_pr_non_integration_branch",
+    landed_rollup: bool = True,
+):
+    """Build a rollup (doubling as the research-cycle root) plus one merged
+    child that is under-credited (pr_merged=True, landed_on_integration=False).
+
+    Returns (project, rollup, child, direction_id). The rollup task IS the
+    research_history entry's ``task_id`` so the propagation subtree walk (from
+    the rollup) and the direction-outcome child query (children of the research
+    task) both resolve to the same child.
+    """
+    direction_id = "d-backfill"
+    project = await _make_project(session)
+
+    rollup = await _make_task(
+        session,
+        project.id,
+        task_type="research",
+        status=TaskStatus.COMPLETED,
+        context={"_is_rollup_review": True, "rollup_pr_number": 4242},
+    )
+    if landed_rollup:
+        mark_landed_on_integration(rollup)
+        flag_modified(rollup, "context")
+        session.add(rollup)
+
+    project.directions = [
+        {
+            "id": direction_id,
+            "text": "Backfill direction",
+            "status": "active",
+            "priority": "medium",
+            "paths": [],
+            "research_history": [
+                {"task_id": str(rollup.id), "tasks_created": 1, "cycle": 1}
+            ],
+        }
+    ]
+    flag_modified(project, "directions")
+    session.add(project)
+    await session.commit()
+
+    child = await _make_task(
+        session,
+        project.id,
+        task_type="create",
+        status=TaskStatus.COMPLETED,
+        parent_task_id=rollup.id,
+        context={"direction_id": direction_id, "research_task_id": str(rollup.id)},
+    )
+    mark_unblocked_non_merge(child, reason=child_reason)
+    flag_modified(child, "context")
+    session.add(child)
+    await session.commit()
+
+    return project, rollup, child, direction_id
+
+
+@pytest.mark.asyncio
+async def test_backfill_stamps_landed_and_recomputes_direction(cleanup_db):
+    """(a) A landed rollup's under-credited merged child is stamped landed and
+    its direction's prs_merged recomputes to reflect the merge."""
+    project, rollup, child, direction_id = (
+        await _setup_landed_rollup_with_undercredited_child(cleanup_db)
+    )
+
+    # Precondition: child carries the merge-unblock signal but is NOT yet landed,
+    # so is_merged_completion is False and the direction reads zero merges.
+    assert has_merge_unblock_signal(child) is True
+    assert has_landed_signal(child) is False
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 1
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is True
+
+    await cleanup_db.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("prs_merged") == 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_is_idempotent_second_run_noop(cleanup_db):
+    """(b) A second backfill run stamps nothing — already-landed children are
+    skipped, so the sweep converges to a cheap no-op."""
+    project, rollup, child, _ = (
+        await _setup_landed_rollup_with_undercredited_child(cleanup_db)
+    )
+
+    first = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+    assert first == 1
+
+    second = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+    assert second == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is True
+
+
+@pytest.mark.asyncio
+async def test_backfill_skips_force_dropped_child(cleanup_db):
+    """(c) A force-dropped child is NOT stamped even under a landed rollup —
+    the propagation helper's force-drop exclusion is preserved."""
+    project, rollup, child, direction_id = (
+        await _setup_landed_rollup_with_undercredited_child(
+            cleanup_db, child_reason="rollup_no_pr_artifact"
+        )
+    )
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is False
+
+    await cleanup_db.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+    assert entry.get("prs_merged", 0) == 0
+
+
+@pytest.mark.asyncio
+async def test_backfill_leaves_unlanded_rollup_children_untouched(cleanup_db):
+    """(d) A rollup that has NOT landed on integration leaves its children
+    untouched — its own landed signal is the ancestry gate."""
+    project, rollup, child, _ = (
+        await _setup_landed_rollup_with_undercredited_child(
+            cleanup_db, landed_rollup=False
+        )
+    )
+
+    # Guard: the rollup really is un-landed, so it must be ignored by the sweep.
+    assert has_landed_signal(rollup) is False
+
+    stamped = await backfill_landed_rollup_merge_credit(
+        project.id, cleanup_db, rollup_limit=50
+    )
+
+    assert stamped == 0
+
+    refreshed_child = await cleanup_db.get(Task, child.id)
+    assert has_landed_signal(refreshed_child) is False
+    # The merge-unblock signal is still present — it simply was not promoted.
+    assert has_merge_unblock_signal(refreshed_child) is True

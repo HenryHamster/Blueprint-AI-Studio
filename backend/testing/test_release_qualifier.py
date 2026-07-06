@@ -18011,6 +18011,173 @@ async def test_sweep_does_not_redrive_non_transient_error(db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_sweep_redrives_infra_failure_version(db_session, mocker):
+    """A stabilize version stranded at status=infra_failure is re-driven by
+    the sweep — the only non-conclusive qualification outcome with no scheduled
+    re-entry (live v22 stranded exactly this way on 2026-07-06).
+
+    Acceptance proof: after the sweep, version transitions from infra_failure
+    to pending — the transient infrastructure problem is recovered automatically.
+    """
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    sha = "aabbcc" * 6 + "aabb"
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+        "started_at": "2026-07-06T00:00:00",
+        "finalized_at": "2026-07-06T06:01:00",
+    }
+    version.qualification_attempts = 2
+    db_session.add(version)
+    await db_session.commit()
+
+    audit_task = Task(
+        project_id=project.id,
+        title="release-audit",
+        payloads=[{"type": "release_audit", "base_branch": "main"}],
+        vm_instance_id="vm-audit-infra",
+        status=TaskStatus.QUEUED,
+        context={"release_version_id": str(version.id)},
+    )
+    db_session.add(audit_task)
+    await db_session.commit()
+    await db_session.refresh(audit_task)
+
+    mocker.patch(
+        "app.github.get_branch_sha",
+        new=_branch_sha_mock(automain=sha),
+    )
+    mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(return_value=audit_task),
+    )
+    mocker.patch(
+        "app.release_qualifier.compute_audited_surface_hash",
+        return_value="hash-infra",
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    assert count >= 1
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_respects_attempt_cap(db_session, mocker):
+    """A stabilize version at status=infra_failure is NOT re-driven once
+    last_qualification["infra_failure_redrive_count"] reaches
+    _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS, preventing infinite retries."""
+    from app.release_qualifier_sweep import _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+        "infra_failure_redrive_count": _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # No spawn should have happened — attempt cap blocks re-drive.
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_noop_when_not_stabilize_phase(db_session, mocker):
+    """A version in a phase other than stabilize with status=infra_failure is
+    NOT re-driven — the re-driver is scoped to stabilize-phase versions only."""
+    project, version = await _make_project_and_version(db_session, phase="build")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "qualification_timeout",
+        "detail": "qualification pending 361 min (> 360 min limit)",
+    }
+    db_session.add(version)
+    await db_session.commit()
+
+    spawn_mock = mocker.patch(
+        "app.release_qualifier._spawn_release_audit_task",
+        new=AsyncMock(),
+    )
+
+    await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    spawn_mock.assert_not_called()
+    await db_session.refresh(version)
+    assert version.last_qualification["status"] == "infra_failure"
+
+
+@pytest.mark.asyncio
+async def test_redrive_infra_failure_increments_counter_on_repeated_failure(
+    db_session, mocker
+):
+    """When run_qualification returns infra_failure again (persistent infra
+    problem), the per-episode counter is incremented so the cap converges
+    across sweeps and the re-driver does not retry forever.
+
+    run_qualification is mocked to always return infra_failure — simulating
+    a persistent infrastructure outage that each re-drive re-encounters.
+    """
+    from app.release_qualifier_sweep import (
+        _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS,
+        _redrive_infra_failure_qualification,
+    )
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "infra_failure",
+        "blocker": "migration_identity_check_unavailable",
+        "detail": "GitHub unreachable during migration identity check",
+        "started_at": "2026-07-06T00:00:00",
+    }
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    # Mock run_qualification to always return infra_failure — persistent outage.
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "infra_failure", "blocker": "qualification_timeout"}),
+    )
+
+    # Drive the re-driver directly more times than the cap allows.
+    factory = _shared_session_factory(db_session)
+    for _ in range(_MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS + 2):
+        await _redrive_infra_failure_qualification(version.id, session_factory=factory)
+        await db_session.commit()
+
+    await db_session.refresh(version)
+    # run_qualification was called at most _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS times —
+    # the cap stopped further re-drives after it was reached.
+    assert run_qual.await_count == _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+    # The per-episode counter reached the cap (never exceeded).
+    lq = version.last_qualification
+    assert lq.get("infra_failure_redrive_count") == _MAX_INFRA_FAILURE_REDRIVE_ATTEMPTS
+
+
+@pytest.mark.asyncio
 async def test_redrive_requalifies_resolved_blocker_stale_verdict(db_session, mocker):
     """A stabilize version at a conclusive not_promoted verdict with all gating
     findings ledger-resolved and automain HEAD advanced past the candidate SHA

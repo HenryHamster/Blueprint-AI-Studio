@@ -158,6 +158,7 @@ def test_registry_contains_initial_checks():
         "noncode_outcome_window_accounting",
         "direction_acceptance_metric_invariant",
         "completion_debt_completeness",
+        "rollup_child_landing_credit",
     } <= names
 
 
@@ -1029,3 +1030,197 @@ async def test_one_crashing_check_does_not_abort_the_tick(db):
         assert snap["checks_run"] > 1
     finally:
         mis._REGISTRY.pop("boom_test_check", None)
+
+
+# --- Check: rollup_child_landing_credit -------------------------------------
+
+
+def _rollup_ctx(**kwargs):
+    return SweepContext(
+        session=None,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+        **kwargs,
+    )
+
+
+async def _rollup_parent_task(
+    db, project, *, rollup_pr_number, landed: bool
+) -> Task:
+    """A COMPLETED rollup parent task."""
+    ctx = {
+        "_is_rollup_review": True,
+        "rollup_pr_number": rollup_pr_number,
+    }
+    if landed:
+        ctx["landed_on_integration"] = True
+        ctx["pr_merged"] = True
+    else:
+        ctx["landed_on_integration"] = False
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+async def _rollup_child_task(
+    db,
+    project,
+    *,
+    rollup_pr_number,
+    pr_merged: bool = True,
+    landed: bool | None = None,
+    force_dropped: bool = False,
+) -> Task:
+    """A COMPLETED rollup child task (has rollup_pr_number but is NOT a parent)."""
+    ctx: dict = {"rollup_pr_number": rollup_pr_number}
+    if pr_merged:
+        ctx["pr_merged"] = True
+    if landed is True:
+        ctx["landed_on_integration"] = True
+    elif landed is False:
+        ctx["landed_on_integration"] = False
+    if force_dropped:
+        ctx["_non_merge_unblock_reason"] = "force_dropped"
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=ctx,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+@pytest.mark.asyncio
+async def test_registry_contains_rollup_child_landing_credit():
+    names = {c.name for c in registered_checks()}
+    assert "rollup_child_landing_credit" in names
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_flags_under_credited_child(db):
+    """Parent landed, child has pr_merged=True but landed_on_integration=False → FLAGGED.
+
+    The constituent child PR merged into the rollup staging branch (setting pr_merged=True)
+    but landed_on_integration was stamped False (not on the integration branch yet). When
+    the rollup parent lands, the child should be backfilled to landed_on_integration=True.
+    Without the backfill, has_landed_signal(child) returns False (explicit False wins over
+    the pr_merged legacy fallback), representing the under-credit.
+    """
+    project = await _project(db)
+    rollup_pr = 42
+    await _rollup_parent_task(db, project, rollup_pr_number=rollup_pr, landed=True)
+    # landed=False: explicitly NOT stamped on integration (the staging-merge state)
+    await _rollup_child_task(
+        db, project, rollup_pr_number=rollup_pr, pr_merged=True, landed=False
+    )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "rollup_child_landing_credit"
+    assert f.delta == 1
+    assert f.ground_truth == 1
+    assert f.self_reported == 0
+    assert "under-credited" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_ok_when_child_is_stamped(db):
+    """Parent landed, child also carries landed_on_integration=True → OK."""
+    project = await _project(db)
+    rollup_pr = 99
+    await _rollup_parent_task(db, project, rollup_pr_number=rollup_pr, landed=True)
+    await _rollup_child_task(
+        db, project, rollup_pr_number=rollup_pr, pr_merged=True, landed=True
+    )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK and r.delta == 0 for r in results)
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_skips_force_dropped_child(db):
+    """A force-dropped child (has _non_merge_unblock_reason) must not be counted."""
+    project = await _project(db)
+    rollup_pr = 77
+    await _rollup_parent_task(db, project, rollup_pr_number=rollup_pr, landed=True)
+    await _rollup_child_task(
+        db, project, rollup_pr_number=rollup_pr,
+        pr_merged=True, landed=None, force_dropped=True
+    )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    # Force-dropped child excluded → OK (no under-credited children)
+    assert all(not r.flagged for r in results)
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_ignores_unmerged_rollup_parent(db):
+    """If the rollup parent has NOT landed, the child should not be flagged."""
+    project = await _project(db)
+    rollup_pr = 55
+    await _rollup_parent_task(db, project, rollup_pr_number=rollup_pr, landed=False)
+    await _rollup_child_task(
+        db, project, rollup_pr_number=rollup_pr, pr_merged=True, landed=None
+    )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    # No landed parent → SKIPPED (no landed rollup_pr_numbers to match against)
+    assert all(not r.flagged for r in results)
+    statuses = {r.status for r in results}
+    assert CheckStatus.FLAGGED not in statuses
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_counts_multiple_under_credited(db):
+    """Delta equals the number of under-credited children when multiple exist."""
+    project = await _project(db)
+    rollup_pr = 11
+    await _rollup_parent_task(db, project, rollup_pr_number=rollup_pr, landed=True)
+    for _ in range(3):
+        await _rollup_child_task(
+            db, project, rollup_pr_number=rollup_pr, pr_merged=True, landed=False
+        )
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    assert flagged[0].delta == 3

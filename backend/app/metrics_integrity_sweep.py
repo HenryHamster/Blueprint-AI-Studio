@@ -1310,3 +1310,181 @@ async def check_completion_debt_completeness(
                 )
             )
     return results
+
+
+@register_check(
+    "rollup_child_landing_credit",
+    "Recompute integration-landing credit for rollup constituent children and flag "
+    "children whose rollup parent landed but whose own landed_on_integration stamp "
+    "is absent (under-credit).",
+)
+async def check_rollup_child_landing_credit(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: if a rollup parent has the canonical integration-landing signal
+    (``has_landed_signal``), every constituent child that carries a merge-unblock
+    signal (``has_merge_unblock_signal`` / ``pr_merged=True``) and is NOT
+    force-dropped (lacks ``NON_MERGE_UNBLOCK_REASON_KEY``) SHOULD also carry
+    ``has_landed_signal``.  A child that is missing the landing stamp is an
+    under-credited unit: the direction reads ``prs_merged=0`` / all-zero
+    ``merge_credit`` despite the rollup having provably landed on the integration
+    branch.
+
+    Rollup parent identification mirrors ``rollup_state._is_rollup_parent_awaiting_merge``:
+    a task whose context carries ``_is_rollup_review=True`` or has
+    ``rollup_pr_number`` set (and whose own ``landed_on_integration`` is not False)
+    is treated as a rollup parent candidate.
+
+    Constituent child identification: context carries ``rollup_pr_number`` (the
+    staging PR that was merged into the rollup), the task is NOT itself a rollup
+    parent by the criteria above, and it has ``has_merge_unblock_signal``.
+
+    Bounded to the most-recent ``sample_limit`` COMPLETED tasks; groups per project.
+    Flag-only in every mode — never writes to the tasks it audits.
+    """
+    from app.landed_signal import (
+        NON_MERGE_UNBLOCK_REASON_KEY,
+        has_landed_signal,
+        has_merge_unblock_signal,
+    )
+    from app.models import Task, TaskStatus
+
+    tasks = (
+        await ctx.session.execute(
+            select(Task)
+            .where(Task.status == TaskStatus.COMPLETED)
+            .order_by(Task.id.desc())
+            .limit(ctx.sample_limit)
+        )
+    ).scalars().all()
+
+    if not tasks:
+        return [
+            CheckResult(
+                check="rollup_child_landing_credit",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no completed tasks in sample window",
+            )
+        ]
+
+    def _is_rollup_parent(task: Task) -> bool:
+        # Among completed tasks the reliable parent signal is _is_rollup_review=True.
+        # Children also carry rollup_pr_number (linking them to the parent) but do
+        # NOT carry _is_rollup_review, so using rollup_pr_number alone would
+        # mis-classify children as parents.
+        return (task.context or {}).get("_is_rollup_review") is True
+
+    def _is_rollup_child(task: Task) -> bool:
+        ctx_map = task.context or {}
+        return bool(ctx_map.get("rollup_pr_number")) and not _is_rollup_parent(task)
+
+    # Collect landed rollup parents: set of rollup_pr_number values (or task ids)
+    # that carry the integration landing signal, keyed by project_id.
+    # We identify parents by their context["rollup_pr_number"] when acting as parent
+    # (i.e. the PR number of the rollup itself), or by task.id as a fallback.
+    # Children reference the same rollup_pr_number to link to their parent.
+    # Strategy: group parents by (project_id, rollup_pr_number); a parent is "landed"
+    # if has_landed_signal(parent) is True.
+
+    # First pass: classify every task.
+    parents: Dict[str, List[Task]] = {}  # key: str(project_id)
+    children: Dict[str, List[Task]] = {}
+
+    for task in tasks:
+        pid = str(task.project_id)
+        if _is_rollup_parent(task):
+            parents.setdefault(pid, []).append(task)
+        elif _is_rollup_child(task):
+            children.setdefault(pid, []).append(task)
+
+    has_any_rollup_data = bool(parents or children)
+    if not has_any_rollup_data:
+        return [
+            CheckResult(
+                check="rollup_child_landing_credit",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no rollup parents or children in sample window",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    all_pids = set(parents.keys()) | set(children.keys())
+
+    for pid in sorted(all_pids):
+        project_parents = parents.get(pid, [])
+        project_children = children.get(pid, [])
+
+        if not project_parents or not project_children:
+            # No children to audit OR no parents to anchor credit to.
+            continue
+
+        # Build the set of rollup_pr_number values for LANDED parents in this project.
+        landed_rollup_pr_numbers: set = set()
+        for parent in project_parents:
+            ctx_map = parent.context or {}
+            pr_num = ctx_map.get("rollup_pr_number")
+            if pr_num and has_landed_signal(parent):
+                landed_rollup_pr_numbers.add(pr_num)
+
+        if not landed_rollup_pr_numbers:
+            # No landed rollup parents in this project's sample — nothing to flag.
+            continue
+
+        # Count children whose rollup parent landed but who lack the landed signal.
+        under_credited = 0
+        for child in project_children:
+            ctx_map = child.context or {}
+            # Must have a merge-unblock signal (pr_merged=True).
+            if not has_merge_unblock_signal(child):
+                continue
+            # Must NOT be force-dropped.
+            if NON_MERGE_UNBLOCK_REASON_KEY in ctx_map:
+                continue
+            # Must link to a landed rollup parent.
+            child_rollup_pr = ctx_map.get("rollup_pr_number")
+            if child_rollup_pr not in landed_rollup_pr_numbers:
+                continue
+            # The child should have the landed signal but doesn't.
+            if not has_landed_signal(child):
+                under_credited += 1
+
+        if under_credited > 0:
+            results.append(
+                CheckResult(
+                    check="rollup_child_landing_credit",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=0,
+                    ground_truth=under_credited,
+                    delta=under_credited,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{under_credited} rollup constituent child(ren) whose rollup "
+                        "parent landed on the integration branch but whose own "
+                        "landed_on_integration stamp is absent (under-credited merge credit)"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="rollup_child_landing_credit",
+                    status=CheckStatus.OK,
+                    self_reported=0,
+                    ground_truth=0,
+                    delta=0,
+                    subject=pid,
+                    detail="all rollup children of landed parents carry the landing signal",
+                )
+            )
+
+    if not results:
+        return [
+            CheckResult(
+                check="rollup_child_landing_credit",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no rollup children to audit against landed parents in sample",
+            )
+        ]
+    return results
