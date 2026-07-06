@@ -664,7 +664,7 @@ def _floor_direction_entry(stat: dict) -> dict:
     and their state. Everything else is fetchable via ``./fetch direction <id>``.
     """
     out: dict[str, Any] = {}
-    for key in ("id", "priority", "status", "gap_id", "system_id"):
+    for key in ("id", "priority", "status", "gap_id", "system_id", "in_flight"):
         _put_present(out, stat, key)
     headline = _bounded_text(stat.get("text"), _DIRECTION_FLOOR_TEXT_CAP)
     if headline:
@@ -818,6 +818,7 @@ def _compact_direction_summary_entry(stat: dict) -> dict:
         "id",
         "priority",
         "status",
+        "in_flight",
         "total_cycles",
         "prs_merged",
         "verified_prs_merged",

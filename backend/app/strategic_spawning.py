@@ -1176,6 +1176,28 @@ _ANCESTRY_CALL_TIMEOUT_S = 15.0
 _QUAL_SHA_PAT = re.compile(r"(?<!-)\b([0-9a-f]{8})\b")
 
 
+def _stamp_direction_in_flight(
+    direction_stats: list[dict],
+    active_by_direction: dict[str, int] | None,
+) -> None:
+    """Stamp a per-direction ``in_flight`` task count onto each stat in place.
+
+    Drawn from the SAME ``active_by_direction`` mapping that feeds
+    :func:`_build_cycle_start_reconciliation` (``direction_pipeline[*].in_flight``)
+    so the floored/summarized ``directions_summary`` line and the reconciliation
+    surface can never silently disagree. The count is stamped EVEN WHEN ZERO so
+    the strategist can distinguish a staffed direction (>0) from an idle one (0)
+    even under extreme byte pressure where richer sections are dropped; a
+    direction absent from ``active_by_direction`` defaults to 0.
+    """
+    active = active_by_direction or {}
+    for stat in direction_stats:
+        if not isinstance(stat, dict):
+            continue
+        did = str(stat.get("id") or "")
+        stat["in_flight"] = int(active.get(did, 0) or 0)
+
+
 def _build_cycle_start_reconciliation(
     direction_stats: list[dict],
     problem_model: dict | None,
@@ -7948,6 +7970,14 @@ async def _spawn_strategic_review(
     _verified_problem_model = await _verify_capability_backing_paths(
         _agent_view_problem_model(project.problem_model),
         **verification_kwargs,
+    )
+    # Stamp per-direction in-flight counts onto direction_stats from the SAME
+    # active_by_direction mapping the reconciliation reads, so the (droppable)
+    # directions_summary floor and cycle_start_reconciliation.direction_pipeline
+    # can never disagree. Stamped even when 0 so staffed>0 stays distinguishable
+    # from idle=0 after the reconciliation section is dropped under byte pressure.
+    _stamp_direction_in_flight(
+        direction_stats, (recent_interventions or {}).get("active_by_direction")
     )
     _cycle_start_reconciliation = _build_cycle_start_reconciliation(
         direction_stats,

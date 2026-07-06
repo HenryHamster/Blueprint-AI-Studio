@@ -63,6 +63,66 @@ def test_compact_direction_entry_omits_grounding_when_absent():
     assert "retired_direction_grounding" not in out
 
 
+def test_compact_direction_entry_preserves_in_flight_count():
+    """_compact_direction_summary_entry carries the in_flight scalar through the
+    full/summarize path, including the zero case (present-even-when-0)."""
+    from app.strategic_payload_compaction import _compact_direction_summary_entry
+
+    staffed = _compact_direction_summary_entry(
+        {"id": "d-staffed", "status": "active", "in_flight": 3}
+    )
+    assert staffed["in_flight"] == 3
+
+    idle = _compact_direction_summary_entry(
+        {"id": "d-idle", "status": "active", "in_flight": 0}
+    )
+    # Zero must survive so idle stays distinguishable from staffed.
+    assert idle["in_flight"] == 0
+
+    # Unstamped entry simply omits the field (backward-compatible).
+    unstamped = _compact_direction_summary_entry({"id": "d-old", "status": "active"})
+    assert "in_flight" not in unstamped
+
+
+def test_floor_direction_entry_carries_in_flight_count():
+    """_floor_direction_entry emits the in_flight count on the ultra-compact core
+    floor line so a staffed direction is distinguishable from an idle one even
+    under extreme byte pressure. Zero survives; an unstamped entry omits it."""
+    from app.strategic_payload_compaction import _floor_direction_entry
+
+    staffed = _floor_direction_entry(
+        {"id": "d-staffed", "priority": 1, "status": "active", "in_flight": 2}
+    )
+    assert staffed["in_flight"] == 2
+    # Floor keeps the load-bearing identity scalars alongside the count.
+    assert staffed["id"] == "d-staffed"
+    assert staffed["status"] == "active"
+
+    idle = _floor_direction_entry(
+        {"id": "d-idle", "priority": 2, "status": "active", "in_flight": 0}
+    )
+    assert idle["in_flight"] == 0
+
+    unstamped = _floor_direction_entry({"id": "d-old", "status": "active"})
+    assert "in_flight" not in unstamped
+
+
+def test_directions_summary_floor_retains_in_flight_for_staffed_direction():
+    """The guaranteed core floor retains the per-direction in-flight count for a
+    staffed direction so the strategist can avoid duplicate spawns in degraded
+    (budget-pressured) cycles where the reconciliation section is dropped."""
+    from app.strategic_payload_compaction import _directions_summary_floor
+
+    stats = [
+        {"id": "d-staffed", "priority": 1, "status": "active", "in_flight": 4},
+        {"id": "d-idle", "priority": 2, "status": "active", "in_flight": 0},
+    ]
+    floored = _directions_summary_floor(stats)
+    by_id = {entry["id"]: entry for entry in floored}
+    assert by_id["d-staffed"]["in_flight"] == 4
+    assert by_id["d-idle"]["in_flight"] == 0
+
+
 def test_packs_all_parts_under_budget():
     """Small payload, generous budget — every key included, no trims/drops."""
     payload = {

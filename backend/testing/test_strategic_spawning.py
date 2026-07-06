@@ -5084,6 +5084,72 @@ async def test_playbook_keys_index_skips_pending_entries(db_session, mocker):
 # ---------------------------------------------------------------------------
 
 
+def test_stamp_direction_in_flight_counts():
+    """_stamp_direction_in_flight stamps the per-direction in-flight count from
+    active_by_direction onto each stat in place — staffed>0, idle=0, and a
+    direction absent from the mapping defaults to 0 (present-even-when-0)."""
+    from app.strategic_spawning import _stamp_direction_in_flight
+
+    stats = [
+        {"id": "d-staffed", "status": "active"},
+        {"id": "d-idle", "status": "active"},
+        {"id": "d-absent", "status": "active"},
+    ]
+    _stamp_direction_in_flight(stats, {"d-staffed": 3, "d-idle": 0})
+    by_id = {s["id"]: s for s in stats}
+    assert by_id["d-staffed"]["in_flight"] == 3
+    assert by_id["d-idle"]["in_flight"] == 0
+    # Absent from the mapping still gets an explicit 0, not a missing field.
+    assert by_id["d-absent"]["in_flight"] == 0
+
+
+def test_stamp_direction_in_flight_handles_none_mapping():
+    """A None active_by_direction (e.g. resident/degraded path) stamps 0, never
+    raises — graceful degrade."""
+    from app.strategic_spawning import _stamp_direction_in_flight
+
+    stats = [{"id": "d-1", "status": "active"}]
+    _stamp_direction_in_flight(stats, None)
+    assert stats[0]["in_flight"] == 0
+
+
+def test_stamped_in_flight_matches_reconciliation_pipeline():
+    """The count stamped onto direction_stats and the value
+    _build_cycle_start_reconciliation reports in direction_pipeline[*].in_flight
+    are derived from the SAME active_by_direction mapping, so they cannot
+    disagree for a given direction."""
+    from app.strategic_spawning import (
+        _stamp_direction_in_flight,
+        _build_cycle_start_reconciliation,
+    )
+
+    direction_stats = [
+        {"id": "d-staffed", "status": "active", "text": "moving", "gap_id": "g-a"},
+        {"id": "d-idle", "status": "active", "text": "quiet", "gap_id": "g-b"},
+    ]
+    active_by_direction = {"d-staffed": 2, "d-idle": 0}
+
+    _stamp_direction_in_flight(direction_stats, active_by_direction)
+
+    problem_model = {
+        "gaps": [
+            {"id": "g-a", "status": "active"},
+            {"id": "g-b", "status": "active"},
+        ]
+    }
+    recon = _build_cycle_start_reconciliation(
+        direction_stats, problem_model, active_by_direction
+    )
+    pipeline_by_id = {
+        entry["direction_id"]: entry for entry in recon["direction_pipeline"]
+    }
+    stamped_by_id = {s["id"]: s for s in direction_stats}
+    for did in ("d-staffed", "d-idle"):
+        assert stamped_by_id[did]["in_flight"] == pipeline_by_id[did]["in_flight"]
+    assert stamped_by_id["d-staffed"]["in_flight"] == 2
+    assert stamped_by_id["d-idle"]["in_flight"] == 0
+
+
 def test_agent_view_design_doc_strips_playbook_archive():
     """playbook_archive is operator-only state — it must never ship in agent
     payloads. Unbounded growth of this field was the trigger for the silent
