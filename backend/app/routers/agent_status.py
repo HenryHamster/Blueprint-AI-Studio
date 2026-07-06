@@ -3305,25 +3305,40 @@ async def update_agent_status(
                         )
                 # Capture positive pattern for sampling-eligible first-attempt successes
                 if _ctx["_first_attempt_succeeded"] and _proj:
+                    # SAVEPOINT isolation (DB-contention fix): capture_success_pattern
+                    # takes a FOR UPDATE lock on the Project row and issues a COUNT
+                    # query (success_patterns.py), either of which can hit the 30s
+                    # lock_timeout and raise LockNotAvailableError. Previously this
+                    # ran directly in the request's OUTER transaction and its except
+                    # rolled that WHOLE transaction back — discarding the pending
+                    # terminal-status write, so the COMPLETED/FAILED transition the
+                    # agent reported was never persisted (prod chain: capture
+                    # lock-timeout -> InFailedSQLTransactionError on the early commit
+                    # -> completed PR/commit silently lost). Capture is best-effort
+                    # telemetry, so: flush the already-staged terminal status +
+                    # metrics into the OUTER transaction first, then run capture
+                    # inside a nested SAVEPOINT. A capture failure now rolls back
+                    # ONLY the savepoint (via begin_nested's __aexit__), leaving the
+                    # outer transaction — and the terminal status — intact for the
+                    # early commit below. Mirrors the SAVEPOINT discipline in
+                    # release_reconciliation._record_post_promotion_outcome.
                     try:
                         from app.playbook_learning import capture_success_pattern
 
-                        await capture_success_pattern(task, session)
+                        await session.flush()
+                        async with session.begin_nested():
+                            await capture_success_pattern(task, session)
                     except Exception as _sce:
                         logger.warning(
                             f"[PLAYBOOK] Failed to capture success pattern for task {_task_id_str}: {_sce}"
                         )
-                        # WHY: capture_success_pattern issues a COUNT query
-                        # (session.execute) and session.get(Project, ...) — both
-                        # may raise on serialization / lock-timeout / connection
-                        # loss, leaving the session pending-rollback and
-                        # crashing the early commit at line ~1979. This was one
-                        # of the leak categories explicitly named in the
-                        # comment block at lines ~1951-1962 ("playbook
-                        # capture/learning").
-                        with contextlib.suppress(Exception):
-                            await session.rollback()
-                        _attrs_may_be_expired = True
+                        # The nested SAVEPOINT already rolled back the failed
+                        # capture; the outer transaction (holding the terminal
+                        # status) stays valid, so we deliberately do NOT issue a
+                        # full session.rollback() here — that full rollback is
+                        # exactly what used to drop the completion. A savepoint
+                        # rollback does not expire the outer identity map, so
+                        # _attrs_may_be_expired is left unchanged.
             except Exception as _e:
                 logger.warning(
                     f"[METRICS] Failed to record first-attempt metrics for task {_task_id_str}: {_e}"

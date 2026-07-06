@@ -190,21 +190,27 @@ async def _maybe_create_drift_alerts(
                 f"Direction {direction_id} has {claimed} claimed changes but 0 PRs merged in 7d",
             )
         )
-    for title, message in candidates:
-        existing = (
-            (
-                await session.execute(
-                    select(Alert).where(
-                        Alert.project_id == project_id,
-                        Alert.title == title,
-                        Alert.dismissed_at.is_(None),
-                    )
+    if not candidates:
+        return
+    # Batch the undismissed-alert existence check into one query (was one query
+    # per candidate title) and test membership in-memory; create-only-if-absent
+    # semantics are preserved exactly.
+    existing_alerts = (
+        (
+            await session.execute(
+                select(Alert).where(
+                    Alert.project_id == project_id,
+                    Alert.dismissed_at.is_(None),
+                    Alert.title.in_([t for t, _ in candidates]),
                 )
             )
-            .scalars()
-            .first()
         )
-        if not existing:
+        .scalars()
+        .all()
+    )
+    existing_titles = {a.title for a in existing_alerts}
+    for title, message in candidates:
+        if title not in existing_titles:
             session.add(
                 Alert(
                     project_id=project_id,

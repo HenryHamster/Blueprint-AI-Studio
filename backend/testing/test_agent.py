@@ -12281,6 +12281,70 @@ async def test_playbook_confirmed_count_incremented_on_first_attempt_success(
 
 
 @pytest.mark.asyncio
+async def test_completion_persists_when_playbook_capture_hits_lock_timeout(
+    client: AsyncClient, db_session, mocker
+):
+    """Regression (DB-contention fix B): a first-attempt COMPLETED report must
+    persist the terminal status even when the best-effort playbook success-
+    pattern capture raises a DB lock error.
+
+    Prod chain being guarded: capture_success_pattern took a FOR UPDATE lock on
+    the Project row, hit the 30s lock_timeout (LockNotAvailableError), and its
+    except rolled the WHOLE request transaction back — dropping the pending
+    COMPLETED write, so the finished PR/commit was silently lost. Capture now
+    runs inside a nested SAVEPOINT, so its failure rolls back only the savepoint
+    and the completion still commits."""
+    mocker.patch("app.vm_lifecycle.delete_agent_vm", return_value=True)
+
+    class _FakeLockNotAvailableError(Exception):
+        sqlstate = "55P03"
+
+        def __str__(self):
+            return "canceling statement due to lock timeout"
+
+    capture_mock = mocker.patch(
+        "app.playbook_learning.capture_success_pattern",
+        new_callable=AsyncMock,
+        side_effect=_FakeLockNotAvailableError(),
+    )
+
+    project = Project(name="Capture Lock Timeout", user_id="test-user-capture-lock")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = Task(
+        project_id=project.id,
+        payloads=[{"type": "create", "prompt": "do something"}],
+        vm_instance_id="agent-vm-capture-lock-1",
+        status=TaskStatus.IN_PROGRESS,
+        attempt_count=0,  # first attempt → capture path is exercised
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    token = create_agent_token(str(task_id), "agent-vm-capture-lock-1")
+    resp = await client.post(
+        "/api/agent/status",
+        json={"task_id": str(task_id), "status": "COMPLETED", "logs": "done"},
+        headers={"x-agent-token": token},
+    )
+    # Capture failure is swallowed — the request must not 500.
+    assert resp.status_code == 200
+    # The guarded capture path was actually exercised.
+    assert capture_mock.await_count >= 1
+
+    # The terminal status must be durably committed despite the capture failure.
+    await db_session.refresh(task)
+    assert task.status == TaskStatus.COMPLETED, (
+        "COMPLETED must persist even when playbook capture raises a DB lock "
+        f"error; got {task.status}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_playbook_confirmed_count_not_incremented_on_retry_success(
     client: AsyncClient, db_session, mocker
 ):

@@ -198,6 +198,11 @@ export function MessagesListView({
     );
   }
 
+  // Compute the top-3 noisy event types once per render (used twice below: for
+  // the `.length` guard and the `.map`). getTop3NoisyEventTypes is memoized in
+  // MessagesPanel; binding its result here avoids invoking it twice.
+  const topNoisyEventTypes = getTop3NoisyEventTypes();
+
   return (
     <div ref={scrollRef} className="relative flex-1 space-y-2.5 overflow-y-auto bg-workbench-surface px-3 py-3 custom-scrollbar md:px-4">
       {/* Prominent banner: X new since {time} with action buttons */}
@@ -408,10 +413,10 @@ export function MessagesListView({
                     <>
                       <div className="fixed inset-0 z-40" onClick={() => setShowTempMuteMenu(false)} />
                       <div className="absolute right-0 top-full z-50 mt-1 min-w-48 space-y-1 rounded-md border border-neutral-700 bg-workbench-layer p-2 shadow-xl">
-                        {getTop3NoisyEventTypes().length > 0 ? (
+                        {topNoisyEventTypes.length > 0 ? (
                           <>
                             <p className="text-ui-sm text-neutral-500 px-2 py-1">Mute for</p>
-                            {getTop3NoisyEventTypes().map(([eventType, count]) => {
+                            {topNoisyEventTypes.map(([eventType, count]) => {
                               const label = ROUTINE_EVENT_LABELS[eventType] ?? eventType.replace(/_/g, ' ');
                               // eslint-disable-next-line react-hooks/purity -- render-time freshness check, unchanged from the original inline MessagesPanel render
                               const isActive = tempMutes[eventType] && tempMutes[eventType] > Date.now();

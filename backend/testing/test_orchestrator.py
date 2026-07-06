@@ -8488,6 +8488,37 @@ class TestDispatchCrashContainment:
         )
 
     @staticmethod
+    def _contend_staleness_recompute(mocker, contend_task_id):
+        """Make recompute_launch_staleness raise a TRANSIENT DB lock-timeout —
+        the prod shape: an asyncpg LockNotAvailableError (SQLSTATE 55P03) wrapped
+        by SQLAlchemy's PendingRollbackError, whose own message omits the lock
+        cause so detection must walk the __cause__ chain — for ONE task; behaves
+        normally (no context change) for every other task."""
+        from sqlalchemy.exc import PendingRollbackError
+
+        class _FakeLockNotAvailableError(Exception):
+            sqlstate = "55P03"
+
+            def __str__(self):
+                return "canceling statement due to lock timeout"
+
+        async def _contended(session, task):
+            if task.id == contend_task_id:
+                try:
+                    raise _FakeLockNotAvailableError()
+                except _FakeLockNotAvailableError as _orig:
+                    raise PendingRollbackError(
+                        "This Session's transaction has been rolled back due to "
+                        "a previous exception during flush."
+                    ) from _orig
+            return False
+
+        return mocker.patch(
+            "app.research_completion.recompute_launch_staleness",
+            side_effect=_contended,
+        )
+
+    @staticmethod
     def _set_slots(_orch_module, n=4):
         _orch_module._runtime_config["max_concurrent_vms"] = n
         _orch_module._runtime_config["warm_pool_enabled"] = False
@@ -8579,6 +8610,79 @@ class TestDispatchCrashContainment:
         assert "Dispatch preparation crashed" in (
             poison_row.latest_status_message or ""
         )
+
+    @pytest.mark.asyncio
+    async def test_transient_contention_not_quarantined(
+        self, orch_crash_db, mocker
+    ):
+        """A dispatch-prep failure that is TRANSIENT DB row/lock contention (the
+        30s lock_timeout expiring, surfaced as a PendingRollbackError wrapping an
+        asyncpg LockNotAvailableError) must NOT be treated as a poison task: the
+        _dispatch_prep_failures counter must not increment and the task must stay
+        QUEUED — even when it is already one crash away from the quarantine
+        threshold. Contention self-heals when the lock releases; quarantining
+        healthy tasks (review/fix/design_doc_update) was the prod bug."""
+        from sqlmodel import select as _select
+        import app.orchestrator as _orch_module
+
+        self._mock_dispatch_runtime(mocker)
+        self._set_slots(_orch_module)
+
+        threshold = _orch_module.DISPATCH_PREP_FAILURE_QUARANTINE_THRESHOLD
+        async with orch_crash_db() as session:
+            project = make_project(name="Contention Not Poison", user_id=_TEST_USER)
+            session.add(project)
+            await session.commit()
+            await session.refresh(project)
+
+            # Pre-seed the counter to threshold-1: a genuine crash here WOULD
+            # quarantine (FAILED). Proving the task stays QUEUED at counter==
+            # threshold-1 is the strong form of "contention never fails a task".
+            contended = make_task(
+                project_id=project.id,
+                status=TaskStatus.QUEUED,
+                vm_instance_id=None,
+                payloads=[{"type": "review", "prompt": "healthy review task"}],
+                context={"_dispatch_prep_failures": threshold - 1},
+            )
+            session.add(contended)
+            await session.commit()
+            await session.refresh(contended)
+            contended_id = contended.id
+
+        self._contend_staleness_recompute(mocker, contended_id)
+        try:
+            await self._run_one_cycle(mocker)
+        finally:
+            self._clear_slots(_orch_module)
+
+        async with orch_crash_db() as verify:
+            row = (
+                (await verify.execute(_select(Task).where(Task.id == contended_id)))
+                .scalars()
+                .first()
+            )
+
+        assert row is not None
+        # Primary invariant: contention never transitions the task to FAILED —
+        # it is left QUEUED to retry when the lock releases. (A genuine crash at
+        # this same pre-seeded threshold-1 WOULD quarantine to FAILED, per
+        # test_poison_task_quarantined_at_threshold.)
+        assert row.status == TaskStatus.QUEUED, (
+            "Transient DB contention must leave the task QUEUED for retry, "
+            f"never FAILED/quarantined — got {row.status}"
+        )
+        # The quarantine counter must NOT have advanced to the threshold: the
+        # contention branch never touches it (in prod the rollback of the
+        # poisoned txn preserves the prior committed value; either way it must
+        # stay strictly below the quarantine threshold).
+        _counter = (row.context or {}).get("_dispatch_prep_failures")
+        assert _counter is None or _counter < threshold, (
+            "Transient contention must NOT accrue toward the quarantine "
+            f"counter; expected < {threshold}, got {_counter!r}"
+        )
+        assert (row.context or {}).get("failure_category") != "PROVISION_FAILURE"
+        assert "quarantined" not in (row.latest_status_message or "")
 
     @pytest.mark.asyncio
     async def test_post_dispatch_ci_poll_still_reached(self, orch_crash_db, mocker):

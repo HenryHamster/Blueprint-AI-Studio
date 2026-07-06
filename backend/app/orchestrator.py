@@ -5488,12 +5488,37 @@ async def orchestrator_worker():
                         # (MissingGreenlet, the hazard documented at the
                         # gate-info snapshot above). Use the snapshot tuple
                         # (_qt_id, _task_type_for_gate) instead.
-                        logger.error(
-                            f"[ORCHESTRATOR] Dispatch prep crashed for task {_qt_id} "
-                            f"(type={_task_type_for_gate or '?'}): {_dispatch_prep_exc!r} "
-                            "— contained; continuing with next task",
-                            exc_info=True,
+                        # Transient DB row/lock contention (the global 30s
+                        # lock_timeout expiring on a FOR UPDATE, a broken
+                        # deadlock, or a statement hitting an already-aborted
+                        # txn) is NOT a poison task — it self-heals once the lock
+                        # releases. Detect it (walking the __cause__/.orig chain:
+                        # the surfaced error is usually a PendingRollbackError /
+                        # DBAPIError wrapping the asyncpg LockNotAvailableError)
+                        # so it does NOT accrue toward the 3-strike quarantine
+                        # below, which in prod was FAILing healthy
+                        # review/fix/design_doc_update tasks during contention
+                        # bursts (~489 lock_timeout events/24h).
+                        from app.db_contention import is_db_contention_error
+
+                        _prep_is_contention = is_db_contention_error(
+                            _dispatch_prep_exc
                         )
+                        if _prep_is_contention:
+                            logger.warning(
+                                "[ORCHESTRATOR] Dispatch prep hit transient DB "
+                                f"contention for task {_qt_id} "
+                                f"(type={_task_type_for_gate or '?'}): "
+                                f"{_dispatch_prep_exc!r} — left QUEUED, will retry "
+                                "next cycle (not counted toward quarantine)"
+                            )
+                        else:
+                            logger.error(
+                                f"[ORCHESTRATOR] Dispatch prep crashed for task {_qt_id} "
+                                f"(type={_task_type_for_gate or '?'}): {_dispatch_prep_exc!r} "
+                                "— contained; continuing with next task",
+                                exc_info=True,
+                            )
                         try:
                             await session.rollback()
                         except Exception:
@@ -5512,6 +5537,15 @@ async def orchestrator_worker():
                                     f"{_iter_preclaimed_account_id} after dispatch crash "
                                     f"for task {_qt_id}"
                                 )
+                        if _prep_is_contention:
+                            # Leave the task QUEUED untouched: the rollback above
+                            # discarded any partial in-txn mutation and the
+                            # pre-claimed account was released, so the next cycle
+                            # re-dispatches cleanly once the lock frees. Do NOT
+                            # touch _dispatch_prep_failures and do NOT quarantine
+                            # — transient contention must never transition the
+                            # task to FAILED.
+                            continue
                         try:
                             _crashed_task = await _lock_dispatchable_task_for_mutation(
                                 session, _qt_id

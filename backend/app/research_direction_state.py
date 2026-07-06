@@ -551,6 +551,36 @@ async def apply_post_spawn_state(
                         _merge_finding_challenge_summary(
                             _summary, _summarize_finding_challenge(_challenge)
                         )
+            # Batch-load undismissed deadlock alerts for this project once (was up
+            # to 2*N per-direction Alert existence queries). Dedup is matched
+            # in-memory below by checking whether any alert of the relevant title
+            # already references the direction id in its message text — the exact
+            # equivalent of the per-direction ``Alert.message.contains(did)`` check.
+            _dedup_deadlock_alert_messages: list[str] = []
+            _af_deadlock_alert_messages: list[str] = []
+            _undismissed_deadlock_alerts = (
+                (
+                    await session.execute(
+                        select(Alert).where(
+                            Alert.project_id == task.project_id,
+                            Alert.dismissed_at.is_(None),
+                            Alert.title.in_(
+                                [
+                                    "Dedup deadlock detected",
+                                    "Already-fixed deadlock detected",
+                                ]
+                            ),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            for _alert in _undismissed_deadlock_alerts:
+                if _alert.title == "Dedup deadlock detected":
+                    _dedup_deadlock_alert_messages.append(_alert.message or "")
+                elif _alert.title == "Already-fixed deadlock detected":
+                    _af_deadlock_alert_messages.append(_alert.message or "")
             for d in directions:
                 did = d.get("id")
                 if did in direction_ids_with_findings:
@@ -697,19 +727,8 @@ async def apply_post_spawn_state(
                             and f.get("title")
                         ][:3]
                         # Guard: only create alert if no undismissed alert exists for this direction
-                        _existing_deadlock_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.title == "Dedup deadlock detected",
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.message.contains(did),
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .first()
+                        _existing_deadlock_alert = any(
+                            did in _msg for _msg in _dedup_deadlock_alert_messages
                         )
                         if not _existing_deadlock_alert:
                             _deadlock_alert = Alert(
@@ -817,20 +836,8 @@ async def apply_post_spawn_state(
                             exhausted=True,
                         )
                     if _af_deadlocked and d.get("status") == "active":
-                        _existing_af_alert = (
-                            (
-                                await session.execute(
-                                    select(Alert).where(
-                                        Alert.project_id == task.project_id,
-                                        Alert.title
-                                        == "Already-fixed deadlock detected",
-                                        Alert.dismissed_at.is_(None),
-                                        Alert.message.contains(did),
-                                    )
-                                )
-                            )
-                            .scalars()
-                            .first()
+                        _existing_af_alert = any(
+                            did in _msg for _msg in _af_deadlock_alert_messages
                         )
                         if not _existing_af_alert:
                             _af_alert = Alert(

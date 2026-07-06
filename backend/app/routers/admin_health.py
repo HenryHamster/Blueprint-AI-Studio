@@ -237,29 +237,61 @@ async def _compute_health_overview(
         window_start = now - timedelta(hours=lookback_hours)
         prev_window_start = window_start - timedelta(hours=lookback_hours)
         # Phase B4 (H-P4): cap unbounded scan at 5000 rows (was 20000) and
-        # warn if truncated. The status_log JSONB column is required because
-        # _derive_at() reads its last entry. Other heavy JSONBs (context,
-        # payloads, plan_output) stay deferred via load_only.
+        # warn if truncated. _derive_at() only reads status_log[-1]["t"], so on
+        # PostgreSQL project just that scalar SQL-side (mirrors the proven
+        # projection in admin_digest.py) rather than materializing the full
+        # status_log JSONB array for up to 5000 rows. SQLite (tests) lacks
+        # negative-index JSON paths, so it falls back to loading status_log
+        # directly. Other heavy JSONBs (context, payloads, plan_output) stay
+        # deferred via load_only either way.
         _XP_LIMIT = 5000
-        xp_result = await session.execute(
-            select(Task)
-            .where(
-                Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
-                Task.created_at >= prev_window_start,
-                Task.archived.is_(False),
-            )
-            .options(
-                load_only(
-                    Task.id,
-                    Task.status,
-                    Task.created_at,
-                    Task.status_log,
-                    raiseload=True,
+        _use_projection = resolve_dialect_name(session) == "postgresql"
+        if _use_projection:
+            xp_result = await session.execute(
+                select(
+                    Task,
+                    Task.status_log[-1]["t"].astext.label("_last_status_ts"),
                 )
+                .where(
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                    Task.created_at >= prev_window_start,
+                    Task.archived.is_(False),
+                )
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.created_at,
+                        raiseload=True,
+                    )
+                )
+                .limit(_XP_LIMIT)
             )
-            .limit(_XP_LIMIT)
-        )
-        xp_tasks = xp_result.scalars().all()
+            xp_tasks = []
+            for row in xp_result.all():
+                task = row[0]
+                object.__setattr__(task, "_last_status_ts", row[1])
+                xp_tasks.append(task)
+        else:
+            xp_result = await session.execute(
+                select(Task)
+                .where(
+                    Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                    Task.created_at >= prev_window_start,
+                    Task.archived.is_(False),
+                )
+                .options(
+                    load_only(
+                        Task.id,
+                        Task.status,
+                        Task.created_at,
+                        Task.status_log,
+                        raiseload=True,
+                    )
+                )
+                .limit(_XP_LIMIT)
+            )
+            xp_tasks = xp_result.scalars().all()
         if len(xp_tasks) >= _XP_LIMIT:
             logger.warning(
                 "[HEALTH-OVERVIEW] success-rate scan hit cap=%d rows over %dh — "
@@ -270,6 +302,19 @@ async def _compute_health_overview(
             )
 
         def _derive_at(t: Task):
+            # PG projection path stashes status_log[-1]["t"] on `_last_status_ts`
+            # (possibly None when the array is empty / the key is missing); the
+            # SQLite path leaves it unset and reads the loaded status_log tail.
+            # Both preserve the original semantics exactly: fall back to
+            # created_at when the timestamp is absent or unparseable.
+            if hasattr(t, "_last_status_ts"):
+                ts = t._last_status_ts
+                if ts:
+                    try:
+                        return datetime.fromisoformat(ts)
+                    except (KeyError, ValueError):
+                        pass
+                return t.created_at
             if t.status_log:
                 try:
                     return datetime.fromisoformat(t.status_log[-1]["t"])

@@ -673,6 +673,37 @@ async def record_artifact_consumptions_for_task(
         .all()
     )
     artifacts_by_id = {artifact.id: artifact for artifact in artifacts}
+
+    # Batch-load producers and existing consumptions once (was 2*N per-artifact
+    # round-trips): a single Task query keyed by producer id and a single
+    # ArtifactConsumption query for this consumer, looked up in-memory below.
+    producer_task_ids = {artifact.task_id for artifact in artifacts}
+    producers_by_id: dict[uuid.UUID, Task] = {}
+    if producer_task_ids:
+        producer_rows = (
+            (await session.execute(select(Task).where(Task.id.in_(producer_task_ids))))
+            .scalars()
+            .all()
+        )
+        producers_by_id = {producer.id: producer for producer in producer_rows}
+    existing_consumptions_by_artifact: dict[uuid.UUID, ArtifactConsumption] = {}
+    existing_consumption_rows = (
+        (
+            await session.execute(
+                select(ArtifactConsumption).where(
+                    ArtifactConsumption.consumer_task_id == task.id,
+                    ArtifactConsumption.artifact_id.in_(ids),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for _consumption in existing_consumption_rows:
+        existing_consumptions_by_artifact.setdefault(
+            _consumption.artifact_id, _consumption
+        )
+
     recorded: list[ArtifactConsumption] = []
     recorded_id_strings: list[str] = []
 
@@ -680,21 +711,10 @@ async def record_artifact_consumptions_for_task(
         artifact = artifacts_by_id.get(artifact_id)
         if artifact is None:
             continue
-        producer = await session.get(Task, artifact.task_id)
+        producer = producers_by_id.get(artifact.task_id)
         if producer is None or producer.project_id != task.project_id:
             continue
-        existing = (
-            (
-                await session.execute(
-                    select(ArtifactConsumption).where(
-                        ArtifactConsumption.consumer_task_id == task.id,
-                        ArtifactConsumption.artifact_id == artifact.id,
-                    )
-                )
-            )
-            .scalars()
-            .first()
-        )
+        existing = existing_consumptions_by_artifact.get(artifact.id)
         if existing is None:
             existing = ArtifactConsumption(
                 artifact_id=artifact.id,

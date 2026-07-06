@@ -1285,6 +1285,7 @@ async def get_direction_task_counts(
                 Task.context,
                 Task.title,
                 Task.latest_status_message,
+                Task.created_at,
                 raiseload=True,
             )
         )
@@ -1292,29 +1293,44 @@ async def get_direction_task_counts(
     )
     tasks = result.scalars().all()
 
+    # Per-direction cap on the returned active-task preview. `counts` and
+    # `counts_by_type` are still tallied across every matched task; only the
+    # `active_tasks` list is bounded so this ~10s-polled response can't grow
+    # without limit when a single direction accumulates thousands of live
+    # tasks. We keep the most-recent N by created_at, sorting in Python AFTER
+    # the scan so the query's (unordered) 5000-row set — and therefore the
+    # counts — stays byte-identical to the previous behavior.
+    _ACTIVE_TASKS_CAP = 50
+
     counts: Dict[str, int] = {}
     counts_by_type: Dict[str, Dict[str, int]] = {}
-    active_tasks: Dict[str, list[dict]] = {}
+    active_raw: Dict[str, list[tuple]] = {}
     for task in tasks:
         payload = task.first_payload
         dir_ids = task_primary_direction_ids_shallow(task)
         if not dir_ids:
             continue
         task_type = payload.get("type") or "unknown"
+        entry = {
+            "id": str(task.id),
+            "status": task.status.value
+            if hasattr(task.status, "value")
+            else str(task.status),
+            "title": task.title or "",
+            "latest_status_message": (task.latest_status_message or "")[:200],
+        }
         for d_id in dir_ids:
             counts[d_id] = counts.get(d_id, 0) + 1
             counts_by_type.setdefault(d_id, {})
             counts_by_type[d_id][task_type] = counts_by_type[d_id].get(task_type, 0) + 1
-            active_tasks.setdefault(d_id, []).append(
-                {
-                    "id": str(task.id),
-                    "status": task.status.value
-                    if hasattr(task.status, "value")
-                    else str(task.status),
-                    "title": task.title or "",
-                    "latest_status_message": (task.latest_status_message or "")[:200],
-                }
-            )
+            active_raw.setdefault(d_id, []).append((task.created_at, entry))
+
+    active_tasks: Dict[str, list[dict]] = {}
+    for d_id, entries in active_raw.items():
+        # Sort on the created_at key only (never the tuple) so equal timestamps
+        # don't force a comparison of the unorderable dict payloads.
+        entries.sort(key=lambda e: e[0], reverse=True)
+        active_tasks[d_id] = [item for _, item in entries[:_ACTIVE_TASKS_CAP]]
 
     return {
         "counts": counts,

@@ -1,5 +1,5 @@
 import { X, Check, AlertTriangle, HelpCircle, Bug, StickyNote, MessageSquare, PlusCircle, Trash2, CheckSquare, Reply, Copy } from 'lucide-react';
-import { useState, useCallback } from 'react';
+import { useState, useCallback, memo } from 'react';
 import { parseTimestamp } from '../utils/time';
 import { ESCALATION_BADGE_LABELS, HIGH_SIGNAL_NOTE_BADGE_LABELS } from './eventPrefs';
 import { MarkdownContent } from './MarkdownContent';
@@ -221,7 +221,7 @@ export interface MessageBubbleProps {
   onOpenStrategicContext?: () => void;
 }
 
-export function MessageBubble({
+export const MessageBubble = memo(function MessageBubble({
   msg,
   faded = false,
   readOnly = false,
@@ -534,4 +534,4 @@ export function MessageBubble({
       </div>
     </div>
   );
-}
+});
