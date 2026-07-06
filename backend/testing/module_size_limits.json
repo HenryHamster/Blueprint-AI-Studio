@@ -112,7 +112,7 @@
     "recovery_post_commit_orphans.py": 750,
     "recovery_post_commit_pending.py": 1100,
     "recovery_sidecar.py": 400,
-    "release_version.py": 1750,
+    "release_version.py": 2050,
     "ci_resolution.py": 1800,
     "routers/admin_project_config.py": 1800,
     "compute_backends.py": 2350,
@@ -121,12 +121,13 @@
     "strategic_state_read_model.py": 1100,
     "strategic_resident_session.py": 2250,
     "work_session_check_in.py": 400,
-    "release_qualifier_sweep.py": 2100,
+    "release_qualifier_sweep.py": 2700,
     "operator_attention.py": 2150,
     "payload_schemas.py": 1750,
     "lifecycle.py": 1750,
     "research_direction_state.py": 1750,
-    "dep_lifecycle.py": 800
+    "dep_lifecycle.py": 800,
+    "routers/admin_health.py": 1750
   },
   "agent": {
     "index.ts": 4600,

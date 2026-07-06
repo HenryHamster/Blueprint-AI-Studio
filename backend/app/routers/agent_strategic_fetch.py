@@ -553,7 +553,17 @@ async def agent_fetch_qualification(
         .first()
     )
     if open_row is None:
-        return {"source": "no_open_version"}
+        return {
+            "source": "no_open_version",
+            "qualification_trigger_state": {
+                "trigger_state": "blocked",
+                "open_version_id": None,
+                "reason": "no_open_version",
+                "summary": "no open release version — nothing to qualify",
+                "coverage_total": 0,
+                "coverage_covered": 0,
+            },
+        }
 
     # Re-qualification readiness signal + per-finding resolution view (ADDITIVE).
     # The fix-first triage workflow needs to know, from the same read it already
@@ -600,6 +610,28 @@ async def agent_fetch_qualification(
         logger.exception(
             "[AGENT_FETCH] goal_coverage_drift compute failed for project %s; "
             "serving qualification without the drift signal",
+            project_id,
+        )
+
+    # Initial-qualification trigger-state signal (ADDITIVE). Answers 'why hasn't
+    # the FIRST qualification fired' — armed, or blocked because coverage is N/M,
+    # wrong phase, or already attempted. Computed via the shared classifier so the
+    # sweep and this read-surface cannot drift apart. Best-effort: a compute
+    # failure degrades to ``qualification_trigger_state: None`` without breaking
+    # the read or changing any existing key.
+    qualification_trigger_state: dict | None = None
+    try:
+        from app.release_readiness import (  # noqa: PLC0415
+            compute_qualification_trigger_state,
+        )
+
+        qualification_trigger_state = await compute_qualification_trigger_state(
+            session, project_id
+        )
+    except Exception:
+        logger.exception(
+            "[AGENT_FETCH] qualification_trigger_state compute failed for project "
+            "%s; serving qualification without the trigger-state signal",
             project_id,
         )
 
@@ -669,6 +701,7 @@ async def agent_fetch_qualification(
             "source": "qualification_verdict",
             "source_disagreement": source_disagreement,
             "goal_coverage_drift": goal_coverage_drift,
+            "qualification_trigger_state": qualification_trigger_state,
             **requalification_extra,
         }
 
@@ -691,6 +724,7 @@ async def agent_fetch_qualification(
         "qualify_request_blocked_at": qual.get("qualify_request_blocked_at") or None,
         "source": "last_qualification",
         "goal_coverage_drift": goal_coverage_drift,
+        "qualification_trigger_state": qualification_trigger_state,
         **requalification_extra,
     }
 

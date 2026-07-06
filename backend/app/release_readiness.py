@@ -1094,6 +1094,114 @@ async def compute_requalification_readiness(
     }
 
 
+async def compute_qualification_trigger_state(
+    session: AsyncSession,
+    project_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Classify whether the open version's INITIAL qualification trigger is armed.
+
+    This is a cheap, DB-only predicate (no GitHub round-trips) that answers
+    'why hasn't the initial qualification fired / would it fire now'.  It is
+    the single source of truth for the initial-trigger decision so the sweep
+    function and any future read-surface cannot drift apart.
+
+    Returns a dict shaped::
+
+        {
+          "trigger_state": "armed" | "blocked",
+          "open_version_id": str | None,
+          "reason": str,   # machine-readable code
+          "summary": str,  # human-readable explanation
+          "coverage_total": int,
+          "coverage_covered": int,
+        }
+
+    ``trigger_state`` is ``"armed"`` exactly when:
+      - an open release version exists for the project, AND
+      - the version is in the "stabilize" phase, AND
+      - no prior qualification attempt exists (``last_qualification is None``
+        AND ``qualification_attempts == 0``), AND
+      - criterion coverage is complete: NOT (total > 0 and covered < total).
+
+    ``reason`` codes when ``trigger_state == "blocked"``:
+      - ``"no_open_version"``       — no open release version
+      - ``"wrong_phase"``           — version exists but is not in stabilize phase
+      - ``"prior_attempt_exists"``  — last_qualification is set OR qualification_attempts > 0
+      - ``"coverage_incomplete"``   — coverage gate would fire (total > 0 and covered < total)
+    """
+    from app.acceptance_criteria import get_version_coverage_summary  # noqa: PLC0415
+
+    version = await release_version.current_open_version(session, project_id)
+    if version is None:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": None,
+            "reason": "no_open_version",
+            "summary": "no open release version — nothing to qualify",
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    if version.phase != "stabilize":
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "wrong_phase",
+            "summary": (
+                f"version v{version.version_number} is in phase "
+                f"'{version.phase}', not 'stabilize'"
+            ),
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    has_prior_attempt = (
+        version.last_qualification is not None
+        or (version.qualification_attempts or 0) > 0
+    )
+    if has_prior_attempt:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "prior_attempt_exists",
+            "summary": (
+                f"version v{version.version_number} already has a qualification "
+                "attempt recorded — initial trigger does not re-fire"
+            ),
+            "coverage_total": 0,
+            "coverage_covered": 0,
+        }
+
+    coverage = await get_version_coverage_summary(session, version.id)
+    total = int(coverage.get("total") or 0)
+    covered = int(coverage.get("covered") or 0)
+
+    if total > 0 and covered < total:
+        return {
+            "trigger_state": "blocked",
+            "open_version_id": str(version.id),
+            "reason": "coverage_incomplete",
+            "summary": (
+                f"criterion coverage incomplete for v{version.version_number}: "
+                f"{covered}/{total} active criteria covered"
+            ),
+            "coverage_total": total,
+            "coverage_covered": covered,
+        }
+
+    return {
+        "trigger_state": "armed",
+        "open_version_id": str(version.id),
+        "reason": "armed",
+        "summary": (
+            f"v{version.version_number} is stabilize-phase with no prior attempt "
+            f"and complete criterion coverage ({covered}/{total if total else 'none'})"
+        ),
+        "coverage_total": total,
+        "coverage_covered": covered,
+    }
+
+
 async def compute_goal_coverage_drift_signal(
     session: AsyncSession,
     project_id: uuid.UUID,

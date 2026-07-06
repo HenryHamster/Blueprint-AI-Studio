@@ -886,6 +886,112 @@ async def _reconcile_if_criterion_coverage_now_complete(
             return False
 
 
+async def _fire_initial_qualification_if_coverage_complete(
+    version_id,
+    *,
+    session_factory=None,
+) -> bool:
+    """Fire the FIRST qualification for a stabilize-phase version once coverage is complete.
+
+    This is the initial-trigger complement to
+    :func:`_reconcile_if_criterion_coverage_now_complete` (which handles the
+    RE-drive path for versions that already have a ``not_promoted`` attempt).
+    Here we fire the FIRST qualification for a version that has never been
+    qualified at all (``last_qualification is None`` AND
+    ``qualification_attempts == 0``) once criterion coverage is complete.
+
+    Uses :func:`~app.release_readiness.compute_qualification_trigger_state` as
+    the single classifier so the read-surface and sweep behavior cannot drift.
+    Resolves the automain HEAD SHA and invokes ``run_qualification`` on the
+    same pattern as :func:`_reconcile_if_criterion_coverage_now_complete`.
+
+    Returns True iff a new qualification was spawned.
+    """
+    from app import github, release_qualifier
+    from app.release_readiness import compute_qualification_trigger_state
+
+    factory = session_factory or AsyncSessionLocal
+    async with factory() as session:
+        try:
+            version = await session.get(release_version.ReleaseVersion, version_id)
+            if version is None:
+                return False
+
+            trigger = await compute_qualification_trigger_state(
+                session, version.project_id
+            )
+            if trigger.get("trigger_state") != "armed":
+                return False
+            # Guard: only act on the version we were asked about (the trigger
+            # resolves the open version for the project; confirm it matches).
+            if str(version.id) != trigger.get("open_version_id"):
+                return False
+
+            project = await session.get(Project, version.project_id)
+            if project is None:
+                return False
+            resolved = await _resolve_github_with_session(session, project)
+            if resolved is None:
+                logger.warning(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "no GitHub credentials for v%d — skipping",
+                    version.version_number,
+                )
+                return False
+            token, owner, repo = resolved
+            integration_branch, _promotion_target = (
+                release_qualifier._lts_branch_names(project)
+            )
+            try:
+                automain_sha = await github.get_branch_sha(
+                    token, owner, repo, integration_branch
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "could not resolve %s HEAD SHA for v%d (%s) — skipping",
+                    integration_branch,
+                    version.version_number,
+                    exc,
+                )
+                return False
+            if not automain_sha:
+                return False
+
+            logger.info(
+                "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                "coverage complete for v%d on %s (total=%d covered=%d) "
+                "— spawning initial qualification",
+                version.version_number,
+                automain_sha[:8],
+                trigger.get("coverage_total", 0),
+                trigger.get("coverage_covered", 0),
+            )
+            result = await release_qualifier.run_qualification(
+                session, version.project_id, version
+            )
+            if result and result.get("status") == "spawned":
+                await session.commit()
+                return True
+            await session.rollback()
+            return False
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                "unexpected error for version %s",
+                version_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RELEASE_QUALIFIER] fire_initial_qualification: "
+                    "rollback failed for version %s after unexpected error",
+                    version_id,
+                )
+            return False
+
+
 async def _auto_stale_not_promoted_findings(
     version_id,
     *,
@@ -2156,6 +2262,34 @@ async def sweep_stuck_qualifications(
             logger.info(
                 "[RELEASE_QUALIFIER] sweep promoted dry-run-pass version %s "
                 "(promotion now enabled — candidate current)",
+                version_id,
+            )
+
+    # Fire the INITIAL qualification for stabilize-phase versions that have
+    # never been qualified once their criterion coverage is complete.  Every
+    # other loop in this sweep is a RE-driver; this is the only trigger that
+    # fires the first qualification automatically — filling the gap where the
+    # strategist never emitted qualify_request.  Runs AFTER all RE-driver loops
+    # so a version that transitioned state during this sweep cycle is handled
+    # by the appropriate re-driver first.
+    for version_id in version_ids:
+        try:
+            fired = await _fire_initial_qualification_if_coverage_complete(
+                version_id,
+                session_factory=session_factory,
+            )
+        except Exception:
+            logger.exception(
+                "[RELEASE_QUALIFIER] sweep: initial qualification fire failed "
+                "for version %s",
+                version_id,
+            )
+            continue
+        if fired:
+            finalized += 1
+            logger.info(
+                "[RELEASE_QUALIFIER] sweep fired initial qualification for "
+                "version %s (coverage complete — first qualification spawned)",
                 version_id,
             )
 

@@ -9136,6 +9136,85 @@ async def test_criterion_coverage_incomplete_blocks_qualification(
 
 
 @pytest.mark.asyncio
+async def test_qualification_trigger_state_surface_explains_armed_and_blocked(
+    client, db_session
+):
+    """The agent qualification read surfaces ``qualification_trigger_state`` and
+    explains BOTH an armed trigger (stabilize phase, no prior attempt, complete
+    criterion coverage) and a blocked trigger (coverage incomplete) with the
+    correct machine-readable reason and coverage counts.
+
+    Exercises the production read-surface wiring in
+    ``routers/agent_strategic_fetch.py`` (which threads the shared
+    ``compute_qualification_trigger_state`` classifier onto every branch of
+    ``agent_fetch_qualification``), end-to-end over the real HTTP route.
+    """
+    from httpx import AsyncClient  # noqa: PLC0415
+    from app.auth import create_agent_token  # noqa: PLC0415
+
+    assert isinstance(client, AsyncClient)
+
+    # Stabilize-phase open version with no prior qualification attempt.
+    project, version = await _make_project_and_version(
+        db_session, phase="stabilize"
+    )
+    assert version.last_qualification is None
+    assert (version.qualification_attempts or 0) == 0
+
+    task = Task(
+        project_id=project.id, payloads=[{}], vm_instance_id="agent-vm-trigger"
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    token = create_agent_token(str(task.id), task.vm_instance_id)
+    headers = {"x-agent-token": token}
+    url = f"/api/agent/projects/{project.id}/qualification"
+
+    # ARMED: one active criterion, fully covered by proven merge-test evidence,
+    # no prior attempt → the initial trigger would fire now.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-covered-armed",
+        text="Covered criterion",
+        source_kind="task_merge",
+    )
+
+    res = await client.get(url, headers=headers)
+    assert res.status_code == 200, res.text
+    armed = res.json()["qualification_trigger_state"]
+    assert armed is not None
+    assert armed["trigger_state"] == "armed"
+    assert armed["reason"] == "armed"
+    assert armed["open_version_id"] == str(version.id)
+    assert armed["coverage_total"] == 1
+    assert armed["coverage_covered"] == 1
+
+    # BLOCKED: add a second active criterion with no covering evidence →
+    # coverage becomes incomplete (1/2) so the trigger is blocked, and the
+    # surface explains exactly why with the live coverage counts.
+    await _add_version_criterion(
+        db_session,
+        project,
+        version,
+        key="c-uncovered-blocked",
+        text="Uncovered criterion",
+    )
+
+    res = await client.get(url, headers=headers)
+    assert res.status_code == 200, res.text
+    blocked = res.json()["qualification_trigger_state"]
+    assert blocked is not None
+    assert blocked["trigger_state"] == "blocked"
+    assert blocked["reason"] == "coverage_incomplete"
+    assert blocked["open_version_id"] == str(version.id)
+    assert blocked["coverage_total"] == 2
+    assert blocked["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
 async def test_criterion_coverage_all_covered_passes_qualification(
     db_session, mocker
 ):
@@ -31893,3 +31972,356 @@ async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
 
     # At least the dry_run re-drive must have contributed to the finalized count.
     assert count >= 1
+
+
+# ---------------------------------------------------------------------------
+# compute_qualification_trigger_state + _fire_initial_qualification tests
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_armed(db_session, mocker):
+    """open stabilize-phase version, no prior attempt, coverage complete → armed."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    # Add a covered criterion so total > 0 and covered == total.
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-trig-armed", text="Covered criterion",
+        source_kind="task_merge",
+    )
+    assert version.last_qualification is None
+    assert (version.qualification_attempts or 0) == 0
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "armed"
+    assert result["open_version_id"] == str(version.id)
+    assert result["reason"] == "armed"
+    assert result["coverage_total"] == 1
+    assert result["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_armed_no_criteria(db_session):
+    """No active criteria (total == 0) is not incomplete → trigger armed."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "armed"
+    assert result["coverage_total"] == 0
+    assert result["coverage_covered"] == 0
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_no_version(db_session):
+    """No open version → reason=no_open_version."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project = Project(
+        name="NoVer-Project",
+        user_id="rq-user-nv",
+        github_owner="acme",
+        github_repo="nover",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["open_version_id"] is None
+    assert result["reason"] == "no_open_version"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_wrong_phase(db_session):
+    """Version in 'build' phase → reason=wrong_phase."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="build")
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "wrong_phase"
+    assert result["open_version_id"] == str(version.id)
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_prior_attempt_last_qual(
+    db_session,
+):
+    """last_qualification is set → reason=prior_attempt_exists."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "error",
+        "candidate_sha": "err00000" * 5,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "prior_attempt_exists"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_prior_attempt_attempts_count(
+    db_session,
+):
+    """qualification_attempts > 0 (even with no last_qualification) → reason=prior_attempt_exists."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.qualification_attempts = 1
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "prior_attempt_exists"
+
+
+@pytest.mark.asyncio
+async def test_compute_qualification_trigger_state_blocked_coverage_incomplete(
+    db_session,
+):
+    """total > 0 and covered < total → reason=coverage_incomplete."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-covered", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing", text="Not covered yet",
+    )
+
+    result = await compute_qualification_trigger_state(db_session, project.id)
+
+    assert result["trigger_state"] == "blocked"
+    assert result["reason"] == "coverage_incomplete"
+    assert result["coverage_total"] == 2
+    assert result["coverage_covered"] == 1
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_spawns(
+    db_session, mocker
+):
+    """Armed version: sweep function fires the first qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-init-covered", text="Covered criterion for initial qual",
+        source_kind="task_merge",
+    )
+
+    automain_sha = "initfire" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is True
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_coverage_incomplete(
+    db_session, mocker
+):
+    """Coverage incomplete → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-partial", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-missing-init", text="Not yet covered",
+    )
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_wrong_phase(
+    db_session, mocker
+):
+    """Build-phase version → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="build")
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete_noop_prior_attempt(
+    db_session, mocker
+):
+    """Prior attempt exists → function returns False without calling run_qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "not_promoted",
+        "candidate_sha": "prior000" * 5,
+        "blocker": "ci_not_green",
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert fired is False
+    run_qual_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_sweep_initial_qualification_wired(db_session, mocker):
+    """Integration: sweep picks up a stabilize-phase version with no prior attempt
+    and complete coverage and fires the initial qualification."""
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-sweep-init", text="Covered criterion for sweep integration",
+        source_kind="task_merge",
+    )
+
+    automain_sha = "swpinit0" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    count = await rq.sweep_stuck_qualifications(
+        db_session,
+        session_factory=_shared_session_factory(db_session),
+    )
+
+    assert count >= 1
+    run_qual_mock.assert_called()
+
+
+# Named acceptance test: test_fire_initial_qualification_if_coverage_complete
+@pytest.mark.asyncio
+async def test_fire_initial_qualification_if_coverage_complete(db_session, mocker):
+    """Named acceptance test: sweep fires the initial qualification for a
+    stabilize-phase version with complete criterion coverage and no prior attempt
+    (last_qualification is None, qualification_attempts == 0); the trigger-state
+    surface reports 'armed' for such a version and 'blocked' with specific reasons
+    for all the failing cases."""
+    from app.release_readiness import compute_qualification_trigger_state
+
+    # --- Part 1: verify trigger_state surface ---
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project, version,
+        key="c-accept-covered", text="Acceptance test covered criterion",
+        source_kind="task_merge",
+    )
+
+    trigger = await compute_qualification_trigger_state(db_session, project.id)
+    assert trigger["trigger_state"] == "armed", (
+        f"Expected armed trigger, got: {trigger}"
+    )
+    assert trigger["coverage_total"] == 1
+    assert trigger["coverage_covered"] == 1
+
+    # --- Part 2: sweep fires the initial qualification ---
+
+    automain_sha = "accept00" * 5
+    mocker.patch(
+        "app.github.get_branch_sha", new=_branch_sha_mock(automain=automain_sha)
+    )
+    run_qual_mock = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned", "candidate_sha": automain_sha}),
+    )
+
+    fired = await rq._fire_initial_qualification_if_coverage_complete(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert fired is True
+    run_qual_mock.assert_called_once()
+
+    # --- Part 3: blocked cases ---
+
+    # After firing (mocked), a real version would have last_qualification set;
+    # test blocking on a fresh version with an existing attempt.
+    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    version2.last_qualification = {
+        "status": "infra_failure",
+        "candidate_sha": "prior111" * 5,
+    }
+    db_session.add(version2)
+    await db_session.commit()
+    await db_session.refresh(version2)
+
+    blocked = await compute_qualification_trigger_state(db_session, project2.id)
+    assert blocked["trigger_state"] == "blocked"
+    assert blocked["reason"] == "prior_attempt_exists"
+
+    # Coverage incomplete blocks.
+    project3, version3 = await _make_project_and_version(db_session, phase="stabilize")
+    await _add_version_criterion(
+        db_session, project3, version3,
+        key="c-blk-covered", text="Covered", source_kind="task_merge",
+    )
+    await _add_version_criterion(
+        db_session, project3, version3,
+        key="c-blk-missing", text="Not covered",
+    )
+
+    blocked2 = await compute_qualification_trigger_state(db_session, project3.id)
+    assert blocked2["trigger_state"] == "blocked"
+    assert blocked2["reason"] == "coverage_incomplete"

@@ -7006,6 +7006,24 @@ async def _spawn_strategic_review(
                 logger.exception(
                     "[STRATEGIC] criterion_coverage fetch failed; continuing"
                 )
+            try:
+                from app.release_readiness import (
+                    compute_qualification_trigger_state,
+                )
+
+                _trigger_state = await compute_qualification_trigger_state(
+                    session, project.id
+                )
+                if _trigger_state is not None:
+                    if _version_phase_block is None:
+                        _version_phase_block = {}
+                    _version_phase_block["qualification_trigger_state"] = (
+                        _trigger_state
+                    )
+            except Exception:
+                logger.exception(
+                    "[STRATEGIC] qualification_trigger_state fetch failed; continuing"
+                )
         except Exception as _vpb_exc:
             logger.exception("[STRATEGIC] version_phase block build failed; continuing")
             _version_phase_block = {
@@ -7981,9 +7999,16 @@ async def _spawn_strategic_review(
                         f"v{_open_version.version_number} has been in the stabilize "
                         f"phase for {_stab_age_days} day(s) with {_stab_merged} merged "
                         f"task(s) without making progress toward qualification. "
-                        f"stabilize→qualify is agent-driven — consider emitting a "
-                        f"qualify_request now, or identifying and resolving whatever "
-                        f"is preventing qualification readiness."
+                        f"The FIRST qualification now fires AUTOMATICALLY once "
+                        f"criterion coverage is complete — qualify_request is no "
+                        f"longer required to start it. Check "
+                        f"version_phase.qualification_trigger_state: if it is "
+                        f"'blocked' the summary/reason tells you what to resolve "
+                        f"(e.g. coverage N/M) to let the trigger arm. "
+                        f"qualify_request only ACCELERATES the first qualification "
+                        f"(fires it before the next sweep) or re-drives after a "
+                        f"conclusive verdict — emit one to fire sooner, but "
+                        f"resolving the blocker is what actually unsticks the stall."
                     )
                     prompt_suffix = (
                         f"{prompt_suffix}\n{_stab_stall_hint}"

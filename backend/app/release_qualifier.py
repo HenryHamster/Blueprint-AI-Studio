@@ -232,6 +232,7 @@ from app.release_qualifier_sweep import (
     _force_finalize_sweep_crash_loop,  # noqa: F401 — re-exported for tests
     _force_finalize_timed_out_qualification,
     _parse_started_at,
+    _fire_initial_qualification_if_coverage_complete,  # noqa: F401 — re-exported for tests
     _reconcile_if_criterion_coverage_now_complete,  # noqa: F401 — re-exported for tests
     _redrive_deferred_unsynced_qualification,  # noqa: F401 — re-exported for tests
     _redrive_dry_run_candidate,  # noqa: F401 — re-exported for tests

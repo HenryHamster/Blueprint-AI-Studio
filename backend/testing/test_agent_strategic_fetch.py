@@ -1556,6 +1556,11 @@ async def test_agent_fetch_qualification_returns_latest_verdict_findings(
     states = {f["state"] for f in body["finding_resolution"]}
     assert states == {"unresolved"}
     assert {f["severity"] for f in body["finding_resolution"]} == {"high", "medium"}
+    # Additive initial-trigger surface is present on the verdict branch and, when
+    # computed, is a shaped dict (never raises out of this best-effort block).
+    assert "qualification_trigger_state" in body
+    _trigger = body["qualification_trigger_state"]
+    assert _trigger is None or _trigger["trigger_state"] in {"armed", "blocked"}
 
 
 @pytest.mark.asyncio
