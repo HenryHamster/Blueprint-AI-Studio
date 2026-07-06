@@ -563,6 +563,47 @@ def test_gc_problem_model_noop_under_cap():
     assert model.model_dump() == before
 
 
+def test_gc_problem_model_deduplicates_archived_gaps():
+    """When archived_gaps holds duplicates (same id, persisted by append-without-
+    dedup), gc_problem_model collapses them, keeping the newest by timestamp,
+    and records the heal in the summary."""
+    archived = [
+        Gap(
+            id="g-dup",
+            name="old copy",
+            status="closed",
+            closed="2026-01-01T00:00:00",
+        ),
+        Gap(
+            id="g-dup",
+            name="newer copy",
+            status="closed",
+            closed="2026-01-02T00:00:00",
+        ),
+        Gap(
+            id="g-dup",
+            name="oldest copy",
+            status="closed",
+            closed="2025-12-31T00:00:00",
+        ),
+        Gap(id="g-unique", name="solo", status="closed", closed="2026-01-03T00:00:00"),
+    ]
+    model = ProblemModel(archived_gaps=archived)
+
+    summary = gc_problem_model(model)
+
+    # 2 duplicates collapsed, 1 healed
+    assert summary["archived_gaps_deduplicated"] == 2
+    # Kept only 2 unique ids
+    assert len(model.archived_gaps) == 2
+    kept_ids = {g.id for g in model.archived_gaps}
+    assert kept_ids == {"g-dup", "g-unique"}
+    # The kept duplicate is the newest one
+    kept_dup = next(g for g in model.archived_gaps if g.id == "g-dup")
+    assert kept_dup.closed == "2026-01-02T00:00:00"
+    assert kept_dup.name == "newer copy"
+
+
 def test_apply_agent_update_caps_archived_gaps():
     """A model accumulating archived gaps past the cap is structurally bounded
     on write-back, regardless of whether the agent pruned — the oldest roll

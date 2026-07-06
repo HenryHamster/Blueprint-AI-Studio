@@ -925,6 +925,28 @@ def reconcile_gap_staffing_raw_result(
     }
 
 
+def _deduplicate_archived_gaps(gaps: list[Gap]) -> tuple[list[Gap], int]:
+    """Collapse duplicate gap IDs in the archive, keeping the newest version.
+
+    Returns (deduplicated_list, collapsed_count). Keeps the version with the
+    most recent closed or opened timestamp for each gap id.
+    """
+    seen: dict[str, Gap] = {}
+    for gap in gaps:
+        gap_id = gap.id
+        if gap_id not in seen:
+            seen[gap_id] = gap
+        else:
+            # Keep the gap with the more recent timestamp.
+            existing_time = seen[gap_id].closed or seen[gap_id].opened or ""
+            new_time = gap.closed or gap.opened or ""
+            if new_time > existing_time:
+                seen[gap_id] = gap
+    deduplicated = list(seen.values())
+    collapsed_count = len(gaps) - len(deduplicated)
+    return deduplicated, collapsed_count
+
+
 def _archived_gap_recency_key(gap: Gap) -> str:
     """Sort key for archived-gap eviction — most recent first when sorted
     descending. Prefers ``closed`` (when it was archived), falling back to
@@ -1123,14 +1145,21 @@ def gc_problem_model(model: ProblemModel) -> dict[str, Any]:
     abandoned) — so oldest-first eviction of any of these is safe.
 
     Returns a dict like ``{"archived_gaps_evicted": ["g-x"],
-    "rejected_agent_edits_trimmed": 2, "friction_evicted": ["f-y"]}`` recording
-    what rolled off, suitable for folding into the revision-log diff.
+    "rejected_agent_edits_trimmed": 2, "friction_evicted": ["f-y"],
+    "archived_gaps_deduplicated": 5}`` recording what rolled off, suitable for
+    folding into the revision-log diff.
     """
     summary: dict[str, Any] = {}
     evicted_ids: list[str] = []
     active_gap_tails_trimmed: list[dict[str, Any]] = []
     capabilities_evicted: list[str] = []
     friction_evicted: list[str] = []
+
+    # Deduplicate archived gaps before eviction — collapse duplicates, keep newest.
+    dedup_gaps, dedup_count = _deduplicate_archived_gaps(model.archived_gaps)
+    if dedup_count > 0:
+        model.archived_gaps = dedup_gaps
+        summary["archived_gaps_deduplicated"] = dedup_count
 
     if len(model.archived_gaps) > ARCHIVED_GAPS_DURABLE_MAX:
         # Stable sort newest-last by recency, then keep the most-recent N.
