@@ -8,6 +8,7 @@ from datetime import timedelta
 from app.direction_metrics import (
     _entry_generalized_successes,
     _entry_generalized_terminal_outcomes,
+    canonical_cost_per_merged_pr,
 )
 from app.direction_outcomes import verified_merged_count
 from app.time_utils import _utcnow
@@ -321,12 +322,6 @@ def _build_outcome_evaluation(
         # outcome["merged"], difficulty, and the downstream selection trims.
         raw_merged = sum(h.get("prs_merged", 0) for h in window_history)
         verified_merged = sum(verified_merged_count(h) for h in window_history)
-        # For CPM, count only autonomous merges; legacy entries without the field
-        # are treated as all-autonomous (conservative fallback for old data).
-        autonomous_merged = sum(
-            h.get("autonomous_prs_merged", h.get("prs_merged", 0))
-            for h in window_history
-        )
         rejected = sum(h.get("prs_rejected", 0) for h in window_history)
         failed = sum(h.get("tasks_failed", 0) for h in window_history)
         failed_infra = sum(h.get("tasks_failed_infra", 0) for h in window_history)
@@ -419,10 +414,9 @@ def _build_outcome_evaluation(
         cost_budget_usd = d.get("cost_budget_usd")
         if estimated_cost_usd > 0:
             outcome["estimated_cost_usd"] = estimated_cost_usd
-            if autonomous_merged > 0:
-                outcome["cost_per_merged_pr"] = round(
-                    estimated_cost_usd / autonomous_merged, 2
-                )
+            cpm = canonical_cost_per_merged_pr(estimated_cost_usd, raw_merged)
+            if cpm is not None:
+                outcome["cost_per_merged_pr"] = cpm
         if isinstance(cost_budget_usd, (int, float)) and cost_budget_usd > 0:
             outcome["cost_budget_usd"] = cost_budget_usd
             if estimated_cost_usd > cost_budget_usd:

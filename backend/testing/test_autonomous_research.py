@@ -7864,15 +7864,20 @@ async def test_stage_dropout_breakdown(db_session):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# _opened_pr type-awareness — review/fix tasks must NOT be misclassified
+# tasks_completed_no_pr type-awareness — review/fix/panel_review children that
+# are ATTACHED to a real (open) PR are NOT genuine no-CODE no-ops.  They carry a
+# pr_number (context/payload) even without a PULL_REQUEST artifact of their own,
+# so they must be EXCLUDED from the no-op bucket.  (This is the no-op gate; the
+# separate _opened_pr type-skip for the merge-VOLUME metrics is unchanged.)
 # ─────────────────────────────────────────────────────────────────────────────
 
 
 @pytest.mark.asyncio
 async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
     """A completed review task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr, not as having opened a PR.
-    ReviewPayload.pr_number is the PR under review, not one opened by the task.
+    is ATTACHED to a real (open) PR, so it must NOT be counted as a no-CODE no-op.
+    ReviewPayload.pr_number is the PR under review — a real PR association that
+    disqualifies the child from tasks_completed_no_pr.
     """
     direction_id = "d-openedpr001"
     direction = _active_direction(direction_id, "Opened-PR classification test")
@@ -7933,9 +7938,10 @@ async def test_review_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # review task with pr_number but no artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Review task with pr_number but no PULL_REQUEST artifact should count as "
+    # review task attached to an open PR (pr_number in payload) → NOT a no-CODE
+    # no-op, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Review task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )
@@ -8023,8 +8029,9 @@ async def test_create_task_with_pr_artifact_does_not_count_as_no_pr(db_session):
 @pytest.mark.asyncio
 async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     """A completed fix task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr.
-    Fix tasks iterate an existing PR rather than opening a new one.
+    pushed code onto an existing open PR, so it must NOT be counted as a no-CODE
+    no-op. Fix tasks iterate an existing PR — a real PR association that
+    disqualifies the child from tasks_completed_no_pr even without its own artifact.
     """
     direction_id = "d-openedpr003"
     direction = _active_direction(direction_id, "Fix-task PR classification")
@@ -8084,9 +8091,10 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # fix task with pr_number but no PULL_REQUEST artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Fix task with pr_number but no PULL_REQUEST artifact should count as "
+    # fix task attached to an open PR (pr_number in payload) → churned code onto
+    # a real PR, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Fix task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )
@@ -8094,9 +8102,10 @@ async def test_fix_task_with_pr_number_counts_as_no_pr(db_session):
 
 @pytest.mark.asyncio
 async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
-    """A completed panel_review task with pr_number in payload and no PULL_REQUEST artifact
-    must be counted as tasks_completed_no_pr, not as having opened a PR.
-    PanelReviewPayload.pr_number is the PR under review (input), not one opened by the task.
+    """A completed panel_review task with pr_number in payload and no PULL_REQUEST
+    artifact is ATTACHED to a real (open) PR, so it must NOT be counted as a
+    no-CODE no-op. PanelReviewPayload.pr_number is the PR under review (input) —
+    a real PR association that disqualifies the child from tasks_completed_no_pr.
     """
     direction_id = "d-openedpr004"
     direction = _active_direction(direction_id, "Panel-review PR classification")
@@ -8156,9 +8165,10 @@ async def test_panel_review_task_with_pr_number_counts_as_no_pr(db_session):
     d = next(x for x in dirs if x.get("id") == direction_id)
     entry = d["research_history"][0]
 
-    # panel_review task with pr_number but no PULL_REQUEST artifact → no-PR completion
-    assert entry.get("tasks_completed_no_pr") == 1, (
-        f"Panel_review task with pr_number but no PULL_REQUEST artifact should count as "
+    # panel_review task attached to an open PR (pr_number in payload) → NOT a
+    # no-CODE no-op, so it is excluded from tasks_completed_no_pr.
+    assert entry.get("tasks_completed_no_pr") == 0, (
+        f"Panel_review task attached to a real PR (pr_number in payload) should NOT count as "
         f"tasks_completed_no_pr; got tasks_completed_no_pr={entry.get('tasks_completed_no_pr')}, "
         f"entry={entry}"
     )

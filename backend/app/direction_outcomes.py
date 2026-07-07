@@ -1376,6 +1376,33 @@ async def _update_direction_research_outcomes(
             return True
         return bool((ct.first_payload or {}).get("pr_number"))
 
+    def _associated_with_pr(ct: Task) -> bool:
+        """True when *ct* is associated with a real PR — for the no-op gate ONLY.
+
+        Unlike ``_opened_pr``, this predicate does NOT skip the pr_number
+        signals for 'review', 'fix', and 'panel_review' types.  For the
+        no-CODE-no-op question, ANY association with a real pull request
+        disqualifies the child: a fix task that pushed code onto an existing
+        open (not-yet-landed) PR carries ``context['review_loop']['pr_number']``
+        (and often ``context['pr_number']``) but no PULL_REQUEST artifact of
+        its own, so ``_opened_pr`` returns False — yet it emphatically churned
+        code and is NOT a "work already exists" no-op.
+
+        Do NOT reuse this for the merge-VOLUME metrics (``merged_prs_any_base``
+        and others): there the fix/review/panel_review pr_number skip in
+        ``_opened_pr`` is correct (a review's pr_number is the PR under review,
+        not a merge that task produced).
+        """
+        if _opened_pr(ct):
+            return True
+        ctx_ = ct.context or {}
+        review_loop = ctx_.get("review_loop")
+        if isinstance(review_loop, dict) and review_loop.get("pr_number"):
+            return True
+        if ctx_.get("pr_number") or ctx_.get("rollup_pr_number"):
+            return True
+        return bool((ct.first_payload or {}).get("pr_number"))
+
     # Per-(provider, model) cost rollup using the shared pair-atomic helper so
     # both this path and the digest path stay consistent and cannot produce
     # chimera keys (e.g. openai|claude-opus-4-8 from independently-resolved
@@ -1442,20 +1469,28 @@ async def _update_direction_research_outcomes(
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED and (ct.context or {}).get("pr_rejected")
     )
-    # tasks_completed_no_pr: children that COMPLETED correctly without ever
-    # opening a PR — "no changes needed / work already exists" outcomes. These
-    # are a healthy result, NOT churn, so a downstream zero-merge/churn guard
-    # must be able to subtract them from the completed-but-unmerged population.
-    # Excludes merged completions (is_merged_completion) and pr_rejected ones so
-    # only genuine no-PR completions are counted; ``_opened_pr`` gates on the
-    # canonical PULL_REQUEST artifact (plus pr_number fallbacks).
+    # tasks_completed_no_pr: children that COMPLETED correctly without producing
+    # any code toward ANY pull request — genuine "no changes needed / work
+    # already exists" no-CODE no-ops. These are a healthy result, NOT churn, so
+    # a downstream zero-merge/churn guard must be able to subtract them from the
+    # completed-but-unmerged population.
+    #
+    # Excludes merged completions (is_merged_completion) and pr_rejected ones,
+    # AND — via ``_associated_with_pr`` rather than ``_opened_pr`` — any
+    # fix/review/panel_review child attached to an open (unmerged) PR.  A fix
+    # task that pushed code onto an existing open PR carries a pr_number in
+    # context/review_loop but no PULL_REQUEST artifact of its own, so
+    # ``_opened_pr`` returns False for it; counting it here would wrongly treat
+    # churned code as a no-op and under-report churn.  ``_associated_with_pr``
+    # closes that gap so the count is genuine no-CODE no-ops, not merely "did
+    # not open a NEW PR".
     entry["tasks_completed_no_pr"] = sum(
         1
         for ct in child_tasks_rows
         if ct.status == TaskStatus.COMPLETED
         and not is_merged_completion(ct)
         and not (ct.context or {}).get("pr_rejected")
-        and not _opened_pr(ct)
+        and not _associated_with_pr(ct)
     )
     _merged_rows = [ct for ct in child_tasks_rows if is_merged_completion(ct)]
     entry["autonomous_prs_merged"] = sum(

@@ -1187,9 +1187,9 @@ def test_cost_estimate_per_direction_and_overall():
     cheap_cost = round(4 * 1.0 * 3600 * ON_DEMAND_RATE, 2)
     pricey_cost = round(5 * 4.0 * 3600 * ON_DEMAND_RATE, 2)
     assert by_id["dir-cheap"]["estimated_cost_usd"] == cheap_cost
-    assert by_id["dir-cheap"]["cost_per_merged_pr"] == round(cheap_cost / 4, 2)
+    assert by_id["dir-cheap"]["cost_per_merged_pr"] == round(cheap_cost / 4, 4)
     assert by_id["dir-pricey"]["estimated_cost_usd"] == pricey_cost
-    assert by_id["dir-pricey"]["cost_per_merged_pr"] == round(pricey_cost / 1, 2)
+    assert by_id["dir-pricey"]["cost_per_merged_pr"] == round(pricey_cost / 1, 4)
 
     overall = result["overall"]
     assert overall["estimated_cost_usd"] == round(cheap_cost + pricey_cost, 2)
@@ -2142,10 +2142,21 @@ def test_evidence_absent_when_no_recent_findings_evidence():
 
 
 class TestAutonomousCPM:
-    """cost_per_merged_pr uses autonomous_prs_merged as denominator."""
+    """cost_per_merged_pr uses the FULL merged population (autonomous + assisted) as denominator.
 
-    def test_cpm_absent_when_all_assisted_merges(self):
-        """CPM is None when autonomous_prs_merged == 0 even if prs_merged > 0."""
+    The numerator (total_cost) covers ALL work on a direction. To keep
+    numerator/denominator population-consistent, the denominator must also cover
+    ALL merged PRs — including operator-assisted ones — so a direction is not
+    penalised for accepting operator help.
+    """
+
+    def test_cpm_present_when_all_assisted_merges(self):
+        """CPM uses total merged (autonomous + assisted), so prs_merged=3 gives CPM=cost/3."""
+        from app.routers.admin_analytics import ON_DEMAND_RATE
+
+        tasks = 3
+        hours = 2.0
+        expected_cost = round(tasks * hours * 3600 * ON_DEMAND_RATE, 2)
         directions = [
             {
                 "id": "dir-1",
@@ -2156,8 +2167,8 @@ class TestAutonomousCPM:
                         "prs_merged": 3,
                         "autonomous_prs_merged": 0,
                         "assisted_prs_merged": 3,
-                        "tasks_created": 3,
-                        "avg_time_to_merge_hours": 2.0,
+                        "tasks_created": tasks,
+                        "avg_time_to_merge_hours": hours,
                     }
                 ],
             }
@@ -2165,7 +2176,8 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert "cost_per_merged_pr" not in d
+        # total merged = 3 (the full population), not 0 (autonomous only)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 4)
 
     def test_fully_autonomous_cpm_equals_legacy_cpm(self):
         """Fully-autonomous direction: CPM with autonomous_prs_merged == CPM with prs_merged."""
@@ -2196,8 +2208,8 @@ class TestAutonomousCPM:
         ][0]
         assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
 
-    def test_legacy_entry_without_autonomous_field_uses_prs_merged_fallback(self):
-        """Legacy entries lacking autonomous_prs_merged default to prs_merged (all-autonomous)."""
+    def test_legacy_entry_without_autonomous_field_uses_prs_merged(self):
+        """Legacy entries lacking autonomous_prs_merged use prs_merged as the total merged count."""
         from app.routers.admin_analytics import ON_DEMAND_RATE
 
         prs = 2
@@ -2222,10 +2234,16 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 2)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / prs, 4)
 
-    def test_mixed_attribution_cpm_uses_autonomous_count(self):
-        """CPM denominator is autonomous count, not total merged."""
+    def test_mixed_attribution_cpm_uses_total_merged_count(self):
+        """CPM denominator is the FULL merged count (autonomous + assisted), not autonomous-only.
+
+        Population-consistency: the numerator (total_cost) covers all direction work;
+        the denominator must cover the same population — all merged PRs. Using
+        autonomous-only (3) instead of total (5) would inflate CPM and penalise
+        directions that accepted operator help.
+        """
         from app.routers.admin_analytics import ON_DEMAND_RATE
 
         tasks = 5
@@ -2250,7 +2268,8 @@ class TestAutonomousCPM:
         d = _build_outcome_evaluation(_make_project(directions=directions))[
             "directions"
         ][0]
-        assert d.get("cost_per_merged_pr") == round(expected_cost / 3, 2)
+        # canonical: total merged = 5 (not autonomous-only = 3)
+        assert d.get("cost_per_merged_pr") == round(expected_cost / 5, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -3029,7 +3048,7 @@ def test_cost_uses_recorded_spend_over_proxy():
     result = _build_outcome_evaluation(_make_project(directions=directions))
     d = result["directions"][0]
     assert d["estimated_cost_usd"] == 7.77
-    assert d["cost_per_merged_pr"] == round(7.77 / 2, 2)
+    assert d["cost_per_merged_pr"] == round(7.77 / 2, 4)
 
 
 def test_cost_sums_recorded_and_proxy_entries():

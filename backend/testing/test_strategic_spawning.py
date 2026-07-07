@@ -2355,7 +2355,7 @@ async def test_cost_fields_present_when_history_has_merge_data(db_session):
 
     expected_cost = round((4 * 1.5 + 2 * 2.0) * 3600 * ON_DEMAND_RATE, 2)
     assert d_stat["estimated_cost_usd"] == expected_cost
-    assert d_stat["cost_per_merged_pr"] == round(expected_cost / 3, 2)
+    assert d_stat["cost_per_merged_pr"] == round(expected_cost / 3, 4)
 
 
 @pytest.mark.asyncio

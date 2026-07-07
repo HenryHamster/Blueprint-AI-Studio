@@ -906,4 +906,23 @@ def _compute_rolling_median_review_iterations(d: dict) -> float | None:
     return (values[mid - 1] + values[mid]) / 2.0
 
 
+def canonical_cost_per_merged_pr(
+    total_cost: float, total_merged_prs: int
+) -> float | None:
+    """Return cost-per-merged-PR using a population-consistent formula.
+
+    The numerator (total_cost) covers ALL work on a direction — autonomous AND
+    operator-assisted. The denominator MUST cover the same population: ALL
+    merged PRs (autonomous + assisted). Dividing by autonomous-only merges
+    while including assisted costs in the numerator over-states the metric for
+    any direction that accepted operator help, and can trigger spurious
+    retirement flags. This helper is the single source of truth for that
+    population rule so the three compute sites (digest_direction_progress,
+    strategic_analysis, strategic_spawning) can never drift again.
+    """
+    if total_merged_prs <= 0:
+        return None
+    return round(total_cost / total_merged_prs, 4)
+
+
 

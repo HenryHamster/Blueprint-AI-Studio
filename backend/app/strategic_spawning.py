@@ -19,7 +19,10 @@ from sqlalchemy.orm import load_only
 from sqlmodel import select
 
 from app import strategic_cycle
-from app.direction_metrics import _compute_direction_quality_score
+from app.direction_metrics import (
+    _compute_direction_quality_score,
+    canonical_cost_per_merged_pr,
+)
 from app.direction_outcomes import (
     compute_direction_autonomy_state,
     declared_merged_count,
@@ -4848,10 +4851,9 @@ def _build_direction_stats(
         )
         if estimated_cost_usd > 0:
             stat_entry["estimated_cost_usd"] = estimated_cost_usd
-            if total_merged > 0:
-                stat_entry["cost_per_merged_pr"] = round(
-                    estimated_cost_usd / total_merged, 2
-                )
+            cpm = canonical_cost_per_merged_pr(estimated_cost_usd, total_merged)
+            if cpm is not None:
+                stat_entry["cost_per_merged_pr"] = cpm
         ctx = d.get("research_context")
         if ctx:
             stat_entry["research_context"] = ctx[:3000]
