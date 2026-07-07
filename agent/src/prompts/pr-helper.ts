@@ -339,6 +339,12 @@ fi
 API="\${ORCHESTRATOR_URL:?ORCHESTRATOR_URL not set}"
 _load_agent_token
 TASK="${cfg.taskId}"
+# _load_github_token's backend fallback reads $TASK_ID (the standard VM env var,
+# baked into /etc/agent.env by the orchestrator startup script). Set it from the
+# build-time task id so the fallback works even when the ambient shell env does
+# not carry TASK_ID — the script already knows its own task id, so it must not
+# depend on an external env var to fetch the push token.
+TASK_ID="${cfg.taskId}"
 
 # 3. Refresh GitHub token + remote URL right before push. _load_github_token
 #    prefers the live token file (kept fresh by the Node agent at ~45min

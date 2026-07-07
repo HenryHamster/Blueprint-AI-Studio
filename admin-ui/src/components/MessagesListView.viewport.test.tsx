@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from 'vitest';
+import { afterEach, describe, expect, test, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act, createRef } from 'react';
 import { MessagesListView, type MessagesListViewProps, buildTriageItems, type BuildParams } from './MessagesListView';
@@ -142,17 +142,20 @@ describe('MessagesListView — viewport regression', () => {
 
   test('scroll-to-bottom button appears when showScrollDown=true in triage mode', async () => {
     const msg = makeMsg({ id: 'n1', message_type: 'NOTE', content: 'test message' });
-    let button: HTMLButtonElement | null = null;
-    await act(async () => {
-      await renderView(baseProps({
-        presentation: 'triage',
-        messages: [msg],
-        otherHighSignal: [msg],
-        showScrollDown: true,
-      }));
-      button = host?.querySelector('button[aria-label="Scroll to latest message"]') as HTMLButtonElement | null;
+    await renderView(baseProps({
+      presentation: 'triage',
+      messages: [msg],
+      otherHighSignal: [msg],
+      showScrollDown: true,
+    }));
+    // The triage rows render message content through MarkdownContent, which is
+    // code-split via React.lazy (PR #13146). On first paint that lazy chunk
+    // suspends, so the surrounding update — including the scroll-to-bottom
+    // control that sits beside the virtualized list — has not committed yet.
+    // Poll until the render settles rather than asserting mid-suspense.
+    await vi.waitFor(() => {
+      expect(host?.querySelector('button[aria-label="Scroll to latest message"]')).toBeTruthy();
     });
-    expect(button).toBeTruthy();
   });
 
   test('mute_active_banner renders in collapsed routine without breaking layout', async () => {

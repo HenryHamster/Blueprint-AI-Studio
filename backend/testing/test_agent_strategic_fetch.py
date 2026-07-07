@@ -5630,7 +5630,17 @@ async def test_get_task_children_include_pr_url_for_completed_child(
 
 @pytest.mark.asyncio
 async def test_list_tasks_includes_children_inline(client: AsyncClient, db_session):
-    """GET /tasks list response: each item has a children key; parent with one child shows it."""
+    """GET /tasks list response: the strategist root exposes its direct child
+    inline via `children`.
+
+    Per the documented descendant-visibility contract (#13074; see the `tasks`
+    help text in agent strategic-helpers), the list is FLAT — it surfaces the
+    strategist root AND its transitive descendants as top-level items, each
+    carrying parent_task_id, and each item ALSO exposes its direct pipeline
+    subtasks inline via `children`. So a root + one child yields two items: the
+    root item carries the child inline, and the child is independently visible
+    as a top-level item mapping back to its parent.
+    """
     project = Project(name="Children List", user_id="u-cl")
     db_session.add(project)
     await db_session.commit()
@@ -5653,12 +5663,19 @@ async def test_list_tasks_includes_children_inline(client: AsyncClient, db_sessi
     )
     assert res.status_code == 200, res.text
     items = res.json()["data"]
-    assert len(items) == 1
-    item = items[0]
-    assert "children" in item
-    assert len(item["children"]) == 1
-    assert item["children"][0]["id"] == str(child.id)
-    assert item["children"][0]["title"] == "List child"
+    by_id = {it["id"]: it for it in items}
+    # The root strategist task carries its direct child inline via `children`.
+    assert str(parent.id) in by_id
+    parent_item = by_id[str(parent.id)]
+    assert "children" in parent_item
+    assert len(parent_item["children"]) == 1
+    assert parent_item["children"][0]["id"] == str(child.id)
+    assert parent_item["children"][0]["title"] == "List child"
+    # The child is also visible as a top-level item mapping back to its parent
+    # (flat descendant visibility — #13074), so agents can map failing
+    # descendants back to the spawned task without walking the nested tree.
+    assert str(child.id) in by_id
+    assert by_id[str(child.id)]["parent_task_id"] == str(parent.id)
 
 
 @pytest.mark.asyncio

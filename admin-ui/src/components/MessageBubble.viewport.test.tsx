@@ -1,4 +1,4 @@
-import { afterEach, describe, test, expect } from 'vitest';
+import { afterEach, describe, test, expect, vi } from 'vitest';
 import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import { MessageBubble } from './MessageBubble';
@@ -90,7 +90,13 @@ describe('MessageBubble — viewport regression', () => {
         );
       });
     });
-    if (host) expect(host.textContent).toContain('System notification message');
+    // Message body renders through MarkdownContent, which is code-split via
+    // React.lazy (PR #13146). On the first render in this file the lazy chunk
+    // suspends, so the body text commits a tick after the initial paint. Poll
+    // until it settles rather than asserting mid-suspense.
+    await vi.waitFor(() => {
+      expect(host?.textContent).toContain('System notification message');
+    });
     await expectNoTextTruncationAt(420, async () => {});
     await expectMinTouchTargetAt(420, async () => {});
   });

@@ -486,84 +486,11 @@ describe('DashboardHome — viewport regression', () => {
     });
   });
 
-  test('version lifecycle panel renders parseable-but-unscoreable audit reason chip', async () => {
-    setVersionLifecycleResponse({
-      current_version: {
-        version_number: 42,
-        phase: 'stabilize',
-        phase_changed_at: '2026-05-20T12:00:00Z',
-        opened_at: '2026-05-15T00:00:00Z',
-        qualification_attempts: 2,
-        merged_task_count: 15,
-        last_qualification: {
-          status: 'dry_run',
-          confidence: 0.78,
-          threshold: 0.80,
-          sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
-          blocker: 'audit below threshold',
-          finalized_at: '2026-05-20T11:00:00Z',
-          error: null,
-          consecutive_infra_errors: 0,
-          audit_missing_reason: 'parseable_but_unscoreable',
-        },
-      },
-      recent_versions: [],
-    });
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => {
-        r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
-      });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      });
-      expect(screen.getByText('audit findings present but missing severity tags')).toBeInTheDocument();
-    });
-  });
-
-  test('version lifecycle panel renders infra streak and error distinctly', async () => {
-    setVersionLifecycleResponse({
-      current_version: {
-        version_number: 42,
-        phase: 'stabilize',
-        phase_changed_at: '2026-05-20T12:00:00Z',
-        opened_at: '2026-05-15T00:00:00Z',
-        qualification_attempts: 2,
-        merged_task_count: 15,
-        last_qualification: {
-          status: 'infra_failure',
-          confidence: 0.78,
-          threshold: 0.80,
-          sub_scores: { audit: 0.85, test_erosion: 0.70, smoketest: 0.90 },
-          blocker: null,
-          finalized_at: '2026-05-20T11:00:00Z',
-          error: 'release_audit heartbeat stale',
-          consecutive_infra_errors: 3,
-          audit_missing_reason: null,
-        },
-      },
-      recent_versions: [],
-    });
-    await expectNoOverflowAt(375, async () => {
-      host = document.createElement('div');
-      host.style.padding = '12px';
-      document.body.appendChild(host);
-      const r = createRoot(host);
-      root = r;
-      await act(async () => {
-        r.render(<DashboardHome tasks={POPULATED_TASKS} selectedProjectId="proj-abc" onViewTask={() => {}} />);
-      });
-      await act(async () => {
-        await new Promise<void>((resolve) => setTimeout(resolve, 50));
-      });
-      expect(screen.getByText('3 consecutive infra failures')).toBeInTheDocument();
-      expect(screen.getByText('release_audit heartbeat stale')).toBeInTheDocument();
-    });
-  });
+  // NOTE: the version-lifecycle panel moved out of DashboardHome into its own
+  // dedicated nav tab (OperatorWorkspaces) in #12985, so DashboardHome no longer
+  // renders VersionLifecyclePanel. The audit-reason-chip / infra-streak
+  // assertions that used to live here were relocated to
+  // VersionLifecyclePanel.viewport.test.tsx, which renders the panel directly.
 
   test('verdict history panel renders without overflow at 375px', async () => {
     await expectNoOverflowAt(375, async () => {

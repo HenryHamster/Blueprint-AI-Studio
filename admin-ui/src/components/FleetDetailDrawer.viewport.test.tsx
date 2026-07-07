@@ -41,6 +41,7 @@ vi.mock('../api', () => ({
   listFleetRunners: vi.fn(async () => []),
   registerFleetRunner: vi.fn(async () => ({})),
   revokeFleetRunner: vi.fn(async () => ({})),
+  rotateFleetRunnerToken: vi.fn(async () => ({ runner_id: 'runner-abc123', token: 'tok-rotated' })),
   API_BASE_URL: 'http://localhost:8000',
 }));
 
