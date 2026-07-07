@@ -2802,7 +2802,7 @@ class OrchestratorErrorAck(SQLModel, table=True):
 # Maximum stored length for operator/user-authored message content and
 # resolution notes. Shared by the admin-notifications and project-directions
 # message endpoints so their over-limit rejection cannot drift apart.
-MESSAGE_CONTENT_MAX = 5000
+MESSAGE_CONTENT_MAX = 20000
 
 
 class DigestCacheEntry(SQLModel, table=True):

@@ -4,6 +4,7 @@ export function createApiMock(overrides: Record<string, unknown> = {}) {
   return {
     API_BASE_URL: '',
     COST_PER_VM_HR: 0.067,
+    MESSAGE_CONTENT_MAX: 20000,
     authHeaders: vi.fn(),
     authGet: vi.fn(),
     apiFetch: vi.fn(),

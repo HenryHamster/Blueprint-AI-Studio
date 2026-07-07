@@ -18,6 +18,9 @@ export const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 /** Hourly cost in USD for a standard e2-standard-2 GCP VM on-demand pricing. Used to calculate task cost estimates. */
 export const COST_PER_VM_HR = 0.067;
 
+/** Maximum character count for operator/user-authored strategic chat messages. Must match MESSAGE_CONTENT_MAX in backend/app/models.py. */
+export const MESSAGE_CONTENT_MAX = 20000;
+
 /**
  * Generate Firebase authentication headers for API requests.
  * @returns Promise resolving to headers object with Authorization (Bearer token) and Content-Type
