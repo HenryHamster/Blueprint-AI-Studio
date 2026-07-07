@@ -170,6 +170,7 @@ def test_registry_contains_initial_checks():
         "first_attempt_rate_denominator_coverage",
         "sr_catch_rate_cache_freshness",
         "acceptance_window_sub_scores_invariant",
+        "evidence_claim_reconciliation",
     } <= names
 
 
@@ -2354,3 +2355,184 @@ async def test_acceptance_window_sub_scores_invariant_skips_no_open_versions(db)
     assert len(results) == 1
     assert results[0].status == CheckStatus.SKIPPED
     assert results[0].subject == "global"
+
+
+# --- evidence_claim_reconciliation ------------------------------------------
+
+
+async def _project_with_gap_evidence_ref(
+    db, *, ref, proven=True, kind="named_test", status="active"
+) -> Project:
+    """A project whose problem_model has one active gap carrying one evidence_ref."""
+    pm = {
+        "gaps": [
+            {
+                "id": "g-ev-1",
+                "name": "evidence gap",
+                "status": status,
+                "evidence_refs": [{"kind": kind, "ref": ref, "proven": proven}],
+            }
+        ]
+    }
+    p = Project(name="mi-ev", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+def _ev_ctx(db) -> SweepContext:
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_flags_stale_gap_evidence(db, monkeypatch):
+    """A proven, path-backed evidence_ref whose file is REMOVED at HEAD (the path
+    helper returns a definite False) flags the gap on the observability surface —
+    WITHOUT mutating the durable gap — while an indeterminate (None) result does
+    not (companion assertion below)."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py"
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # path definitely removed at HEAD → proof contradicted
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    # Run in observe mode via the full sweep so we exercise the observability
+    # surface (recent_flags), not just the check function in isolation.
+    _rc["metrics_integrity_sweep_mode"] = "observe"
+    tick = await run_metrics_integrity_sweep(db, now=_utcnow())
+    assert tick is not None
+
+    snap = get_metrics_integrity_observability()
+    ev_flags = [
+        f
+        for f in snap["recent_flags"]
+        if f["check"] == "evidence_claim_reconciliation"
+    ]
+    assert len(ev_flags) == 1, snap["recent_flags"]
+    flag = ev_flags[0]
+    assert flag["subject"] == str(project.id)
+    assert flag["self_reported"] == 1  # one proven path-backed ref
+    assert flag["ground_truth"] == 0  # none still present at HEAD
+    assert flag["delta"] == 1
+    assert "removed at HEAD" in flag["detail"]
+
+    # Observe mode is side-effect-free: durable gap untouched, nothing enrolled.
+    await db.refresh(project)
+    gap = project.problem_model["gaps"][0]
+    assert gap["evidence_refs"][0]["proven"] is True
+    assert gap["status"] == "active"
+    enrolled = (await db.execute(select(EvergreenBacklogItem))).scalars().all()
+    assert enrolled == []
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_indeterminate_not_flagged(db, monkeypatch):
+    """CRITICAL HONESTY RULE: a None (git/API indeterminate) path check must NEVER
+    be laundered into 'removed' — the gap is not flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(db, ref="backend/testing/test_foo.py")
+
+    async def _indeterminate(path, *args, **kwargs):
+        return None  # no checkout / timeout / rate limit — indeterminate
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _indeterminate)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok, results
+    # Proven ref still counts as present ground truth (never laundered to stale).
+    assert ok[0].ground_truth == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_ok_when_ref_present(db, monkeypatch):
+    """A proven ref whose backing file still exists (True) reconciles OK."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(db, ref="backend/testing/test_foo.py")
+
+    async def _present(path, *args, **kwargs):
+        return True
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results)
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok and ok[0].self_reported == 1 and ok[0].ground_truth == 1
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_never_mutates_durable_gap(db, monkeypatch):
+    """The flag-only guarantee: even the check function in isolation performs
+    zero writes to the durable problem_model gap."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py"
+    )
+    before = project.problem_model["gaps"][0]["evidence_refs"][0].copy()
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+
+    await db.refresh(project)
+    after = project.problem_model["gaps"][0]["evidence_refs"][0]
+    assert after == before  # ref, proven flag, kind all untouched
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_closed_gap_unproven_flagged(db, monkeypatch):
+    """A gap that CLAIMS closure but carries only unproven evidence is a
+    'closed but unproven' contradiction — flagged even with no path removal."""
+    import app.source_ref_validation as srv
+
+    await _project_with_gap_evidence_ref(
+        db, ref="backend/testing/test_foo.py", proven=False, status="closed"
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True  # nothing removed — the flag comes from the claim contradiction
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    assert "claims closed" in flagged[0].detail
+
+
+@pytest.mark.asyncio
+async def test_evidence_claim_reconciliation_skips_gaps_without_refs(db):
+    """A gap carrying no structured evidence_refs is skipped (nothing to
+    reconcile) — no flag, no error."""
+    pm = {"gaps": [{"id": "g-1", "name": "plain gap", "status": "active"}]}
+    p = Project(name="mi-ev-none", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+
+    results = await mis.check_evidence_claim_reconciliation(_ev_ctx(db))
+    assert all(not r.flagged for r in results)
+    assert any(
+        r.status == CheckStatus.SKIPPED and "no gaps carry" in r.detail
+        for r in results
+    )

@@ -1807,6 +1807,7 @@ def compute_panel_review_effectiveness(
         _task_llm_cost(t)[0]
         for t in tasks
         if (t.first_payload or {}).get("type") == "panel_review"
+        and (since_dt is None or t.updated_at is None or t.updated_at >= since_dt)
     )
     cost_per_challenge = round(panel_review_llm_cost / total, 4) if total > 0 else None
 

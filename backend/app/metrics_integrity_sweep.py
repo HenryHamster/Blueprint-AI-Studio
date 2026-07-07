@@ -48,7 +48,11 @@ verified > merged or proven > declared), ``first_attempt_rate_denominator_covera
 ``_first_attempt_succeeded`` so the FA-rate denominator is representative), and
 ``sr_catch_rate_cache_freshness`` (checks that each project's persisted
 ``sr_catch_rate_trends`` cache is within the staleness window so operators see
-up-to-date catch-rate trends).
+up-to-date catch-rate trends), and ``evidence_claim_reconciliation``
+(re-verifies structured gap ``evidence_refs`` against HEAD via the tri-state
+path helper and flags gaps whose path-backed proven evidence was definitely
+removed — contradicted — or whose evidence is absent while the gap claims
+closure; an indeterminate (None) check NEVER flags).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -2288,4 +2292,192 @@ async def check_sr_catch_rate_cache_freshness(
                     ),
                 )
             )
+    return results
+
+
+@register_check(
+    "evidence_claim_reconciliation",
+    "Re-verify structured gap evidence_refs against HEAD and flag active gaps "
+    "whose path-backed proven evidence was definitely removed (contradicted), or "
+    "whose evidence is absent while the gap claims closure. An indeterminate "
+    "(None) path check NEVER flags — only a definite removal counts as stale.",
+)
+async def check_evidence_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a gap that carries a ``proven`` structured evidence ref
+    pointing at a file/test path (``named_test`` / ``backing_path``, or any ref
+    whose ``ref`` is a repo file path) only remains proven while that path still
+    exists at HEAD. When the backing file was removed the proof is void — the
+    evidence is *contradicted* even though the stored ``proven`` flag still reads
+    True. This standing check re-verifies each path-backed proven ref via the
+    same tri-state helper the capability backing-path verifier uses
+    (:func:`app.source_ref_validation._path_exists_at_head`) and flags gaps whose
+    proof no longer holds.
+
+    CRITICAL HONESTY RULE: the path helper returns True / False / None. Only a
+    definite ``False`` (path removed at HEAD) counts as stale/contradicted. A
+    ``None`` (no checkout, git error, timeout, rate limit) degrades to
+    ``unverified`` and is NEVER flagged — an indeterminate check must not be
+    laundered into "removed".
+
+    Flag-only and side-effect-free in every mode: it reads ``problem_model``
+    JSONB directly and only constructs :class:`CheckResult` values — it NEVER
+    mutates the durable gap. In ``observe`` mode the sweep records to the bounded
+    observability ring only; enforce-mode enrollment flows through the standard
+    :func:`_enroll_flag_finding` path. Bounded to ``ctx.max_projects`` projects.
+    """
+    from app import source_ref_validation as _srv
+    from app.evidence_primitive import (
+        PATH_BACKED_KINDS,
+        claim_contradicts_evidence,
+        classify_evidence,
+    )
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="evidence_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    def _is_path_backed_ref(kind: Any, ref_str: str) -> bool:
+        """Whether ``ref_str`` names a file/test path re-checkable against HEAD."""
+        if kind in PATH_BACKED_KINDS:
+            return True
+        # A ref of any other kind is only re-verified when it literally looks
+        # like a repo file path (logical ids — criterion keys, artifact ids —
+        # are not resolvable by a path check and are left untouched).
+        return _srv._looks_like_file_path(ref_str)
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        gaps = pm.get("gaps") if isinstance(pm, dict) else None
+        if not isinstance(gaps, list) or not gaps:
+            continue
+
+        gaps_with_refs = 0
+        flagged_details: List[str] = []
+        total_proven_refs = 0
+        total_stale_refs = 0
+        for gap in gaps:
+            if not isinstance(gap, dict):
+                continue
+            refs = gap.get("evidence_refs")
+            if not isinstance(refs, list) or not refs:
+                continue
+            gaps_with_refs += 1
+
+            # Re-verify each PROVEN, path-backed ref against HEAD. A proven ref
+            # whose file is definitely removed (False) makes the gap's evidence
+            # contradicted; None (indeterminate) is left untouched, never stale.
+            proven_refs = 0
+            stale_refs: List[str] = []
+            for ref in refs:
+                if not isinstance(ref, dict) or ref.get("proven") is not True:
+                    continue
+                ref_str = ref.get("ref")
+                if not isinstance(ref_str, str) or not ref_str:
+                    continue
+                if not _is_path_backed_ref(ref.get("kind"), ref_str):
+                    continue
+                proven_refs += 1
+                exists = await _srv._path_exists_at_head(ref_str)
+                if exists is False:
+                    stale_refs.append(ref_str)
+                # True (present) or None (indeterminate) → not stale.
+
+            # Stored classification, then override to contradicted ONLY on a
+            # definite removal. classify_evidence never returns contradicted on
+            # its own — that verdict requires the ground-truth re-check above.
+            evidence_status = classify_evidence(refs)
+            if stale_refs:
+                evidence_status = "contradicted"
+            total_proven_refs += proven_refs
+            total_stale_refs += len(stale_refs)
+
+            gap_id = gap.get("id", "unknown")
+            gap_status = gap.get("status")
+            # Flag when a proven ref was definitely removed, OR when the gap
+            # claims closure while its evidence fails to back it (unproven /
+            # contradicted). An in-progress ("active"/"blocked") gap with
+            # merely-unproven evidence is expected and never flagged.
+            if stale_refs:
+                flagged_details.append(
+                    f"gap {gap_id}: {len(stale_refs)} proven evidence ref(s) "
+                    f"removed at HEAD (e.g. {stale_refs[0]}) — proof contradicted"
+                )
+            elif claim_contradicts_evidence(gap_status, evidence_status):
+                flagged_details.append(
+                    f"gap {gap_id}: claims {gap_status} but evidence is "
+                    f"{evidence_status}"
+                )
+
+        if gaps_with_refs == 0:
+            # No gap in this project carries structured evidence refs — nothing
+            # to reconcile. Emit a per-project SKIPPED for observability parity.
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no gaps carry structured evidence_refs",
+                )
+            )
+            continue
+
+        any_checked = True
+        if flagged_details:
+            preview = "; ".join(flagged_details[:3])
+            if len(flagged_details) > 3:
+                preview += f" (+{len(flagged_details) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=total_proven_refs,
+                    ground_truth=total_proven_refs - total_stale_refs,
+                    delta=len(flagged_details),
+                    severity="warn",
+                    subject=pid,
+                    detail=preview,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="evidence_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=total_proven_refs,
+                    ground_truth=total_proven_refs,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"{gaps_with_refs} gap(s) with evidence_refs reconciled; "
+                        "all path-backed proven refs still present at HEAD"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="evidence_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no gaps with structured evidence_refs in any project",
+            )
+        ]
     return results

@@ -42,6 +42,7 @@ from app.problem_model import (
     check_gap_id_write,
     classify_gap_link,
     compute_model_size_signal,
+    gap_evidence_status,
     gc_problem_model,
     is_empty,
     normalize_active_moves_writeback,
@@ -210,6 +211,104 @@ def test_old_shape_problem_model_with_capabilities_parses():
     }
     model = parse_problem_model(raw)
     assert all(c.backing_paths == [] for c in model.capabilities)
+
+
+def test_gap_evidence_refs_defaults_empty():
+    """Old-shape gap (no evidence_refs) parses with an empty list, so every
+    stored model and older agent payload remains valid."""
+    gap = Gap(id="g-1", name="a gap")
+    assert gap.evidence_refs == []
+    assert gap.evidence == ""  # narrative field unchanged, still present
+
+
+def test_gap_evidence_refs_round_trip():
+    gap = Gap(
+        id="g-1",
+        name="a gap",
+        evidence="narrative still here",
+        evidence_refs=[
+            {
+                "kind": "named_test",
+                "ref": "backend/testing/test_foo.py",
+                "proven": True,
+            },
+            {"kind": "backing_path", "ref": "backend/app/foo.py", "proven": False},
+        ],
+    )
+    dumped = gap.model_dump()
+    assert dumped["evidence_refs"][0]["kind"] == "named_test"
+    assert dumped["evidence_refs"][0]["proven"] is True
+    assert dumped["evidence"] == "narrative still here"
+    restored = Gap.model_validate(dumped)
+    assert restored.evidence_refs == gap.evidence_refs
+
+
+def test_gap_missing_evidence_refs_back_compat_validates():
+    """A stored gap payload lacking evidence_refs validates (extra='forbid' on
+    the parent, but the field's empty default keeps old payloads valid)."""
+    raw = {
+        "revision": 2,
+        "gaps": [
+            {"id": "g-1", "name": "legacy gap", "status": "active", "evidence": "x"},
+        ],
+    }
+    model = parse_problem_model(raw)
+    assert model.gaps[0].evidence_refs == []
+    # Full round-trip preserves the empty default.
+    restored = parse_problem_model(model.model_dump())
+    assert restored.gaps[0].evidence_refs == []
+
+
+def test_gap_evidence_status_helper():
+    proven = Gap(
+        id="g1",
+        name="p",
+        evidence_refs=[{"kind": "named_test", "ref": "a.py", "proven": True}],
+    )
+    partial = Gap(
+        id="g2",
+        name="q",
+        evidence_refs=[{"kind": "named_test", "ref": "a.py", "proven": False}],
+    )
+    empty = Gap(id="g3", name="r")
+    assert gap_evidence_status(proven) == "proven"
+    assert gap_evidence_status(partial) == "partial"
+    assert gap_evidence_status(empty) == "unproven"
+
+
+def test_apply_agent_update_gap_evidence_refs_proposed_wins():
+    """evidence_refs is a plain proposed-wins field through _merge_gap /
+    apply_agent_update — the agent's list replaces the durable one."""
+    current = {
+        "revision": 1,
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "gap",
+                "status": "active",
+                "evidence_refs": [
+                    {"kind": "named_test", "ref": "old.py", "proven": False}
+                ],
+            }
+        ],
+    }
+    proposed = {
+        "gaps": [
+            {
+                "id": "g-1",
+                "name": "gap",
+                "status": "active",
+                "evidence_refs": [
+                    {"kind": "backing_path", "ref": "new.py", "proven": True}
+                ],
+            }
+        ],
+    }
+    new_raw, _diff = apply_agent_update(current, proposed, "2026-04-21T12:00:00")
+    merged_gap = new_raw["gaps"][0]
+    assert merged_gap["evidence_refs"] == [
+        {"kind": "backing_path", "ref": "new.py", "proven": True}
+    ]
 
 
 def test_apply_agent_update_unaffected_by_backing_paths_only_change():

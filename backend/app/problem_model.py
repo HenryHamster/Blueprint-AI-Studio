@@ -34,6 +34,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from app.evidence_primitive import EvidenceRef, EvidenceStatus, classify_evidence
+
 
 # ---------------------------------------------------------------------------
 # Intent & context
@@ -237,6 +239,19 @@ class Gap(BaseModel):
     name: str
     description: str = ""
     evidence: str = ""
+
+    evidence_refs: list[EvidenceRef] = Field(default_factory=list)
+    """Structured, machine-checkable pointers at the evidence backing this gap,
+    alongside the unchanged free-text ``evidence`` narrative. Each ref names a
+    proof :class:`~app.evidence_primitive.ProofKind` and a ``ref`` (a
+    criterion_key / proof_ref / artifact_id / file-or-test path). Optional and
+    default-empty so every stored JSONB model and older agent payload validates
+    unchanged — ``ProblemModel`` uses ``extra="forbid"`` so the field must be
+    declared, but the empty default keeps back-compat round-trips byte-identical.
+    A plain proposed-wins field: it threads through :func:`_merge_gap` and
+    ``apply_agent_update`` with no extra merge logic. Kept small and bounded;
+    the standing evidence-reconciliation sweep re-verifies path-backed refs
+    against HEAD (see ``metrics_integrity_sweep.check_evidence_claim_reconciliation``)."""
 
     size: GapSize = "medium"
     priority: GapPriority = "medium"
@@ -571,6 +586,16 @@ class SelfReflectionEntry(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def gap_evidence_status(gap: Gap) -> EvidenceStatus:
+    """Derived evidence status for a gap, for prompt rendering and the sweep.
+
+    Thin wrapper over :func:`app.evidence_primitive.classify_evidence` on the
+    gap's ``evidence_refs``. Pure and stored-flag-only — it never re-verifies a
+    ref against ground truth; a caller that does so (the reconciliation sweep)
+    overrides the result to ``contradicted`` when a proven ref is disproved."""
+    return classify_evidence(gap.evidence_refs)
 
 
 def parse_problem_model(raw: dict | None) -> ProblemModel:

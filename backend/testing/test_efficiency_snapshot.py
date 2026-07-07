@@ -8055,6 +8055,90 @@ def test_panel_review_effectiveness_cost_per_challenge_usd():
     )
 
 
+def test_cost_per_challenge_excludes_out_of_window_and_degraded():
+    """cost_per_challenge_usd must apply since_dt window filter to numerator (LLM cost).
+
+    The bug: panel_review LLM cost was summed with no window filter, but the
+    denominator (challenged counts) was filtered by since_dt. This inflated
+    cost_per_challenge_usd when the task list spanned wider than the reporting window.
+
+    Setup:
+      - 2 in-window challenged_confirmed (total_challenged = 2)
+      - 1 out-of-window challenged_confirmed (must be ignored in cost calc)
+      - 1 degraded_model_unavailable (no cost in calculation; state != challenged_*)
+      - 3 panel_review tasks: 2 in-window, 1 out-of-window
+      - Expected: cost_per_challenge_usd = (cost of 2 in-window panel_review) / 2
+
+    Verify:
+      - cost_per_challenge_usd correctly excludes out-of-window panel_review cost
+      - cost_per_challenge_usd correctly excludes degraded challenges
+    """
+    from app.efficiency_snapshot import compute_panel_review_effectiveness
+    from app.task_completion import REVIEW_SECOND_OPINION_RECONCILIATION_KEY
+
+    now = _utcnow()
+    window_start = now - timedelta(hours=1)
+    input_rate, output_rate = LLM_TOKEN_PRICING[("anthropic", "claude-sonnet-4-6")]
+
+    def _challenged_review(state, updated_at):
+        return make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            context={REVIEW_SECOND_OPINION_RECONCILIATION_KEY: {"state": state}},
+            updated_at=updated_at,
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+        )
+
+    def _panel_review_task(input_tokens, output_tokens, updated_at):
+        t = make_task(
+            project_id=None,
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "panel_review"}],
+            updated_at=updated_at,
+            vm_provisioned_at=updated_at - timedelta(minutes=5),
+            vm_stopped_at=updated_at,
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        t.api_call_summary = {
+            "llm_call_count": 1,
+            "total_input_tokens": input_tokens,
+            "total_output_tokens": output_tokens,
+        }
+        return t
+
+    tasks = [
+        # In-window challenged (should count)
+        _challenged_review("challenged_confirmed", now - timedelta(minutes=10)),
+        _challenged_review("challenged_confirmed", now - timedelta(minutes=5)),
+        # Out-of-window challenged (should NOT count in cost numerator)
+        _challenged_review("challenged_confirmed", window_start - timedelta(minutes=5)),
+        # Degraded challenge (does not count in total_challenged)
+        _challenged_review("degraded_model_unavailable", now - timedelta(minutes=3)),
+        # In-window panel_review tasks (1000+2000 input, 200+400 output)
+        _panel_review_task(1000, 200, now - timedelta(minutes=8)),
+        _panel_review_task(2000, 400, now - timedelta(minutes=3)),
+        # Out-of-window panel_review task (should NOT count in cost)
+        _panel_review_task(3000, 600, window_start - timedelta(minutes=10)),
+    ]
+
+    result = compute_panel_review_effectiveness(tasks, since_dt=window_start)
+    assert result is not None
+    # Only 2 in-window challenged_confirmed counts (excludes out-of-window and degraded)
+    assert result["total_challenged"] == 2, (
+        f"expected total_challenged=2 (in-window only), got {result['total_challenged']}"
+    )
+
+    # Expected cost: only in-window panel_review tasks count
+    expected_cost = (1000 + 2000) * input_rate + (200 + 400) * output_rate
+    expected_per_challenge = round(expected_cost / 2, 4)
+    assert result["cost_per_challenge_usd"] == expected_per_challenge, (
+        f"expected cost_per_challenge_usd={expected_per_challenge} "
+        f"(in-window tasks only), got {result['cost_per_challenge_usd']}"
+    )
+
+
 def test_panel_review_effectiveness_escalated_fail_open():
     """Escalated records (unchallenged + escalated=True) are counted in
     challenged_escalated (informational) and excluded from total_challenged and fail_open_rate.
