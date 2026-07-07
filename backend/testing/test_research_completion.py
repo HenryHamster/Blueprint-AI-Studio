@@ -16196,3 +16196,87 @@ async def test_note_apply_is_idempotent_on_replay(db_session):
         f"All notes: {notes_second}"
     )
     assert matching_notes_second[0]["added_by_task"] == str(task.id)
+
+
+async def test_zero_children_note_idempotent_on_replay(db_session):
+    """Zero-children research note must not duplicate when _apply_terminal_transition is replayed.
+
+    When a research task completes with zero children, it appends a note to the direction.
+    On a post-commit retry, _apply_terminal_transition must not append duplicate notes with
+    the same message and producing task id. The dedup check must examine existing notes
+    before appending.
+    """
+    from app.research_direction_state import _apply_terminal_transition
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-zero-children-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for zero-children replay"),
+        "research_history": [],
+        "notes": [],
+    }
+    project = _Project(
+        name="Zero Children Note Idempotency Test",
+        user_id="test-user-zero-children-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Call _apply_terminal_transition with zero children, which appends a zero-children note
+    _call_args = {
+        "session": db_session,
+        "task": task,
+        "child_tasks": [],
+        "findings": [],
+        "direction_notes": [],
+        "direction_proposals": [],
+        "status_msg": "Research produced 0 tasks",
+        "research_branch": "research-branch",
+        "original_base": "main",
+        "direction_id": direction_id,
+        "skipped_duplicates": 0,
+        "hash_dedup_count": 0,
+        "word_overlap_count": 0,
+        "file_overlap_count": 0,
+        "type_filtered_count": 0,
+        "empty_prompt_count": 0,
+    }
+
+    # First call: adds zero-children note to the direction
+    await _apply_terminal_transition(**_call_args)
+    await db_session.refresh(project)
+
+    notes_first = project.directions[0].get("notes", [])
+    # Find the note that was added by this task (should contain "created 0 tasks")
+    matching_notes_first = [n for n in notes_first if "created 0 tasks" in n.get("msg", "")]
+    assert len(matching_notes_first) == 1, (
+        f"Expected 1 zero-children note after first call, got {len(matching_notes_first)}. "
+        f"All notes: {notes_first}"
+    )
+    # Verify the note has the producing task id for dedup
+    assert matching_notes_first[0].get("added_by_task") == str(task.id), (
+        f"Expected zero-children note to have added_by_task={task.id}, "
+        f"got {matching_notes_first[0].get('added_by_task')}"
+    )
+
+    # Second call: simulate post-commit retry — same task, same parameters
+    await _apply_terminal_transition(**_call_args)
+    await db_session.refresh(project)
+
+    notes_second = project.directions[0].get("notes", [])
+    matching_notes_second = [n for n in notes_second if "created 0 tasks" in n.get("msg", "")]
+    assert len(matching_notes_second) == 1, (
+        f"Expected 1 zero-children note after retry (idempotent), got {len(matching_notes_second)}. "
+        f"_apply_terminal_transition duplicated the zero-children note on post-commit retry. "
+        f"All notes: {notes_second}"
+    )
+    assert matching_notes_second[0].get("added_by_task") == str(task.id)

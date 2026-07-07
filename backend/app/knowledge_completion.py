@@ -830,7 +830,12 @@ async def _persist_document(
     session: AsyncSession,
     kind: str = "web_research",
 ) -> None:
-    """Persist exactly one KnowledgeDocument, mirror a compact copy, mark COMPLETED."""
+    """Persist exactly one KnowledgeDocument, mirror a compact copy, mark COMPLETED.
+
+    Idempotent on replay: if a document with the same (project_id, source_task_id,
+    source_kind) already exists, the call is a no-op; the existing row is not
+    updated. This guards against double-insertion on post-commit recovery replay.
+    """
     normalized = _normalize_document(document, task)
 
     # The strategic direction that motivated the producing task is carried on
@@ -842,23 +847,49 @@ async def _persist_document(
     source_kind = _source_kind(kind)
     origin = _derive_origin_provenance(task, source_kind=source_kind)
 
-    doc = KnowledgeDocument(
-        project_id=task.project_id,
-        source_task_id=task.id,
-        direction_id=direction_id,
-        source_kind=source_kind,
-        title=normalized["title"],
-        summary=normalized["summary"],
-        body=normalized["body"],
-        topic=normalized["topic"],
-        tags=normalized["tags"],
-        source_citations=normalized["source_citations"],
-        forward_quality_verdict=verdict_record,
-        authoring_branch=normalized.get("authoring_branch"),
-        head_sha=normalized.get("head_sha"),
-        **origin,
+    # Idempotency guard: check if a document with the same (project_id,
+    # source_task_id, source_kind) already exists. If so, skip insertion.
+    # This prevents replay from double-inserting the same document.
+    existing = (
+        (
+            await session.execute(
+                select(KnowledgeDocument).where(
+                    KnowledgeDocument.project_id == task.project_id,
+                    KnowledgeDocument.source_task_id == task.id,
+                    KnowledgeDocument.source_kind == source_kind,
+                )
+            )
+        )
+        .scalars()
+        .first()
     )
-    session.add(doc)
+    if existing is not None:
+        logger.info(
+            "[%s] Knowledge document already exists (%s) for task %s — skipping "
+            "insertion on replay",
+            _kind_tag(kind),
+            existing.id,
+            task.id,
+        )
+        doc = existing
+    else:
+        doc = KnowledgeDocument(
+            project_id=task.project_id,
+            source_task_id=task.id,
+            direction_id=direction_id,
+            source_kind=source_kind,
+            title=normalized["title"],
+            summary=normalized["summary"],
+            body=normalized["body"],
+            topic=normalized["topic"],
+            tags=normalized["tags"],
+            source_citations=normalized["source_citations"],
+            forward_quality_verdict=verdict_record,
+            authoring_branch=normalized.get("authoring_branch"),
+            head_sha=normalized.get("head_sha"),
+            **origin,
+        )
+        session.add(doc)
 
     # Mirror a compact copy into plan_output for debugging / admin visibility
     # (the body is intentionally omitted to keep plan_output small). The

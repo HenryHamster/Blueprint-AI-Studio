@@ -1468,14 +1468,23 @@ async def _apply_terminal_transition(
             _zero_note_entry = {
                 "t": datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
                 "msg": note,
+                "added_by_task": str(task.id),
             }
             session.expire(project, ["directions"])
 
             def _apply_zero_note(dirs: list) -> None:
                 for _d in dirs:
                     if _d.get("id") == direction_id:
-                        _d.setdefault("notes", [])
-                        _d["notes"] = (_d["notes"] or [])[-4:] + [_zero_note_entry]
+                        _notes = list(_d.get("notes") or [])
+                        # Dedup: only append if no existing note has the same msg and added_by_task
+                        _note_msg = _zero_note_entry.get("msg")
+                        _note_task = _zero_note_entry.get("added_by_task")
+                        if not any(
+                            n.get("msg") == _note_msg and n.get("added_by_task") == _note_task
+                            for n in _notes
+                        ):
+                            _notes.append(_zero_note_entry)
+                        _d["notes"] = _notes[-5:]
                         break
 
             await with_directions_locked(session, task.project_id, _apply_zero_note)

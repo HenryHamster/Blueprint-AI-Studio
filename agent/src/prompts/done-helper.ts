@@ -223,7 +223,7 @@ if [ ! -s "$PR_FILE" ]; then
 fi
 PR_URL=$(cat "$PR_FILE")
 # Validate shape — must be a canonical GitHub pull URL.
-# Aligned with agent/src/handlers/code-change.ts:337 (same regex).
+# Aligned with agent/src/handlers/code-change.ts:274 (same regex).
 PR_URL_RE='^https://github\\.com/[^/[:space:]]+/[^/[:space:]]+/pull/[0-9]+$'
 if ! printf '%s' "$PR_URL" | grep -qE "$PR_URL_RE"; then
   echo "[done] Error: $PR_FILE contains an invalid PR URL: $PR_URL" >&2

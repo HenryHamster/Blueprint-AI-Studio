@@ -567,7 +567,7 @@ if admin_ui_runtime_touched; then
   # 2) BASELINE: if the (scoped or full) run fails, re-run the SAME
   #    subset against origin/$BASE in a detached worktree. Both fail →
   #    pre-existing → warn-pass (mirrors frontend CI's BROKEN/OK
-  #    pattern at .github/workflows/ci.yml line 111-143). PR-only fail →
+  #    pattern). PR-only fail →
   #    real regression → block. Worktree path keeps the agent's working
   #    tree untouched.
   ADMIN_UI_CHANGED=$(printf '%s\\n' "$CHANGED" | grep -E '^admin-ui/' || true)
