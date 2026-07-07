@@ -461,7 +461,20 @@ def build_parser() -> argparse.ArgumentParser:
             metavar="REF",
             help=(
                 "Pull this registry ref for the agent image instead of building "
-                "(retagged to --agent-image if they differ)."
+                "(retagged to --agent-image if they differ). Implies --docker-agent."
+            ),
+        )
+        sub_parser.add_argument(
+            "--docker-agent",
+            dest="docker_agent",
+            action="store_true",
+            default=False,
+            help=(
+                "Enable the docker-agent path: ensure the prod agent image and pass it "
+                "to local_runner so read-only agent tasks run in the prod container. "
+                "Without this flag (the default) bwrap is used for all agent tasks. "
+                "Also enabled by BLUEPRINT_AGENT_BACKEND=docker env var, or implicitly "
+                "by --pull (pulling a registry image is inherently a docker opt-in)."
             ),
         )
     return parser
@@ -493,18 +506,32 @@ def main(argv: list[str] | None = None) -> int:
     _print_prereqs(prereqs, url)
     missing = [p for p in prereqs if not p.ok]
 
-    # Zero-config docker-agent path: ensure the prod agent image so read-only agent
-    # tasks run in the prod container. `check` probes (no side effects); `start`
-    # actually builds/pulls. Fail-closed — a None image leaves the docker-agent path
-    # OFF (bwrap-or-decline), preserving the pre-feature behavior.
-    tag = resolve_agent_image_tag(getattr(args, "agent_image", None))
-    image_result = ensure_agent_image(
-        tag=tag,
-        docker_usable=_docker_usable(),
-        build=getattr(args, "build_image", True),
-        pull_ref=getattr(args, "pull", None),
-        probe_only=(args.command == "check"),
+    # Docker-agent opt-in: explicit --docker-agent flag, BLUEPRINT_AGENT_BACKEND=docker,
+    # or --pull (pulling a registry image is inherently a docker operation). Without an
+    # explicit opt-in the docker-agent path stays OFF: bwrap handles all agent tasks.
+    # This is the deliberate bwrap-first preference: docker is never auto-enabled just
+    # because docker happens to be usable on the host.
+    docker_opted_in = (
+        getattr(args, "docker_agent", False)
+        or os.environ.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() == "docker"
+        or getattr(args, "pull", None) is not None
     )
+    if docker_opted_in:
+        tag = resolve_agent_image_tag(getattr(args, "agent_image", None))
+        image_result = ensure_agent_image(
+            tag=tag,
+            docker_usable=_docker_usable(),
+            build=getattr(args, "build_image", True),
+            pull_ref=getattr(args, "pull", None),
+            probe_only=(args.command == "check"),
+        )
+    else:
+        image_result = AgentImageResult(
+            None,
+            False,
+            "docker-agent path OFF (bwrap is default; pass --docker-agent or set "
+            "BLUEPRINT_AGENT_BACKEND=docker to enable the prod-image path).",
+        )
     _print_docker_agent_status(image_result)
 
     if args.command == "check":

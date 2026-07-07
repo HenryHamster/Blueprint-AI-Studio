@@ -2645,6 +2645,88 @@ class TestAgentImagePresence(unittest.TestCase):
         self.assertFalse(self._advertised_after_image_gate(inspect_rc=1))
 
 
+class TestAgentBackendPreference(unittest.TestCase):
+    """The default agent backend is bwrap-first; docker requires an explicit opt-in.
+
+    These tests drive the preference logic in main() (agent_backend_pref) and the
+    decide_agent_backend integration, confirming that:
+      1. Default (no env vars, no image) → bwrap backend selected.
+      2. BLUEPRINT_AGENT_BACKEND=docker → docker backend for read-only types.
+      3. BLUEPRINT_AGENT_BACKEND=bwrap with image set → image ignored, bwrap used.
+    """
+
+    def setUp(self):
+        local_runner._shutdown_event.clear()
+
+    def tearDown(self):
+        local_runner._shutdown_event.clear()
+
+    def _backend_from_env(self, env_overrides, *, caps, task_type="research"):
+        """Drive decide_agent_backend the way main() + _spawn_agent_task would.
+
+        Parses agent_image and agent_backend_pref from env_overrides (mirrors the
+        main() startup block), then calls decide_agent_backend with the result.
+        ``agent_binary_present=True`` is assumed (we're testing backend selection,
+        not binary detection — the host binary check is separate from isolation routing).
+        """
+        env = {**env_overrides}
+        agent_image = env.get("BLUEPRINT_AGENT_IMAGE", "").strip() or None
+        pref = env.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() or "auto"
+        if pref == "bwrap":
+            agent_image = None
+        # BLUEPRINT_AGENT_BACKEND=docker just keeps agent_image as-is; the
+        # docker path activates when decide_agent_backend sees image+docker_usable.
+        return iso.decide_agent_backend(
+            caps, True, task_type=task_type, agent_image=agent_image
+        )
+
+    def test_default_no_env_uses_bwrap(self):
+        """No env vars at all → bwrap backend (the default)."""
+        backend = self._backend_from_env({}, caps=_bwrap_caps())
+        self.assertEqual(backend, iso.BACKEND_BWRAP)
+
+    def test_default_docker_usable_but_no_image_uses_bwrap(self):
+        """Docker usable but BLUEPRINT_AGENT_IMAGE not set → bwrap."""
+        backend = self._backend_from_env({}, caps=_docker_caps())
+        # No image means decide_agent_backend returns bwrap (or decline if no bwrap).
+        # _docker_caps has no bwrap, so it's DECLINE — proving docker is NOT auto-selected.
+        self.assertNotEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_docker_opt_in_with_image_routes_read_only_to_docker(self):
+        """BLUEPRINT_AGENT_BACKEND=docker + BLUEPRINT_AGENT_IMAGE → docker for research."""
+        backend = self._backend_from_env(
+            {
+                "BLUEPRINT_AGENT_BACKEND": "docker",
+                "BLUEPRINT_AGENT_IMAGE": "registry/agent:prod",
+            },
+            caps=_docker_caps(),
+            task_type="research",
+        )
+        self.assertEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_bwrap_force_ignores_image(self):
+        """BLUEPRINT_AGENT_BACKEND=bwrap zeroes out agent_image → docker NOT selected."""
+        # With BACKEND=bwrap, agent_image is discarded. Even though docker is usable and
+        # the image would normally enable docker, bwrap is forced so docker is never chosen.
+        backend = self._backend_from_env(
+            {
+                "BLUEPRINT_AGENT_BACKEND": "bwrap",
+                "BLUEPRINT_AGENT_IMAGE": "registry/agent:prod",
+            },
+            caps=_docker_caps(),   # docker usable, but bwrap is forced → docker NOT selected
+        )
+        self.assertNotEqual(backend, iso.BACKEND_DOCKER)
+
+    def test_explicit_image_without_backend_pref_acts_as_docker_optin(self):
+        """BLUEPRINT_AGENT_IMAGE set (no BACKEND pref) → auto mode treats image as opt-in."""
+        backend = self._backend_from_env(
+            {"BLUEPRINT_AGENT_IMAGE": "registry/agent:prod"},
+            caps=_docker_caps(),
+            task_type="research",
+        )
+        self.assertEqual(backend, iso.BACKEND_DOCKER)
+
+
 class TestCredentialPersistence(unittest.TestCase):
     """Token persistence: save/load round-trip, file permissions, fallback behaviour."""
 

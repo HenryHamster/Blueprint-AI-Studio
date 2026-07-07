@@ -410,7 +410,7 @@ class MainDockerAgentWiringTests(unittest.TestCase):
              patch.object(br, "ensure_agent_image",
                           return_value=br.AgentImageResult("blueprint-agent:local", True, "ON")) as ens, \
              patch.object(br, "run_local_runner", return_value=0) as run_mock:
-            rc = br.main(["start", "--token", "tok"])
+            rc = br.main(["start", "--token", "tok", "--docker-agent"])
         self.assertEqual(rc, 0)
         # start actually builds/pulls (probe_only False) and the ensured image flows through.
         self.assertFalse(ens.call_args.kwargs["probe_only"])
@@ -423,7 +423,7 @@ class MainDockerAgentWiringTests(unittest.TestCase):
              patch.object(br, "ensure_agent_image",
                           return_value=br.AgentImageResult(None, False, "OFF")) as ens, \
              patch.object(br, "run_local_runner", return_value=0) as run_mock:
-            rc = br.main(["check", "--token", "tok"])
+            rc = br.main(["check", "--token", "tok", "--docker-agent"])
         self.assertEqual(rc, 0)
         self.assertTrue(ens.call_args.kwargs["probe_only"])  # no build/pull during check
         self.assertIsNone(run_mock.call_args.kwargs["agent_image"])
@@ -435,7 +435,7 @@ class MainDockerAgentWiringTests(unittest.TestCase):
              patch.object(br, "ensure_agent_image",
                           return_value=br.AgentImageResult(None, False, "OFF")) as ens, \
              patch.object(br, "run_local_runner", return_value=0):
-            br.main(["start", "--token", "tok", "--agent-image", "custom:tag"])
+            br.main(["start", "--token", "tok", "--docker-agent", "--agent-image", "custom:tag"])
         self.assertEqual(ens.call_args.kwargs["tag"], "custom:tag")
 
     def test_no_build_image_flag_reaches_ensure(self):
@@ -445,8 +445,49 @@ class MainDockerAgentWiringTests(unittest.TestCase):
              patch.object(br, "ensure_agent_image",
                           return_value=br.AgentImageResult(None, False, "OFF")) as ens, \
              patch.object(br, "run_local_runner", return_value=0):
-            br.main(["start", "--token", "tok", "--no-build-image"])
+            br.main(["start", "--token", "tok", "--docker-agent", "--no-build-image"])
         self.assertFalse(ens.call_args.kwargs["build"])
+
+    def test_docker_not_used_by_default_when_docker_usable(self):
+        """Even when docker is usable, docker-agent path is OFF without explicit opt-in."""
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "check_prerequisites", return_value=self._ok_prereqs()), \
+             patch.object(br, "_docker_usable", return_value=True), \
+             patch.object(br, "ensure_agent_image") as ens, \
+             patch.object(br, "run_local_runner", return_value=0) as run_mock:
+            rc = br.main(["start", "--token", "tok"])
+        self.assertEqual(rc, 0)
+        # ensure_agent_image must NOT be called — no build/pull without explicit opt-in.
+        ens.assert_not_called()
+        # agent_image must be None so BLUEPRINT_AGENT_IMAGE is NOT exported to the child.
+        self.assertIsNone(run_mock.call_args.kwargs["agent_image"])
+
+    def test_docker_agent_env_backend_acts_as_optin(self):
+        """BLUEPRINT_AGENT_BACKEND=docker activates the docker path without --docker-agent."""
+        with patch.dict("os.environ", {"BLUEPRINT_AGENT_BACKEND": "docker"}, clear=True), \
+             patch.object(br, "check_prerequisites", return_value=self._ok_prereqs()), \
+             patch.object(br, "_docker_usable", return_value=True), \
+             patch.object(br, "ensure_agent_image",
+                          return_value=br.AgentImageResult("blueprint-agent:local", True, "ON")) as ens, \
+             patch.object(br, "run_local_runner", return_value=0) as run_mock:
+            rc = br.main(["start", "--token", "tok"])
+        self.assertEqual(rc, 0)
+        # ensure_agent_image IS called (env var is an explicit opt-in).
+        ens.assert_called_once()
+        self.assertEqual(run_mock.call_args.kwargs["agent_image"], "blueprint-agent:local")
+
+    def test_pull_flag_acts_as_docker_optin(self):
+        """--pull implies docker opt-in without needing --docker-agent."""
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "check_prerequisites", return_value=self._ok_prereqs()), \
+             patch.object(br, "_docker_usable", return_value=True), \
+             patch.object(br, "ensure_agent_image",
+                          return_value=br.AgentImageResult("blueprint-agent:local", True, "ON")) as ens, \
+             patch.object(br, "run_local_runner", return_value=0):
+            rc = br.main(["start", "--token", "tok", "--pull", "registry.io/agent:1"])
+        self.assertEqual(rc, 0)
+        ens.assert_called_once()
+        self.assertEqual(ens.call_args.kwargs["pull_ref"], "registry.io/agent:1")
 
 
 def _resolve_admin_ui_src_root() -> str | None:

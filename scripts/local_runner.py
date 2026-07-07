@@ -2147,21 +2147,34 @@ def main() -> None:
     )
     max_auth_failures = _env_int("BLUEPRINT_RUNNER_MAX_AUTH_FAILURES", 20, minimum=0)
 
-    # Prod agent container image (agent/Dockerfile). When set AND docker is usable,
-    # read-only agent task types run in this image (prod-parity, non-root) instead
-    # of bwrap. Empty → None → bwrap-only (unchanged). BLUEPRINT_AGENT_BACKEND=bwrap
-    # is an operator override that force-disables the docker agent backend.
+    # Prod agent container image (agent/Dockerfile). The default agent backend is bwrap
+    # (host toolchain); the docker backend is used only on an explicit opt-in:
+    #   BLUEPRINT_AGENT_BACKEND=docker   explicit docker selection
+    #   BLUEPRINT_AGENT_BACKEND=bwrap    force bwrap (override even if image is set)
+    #   BLUEPRINT_AGENT_BACKEND=auto     bwrap-first; docker only if image is set by
+    #                                    the operator (e.g. direct BLUEPRINT_AGENT_IMAGE
+    #                                    env, not auto-injected by blueprint-runner)
+    # blueprint-runner no longer auto-injects BLUEPRINT_AGENT_IMAGE — the launcher
+    # requires --docker-agent or BLUEPRINT_AGENT_BACKEND=docker to enable the docker
+    # path, so this env var is only present when the operator explicitly chose docker.
     agent_image = os.environ.get("BLUEPRINT_AGENT_IMAGE", "").strip() or None
     agent_backend_pref = (
         os.environ.get("BLUEPRINT_AGENT_BACKEND", "").strip().lower() or "auto"
     )
-    if agent_backend_pref == "bwrap" and agent_image is not None:
+    if agent_backend_pref == "bwrap":
+        if agent_image is not None:
+            print(
+                "[runner] BLUEPRINT_AGENT_BACKEND=bwrap — ignoring BLUEPRINT_AGENT_IMAGE "
+                "and using the host bwrap agent backend.",
+                flush=True,
+            )
+        agent_image = None
+    elif agent_backend_pref == "docker":
         print(
-            "[runner] BLUEPRINT_AGENT_BACKEND=bwrap — ignoring BLUEPRINT_AGENT_IMAGE "
-            "and using the host bwrap agent backend.",
+            "[runner] BLUEPRINT_AGENT_BACKEND=docker — docker agent path enabled.",
             flush=True,
         )
-        agent_image = None
+        # agent_image kept as-is; the fail-closed image-present check below applies.
 
     caps = _get_capabilities()
 

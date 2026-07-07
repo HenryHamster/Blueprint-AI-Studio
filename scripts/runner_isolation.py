@@ -392,19 +392,36 @@ def decide_agent_backend(
 ) -> str:
     """Choose an agent task's isolation backend, fail-closed.
 
+    **Policy: bwrap-first.** A container backend is used only when a documented
+    necessity holds — never merely because a container runtime is present.  The
+    three documented necessities for the agent slice are:
+
+      1. **Prod-parity opt-in**: ``agent_image`` is explicitly supplied by the
+         launcher AND docker is usable AND the task type is read-only-eligible
+         (``task_type is None`` or in :data:`AGENT_DOCKER_TYPES`).  Running the
+         prod agent container gives exact Cloud-Run / GCE parity and is an
+         explicit operator choice, not a default.
+      2. **bwrap unbuildable**: ``caps.bwrap_ok`` is false (binary absent or
+         unprivileged userns disabled).  No boundary other than a container is
+         available; the runner declines if no container route exists either.
+      3. *(Compute only — not agent)*: image-native jobs that supply a
+         ``container_image`` the experiment must run inside.
+
     Backends, in preference order:
 
-      * ``BACKEND_DOCKER`` — an ``agent_image`` is supplied AND docker is usable
-        (``caps.docker_usable`` — the SAME probe the compute path uses) AND the
-        task type is read-only-eligible (``task_type is None`` or in
-        :data:`AGENT_DOCKER_TYPES`). Running the prod agent container is exact
-        prod parity (Cloud Run Jobs / GCE VMs run this same image) and gives the
-        agent a real, rm-able ``/workspace`` layer dir, fixing the bwrap
-        ``rm -rf /workspace`` EBUSY crash. This path does NOT require
-        ``agent_binary_present``: the image ships its own agent build, so a host
-        ``dist/index.js`` is irrelevant to it.
-      * ``BACKEND_BWRAP`` — no eligible docker image, but a built host agent
-        binary AND a rootless bwrap sandbox are available.
+      * ``BACKEND_DOCKER`` — ``agent_image`` supplied AND docker usable AND
+        task type read-only-eligible (documented necessity #1 above).  This
+        path does NOT require ``agent_binary_present``: the image ships its
+        own agent build, so a host ``dist/index.js`` is irrelevant to it.
+        Historical note: this path was introduced to work around an EBUSY
+        crash when bwrap-sandboxed agents ran ``rm -rf /workspace`` on a
+        bind-mount point; that root cause is now fixed in workspacePrep.ts
+        (empty-in-place instead of rm-dir), so the docker path is a pure
+        opt-in for prod-parity runs.
+      * ``BACKEND_BWRAP`` — preferred default: no eligible docker image (or
+        docker is unusable), host agent binary present, rootless bwrap sandbox
+        available.  This covers WSL PC, second PC, DGX (userns on), and lab
+        server for the common imageless-agent case.
       * ``DECLINE`` — neither boundary can be built.
 
     CRITICAL invariant: when ``agent_image`` is falsy the result is byte-identical

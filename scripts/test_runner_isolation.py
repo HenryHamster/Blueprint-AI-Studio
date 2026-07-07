@@ -192,6 +192,45 @@ class TestDecisionTable(unittest.TestCase):
         self.assertFalse(denied.docker_usable)
         self.assertEqual(iso.decide_compute_backend(denied, has_image=True), iso.BACKEND_BWRAP)
 
+    def test_bwrap_first_policy_across_device_shapes(self):
+        """Bwrap-first policy: docker chosen only when agent_image explicitly supplied.
+
+        Covers all four target device shapes from the design doc.  Without an
+        agent_image the result must always be BACKEND_BWRAP (or DECLINE on a
+        box where bwrap is unbuildable) — docker must NEVER win by default.
+        """
+        # WSL PC / second PC: bwrap + docker both present, no image → bwrap wins.
+        wsl_pc = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=True)
+        self.assertEqual(iso.decide_agent_backend(wsl_pc, True), iso.BACKEND_BWRAP)
+
+        # Lab server: same — bwrap preferred even though docker is fully usable.
+        lab_server = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=True)
+        self.assertEqual(iso.decide_agent_backend(lab_server, True), iso.BACKEND_BWRAP)
+
+        # DGX (userns on, docker socket denied): bwrap wins; denied docker is skipped.
+        dgx_userns_on = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=False)
+        self.assertEqual(iso.decide_agent_backend(dgx_userns_on, True), iso.BACKEND_BWRAP)
+
+        # DGX (userns off, docker denied): no viable boundary → DECLINE.
+        dgx_userns_off = _caps(docker_usable=False)
+        self.assertEqual(iso.decide_agent_backend(dgx_userns_off, True), iso.DECLINE)
+
+        # Opt-in: explicit agent_image + docker usable → BACKEND_DOCKER (documented necessity #1).
+        self.assertEqual(
+            iso.decide_agent_backend(
+                lab_server, True, agent_image="reg/agent:v1", task_type="research"
+            ),
+            iso.BACKEND_DOCKER,
+        )
+        # Same lab_server + image but docker NOT usable → falls back to bwrap.
+        lab_no_docker = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=True, docker_usable=False)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                lab_no_docker, True, agent_image="reg/agent:v1", task_type="research"
+            ),
+            iso.BACKEND_BWRAP,
+        )
+
 
 # ── GPU assignment ────────────────────────────────────────────────────────────
 
