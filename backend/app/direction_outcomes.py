@@ -1850,6 +1850,10 @@ async def _update_direction_research_outcomes(
             TaskStatus.CANCELLED,
         ):
             continue
+        # Non-genuine cancellations (cascade kills, superseded, cap-exhausted-after-approve, etc.)
+        # must not count against direction health per the _is_non_genuine_cancelled contract.
+        if _is_non_genuine_cancelled(_ct):
+            continue
         _task_outcome = evaluate_task_outcome(_ct)
         _kind = _task_outcome.kind
         if _kind not in _outcome_kind_counts:

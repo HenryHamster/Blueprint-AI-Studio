@@ -6742,13 +6742,13 @@ def test_stranded_reachable_metrics_allow_persisted_discounts():
 
     stranded_negative = {**valid, "stranded_prs_merged": -1}
     assert any(
-        "stranded (-1) is negative" == violation
+        violation == "stranded (-1) is negative"
         for violation in acceptance_metric_invariant_violations(stranded_negative)
     )
 
     reachable_too_high = {**valid, "reachable_prs_merged": 3}
     assert any(
-        "reachable (3) exceeds prs_merged (1)" == violation
+        violation == "reachable (3) exceeds prs_merged (1)"
         for violation in acceptance_metric_invariant_violations(reachable_too_high)
     )
 
@@ -9737,4 +9737,149 @@ async def test_tasks_merged_staging_only_counts_staged_not_landed_children(
     # Verify prs_merged only counts fully-landed merges (not staging-only)
     assert entry["prs_merged"] == 1, (
         f"expected 1 fully-landed merge, got {entry['prs_merged']}"
+    )
+
+
+async def test_non_genuine_cancels_excluded_from_generalized_health_rate(
+    db_session: AsyncSession,
+):
+    """Verify non-genuine cancellations don't count against direction health_rate.
+
+    Non-genuine outcomes (cascade kills, superseded, cap-exhausted-after-approve,
+    REASSIGNED/SCOPE_EMPTY handoffs) must not count in generalized_health_rate
+    denominator or outcome_kind_breakdown per _is_non_genuine_cancelled contract.
+    """
+    project = await _create_project(db_session)
+    direction_id = "dir-123"
+
+    # Create a research task parent
+    research_task = Task(
+        project_id=project.id,
+        title="Research cycle",
+        payloads=[{"type": "research"}],
+        status=TaskStatus.COMPLETED,
+    )
+    db_session.add(research_task)
+    await db_session.flush()
+
+    research_task_id = str(research_task.id)
+
+    # Create direction with research_history entry
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=0)]
+
+    # Child 1: SUCCESS (code merge) — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="successful-fix",
+    )
+
+    # Child 2: GENUINE FAILURE — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.FAILED,
+        context={"failure_category": "CODE_ERROR"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="failed-task",
+    )
+
+    # Child 3: NON-GENUINE CANCEL (cascade kill) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"_replaced_by_task_id": "another-task-id"},
+        latest_status_message="Parent requeued",
+        payloads=[{"type": "create", "scope": "small"}],
+        title="cascade-cancelled",
+    )
+
+    # Child 4: NON-GENUINE CANCEL (pr closed non-rejection) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_detail": "pr_closed_non_rejection"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="pr-closed",
+    )
+
+    # Child 5: NON-GENUINE CANCEL (cap exhausted after approve) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_detail": "cap_exhausted_after_approve"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="cap-exhausted",
+    )
+
+    # Child 6: NON-GENUINE CANCEL (SCOPE_EMPTY) — should NOT count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.CANCELLED,
+        context={"failure_category": "SCOPE_EMPTY"},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="scope-empty",
+    )
+
+    # Child 7: NEUTRAL outcome (read-only task with no findings) — should count
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},
+        payloads=[{"type": "research"}],
+        title="research-no-findings",
+    )
+
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Verify generalized_successes: only the merged code task counts as success
+    assert entry["generalized_successes"] == 1, (
+        f"expected 1 success (merged fix), got {entry['generalized_successes']}"
+    )
+
+    # Verify generalized_health_rate denominator:
+    # Should be: 1 success + 1 failure + 1 neutral = 3
+    # Should NOT include the 3 non-genuine cancels
+    outcome_kind_breakdown = entry.get("outcome_kind_breakdown", {})
+
+    # Sum all outcomes to verify the denominator
+    total_terminal_outcomes = sum(
+        count for kind_counts in outcome_kind_breakdown.values()
+        for count in kind_counts.values()
+    )
+    assert total_terminal_outcomes == 3, (
+        f"expected 3 terminal outcomes (1 success + 1 failure + 1 neutral), "
+        f"got {total_terminal_outcomes}. Breakdown: {outcome_kind_breakdown}"
+    )
+
+    # Verify health_rate: 1 success / 3 terminal = 0.333
+    expected_health_rate = round(1 / 3, 3)
+    assert entry["generalized_health_rate"] == expected_health_rate, (
+        f"expected health_rate {expected_health_rate}, "
+        f"got {entry['generalized_health_rate']}"
     )
