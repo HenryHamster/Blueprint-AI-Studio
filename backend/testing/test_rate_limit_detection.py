@@ -13,7 +13,6 @@ message mentioning "billing". See RATE_LIMIT_PATTERNS in max_plan_pool.py.
 """
 
 from unittest.mock import MagicMock
-from datetime import timezone
 
 import pytest
 

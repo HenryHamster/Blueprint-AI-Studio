@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState } from 'react';
 import { Play, Pause, RotateCw, Wrench, CheckCircle, Zap, AlertTriangle } from 'lucide-react';
 import { parseTimestamp } from '../utils/time';
 import { apiFetch } from '../api';
@@ -11,24 +11,24 @@ function MergeGradeGateSettings() {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState(false);
 
-  const load = useCallback(async () => {
-    try {
-      const res = await apiFetch('/api/admin/settings');
-      if (res.ok) {
-        const data = await res.json();
-        const val = data?.merge_grade_block_threshold ?? 0.0;
-        setThreshold(val);
-        setInput(String(val));
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await apiFetch('/api/admin/settings');
+        if (res.ok) {
+          const data = await res.json();
+          const val = data?.merge_grade_block_threshold ?? 0.0;
+          setThreshold(val);
+          setInput(String(val));
+        }
+      } catch {
+        // Unauthenticated / network error on mount: keep defaults. Mirrors the
+        // defensive mount-fetch handling in sibling settings panels so a failed
+        // load never escapes as an unhandled promise rejection (which fails the
+        // viewport browser-mode test run even when every test file passes).
       }
-    } catch {
-      // Unauthenticated / network error on mount: keep defaults. Mirrors the
-      // defensive mount-fetch handling in sibling settings panels so a failed
-      // load never escapes as an unhandled promise rejection (which fails the
-      // viewport browser-mode test run even when every test file passes).
-    }
+    })();
   }, []);
-
-  useEffect(() => { load(); }, [load]);
 
   const save = async () => {
     const val = parseFloat(input);
