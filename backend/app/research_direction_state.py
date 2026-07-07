@@ -35,6 +35,7 @@ from app.direction_metrics import (
     build_evicted_cycle_snapshot,
 )
 from app.direction_outcomes import credit_gate_merged_count
+from app.failure_classification import CO_DEFERRED_SHELVED
 from app.research_context import (
     _build_research_context,
     build_recent_findings_evidence,
@@ -622,7 +623,19 @@ async def apply_post_spawn_state(
                     entry = {
                         "timestamp": now_iso,
                         "task_id": str(task.id),
-                        "tasks_created": len(dir_child_tasks),
+                        "tasks_created": sum(
+                            1
+                            for ct in dir_child_tasks
+                            if not (
+                                ct.status == TaskStatus.CANCELLED
+                                and (
+                                    (ct.context or {}).get(
+                                        "prerequisite_escalated_to_parent"
+                                    )
+                                    or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+                                )
+                            )
+                        ),
                         "findings_produced": findings_produced_by_dir.get(did, 0),
                         "batch_cap_applied": batch_cap_applied_count,
                         "summary": "; ".join(t[:60] for t in titles)

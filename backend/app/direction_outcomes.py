@@ -1521,7 +1521,20 @@ async def _update_direction_research_outcomes(
         }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
 
-    entry["tasks_created"] = len(child_tasks_rows)
+    # Exclude children cancelled at spawn time by prerequisite wiring
+    # (escalated-to-parent or co-deferred-shelved) — they were inserted but
+    # never ran, so counting them inflates tasks_created and masks saturation.
+    entry["tasks_created"] = sum(
+        1
+        for ct in child_tasks_rows
+        if not (
+            ct.status == TaskStatus.CANCELLED
+            and (
+                (ct.context or {}).get("prerequisite_escalated_to_parent")
+                or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+            )
+        )
+    )
     entry["tasks_completed"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
     )

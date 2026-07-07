@@ -5366,6 +5366,93 @@ async def test_unmatched_task_hash_prerequisite_escalates_to_parent(db_session, 
 
 
 @_pytest.mark.asyncio
+async def test_prereq_cancelled_children_excluded_from_survival_and_tasks_created(
+    db_session, mocker
+):
+    """Prereq-cancelled children (escalated-to-parent) must NOT count toward
+    research_surviving_findings or tasks_created.
+
+    Before the fix: _surviving_findings was computed as _impl_spawned BEFORE the
+    prereq-wiring loop ran. If a spawned child was later cancelled with
+    prerequisite_escalated_to_parent=True (no_live_or_deferred_provider), it
+    still counted as a surviving finding and as tasks_created>=1, preventing the
+    saturation detector from ever marking the direction auto-complete.
+
+    After the fix: the survival signal is adjusted downward after the loop, and
+    direction_outcomes excludes those children from tasks_created.
+    """
+    from test_autonomous_research import _make_finding, _patch_research_externals
+    from app.failure_classification import CO_DEFERRED_SHELVED
+
+    _project, direction, task = await _grader_project_and_task(db_session, "d-prqexcl")
+    finding = _make_finding(title="Add metrics endpoint", direction_id=direction["id"])
+    missing_ref = "deadbeef00000000"
+    # Unresolvable task-hash prerequisite forces escalation to parent.
+    finding["prerequisite"] = {"kind": "task", "ref": missing_ref}
+
+    _patch_research_externals(mocker)
+    mocker.patch(
+        "app.research_completion._parse_research_findings", return_value=[finding]
+    )
+
+    await _handle_research_completion(task, "", db_session)
+    await db_session.refresh(task)
+
+    children = (
+        (
+            await db_session.execute(
+                _select(_Task).where(_Task.parent_task_id == task.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(children) == 1
+    child = children[0]
+    assert child.status == TaskStatus.CANCELLED, "prereq-escalated child must be CANCELLED"
+    assert (child.context or {}).get("prerequisite_escalated_to_parent") is True
+
+    # The key assertion: surviving_findings must be 0, not 1.
+    surviving = (task.context or {}).get("research_surviving_findings")
+    assert surviving == 0, (
+        f"prereq-cancelled child must not count as a surviving finding "
+        f"(got research_surviving_findings={surviving})"
+    )
+
+    # _first_attempt_succeeded must be downgraded because surviving==0.
+    assert not (task.context or {}).get("_first_attempt_succeeded"), (
+        "a cycle whose only child was prereq-cancelled must not be a first-attempt success"
+    )
+
+    # Confirm direction_outcomes.tasks_created would exclude this child.
+    # We test this via the context predicate directly (same logic as direction_outcomes.py).
+    child_is_prereq_cancelled = (
+        child.status == TaskStatus.CANCELLED
+        and (
+            (child.context or {}).get("prerequisite_escalated_to_parent")
+            or (child.context or {}).get(CO_DEFERRED_SHELVED)
+        )
+    )
+    assert child_is_prereq_cancelled, (
+        "child must satisfy the prereq-cancel predicate used in tasks_created exclusion"
+    )
+
+    # The initial research_history entry written by apply_post_spawn_state must also
+    # exclude prereq-cancelled children from tasks_created (research_direction_state.py).
+    await db_session.refresh(_project)
+    direction_entry = next(
+        (d for d in _project.directions if d.get("id") == direction["id"]), None
+    )
+    assert direction_entry is not None, "direction must exist in project"
+    research_history = direction_entry.get("research_history", [])
+    assert len(research_history) >= 1, "research_history must have at least one entry"
+    assert research_history[-1]["tasks_created"] == 0, (
+        f"prereq-cancelled children must not count toward tasks_created in the initial "
+        f"history entry (got {research_history[-1]['tasks_created']})"
+    )
+
+
+@_pytest.mark.asyncio
 async def test_depends_on_indices_missing_sibling_wires_to_existing_inflight(
     db_session, mocker
 ):

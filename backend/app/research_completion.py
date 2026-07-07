@@ -5743,6 +5743,26 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
         flag_modified(task, "context")
         session.add(task)
 
+    # Adjust the surviving-findings signal to exclude children cancelled during
+    # prerequisite wiring (escalated-to-parent or co-deferred-shelved). These
+    # tasks were counted in _surviving_findings at spawn time but never actually
+    # ran; leaving them in the signal causes the saturation detector to see
+    # tasks_created>=1 on a cycle that produced no real work, preventing
+    # auto-completion for stuck directions.
+    _prereq_cancelled_count = sum(
+        1
+        for ct in child_tasks
+        if ct.status == TaskStatus.CANCELLED
+        and (
+            (ct.context or {}).get("prerequisite_escalated_to_parent")
+            or (ct.context or {}).get(CO_DEFERRED_SHELVED)
+        )
+    )
+    if _prereq_cancelled_count:
+        _record_research_survival_signal(
+            task, surviving=max(0, _surviving_findings - _prereq_cancelled_count)
+        )
+
     # Chain auto-decomposed siblings: when a finding is split into N sub-tasks
     # by cochange/path clustering, run them serially rather than in parallel.
     # Each sibling's base branch otherwise picks up partial sibling-merged
