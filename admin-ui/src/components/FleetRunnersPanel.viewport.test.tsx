@@ -9,9 +9,25 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
   {
     id: 'runner-abc123',
     hostname: 'gpu-worker-01',
-    version: '1.2.3',
+    version: 'v22-3-gabcdef',
     status: 'active',
-    capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+    // Runner reporting the full isolation-backend inventory + selected backends.
+    capabilities: {
+      task_types: 'all',
+      has_gpu: true,
+      max_concurrent: 2,
+      isolation_backends: {
+        bwrap_ok: true,
+        userns_ok: true,
+        docker_usable: true,
+        podman_usable: true,
+        apptainer_ok: true,
+        enroot_ok: true,
+        systemd_run_ok: true,
+      },
+      agent_backend: 'bwrap',
+      compute_backend: 'docker',
+    },
     last_seen_at: new Date(Date.now() - 30_000).toISOString(),
     created_at: '2026-06-01T00:00:00Z',
   },
@@ -20,6 +36,7 @@ const SAMPLE_RUNNERS: FleetRunner[] = [
     hostname: null,
     version: null,
     status: 'active',
+    // Older runner with no isolation-backend inventory — Backends section hidden.
     capabilities: { task_types: ['compute_experiment'], has_gpu: false, max_concurrent: 1 },
     last_seen_at: null,
     created_at: '2026-06-10T00:00:00Z',
@@ -72,6 +89,13 @@ describe('FleetRunnersPanel — viewport regression', () => {
 
   test('renders without horizontal overflow at 768px', async () => {
     await expectNoOverflowAt(768, async () => { await mount(768); });
+  });
+
+  // 1280px is the acceptance-evidence capture width: the isolation-backend
+  // inventory row (backend pills + agent→/compute→ indicators) must not push the
+  // card past the viewport at the operator's primary desktop width.
+  test('renders backend inventory without horizontal overflow at 1280px', async () => {
+    await expectNoOverflowAt(1280, async () => { await mount(1280); });
   });
 
   test('action buttons meet 44px touch target at 375px', async () => {

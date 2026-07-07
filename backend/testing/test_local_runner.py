@@ -1111,6 +1111,60 @@ class TestRunnerEndpoints:
         assert health2["degraded"] is False
 
     @pytest.mark.asyncio
+    async def test_heartbeat_persists_isolation_backends(
+        self, client: AsyncClient, db_session
+    ):
+        # The runner reports its isolation-backend inventory + selected backends +
+        # version; all ride on capabilities (version is a first-class column) so the
+        # fleet panel can show per-device backend availability.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        inventory = {
+            "bwrap_ok": True,
+            "userns_ok": True,
+            "docker_usable": False,
+            "podman_usable": False,
+            "apptainer_ok": True,
+            "enroot_ok": False,
+            "systemd_run_ok": True,
+        }
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={
+                "version": "v22-15-gabc1234-dirty",
+                "isolation_backends": inventory,
+                "agent_backend": "bwrap",
+                "compute_backend": "bwrap",
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert runner.version == "v22-15-gabc1234-dirty"
+        assert runner.capabilities["isolation_backends"] == inventory
+        assert runner.capabilities["agent_backend"] == "bwrap"
+        assert runner.capabilities["compute_backend"] == "bwrap"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_tolerates_missing_isolation_backends(
+        self, client: AsyncClient, db_session
+    ):
+        # Old runners omit the isolation fields entirely — heartbeat must still
+        # succeed and leave capabilities without those keys.
+        project = await _make_project(db_session)
+        runner, token = await _make_runner(db_session, project.id)
+        resp = await client.post(
+            "/api/runner/heartbeat",
+            json={"active_task_ids": []},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        await db_session.refresh(runner)
+        assert "isolation_backends" not in runner.capabilities
+        assert "agent_backend" not in runner.capabilities
+        assert "compute_backend" not in runner.capabilities
+
+    @pytest.mark.asyncio
     async def test_heartbeat_tolerates_missing_trust_telemetry(
         self, client: AsyncClient, db_session
     ):
@@ -3128,6 +3182,107 @@ class TestRunnerDeathAlert:
         assert dismissed == 1
         assert dedupe_key not in _runner_escalation_last_notified
 
+    @pytest.mark.asyncio
+    async def test_escalation_fires_for_born_error_alert(self, db_session):
+        """Born-ERROR alerts (had_active_work=True) still get re-notified by the sweep.
+
+        Regression guard for the guard that was incorrectly keying off raw severity:
+        a runner that died mid-job creates an ERROR-severity alert from birth.
+        The plural sweep must still re-notify for it — only alerts escalated from
+        WARNING→ERROR by the singular _maybe_escalate_runner_deactivated_alert path
+        should be skipped (those are tracked in _runner_outage_escalated_keys, not
+        by severity alone).
+        """
+        from app.alert_dispatch import (
+            _maybe_escalate_runner_deactivated_alerts,
+            _runner_escalation_last_notified,
+            _runner_outage_escalated_keys,
+        )
+
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        dedupe_key = f"runner.deactivated:{runner.id}"
+
+        # Seed a born-ERROR alert (had_active_work=True path creates ERROR severity).
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="Fleet runner went offline mid-job: testhost",
+            message="Runner offline mid-job",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=dedupe_key,
+        )
+        alert.created_at = _utcnow() - timedelta(hours=2)
+        db_session.add(alert)
+        await db_session.commit()
+
+        # Ensure no stale state from the singular escalation path.
+        _runner_escalation_last_notified.pop(dedupe_key, None)
+        _runner_outage_escalated_keys.discard(dedupe_key)
+
+        with patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as notify:
+            count = await _maybe_escalate_runner_deactivated_alerts(db_session)
+
+        # Must re-notify even though severity is ERROR (it was born ERROR, not
+        # escalated-to-ERROR by the sweep).
+        assert count == 1, "born-ERROR alert should receive re-notification from the sweep"
+        notify.assert_called_once()
+        call_event = notify.call_args.args[1]
+        assert call_event == "RUNNER_DEACTIVATED"
+        # Cleanup
+        _runner_escalation_last_notified.pop(dedupe_key, None)
+        _runner_outage_escalated_keys.discard(dedupe_key)
+
+    async def test_acknowledged_born_error_alert_not_repaged(self, db_session):
+        """Acknowledging a born-ERROR alert suppresses its RUNNER_DEACTIVATED re-pages.
+
+        Mirrors the contract promised by Alert.acknowledged_at and the
+        POST /alerts/{id}/acknowledge endpoint: acknowledging suppresses further
+        escalation re-pages until the alert auto-resolves.
+        """
+        from app.alert_dispatch import (
+            _maybe_escalate_runner_deactivated_alerts,
+            _runner_escalation_last_notified,
+            _runner_outage_escalated_keys,
+        )
+
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(db_session, project.id)
+        dedupe_key = f"runner.deactivated:{runner.id}"
+
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.ERROR,
+            title="Fleet runner went offline mid-job: testhost",
+            message="Runner offline mid-job",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=dedupe_key,
+        )
+        alert.created_at = _utcnow() - timedelta(hours=2)
+        alert.acknowledged_at = _utcnow()
+        db_session.add(alert)
+        await db_session.commit()
+
+        _runner_escalation_last_notified.pop(dedupe_key, None)
+        _runner_outage_escalated_keys.discard(dedupe_key)
+
+        with patch(
+            "app.notification_dispatch.dispatch_external_notification",
+            new_callable=AsyncMock,
+        ) as notify:
+            count = await _maybe_escalate_runner_deactivated_alerts(db_session)
+
+        assert count == 0, "acknowledged born-ERROR alert must NOT be re-paged"
+        notify.assert_not_called()
+        # Cleanup
+        _runner_escalation_last_notified.pop(dedupe_key, None)
+        _runner_outage_escalated_keys.discard(dedupe_key)
+
 
 class TestRunnerDegradedAlert:
     """Degraded-runner alerting: a runner that heartbeats but fails every job
@@ -3301,6 +3456,199 @@ class TestRunnerDegradedAlert:
         alerts = await self._degraded_alerts(db_session, project.id)
         assert len(alerts) == 0
         notify.assert_not_called()
+
+
+
+class TestRunnerDeathEscalation:
+    """Runner-outage escalation: alerts older than the threshold are escalated
+    to ERROR and re-paged. Acked alerts are suppressed. Flap suppression is
+    natural (recovery before threshold dismisses the alert). See
+    app.alert_dispatch._maybe_escalate_runner_deactivated_alert and
+    app.orchestrator_runner_dispatch._sweep_runner_deactivated_escalations."""
+
+    async def _seed_alert(self, db_session, project_id, runner_id, *, age_hours=5):
+        """Seed an open runner-deactivated WARNING alert with the given age."""
+        alert = Alert(
+            project_id=project_id,
+            severity=AlertSeverity.WARNING,
+            title=f"Fleet runner went offline: runner {str(runner_id)[:8]}",
+            message="dead",
+            domain="core",
+            event_type="runner.deactivated",
+            dedupe_key=f"runner.deactivated:{runner_id}",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+        # Back-date created_at to simulate an aging alert.
+        from sqlalchemy import update as _sa_update
+        from app.models import Alert as _Alert
+        await db_session.execute(
+            _sa_update(_Alert)
+            .where(_Alert.id == alert.id)
+            .values(created_at=_utcnow() - timedelta(hours=age_hours))
+        )
+        await db_session.commit()
+        await db_session.refresh(alert)
+        return alert
+
+    @pytest.mark.asyncio
+    async def test_escalates_old_warning_alert(self, db_session):
+        """An open WARNING alert older than the threshold is escalated to ERROR."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session, project.id, status="inactive",
+            last_seen_at=_utcnow() - timedelta(hours=5),
+        )
+        alert = await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
+                db_session,
+                project_id=project.id,
+                runner_id=runner.id,
+                hostname=runner.hostname,
+            )
+        assert escalated is True
+        await db_session.refresh(alert)
+        assert alert.severity == AlertSeverity.ERROR
+        assert "escalated outage" in alert.title
+        webhook.assert_awaited_once()
+        assert webhook.await_args.args[0] == "RUNNER_OUTAGE_ESCALATED"
+
+    @pytest.mark.asyncio
+    async def test_skips_escalation_if_acknowledged(self, db_session):
+        """An ack'd alert is not escalated — operator already knows."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session, project.id, status="inactive",
+            last_seen_at=_utcnow() - timedelta(hours=5),
+        )
+        alert = await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
+        alert.acknowledged_at = _utcnow()
+        db_session.add(alert)
+        await db_session.commit()
+        with patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
+                db_session,
+                project_id=project.id,
+                runner_id=runner.id,
+            )
+        assert escalated is False
+        webhook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_escalation_if_alert_young(self, db_session):
+        """A recent alert (within threshold) is not escalated — flap suppression."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session, project.id, status="inactive",
+            last_seen_at=_utcnow() - timedelta(minutes=10),
+        )
+        alert = await self._seed_alert(db_session, project.id, runner.id, age_hours=0)
+        # Ensure created_at is very recent (minutes, not hours).
+        from sqlalchemy import update as _sa_update
+        from app.models import Alert as _Alert
+        await db_session.execute(
+            _sa_update(_Alert)
+            .where(_Alert.id == alert.id)
+            .values(created_at=_utcnow() - timedelta(minutes=10))
+        )
+        await db_session.commit()
+        with patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            escalated = await alert_dispatch._maybe_escalate_runner_deactivated_alert(
+                db_session,
+                project_id=project.id,
+                runner_id=runner.id,
+            )
+        assert escalated is False
+        webhook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sweep_escalates_inactive_runner(self, db_session):
+        """_sweep_runner_deactivated_escalations fires escalation for aged alerts."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session, project.id, status="inactive",
+            last_seen_at=_utcnow() - timedelta(hours=5),
+        )
+        await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
+        with patch(
+            "app.alert_dispatch.broadcast_to_project", new=AsyncMock()
+        ), patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._sweep_runner_deactivated_escalations(db_session)
+        webhook.assert_awaited_once()
+        assert webhook.await_args.args[0] == "RUNNER_OUTAGE_ESCALATED"
+
+    @pytest.mark.asyncio
+    async def test_sweep_skips_active_runner(self, db_session):
+        """_sweep_runner_deactivated_escalations skips if runner recovered (active)."""
+        project = await _make_project(db_session)
+        runner, _ = await _make_runner(
+            db_session, project.id, status="active",
+            last_seen_at=_utcnow() - timedelta(minutes=1),
+        )
+        await self._seed_alert(db_session, project.id, runner.id, age_hours=5)
+        with patch(
+            "app.alert_dispatch._send_webhook_notification", new=AsyncMock()
+        ) as webhook:
+            await orch._sweep_runner_deactivated_escalations(db_session)
+        webhook.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_endpoint_stamps_timestamp(
+        self, client: AsyncClient, db_session
+    ):
+        """POST /alerts/{id}/acknowledge sets acknowledged_at."""
+        project = await _make_project(db_session)
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="Test runner alert",
+            message="down",
+            event_type="runner.deactivated",
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "acknowledged"
+        await db_session.refresh(alert)
+        assert alert.acknowledged_at is not None
+
+    @pytest.mark.asyncio
+    async def test_acknowledge_endpoint_idempotent(
+        self, client: AsyncClient, db_session
+    ):
+        """Acknowledging an already-acknowledged alert is a no-op (200)."""
+        project = await _make_project(db_session)
+        acked_at = _utcnow() - timedelta(minutes=1)
+        alert = Alert(
+            project_id=project.id,
+            severity=AlertSeverity.WARNING,
+            title="Test runner alert",
+            message="down",
+            event_type="runner.deactivated",
+            acknowledged_at=acked_at,
+        )
+        db_session.add(alert)
+        await db_session.commit()
+        await db_session.refresh(alert)
+        resp = await client.post(f"/api/admin/alerts/{alert.id}/acknowledge")
+        assert resp.status_code == 200
+        await db_session.refresh(alert)
+        # acknowledged_at should not be updated on second call.
+        assert alert.acknowledged_at is not None
 
 
 class TestDeadRunnerAttention:

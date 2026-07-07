@@ -1100,6 +1100,79 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
                 "[RUNNERS] Failed to emit stale-runner refetch for project %s",
                 project_id,
             )
+    # Escalate alerts for runners that have been inactive past the threshold.
+    try:
+        await _sweep_runner_deactivated_escalations(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep runner-deactivated escalations")
+
+
+async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
+    """Escalate aging runner-outage alerts past the configured threshold.
+
+    Queries open WARNING-severity runner-deactivated alerts older than
+    ``runner_escalation_age_seconds`` (default 4h) and fires an escalated
+    ERROR-severity notification for each unacknowledged runner that is still
+    inactive. Called at the end of every ``_deactivate_stale_runners`` cycle.
+
+    Flap suppression is natural: a runner that re-arms before the threshold
+    dismisses its open alert (via ``_resolve_runner_deactivated_alert``), so this
+    sweep finds nothing to escalate for a briefly-flapping runner.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_DEACTIVATED_EVENT_TYPE,
+        _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT,
+        _maybe_escalate_runner_deactivated_alert,
+    )
+    from app.models import Alert, AlertSeverity
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_escalation_age_seconds", _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT
+        )
+    )
+    escalation_cutoff = _utcnow() - timedelta(seconds=threshold)
+    rows = (
+        await session.execute(
+            select(Alert).where(
+                Alert.event_type == _RUNNER_DEACTIVATED_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+                Alert.severity == AlertSeverity.WARNING,
+                Alert.created_at <= escalation_cutoff,
+            )
+        )
+    ).scalars().all()
+
+    for alert in rows:
+        if not alert.dedupe_key:
+            continue
+        # Reconstruct runner_id from dedupe_key: "runner.deactivated:{runner_id}"
+        parts = alert.dedupe_key.split(":", 1)
+        if len(parts) != 2:
+            continue
+        try:
+            runner_id = uuid.UUID(parts[1])
+        except ValueError:
+            continue
+        runner = await session.get(LocalRunner, runner_id)
+        if runner is None or runner.status == "active":
+            continue
+        try:
+            await _maybe_escalate_runner_deactivated_alert(
+                session,
+                project_id=alert.project_id,
+                runner_id=runner_id,
+                hostname=runner.hostname,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to escalate runner-deactivated alert for %s",
+                runner_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception("[RUNNERS] rollback after escalation failure failed")
 
 
 # Consecutive-failure count at which a live runner is considered degraded.

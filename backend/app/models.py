@@ -2615,6 +2615,14 @@ class Alert(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Operator acknowledgement: set when the operator acknowledges an ongoing
+    # outage alert (e.g. runner offline) to suppress further escalation re-pages
+    # until the alert auto-resolves on recovery. Distinct from dismissed_at: the
+    # alert remains visible; only escalation webhooks are gated on this field.
+    acknowledged_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),

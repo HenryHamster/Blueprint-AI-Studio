@@ -416,6 +416,7 @@ from app.orchestrator_runner_dispatch import (  # noqa: F401
     _runner_handles_task_type,
     _select_eligible_runner,
     _strategic_local_hold_timeout_seconds,
+    _sweep_runner_deactivated_escalations,
     _task_requires_strategic_local_runner,
     _try_runner_dispatch,
     _try_strategic_local_required_runner_path,

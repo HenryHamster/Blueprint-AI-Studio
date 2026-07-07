@@ -1703,6 +1703,12 @@ _RUNNER_DEGRADED_EVENT_TYPE = "runner.degraded"
 _RUNNER_ESCALATION_FIRST_SECONDS = 3600    # 1h
 _RUNNER_ESCALATION_REPEAT_SECONDS = 14400  # 4h
 _runner_escalation_last_notified: dict[str, "datetime"] = {}
+# Dedupe keys of alerts escalated from WARNING→ERROR by the singular
+# _maybe_escalate_runner_deactivated_alert path (RUNNER_OUTAGE_ESCALATED).
+# Used to distinguish "escalated-to-ERROR by sweep" from "born-ERROR
+# (had_active_work)" so the periodic re-notification sweep (_maybe_escalate_
+# runner_deactivated_alerts) can still page for mid-job deaths.
+_runner_outage_escalated_keys: set[str] = set()
 
 
 def _runner_deactivated_dedupe_key(runner_id: "uuid.UUID | str") -> str:
@@ -1827,6 +1833,104 @@ async def _maybe_create_runner_deactivated_alert(
     return True
 
 
+# Escalation age threshold: a runner inactive past this duration triggers a
+# second, ERROR-severity escalation notification. Configurable at runtime via
+# ``runner_escalation_age_seconds`` (default 4h). The flap-suppression window is
+# implicit: a runner that re-arms before the threshold never gets escalated
+# because recovery dismisses the alert before the sweep reaches it.
+_RUNNER_ESCALATION_AGE_SECONDS_DEFAULT = 4 * 3600  # 4 hours
+
+
+async def _maybe_escalate_runner_deactivated_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+) -> bool:
+    """Escalate a long-running runner outage from WARNING to ERROR and re-page.
+
+    Called from the orchestrator's stale-runner escalation sweep for inactive
+    runners whose open deactivation alert is older than the configured escalation
+    threshold (default 4h). Produces a second, escalated notification distinct
+    from the initial RUNNER_DEACTIVATED page. Skipped if:
+
+    * No open deactivation alert exists (runner already recovered or never paged).
+    * The alert has been acknowledged by the operator (``acknowledged_at`` set).
+    * The alert's severity is already ERROR (already escalated this cycle).
+    * The alert's age (``created_at`` to now) is below the threshold.
+
+    Flap suppression is natural: a runner that recovers before the threshold
+    dismisses its alert (via ``_resolve_runner_deactivated_alert``), so the sweep
+    finds nothing to escalate. Commits its own row; caller wraps best-effort.
+    Returns True when an escalation notification was fired.
+    """
+    threshold = int(
+        _runtime_config.get(
+            "runner_escalation_age_seconds", _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT
+        )
+    )
+    dedupe_key = _runner_deactivated_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    alert = result.scalars().first()
+    if alert is None:
+        return False
+    if alert.acknowledged_at is not None:
+        return False
+    if alert.severity == AlertSeverity.ERROR:
+        return False
+    now = _utcnow()
+    age_seconds = (now - alert.created_at).total_seconds()
+    if age_seconds < threshold:
+        return False
+
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    age_str = _fmt_duration_seconds(int(age_seconds))
+    hours = threshold // 3600
+    alert.severity = AlertSeverity.ERROR
+    alert.title = f"Fleet runner offline — escalated outage: {runner_label}"
+    alert.occurrence_count = int(alert.occurrence_count or 1) + 1
+    alert.last_seen_at = now
+    session.add(alert)
+    await session.commit()
+    await broadcast_to_project(
+        str(project_id),
+        "alert_updated",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+        },
+    )
+    await _send_webhook_notification(
+        "RUNNER_OUTAGE_ESCALATED",
+        alert.title,
+        (
+            f"Runner {runner_label} has been offline for {age_str} "
+            f"(threshold: {hours}h). Immediate action required — bring the "
+            f"runner back online or retarget its work."
+        ),
+    )
+    logger.warning(
+        "[RUNNERS] Escalated runner-deactivated alert for %s (%s): offline %s",
+        runner_label,
+        runner_id,
+        age_str,
+    )
+    # Record that this alert was escalated via the singular path so the periodic
+    # re-notification sweep (_maybe_escalate_runner_deactivated_alerts) knows to
+    # skip it and not double-page with a RUNNER_DEACTIVATED on top of the
+    # RUNNER_OUTAGE_ESCALATED already fired here.
+    _runner_outage_escalated_keys.add(dedupe_key)
+    return True
+
+
 async def _resolve_runner_deactivated_alert(
     session: AsyncSession,
     project_id: "uuid.UUID",
@@ -1874,6 +1978,7 @@ async def _resolve_runner_deactivated_alert(
         # Clear escalation state so the next outage starts fresh.
         if alert.dedupe_key:
             _runner_escalation_last_notified.pop(alert.dedupe_key, None)
+            _runner_outage_escalated_keys.discard(alert.dedupe_key)
     return len(open_alerts)
 
 
@@ -1903,6 +2008,23 @@ async def _maybe_escalate_runner_deactivated_alerts(session: AsyncSession) -> in
     dispatched = 0
     for alert in open_alerts:
         if alert.dedupe_key is None:
+            continue
+        # Honour the acknowledged_at contract: operator acknowledgement suppresses
+        # further re-pages until the runner recovers (alert auto-resolves).  This
+        # mirrors the check in the singular _maybe_escalate_runner_deactivated_alert
+        # (alert_dispatch.py:1884) and is especially important for born-ERROR alerts
+        # (had_active_work=True) which are never added to _runner_outage_escalated_keys
+        # and therefore reach this sweep exclusively.  Also fixes the restart edge-case
+        # where an acknowledged WARNING→ERROR alert re-pages because the in-memory set
+        # is empty after a process restart.
+        if alert.acknowledged_at is not None:
+            continue
+        # Skip alerts that were escalated from WARNING→ERROR by the singular
+        # _maybe_escalate_runner_deactivated_alert path (RUNNER_OUTAGE_ESCALATED
+        # was already fired there). Keying off the dedicated set — not raw severity
+        # — lets born-ERROR alerts (had_active_work=True, created at ERROR severity)
+        # still receive periodic RUNNER_DEACTIVATED re-notifications here.
+        if alert.dedupe_key in _runner_outage_escalated_keys:
             continue
         age_s = (now - alert.created_at).total_seconds()
         last_notified = _runner_escalation_last_notified.get(alert.dedupe_key)

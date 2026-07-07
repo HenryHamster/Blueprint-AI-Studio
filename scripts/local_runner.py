@@ -252,6 +252,33 @@ def _hostname() -> str | None:
     return name or None
 
 
+def _runner_version() -> str | None:
+    """Best-effort runner version from ``git describe`` in the scripts directory.
+
+    Sent on every heartbeat so the operator's fleet view can see which build each
+    heterogeneous device is running (a stale runner is a common cause of a device
+    silently declining a task class). Returns a short version string (tag/sha,
+    ``-dirty`` when the working tree has uncommitted changes) or ``None`` on ANY
+    failure — git absent, not a repo, timeout — so a version probe never breaks a
+    heartbeat (the schema tolerates a missing version; old runners omit it).
+    """
+    scripts_dir = os.path.dirname(os.path.abspath(__file__))
+    try:
+        result = subprocess.run(
+            ["git", "describe", "--tags", "--always", "--dirty"],
+            cwd=scripts_dir,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    version = result.stdout.strip()
+    return version or None
+
+
 def _node_runtime_ok() -> bool:
     """Return True iff ``node --version`` actually runs (binary present + executable).
 
@@ -822,6 +849,10 @@ def _heartbeat_loop(
     # is enrolled from the browser, which cannot know the host's name, so this is
     # the only place the hostname is populated).
     hostname = _hostname()
+    # Runner version is stable for the process lifetime — resolve it once (a git
+    # describe shell-out) and send it on every heartbeat so the fleet view can show
+    # which build each device runs. Best-effort: None when git/the repo is absent.
+    version = _runner_version()
     consecutive_401 = 0
     while not _shutdown_event.is_set():
         try:
@@ -844,9 +875,10 @@ def _heartbeat_loop(
             # If NEITHER leg is satisfiable, agent_available=False and the
             # orchestrator stops pinning agent tasks here. When agent_image is None
             # this collapses to the prior bwrap-only behavior (no regression).
+            agent_binary_present = _locate_agent_binary() is not None
             bwrap_agent_ok = (
                 agent_sandbox_ok
-                and _locate_agent_binary() is not None
+                and agent_binary_present
                 and _node_runtime_ok()
             )
             # A docker-only box (docker+image WITHOUT bwrap) advertises
@@ -876,12 +908,32 @@ def _heartbeat_loop(
             last_success_at, consecutive_failures = (
                 telemetry.snapshot() if telemetry is not None else (None, 0)
             )
+            # Isolation-backend inventory + selected backends for per-device
+            # observability. Gated on caps: an old caller may pass caps=None, in
+            # which case these serialize as null (the schema tolerates them absent).
+            if caps is not None:
+                isolation_backends = iso.capabilities_inventory(caps)
+                agent_backend = iso.decide_agent_backend(
+                    caps, agent_binary_present=agent_binary_present,
+                    agent_image=agent_image,
+                )
+                compute_backend = iso.decide_compute_backend(
+                    caps, has_image=agent_image is not None
+                )
+            else:
+                isolation_backends = None
+                agent_backend = None
+                compute_backend = None
             body = {
                 "active_task_ids": task_ids,
                 "active_compute_job_ids": compute_job_ids,
                 "agent_available": agent_available,
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
+                "version": version,
+                "isolation_backends": isolation_backends,
+                "agent_backend": agent_backend,
+                "compute_backend": compute_backend,
                 # Health telemetry consumed by the orchestrator to spot a runner
                 # that is failing every job / running low on disk / idle-GPU.
                 "last_successful_job_at": last_success_at,
@@ -1870,6 +1922,17 @@ def _preflight(
                 "agent_available": claimable[iso.CLASS_AGENT],
                 "supported_agent_task_types": supported_agent_task_types,
                 "hostname": hostname,
+                "version": _runner_version(),
+                # Isolation-backend inventory + selected backends so `--check`
+                # populates the fleet view the same way the running heartbeat does.
+                "isolation_backends": iso.capabilities_inventory(caps),
+                "agent_backend": iso.decide_agent_backend(
+                    caps, agent_binary_present=agent_binary is not None,
+                    agent_image=agent_image,
+                ),
+                "compute_backend": iso.decide_compute_backend(
+                    caps, has_image=agent_image is not None
+                ),
                 **gpu_caps,
             },
         )

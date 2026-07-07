@@ -166,6 +166,14 @@ class HeartbeatRequest(BaseModel):
     supported_agent_task_types: list[StrictStr] | None = None
     hostname: Optional[str] = None
     version: Optional[str] = None
+    # Runner-reported isolation-backend inventory + selected backends (optional;
+    # old runners omit these). isolation_backends is a flat {backend: bool} map
+    # (bwrap_ok/userns_ok/docker_usable/podman_usable/apptainer_ok/enroot_ok/
+    # systemd_run_ok); agent_backend/compute_backend name the backend the runner
+    # would use for each class. All ride in capabilities JSONB for the fleet panel.
+    isolation_backends: Optional[dict] = None
+    agent_backend: Optional[str] = None
+    compute_backend: Optional[str] = None
     # Runner-reported hardware capabilities (optional; old runners omit these).
     has_gpu: Optional[StrictBool] = None
     gpu_count: Optional[int] = None
@@ -305,6 +313,15 @@ async def heartbeat(
     # Tolerated as absent so older runners keep heartbeating unchanged.
     if payload.supported_agent_task_types is not None:
         caps["supported_agent_task_types"] = list(payload.supported_agent_task_types)
+    # Isolation-backend inventory + selected backends. Additive to the JSONB (no
+    # migration needed) so the fleet panel can show per-device backend availability.
+    # All optional and tolerated as missing so older runners keep heartbeating.
+    if payload.isolation_backends is not None:
+        caps["isolation_backends"] = payload.isolation_backends
+    if payload.agent_backend is not None:
+        caps["agent_backend"] = payload.agent_backend
+    if payload.compute_backend is not None:
+        caps["compute_backend"] = payload.compute_backend
     if payload.has_gpu is not None:
         caps["has_gpu"] = payload.has_gpu
     if payload.gpu_count is not None:

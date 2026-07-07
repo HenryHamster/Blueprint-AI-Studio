@@ -425,9 +425,12 @@ def decide_agent_backend(
       * ``DECLINE`` — neither boundary can be built.
 
     CRITICAL invariant: when ``agent_image`` is falsy the result is byte-identical
-    to the historical bwrap-or-decline table below — the docker branch is inert,
-    so there is no behavioral change for callers that do not pass an image.
+    to the historical bwrap-or-decline table — the docker branch is inert.
     """
+    # Preferred: rootless bwrap when binary + sandbox are both available.
+    if agent_binary_present and caps.bwrap_ok:
+        return BACKEND_BWRAP
+    # Reserved docker fallback: bwrap unavailable, but prod image + usable docker.
     if (
         agent_image
         and caps.docker_usable
@@ -436,8 +439,6 @@ def decide_agent_backend(
         return BACKEND_DOCKER
     if not agent_binary_present:
         return DECLINE
-    if caps.bwrap_ok:
-        return BACKEND_BWRAP
     return DECLINE
 
 
@@ -476,6 +477,28 @@ def compute_decline_reason(caps: Capabilities, has_image: bool) -> str | None:
             "sandbox (install a container runtime or bubblewrap)"
         )
     return "no bwrap sandbox for imageless compute (install bubblewrap)"
+
+
+def capabilities_inventory(caps: Capabilities) -> dict[str, bool]:
+    """Return the runner's isolation-backend availability inventory (JSON-safe).
+
+    A flat ``{backend: bool}`` map surfaced in the heartbeat so the operator's
+    fleet view can show WHICH isolation backends each heterogeneous device can
+    actually build a sandbox with — instead of a single opaque ``agent_available``
+    flag. The values are the SAME derived predicates the decision table keys on
+    (``caps.bwrap_ok`` property, the ``*_usable`` probes, and ``bool(path)`` for
+    the path-only HPC backends), so this can never drift from :func:`detect_capabilities`.
+    Every value is a plain ``bool`` → the dict is ``json.dumps``-serializable.
+    """
+    return {
+        "bwrap_ok": caps.bwrap_ok,
+        "userns_ok": caps.userns_ok,
+        "docker_usable": caps.docker_usable,
+        "podman_usable": caps.podman_usable,
+        "apptainer_ok": bool(caps.apptainer_path),
+        "enroot_ok": bool(caps.enroot_path),
+        "systemd_run_ok": bool(caps.systemd_run_path),
+    }
 
 
 def claimable_classes(caps: Capabilities, agent_binary_present: bool) -> dict[str, bool]:
@@ -1148,7 +1171,9 @@ def plan_agent_execution(
         source_env,
         {
             **injected_env,
-            "AGENT_WORKSPACE": SANDBOX_WORKSPACE,
+            # Point the agent at a subdirectory of the bind mount, not the
+            # mountpoint itself: rm -rf on the mountpoint returns EBUSY.
+            "AGENT_WORKSPACE": SANDBOX_WORKSPACE + "/agent",
             "HOME": SANDBOX_HOME,
         },
         tool_dirs_for(tools),

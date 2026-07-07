@@ -73,6 +73,36 @@ class TestDecisionTable(unittest.TestCase):
             iso.BACKEND_BWRAP,
         )
 
+    def test_decide_agent_backend_prefers_bwrap_when_usable(self):
+        # bwrap_ok + binary + usable docker + eligible image → bwrap wins (preferred).
+        both = _caps(docker_usable=True, bwrap_path="/usr/bin/bwrap", userns_ok=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                both, True, task_type="research", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_BWRAP,
+        )
+        # Same for task_type=None (unclassified).
+        self.assertEqual(
+            iso.decide_agent_backend(both, True, agent_image="reg/agent:latest"),
+            iso.BACKEND_BWRAP,
+        )
+        # Docker reserved when bwrap unavailable (no binary either — image ships its own).
+        docker_only = _caps(docker_usable=True)
+        self.assertEqual(
+            iso.decide_agent_backend(
+                docker_only, False, task_type="research", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_DOCKER,
+        )
+        # bwrap_ok but no binary + eligible image + usable docker → docker fallback.
+        self.assertEqual(
+            iso.decide_agent_backend(
+                both, False, task_type="research", agent_image="reg/agent:latest"
+            ),
+            iso.BACKEND_DOCKER,
+        )
+
     def test_agent_docker_declined_for_write_task_type(self):
         # A write/heavy type is NOT eligible for the read-only image → it falls
         # through to the bwrap/decline table unchanged.
@@ -613,8 +643,9 @@ class TestAgentPlan(unittest.TestCase):
         self.assertEqual(plan.env["AGENT_SECRET_TOKEN"], "SUPER-SECRET-JWT")
         self.assertEqual(plan.env["ANTHROPIC_API_KEY"], "sk-ant")
         self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", plan.env)
-        # Workspace bound; AGENT_WORKSPACE points inside the sandbox.
-        self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace")
+        # Workspace bound; AGENT_WORKSPACE points at a subdirectory (not the
+        # bind mountpoint itself) so the agent's rm -rf avoids EBUSY.
+        self.assertEqual(plan.env["AGENT_WORKSPACE"], "/workspace/agent")
         self.assertIn("/tmp/ws/t1", plan.argv)
 
     def test_agent_plan_docker_backend(self):
@@ -751,6 +782,70 @@ class TestComputePlan(unittest.TestCase):
     def test_decline_when_no_boundary(self):
         plan = self._common(caps=_caps())
         self.assertTrue(plan.declined)
+
+
+# ── Capabilities inventory (heartbeat backend-availability map) ────────────────
+
+class TestCapabilitiesInventory(unittest.TestCase):
+    _EXPECTED_KEYS = {
+        "bwrap_ok",
+        "userns_ok",
+        "docker_usable",
+        "podman_usable",
+        "apptainer_ok",
+        "enroot_ok",
+        "systemd_run_ok",
+    }
+
+    def test_all_flags_true(self):
+        caps = _caps(
+            bwrap_path="/usr/bin/bwrap",
+            userns_ok=True,
+            docker_usable=True,
+            podman_usable=True,
+            apptainer_path="/usr/bin/apptainer",
+            enroot_path="/usr/bin/enroot",
+            systemd_run_path="/usr/bin/systemd-run",
+        )
+        inv = iso.capabilities_inventory(caps)
+        self.assertTrue(all(inv.values()))
+        self.assertEqual(set(inv), self._EXPECTED_KEYS)
+
+    def test_bwrap_ok_reflects_userns_property_semantics(self):
+        # bwrap binary present but userns unavailable → bwrap_ok is False (the
+        # Capabilities.bwrap_ok property couples the binary AND userns), while
+        # userns_ok is independently reported False.
+        caps = _caps(bwrap_path="/usr/bin/bwrap", userns_ok=False)
+        inv = iso.capabilities_inventory(caps)
+        self.assertFalse(inv["bwrap_ok"])
+        self.assertFalse(inv["userns_ok"])
+
+    def test_path_only_backends_use_bool_of_path(self):
+        caps = _caps(
+            apptainer_path="/usr/bin/apptainer",
+            enroot_path="/usr/bin/enroot",
+            systemd_run_path="/usr/bin/systemd-run",
+        )
+        inv = iso.capabilities_inventory(caps)
+        self.assertTrue(inv["apptainer_ok"])
+        self.assertTrue(inv["enroot_ok"])
+        self.assertTrue(inv["systemd_run_ok"])
+
+    def test_empty_caps_all_false(self):
+        inv = iso.capabilities_inventory(_caps())
+        self.assertEqual(set(inv), self._EXPECTED_KEYS)
+        self.assertFalse(any(inv.values()))
+
+    def test_json_serializable_with_exact_keys(self):
+        import json
+
+        caps = _caps(docker_usable=True)
+        inv = iso.capabilities_inventory(caps)
+        # Round-trips through JSON and every value is a real bool.
+        reloaded = json.loads(json.dumps(inv))
+        self.assertEqual(set(reloaded), self._EXPECTED_KEYS)
+        for value in reloaded.values():
+            self.assertIsInstance(value, bool)
 
 
 if __name__ == "__main__":

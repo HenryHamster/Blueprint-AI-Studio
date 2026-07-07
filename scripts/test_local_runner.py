@@ -1283,6 +1283,82 @@ class TestGpuDetection(unittest.TestCase):
         with patch.object(local_runner.socket, "gethostname", side_effect=OSError):
             self.assertIsNone(local_runner._hostname())
 
+    def test_isolation_backends_included_in_heartbeat_body(self):
+        """Heartbeat body carries the isolation-backend inventory, selected
+        agent/compute backends, and the runner version when caps are supplied."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value="v22-abc"), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value="/agent/dist/index.js"), \
+                 patch.object(local_runner, "_node_runtime_ok", return_value=True):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                    caps=_bwrap_caps(),
+                    agent_image=None,
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertEqual(body["version"], "v22-abc")
+        self.assertIsInstance(body["isolation_backends"], dict)
+        self.assertTrue(body["isolation_backends"]["bwrap_ok"])
+        self.assertFalse(body["isolation_backends"]["docker_usable"])
+        # bwrap host with an agent binary → bwrap agent backend, bwrap compute.
+        self.assertEqual(body["agent_backend"], iso.BACKEND_BWRAP)
+        self.assertEqual(body["compute_backend"], iso.BACKEND_BWRAP)
+
+    def test_isolation_fields_none_when_caps_absent(self):
+        """caps=None (an old caller) → the three isolation fields serialize as
+        None so the heartbeat is non-breaking and the backend tolerates them."""
+        posted_bodies = []
+
+        def fake_post(url, token, body, **kwargs):
+            posted_bodies.append(body)
+            local_runner._shutdown_event.set()
+            return 200, {"ok": True}
+
+        active_tasks: dict = {}
+        lock = threading.Lock()
+        local_runner._shutdown_event.clear()
+
+        try:
+            with patch.object(local_runner, "_post", fake_post), \
+                 patch.object(local_runner, "_runner_version", return_value=None), \
+                 patch.object(local_runner, "_locate_agent_binary", return_value=None):
+                local_runner._heartbeat_loop(
+                    "https://api",
+                    "tok",
+                    active_tasks,
+                    lock,
+                    {"has_gpu": False, "gpu_count": 0, "gpu_names": []},
+                )
+        finally:
+            local_runner._shutdown_event.clear()
+
+        self.assertEqual(len(posted_bodies), 1)
+        body = posted_bodies[0]
+        self.assertIsNone(body["isolation_backends"])
+        self.assertIsNone(body["agent_backend"])
+        self.assertIsNone(body["compute_backend"])
+        self.assertIsNone(body["version"])
+
     def test_docker_only_declares_read_only_agent_slice(self):
         """A docker-only box (docker+image, NO bwrap) DECLARES the read-only agent
         slice in supported_agent_task_types.
@@ -1962,6 +2038,35 @@ class TestFunctionalProbes(unittest.TestCase):
         fake.stdout = "250\n"
         with patch("subprocess.run", return_value=fake):
             self.assertEqual(local_runner._gpu_utilization_pct(), 100)
+
+    def test_runner_version_returns_describe_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "v22-15-gabc1234-dirty\n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertEqual(local_runner._runner_version(), "v22-15-gabc1234-dirty")
+
+    def test_runner_version_none_on_nonzero_exit(self):
+        fake = MagicMock()
+        fake.returncode = 128  # not a git repo
+        fake.stdout = ""
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_when_git_absent(self):
+        with patch("subprocess.run", side_effect=FileNotFoundError):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_on_os_error(self):
+        with patch("subprocess.run", side_effect=OSError):
+            self.assertIsNone(local_runner._runner_version())
+
+    def test_runner_version_none_on_empty_output(self):
+        fake = MagicMock()
+        fake.returncode = 0
+        fake.stdout = "   \n"
+        with patch("subprocess.run", return_value=fake):
+            self.assertIsNone(local_runner._runner_version())
 
 
 class TestAgentWallClockDeadline(unittest.TestCase):

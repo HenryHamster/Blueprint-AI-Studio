@@ -142,6 +142,45 @@ describe('FleetRunnersPanel — behavioral', () => {
     expect(el.textContent).toContain('never seen');
   });
 
+  // ── Isolation-backend inventory ──────────────────────────────────────────────
+
+  test('renders isolation-backend pills and selected agent/compute backends', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: {
+          ...SAMPLE_RUNNERS[0].capabilities,
+          isolation_backends: { bwrap_ok: true, docker_usable: true, podman_usable: false },
+          agent_backend: 'bwrap',
+          compute_backend: 'docker',
+        },
+      },
+    ]);
+    const el = await mount();
+    const section = el.querySelector('[data-testid="fleet-runner-backends"]');
+    expect(section).not.toBeNull();
+    // Only the truthy flags surface as pills (podman is false → absent).
+    expect(section?.textContent).toContain('bwrap');
+    expect(section?.textContent).toContain('docker');
+    expect(section?.textContent).not.toContain('podman');
+    // Selected backends are called out with a → indicator.
+    expect(section?.textContent).toContain('agent→bwrap');
+    expect(section?.textContent).toContain('compute→docker');
+    // The selected bwrap pill gets the emerald highlight; a non-selected pill would not.
+    expect(section?.querySelector('.text-emerald-300')).not.toBeNull();
+  });
+
+  test('hides the backends section for an older runner without isolation_backends', async () => {
+    vi.mocked(listFleetRunners).mockResolvedValueOnce([
+      {
+        ...SAMPLE_RUNNERS[0],
+        capabilities: { task_types: 'all', has_gpu: true, max_concurrent: 2 },
+      },
+    ]);
+    const el = await mount();
+    expect(el.querySelector('[data-testid="fleet-runner-backends"]')).toBeNull();
+  });
+
   // ── Enroll runner ────────────────────────────────────────────────────────────
 
   test('enrolling a runner calls registerFleetRunner and shows the token dialog', async () => {

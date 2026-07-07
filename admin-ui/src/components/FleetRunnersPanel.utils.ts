@@ -1,4 +1,51 @@
+import type { FleetRunner } from '../api';
+
 export type RunnerSetupPreset = 'default' | 'strategic_local';
+
+/**
+ * Ordered map from the runner's isolation-backend availability flag (as reported
+ * in `capabilities.isolation_backends`) to the short label shown in the fleet
+ * panel. Order here is the display order of the "available" pills.
+ */
+const ISOLATION_BACKEND_LABELS: ReadonlyArray<{ flag: string; label: string }> = [
+  { flag: 'bwrap_ok', label: 'bwrap' },
+  { flag: 'docker_usable', label: 'docker' },
+  { flag: 'podman_usable', label: 'podman' },
+  { flag: 'apptainer_ok', label: 'apptainer' },
+  { flag: 'enroot_ok', label: 'enroot' },
+];
+
+export interface BackendInventory {
+  /** Short labels for isolation backends the runner reported as usable. */
+  available: string[];
+  /** Selected agent-task isolation backend, or null if the runner didn't report one. */
+  agentBackend: string | null;
+  /** Selected compute-job isolation backend, or null if the runner didn't report one. */
+  computeBackend: string | null;
+}
+
+/**
+ * Reduce a runner's `capabilities` into display-ready isolation-backend data:
+ * the list of usable backends (only truthy flags), plus the selected agent and
+ * compute backends. Older runners that never reported `isolation_backends`
+ * yield an empty `available` list, so the panel can hide the section entirely.
+ */
+export function formatBackendInventory(
+  capabilities: FleetRunner['capabilities'],
+): BackendInventory {
+  const flags = capabilities?.isolation_backends;
+  const available: string[] = [];
+  if (flags) {
+    for (const { flag, label } of ISOLATION_BACKEND_LABELS) {
+      if (flags[flag as keyof typeof flags]) available.push(label);
+    }
+  }
+  return {
+    available,
+    agentBackend: capabilities?.agent_backend ?? null,
+    computeBackend: capabilities?.compute_backend ?? null,
+  };
+}
 
 /** Human-readable binary byte size: 1536 → "1.5 KiB", 2147483648 → "2 GiB". */
 export function formatBytes(bytes: number): string {

@@ -4429,6 +4429,19 @@ export interface FleetRunner {
     workload?: string;
     gpu_count?: number;
     gpu_names?: string[];
+    // Isolation-backend inventory + selected backends reported by the runner
+    // heartbeat, for per-device observability in the fleet panel.
+    isolation_backends?: {
+      bwrap_ok?: boolean;
+      userns_ok?: boolean;
+      docker_usable?: boolean;
+      podman_usable?: boolean;
+      apptainer_ok?: boolean;
+      enroot_ok?: boolean;
+      systemd_run_ok?: boolean;
+    };
+    agent_backend?: string;
+    compute_backend?: string;
     // Display-only trust telemetry stashed on capabilities at heartbeat.
     disk_free_bytes?: number;
     gpu_utilization_pct?: number;
