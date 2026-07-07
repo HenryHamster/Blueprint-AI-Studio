@@ -48,11 +48,15 @@ verified > merged or proven > declared), ``first_attempt_rate_denominator_covera
 ``_first_attempt_succeeded`` so the FA-rate denominator is representative), and
 ``sr_catch_rate_cache_freshness`` (checks that each project's persisted
 ``sr_catch_rate_trends`` cache is within the staleness window so operators see
-up-to-date catch-rate trends), and ``evidence_claim_reconciliation``
+up-to-date catch-rate trends), ``evidence_claim_reconciliation``
 (re-verifies structured gap ``evidence_refs`` against HEAD via the tri-state
 path helper and flags gaps whose path-backed proven evidence was definitely
 removed — contradicted — or whose evidence is absent while the gap claims
-closure; an indeterminate (None) check NEVER flags).
+closure; an indeterminate (None) check NEVER flags), and
+``capability_claim_reconciliation`` (re-verifies each working/partial capability's
+``backing_paths`` against HEAD via the same tri-state helper and flags capabilities
+whose EVERY declared backing path was definitely removed; indeterminate (None)
+and planned capabilities are NEVER flagged).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -2724,4 +2728,159 @@ async def check_saturated_direction_with_nonmerge_productivity(
             )
         ]
 
+    return results
+
+
+@register_check(
+    "capability_claim_reconciliation",
+    "Re-verify working/partial capability backing_paths against HEAD and flag "
+    "capabilities whose EVERY declared backing path was definitely removed. An "
+    "indeterminate (None) path check NEVER flags — only definite removal counts.",
+)
+async def check_capability_claim_reconciliation(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a capability declared 'working' or 'partial' whose
+    ``backing_paths`` ALL return a definite False from the tri-state HEAD check is
+    claiming operational status while its backing code no longer exists. This
+    standing check re-verifies each backing path via
+    :func:`app.source_ref_validation._path_exists_at_head` and flags the
+    capability only when EVERY path is definitively removed.
+
+    CRITICAL HONESTY RULE (mirrors ``evidence_claim_reconciliation`` exactly): the
+    path helper returns True / False / None. Only a definite ``False`` for ALL
+    declared paths triggers a flag. A single ``True`` (still present) OR a single
+    ``None`` (indeterminate: no checkout, git error, timeout, rate-limit) anywhere
+    in the path list PREVENTS the flag — an outage must never be laundered into
+    'removed'. ``planned`` capabilities are aspirational (code not yet built) and
+    are NEVER flagged for absent backing paths.
+
+    Flag-only and side-effect-free in every mode: reads ``problem_model`` JSONB
+    directly and only constructs :class:`CheckResult` values — NEVER mutates the
+    durable capability. Bounded to ``ctx.max_projects`` projects.
+    """
+    from app import source_ref_validation as _srv
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.problem_model).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="capability_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    for project_id, raw_pm in projects:
+        pid = str(project_id)
+        pm = raw_pm if isinstance(raw_pm, dict) else {}
+        capabilities = pm.get("capabilities") if isinstance(pm, dict) else None
+        if not isinstance(capabilities, list) or not capabilities:
+            continue
+
+        # Eligible: working/partial capabilities with at least one file-path-shaped
+        # backing_path. planned capabilities are aspirational — never flagged.
+        eligible: List[dict] = []
+        for cap in capabilities:
+            if not isinstance(cap, dict):
+                continue
+            if cap.get("status") not in ("working", "partial"):
+                continue
+            paths = cap.get("backing_paths")
+            if not isinstance(paths, list) or not paths:
+                continue
+            # Keep only paths that look like repo file paths; skip logical ids.
+            file_paths = [
+                p for p in paths
+                if isinstance(p, str) and p and _srv._looks_like_file_path(p)
+            ]
+            if not file_paths:
+                continue
+            eligible.append({"cap": cap, "file_paths": file_paths})
+
+        if not eligible:
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no working/partial capabilities with backing_paths to audit",
+                )
+            )
+            continue
+
+        any_checked = True
+        audited = len(eligible)
+        flagged_caps: List[str] = []
+
+        for item in eligible:
+            cap = item["cap"]
+            file_paths = item["file_paths"]
+
+            # Re-verify each backing path. A single True or None prevents a flag.
+            all_removed = True
+            for path in file_paths:
+                exists = await _srv._path_exists_at_head(path)
+                if exists is True or exists is None:
+                    # Present or indeterminate — do NOT flag. Stop early.
+                    all_removed = False
+                    break
+                # exists is False — definitely removed; keep checking remaining paths.
+
+            if all_removed:
+                cap_name = cap.get("name") or cap.get("id") or "unknown"
+                flagged_caps.append(cap_name)
+
+        if flagged_caps:
+            preview = ", ".join(flagged_caps[:3])
+            if len(flagged_caps) > 3:
+                preview += f" (+{len(flagged_caps) - 3} more)"
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=audited,
+                    ground_truth=audited - len(flagged_caps),
+                    delta=len(flagged_caps),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{len(flagged_caps)} working/partial capability(ies) whose "
+                        f"every declared backing path was removed at HEAD: {preview}"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="capability_claim_reconciliation",
+                    status=CheckStatus.OK,
+                    self_reported=audited,
+                    ground_truth=audited,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"{audited} working/partial capability(ies) with backing_paths "
+                        "reconciled; all paths still present or indeterminate at HEAD"
+                    ),
+                )
+            )
+
+    if not any_checked and not results:
+        return [
+            CheckResult(
+                check="capability_claim_reconciliation",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no working/partial capabilities with backing_paths in any project",
+            )
+        ]
     return results

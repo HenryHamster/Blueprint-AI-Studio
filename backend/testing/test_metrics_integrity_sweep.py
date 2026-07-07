@@ -173,6 +173,7 @@ def test_registry_contains_initial_checks():
         "undeclared_test_cochange_coverage_split",
         "evidence_claim_reconciliation",
         "saturated_direction_with_nonmerge_productivity",
+        "capability_claim_reconciliation",
     } <= names
 
 
@@ -2796,3 +2797,232 @@ async def test_saturated_direction_with_nonmerge_productivity_checks_acceptance_
     f = flagged[0]
     assert "possibly_saturated" in f.detail
     assert "verified_evidence" in f.detail or "acceptance" in f.detail.lower()
+
+
+# --- Check: capability_claim_reconciliation ---------------------------------
+
+
+async def _project_with_capabilities(db, capabilities: list) -> Project:
+    """A project whose problem_model has the given capabilities list."""
+    pm = {"capabilities": capabilities}
+    p = Project(name="mi-cap", user_id="u1", problem_model=pm)
+    db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return p
+
+
+def _cap_ctx(db) -> SweepContext:
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_flags_removed_backing_paths(
+    db, monkeypatch
+):
+    """REQUIRED acceptance test: a working/partial capability whose every declared
+    backing_path is DEFINITELY removed at HEAD (False) must be FLAGGED — the
+    self-reported 'working' claim is no longer backed by code."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False  # definite removal
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "capability_claim_reconciliation"
+    assert f.status == CheckStatus.FLAGGED
+    assert f.subject == str(project.id)
+    assert f.delta == 1
+    assert "repo_map" in f.detail
+    assert "removed at HEAD" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_indeterminate_not_flagged(
+    db, monkeypatch
+):
+    """CRITICAL HONESTY RULE: a None (indeterminate) path check must NEVER be
+    laundered into 'removed' — the capability is NOT flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+
+    async def _indeterminate(path, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _indeterminate)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok, results
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_ok_when_all_paths_present(
+    db, monkeypatch
+):
+    """All backing_paths still present at HEAD → OK, not flagged."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py", "backend/app/foo.py"],
+            }
+        ],
+    )
+
+    async def _present(path, *args, **kwargs):
+        return True
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _present)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert ok and ok[0].delta == 0
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_mixed_presence_not_flagged(
+    db, monkeypatch
+):
+    """If SOME paths are removed but at least one is still present, no flag is raised."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "partial",
+                "backing_paths": [
+                    "backend/app/gone.py",  # removed
+                    "backend/app/present.py",  # still present
+                ],
+            }
+        ],
+    )
+
+    async def _mixed(path, *args, **kwargs):
+        return path == "backend/app/present.py"  # True for present, False for gone
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _mixed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_planned_never_flagged(
+    db, monkeypatch
+):
+    """planned capabilities must NEVER be flagged for absent backing paths."""
+    import app.source_ref_validation as srv
+
+    await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "future_feature",
+                "status": "planned",
+                "backing_paths": ["backend/app/future.py"],
+            }
+        ],
+    )
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    # planned caps don't count as eligible → SKIPPED
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_skips_empty_backing_paths(db):
+    """A working capability with no backing_paths is skipped (nothing to audit)."""
+    await _project_with_capabilities(
+        db,
+        [{"name": "repo_map", "status": "working", "backing_paths": []}],
+    )
+
+    results = await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+    assert all(not r.flagged for r in results), results
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert skipped
+
+
+@pytest.mark.asyncio
+async def test_capability_claim_reconciliation_is_flag_only(db, monkeypatch):
+    """The check must never mutate the durable problem_model — flag-only guarantee."""
+    import app.source_ref_validation as srv
+
+    project = await _project_with_capabilities(
+        db,
+        [
+            {
+                "name": "repo_map",
+                "status": "working",
+                "backing_paths": ["backend/app/repo_map.py"],
+            }
+        ],
+    )
+    before = project.problem_model["capabilities"][0].copy()
+
+    async def _removed(path, *args, **kwargs):
+        return False
+
+    monkeypatch.setattr(srv, "_path_exists_at_head", _removed)
+
+    await mis.check_capability_claim_reconciliation(_cap_ctx(db))
+
+    await db.refresh(project)
+    after = project.problem_model["capabilities"][0]
+    assert after == before  # name, status, backing_paths all untouched
+
+
+def test_registry_contains_capability_claim_reconciliation():
+    """The new check must be registered in the global registry."""
+    names = {c.name for c in registered_checks()}
+    assert "capability_claim_reconciliation" in names
