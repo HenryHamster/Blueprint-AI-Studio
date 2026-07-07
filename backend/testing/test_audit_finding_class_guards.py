@@ -305,6 +305,58 @@ _EXCLUDE_RE = re.compile(
 _DROPPED_COLUMN = "theme" + "_delivery"  # split to avoid self-match
 
 
+def _resolve_search_dirs() -> list[Path]:
+    """Resolve the source trees to scan for dropped-column residuals, robust to
+    both a dev checkout and the CI backend-only Docker layout.
+
+    Layouts handled:
+
+    - **Dev checkout** — the repo root holds ``backend/``, ``agent/`` and
+      ``admin-ui/`` as siblings (``_REPO_ROOT / <name>``).
+    - **CI backend-only Docker** — ``scripts/test-backend.sh`` and the CI shards
+      bind-mount the *backend* source over ``/app``, so ``_BACKEND_ROOT`` itself
+      IS the backend tree and ``_REPO_ROOT`` resolves to ``/`` where no
+      ``backend``/``agent``/``admin-ui`` sibling exists. agent/ and admin-ui/,
+      when mounted, land at ``/agent/src`` and ``/admin-ui/src`` — the same
+      volume-mount targets ``_resolve_prompt_ts_path`` / ``_resolve_admin_ui_src_root``
+      in ``test_invariants.py`` rely on.
+
+    The backend tree is ALWAYS resolvable because this test file lives inside it
+    (``_BACKEND_ROOT``), so the guard always has at least one real directory to
+    scan and can never silently degrade to a no-op precondition failure — which
+    is exactly the regression this fixes: the old code only looked at
+    ``_REPO_ROOT / "backend"``, which does not exist when the backend is mounted
+    at ``/app``.
+    """
+    resolved: list[Path] = []
+    seen: set[Path] = set()
+
+    def _add(path: Path) -> None:
+        rp = path.resolve()
+        if rp.is_dir() and rp not in seen:
+            seen.add(rp)
+            resolved.append(rp)
+
+    # backend/ — dev-checkout sibling, else the backend root this test lives in
+    # (the Docker /app mount). One of these two always exists.
+    backend_sibling = _REPO_ROOT / "backend"
+    _add(backend_sibling if backend_sibling.is_dir() else _BACKEND_ROOT)
+
+    # agent/ — dev-checkout sibling, else the Docker volume-mount target.
+    for agent_candidate in (_REPO_ROOT / "agent", Path("/agent/src")):
+        if agent_candidate.is_dir():
+            _add(agent_candidate)
+            break
+
+    # admin-ui/ — dev-checkout sibling, else the Docker volume-mount target.
+    for admin_candidate in (_REPO_ROOT / "admin-ui", Path("/admin-ui/src")):
+        if admin_candidate.is_dir():
+            _add(admin_candidate)
+            break
+
+    return resolved
+
+
 class TestDroppedColumnResidualAbsent:
     """The qualificationverdict column dropped in migration 0351 must leave no
     residual references in live code outside alembic/versions.
@@ -318,17 +370,17 @@ class TestDroppedColumnResidualAbsent:
         """Walk backend/, agent/, admin-ui/ (excluding alembic/versions and this
         guard file) and fail if any source file contains the dropped column name.
 
-        Skipped only when ALL search directories are absent (e.g. CI backend-only
-        Docker context that doesn't mount agent/ or admin-ui/); the backend/ dir
-        is always searched from the test environment.
+        Directory discovery is via ``_resolve_search_dirs()``, which is robust to
+        both a dev checkout (backend/ agent/ admin-ui/ as repo-root siblings) and
+        the CI backend-only Docker layout (backend mounted at /app; agent/admin-ui
+        at /agent/src, /admin-ui/src when mounted). The backend tree is ALWAYS
+        resolvable, so the guard always runs — it never degrades to the empty
+        ``checked_dirs`` precondition failure it hit when it assumed a dev layout.
         """
         hits: list[str] = []
         checked_dirs: list[Path] = []
 
-        for dir_name in _SEARCH_DIRS:
-            search_dir = _REPO_ROOT / dir_name
-            if not search_dir.is_dir():
-                continue
+        for search_dir in _resolve_search_dirs():
             checked_dirs.append(search_dir)
             for path in search_dir.rglob("*"):
                 if not path.is_file():
@@ -343,13 +395,21 @@ class TestDroppedColumnResidualAbsent:
                 except OSError:
                     continue
                 if _DROPPED_COLUMN in text:
-                    rel = path.relative_to(_REPO_ROOT)
+                    # Prefer a repo-root-relative path for the message; fall back
+                    # to the absolute path when the scanned tree is not under
+                    # _REPO_ROOT (e.g. the /agent/src Docker mount when _REPO_ROOT
+                    # is /).
+                    try:
+                        rel: Path = path.relative_to(_REPO_ROOT)
+                    except ValueError:
+                        rel = path
                     hits.append(str(rel))
 
         assert checked_dirs, (
-            "No searchable directories were found. Expected at least one of "
-            + ", ".join(_SEARCH_DIRS)
-            + " to exist relative to the repo root."
+            "No searchable directories were found. Expected at least the backend "
+            "source tree to be scannable in every environment — a dev checkout at "
+            f"{_REPO_ROOT / 'backend'} or the Docker backend mount at {_BACKEND_ROOT} "
+            f"(logical search set: {', '.join(_SEARCH_DIRS)})."
         )
 
         assert not hits, (
@@ -491,12 +551,12 @@ class TestLongLivedDocsDoNotReferenceRemovedCodePaths:
 
             rel_path = doc_path.relative_to(_REPO_ROOT)
             for removed_ref in removed_refs:
-                for pattern in removed_ref.patterns:
-                    if pattern in text:
-                        violations.append(
-                            f"{rel_path}: contains '{pattern}' "
-                            f"({removed_ref.name}; {removed_ref.rationale})"
-                        )
+                violations.extend(
+                    f"{rel_path}: contains '{pattern}' "
+                    f"({removed_ref.name}; {removed_ref.rationale})"
+                    for pattern in removed_ref.patterns
+                    if pattern in text
+                )
 
         assert not violations, (
             "Documentation contains references to removed code paths or components. "

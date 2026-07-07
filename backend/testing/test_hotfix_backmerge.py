@@ -3398,10 +3398,16 @@ async def test_module_size_check_within_cap_no_alert(db_session, mocker):
         "app.github.get_pr_files",
         new=AsyncMock(return_value=[_make_pr_file("backend/app/orchestrator.py")]),
     )
-    # 7000 lines — under the 7750 cap.
+    # A line count comfortably within the tracked cap → no violation, no alert.
+    # Derived from the live cap (not hardcoded) so a future cap change — e.g. the
+    # orchestrator.py decomposition that lowered the cap from 7750 to 4400 — can't
+    # silently flip this "within cap" fixture into an over-cap one and mask the
+    # no-alert path. Mirrors the `_ORCH_CAP + N` pattern used by the over-cap
+    # fixtures above; see the _ORCH_CAP rationale near the top of this module.
+    within = max(_ORCH_CAP - 200, 0)
     mocker.patch(
         "app.github.get_file_text_at_ref",
-        new=AsyncMock(return_value=_make_file_content(7000)),
+        new=AsyncMock(return_value=_make_file_content(within)),
     )
 
     result = await hb.open_backmerge_pr(db_session, project.id)

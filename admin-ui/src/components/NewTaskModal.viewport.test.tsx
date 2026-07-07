@@ -592,6 +592,11 @@ describe('NewTaskModal — viewport regression', () => {
             }}
             preflightLoading={false}
             preflightError="Request timeout after 5s — unable to estimate cost"
+            ideaText=""
+            setIdeaText={() => {}}
+            draftNotes={null}
+            setDraftNotes={() => {}}
+            onDraftApplied={() => {}}
             onRepoChange={() => {}}
             onSubmit={async () => {}}
             onClose={() => {}}

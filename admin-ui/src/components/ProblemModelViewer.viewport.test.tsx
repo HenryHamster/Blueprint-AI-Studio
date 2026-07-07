@@ -3,6 +3,7 @@ import { createRoot, type Root } from 'react-dom/client';
 import { act } from 'react';
 import ProblemModelViewer from './ProblemModelViewer';
 import { expectNoOverflowAt, expectNoTextTruncationAt } from '../test/viewport';
+import { formatAbsolute } from '../utils/time';
 import type { ProblemModel, SelfReflectionEntry } from '../types';
 
 vi.mock('../api', () => ({
@@ -207,7 +208,16 @@ describe('ProblemModelViewer — viewport regression', () => {
     expect(host.textContent).toContain('Proven');
     expect(host.textContent).toContain('named_test');
     expect(host.textContent).toContain('test_proof_recorded_on_named_test_proven');
-    expect(host.textContent).toContain('2026-06-09T12:34:56Z');
+    // The proof timestamp is humanized: the body shows a relative "proved Nd ago"
+    // label while the absolute instant is surfaced via the title tooltip
+    // (PR #12566, "humanize raw ISO timestamps in evidence panels"). Assert the
+    // absolute timestamp is surfaced in the tooltip rather than expecting a raw
+    // ISO string in the body text (which is both stale and wall-clock fragile).
+    const provedEl = Array.from(host.querySelectorAll('span[title]')).find(
+      (el) => el.textContent?.trim().startsWith('proved'),
+    );
+    expect(provedEl).toBeTruthy();
+    expect(provedEl?.getAttribute('title')).toBe(formatAbsolute('2026-06-09T12:34:56Z'));
     expect(host.textContent).toContain('abc123def456');
   });
 
