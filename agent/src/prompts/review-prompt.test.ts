@@ -4,6 +4,7 @@ import {
   buildLensScopedChecklistSection,
   buildReviewIterationPreamble,
   buildReviewVerdictInstructions,
+  buildReviewPromptFingerprintContent,
   REVIEW_DELTA_FOCUS_NOTE,
 } from './review-prompt.js';
 
@@ -279,5 +280,17 @@ describe('buildReviewVerdictInstructions — block on substantiated code defects
 
   it('still writes the verdict JSON to the per-task /tmp file', () => {
     expect(out).toContain('/tmp/review_verdict_task-xyz.json');
+  });
+});
+
+describe('buildReviewPromptFingerprintContent — no duplicate constants', () => {
+  it('fingerprint content does not contain duplicate file-restrictions sentence', () => {
+    const content = buildReviewPromptFingerprintContent();
+    // The file-restrictions sentence should appear exactly once in the fingerprint,
+    // not duplicated by a standalone constant. This verifies the dead REVIEW_FILE_RESTRICTIONS_NOTE
+    // constant has been removed and is not injected into the fingerprint.
+    const restrictionsSentence = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
+    const count = (content.match(new RegExp(restrictionsSentence.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g')) || []).length;
+    expect(count).toBe(1);
   });
 });

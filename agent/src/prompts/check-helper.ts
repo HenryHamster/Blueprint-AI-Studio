@@ -709,7 +709,8 @@ ${buildViewportUploadBlock(cfg.taskId)}      fi
     fi
   fi
 
-  run "admin-ui build"   bash -c 'cd admin-ui && VITE_API_URL=http://localhost:8080 VITE_FIREBASE_API_KEY=ci VITE_FIREBASE_AUTH_DOMAIN=ci.firebaseapp.com VITE_FIREBASE_PROJECT_ID=ci npm run build 2>&1'
+  # Typecheck on agent VM; vite bundle OOMs here and is CI's job.
+  run "admin-ui typecheck" bash -c 'cd admin-ui && npm run typecheck 2>&1'
 
   # Run the admin-ui unit vitest suite on EVERY ./check (not gated behind \`test\`):
   # mirrors the agent-vitest rationale — ./pr open gates on plain ./check, so

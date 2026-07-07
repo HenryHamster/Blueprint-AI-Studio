@@ -23,7 +23,6 @@ export type ReviewPromptFingerprintOptions = {
 // cannot silently drift while claiming the same version.
 export const REVIEW_CLAUDEMD_PROMPT_HEADER = '## Codebase Instructions\n';
 export const REVIEW_CLAUDEMD_PROMPT_FOOTER = '\n\nCheck that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.\n\n';
-export const REVIEW_FILE_RESTRICTIONS_NOTE = 'Check that the changes respect the File Restrictions listed above. Changes to restricted files should result in REQUEST_CHANGES.';
 
 export const REVIEW_HISTORY_INTRO = 'Issues from previous iterations (verify each was addressed — issues marked "(likely resolved ...)" were not re-flagged in the following iteration and are historical context, not active blockers):';
 export const REVIEW_ITERATION_PRIOR_NOTE = '\nPrevious iterations have already addressed some issues. Focus on what remains unresolved.';
@@ -324,7 +323,6 @@ export function buildReviewPromptFingerprintContent(
     REVIEW_FIX_RESPONSES_INSTRUCTIONS,
     buildReviewMasterPreamble('<PR>', '<BRANCH>', '<BASE>'),
     buildReviewDiffAccessHint('<BASE>'),
-    REVIEW_FILE_RESTRICTIONS_NOTE,
     buildReviewCoreGuidance(buildConfig, 'TASK_ID'),
   ];
   const rollupGuidance = buildRollupReviewGuidance(options.branch || '', options.baseBranch || 'main');

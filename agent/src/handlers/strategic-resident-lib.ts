@@ -239,7 +239,7 @@ export function residentConfig(payload: Record<string, unknown>): ResidentConfig
     messagePollMs: Math.min(idleTickMs, Math.max(750, Math.round(messagePollSec * 1000))),
     turnTimeoutMs: Math.max(15_000, Math.round(turnTimeoutSec * 1000)),
     autonomousEnabled,
-    // Never poll slower than the idle tick (60s floor keeps the session lively).
+    // Never poll slower than the idle tick (600s floor keeps the session lively).
     minTickMs: Math.max(idleTickMs, Math.round(minTickSec * 1000)),
     autonomousTurnTimeoutMs: Math.max(15_000, Math.round(autonomousTurnTimeoutSec * 1000)),
     maxOpsPerTurn,
@@ -941,6 +941,15 @@ export function buildAutonomousPrompt(
     'welcome: read code, task outcomes, a direction, or the qualification findings',
     'before deciding — do not stop at revision numbers or counts.',
     '',
+    'Dispatched work runs concurrently: once you spawn_task, spawn_fix, or',
+    'create_direction, that work executes in the pipeline regardless of your cadence.',
+    'When two pieces of work are genuinely independent (no shared files, no logical',
+    'dependency), dispatch BOTH now rather than staging one behind the other.',
+    '',
+    'Maintain a standing agenda in your session memory; act on the highest-leverage',
+    'item actionable NOW. If more actionable items remain after this turn, end with a',
+    'literal line: AGENDA-CONTINUE',
+    '',
     'Rotating examination focus (prefer the first; pick another ONLY with a concrete',
     'lead — your verdict MUST name the surface you actually examined):',
   );
@@ -961,10 +970,6 @@ export function buildAutonomousPrompt(
   }
 
   lines.push(
-    '',
-    'Maintain a standing agenda in your session memory; act on the highest-leverage',
-    'item actionable NOW. If more actionable items remain after this turn, end with a',
-    'literal line: AGENDA-CONTINUE',
     '',
     'Operator visibility: do NOT send unsolicited durable messages. Use `./messages',
     "send` ONLY to reply to the operator or to surface something operator-actionable",

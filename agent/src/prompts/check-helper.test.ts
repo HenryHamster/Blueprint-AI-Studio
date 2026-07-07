@@ -56,6 +56,10 @@ describe('writeCheckHelper — direct invocation', () => {
     expect(script).toContain('touches agent/');
     expect(script).toContain('touches backend/');
     expect(script).toContain('admin-ui playwright chromium');
+    // The admin-ui typecheck runs on the agent VM (safe, no OOM); vite bundle
+    // is deferred to CI where it has room to breathe.
+    expect(script).toContain('run "admin-ui typecheck" bash -c \'cd admin-ui && npm run typecheck 2>&1\'');
+    expect(script).not.toContain('npm run build 2>&1'); // no vite build on agent VM
     // The agent vitest suite runs on every ./check (not behind `test`) for
     // agent-touching changes, routed through `run` so a failure lands in
     // FAILED and ./check fails closed.

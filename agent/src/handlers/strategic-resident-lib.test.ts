@@ -468,6 +468,17 @@ describe('buildAutonomousPrompt (dynamic, evidence-gated)', () => {
     expect(p).toContain('Open leads');
     expect(p).toContain('code:backend: hardcoded model id');
   });
+
+  it('includes pipeline-parallelism reminder: dispatched work runs concurrently', () => {
+    const p = buildAutonomousPrompt(focus, [], [], false);
+    // Reminder that dispatched work runs concurrently and independent work should be dispatched together
+    expect(p).toContain('Dispatched work runs concurrently');
+    expect(p).toContain('spawn_task, spawn_fix, or');
+    expect(p).toContain('pipeline regardless of your cadence');
+    expect(p).toContain('genuinely independent');
+    expect(p).toContain('dispatch BOTH now');
+    expect(p).toContain('staging one behind the other');
+  });
 });
 
 describe('buildSurfaceCatalog', () => {
