@@ -46,6 +46,7 @@ from app.json_extract import (
     scan_balanced_json_objects,
 )
 from app.models import Task, TaskStatus
+from app.shared_state import runtime_config as _runtime_config
 from app.task_capabilities import get_task_capability
 
 logger = logging.getLogger(__name__)
@@ -195,6 +196,8 @@ def review_is_high_stakes(
     *,
     base_branch: str | None,
     trunk_branches: Collection[str],
+    diff_non_test_lines: int | None = None,
+    diff_non_test_file_count: int | None = None,
 ) -> bool:
     """Predicate: does this ordinary ``review`` verdict warrant a second opinion?
 
@@ -210,14 +213,30 @@ def review_is_high_stakes(
     * reviews of PRs targeting non-trunk branches (e.g. ``research/*``) are
       re-covered by the rollup review at the trunk boundary.
 
+    Trivially small diffs (non-test lines < ``review_second_opinion_min_lines``
+    AND non-test file count <= ``review_second_opinion_min_files``) are also
+    exempted — a one-line typo fix does not need a full extra panel_review run.
+    Pass ``diff_non_test_lines`` and ``diff_non_test_file_count`` from the
+    source task's ``_pr_diff_summary`` / ``_pr_changed_files`` context; when
+    absent the size exemption is skipped (fail-open toward challenging).
+
     Kept as a single function so operators can re-broaden or further narrow it
     without touching the lifecycle wiring.
     """
-    return (
+    if not (
         verdict == "APPROVE"
         and base_branch is not None
         and base_branch in trunk_branches
-    )
+    ):
+        return False
+
+    if diff_non_test_lines is not None and diff_non_test_file_count is not None:
+        min_lines = int(_runtime_config.get("review_second_opinion_min_lines", 50))
+        min_files = int(_runtime_config.get("review_second_opinion_min_files", 4))
+        if diff_non_test_lines < min_lines and diff_non_test_file_count <= min_files:
+            return False
+
+    return True
 
 
 async def spawn_review_second_opinion(

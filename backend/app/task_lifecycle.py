@@ -3078,6 +3078,10 @@ async def _process_post_commit(
                     review_is_high_stakes,
                     spawn_review_second_opinion,
                 )
+                from app.review_heuristics import (
+                    _diff_lines_changed,
+                    _is_test_file,
+                )
 
                 _recon_record = (task.context or {}).get(
                     REVIEW_SECOND_OPINION_RECONCILIATION_KEY
@@ -3123,6 +3127,39 @@ async def _process_post_commit(
                 elif not verdict_unparseable and _runtime_config.get(
                     "review_second_opinion_gate_enabled", True
                 ):
+                    # Load source task diff stats for the size-exemption check.
+                    # The review task itself does not carry _pr_diff_summary /
+                    # _pr_changed_files (both are excluded from context
+                    # propagation in review_pipeline._PROPAGATE_UNDERSCORE_KEYS),
+                    # so we read them from the original create/fix/refactor task.
+                    # One extra DB read per APPROVE-to-trunk verdict; skipped
+                    # when original_task_id is unavailable (fail-open: challenge).
+                    _so_diff_lines: int | None = None
+                    _so_file_count: int | None = None
+                    if original_task_id:
+                        try:
+                            _so_source = await session.get(
+                                Task, uuid.UUID(original_task_id)
+                            )
+                            if _so_source is not None:
+                                _so_ctx = _so_source.context or {}
+                                _so_diff_lines = _diff_lines_changed(
+                                    _so_ctx.get("_pr_diff_summary"),
+                                    exclude_test_files=True,
+                                )
+                                _so_files = _so_ctx.get("_pr_changed_files") or []
+                                _so_file_count = sum(
+                                    1
+                                    for f in _so_files
+                                    if not _is_test_file(f)
+                                )
+                        except Exception:
+                            logger.debug(
+                                "[REVIEW PIPELINE] PR #%s: could not load source task "
+                                "%s for diff-size check — proceeding with challenge",
+                                pr_number,
+                                original_task_id,
+                            )
                     if review_is_high_stakes(
                         verdict,
                         issues,
@@ -3135,6 +3172,8 @@ async def _process_post_commit(
                             ),
                             _shared_state.get_project_promotion_target(_review_project),
                         ),
+                        diff_non_test_lines=_so_diff_lines,
+                        diff_non_test_file_count=_so_file_count,
                     ):
                         _sample_rate = float(
                             _runtime_config.get(

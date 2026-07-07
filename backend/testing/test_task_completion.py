@@ -3917,6 +3917,147 @@ def test_parse_panel_review_embedded_json_in_prose():
     assert panel["overall_verdict"] == "APPROVE"
 
 
+def test_review_is_high_stakes_approve_trunk_large_diff():
+    """APPROVE on trunk with a large diff is high-stakes and should challenge."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    result = review_is_high_stakes(
+        "APPROVE",
+        [],
+        [],
+        review_task,
+        base_branch="automain",
+        trunk_branches=("automain", "main"),
+        diff_non_test_lines=200,
+        diff_non_test_file_count=10,
+    )
+    assert result is True
+
+
+def test_review_is_high_stakes_approve_trunk_small_diff_skips():
+    """APPROVE on trunk with a trivially small diff should NOT trigger the challenge."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    # 10 non-test lines, 1 non-test file — well below default thresholds (50 / 4)
+    result = review_is_high_stakes(
+        "APPROVE",
+        [],
+        [],
+        review_task,
+        base_branch="automain",
+        trunk_branches=("automain", "main"),
+        diff_non_test_lines=10,
+        diff_non_test_file_count=1,
+    )
+    assert result is False
+
+
+def test_review_is_high_stakes_approve_trunk_no_diff_info_challenges():
+    """When diff size is unknown (None), fail-open and still challenge."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    result = review_is_high_stakes(
+        "APPROVE",
+        [],
+        [],
+        review_task,
+        base_branch="automain",
+        trunk_branches=("automain", "main"),
+        diff_non_test_lines=None,
+        diff_non_test_file_count=None,
+    )
+    assert result is True
+
+
+def test_review_is_high_stakes_request_changes_always_false():
+    """REQUEST_CHANGES is never high-stakes regardless of diff size."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    result = review_is_high_stakes(
+        "REQUEST_CHANGES",
+        [],
+        [],
+        review_task,
+        base_branch="automain",
+        trunk_branches=("automain", "main"),
+        diff_non_test_lines=5,
+        diff_non_test_file_count=1,
+    )
+    assert result is False
+
+
+def test_review_is_high_stakes_approve_non_trunk_always_false():
+    """APPROVE on a non-trunk branch (e.g. research/) never triggers a challenge."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    result = review_is_high_stakes(
+        "APPROVE",
+        [],
+        [],
+        review_task,
+        base_branch="research/foo",
+        trunk_branches=("automain", "main"),
+        diff_non_test_lines=5,
+        diff_non_test_file_count=1,
+    )
+    assert result is False
+
+
+def test_review_is_high_stakes_small_diff_at_exact_threshold():
+    """A diff at exactly the threshold (49 lines, 4 files) is exempt; at
+    exactly min_lines it is NOT exempt (< min_lines, not <=)."""
+    from app.task_evaluators import review_is_high_stakes
+
+    review_task = make_task(payloads=[{"type": "review"}])
+    # 49 lines, 4 files — below both defaults (50 / 4) → exempt
+    assert (
+        review_is_high_stakes(
+            "APPROVE",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain",),
+            diff_non_test_lines=49,
+            diff_non_test_file_count=4,
+        )
+        is False
+    )
+    # 50 lines, 4 files — lines are NOT < 50 → high-stakes
+    assert (
+        review_is_high_stakes(
+            "APPROVE",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain",),
+            diff_non_test_lines=50,
+            diff_non_test_file_count=4,
+        )
+        is True
+    )
+    # 49 lines, 5 files — files exceed max (> 4) → high-stakes
+    assert (
+        review_is_high_stakes(
+            "APPROVE",
+            [],
+            [],
+            review_task,
+            base_branch="automain",
+            trunk_branches=("automain",),
+            diff_non_test_lines=49,
+            diff_non_test_file_count=5,
+        )
+        is True
+    )
+
+
 @pytest.mark.asyncio
 async def test_spawn_review_second_opinion_uses_opus_quality_tier(db_session):
     """spawn_review_second_opinion must NOT set quality_tier in the spawned
