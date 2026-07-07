@@ -10,6 +10,7 @@ import pytest_asyncio
 from datetime import datetime, timedelta, timezone
 from httpx import AsyncClient, ASGITransport
 
+from app.time_utils import _utcnow
 import app.shared_state as _shared_state
 import app.orchestrator as _orch_module
 from app.main import app
@@ -116,8 +117,8 @@ def healthy_orchestrator():
     must have a fresh heartbeat too."""
     original_cycle = _orch_module._orchestrator_last_cycle
     original_progress = _orch_module._orchestrator_last_progress
-    _orch_module._orchestrator_last_cycle = datetime.utcnow()
-    _orch_module._orchestrator_last_progress = datetime.utcnow()
+    _orch_module._orchestrator_last_cycle = _utcnow()
+    _orch_module._orchestrator_last_progress = _utcnow()
     yield
     _orch_module._orchestrator_last_cycle = original_cycle
     _orch_module._orchestrator_last_progress = original_progress
@@ -255,7 +256,7 @@ class TestHealthEndpoint:
         death-spiral fix.)"""
         original_cycle = _orch_module._orchestrator_last_cycle
         original_progress = _orch_module._orchestrator_last_progress
-        wedged = datetime.utcnow() - timedelta(
+        wedged = _utcnow() - timedelta(
             seconds=_orch_module.ORCHESTRATOR_HANG_SECONDS + 30
         )
         _orch_module._orchestrator_last_cycle = wedged
@@ -277,7 +278,7 @@ class TestHealthEndpoint:
         this returned 503 and Cloud Run killed the container mid-cycle."""
         original_cycle = _orch_module._orchestrator_last_cycle
         original_progress = _orch_module._orchestrator_last_progress
-        now = datetime.utcnow()
+        now = _utcnow()
         _orch_module._orchestrator_last_cycle = now - timedelta(seconds=240)
         _orch_module._orchestrator_last_progress = now - timedelta(seconds=2)
         try:
@@ -295,7 +296,7 @@ class TestHealthEndpoint:
     ):
         """orchestrator_cycle_age_seconds is roughly the time since last cycle."""
         original = _orch_module._orchestrator_last_cycle
-        _orch_module._orchestrator_last_cycle = datetime.utcnow() - timedelta(
+        _orch_module._orchestrator_last_cycle = _utcnow() - timedelta(
             seconds=10
         )
         try:
@@ -892,7 +893,7 @@ class TestMaxPlanAccountPool:
                 "name": "rate_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=31),
+                "disabled_at": _utcnow() - timedelta(minutes=31),
             }
         )
         await recheck_disabled_accounts()
@@ -910,7 +911,7 @@ class TestMaxPlanAccountPool:
                 "name": "rate_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=10),
+                "disabled_at": _utcnow() - timedelta(minutes=10),
             }
         )
         await recheck_disabled_accounts()
@@ -927,7 +928,7 @@ class TestMaxPlanAccountPool:
                 "name": "rate_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=30),
+                "disabled_at": _utcnow() - timedelta(minutes=30),
             }
         )
         await recheck_disabled_accounts()
@@ -985,7 +986,7 @@ class TestMaxPlanAccountPool:
         for acct in _account_by_id.values():
             if acct["id"] == "a1":
                 acct["enabled"] = False
-                acct["disabled_at"] = datetime.utcnow()
+                acct["disabled_at"] = _utcnow()
 
         assert _account_by_id["a1"]["enabled"] is False
 
@@ -994,7 +995,7 @@ class TestMaxPlanAccountPool:
         assert _account_by_id["a1"]["enabled"] is False
 
         # Fast-forward: simulate 31 minutes passing
-        _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=31)
+        _account_by_id["a1"]["disabled_at"] = _utcnow() - timedelta(minutes=31)
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True
 
@@ -1009,7 +1010,7 @@ class TestMaxPlanAccountPool:
                 "name": "expired",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=45),
+                "disabled_at": _utcnow() - timedelta(minutes=45),
             }
         )
         _add_to_pool(
@@ -1018,7 +1019,7 @@ class TestMaxPlanAccountPool:
                 "name": "fresh",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=5),
+                "disabled_at": _utcnow() - timedelta(minutes=5),
             }
         )
         await recheck_disabled_accounts()
@@ -1039,14 +1040,14 @@ class TestMaxPlanAccountPool:
                 "name": "twice_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=59),
+                "disabled_at": _utcnow() - timedelta(minutes=59),
                 "rl_hit_count": 2,
             }
         )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 59 min < 60 min cooldown
 
-        _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=61)
+        _account_by_id["a1"]["disabled_at"] = _utcnow() - timedelta(minutes=61)
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True  # 61 min >= 60 min cooldown
 
@@ -1061,14 +1062,14 @@ class TestMaxPlanAccountPool:
                 "name": "thrice_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=119),
+                "disabled_at": _utcnow() - timedelta(minutes=119),
                 "rl_hit_count": 3,
             }
         )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 119 min < 120 min cooldown
 
-        _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=121)
+        _account_by_id["a1"]["disabled_at"] = _utcnow() - timedelta(minutes=121)
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True  # 121 min >= 120 min cooldown
 
@@ -1083,14 +1084,14 @@ class TestMaxPlanAccountPool:
                 "name": "quad_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=239),
+                "disabled_at": _utcnow() - timedelta(minutes=239),
                 "rl_hit_count": 4,
             }
         )
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is False  # 239 min < 240 min cooldown
 
-        _account_by_id["a1"]["disabled_at"] = datetime.utcnow() - timedelta(minutes=241)
+        _account_by_id["a1"]["disabled_at"] = _utcnow() - timedelta(minutes=241)
         await recheck_disabled_accounts()
         assert _account_by_id["a1"]["enabled"] is True  # 241 min >= 240 min cap
 
@@ -1105,7 +1106,7 @@ class TestMaxPlanAccountPool:
                 "name": "many_limited",
                 "enabled": False,
                 "active_tasks": 0,
-                "disabled_at": datetime.utcnow() - timedelta(minutes=241),
+                "disabled_at": _utcnow() - timedelta(minutes=241),
                 "rl_hit_count": 10,
             }
         )
@@ -1129,7 +1130,7 @@ class TestMaxPlanAccountPool:
             for acct in _account_by_id.values():
                 if acct["id"] == "a1":
                     acct["enabled"] = False
-                    acct["disabled_at"] = datetime.utcnow()
+                    acct["disabled_at"] = _utcnow()
                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
 
         assert (
@@ -1142,7 +1143,7 @@ class TestMaxPlanAccountPool:
             for acct in _account_by_id.values():
                 if acct["id"] == "a1":
                     acct["enabled"] = False
-                    acct["disabled_at"] = datetime.utcnow()
+                    acct["disabled_at"] = _utcnow()
                     acct["rl_hit_count"] = acct.get("rl_hit_count", 0) + 1
 
         assert (
@@ -1198,7 +1199,7 @@ class TestMaxPlanAccountPool:
     ):
         """After an Opus-4-8 429, the mark path writes the opus-4-8 cascade entry.
         A Haiku lookup normalizes to Opus-4-8, so haiku requests are also blocked."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = {
             "id": "a1",
             "name": "evan",
@@ -1227,7 +1228,7 @@ class TestMaxPlanAccountPool:
             "active_tasks": 0,
             "oauth_token": "sk-ant-test",
             "disabled_models": {
-                "claude-opus-4-8": {"hits": 1, "at": datetime.utcnow()}
+                "claude-opus-4-8": {"hits": 1, "at": _utcnow()}
             },
         }
         assert _account_available_for_model(acct, None) is False
@@ -1252,7 +1253,7 @@ class TestMaxPlanAccountPool:
         """After an Opus-4-8 429 marks the opus-4-8 meter, another Opus-4-8 request must
         skip that account in favor of a healthy one — even if the healthy
         account has more active tasks."""
-        now = datetime.utcnow()
+        now = _utcnow()
         _add_to_pool(
             {
                 "id": "a1",
@@ -1291,7 +1292,7 @@ HAIKU = "claude-haiku-4-5-20251001"
 
 
 def _disabled_entry(minutes_ago: int, hits: int = 1) -> dict:
-    return {"hits": hits, "at": datetime.utcnow() - timedelta(minutes=minutes_ago)}
+    return {"hits": hits, "at": _utcnow() - timedelta(minutes=minutes_ago)}
 
 
 def _acct_with_disables(acct_id: str, dm: dict, **extra) -> dict:
@@ -1461,7 +1462,7 @@ class TestCircuitBreaker:
         self, clean_max_plan_pool, monkeypatch
     ):
         """Opus success clears the opus-4-7 bucket — the shared meter for all tasks."""
-        now = datetime.utcnow()
+        now = _utcnow()
         _add_to_pool(
             _acct_with_disables(
                 "a1",
@@ -1483,7 +1484,7 @@ class TestCircuitBreaker:
     ):
         """Haiku success proves Opus-4-7's meter is fine (shared bucket) —
         clearing Haiku normalizes to clearing the opus-4-7 entry."""
-        now = datetime.utcnow()
+        now = _utcnow()
         _add_to_pool(
             _acct_with_disables(
                 "a1",
@@ -1553,7 +1554,7 @@ class TestCircuitBreaker:
         async with _max_plan_pool_lock:
             _account_by_id["a1"]["disabled_models"][OPUS] = {
                 "hits": 2,
-                "at": datetime.utcnow(),
+                "at": _utcnow(),
             }
         await release_max_plan_account("a1")
 
@@ -1593,7 +1594,7 @@ class TestHealthScoreComputation:
 
     def test_completions_increase_score(self):
         """Each completion adds +1 to the health score."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _make_acct(
             "a1",
             completion_events=[
@@ -1605,7 +1606,7 @@ class TestHealthScoreComputation:
 
     def test_rate_limit_events_decrease_score(self):
         """Each rate-limit event subtracts 2 from the health score."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _make_acct(
             "a1",
             rl_events=[
@@ -1617,7 +1618,7 @@ class TestHealthScoreComputation:
 
     def test_mixed_events_combined_correctly(self):
         """Health score = completions - 2 * rl_events."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _make_acct(
             "a1",
             completion_events=[
@@ -1632,7 +1633,7 @@ class TestHealthScoreComputation:
 
     def test_events_outside_window_excluded(self):
         """Events older than 24h are not counted in the health score."""
-        now = datetime.utcnow()
+        now = _utcnow()
         cutoff_plus_one = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 1)
         acct = _make_acct(
             "a1",
@@ -1643,7 +1644,7 @@ class TestHealthScoreComputation:
 
     def test_events_at_window_boundary_excluded(self):
         """Events exactly at the 24h cutoff (not strictly greater) are excluded."""
-        now = datetime.utcnow()
+        now = _utcnow()
         exactly_at_cutoff = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS)
         acct = _make_acct(
             "a1",
@@ -1666,7 +1667,7 @@ class TestHealthScoreComputation:
 
     def test_get_account_health_stats_avg_duration(self):
         """avg_duration_seconds is the mean of recent completion durations."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _make_acct(
             "a1",
             completion_events=[
@@ -1685,7 +1686,7 @@ class TestHealthScoreComputation:
 
     def test_get_account_health_stats_rl_count(self):
         """rl_events_24h counts rate-limit events within the window."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _make_acct(
             "a1",
             rl_events=[
@@ -1704,7 +1705,7 @@ class TestAccountSelectionByHealthScore:
     @pytest.mark.asyncio
     async def test_select_prefers_higher_health_score(self, clean_max_plan_pool):
         """Account with more completions and fewer rate limits is preferred over idle account."""
-        now = datetime.utcnow()
+        now = _utcnow()
         # Healthy account with good track record
         _add_to_pool(
             _make_acct(
@@ -1821,7 +1822,7 @@ class TestAccountSelectionByHealthScore:
     ):
         """An account with multiple recent rate limits loses to a healthier alternative."""
         monkeypatch.setattr("app.max_plan_pool._persist_rate_limit_state", _async_noop)
-        now = datetime.utcnow()
+        now = _utcnow()
 
         # Chronically rate-limited account (but currently healthy — models cleared)
         _add_to_pool(
@@ -1899,8 +1900,8 @@ class TestDisabledStatePersistenceAndRestoration:
         """
         from app.max_plan_pool import _account_state_for_model
 
-        # _utcnow() returns naive datetimes — use datetime.utcnow() to match
-        now = datetime.utcnow()
+        # _utcnow() returns naive datetimes — use _utcnow() to match
+        now = _utcnow()
         # Build an entry that simulates what load_max_plan_pool would restore
         restored_entry = {
             "id": "a1",
@@ -1922,7 +1923,7 @@ class TestDisabledStatePersistenceAndRestoration:
         """Cooldowns that elapsed while the service was down are not restored."""
         from app.max_plan_pool import _account_state_for_model
 
-        now = datetime.utcnow()
+        now = _utcnow()
         # Cooldown elapsed (hits=1 → 30min, but 45min have passed)
         expired_entry = {
             "id": "a1",
@@ -1948,7 +1949,7 @@ class TestDisabledStatePersistenceAndRestoration:
 
         _account_by_id.clear()
         _max_plan_pools.clear()
-        now = datetime.utcnow()
+        now = _utcnow()
         a_healthy = {
             "id": "h",
             "name": "h",

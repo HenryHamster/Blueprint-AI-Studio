@@ -15,6 +15,7 @@ import uuid
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock
 
+from app.time_utils import _utcnow
 import app.main as _main_module
 import app.shared_state as _shared_state
 from app.reaper import reaper_service
@@ -353,7 +354,7 @@ class TestReaperService:
             vm_instance_id="stale-vm-001",
             status=TaskStatus.IN_PROGRESS,
             # Heartbeat older than the 5-minute window
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+            last_heartbeat=_utcnow() - timedelta(minutes=6),
             attempt_count=max_retries,  # exhausted — next reap should FAIL, not retry
         )
         db_session.add(task)
@@ -393,7 +394,7 @@ class TestReaperService:
             project_id=project.id,
             vm_instance_id="healthy-vm-001",
             status=TaskStatus.IN_PROGRESS,
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=2),  # within window
+            last_heartbeat=_utcnow() - timedelta(minutes=2),  # within window
             attempt_count=0,
         )
         db_session.add(task)
@@ -434,7 +435,7 @@ class TestReaperService:
             project_id=project.id,
             vm_instance_id="retry-vm-001",
             status=TaskStatus.IN_PROGRESS,
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=7),
+            last_heartbeat=_utcnow() - timedelta(minutes=7),
             attempt_count=0,  # first attempt — should be retried
         )
         db_session.add(task)
@@ -477,7 +478,7 @@ class TestReaperService:
             project_id=project.id,
             vm_instance_id=None,  # no VM — logical parent task
             status=TaskStatus.IN_PROGRESS,
-            last_heartbeat=datetime.utcnow() - timedelta(hours=2),
+            last_heartbeat=_utcnow() - timedelta(hours=2),
             attempt_count=max_retries,
         )
         db_session.add(task)
@@ -526,7 +527,7 @@ class TestReaperService:
             project_id=project.id,
             vm_instance_id="race-vm-001",
             status=TaskStatus.IN_PROGRESS,
-            last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+            last_heartbeat=_utcnow() - timedelta(minutes=6),
             attempt_count=max_retries,
         )
         db_session.add(task)
@@ -596,7 +597,7 @@ class TestReaperService:
             project_id=project.id,
             vm_instance_id="already-failed-vm",
             status=TaskStatus.FAILED,  # terminal state
-            last_heartbeat=datetime.utcnow() - timedelta(hours=2),
+            last_heartbeat=_utcnow() - timedelta(hours=2),
             attempt_count=3,
         )
         db_session.add(task)
@@ -633,7 +634,7 @@ class TestReaperService:
         await db_session.commit()
         await db_session.refresh(project)
 
-        now = datetime.utcnow()
+        now = _utcnow()
         task = make_task(
             project_id=project.id,
             vm_instance_id="silent-vm-001",
@@ -684,7 +685,7 @@ class TestReaperService:
         await db_session.commit()
         await db_session.refresh(project)
 
-        now = datetime.utcnow()
+        now = _utcnow()
         task = make_task(
             project_id=project.id,
             vm_instance_id="crashed-vm-001",
@@ -732,7 +733,7 @@ class TestReaperService:
         await db_session.commit()
         await db_session.refresh(project)
 
-        now = datetime.utcnow()
+        now = _utcnow()
         task = make_task(
             project_id=project.id,
             vm_instance_id="booting-vm-001",
@@ -1287,7 +1288,7 @@ class TestResearchSpawning:
         # Trip the circuit breaker with a recent open time (still in cooldown)
         breaker = _shared_state.get_circuit_breaker(str(project.id))
         breaker["state"] = "OPEN"
-        breaker["opened_at"] = datetime.utcnow() - timedelta(
+        breaker["opened_at"] = _utcnow() - timedelta(
             minutes=5
         )  # only 5 min; cooldown is 30 min
         breaker["cooldown_seconds"] = 1800
@@ -1334,7 +1335,7 @@ class TestResearchSpawning:
             vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
             status=TaskStatus.IN_PROGRESS,
             created_by="ORCHESTRATOR",
-            started_at=datetime.utcnow() - timedelta(minutes=45),
+            started_at=_utcnow() - timedelta(minutes=45),
         )
         db_session.add(stuck_task)
         await db_session.commit()
@@ -1459,7 +1460,7 @@ class TestResearchSpawning:
                 vm_instance_id=f"agent-vm-{uuid.uuid4().hex[:16]}",
                 status=TaskStatus.COMPLETED,
                 created_by="ORCHESTRATOR",
-                created_at=datetime.utcnow() - timedelta(minutes=10),
+                created_at=_utcnow() - timedelta(minutes=10),
             )
             db_session.add(t)
         await db_session.commit()
@@ -4734,7 +4735,7 @@ class TestWarmVMSkipProvision:
             await session.refresh(project)
 
             target_vm = "agent-vm-warm-target-1"
-            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
             task = make_task(
                 project_id=project.id,
                 vm_instance_id=None,
@@ -4752,7 +4753,7 @@ class TestWarmVMSkipProvision:
             task_id = task.id
 
         # Mark VM as alive via the shared-state heartbeat map
-        _shared_state.vm_last_heartbeat[target_vm] = datetime.utcnow()
+        _shared_state.vm_last_heartbeat[target_vm] = _utcnow()
         try:
             await self._run_one_cycle(mocker)
         finally:
@@ -4804,7 +4805,7 @@ class TestWarmVMSkipProvision:
             await session.refresh(project)
 
             target_vm = "agent-vm-warm-target-2"
-            past = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+            past = (_utcnow() - timedelta(seconds=60)).isoformat()
             task = make_task(
                 project_id=project.id,
                 vm_instance_id=None,
@@ -4823,7 +4824,7 @@ class TestWarmVMSkipProvision:
 
         # Heartbeat is fresh, but deadline is past — the warm fields should
         # still be cleared (deadline takes precedence).
-        _shared_state.vm_last_heartbeat[target_vm] = datetime.utcnow()
+        _shared_state.vm_last_heartbeat[target_vm] = _utcnow()
         try:
             await self._run_one_cycle(mocker)
         finally:
@@ -4879,7 +4880,7 @@ class TestWarmVMSkipProvision:
             await session.refresh(project)
 
             target_vm = "agent-vm-warm-target-3"
-            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
             task = make_task(
                 project_id=project.id,
                 vm_instance_id=None,
@@ -4970,7 +4971,7 @@ class TestWarmVMSkipProvision:
             await session.refresh(project)
 
             target_vm = "agent-vm-warm-target-commitfail"
-            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
             task = make_task(
                 project_id=project.id,
                 vm_instance_id=None,
@@ -5543,7 +5544,7 @@ class TestWarmVMSkipProvision:
                 await session.refresh(project)
 
                 target_vm = "agent-vm-pool-target-1"
-                deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+                deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
                 task = make_task(
                     project_id=project.id,
                     # _pin_task_to_pool_vm stamps the pool VM's id onto the task;
@@ -5620,7 +5621,7 @@ class TestWarmVMSkipProvision:
             await session.refresh(project)
 
             parked_vm = "agent-vm-parked-rl-001"
-            deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+            deadline = (_utcnow() + timedelta(seconds=240)).isoformat()
             task = make_task(
                 project_id=project.id,
                 # agent_status stamps the held VM id onto vm_instance_id
@@ -5696,7 +5697,7 @@ class TestWarmVMSkipProvision:
 
             parked_vm = "agent-vm-parked-rl-expired-002"
             # Already-expired deadline → deadline_expired path
-            expired = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+            expired = (_utcnow() - timedelta(seconds=10)).isoformat()
             task = make_task(
                 project_id=project.id,
                 vm_instance_id=parked_vm,
@@ -5716,7 +5717,7 @@ class TestWarmVMSkipProvision:
 
         # Register a heartbeat so the VM appears alive — the expired deadline
         # alone must trigger the clear (not unresponsive).
-        _shared_state.vm_last_heartbeat[parked_vm] = datetime.utcnow()
+        _shared_state.vm_last_heartbeat[parked_vm] = _utcnow()
         try:
             await self._run_one_cycle(mocker)
         finally:

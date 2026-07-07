@@ -1077,7 +1077,7 @@ async def test_gcp_cleanup_spares_live_warm_handoff_target_vm(gcp_db, mocker):
     """A QUEUED warm-handoff successor should keep its source VM active until
     the deadline, so the generic orphan sweep must not pass that VM to cleanup."""
     project = await _make_project(gcp_db)
-    live_deadline = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+    live_deadline = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)).isoformat()
     handoff_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "test"}],
@@ -1111,7 +1111,7 @@ async def test_gcp_cleanup_reclaims_expired_warm_handoff_target_vm(gcp_db, mocke
     """Once a warm-handoff deadline expires, the source VM should be reclaimable
     again if no task has claimed it."""
     project = await _make_project(gcp_db)
-    expired_deadline = (datetime.utcnow() - timedelta(minutes=10)).isoformat()
+    expired_deadline = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=10)).isoformat()
     handoff_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "test"}],
@@ -1312,7 +1312,7 @@ async def test_gcp_cleanup_does_not_reap_parked_task_vm(gcp_db, mocker):
         vm_instance_id="agent-vm-parked-1",
         context={
             "parked_for_retarget": True,
-            "park_deadline": (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
+            "park_deadline": (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(minutes=10)).isoformat(),
         },
     )
     gcp_db.add(parked_task)

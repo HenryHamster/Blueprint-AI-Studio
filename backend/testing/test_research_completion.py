@@ -3,7 +3,7 @@
 import json
 import logging
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
@@ -2976,7 +2976,7 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
     # Two pre-existing dedup-zero history entries (both with hash_dedup activity)
     old_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)).isoformat(),
             "task_id": "t-old-dl1",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -2991,7 +2991,7 @@ async def test_dedup_deadlock_auto_completes_exhausted_direction(db_session):
             "summary": "no findings",
         },
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat(),
             "task_id": "t-old-dl2",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -3098,7 +3098,7 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
     direction_id = "d-dft-populate"
     old_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)).isoformat(),
             "task_id": "t-dft-old1",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -3117,7 +3117,7 @@ async def test_dedup_deadlock_populates_deadlock_filtered_titles(db_session):
             "summary": "no findings",
         },
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat(),
             "task_id": "t-dft-old2",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -3220,7 +3220,7 @@ async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_ses
     direction_id = "d-dft-clear"
     old_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)).isoformat(),
             "task_id": "t-dft-c1",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -3235,7 +3235,7 @@ async def test_dedup_deadlock_filtered_titles_cleared_on_productive_cycle(db_ses
             "summary": "no findings",
         },
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat(),
             "task_id": "t-dft-c2",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -15125,7 +15125,7 @@ async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
     # Two pre-existing dedup-zero history entries to prime the deadlock window.
     old_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)).isoformat(),
             "task_id": "t-gcr-old1",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -15140,7 +15140,7 @@ async def test_exhaustion_autocomplete_reconciles_gap_active_moves(db_session):
             "summary": "no findings",
         },
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat(),
             "task_id": "t-gcr-old2",
             "tasks_created": 0,
             "findings_produced": 0,
@@ -15545,7 +15545,7 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
     # genuine low-output cycles → possibly_saturated=True → triggers auto-complete check.
     old_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=10)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=10)).isoformat(),
             "task_id": "t-agg-str-1",
             "tasks_created": 1,
             "findings_produced": 0,
@@ -15560,7 +15560,7 @@ async def test_apply_post_spawn_state_aggregate_stranded_merges_not_counted(db_s
             "summary": "test cycle 1",
         },
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=5)).isoformat(),
+            "timestamp": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=5)).isoformat(),
             "task_id": "t-agg-str-2",
             "tasks_created": 1,
             "findings_produced": 0,

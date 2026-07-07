@@ -6,7 +6,7 @@ warm-pinned tasks per VM, and the warm-pin clear-rate (a leading indicator
 of warm-VM instability).
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from httpx import AsyncClient, ASGITransport
@@ -112,7 +112,7 @@ async def test_warm_vm_state_active_chain(client: AsyncClient, db_session):
         payloads=[{"type": "review", "pr_number": 42}],
         vm_instance_id=vm_id,
         status=TaskStatus.COMPLETED,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=5),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5),
     )
     db_session.add(prior)
 
@@ -123,8 +123,8 @@ async def test_warm_vm_state_active_chain(client: AsyncClient, db_session):
         payloads=[{"type": "fix", "pr_number": 42}],
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
-        started_at=datetime.utcnow(),
-        last_heartbeat=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
         context={
             "_timing": {
                 "warm_start": True,
@@ -136,7 +136,7 @@ async def test_warm_vm_state_active_chain(client: AsyncClient, db_session):
     db_session.add(current)
 
     # QUEUED warm-pinned follow-up — should appear in warm_pinned_queued.
-    deadline = (datetime.utcnow() + timedelta(seconds=240)).isoformat()
+    deadline = (datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(seconds=240)).isoformat()
     pinned = Task(
         project_id=project.id,
         title="Re-review PR #42",
@@ -216,8 +216,8 @@ async def test_warm_vm_state_backlog_reuse_attribution(client: AsyncClient, db_s
         payloads=[{"type": "create"}],
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
-        started_at=datetime.utcnow(),
-        last_heartbeat=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
         context={
             "_timing": {
                 "warm_start": True,
@@ -280,8 +280,8 @@ async def test_warm_vm_state_pool_origin_attribution(client: AsyncClient, db_ses
         payloads=[{"type": "create"}],
         vm_instance_id=vm_id,
         status=TaskStatus.IN_PROGRESS,
-        started_at=datetime.utcnow(),
-        last_heartbeat=datetime.utcnow(),
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
         context={
             "_timing": {
                 "warm_start": True,
@@ -332,7 +332,7 @@ async def test_warm_vm_state_stale_heartbeat(client: AsyncClient, db_session):
     try:
         vm_id = "agent-vm-stale"
         # Heartbeat 5 minutes ago — well past the 90s freshness threshold.
-        _shared_state.vm_last_heartbeat[vm_id] = datetime.utcnow() - timedelta(
+        _shared_state.vm_last_heartbeat[vm_id] = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(
             minutes=5
         )
 

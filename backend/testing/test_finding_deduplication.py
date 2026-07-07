@@ -2,7 +2,7 @@
 
 import hashlib
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 
@@ -51,7 +51,7 @@ def _make_task(
         context=context or {},
         payloads=[],
         created_by="TEST",
-        created_at=created_at or datetime.utcnow(),
+        created_at=created_at or datetime.now(timezone.utc).replace(tzinfo=None),
         parent_task_id=parent_task_id,
         latest_status_message=latest_status_message,
         vm_instance_id=f"vm-{uuid.uuid4().hex[:8]}",
@@ -261,7 +261,7 @@ def test_extract_recent_terminal_finding_history_uses_plan_output_without_hash()
     t = _make_task(
         status=TaskStatus.COMPLETED,
         context={},
-        created_at=datetime.utcnow(),
+        created_at=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     t.plan_output = [
         {
@@ -295,7 +295,7 @@ def test_build_dedup_state_excludes_infra_failures():
 
 
 def test_build_dedup_state_code_error_cooldown_boundary():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     within = _make_task(
         status=TaskStatus.FAILED,
         context={"finding_hash": "cool1"},
@@ -315,7 +315,7 @@ def test_build_dedup_state_code_error_cooldown_boundary():
 
 
 def test_build_dedup_state_code_error_cooldown_boundary_uses_created_at_plus_window():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     at_boundary = _make_task(
         status=TaskStatus.FAILED,
         context={"finding_hash": "boundary"},
@@ -327,7 +327,7 @@ def test_build_dedup_state_code_error_cooldown_boundary_uses_created_at_plus_win
 
 
 def test_build_dedup_state_suppress_until_active():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     future_iso = (now + timedelta(hours=1)).isoformat()
     t = _make_task(
         status=TaskStatus.CANCELLED,
@@ -350,7 +350,7 @@ def test_build_dedup_state_suppress_until_active():
 
 
 def test_build_dedup_state_suppress_until_adds_label_for_completed_respawn():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     future_iso = (now + timedelta(hours=1)).isoformat()
     # COMPLETED-without-pr_merged task that carries an active suppress_until:
     # the hash should be added with the "suppressed" label (no prior
@@ -365,7 +365,7 @@ def test_build_dedup_state_suppress_until_adds_label_for_completed_respawn():
 
 
 def test_build_dedup_state_prior_failure_keeps_most_recent():
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     older = _make_task(
         status=TaskStatus.FAILED,
         context={"finding_hash": "dup1"},
@@ -1530,7 +1530,7 @@ def test_build_dedup_state_passes_at_time_to_classify_failure():
     """build_dedup_state must pass at_time=last_heartbeat so rate-limit correlation
     uses the failure instant rather than sweep time, preventing RATE_LIMIT→CODE_ERROR
     flips when analytics paths run hours after the cooldown has lifted."""
-    heartbeat = datetime.utcnow() - timedelta(hours=6)
+    heartbeat = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=6)
     t = _make_task(
         status=TaskStatus.FAILED,
         context={"finding_hash": "rl1"},

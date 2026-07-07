@@ -6416,7 +6416,7 @@ async def test_list_residual_cases_orders_by_last_seen_desc(
 
     from datetime import datetime, timedelta
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     db_session.add(
         ResidualRemediationCase(
             project_id=project.id,

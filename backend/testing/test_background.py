@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
+from app.time_utils import _utcnow
 from app.models import Project, Task, TaskStatus, Alert
 from app.reaper import reaper_service, _reaper_skip_counts
 from app.broadcast import broadcast_to_project, manager
@@ -74,7 +75,7 @@ async def test_reaper_evaluating_sweep_queries_updated_at(reaper_db, mocker):
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck evaluating"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -161,7 +162,7 @@ async def test_reaper_retry_path(reaper_db, mocker):
         vm_instance_id="retry-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -203,7 +204,7 @@ async def test_reaper_retry_preserves_analysis_artifacts(reaper_db, mocker):
         vm_instance_id="artifact-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context=dict(original_ctx),
     )
     reaper_db.add(task)
@@ -252,7 +253,7 @@ async def test_reaper_terminal_failure(reaper_db, mocker):
         vm_instance_id="final-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -292,7 +293,7 @@ async def test_reaper_persists_failure_category_on_terminal_fail(reaper_db, mock
         vm_instance_id="category-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,  # At retry limit → reaper must mark FAILED
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -328,7 +329,7 @@ async def test_reaper_five_minute_heartbeat_threshold(reaper_db, mocker):
         vm_instance_id="threshold-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=6),
+        last_heartbeat=_utcnow() - timedelta(minutes=6),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -365,7 +366,7 @@ async def test_reaper_parent_task_reevaluation(reaper_db, mocker):
         vm_instance_id="coordinator-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(coordinator)
     await reaper_db.commit()
@@ -486,7 +487,7 @@ async def test_stale_branch_cleanup_deletes_orphaned_branch(cleanup_db, mocker):
     # HEAD commit 10 days old — well past the 2-day stale threshold.
     mocker.patch(
         "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(days=10),
+        return_value=_utcnow() - timedelta(days=10),
     )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
@@ -535,7 +536,7 @@ async def test_stale_branch_cleanup_skips_active_task_with_old_updated_at(
     await cleanup_db.commit()
     await cleanup_db.refresh(project)
 
-    old = datetime.utcnow() - timedelta(days=30)
+    old = _utcnow() - timedelta(days=30)
     task = Task(
         id=_uuid_with_prefix("cafef00d"),
         project_id=project.id,
@@ -631,7 +632,7 @@ async def test_stale_branch_cleanup_skips_terminal_task_with_open_pr(
     # Commit is well past the stale threshold — only Gate 5.5 should hold.
     mocker.patch(
         "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(days=10),
+        return_value=_utcnow() - timedelta(days=10),
     )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
@@ -679,7 +680,7 @@ async def test_stale_branch_cleanup_deletes_terminal_task_with_merged_pr(
     )
     mocker.patch(
         "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(days=10),
+        return_value=_utcnow() - timedelta(days=10),
     )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
@@ -718,7 +719,7 @@ async def test_stale_branch_cleanup_skips_recent_terminal_task(cleanup_db, mocke
     # HEAD commit 12 hours old — well inside the 2-day stale buffer.
     mocker.patch(
         "app.github.get_commit_date",
-        return_value=datetime.utcnow() - timedelta(hours=12),
+        return_value=_utcnow() - timedelta(hours=12),
     )
     mock_delete = mocker.patch("app.github.delete_branch", return_value=True)
 
@@ -1713,7 +1714,7 @@ async def test_reaper_infra_provision_failure_no_retry_budget_burn(reaper_db, mo
         payloads=[{"type": "create", "prompt": "do work"}],
         vm_instance_id="infra-vm",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=20),
+        started_at=_utcnow() - timedelta(minutes=20),
         context={"provision_zone": "us-central1-a"},
     )
     reaper_db.add(task)
@@ -1761,7 +1762,7 @@ async def test_reaper_account_provision_failure_burns_retry_budget(reaper_db, mo
         payloads=[{"type": "create", "prompt": "do work"}],
         vm_instance_id="account-vm",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=20),
+        started_at=_utcnow() - timedelta(minutes=20),
         context={"provision_zone": "us-central1-b", "max_plan_account_id": "acct-abc"},
     )
     reaper_db.add(task)
@@ -1808,7 +1809,7 @@ async def test_reaper_infra_provision_failure_with_zone_recovery(reaper_db, mock
         payloads=[{"type": "create", "prompt": "test"}],
         vm_instance_id="nozone-vm",
         status=TaskStatus.PROVISIONING,
-        started_at=datetime.utcnow() - timedelta(minutes=20),
+        started_at=_utcnow() - timedelta(minutes=20),
         context={},
     )
     reaper_db.add(task)
@@ -1859,7 +1860,7 @@ async def test_reaper_rate_limit_requeue_without_burning_retry_budget(
         vm_instance_id="rl-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={
             "max_plan_account_id": "rl-acct-123",
             # Exact pattern from RATE_LIMIT_PATTERNS
@@ -1936,7 +1937,7 @@ async def test_reaper_rate_limit_disable_account_model_failure_handled_gracefull
         vm_instance_id="rl-err-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={
             "max_plan_account_id": "rl-acct-456",
             "last_error": "API Error: Rate limit reached",
@@ -2008,7 +2009,7 @@ async def test_reaper_rate_limit_disable_account_model_retry_succeeds(
         vm_instance_id="rl-retry-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=1,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
         context={
             "max_plan_account_id": "rl-acct-789",
             "last_error": "API Error: Rate limit reached",
@@ -2114,7 +2115,7 @@ async def test_reaper_unblocks_dependent_tasks_on_terminal_failure(reaper_db, mo
         vm_instance_id="failing-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,  # max_retries=3, so can_retry=False → FAILED
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(failed_task)
     await reaper_db.commit()
@@ -2180,7 +2181,7 @@ async def test_reaper_dep_unblocking_error_does_not_crash_reaper(reaper_db, mock
         vm_instance_id="dep-err-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=3,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(failed_task)
     await reaper_db.commit()
@@ -2251,7 +2252,7 @@ async def test_reaper_force_lock_failure_clears_tracking_state(
         vm_instance_id="orphan-vm-fl",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(orphaned)
     await reaper_db.commit()
@@ -2292,7 +2293,7 @@ async def test_reaper_force_lock_threshold_is_five(
         vm_instance_id="threshold-vm",
         status=TaskStatus.IN_PROGRESS,
         attempt_count=0,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=10),
+        last_heartbeat=_utcnow() - timedelta(minutes=10),
     )
     reaper_db.add(orphaned)
     await reaper_db.commit()
@@ -2950,7 +2951,7 @@ async def test_reaper_rescues_evaluating_parent_all_children_failed(reaper_db, m
         payloads=[{"type": "research", "prompt": "stuck"}],
         status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3},
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -2996,7 +2997,7 @@ async def test_reaper_does_not_rescue_parent_with_running_children(reaper_db, mo
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -3044,7 +3045,7 @@ async def test_reaper_failure_message_includes_failure_classes(reaper_db, mocker
         payloads=[{"type": "research", "prompt": "stuck"}],
         status=TaskStatus.EVALUATING,
         context={"_requeue_count": 3},
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -3089,7 +3090,7 @@ async def test_reaper_parent_rescue_calls_requeue_before_failing(reaper_db, mock
         project_id=project.id,
         payloads=[{"type": "research", "prompt": "stuck"}],
         status=TaskStatus.EVALUATING,
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(parent)
     await reaper_db.commit()
@@ -3160,7 +3161,7 @@ async def test_infra_recovery_resurrects_provision_failure_when_zone_available(
             "provision_failures_infra": 1,
             "_infra_wait": True,
         },
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3209,7 +3210,7 @@ async def test_infra_recovery_does_not_resurrect_when_no_zone_available(
         status=TaskStatus.FAILED,
         attempt_count=3,
         context={"failure_category": "PROVISION_FAILURE"},
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3247,7 +3248,7 @@ async def test_infra_recovery_caps_at_one_resurrection_per_task(reaper_db, mocke
             "failure_category": "PROVISION_FAILURE",
             "_resurrection_count": 1,  # Already resurrected once
         },
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3283,7 +3284,7 @@ async def test_infra_recovery_resurrects_agent_timeout_when_zone_available(
         status=TaskStatus.FAILED,
         attempt_count=2,
         context={"failure_category": "AGENT_TIMEOUT"},
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3325,7 +3326,7 @@ async def test_infra_recovery_skips_agent_timeout_when_no_zone_available(
         status=TaskStatus.FAILED,
         attempt_count=2,
         context={"failure_category": "AGENT_TIMEOUT"},
-        updated_at=datetime.utcnow() - timedelta(minutes=20),
+        updated_at=_utcnow() - timedelta(minutes=20),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3359,7 +3360,7 @@ async def test_infra_recovery_skips_tasks_older_than_two_hours(reaper_db, mocker
         attempt_count=3,
         context={"failure_category": "PROVISION_FAILURE"},
         # 3 hours ago — outside the 2h window
-        updated_at=datetime.utcnow() - timedelta(hours=3),
+        updated_at=_utcnow() - timedelta(hours=3),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3392,7 +3393,7 @@ async def test_infra_recovery_does_not_resurrect_code_error_tasks(reaper_db, moc
         status=TaskStatus.FAILED,
         attempt_count=3,
         context={"failure_category": "CODE_ERROR"},
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3432,7 +3433,7 @@ async def test_infra_recovery_resurrects_external_api_when_deps_healthy(
         status=TaskStatus.FAILED,
         attempt_count=3,
         context={"failure_category": "EXTERNAL_API"},
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3483,7 +3484,7 @@ async def test_infra_recovery_clears_api_failure_retries_on_external_api_resurre
             # Simulate a task that exhausted its retry budget before failing permanently
             "_api_failure_retries": 6,
         },
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3527,7 +3528,7 @@ async def test_infra_recovery_does_not_resurrect_external_api_when_deps_unhealth
         status=TaskStatus.FAILED,
         attempt_count=3,
         context={"failure_category": "EXTERNAL_API"},
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3576,7 +3577,7 @@ async def test_infra_recovery_resurrects_rate_limit_when_account_available(
             "blacklisted_accounts": ["acct-blacklisted"],
             "max_plan_account_id": "acct-blacklisted",
         },
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -3628,7 +3629,7 @@ async def test_infra_recovery_does_not_resurrect_rate_limit_when_all_accounts_bl
             "failure_category": "RATE_LIMIT",
             "blacklisted_accounts": ["acct-1"],
         },
-        updated_at=datetime.utcnow() - timedelta(minutes=30),
+        updated_at=_utcnow() - timedelta(minutes=30),
     )
     reaper_db.add(task)
     await reaper_db.commit()
@@ -4099,8 +4100,8 @@ async def test_reaper_clears_far_future_retry_after(reaper_db, mocker):
 
     # Audit W1: retry_after is now a column (Task.retry_after_until); the
     # context counter (_retry_after_resets) stays in JSONB for escalation logic.
-    far_future_dt = datetime.utcnow() + timedelta(hours=5)
-    valid_dt = datetime.utcnow() + timedelta(minutes=5)
+    far_future_dt = _utcnow() + timedelta(hours=5)
+    valid_dt = _utcnow() + timedelta(minutes=5)
     stale_task = Task(
         project_id=project.id,
         payloads=[{"type": "create", "prompt": "do work"}],
@@ -4175,7 +4176,7 @@ def test_set_retry_after_clamps_to_30_minutes():
     set_retry_after(ctx, 9999)
     dt = parse_retry_after(ctx["retry_after"])
     assert dt is not None
-    assert dt <= datetime.utcnow() + timedelta(
+    assert dt <= _utcnow() + timedelta(
         minutes=RETRY_AFTER_MAX_MINUTES
     ) + timedelta(seconds=5)
 
@@ -4183,4 +4184,4 @@ def test_set_retry_after_clamps_to_30_minutes():
     set_retry_after(ctx2, -100)
     dt2 = parse_retry_after(ctx2["retry_after"])
     assert dt2 is not None
-    assert dt2 >= datetime.utcnow() - timedelta(seconds=5)
+    assert dt2 >= _utcnow() - timedelta(seconds=5)

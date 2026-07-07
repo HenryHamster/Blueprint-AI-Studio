@@ -13,7 +13,7 @@ Covers:
 from __future__ import annotations
 
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
 
 import pytest
@@ -332,7 +332,7 @@ class TestSuccessRateSelection:
         """Among accounts that pass the availability filter, 7d success rate wins
         over active_tasks as the tiebreaker."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         low_success_id = f"acct-low-{uuid.uuid4().hex}"
         high_success_id = f"acct-high-{uuid.uuid4().hex}"
         low_success = {
@@ -399,7 +399,7 @@ class TestBalancedSuccessRateSelection:
         out.  When its active_tasks count is lower it still wins over a
         high-success-rate account that is busier."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         low_sample_id = f"acct-ls-{uuid.uuid4().hex}"
         high_success_id = f"acct-hs-{uuid.uuid4().hex}"
         low_sample = {
@@ -450,7 +450,7 @@ class TestBalancedSuccessRateSelection:
         rate.  Ids are assigned so that the low-success account would win the
         current alphabetic tiebreak — the xfail verifies the new behaviour."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         # "aaa-..." sorts before "zzz-..." so current code picks low_success.
         low_success_id = "aaa-lo-" + uuid.uuid4().hex
         high_success_id = "zzz-hi-" + uuid.uuid4().hex
@@ -497,7 +497,7 @@ class TestBalancedSuccessRateSelection:
     async def test_equal_success_tiebreaks_by_lower_load(self):
         """When both accounts have identical success rates, the less-loaded one wins."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         busy_id = f"acct-busy-{uuid.uuid4().hex}"
         idle_id = f"acct-idle-{uuid.uuid4().hex}"
         busy = {
@@ -542,7 +542,7 @@ class TestBalancedSuccessRateSelection:
         """When task_type is passed, balanced selection uses task-type-scoped
         success rate instead of (or as fallback from) the aggregate."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         good_id = f"acct-good-{uuid.uuid4().hex}"
         bad_id = f"acct-bad-{uuid.uuid4().hex}"
         # good: 3/3 "create" successes; bad: 0/3 "create" successes.
@@ -600,7 +600,7 @@ class TestBalancedSuccessRateSelection:
         filter keeps the full pool — no account is starved — and the
         load-based tiebreak picks the least-busy one."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         busy_id = f"acct-busy-{uuid.uuid4().hex}"
         idle_id = f"acct-idle-{uuid.uuid4().hex}"
         busy = {
@@ -652,7 +652,7 @@ class TestBalancedSuccessRateSelection:
         """A probing-state account (cooldown elapsed, active_tasks == 0) is
         selected in balanced mode when no healthy account is available."""
         user_id = f"u-{uuid.uuid4().hex}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         probing_id = f"acct-probe-{uuid.uuid4().hex}"
         probing = {
             "id": probing_id,

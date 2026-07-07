@@ -26,6 +26,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, select
 
+from app.time_utils import _utcnow
 from app import compute
 from app import compute_backends as compute_backends_module
 from app import compute_jobs
@@ -1957,7 +1958,7 @@ async def test_process_compute_jobs_once_persists_result_metrics(
         async def launch(self, spec):
             return ComputeLaunchResult(
                 external_id="fake-job-metrics",
-                started_at=datetime.utcnow() - timedelta(seconds=10),
+                started_at=_utcnow() - timedelta(seconds=10),
                 cost_rate_per_second=0.0,
                 message="launched",
             )
@@ -1969,7 +1970,7 @@ async def test_process_compute_jobs_once_persists_result_metrics(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
                 metrics={"accuracy": 0.97, "tokens_per_sec": 512.0},
             )
@@ -2031,7 +2032,7 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
     job.polling_metadata = meta
     await db_session.commit()
 
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -2058,7 +2059,7 @@ async def test_process_compute_jobs_once_launches_and_records_terminal_success(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -2128,7 +2129,7 @@ async def test_process_compute_jobs_once_records_launch_failure_then_clears_on_s
                 raise RuntimeError("launch provider unavailable")
             return ComputeLaunchResult(
                 external_id="launch-rpc-failure",
-                started_at=datetime.utcnow(),
+                started_at=_utcnow(),
                 cost_rate_per_second=0.001,
                 message="launched",
             )
@@ -2195,7 +2196,7 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
             await asyncio.sleep(0.05)
             return ComputeLaunchResult(
                 external_id="runtime-deadline-job",
-                started_at=datetime.utcnow(),
+                started_at=_utcnow(),
                 cost_rate_per_second=0.001,
                 message="launched",
             )
@@ -2230,7 +2231,7 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
     # Launch delay is no longer consumed by the runtime deadline: even if the
     # prelaunch wall clock is now in the past, the running job stays alive until
     # its launch-time runtime window expires.
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=1)
     await db_session.commit()
 
     await compute_jobs.process_compute_jobs_once(session_factory=session_factory)
@@ -2238,10 +2239,10 @@ async def test_compute_runtime_deadline_starts_after_launch(db_session, monkeypa
     assert job.status == ComputeJobStatus.RUNNING
     assert terminate_reasons == []
 
-    job.started_at = datetime.utcnow() - timedelta(seconds=61)
+    job.started_at = _utcnow() - timedelta(seconds=61)
     job.polling_metadata = {
         **job.polling_metadata,
-        "runtime_deadline_at": (datetime.utcnow() - timedelta(seconds=1)).isoformat(),
+        "runtime_deadline_at": (_utcnow() - timedelta(seconds=1)).isoformat(),
     }
     await db_session.commit()
 
@@ -2281,10 +2282,10 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
     meta = dict(job.polling_metadata or {})
     meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
-        datetime.utcnow() + timedelta(milliseconds=200)
+        _utcnow() + timedelta(milliseconds=200)
     ).isoformat()
     job.polling_metadata = meta
-    job.wall_clock_deadline = datetime.utcnow() + timedelta(milliseconds=200)
+    job.wall_clock_deadline = _utcnow() + timedelta(milliseconds=200)
     await db_session.commit()
 
     terminate_reasons: list[str] = []
@@ -2299,7 +2300,7 @@ async def test_process_compute_jobs_once_times_out_provisioning_before_launch(
             await asyncio.sleep(0.5)
             return ComputeLaunchResult(
                 external_id="slow-launch-job",
-                started_at=datetime.utcnow(),
+                started_at=_utcnow(),
                 cost_rate_per_second=0.001,
                 message="launched",
             )
@@ -2374,11 +2375,11 @@ async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
     meta = dict(job.polling_metadata or {})
     meta["preflight_smoke_done"] = True
     meta["provisioning_deadline_at"] = (
-        datetime.utcnow() - timedelta(seconds=1)
+        _utcnow() - timedelta(seconds=1)
     ).isoformat()
     job.polling_metadata = meta
     # wall_clock_deadline stays far in the future (the full runtime budget).
-    assert (job.wall_clock_deadline - datetime.utcnow()).total_seconds() > 1000
+    assert (job.wall_clock_deadline - _utcnow()).total_seconds() > 1000
     await db_session.commit()
 
     terminate_reasons: list[str] = []
@@ -2437,11 +2438,11 @@ async def test_provisioning_subdeadline_fails_fast(db_session, monkeypatch):
     # Simulate a job that is already RUNNING with the sub-deadline expired.
     meta2 = dict(job2.polling_metadata or {})
     meta2["provisioning_deadline_at"] = (
-        datetime.utcnow() - timedelta(seconds=1)
+        _utcnow() - timedelta(seconds=1)
     ).isoformat()
     job2.polling_metadata = meta2
     job2.status = ComputeJobStatus.RUNNING
-    job2.started_at = datetime.utcnow() - timedelta(seconds=5)
+    job2.started_at = _utcnow() - timedelta(seconds=5)
     await db_session.commit()
 
     poll_calls: list[str] = []
@@ -2507,7 +2508,7 @@ async def test_compute_monitor_records_backend_rpc_failure_without_terminalizing
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2573,7 +2574,7 @@ async def test_running_job_past_deadline_terminates_when_poll_unreachable(
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "unreachable-backend-vm"
     # Backdate the wall_clock_deadline so it has already expired.
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=1)
     db_session.add(
         TaskWakeRegistration(
             task_id=task.id,
@@ -2581,7 +2582,7 @@ async def test_running_job_past_deadline_terminates_when_poll_unreachable(
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2654,7 +2655,7 @@ async def test_process_compute_jobs_once_records_cost_failure_without_firing_wak
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2667,7 +2668,7 @@ async def test_process_compute_jobs_once_records_cost_failure_without_firing_wak
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -2736,7 +2737,7 @@ async def test_poll_failure_threshold_transitions_job_to_failed(
         deadline_seconds=3600,
     )
     job.status = ComputeJobStatus.RUNNING
-    job.started_at = datetime.utcnow() - timedelta(minutes=5)
+    job.started_at = _utcnow() - timedelta(minutes=5)
     job.external_compute_id = "poll-failure-threshold"
     db_session.add(
         TaskWakeRegistration(
@@ -2745,7 +2746,7 @@ async def test_poll_failure_threshold_transitions_job_to_failed(
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2817,9 +2818,9 @@ async def test_poll_failure_wall_clock_deadline_transitions_to_timed_out(
         deadline_seconds=3600,
     )
     job.status = ComputeJobStatus.RUNNING
-    job.started_at = datetime.utcnow() - timedelta(hours=2)
+    job.started_at = _utcnow() - timedelta(hours=2)
     # Place wall_clock_deadline in the past.
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(minutes=10)
+    job.wall_clock_deadline = _utcnow() - timedelta(minutes=10)
     job.external_compute_id = "poll-failure-deadline"
     db_session.add(
         TaskWakeRegistration(
@@ -2828,7 +2829,7 @@ async def test_poll_failure_wall_clock_deadline_transitions_to_timed_out(
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2889,8 +2890,8 @@ async def test_poll_failure_estimated_spend_cap_transitions_to_spend_cap_exceede
     )
     job.status = ComputeJobStatus.RUNNING
     # Started 1 minute ago; at $0.1/s that's $6 >> $1.00 cap.
-    job.started_at = datetime.utcnow() - timedelta(minutes=1)
-    job.wall_clock_deadline = datetime.utcnow() + timedelta(hours=20)
+    job.started_at = _utcnow() - timedelta(minutes=1)
+    job.wall_clock_deadline = _utcnow() + timedelta(hours=20)
     job.external_compute_id = "poll-failure-spend-cap"
     # Store cost_rate_per_second in polling_metadata so the helper can estimate.
     meta = dict(job.polling_metadata or {})
@@ -2903,7 +2904,7 @@ async def test_poll_failure_estimated_spend_cap_transitions_to_spend_cap_exceede
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -2969,7 +2970,7 @@ async def test_process_compute_jobs_once_records_terminate_failure_and_still_ter
             wake_source_kind=compute_jobs.COMPUTE_JOB_TERMINAL_WAKE_KIND,
             wake_source_ref=str(job.id),
             wake_action=WakeAction.FINALIZE,
-            deadline_at=datetime.utcnow() + timedelta(hours=1),
+            deadline_at=_utcnow() + timedelta(hours=1),
         )
     )
     await db_session.commit()
@@ -3373,7 +3374,7 @@ async def test_ordinary_compute_job_ignores_unconfirmed_release(db_session):
         version_number=1,
         status="promoted",
         promoted_sha="abc123",
-        promoted_at=datetime.utcnow(),
+        promoted_at=_utcnow(),
     )
     db_session.add(version)
     await db_session.flush()
@@ -3410,7 +3411,7 @@ async def test_live_proof_compute_job_records_serving_evidence_and_idempotency(
     db_session.add(project)
     await db_session.commit()
     await db_session.refresh(project)
-    served_at = datetime.utcnow()
+    served_at = _utcnow()
     version = ReleaseVersion(
         project_id=project.id,
         version_number=7,
@@ -3624,7 +3625,7 @@ async def test_create_compute_job_gpu_extends_wall_clock_deadline(
     """GPU jobs add GPU_PROVISIONING_ALLOWANCE_SECONDS to wall_clock_deadline; CPU jobs do not."""
     monkeypatch.setattr(compute, "LOCAL_MODE", False)
     task_gpu = await _make_compute_task(db_session)
-    before = datetime.utcnow()
+    before = _utcnow()
     job_gpu = await compute_jobs.create_compute_job(
         db_session,
         task_gpu,
@@ -3635,7 +3636,7 @@ async def test_create_compute_job_gpu_extends_wall_clock_deadline(
         backend_name="gcp",
         accelerator="T4",
     )
-    after = datetime.utcnow()
+    after = _utcnow()
 
     # GPU wall_clock_deadline includes the provisioning allowance.
     expected_allowance = compute_jobs.GPU_PROVISIONING_ALLOWANCE_SECONDS
@@ -3648,7 +3649,7 @@ async def test_create_compute_job_gpu_extends_wall_clock_deadline(
 
     # CPU job wall_clock_deadline does NOT include the allowance.
     task_cpu = await _make_compute_task(db_session)
-    before_cpu = datetime.utcnow()
+    before_cpu = _utcnow()
     job_cpu = await compute_jobs.create_compute_job(
         db_session,
         task_cpu,
@@ -3657,7 +3658,7 @@ async def test_create_compute_job_gpu_extends_wall_clock_deadline(
         spend_cap_usd=1.0,
         deadline_seconds=600,
     )
-    after_cpu = datetime.utcnow()
+    after_cpu = _utcnow()
     lower_cpu = before_cpu + timedelta(seconds=600)
     upper_cpu = after_cpu + timedelta(seconds=600)
     assert lower_cpu <= job_cpu.wall_clock_deadline <= upper_cpu, (
@@ -3960,7 +3961,7 @@ async def test_process_compute_jobs_once_kills_on_spend_cap(db_session, monkeypa
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-job-2"
-    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.started_at = _utcnow() - timedelta(seconds=60)
     db_session.add(job)
     await db_session.commit()
 
@@ -4023,8 +4024,8 @@ async def test_process_compute_jobs_once_kills_on_deadline(db_session, monkeypat
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-job-3"
-    job.started_at = datetime.utcnow() - timedelta(seconds=60)
-    job.wall_clock_deadline = datetime.utcnow() + timedelta(seconds=60)
+    job.started_at = _utcnow() - timedelta(seconds=60)
+    job.wall_clock_deadline = _utcnow() + timedelta(seconds=60)
     db_session.add(job)
     await db_session.commit()
 
@@ -4191,7 +4192,7 @@ async def test_list_compute_jobs_returns_active_and_recent_excludes_others(db_se
     await db_session.refresh(task)
     await db_session.refresh(other_task)
 
-    now = datetime.utcnow()
+    now = _utcnow()
 
     active = ComputeJob(
         task_id=task.id,
@@ -5460,7 +5461,7 @@ async def test_get_recent_terminal_compute_spend_terminal_only_and_windowed(db_s
     await db_session.refresh(project)
     await db_session.refresh(other)
 
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_start = _utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
 
     def _job(*, proj_id, status, final_cost, completed_at):
         return ComputeJob(
@@ -5607,7 +5608,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
     assert task.status == TaskStatus.PARKED
     assert task.parked_at is not None
 
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -5628,7 +5629,7 @@ async def test_compute_job_terminal_wakes_parked_task_once(db_session, monkeypat
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -5750,7 +5751,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
     job.polling_metadata = meta
     await db_session.commit()
 
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -5771,7 +5772,7 @@ async def test_compute_job_terminal_before_park_still_finalizes_once(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -6024,7 +6025,7 @@ async def test_park_task_waits_for_terminal_job_commit_before_catch_up(
         assert locked_job is not None
         locked_job.status = ComputeJobStatus.SUCCEEDED
         locked_job.outcome = ComputeJobOutcome.SUCCESS
-        locked_job.completed_at = datetime.utcnow()
+        locked_job.completed_at = _utcnow()
         locked_job.final_cost_usd = 0.25
         locked_job.accrued_cost_usd = 0.25
         await terminal_session.flush()
@@ -7734,7 +7735,7 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
     from app.task_lifecycle import fire_task_wakes, park_task
     from app.time_utils import _utcnow
 
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class _AlwaysSucceedsBackend:
         def external_id_for(self, persisted_job):
@@ -7755,7 +7756,7 @@ async def test_compute_park_wake_is_race_safe_under_lock_contention(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -8043,7 +8044,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
 
     launch_entered = asyncio.Event()
     launch_release = asyncio.Event()
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class _BlockingLaunchBackend:
         def external_id_for(self, persisted_job):
@@ -8149,7 +8150,7 @@ async def test_compute_monitor_does_not_hold_row_lock_across_backend_rpcs(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -9236,7 +9237,7 @@ async def _make_terminal_job(
         status=ComputeJobStatus.SUCCEEDED,
         final_cost_usd=final_cost_usd,
         accrued_cost_usd=final_cost_usd,
-        completed_at=datetime.utcnow() - timedelta(hours=1),
+        completed_at=_utcnow() - timedelta(hours=1),
     )
     db_session.add(job)
     await db_session.commit()
@@ -11261,7 +11262,7 @@ async def test_compute_job_vm_heartbeat_noop_for_terminal_job(
     )
     job.status = ComputeJobStatus.SUCCEEDED
     job.outcome = ComputeJobOutcome.SUCCESS
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.last_heartbeat_at = None
     await db_session.commit()
 
@@ -11316,12 +11317,12 @@ async def test_provisioning_deadline_skipped_when_vm_heartbeated(
     # sees provisioning_timeout_seconds == 0.0 on its first pass.
     meta = dict(job.polling_metadata or {})
     meta["provisioning_deadline_at"] = (
-        datetime.utcnow() - timedelta(seconds=10)
+        _utcnow() - timedelta(seconds=10)
     ).isoformat()
     job.polling_metadata = meta
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=10)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=10)
     # Simulate the VM having already heartbeated (endpoint set this).
-    job.last_heartbeat_at = datetime.utcnow() - timedelta(seconds=5)
+    job.last_heartbeat_at = _utcnow() - timedelta(seconds=5)
     job.status = ComputeJobStatus.STARTING
     await db_session.commit()
 
@@ -11389,10 +11390,10 @@ async def test_provisioning_deadline_still_terminates_without_heartbeat(
     )
     meta = dict(job.polling_metadata or {})
     meta["provisioning_deadline_at"] = (
-        datetime.utcnow() - timedelta(seconds=10)
+        _utcnow() - timedelta(seconds=10)
     ).isoformat()
     job.polling_metadata = meta
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=10)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=10)
     job.last_heartbeat_at = None  # No heartbeat — VM never booted
     job.status = ComputeJobStatus.STARTING
     await db_session.commit()
@@ -11462,10 +11463,10 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
     # but short enough that the 1-second launch sleep causes a TimeoutError.
     meta = dict(job.polling_metadata or {})
     meta["provisioning_deadline_at"] = (
-        datetime.utcnow() + timedelta(milliseconds=300)
+        _utcnow() + timedelta(milliseconds=300)
     ).isoformat()
     job.polling_metadata = meta
-    job.wall_clock_deadline = datetime.utcnow() + timedelta(seconds=300)
+    job.wall_clock_deadline = _utcnow() + timedelta(seconds=300)
     job.status = ComputeJobStatus.STARTING
     # Pre-write only last_heartbeat_at, leaving status=STARTING.  This simulates
     # the race where the VM's POST /heartbeat wrote last_heartbeat_at AFTER
@@ -11473,7 +11474,7 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
     # launch path with STARTING), but before wait_for fired.  The guard in the
     # asyncio.TimeoutError handler detects the heartbeat and completes the
     # STARTING→RUNNING transition that the endpoint normally does atomically.
-    job.last_heartbeat_at = datetime.utcnow()
+    job.last_heartbeat_at = _utcnow()
     await db_session.commit()
 
     terminate_reasons: list[str] = []
@@ -11489,7 +11490,7 @@ async def test_launch_lro_timeout_skipped_when_vm_heartbeated(db_session, monkey
             await asyncio.sleep(1.0)
             return ComputeLaunchResult(
                 external_id="lro-slow-vm",
-                started_at=datetime.utcnow(),
+                started_at=_utcnow(),
                 cost_rate_per_second=0.0,
                 message="done",
             )

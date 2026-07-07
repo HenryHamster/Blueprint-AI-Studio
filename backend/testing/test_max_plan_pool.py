@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from app.time_utils import _utcnow
 from app.providers.base import UsageSnapshot
 from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
@@ -142,7 +143,7 @@ class TestComputeHealthScore:
         assert _compute_health_score(_acct()) == 0.0
 
     def test_formula_completions_minus_twice_rl_events(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             completion_events=[
                 {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
@@ -155,7 +156,7 @@ class TestComputeHealthScore:
         assert _compute_health_score(acct, now=now) == 1.0
 
     def test_events_outside_24h_window_excluded(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         old = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 60)
         acct = _acct(
             completion_events=[{"at": old, "duration_seconds": 60.0}],
@@ -180,7 +181,7 @@ class TestGetAccountHealthStats:
         }
 
     def test_aggregates_counts_and_durations(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             completion_events=[
                 {"at": now - timedelta(hours=1), "duration_seconds": 60.0},
@@ -203,7 +204,7 @@ class TestGetAccountHealthStats:
 
 class TestPruneHealthEvents:
     def test_removes_events_older_than_cutoff(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         old = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 60)
         fresh = now - timedelta(hours=1)
         acct = _acct(
@@ -220,7 +221,7 @@ class TestPruneHealthEvents:
 
     def test_noop_when_lists_absent(self):
         acct = _acct()
-        _prune_health_events(acct, datetime.utcnow())
+        _prune_health_events(acct, _utcnow())
         assert "rl_events" not in acct
         assert "completion_events" not in acct
 
@@ -230,7 +231,7 @@ class TestPruneHealthEvents:
 
 class TestDailyResetIfElapsed:
     def test_seeds_reset_at_when_missing(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(daily_task_count=3)
         assert _daily_reset_if_elapsed(acct, now) is False
         assert acct["daily_task_count_reset_at"] == now
@@ -238,7 +239,7 @@ class TestDailyResetIfElapsed:
         assert acct["daily_task_count"] == 3
 
     def test_no_reset_within_window(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             daily_task_count=5, daily_task_count_reset_at=now - timedelta(hours=12)
         )
@@ -246,7 +247,7 @@ class TestDailyResetIfElapsed:
         assert acct["daily_task_count"] == 5
 
     def test_resets_after_window_elapsed(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             daily_task_count=42, daily_task_count_reset_at=now - timedelta(hours=25)
         )
@@ -298,14 +299,14 @@ class TestAccountAvailableForModel:
 
     def test_unavailable_during_active_cooldown(self):
         # Fresh disable → still within cooldown window.
-        acct = _acct(disabled_models={OPUS: {"hits": 1, "at": datetime.utcnow()}})
+        acct = _acct(disabled_models={OPUS: {"hits": 1, "at": _utcnow()}})
         assert _account_available_for_model(acct, OPUS) is False
 
     def test_available_as_probing_after_cooldown_elapses(self):
         # hits=1 → 30 min cooldown; 60 min ago → cooldown elapsed → probing (still "available").
         acct = _acct(
             disabled_models={
-                OPUS: {"hits": 1, "at": datetime.utcnow() - timedelta(minutes=60)}
+                OPUS: {"hits": 1, "at": _utcnow() - timedelta(minutes=60)}
             }
         )
         assert _account_available_for_model(acct, OPUS) is True
@@ -332,7 +333,7 @@ class TestDescribePoolBlockage:
     def test_all_rate_limited_reports_earliest_recovery(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(
                 id="r1",
                 user_id="u",
@@ -349,7 +350,7 @@ class TestDescribePoolBlockage:
     def test_partial_rate_limit_mentions_counts(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             healthy = _acct(id="h", user_id="u")
             rl = _acct(
                 id="r", user_id="u", disabled_models={OPUS: {"hits": 1, "at": now}}
@@ -387,7 +388,7 @@ class TestSummarizePoolState:
     def test_aggregates_healthy_rate_limited_and_other(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             healthy = _acct(id="h", user_id="u")
             rl = _acct(
                 id="r",
@@ -433,14 +434,14 @@ class TestAlternateAccountRecoveryDeadline:
                 id="failed",
                 user_id="u-park",
                 disabled_models={
-                    OPUS: {"at": datetime.utcnow() - timedelta(minutes=5), "hits": 1}
+                    OPUS: {"at": _utcnow() - timedelta(minutes=5), "hits": 1}
                 },
             )
             alternate = _acct(id="alternate", user_id="u-park")
             _account_by_id.update({"failed": failed, "alternate": alternate})
             _max_plan_pools["u-park"] = [failed, alternate]
 
-            now = datetime.utcnow()
+            now = _utcnow()
             deadline = await alternate_account_recovery_deadline(
                 "failed",
                 OPUS,
@@ -456,7 +457,7 @@ class TestAlternateAccountRecoveryDeadline:
     async def test_returns_recovery_within_budget_and_none_outside_budget(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             failed = _acct(id="failed", user_id="u-park")
             recovering = _acct(
                 id="recovering",
@@ -498,7 +499,7 @@ class TestHealthScoreDisqualifyThreshold:
 
     def test_score_at_threshold_minus_one_is_below(self):
         """An account with score below threshold would be filtered when alternatives exist."""
-        now = datetime.utcnow()
+        now = _utcnow()
         # Build an account whose health score lands below _HEALTH_SCORE_DISQUALIFY_THRESHOLD.
         # score = completions - 2*rl_events; 3 rl_events → score = -6, which is below -4.
         acct = _acct(
@@ -509,7 +510,7 @@ class TestHealthScoreDisqualifyThreshold:
 
     def test_score_at_threshold_is_eligible(self):
         """An account with score == threshold is NOT filtered."""
-        now = datetime.utcnow()
+        now = _utcnow()
         # score = 0 completions - 2*2 rl_events = -4 == threshold → eligible
         acct = _acct(
             rl_events=[now - timedelta(hours=i) for i in range(1, 3)],
@@ -626,7 +627,7 @@ class TestGetAllAccountHealthSummaries:
     def test_healthy_account_has_expected_keys(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(id="h1", user_id="u", name="TestAcct")
             _account_by_id["h1"] = acct
             _max_plan_pools["u"] = [acct]
@@ -645,7 +646,7 @@ class TestGetAllAccountHealthSummaries:
     def test_rate_limited_account_shows_cooldown(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(
                 id="r1",
                 user_id="u",
@@ -667,7 +668,7 @@ class TestGetAllAccountHealthSummaries:
     def test_disabled_account_shows_fully_disabled(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(
                 id="d1",
                 user_id="u",
@@ -686,7 +687,7 @@ class TestGetAllAccountHealthSummaries:
     def test_low_health_score_shows_disqualified(self):
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             # 3 rl_events → score = -6, below threshold of -4
             acct = _acct(
                 id="q1",
@@ -706,7 +707,7 @@ class TestGetAllAccountHealthSummaries:
         """quota_exhausted kind is preserved in rate_limited_models and has 24h cooldown."""
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(
                 id="qe1",
                 user_id="u",
@@ -732,7 +733,7 @@ class TestGetAllAccountHealthSummaries:
         """success_rate_7d appears in each account summary entry."""
         self._reset_pools()
         try:
-            now = datetime.utcnow()
+            now = _utcnow()
             acct = _acct(
                 id="s1",
                 user_id="u",
@@ -758,7 +759,7 @@ class TestComputeSuccessRate7d:
         assert _compute_success_rate_7d(_acct()) is None
 
     def test_returns_none_when_fewer_than_3_events(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=1), "success": True},
@@ -768,7 +769,7 @@ class TestComputeSuccessRate7d:
         assert _compute_success_rate_7d(acct, now) is None
 
     def test_returns_rate_from_3_plus_events(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=1), "success": True},
@@ -780,7 +781,7 @@ class TestComputeSuccessRate7d:
         assert rate == 2 / 3
 
     def test_excludes_events_older_than_7d(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
         acct = _acct(
             outcome_events=[
@@ -792,7 +793,7 @@ class TestComputeSuccessRate7d:
         assert _compute_success_rate_7d(acct, now) is None
 
     def test_perfect_success_rate(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=i + 1), "success": True} for i in range(5)
@@ -801,7 +802,7 @@ class TestComputeSuccessRate7d:
         assert _compute_success_rate_7d(acct, now) == 1.0
 
     def test_zero_success_rate(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=i + 1), "success": False} for i in range(3)
@@ -818,7 +819,7 @@ class TestComputeSuccessRateByType:
 
     def test_no_task_type_returns_aggregate_unchanged(self):
         """Omitting task_type returns the aggregate — backward compatible."""
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=(
                 [
@@ -851,7 +852,7 @@ class TestComputeSuccessRateByType:
 class TestSuccessRateTiebreaking:
     def test_higher_success_rate_scores_higher(self):
         """_compute_success_rate_7d should rank high-success above low-success accounts."""
-        now = datetime.utcnow()
+        now = _utcnow()
         good = _acct(
             id="good",
             outcome_events=[
@@ -872,14 +873,14 @@ class TestSuccessRateTiebreaking:
 
     def test_no_data_accounts_score_zero(self):
         """Accounts with no outcome history contribute 0.0 (or 0.0 via `or`) to key."""
-        now = datetime.utcnow()
+        now = _utcnow()
         assert (_compute_success_rate_7d(_acct(id="a"), now) or 0.0) == 0.0
         assert (_compute_success_rate_7d(_acct(id="b"), now) or 0.0) == 0.0
 
     def test_selection_key_prefers_high_success(self):
         """The selection key (health, success_rate, -active_tasks) ranks the
         high-success account ahead of the low-success account."""
-        now = datetime.utcnow()
+        now = _utcnow()
         hi = _acct(
             id="hi",
             active_tasks=1,
@@ -909,7 +910,7 @@ class TestSuccessRateTiebreaking:
         _compute_success_rate_7d — identical to an account with zero events.
         Both contribute 0.0 to the selection key via `or 0.0`, so a new account
         is never penalised relative to another new account."""
-        now = datetime.utcnow()
+        now = _utcnow()
         low_sample = _acct(
             id="new",
             outcome_events=[
@@ -928,7 +929,7 @@ class TestSuccessRateTiebreaking:
     def test_equal_success_rate_tiebreaks_by_active_tasks(self):
         """When two accounts have the same success rate, the one with fewer
         active_tasks ranks higher in the selection key."""
-        now = datetime.utcnow()
+        now = _utcnow()
         busy = _acct(
             id="busy",
             active_tasks=3,
@@ -968,7 +969,7 @@ class TestBalancedSuccessRateBias:
     def _acct_with_rate(
         self, id_, success_rate=None, active_tasks=0, provider="anthropic"
     ):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = {
             "id": id_,
             "name": id_,
@@ -1263,7 +1264,7 @@ class TestDisableAccountForAuth:
 
 class TestComputeSuccessRate7dForType:
     def test_returns_none_when_no_typed_events(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1277,7 +1278,7 @@ class TestComputeSuccessRate7dForType:
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_returns_none_below_min_sample_threshold(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1295,7 +1296,7 @@ class TestComputeSuccessRate7dForType:
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_returns_type_scoped_rate_ignoring_other_types(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1334,7 +1335,7 @@ class TestComputeSuccessRate7dForType:
         assert _compute_success_rate_7d_for_type(acct, "create", now) == 1.0
 
     def test_excludes_events_outside_7d_window(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         old = now - timedelta(seconds=_OUTCOME_WINDOW_SECONDS + 60)
         acct = _acct(
             outcome_events=[
@@ -1346,7 +1347,7 @@ class TestComputeSuccessRate7dForType:
         assert _compute_success_rate_7d_for_type(acct, "create", now) is None
 
     def test_events_without_task_type_excluded(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=1), "success": True},
@@ -1367,7 +1368,7 @@ class TestComputeSuccessRate7dForType:
 
 class TestEffectiveSuccessRate:
     def test_returns_typed_rate_when_sufficient_typed_samples(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1390,7 +1391,7 @@ class TestEffectiveSuccessRate:
         assert rate == 1.0
 
     def test_falls_back_to_aggregate_when_typed_sample_sparse(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1409,7 +1410,7 @@ class TestEffectiveSuccessRate:
         assert rate == 0.25
 
     def test_falls_back_to_aggregate_when_task_type_is_none(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {"at": now - timedelta(hours=i + 1), "success": i < 3} for i in range(5)
@@ -1419,7 +1420,7 @@ class TestEffectiveSuccessRate:
         assert rate == _compute_success_rate_7d(acct, now)
 
     def test_returns_none_when_both_typed_and_aggregate_sparse(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             outcome_events=[
                 {
@@ -1440,7 +1441,7 @@ class TestComputeAvgDuration24h:
         assert _compute_avg_duration_24h(_acct()) is None
 
     def test_returns_none_below_min_samples(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             completion_events=[
                 {"at": now - timedelta(hours=1), "duration_seconds": 60.0}
@@ -1450,7 +1451,7 @@ class TestComputeAvgDuration24h:
         assert _compute_avg_duration_24h(acct, now) is None
 
     def test_returns_average_at_min_samples(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             completion_events=[
                 {
@@ -1469,7 +1470,7 @@ class TestComputeAvgDuration24h:
         assert abs(result - expected) < 0.01
 
     def test_excludes_events_outside_24h_window(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         old = now - timedelta(seconds=_HEALTH_WINDOW_SECONDS + 60)
         acct = _acct(
             completion_events=[
@@ -1481,7 +1482,7 @@ class TestComputeAvgDuration24h:
         assert _compute_avg_duration_24h(acct, now) is None
 
     def test_events_missing_duration_are_skipped(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(
             completion_events=[
                 {"at": now - timedelta(hours=1)},  # no duration_seconds
@@ -1503,7 +1504,7 @@ class TestLatencyAwareSelection:
     def _acct_with_duration(
         self, id_, avg_seconds=None, active_tasks=0, provider="anthropic"
     ):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = {
             "id": id_,
             "name": id_,
@@ -1532,7 +1533,7 @@ class TestLatencyAwareSelection:
 
     async def test_sample_floor_prevents_whip(self):
         """Account with fewer than _LATENCY_MIN_SAMPLES completions does not lose to a fast one."""
-        now = datetime.utcnow()
+        now = _utcnow()
         sparse = {
             "id": "sparse",
             "name": "sparse",
@@ -1882,8 +1883,6 @@ class TestRegressionQuarantine:
     async def test_clear_regression_on_success_leaves_quota_exhausted_sibling(self):
         """Clearing regression on one model must not touch quota_exhausted on another."""
         from app.max_plan_pool import clear_regression_on_success
-        from datetime import datetime
-
         acct_id = "a"
         acct = _acct(id=acct_id, name="A")
         sonnet = "claude-sonnet-4-5"
@@ -1892,7 +1891,7 @@ class TestRegressionQuarantine:
             sonnet: {
                 "kind": "regression",
                 "hits": 1,
-                "at": datetime.utcnow(),
+                "at": _utcnow(),
                 "provider": "anthropic",
                 "regression_stats": {
                     "account_rate": 0.1,
@@ -1902,7 +1901,7 @@ class TestRegressionQuarantine:
                     "started_at": "2026-04-29T00:00:00+00:00",
                 },
             },
-            OPUS: {"kind": "quota_exhausted", "hits": 1, "at": datetime.utcnow()},
+            OPUS: {"kind": "quota_exhausted", "hits": 1, "at": _utcnow()},
         }
         _account_by_id[acct_id] = acct
         with patch("app.max_plan_pool._persist_rate_limit_state"):
@@ -1934,7 +1933,7 @@ class TestScanRegressionsDedupe:
         acct["disabled_models"] = {
             "claude-r": {
                 "hits": 1,
-                "at": datetime.utcnow() - timedelta(seconds=60),
+                "at": _utcnow() - timedelta(seconds=60),
                 "kind": "regression",
                 "provider": "anthropic",
             }
@@ -2022,7 +2021,7 @@ class TestPoolWideRateLimitCooldownScoping:
         pool_wide_rate_limit_cooldown from returning True for user A's pool."""
         from app.max_plan_pool import pool_wide_rate_limit_cooldown
 
-        now = datetime.utcnow()
+        now = _utcnow()
         # User A: single account rate-limited
         self._add(
             "user-a",
@@ -2039,7 +2038,7 @@ class TestPoolWideRateLimitCooldownScoping:
         verdict when all anthropic accounts are rate-limited."""
         from app.max_plan_pool import pool_wide_rate_limit_cooldown
 
-        now = datetime.utcnow()
+        now = _utcnow()
         self._add(
             "user-a",
             "a-ant",
@@ -2058,7 +2057,7 @@ class TestPoolWideRateLimitCooldownScoping:
         """If the scoped pool has at least one healthy account, return False."""
         from app.max_plan_pool import pool_wide_rate_limit_cooldown
 
-        now = datetime.utcnow()
+        now = _utcnow()
         self._add(
             "user-a",
             "a1",
@@ -2073,7 +2072,7 @@ class TestPoolWideRateLimitCooldownScoping:
         model is still healthy for the requested model, so return False."""
         from app.max_plan_pool import pool_wide_rate_limit_cooldown
 
-        now = datetime.utcnow()
+        now = _utcnow()
         # Account disabled for claude-sonnet only, not for Opus
         self._add(
             "user-a",
@@ -2103,12 +2102,12 @@ class TestDbPoolWideRateLimitCooldownScoping:
     async def test_user_filter_isolates_verdict(self, monkeypatch):
         """When user_id is passed, only that user's accounts are considered.
         A healthy account for user-b must not prevent True for user-a's pool."""
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         from unittest.mock import AsyncMock, MagicMock
         from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
         from app.models import MaxPlanAccount
 
-        rl_at = datetime.utcnow() - timedelta(minutes=5)
+        rl_at = _utcnow() - timedelta(minutes=5)
         a_acct = MaxPlanAccount(
             user_id="user-a",
             name="a",
@@ -2144,12 +2143,12 @@ class TestDbPoolWideRateLimitCooldownScoping:
     ):
         """When providers filter is set, a healthy account on a different provider
         must not prevent a True verdict for the filtered provider pool."""
-        from datetime import datetime, timedelta
+        from datetime import timedelta
         from unittest.mock import AsyncMock, MagicMock
         from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
         from app.models import MaxPlanAccount, LLMProviderName
 
-        rl_at = datetime.utcnow() - timedelta(minutes=5)
+        rl_at = _utcnow() - timedelta(minutes=5)
         ant_acct = MaxPlanAccount(
             user_id="u",
             name="ant",
@@ -2204,12 +2203,12 @@ def _acct_usage(acct, snap, *, at):
 
 class TestCachedUsageSnapshot:
     def test_fresh_snapshot_returned(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), _known_snap(10.0, 20.0), at=now)
         assert _cached_usage_snapshot(acct, now) is not None
 
     def test_stale_snapshot_treated_as_unknown(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(
             _acct(),
             _known_snap(10.0, 20.0),
@@ -2218,37 +2217,37 @@ class TestCachedUsageSnapshot:
         assert _cached_usage_snapshot(acct, now) is None
 
     def test_missing_snapshot_is_none(self):
-        assert _cached_usage_snapshot(_acct(), datetime.utcnow()) is None
+        assert _cached_usage_snapshot(_acct(), _utcnow()) is None
 
     def test_non_snapshot_value_is_none(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(usage_snapshot={"not": "a snapshot"}, usage_snapshot_at=now)
         assert _cached_usage_snapshot(acct, now) is None
 
 
 class TestUsageGateShouldSkip:
     def test_five_hour_over_threshold_skips(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), _known_snap(95.0, 10.0), at=now)
         assert _usage_gate_should_skip(acct, now, 90.0) is True
 
     def test_seven_day_over_threshold_skips(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), _known_snap(10.0, 92.0), at=now)
         assert _usage_gate_should_skip(acct, now, 90.0) is True
 
     def test_under_threshold_not_skipped(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), _known_snap(80.0, 85.0), at=now)
         assert _usage_gate_should_skip(acct, now, 90.0) is False
 
     def test_unknown_snapshot_never_skipped(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), UsageSnapshot.unknown("t"), at=now)
         assert _usage_gate_should_skip(acct, now, 90.0) is False
 
     def test_stale_snapshot_never_skipped(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(
             _acct(),
             _known_snap(99.0, 99.0),
@@ -2259,22 +2258,22 @@ class TestUsageGateShouldSkip:
 
 class TestUsageHeadroomRank:
     def test_known_rank_is_100_minus_max_util(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), _known_snap(20.0, 60.0), at=now)
         assert _usage_headroom_rank(acct, now) == 40.0
 
     def test_unknown_ranks_neutral(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(_acct(), UsageSnapshot.unknown("t"), at=now)
         assert _usage_headroom_rank(acct, now) == _USAGE_HEADROOM_NEUTRAL
 
     def test_missing_ranks_neutral(self):
         assert (
-            _usage_headroom_rank(_acct(), datetime.utcnow()) == _USAGE_HEADROOM_NEUTRAL
+            _usage_headroom_rank(_acct(), _utcnow()) == _USAGE_HEADROOM_NEUTRAL
         )
 
     def test_stale_ranks_neutral(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(
             _acct(),
             _known_snap(20.0, 60.0),
@@ -2317,7 +2316,7 @@ class TestUsageHeadroomSettings:
 
 class TestApplyUsageGate:
     def test_filters_over_threshold_when_alternatives_remain(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         hot = _acct_usage(_acct(id="hot"), _known_snap(95.0, 10.0), at=now)
         cool = _acct_usage(_acct(id="cool"), _known_snap(10.0, 10.0), at=now)
         result = _apply_usage_gate(
@@ -2326,7 +2325,7 @@ class TestApplyUsageGate:
         assert result == [cool]
 
     def test_keeps_all_when_every_candidate_exhausted(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         a = _acct_usage(_acct(id="a"), _known_snap(95.0, 10.0), at=now)
         b = _acct_usage(_acct(id="b"), _known_snap(92.0, 10.0), at=now)
         result = _apply_usage_gate(
@@ -2335,7 +2334,7 @@ class TestApplyUsageGate:
         assert result == [a, b]  # no deadlock — never empties the set
 
     def test_single_candidate_unchanged(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         only = _acct_usage(_acct(id="only"), _known_snap(99.0, 99.0), at=now)
         result = _apply_usage_gate(
             [only], now=now, threshold_pct=90.0, acct_getter=lambda a: a
@@ -2345,7 +2344,7 @@ class TestApplyUsageGate:
 
 class TestUsageSnapshotSummary:
     def test_known_summary_shape(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         snap = UsageSnapshot(
             known=True,
             window_utilizations={"five_hour": 28.0, "seven_day": 64.0},
@@ -2362,13 +2361,13 @@ class TestUsageSnapshotSummary:
         assert out["stale"] is False
 
     def test_missing_summary_is_unknown(self):
-        out = _usage_snapshot_summary(_acct(), datetime.utcnow())
+        out = _usage_snapshot_summary(_acct(), _utcnow())
         assert out["known"] is False
         assert out["five_hour_utilization"] is None
         assert out["stale"] is True
 
     def test_stale_flag_set(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct_usage(
             _acct(),
             _known_snap(10.0, 10.0),
@@ -2402,7 +2401,7 @@ class TestSelectionUsageGate:
             _account_by_id[a["id"]] = a
 
     async def test_long_running_skips_exhausted_even_when_better_ranked(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         # `hot` ranks first on health_score but is over the usage threshold.
         hot = _healthy_acct(
             "hot",
@@ -2424,7 +2423,7 @@ class TestSelectionUsageGate:
         assert account["id"] == "cool"
 
     async def test_non_long_running_type_does_not_skip(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         hot = _healthy_acct(
             "hot",
             completion_events=[
@@ -2446,7 +2445,7 @@ class TestSelectionUsageGate:
         assert account["id"] == "hot"
 
     async def test_unknown_account_not_skipped(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         unknown = _healthy_acct("unk")
         _acct_usage(unknown, UsageSnapshot.unknown("t"), at=now)
         hot = _healthy_acct("hot")
@@ -2462,7 +2461,7 @@ class TestSelectionUsageGate:
         assert account["id"] == "unk"
 
     async def test_disabled_gate_is_noop(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         # hot has fewer active tasks; with the gate OFF, load-balancing picks it
         # despite high utilization (headroom ignored entirely).
         hot = _healthy_acct("hot", active_tasks=0)
@@ -2479,7 +2478,7 @@ class TestSelectionUsageGate:
         assert account["id"] == "hot"
 
     async def test_ranking_prefers_more_headroom(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         # Equal health/success/duration/active_tasks → headroom decides.
         more = _healthy_acct("more")
         _acct_usage(more, _known_snap(20.0, 20.0), at=now)  # headroom 80
@@ -2495,7 +2494,7 @@ class TestSelectionUsageGate:
         assert account["id"] == "more"
 
     async def test_unknown_ranks_neutrally_between_high_and_low(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         # Unknown (neutral 50) should beat a low-headroom account (20)…
         unknown = _healthy_acct("unk")
         _acct_usage(unknown, UsageSnapshot.unknown("t"), at=now)
@@ -2515,7 +2514,7 @@ class TestNoIOUnderLock:
     _USER = "u"
 
     async def test_selection_reads_only_cache_no_probe(self, monkeypatch):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _healthy_acct("a")
         _acct_usage(acct, _known_snap(10.0, 10.0), at=now)  # fresh → no refresh
         _max_plan_pools.clear()
@@ -2596,7 +2595,7 @@ class TestNoIOUnderLock:
             ran["count"] += 1
 
         monkeypatch.setattr("app.max_plan_pool._refresh_usage_snapshot", _fake_refresh)
-        _maybe_schedule_usage_refresh(acct, datetime.utcnow())
+        _maybe_schedule_usage_refresh(acct, _utcnow())
         assert acct.get("usage_probe_inflight") is True
         await asyncio.sleep(0)  # let the fire-and-forget task run
         assert ran["count"] == 1
@@ -2692,7 +2691,7 @@ class TestRecordAccountStartupFailure:
 class TestStartupFailureAccountState:
     async def test_account_unavailable_during_cooldown(self):
         acct = _pool_acct("a")
-        now = datetime.utcnow()
+        now = _utcnow()
         acct["startup_failure_cooldown_at"] = now - timedelta(seconds=10)
         # 10 seconds elapsed < 30min cooldown → unavailable
         state = _account_state_for_model(acct, "claude-opus-4-8", now=now)
@@ -2700,7 +2699,7 @@ class TestStartupFailureAccountState:
 
     async def test_account_available_after_cooldown_expires(self):
         acct = _pool_acct("a")
-        now = datetime.utcnow()
+        now = _utcnow()
         expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
         acct["startup_failure_cooldown_at"] = expired_at
         state = _account_state_for_model(acct, "claude-opus-4-8", now=now)
@@ -2716,7 +2715,7 @@ class TestStartupFailureAccountState:
 class TestRecheckClearsStartupCooldown:
     async def test_recheck_clears_expired_cooldown(self, monkeypatch):
         acct = _pool_acct("a")
-        now = datetime.utcnow()
+        now = _utcnow()
         expired_at = now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 60)
         acct["startup_failure_cooldown_at"] = expired_at
         acct["disabled_reason"] = (
@@ -2737,7 +2736,7 @@ class TestRecheckClearsStartupCooldown:
 
     async def test_recheck_does_not_clear_active_cooldown(self, monkeypatch):
         acct = _pool_acct("a")
-        now = datetime.utcnow()
+        now = _utcnow()
         acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # recent
         acct["disabled_reason"] = "startup-failure cooldown: ..."
 
@@ -2757,7 +2756,7 @@ class TestRecheckClearsStartupCooldown:
         while a startup-failure cooldown is still active (enabled=True accounts
         that carry a disabled_reason for UI visibility)."""
         acct = _pool_acct("a")
-        now = datetime.utcnow()
+        now = _utcnow()
         acct["startup_failure_cooldown_at"] = now - timedelta(seconds=30)  # active
         expected_reason = (
             "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
@@ -2840,7 +2839,7 @@ class _FakeAsyncSessionCtx:
 
 class TestBuildRateLimitStateBlobStartupFailure:
     def test_startup_failure_cooldown_at_written_to_blob(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(startup_failure_cooldown_at=now)
         blob = _build_rate_limit_state_blob(acct)
         assert blob is not None
@@ -2848,7 +2847,7 @@ class TestBuildRateLimitStateBlobStartupFailure:
         assert blob["startup_failure_cooldown_at"] == now.isoformat()
 
     def test_startup_failure_reason_written_to_blob(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         reason = "startup-failure cooldown: 5 failures in 120min across zones us-central1-b, us-central1-c"
         acct = _acct(startup_failure_cooldown_at=now, disabled_reason=reason)
         blob = _build_rate_limit_state_blob(acct)
@@ -2856,7 +2855,7 @@ class TestBuildRateLimitStateBlobStartupFailure:
         assert blob.get("startup_failure_disabled_reason") == reason
 
     def test_non_startup_reason_not_written_to_blob(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         acct = _acct(startup_failure_cooldown_at=now, disabled_reason="rate limit")
         blob = _build_rate_limit_state_blob(acct)
         assert blob is not None
@@ -2869,7 +2868,7 @@ class TestBuildRateLimitStateBlobStartupFailure:
         assert blob is None or "startup_failure_cooldown_at" not in (blob or {})
 
     def test_blob_roundtrip_preserves_reason(self):
-        now = datetime.utcnow()
+        now = _utcnow()
         reason = "startup-failure cooldown: 3 agent-startup failure(s) in 120min across zones us-east1-b, us-west1-a"
         acct = _acct(startup_failure_cooldown_at=now, disabled_reason=reason)
         blob = _build_rate_limit_state_blob(acct)
@@ -2966,7 +2965,7 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
 
     async def test_active_cooldown_restored_from_rate_limit_state(self, monkeypatch):
         """load_max_plan_pool must restore startup_failure_cooldown_at from rate_limit_state."""
-        now = datetime.utcnow()
+        now = _utcnow()
         active_at = (now - timedelta(seconds=60)).isoformat()
         acct = _FakeMaxPlanAccount(
             "acct-a",
@@ -2979,7 +2978,7 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
 
     async def test_active_cooldown_restores_reason_from_blob(self, monkeypatch):
         """disabled_reason from startup_failure_disabled_reason must survive restart."""
-        now = datetime.utcnow()
+        now = _utcnow()
         active_at = (now - timedelta(seconds=60)).isoformat()
         reason = (
             "startup-failure cooldown: 5 failures across us-central1-b, us-central1-c"
@@ -3002,7 +3001,7 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
         self, monkeypatch
     ):
         """A cooldown without a persisted reason still gets a generic disabled_reason."""
-        now = datetime.utcnow()
+        now = _utcnow()
         active_at = (now - timedelta(seconds=60)).isoformat()
         acct = _FakeMaxPlanAccount(
             "acct-a",
@@ -3017,7 +3016,7 @@ class TestLoadMaxPlanPoolStartupFailureRestore:
 
     async def test_expired_cooldown_clears_stale_disabled_reason(self, monkeypatch):
         """An expired persisted cooldown must not leave a stale startup-failure reason."""
-        now = datetime.utcnow()
+        now = _utcnow()
         expired_at = (
             now - timedelta(seconds=_STARTUP_FAILURE_COOLDOWN_SECONDS + 120)
         ).isoformat()

@@ -1269,7 +1269,7 @@ async def test_rollup_live_sibling_keeps_parent_evaluating_unmutated(eval_db, mo
         parent_task_id=parent.id,
         payloads=[{"type": "create", "prompt": "still working"}],
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow(),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
         context={"sentinel": "untouched"},
     )
     eval_db.add(done_child)
@@ -1344,7 +1344,7 @@ async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, m
 
     # A COMPLETED child whose PR is not merged and is STALE (>10min) so the
     # respawn path fires. updated_at must be old — set it explicitly.
-    stale_when = datetime.utcnow() - timedelta(minutes=20)
+    stale_when = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
     child = Task(
         project_id=project.id,
         parent_task_id=parent.id,
@@ -1375,7 +1375,7 @@ async def test_rollup_concurrent_terminal_events_respawn_at_most_once(eval_db, m
     # respawn again if idempotency were broken — the respawn-count guard must
     # still prevent it.
     await eval_db.refresh(child)
-    child.updated_at = datetime.utcnow() - timedelta(minutes=20)
+    child.updated_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
     eval_db.add(child)
     await eval_db.commit()
     await _check_and_trigger_rollup(child, eval_db)
@@ -3719,7 +3719,7 @@ async def test_chain_active_fresh_heartbeat_defers_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(seconds=30),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
         vm_instance_id="vm-chain-alive",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is True
@@ -3738,14 +3738,14 @@ async def test_chain_active_vmcontact_overrides_stale_heartbeat(eval_db):
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
         # 20min-stale on-row heartbeat (past the default 600s/10min cutoff).
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
         vm_instance_id="vm-chain-lockstarved",
     )
     # Fresh off-row contact (30s) within the 10min stale cutoff.
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-lockstarved",
-            last_contact_at=datetime.utcnow() - timedelta(seconds=30),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30),
         )
     )
     await eval_db.commit()
@@ -3764,14 +3764,14 @@ async def test_chain_active_stale_heartbeat_and_stale_vmcontact_allows_kill(eval
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
         vm_instance_id="vm-chain-dead",
     )
     # Off-row contact is ALSO stale (15min, past the 10min cutoff).
     eval_db.add(
         VmContact(
             vm_instance_id="vm-chain-dead",
-            last_contact_at=datetime.utcnow() - timedelta(minutes=15),
+            last_contact_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=15),
         )
     )
     await eval_db.commit()
@@ -3787,7 +3787,7 @@ async def test_chain_active_no_vmcontact_row_allows_kill(eval_db):
     parent, _child = await _make_chain_parent_and_child(
         eval_db,
         child_status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow() - timedelta(minutes=20),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20),
         vm_instance_id="vm-chain-no-contact-row",
     )
     assert await _chain_has_active_pipeline_work(parent, eval_db) is False

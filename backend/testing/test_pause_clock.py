@@ -5,7 +5,7 @@ mark_paused, accumulate_pause_window) operate on a DeploymentState
 object directly and can be tested without a live DB.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -43,7 +43,7 @@ def test_total_sums_both_kinds():
 
 def test_total_includes_in_flight_window():
     """While paused, total includes the live window even before resume."""
-    paused_at = datetime.utcnow() - timedelta(seconds=20)
+    paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=20)
     s = _state(
         total_auto_paused_seconds=50.0,
         paused_at=paused_at,
@@ -61,7 +61,7 @@ def test_total_includes_in_flight_window():
 
 def test_active_elapsed_no_baseline_returns_raw():
     """Legacy timers with no stashed baseline get raw wall-clock elapsed."""
-    started = datetime.utcnow() - timedelta(seconds=100)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
     s = _state(total_auto_paused_seconds=999.0)  # huge counter — must be ignored
     elapsed = pause_clock.active_elapsed(s, started, baseline_paused=None)
     assert 99.0 <= elapsed <= 102.0
@@ -69,7 +69,7 @@ def test_active_elapsed_no_baseline_returns_raw():
 
 def test_active_elapsed_baseline_zero_no_pauses():
     """No pauses since timer started — active equals raw."""
-    started = datetime.utcnow() - timedelta(seconds=60)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
     s = _state()
     elapsed = pause_clock.active_elapsed(s, started, baseline_paused=0.0)
     assert 59.0 <= elapsed <= 62.0
@@ -77,7 +77,7 @@ def test_active_elapsed_baseline_zero_no_pauses():
 
 def test_active_elapsed_subtracts_pause_window():
     """A 30s pause inside a 100s timer window leaves 70s of active elapsed."""
-    started = datetime.utcnow() - timedelta(seconds=100)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
     s = _state(total_auto_paused_seconds=30.0)
     # Timer started before any pauses, so baseline = 0; pauses since = 30.
     elapsed = pause_clock.active_elapsed(s, started, baseline_paused=0.0)
@@ -86,7 +86,7 @@ def test_active_elapsed_subtracts_pause_window():
 
 def test_active_elapsed_baseline_excludes_pre_start_pauses():
     """Pauses that happened BEFORE the timer started must not be subtracted."""
-    started = datetime.utcnow() - timedelta(seconds=60)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60)
     # 100s of pre-existing pause time, then timer started, then 0 more pauses.
     # baseline captures the 100s — paused_during after start is 0.
     s = _state(total_manual_paused_seconds=100.0)
@@ -96,7 +96,7 @@ def test_active_elapsed_baseline_excludes_pre_start_pauses():
 
 def test_active_elapsed_clamps_to_zero():
     """If total subtracted exceeds raw elapsed, result is clamped to 0."""
-    started = datetime.utcnow() - timedelta(seconds=10)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=10)
     s = _state(total_auto_paused_seconds=999.0)
     elapsed = pause_clock.active_elapsed(s, started, baseline_paused=0.0)
     assert elapsed == 0.0
@@ -105,8 +105,8 @@ def test_active_elapsed_clamps_to_zero():
 def test_active_elapsed_during_in_flight_pause():
     """Timer started before pause; pause is still in flight; elapsed excludes
     the in-flight portion."""
-    started = datetime.utcnow() - timedelta(seconds=100)
-    pause_started = datetime.utcnow() - timedelta(seconds=40)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=100)
+    pause_started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=40)
     s = _state(
         paused_at=pause_started,
         paused_kind=pause_clock.PAUSED_KIND_MANUAL,
@@ -129,7 +129,7 @@ def test_mark_paused_sets_fields():
 
 def test_mark_paused_idempotent_when_already_paused():
     """Re-calling mark_paused must not reset paused_at — would lose in-flight time."""
-    earlier = datetime.utcnow() - timedelta(seconds=300)
+    earlier = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=300)
     s = _state(paused_at=earlier, paused_kind=pause_clock.PAUSED_KIND_AUTO)
     pause_clock.mark_paused(s, pause_clock.PAUSED_KIND_MANUAL)
     # paused_at unchanged — still the original auto-pause start
@@ -154,7 +154,7 @@ def test_accumulate_noop_when_not_paused():
 
 
 def test_accumulate_routes_manual_window_to_manual_counter():
-    paused_at = datetime.utcnow() - timedelta(seconds=15)
+    paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=15)
     s = _state(paused_at=paused_at, paused_kind=pause_clock.PAUSED_KIND_MANUAL)
     pause_clock.accumulate_pause_window(s)
     assert s.paused_at is None
@@ -164,7 +164,7 @@ def test_accumulate_routes_manual_window_to_manual_counter():
 
 
 def test_accumulate_routes_auto_window_to_auto_counter():
-    paused_at = datetime.utcnow() - timedelta(seconds=25)
+    paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=25)
     s = _state(paused_at=paused_at, paused_kind=pause_clock.PAUSED_KIND_AUTO)
     pause_clock.accumulate_pause_window(s)
     assert s.paused_at is None
@@ -175,7 +175,7 @@ def test_accumulate_routes_auto_window_to_auto_counter():
 
 def test_accumulate_preserves_prior_totals():
     """Adding a new window doesn't overwrite previously accumulated time."""
-    paused_at = datetime.utcnow() - timedelta(seconds=10)
+    paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=10)
     s = _state(
         total_manual_paused_seconds=100.0,
         total_auto_paused_seconds=200.0,
@@ -193,13 +193,13 @@ def test_accumulate_preserves_prior_totals():
 def test_full_cycle_active_elapsed_excludes_completed_pause():
     """Simulate: start timer, pause for ~5s, resume, check active_elapsed
     excludes the pause window."""
-    started = datetime.utcnow() - timedelta(seconds=30)
+    started = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=30)
     s = _state()
     baseline = pause_clock.total_paused_seconds(s)
     assert baseline == 0.0
 
     # Enter a manual pause that started 20s ago, ended 5s ago — i.e. lasted 15s.
-    s.paused_at = datetime.utcnow() - timedelta(seconds=20)
+    s.paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=20)
     s.paused_kind = pause_clock.PAUSED_KIND_MANUAL
     # Then jump forward 15s in pause-time, then resume:
     # accumulate_pause_window uses real wall-clock, so simulate by setting
@@ -273,7 +273,7 @@ def test_rollback_pause_snapshot_idempotency():
       3. Leave resume able to restore the operator's real capacity (5), not the
          default fallback.
     """
-    earlier = datetime.utcnow() - timedelta(seconds=300)
+    earlier = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=300)
     s = _state(
         pre_pause_max_vms=5,
         runtime_max_concurrent_vms=5,

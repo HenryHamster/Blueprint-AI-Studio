@@ -169,7 +169,7 @@ async def list_sr_missed_retrospectives(
     Useful for operator-driven learning: surface systematic blind spots so prompt
     or check changes can target them.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     page_start = page * page_size
     page_end = page_start + page_size
     # 0 disables the severity filter (absent param or unrecognized value).
@@ -333,7 +333,7 @@ async def list_sr_unhandled_edges_retrospectives(
     unique label per task, ignoring the ``case_pattern`` filter so the badges
     remain swap-able while staying stable across pagination.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     page_start = page * page_size
     page_end = page_start + page_size
 
@@ -648,7 +648,7 @@ async def get_prompt_fingerprint_analytics(
         project_id, current_user["user_id"], session, "viewer"
     )
 
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -831,7 +831,7 @@ async def fetch_sr_reviewer_disagreement_tasks(
     either passed or omitted the category.  Filters by category, task_type,
     and severity (of the reviewer finding).
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     page_start = page * page_size
     page_end = page_start + page_size
 
@@ -1049,7 +1049,7 @@ async def get_direction_sr_breakdown(
         return {"directions": directions_out, "min_sample": _MIN_DIRECTION_SR_SAMPLE}
 
     # No stored snapshot yet — fall back to recomputing from COMPLETED tasks.
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(
@@ -1084,7 +1084,7 @@ async def get_sr_recent_misses(
     A 'miss' is a category present in _first_attempt_rejection_categories
     that the agent's check_results either marked passed or did not record.
     """
-    cutoff = datetime.utcnow() - timedelta(days=days)
+    cutoff = _utcnow() - timedelta(days=days)
     stmt = (
         select(Task)
         .where(

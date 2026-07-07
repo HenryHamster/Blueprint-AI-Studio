@@ -7,6 +7,7 @@ and does NOT spawn any child tasks or open a PR.
 """
 
 import json
+from datetime import timezone
 import uuid
 from unittest.mock import AsyncMock
 
@@ -550,7 +551,7 @@ async def test_scaffolding_memo_synthesis_failure_leaves_no_queued_task(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=datetime.now(timezone.utc).replace(tzinfo=None),
     )
     await db_session.commit()
 

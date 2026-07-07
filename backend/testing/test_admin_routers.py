@@ -10299,7 +10299,7 @@ class TestRepairStateFailureCategory:
         await db_session.refresh(project)
 
         # Task stuck in IN_PROGRESS with a heartbeat 20 minutes ago
-        stale_heartbeat = datetime.utcnow() - timedelta(minutes=20)
+        stale_heartbeat = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=20)
         stuck_task = Task(
             project_id=project.id,
             payloads=[{"type": "create", "prompt": "test"}],
@@ -16670,7 +16670,7 @@ class TestSrCatchRateHealth:
     def _iso(hours_ago):
         from datetime import datetime, timedelta
 
-        return (datetime.utcnow() - timedelta(hours=hours_ago)).isoformat()
+        return (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours_ago)).isoformat()
 
     @pytest.mark.asyncio
     async def test_healthy(self, client: AsyncClient, db_session):

@@ -716,7 +716,7 @@ async def test_reaper_retry_after_query_uses_retry_index(db_session):
 
     # Mix of QUEUED-with-retry-hold, QUEUED-without, and other statuses
     # so the planner has reason to consider the partial index.
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     tasks = []
     for i in range(20):
         status = TaskStatus.QUEUED if i % 2 == 0 else TaskStatus.IN_PROGRESS

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime as _datetime
 from typing import Any
+
+from app.time_utils import _utcnow
 
 # Sources that the auto-clear path considers "auto-set" and therefore eligible
 # to be cleared when the system recovers. Any unknown or future source (e.g.
@@ -101,6 +102,6 @@ def maybe_auto_clear_mode(
     direction.pop("recommended_mode", None)
     direction.pop(_RECOMMENDED_MODE_META_KEY, None)
     direction.pop(_HEALTHY_CONSECUTIVE_KEY, None)
-    direction["_mode_auto_cleared_at"] = _datetime.utcnow().isoformat()
+    direction["_mode_auto_cleared_at"] = _utcnow().isoformat()
     direction["_mode_auto_cleared_from"] = prev_mode
     return True

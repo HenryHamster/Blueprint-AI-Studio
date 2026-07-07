@@ -13,6 +13,7 @@ message mentioning "billing". See RATE_LIMIT_PATTERNS in max_plan_pool.py.
 """
 
 from unittest.mock import MagicMock
+from datetime import timezone
 
 import pytest
 
@@ -611,7 +612,7 @@ async def test_db_account_was_rate_limited_active_cooldown(monkeypatch):
     from app.max_plan_pool import db_account_was_rate_limited
     from app.models import MaxPlanAccount
 
-    disabled_at = datetime.utcnow() - timedelta(minutes=5)
+    disabled_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     fake_account = MaxPlanAccount(
         user_id="test",
         name="test-acct",
@@ -649,7 +650,7 @@ async def test_db_account_was_rate_limited_expired_cooldown(monkeypatch):
     from app.models import MaxPlanAccount
 
     # hits=1 → 30-minute exponential; disabled 2 hours ago → expired
-    disabled_at = datetime.utcnow() - timedelta(hours=2)
+    disabled_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
     fake_account = MaxPlanAccount(
         user_id="test",
         name="test-acct",
@@ -796,7 +797,7 @@ async def test_db_pool_wide_cooldown_mixed_rate_limited_and_credentialless(monke
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import MaxPlanAccount
 
-    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     rl_acct = MaxPlanAccount(
         user_id="u",
         name="rl",
@@ -833,7 +834,7 @@ async def test_db_pool_wide_cooldown_returns_false_when_account_potentially_usab
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import MaxPlanAccount
 
-    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     rl_acct = MaxPlanAccount(
         user_id="u",
         name="rl",
@@ -867,7 +868,7 @@ async def test_db_pool_wide_cooldown_treats_zai_secret_blob_as_runtime_ready(
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
 
-    rl_at = datetime.utcnow() - timedelta(minutes=5)
+    rl_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
     rl_acct = MaxPlanAccount(
         user_id="u",
         name="rl",
@@ -933,7 +934,7 @@ async def test_db_pool_wide_cooldown_returns_false_when_only_expired_entries(
     from app.models import MaxPlanAccount
 
     # hits=1 → 30-min window; 2h ago → expired
-    expired_at = datetime.utcnow() - timedelta(hours=2)
+    expired_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=2)
     a = MaxPlanAccount(
         user_id="u",
         name="a",

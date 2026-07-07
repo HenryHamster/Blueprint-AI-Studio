@@ -2670,7 +2670,7 @@ def test_compute_spawn_gate_census_empty():
     from app.digest_direction_progress import compute_spawn_gate_census
     from datetime import datetime
 
-    result = compute_spawn_gate_census([], window_start=datetime.utcnow())
+    result = compute_spawn_gate_census([], window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 0
     assert result["gate_invoked_count"] == 0
     assert result["graders_attempted_total"] == 0
@@ -2690,7 +2690,7 @@ def test_compute_spawn_gate_census_skips_non_research_tasks():
         _make_census_task(task_type="create", challenged_count=3),
         _make_census_task(task_type="research", challenged_count=2),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 1
     assert result["graders_attempted_total"] == 2
 
@@ -2704,7 +2704,7 @@ def test_compute_spawn_gate_census_deduplicates_by_task_id():
     tid = uuid.uuid4()
     t1 = _make_census_task(task_id=tid, challenged_count=3)
     t2 = _make_census_task(task_id=tid, challenged_count=3)
-    result = compute_spawn_gate_census([t1, t2], window_start=datetime.utcnow())
+    result = compute_spawn_gate_census([t1, t2], window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 1
     assert result["gate_invoked_count"] == 1
 
@@ -2732,7 +2732,7 @@ def test_compute_spawn_gate_census_aggregates_trail_and_cause():
             cause_counts=None,
         ),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 3
     assert result["gate_invoked_count"] == 3
     assert result["graders_attempted_total"] == 6
@@ -2756,7 +2756,7 @@ def test_compute_spawn_gate_census_covers_undirected_tasks():
         _make_census_task(challenged_count=2, direction_id=None),
         _make_census_task(challenged_count=1, direction_id="dir-1"),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["cycles_scanned"] == 2
     directions = [r["direction_id"] for r in result["rows"]]
     assert None in directions
@@ -2772,7 +2772,7 @@ def test_compute_spawn_gate_census_give_up_count():
         _make_census_task(give_up_adversarial=3),
         _make_census_task(give_up_adversarial=2),
     ]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["give_up_count"] == 5
 
 
@@ -2782,7 +2782,7 @@ def test_compute_spawn_gate_census_gate_not_invoked_when_no_challenged():
     from datetime import datetime
 
     tasks = [_make_census_task(challenged_count=0)]
-    result = compute_spawn_gate_census(tasks, window_start=datetime.utcnow())
+    result = compute_spawn_gate_census(tasks, window_start=datetime.now(timezone.utc).replace(tzinfo=None))
     assert result["gate_invoked_count"] == 0
     assert result["rows"][0]["gate_invoked"] is False
 

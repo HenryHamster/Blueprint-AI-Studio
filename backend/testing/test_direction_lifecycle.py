@@ -7,6 +7,7 @@ from sqlmodel import select
 import app.shared_state as _ss
 import uuid
 
+from app.time_utils import _utcnow
 from app.direction_lifecycle import (
     _process_direction_lifecycle,
     _process_direction_lifecycle_locked,
@@ -32,7 +33,7 @@ def _cost_history(*costs: float) -> list[dict]:
         entries.append(
             {
                 "timestamp": (
-                    datetime.utcnow() - timedelta(days=len(costs) - i)
+                    _utcnow() - timedelta(days=len(costs) - i)
                 ).isoformat(),
                 "tasks_created": 2,
                 "tasks_failed": 0,
@@ -83,7 +84,7 @@ async def test_process_lifecycle_pauses_on_cost_budget_exceeded(db_session, mock
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -119,7 +120,7 @@ async def test_process_lifecycle_no_pause_when_cost_within_budget(db_session, mo
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -152,7 +153,7 @@ async def test_process_lifecycle_no_cost_pause_without_budget_configured(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -167,7 +168,7 @@ async def test_process_lifecycle_flags_retirement_consideration_for_high_cost_pe
     db_session, mocker
 ):
     """Expensive directions are flagged when cost/merge exceeds project median * multiplier."""
-    now = datetime.utcnow()
+    now = _utcnow()
     expensive_direction = {
         "id": "d-expensive",
         "text": "Expensive direction",
@@ -269,7 +270,7 @@ async def test_retirement_evidence_includes_provider_model_split(db_session, moc
     """When a research_history entry carries cost_by_provider_model, the rolling
     aggregate is exposed on retirement_consideration_evidence and sums to the
     entry-level estimated_cost_usd within rounding."""
-    now = datetime.utcnow()
+    now = _utcnow()
     expensive_direction = {
         "id": "d-expensive-split",
         "text": "Expensive with split",
@@ -379,7 +380,7 @@ async def test_retirement_consideration_still_flagged_without_provider_model_spl
     """Legacy directions without cost_by_provider_model on history entries
     must still be flagged for retirement; the split is omitted (empty dict)
     rather than crashing or being skipped."""
-    now = datetime.utcnow()
+    now = _utcnow()
     expensive_legacy = {
         "id": "d-legacy-expensive",
         "text": "Legacy expensive",
@@ -504,7 +505,7 @@ async def test_process_lifecycle_uses_default_cpm_config_when_runtime_values_inv
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -516,7 +517,7 @@ async def test_process_lifecycle_cpm_unchanged_for_fully_autonomous_direction(
     db_session, mocker
 ):
     """Retirement threshold is unchanged when autonomous_prs_merged == prs_merged (migration no-op)."""
-    now = datetime.utcnow()
+    now = _utcnow()
 
     def _auto_entry(cost, merged):
         return {
@@ -605,7 +606,7 @@ async def test_process_lifecycle_lifetime_burn_pause_via_aggregate(db_session, m
     reason, the stored evidence matches the computed metrics, and the
     manual-intervention flag is set with its timestamp.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
 
     direction = {
         "id": "d-lifetime-burn",
@@ -720,7 +721,7 @@ async def test_lifetime_burn_manual_intervention_survives_ttl_window(
     scenarios, this flag should NOT be cleared by the TTL safety net after
     72 hours — the direction remains paused and needs operator action.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     # Flag was set 75 hours ago (past the 72h TTL)
     flagged_at = now - timedelta(hours=75)
 
@@ -789,7 +790,7 @@ async def test_remediation_stuck_manual_intervention_cleared_by_ttl_window(
     cleared by the TTL safety net after 72 hours so operators are not
     perpetually alerted about a direction the system cannot fix.
     """
-    now = datetime.utcnow()
+    now = _utcnow()
     # Flag was set 75 hours ago (past the 72h TTL) but within 48h cooldown window
     # to prevent auto-recovery from interfering with the test.
     flagged_at = now - timedelta(hours=30)
@@ -868,7 +869,7 @@ async def test_process_lifecycle_churn_pause_emits_blocker_notification(
     """
     from app.models import ProjectMessage, MessageType
 
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # 5 recent cycles, each with 10 tasks completed and 0 merges.
     # Window: 50 non-merge_finished, 0 merged, 0% merge rate.
@@ -1003,7 +1004,7 @@ async def test_process_lifecycle_already_built_routes_to_possibly_complete(
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # 5 cycles: 20 completed each, 16 no-op (0.8 dominance), 0 merged, 0 failures.
     # Real non-merge volume = 5*(20-16) = 20 (>=15 churn threshold) so a churn/zero-merge
     # pause would fire — but no_pr_ratio = 0.8 satisfies the already-built signature.
@@ -1065,7 +1066,7 @@ async def test_process_lifecycle_productive_direction_not_churn_paused(
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # 6 cycles, 5 tasks each, fully completed, 0 merged — Rule 2 + Rule 5 territory.
     history = [
         {
@@ -1119,7 +1120,7 @@ async def test_process_lifecycle_productive_direction_still_pauses_on_code_failu
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # 3 cycles, 10 tasks each, 9 code failures → >70% code failure rate (Rule 3).
     history = [
         {
@@ -1174,7 +1175,7 @@ async def test_grace_period_blocks_unproductive_repause_on_stale_history(
     Rule 2 (Unproductive: 0 PRs merged) must not immediately re-trigger it before any
     new research cycle runs.
     """
-    recovered_at = datetime.utcnow() - timedelta(minutes=5)
+    recovered_at = _utcnow() - timedelta(minutes=5)
     # 5 cycles with 0 merges, all timestamped before recovery — Rule 2 would normally fire
     history = [
         {
@@ -1203,7 +1204,7 @@ async def test_grace_period_blocks_unproductive_repause_on_stale_history(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1225,7 +1226,7 @@ async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
     A direction with a new unproductive cycle (timestamp > auto_recovered_at) IS
     paused again by Rule 2, and auto_recovered_at is cleared on re-pause.
     """
-    recovered_at = datetime.utcnow() - timedelta(hours=2)
+    recovered_at = _utcnow() - timedelta(hours=2)
     # 4 pre-recovery cycles with 0 merges
     pre_history = [
         {
@@ -1263,7 +1264,7 @@ async def test_grace_period_expires_after_new_cycle_appended_triggers_pause(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1295,7 +1296,7 @@ async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker
         return_value=None,
     )
 
-    recovered_at = datetime.utcnow() - timedelta(minutes=5)
+    recovered_at = _utcnow() - timedelta(minutes=5)
     # 3 cycles with 90% code failure rate — triggers Rule 3 regardless of grace
     history = [
         {
@@ -1323,7 +1324,7 @@ async def test_grace_period_does_not_block_code_failure_pause(db_session, mocker
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1390,7 +1391,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     d = project.directions[0]
@@ -1404,7 +1405,7 @@ async def test_lifecycle_flags_outcome_scaffolding_and_notifies_once(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
@@ -1426,7 +1427,7 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
@@ -1446,7 +1447,7 @@ async def test_lifecycle_clears_outcome_scaffolding_when_progress_resumes(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is None
@@ -1468,7 +1469,7 @@ async def test_scaffolding_memo_spawned_on_first_flag(db_session, mocker):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
@@ -1517,7 +1518,7 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
@@ -1527,7 +1528,7 @@ async def test_scaffolding_memo_not_respawned_on_evidence_refresh(db_session, mo
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1579,7 +1580,7 @@ async def test_outcome_scaffolding_memo_completed_at_spawn(db_session, mocker):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged") is True
@@ -1653,7 +1654,7 @@ def _already_flagged_direction(flagged_cycles: int = 0, **extra) -> dict:
     """
     d = _scaffolding_direction_for_lifecycle([5, 5, 5, 5, 5, 5])
     d["outcome_scaffolding_flagged"] = True
-    d["outcome_scaffolding_flagged_at"] = datetime.utcnow().isoformat()
+    d["outcome_scaffolding_flagged_at"] = _utcnow().isoformat()
     d["outcome_scaffolding_evidence"] = {"total_cycles": 14}
     d["outcome_scaffolding_flagged_cycles"] = flagged_cycles
     # total_cycles = 4 (research_history) + 10 (history_aggregate) = 14.
@@ -1684,7 +1685,7 @@ async def test_scaffolding_flag_counter_increments_on_new_cycle(db_session, mock
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1720,7 +1721,7 @@ async def test_scaffolding_counter_does_not_increment_without_new_cycle(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1753,7 +1754,7 @@ async def test_scaffolding_legacy_missing_watermark_backfills_without_increment(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1792,7 +1793,7 @@ async def test_scaffolding_escalation_fires_at_mid_threshold(db_session, mocker)
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1826,7 +1827,7 @@ async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
     assert project.directions[0].get("outcome_scaffolding_flagged_cycles") == 3
@@ -1835,7 +1836,7 @@ async def test_scaffolding_escalation_does_not_refire_without_new_cycle(
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1876,7 +1877,7 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1899,7 +1900,7 @@ async def test_scaffolding_auto_retires_at_high_threshold(db_session, mocker):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1940,7 +1941,7 @@ async def test_scaffolding_flag_clear_resets_counter(db_session, mocker):
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -1989,7 +1990,7 @@ async def test_scaffolding_stale_verdict_does_not_freeze_counter(db_session, moc
         project,
         db_session,
         busy_direction_ids=set(),
-        now=datetime.utcnow(),
+        now=_utcnow(),
     )
     await db_session.refresh(project)
 
@@ -2231,7 +2232,7 @@ async def test_already_fixed_deadlock_auto_completes_via_apply_post_spawn(db_ses
     # (already-fixed deadlock signal), zero merges.
     noop_history = [
         {
-            "timestamp": (datetime.utcnow() - timedelta(hours=h)).isoformat(),
+            "timestamp": (_utcnow() - timedelta(hours=h)).isoformat(),
             "task_id": f"t-af-{h}",
             "tasks_created": 2,
             "scope_empty_noop_count": 2,
@@ -2368,7 +2369,7 @@ async def test_lifecycle_skips_direction_with_recently_completed_research(
         await db_session.commit()
 
         active = await _process_direction_lifecycle_locked(
-            project, db_session, set(), datetime.utcnow()
+            project, db_session, set(), _utcnow()
         )
         assert active == [], (
             "Direction with a recently-completed research task must be excluded "
@@ -2419,7 +2420,7 @@ async def test_zombie_churn_threshold_recommends_retirement_without_completion(
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
 
     zombie = {
         "id": "d-zombie",
@@ -2557,7 +2558,7 @@ async def test_code_failure_auto_retire_reconciles_gap(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # >70% code-failure rate (Rule 3) re-trips a code-failure pause this tick;
     # code_failure_pause_count preset to 2 → increments to 3 → hits the retire
     # threshold (_MAX_AUTO_PAUSE_CYCLES = 3).
@@ -2666,7 +2667,7 @@ async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, m
 
     # --- Tick 1: sets auto_retire_pending=True, persisted via directions_modified.
     await _process_direction_lifecycle(
-        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
+        project, db_session, busy_direction_ids=set(), now=_utcnow()
     )
     await db_session.refresh(project)
 
@@ -2681,7 +2682,7 @@ async def test_scaffolding_auto_retire_reconciles_gap_and_persists(db_session, m
 
     # --- Tick 2: designated retire pass executes the retirement and reconciles the gap.
     await _process_direction_lifecycle(
-        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
+        project, db_session, busy_direction_ids=set(), now=_utcnow()
     )
     await db_session.refresh(project)
 
@@ -2712,7 +2713,7 @@ async def test_churn_recommendation_preserves_gap_staffing(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     zombie = {
         "id": "d-zombie-stale",
         "text": "Recycling zombie with stale gap link",
@@ -2761,7 +2762,7 @@ async def test_zombie_not_retired_on_first_churn_pause(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     direction = {
         "id": "d-first-pause",
         "text": "First churn pause",
@@ -2804,7 +2805,7 @@ async def test_code_failure_pause_does_not_increment_churn_count(db_session, moc
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # 3 recent cycles with >70% code failures → Rule 3 'High code failure rate:'.
     direction = {
         "id": "d-codefail",
@@ -2967,7 +2968,7 @@ async def test_lifetime_burn_manual_hold_auto_retires_after_bound(db_session, mo
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     # Direction already paused once for lifetime burn (count=1, threshold=2).
@@ -3054,7 +3055,7 @@ async def test_lifetime_burn_retire_stale_gap_id(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     # Sub-case 1: gap_id points to a *different* gap than where the direction
@@ -3187,7 +3188,7 @@ async def test_lifetime_burn_no_retire_below_threshold(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     direction = {
@@ -3258,7 +3259,7 @@ async def test_lifetime_burn_auto_retire_full_path(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     direction = {
@@ -3314,7 +3315,7 @@ async def test_lifetime_burn_auto_retire_full_path(db_session, mocker):
 
     # --- Simulate 72h elapsed (past the 48h auto-recovery window).
     project.directions[0]["paused_at"] = (
-        datetime.utcnow() - timedelta(hours=72)
+        _utcnow() - timedelta(hours=72)
     ).isoformat()
     flag_modified(project, "directions")
     db_session.add(project)
@@ -3390,7 +3391,7 @@ async def test_churn_family_recommendation_full_path(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
 
     direction = {
         "id": "d-churn-e2e",
@@ -3470,7 +3471,7 @@ async def test_churn_family_recommendation_full_path(db_session, mocker):
     project.directions[0]["status"] = "paused"
     project.directions[0]["auto_paused"] = True
     project.directions[0]["paused_at"] = (
-        datetime.utcnow() - timedelta(hours=72)
+        _utcnow() - timedelta(hours=72)
     ).isoformat()
     flag_modified(project, "directions")
     db_session.add(project)
@@ -3490,7 +3491,7 @@ async def test_churn_family_recommendation_full_path(db_session, mocker):
     #     merges). Its timestamp is after auto_recovered_at so the grace period lifts
     #     and the next tick re-evaluates the churn-family health rules.
     post_recovery_cycle = {
-        "timestamp": (datetime.utcnow() + timedelta(hours=1)).isoformat(),
+        "timestamp": (_utcnow() + timedelta(hours=1)).isoformat(),
         "tasks_created": 2,
         "tasks_completed": 2,
         "tasks_failed": 0,
@@ -3554,7 +3555,7 @@ async def test_lifecycle_auto_retire_records_retired_memory_before_prune(db_sess
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     # >70% code-failure rate (Rule 3) re-trips a code-failure pause this tick;
     # code_failure_pause_count preset to 2 → increments to 3 → hits the retire
     # threshold (_MAX_AUTO_PAUSE_CYCLES = 3).
@@ -3655,7 +3656,7 @@ async def test_malformed_paused_at_skips_only_bad_direction(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
 
     # Direction with malformed paused_at — should be skipped gracefully
     bad_direction = {
@@ -3753,7 +3754,7 @@ async def test_lifecycle_sweep_syncs_direction_table(db_session, mocker):
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     direction = {
         "id": "d-sweep-sync-test",
         "text": "Direction to be auto-paused by sweep",
@@ -3853,7 +3854,7 @@ async def test_paused_extend_burn_sets_pending_flag_not_executes(db_session, moc
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     # Direction already at threshold-1: lb_count=1, paused with manual hold.
@@ -3947,7 +3948,7 @@ async def test_scaffolding_sets_pending_flag_not_executes(db_session, mocker):
     project = await _make_cost_project(db_session, direction)
 
     await _process_direction_lifecycle(
-        project, db_session, busy_direction_ids=set(), now=datetime.utcnow()
+        project, db_session, busy_direction_ids=set(), now=_utcnow()
     )
     await db_session.refresh(project)
 
@@ -3974,7 +3975,7 @@ async def test_designated_retire_pass_consumes_pending_flag(db_session, mocker):
         new_callable=AsyncMock,
     )
 
-    now = datetime.utcnow()
+    now = _utcnow()
     history, aggregate = _lifetime_burn_history(now)
 
     # Direction 1: pending lifetime_burn retirement.
@@ -4086,7 +4087,7 @@ async def test_designated_retire_coherence_guard_skips_already_terminal(
         new_callable=AsyncMock,
     )
 
-    now = datetime.utcnow()
+    now = _utcnow()
     # Direction that was retired by another path (operator PATCH) while the
     # auto_retire_pending flag was still set. The coherence guard must detect
     # the terminal status and clear the flag without re-executing retirement.
@@ -4303,7 +4304,7 @@ async def test_resurrected_direction_survives_next_lifecycle_tick(db_session, mo
     """
     from app.direction_lifecycle import resurrect_direction
 
-    now = datetime.utcnow()
+    now = _utcnow()
     # 5 unproductive cycles (0 merges), all timestamped in the past. Under normal
     # health evaluation this trips Rule 2 (Unproductive: 0 PRs merged).
     history = [
@@ -4410,7 +4411,7 @@ async def test_churn_retirement_recommended_survives_ttl_and_cooldown(db_session
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     direction = {
         "id": "d-hold",
         "text": "Churn direction held for a keep/retire decision",
@@ -4462,7 +4463,7 @@ async def test_churn_retirement_recommended_survives_ttl_and_cooldown(db_session
     # would clear needs_manual_intervention and a follow-up recovery tick would
     # reactivate the direction. The guards must keep it held every time.
     for i in range(3):
-        stale = (datetime.utcnow() - timedelta(hours=200)).isoformat()
+        stale = (_utcnow() - timedelta(hours=200)).isoformat()
         project.directions[0]["paused_at"] = stale
         project.directions[0]["needs_manual_intervention_at"] = stale
         flag_modified(project, "directions")
@@ -4508,7 +4509,7 @@ async def test_auto_recovery_recovers_normal_but_not_recommended(db_session, moc
         new_callable=AsyncMock,
         return_value=None,
     )
-    now = datetime.utcnow()
+    now = _utcnow()
     stale = (now - timedelta(hours=200)).isoformat()
 
     normal = {

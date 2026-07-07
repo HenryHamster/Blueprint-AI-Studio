@@ -35,6 +35,7 @@ Covers:
 """
 
 from __future__ import annotations
+from datetime import timezone
 
 import contextlib
 import json
@@ -6615,7 +6616,7 @@ async def test_run_qualification_fall_through_when_unsynced_too_long(
     # Pre-seed a stale deferral so the accumulated wait exceeds the 30-min window.
     version.last_qualification = {
         "status": "deferred_unsynced",
-        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=45)).isoformat(),
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=45)).isoformat(),
     }
     db_session.add(version)
     await db_session.commit()
@@ -17763,7 +17764,7 @@ async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mock
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",
-        "first_deferred_at": (datetime.utcnow() - timedelta(minutes=3)).isoformat(),
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat(),
     }
     db_session.add(version)
     await db_session.commit()
@@ -17795,7 +17796,7 @@ async def test_sweep_leaves_deferred_unsynced_when_still_behind(db_session, mock
     from datetime import datetime, timedelta
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    first_deferred = (datetime.utcnow() - timedelta(minutes=3)).isoformat()
+    first_deferred = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat()
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",
@@ -17837,7 +17838,7 @@ async def test_redrive_deferred_unsynced_preserves_state_on_transient_sha_error(
     from datetime import datetime, timedelta
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
-    first_deferred = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+    first_deferred = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)).isoformat()
     version.last_qualification = {
         "status": "deferred_unsynced",
         "candidate_sha": "stale00" * 5 + "00000",

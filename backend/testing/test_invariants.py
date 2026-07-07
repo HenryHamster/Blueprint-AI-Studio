@@ -10536,3 +10536,44 @@ def test_string_patch_target_scanner_self_tests():
         tmpdir_path = Path(tmpdir)
         (tmpdir_path / "test_create.py").write_text(src_create)
         assert _collect_app_patch_targets(tmpdir_path) == {}
+
+
+def test_no_deprecated_datetime_utcnow_calls():
+    """No app/ file may call datetime.utcnow() — use _utcnow() from app.time_utils instead.
+
+    Python 3.12 turns every datetime.utcnow() call into a DeprecationWarning; with
+    filterwarnings=error::DeprecationWarning in pyproject.toml this becomes a hard test
+    failure.  The canonical wrapper _utcnow() (in app/time_utils.py) returns a UTC-aware
+    datetime and is exempt from DTZ ruff rules via its own noqa.  This invariant prevents
+    regressions after the de-utcnow sweep.
+    """
+    app_dir = BACKEND_ROOT / "app"
+    violating_files: list[str] = []
+
+    for py_file in sorted(app_dir.rglob("*.py")):
+        source = py_file.read_text(encoding="utf-8")
+        try:
+            tree = ast.parse(source, filename=str(py_file))
+        except SyntaxError:
+            continue
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if (
+                isinstance(func, ast.Attribute)
+                and func.attr == "utcnow"
+                and isinstance(func.value, ast.Name)
+                and func.value.id == "datetime"
+            ):
+                rel = py_file.relative_to(BACKEND_ROOT)
+                violating_files.append(f"  {rel}:{node.lineno}")
+                break  # one report per file is enough
+
+    assert not violating_files, (
+        f"Found datetime.utcnow() calls in {len(violating_files)} app/ file(s).\n"
+        "Replace each with _utcnow() from app.time_utils — it returns a UTC-aware\n"
+        "datetime and avoids the Python 3.12 DeprecationWarning.\n\n"
+        "Offending files:\n" + "\n".join(violating_files)
+    )

@@ -18,7 +18,7 @@ import asyncio
 import json
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app import compute
 from app import compute_jobs
+from app.time_utils import _utcnow
 from app.artifact_prerequisites import (
     ARTIFACT_PREREQUISITES_KEY,
     backfill_artifact_prerequisites,
@@ -187,7 +188,7 @@ async def test_compute_completion_stamps_terminal_result_reference(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -253,7 +254,7 @@ async def test_compute_downstream_artifact_rejects_transient_result_reference(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -325,7 +326,7 @@ async def test_compute_downstream_artifact_requires_durable_output_normal_mode(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -393,7 +394,7 @@ async def test_compute_downstream_artifact_passes_with_durable_output_normal_mod
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -512,7 +513,7 @@ async def test_compute_result_artifact_logical_key_delivered_to_dependent(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -762,7 +763,7 @@ async def test_grounded_negative_compute_knowledge_delivers_to_dependents(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -1347,7 +1348,7 @@ async def test_multiarm_measured_criterion_is_measurable_and_not_failed_loud(
     job.accrued_cost_usd = 0.50
     job.final_cost_usd = 0.50
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     # Multi-arm result: arms each report accuracy; no top-level 'accuracy' key.
     # build_compute_result_logs must surface the arms block so the evaluator can
     # use best-arm semantics.
@@ -1414,7 +1415,7 @@ async def test_multiarm_criterion_min_operator(
     job.accrued_cost_usd = 0.20
     job.final_cost_usd = 0.20
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {
@@ -1468,7 +1469,7 @@ async def test_multiarm_criterion_equality_operator(
     job.accrued_cost_usd = 0.10
     job.final_cost_usd = 0.10
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {
@@ -1521,7 +1522,7 @@ async def test_multiarm_criterion_partial_measurability(
     job.accrued_cost_usd = 0.30
     job.final_cost_usd = 0.30
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {
@@ -1576,7 +1577,7 @@ async def test_multiarm_criterion_all_arms_missing_metric(
     job.accrued_cost_usd = 0.30
     job.final_cost_usd = 0.30
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {
@@ -2261,7 +2262,7 @@ async def test_lifecycle_spend_cap_kill_surfaces_through_task(
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-cap-kill"
-    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.started_at = _utcnow() - timedelta(seconds=60)
     db_session.add(job)
     await db_session.commit()
 
@@ -2313,8 +2314,8 @@ async def test_lifecycle_deadline_kill_surfaces_through_task(
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-deadline-kill"
-    job.started_at = datetime.utcnow() - timedelta(seconds=120)
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.started_at = _utcnow() - timedelta(seconds=120)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=1)
     db_session.add(job)
     await db_session.commit()
 
@@ -2361,7 +2362,7 @@ async def test_lifecycle_success_completes_through_task(
         spend_cap_usd=1.0,
         deadline_seconds=300,
     )
-    started_at = datetime.utcnow() - timedelta(seconds=30)
+    started_at = _utcnow() - timedelta(seconds=30)
 
     class FakeBackend:
         def external_id_for(self, persisted_job):
@@ -2382,7 +2383,7 @@ async def test_lifecycle_success_completes_through_task(
             return ComputeStatusResult(
                 status=ComputeJobStatus.SUCCEEDED,
                 exit_code=0,
-                finished_at=datetime.utcnow(),
+                finished_at=_utcnow(),
                 message="completed",
             )
 
@@ -2492,7 +2493,7 @@ async def test_compute_completion_runtime_deadline_routes_to_agent_timeout(
         deadline_seconds=300,
     )
     job.status = ComputeJobStatus.FAILED
-    job.started_at = datetime.utcnow() - timedelta(seconds=300)
+    job.started_at = _utcnow() - timedelta(seconds=300)
     job.terminal_reason = "compute job exceeded runtime deadline"
     db_session.add(job)
     await db_session.commit()
@@ -2532,7 +2533,7 @@ async def test_compute_completion_intentional_kills_still_complete(
     )
     job.status = ComputeJobStatus.SUCCEEDED
     job.outcome = ComputeJobOutcome.SPEND_CAP_EXCEEDED
-    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.started_at = _utcnow() - timedelta(seconds=60)
     job.final_cost_usd = 0.05
     job.terminal_reason = "spend cap exceeded"
     db_session.add(job)
@@ -2605,7 +2606,7 @@ async def _setup_durable_job_with_artifact(
     job.outcome = ComputeJobOutcome.SUCCESS
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.artifact_id = artifact.id
     job.result_reference = artifact_uri
     job.polling_metadata = {
@@ -3365,7 +3366,7 @@ async def test_live_proof_knowledge_document_carries_release_evidence(
         **(task.context or {}),
         "live_release_proof_marker": True,
     }
-    served_at = datetime.utcnow()
+    served_at = _utcnow()
     version = ReleaseVersion(
         project_id=task.project_id,
         version_number=8,
@@ -3426,7 +3427,7 @@ async def test_live_proof_knowledge_document_carries_release_evidence(
     newer_job.accrued_cost_usd = 0.11
     newer_job.final_cost_usd = 0.11
     newer_job.terminal_reason = "compute job finished"
-    newer_job.completed_at = datetime.utcnow()
+    newer_job.completed_at = _utcnow()
     db_session.add(newer_job)
     await db_session.commit()
     await db_session.refresh(newer_job)
@@ -3797,14 +3798,12 @@ async def test_plan_spawned_compute_experiment_carries_downstream_artifact_evide
         spend_cap_usd=2.0,
         deadline_seconds=600,
     )
-    from datetime import datetime as _dt
-
     job.status = ComputeJobStatus.SUCCEEDED
     job.outcome = ComputeJobOutcome.SUCCESS
     job.accrued_cost_usd = 0.25
     job.final_cost_usd = 0.25
     job.terminal_reason = "compute job finished"
-    job.completed_at = _dt.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -4588,7 +4587,7 @@ async def test_artifact_delivery_record_durable_uri_stamped(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -4632,7 +4631,7 @@ async def test_artifact_delivery_record_transient_uri_stamped(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -4698,7 +4697,7 @@ async def test_require_durable_artifact_passes_with_durable_uri(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -4805,7 +4804,7 @@ async def test_require_durable_artifact_gate_fails_with_linked_transient_artifac
     job.accrued_cost_usd = 0.25
     job.final_cost_usd = 0.25
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
 
     # Attach an Artifact with a transient https:// storage_uri (no gs:// / s3:// etc.)
     artifact = Artifact(
@@ -4919,7 +4918,7 @@ async def test_prerequisite_require_durable_artifact_passes_with_durable_uri(
     job.accrued_cost_usd = 0.37
     job.final_cost_usd = 0.37
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
 
@@ -5395,8 +5394,8 @@ async def test_deadline_kill_salvages_late_echo_sha(db_session, monkeypatch):
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-deadline-salvage"
-    job.started_at = datetime.utcnow() - timedelta(seconds=120)
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.started_at = _utcnow() - timedelta(seconds=120)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=1)
     db_session.add(job)
     await db_session.commit()
 
@@ -5450,7 +5449,7 @@ async def test_spend_cap_kill_salvages_late_metrics(db_session, monkeypatch):
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-budget-salvage"
-    job.started_at = datetime.utcnow() - timedelta(seconds=60)
+    job.started_at = _utcnow() - timedelta(seconds=60)
     db_session.add(job)
     await db_session.commit()
 
@@ -5503,8 +5502,8 @@ async def test_salvage_poll_failure_does_not_block_termination(db_session, monke
     )
     job.status = ComputeJobStatus.RUNNING
     job.external_compute_id = "fake-salvage-fail"
-    job.started_at = datetime.utcnow() - timedelta(seconds=120)
-    job.wall_clock_deadline = datetime.utcnow() - timedelta(seconds=1)
+    job.started_at = _utcnow() - timedelta(seconds=120)
+    job.wall_clock_deadline = _utcnow() - timedelta(seconds=1)
     db_session.add(job)
     await db_session.commit()
 
@@ -5572,7 +5571,7 @@ async def test_durable_artifact_criterion_backend_derived_on_timeout(
     job.accrued_cost_usd = 0.20
     job.final_cost_usd = 0.20
     job.terminal_reason = "wall clock deadline exceeded"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     # Simulate what _link_terminal_artifact stamps after detecting a durable artifact.
     job.polling_metadata = {
         **(job.polling_metadata or {}),
@@ -5641,7 +5640,7 @@ async def test_compute_durable_payload_bytes_criterion_unmet(
     job.accrued_cost_usd = 0.10
     job.final_cost_usd = 0.10
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "durable_payload_bytes": 4096,  # below threshold of 65536
@@ -5687,7 +5686,7 @@ async def test_compute_durable_file_count_criterion(db_session, _quiet_compute_i
     job.accrued_cost_usd = 0.15
     job.final_cost_usd = 0.15
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "durable_payload_bytes": 8192,
@@ -5746,7 +5745,7 @@ async def test_link_terminal_artifact_stamps_durable_metrics(
     job.accrued_cost_usd = 0.18
     job.final_cost_usd = 0.18
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     db_session.add(job)
     await db_session.commit()
     await db_session.refresh(job)
@@ -5826,7 +5825,7 @@ async def test_command_cannot_spoof_durable_metrics_via_result_metrics(
     job.accrued_cost_usd = 0.10
     job.final_cost_usd = 0.10
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     # No durable artifact was linked; command reports spoofed reserved keys.
     job.polling_metadata = {
         **(job.polling_metadata or {}),
@@ -5989,7 +5988,7 @@ def test_runtime_phase_terminal_diagnostics_no_provisioning_fields():
     """
     job = MagicMock()
     job.terminal_reason = "compute job spend cap exceeded"
-    job.started_at = datetime.utcnow()
+    job.started_at = _utcnow()
     job.accelerator_type = "nvidia-tesla-t4"
     job.machine_type = "n1-standard-4"
     job.polling_metadata = {
@@ -6353,7 +6352,7 @@ async def test_per_arm_cost_sums_to_total(db_session, _quiet_compute_io):
     job.accrued_cost_usd = 0.40
     job.final_cost_usd = 0.40
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {
@@ -6421,7 +6420,7 @@ async def test_per_arm_cost_zero_elapsed_no_raise(db_session, _quiet_compute_io)
     job.accrued_cost_usd = 0.20
     job.final_cost_usd = 0.20
     job.terminal_reason = "compute job finished"
-    job.completed_at = datetime.utcnow()
+    job.completed_at = _utcnow()
     job.polling_metadata = {
         **(job.polling_metadata or {}),
         "result_metrics": {

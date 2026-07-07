@@ -17,7 +17,7 @@ colliding with a sibling task that is editing that file.
 """
 
 from contextlib import asynccontextmanager
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -173,7 +173,7 @@ async def test_rollback_while_paused_preserves_real_capacity(
     """A rollback issued while the pipeline is already (auto-)paused must not
     overwrite the genuine pre_pause_max_vms snapshot with the already-zeroed
     live capacity, and must preserve the existing pause window."""
-    paused_at = datetime.utcnow() - timedelta(seconds=300)
+    paused_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=300)
     db_session.add(
         _rollbackable_state(
             status=DeploymentStatus.PAUSED,
@@ -431,7 +431,7 @@ async def test_manual_lever_returns_429_when_row_held(
             status=DeploymentStatus.PAUSED,
             pre_pause_max_vms=7,
             runtime_max_concurrent_vms=7,
-            paused_at=datetime.utcnow() - timedelta(seconds=120),
+            paused_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=120),
             paused_kind=pause_clock.PAUSED_KIND_AUTO,
         )
     )
@@ -493,7 +493,7 @@ async def test_resume_bumps_version_and_single_commit(
             status=DeploymentStatus.PAUSED,
             pre_pause_max_vms=8,
             runtime_max_concurrent_vms=8,
-            paused_at=datetime.utcnow() - timedelta(seconds=60),
+            paused_at=datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=60),
             paused_kind=pause_clock.PAUSED_KIND_MANUAL,
         )
     )

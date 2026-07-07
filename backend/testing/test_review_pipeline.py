@@ -804,7 +804,7 @@ async def test_review_spawn_defers_when_blocked_fix_active(db_session, mocker):
         project_id=project.id,
         status=TaskStatus.BLOCKED,
         last_heartbeat=None,
-        started_at=datetime.utcnow()
+        started_at=datetime.now(timezone.utc).replace(tzinfo=None)
         - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5),
         payloads=[
             {
@@ -906,7 +906,7 @@ async def test_review_spawn_defers_to_ci_waiting_fix_and_does_not_churn(
     ci_waiting_fix = make_task(
         project_id=project.id,
         status=TaskStatus.EVALUATING,
-        last_heartbeat=datetime.utcnow()
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None)
         - timedelta(minutes=PIPELINE_TASK_STALE_MINUTES + 5),
         payloads=[
             {
@@ -1003,7 +1003,7 @@ async def test_review_spawn_defers_when_in_progress_fix_active(db_session, mocke
     inprogress_fix = make_task(
         project_id=project.id,
         status=TaskStatus.IN_PROGRESS,
-        last_heartbeat=datetime.utcnow(),
+        last_heartbeat=datetime.now(timezone.utc).replace(tzinfo=None),
         payloads=[
             {
                 "type": "fix",
@@ -5186,7 +5186,7 @@ async def test_warm_pin_set_when_flag_enabled_and_source_in_progress(
     deadline = datetime.fromisoformat(str(deadline_iso))
     if deadline.tzinfo is not None:
         deadline = deadline.replace(tzinfo=None)
-    assert deadline > datetime.utcnow(), "deadline should be in the future"
+    assert deadline > datetime.now(timezone.utc).replace(tzinfo=None), "deadline should be in the future"
     # Spawned task must have vm_instance_id=NULL so the orchestrator's
     # provisioning loop knows to consult the heartbeat map.
     assert result.vm_instance_id is None
@@ -5207,7 +5207,7 @@ async def test_warm_pin_not_set_when_source_completed_long_ago(db_session, mocke
     )
 
     project = await _make_db_project(db_session)
-    long_ago = datetime.utcnow() - timedelta(seconds=WARM_HANDOFF_WINDOW_SECS + 60)
+    long_ago = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=WARM_HANDOFF_WINDOW_SECS + 60)
     source_task = make_task(
         project_id=project.id,
         status=TaskStatus.COMPLETED,
@@ -15100,7 +15100,7 @@ async def test_mid_retry_defer_defers_review_when_fix_infra_failed_in_grace_wind
     failed_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__("datetime").datetime.utcnow()
+        updated_at=__import__("datetime").datetime.now(timezone.utc).replace(tzinfo=None)
         - __import__("datetime").timedelta(minutes=5),
         payloads=[
             {
@@ -15179,7 +15179,7 @@ async def test_mid_retry_defer_allows_review_when_fix_outside_grace_window(
     old_failed_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__("datetime").datetime.utcnow()
+        updated_at=__import__("datetime").datetime.now(timezone.utc).replace(tzinfo=None)
         - __import__("datetime").timedelta(minutes=25),
         payloads=[
             {
@@ -15256,7 +15256,7 @@ async def test_mid_retry_defer_allows_review_when_budget_exhausted(db_session, m
     exhausted_fix = make_task(
         project_id=project.id,
         status=TaskStatus.FAILED,
-        updated_at=__import__("datetime").datetime.utcnow()
+        updated_at=__import__("datetime").datetime.now(timezone.utc).replace(tzinfo=None)
         - __import__("datetime").timedelta(minutes=5),
         payloads=[
             {

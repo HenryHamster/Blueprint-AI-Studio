@@ -3249,7 +3249,7 @@ async def test_auto_retire_pending_surfaces_in_direction_stats(db_session, mocke
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     project = _make_project(
         directions=[
             {
@@ -3296,7 +3296,7 @@ async def test_auto_retire_pending_surfaces_for_active_scaffolding_direction(
         "app.task_lifecycle._has_active_strategic_task",
         new=AsyncMock(return_value=False),
     )
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     project = _make_project(
         directions=[
             {
