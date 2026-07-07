@@ -11,8 +11,8 @@ for backward compatibility.
 Pure leaf module — depends only on ``app.broadcast``, ``app.notification``,
 ``app.shared_state``, ``app.time_utils``, ``app.models``. Tests patch
 ``app.alert_dispatch.broadcast_to_project`` and
-``app.alert_dispatch._send_webhook_notification`` for the helpers that live
-here, and ``app.alert_dispatch.<helper>`` where a caller invokes one.
+``app.notification_dispatch.dispatch_external_notification`` for the helpers
+that live here, and ``app.alert_dispatch.<helper>`` where a caller invokes one.
 """
 
 import logging
@@ -1695,10 +1695,22 @@ async def _resolve_wake_delivery_stall_alert(
 # on recovery — gets a fresh alert. Kept stable: the resolve-on-recovery path
 # rebuilds the SAME key to find the open alert to dismiss.
 _RUNNER_DEACTIVATED_EVENT_TYPE = "runner.deactivated"
+_RUNNER_DEGRADED_EVENT_TYPE = "runner.degraded"
+
+# Escalation: re-notify at 1h if a runner-deactivated alert stays unresolved,
+# then again every 4h. Ephemeral in-memory tracking — clears on restart, which
+# is acceptable because the initial notification already has retry semantics.
+_RUNNER_ESCALATION_FIRST_SECONDS = 3600    # 1h
+_RUNNER_ESCALATION_REPEAT_SECONDS = 14400  # 4h
+_runner_escalation_last_notified: dict[str, "datetime"] = {}
 
 
 def _runner_deactivated_dedupe_key(runner_id: "uuid.UUID | str") -> str:
     return f"{_RUNNER_DEACTIVATED_EVENT_TYPE}:{runner_id}"
+
+
+def _runner_degraded_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_DEGRADED_EVENT_TYPE}:{runner_id}"
 
 
 async def _maybe_create_runner_deactivated_alert(
@@ -1715,11 +1727,12 @@ async def _maybe_create_runner_deactivated_alert(
 
     Fired from the orchestrator's stale-runner sweep at the moment it flips a
     registered self-hosted runner ``active -> inactive`` (missed heartbeat
-    window). Previously that sweep only nudged the UI cache — an idle registered
-    runner could die and nothing told the operator. This surfaces the death in
-    the same Alerts banner/popover as PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN and,
-    when ``PIPELINE_WEBHOOK_URL`` is set, PUSHES the ``RUNNER_DEACTIVATED`` webhook
-    so the operator is notified without watching the console.
+    window). Surfaces the death in the same Alerts banner/popover as
+    PIPELINE_HALTED / CIRCUIT_BREAKER_OPEN and dispatches a ``RUNNER_DEACTIVATED``
+    external notification through the retry-capable
+    :func:`~app.notification_dispatch.dispatch_external_notification` path (30s /
+    2 min / 10 min backoff) so a misconfigured or transiently-unreachable webhook
+    does not silently drop the alert.
 
     Severity mirrors impact: **ERROR** when the runner had active work in flight
     at deactivation (a job may have been interrupted), **WARNING** when it was
@@ -1729,10 +1742,10 @@ async def _maybe_create_runner_deactivated_alert(
     Deduplicated on ``dedupe_key = runner.deactivated:{runner_id}`` via the shared
     :func:`create_project_alert_if_allowed` upsert: a repeated sweep (or any
     re-entry while the runner stays inactive) bumps the existing open alert's
-    occurrence count instead of creating a second row. The webhook fires ONLY on
-    the first (newly-created) alert, not on dedup hits. Commits its own row so the
-    caller's transaction boundary is independent. Returns ``True`` when a NEW
-    alert was created (and the webhook pushed), else ``False``.
+    occurrence count instead of creating a second row. The notification fires ONLY
+    on the first (newly-created) alert, not on dedup hits. Commits its own row so
+    the caller's transaction boundary is independent. Returns ``True`` when a NEW
+    alert was created (and the notification dispatched), else ``False``.
     """
     runner_label = hostname or f"runner {str(runner_id)[:8]}"
     severity = AlertSeverity.ERROR if had_active_work else AlertSeverity.WARNING
@@ -1791,7 +1804,26 @@ async def _maybe_create_runner_deactivated_alert(
             "event_type": alert.event_type,
         },
     )
-    await _send_webhook_notification("RUNNER_DEACTIVATED", alert.title, alert.message)
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_DEACTIVATED",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "had_active_work": had_active_work,
+                    "active_work_count": active_work_count,
+                    "seconds_since_last_seen": seconds_since_last_seen,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_DEACTIVATED dispatch setup failed: %s", _ne)
     return True
 
 
@@ -1818,6 +1850,203 @@ async def _resolve_runner_deactivated_alert(
     never aborts the heartbeat that triggered it.
     """
     dedupe_key = _runner_deactivated_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+        # Clear escalation state so the next outage starts fresh.
+        if alert.dedupe_key:
+            _runner_escalation_last_notified.pop(alert.dedupe_key, None)
+    return len(open_alerts)
+
+
+async def _maybe_escalate_runner_deactivated_alerts(session: AsyncSession) -> int:
+    """Re-notify for runner-deactivated alerts that have been open too long.
+
+    The initial notification fires on alert creation (with retry semantics). This
+    sweep function is called periodically (every 300s) and fires a follow-up
+    ``RUNNER_DEACTIVATED`` external notification when an alert has been unresolved
+    for more than :data:`_RUNNER_ESCALATION_FIRST_SECONDS` (1h), then re-escalates
+    every :data:`_RUNNER_ESCALATION_REPEAT_SECONDS` (4h).
+
+    Escalation state is tracked in :data:`_runner_escalation_last_notified`
+    (ephemeral; clears on restart — best-effort, the initial delivery already has
+    retry semantics). Returns the count of escalation notifications dispatched.
+    """
+    now = _utcnow()
+    open_alerts = (
+        await session.execute(
+            select(Alert).where(
+                Alert.event_type == _RUNNER_DEACTIVATED_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    dispatched = 0
+    for alert in open_alerts:
+        if alert.dedupe_key is None:
+            continue
+        age_s = (now - alert.created_at).total_seconds()
+        last_notified = _runner_escalation_last_notified.get(alert.dedupe_key)
+
+        should_escalate = False
+        if last_notified is None and age_s >= _RUNNER_ESCALATION_FIRST_SECONDS:
+            should_escalate = True
+        elif last_notified is not None:
+            if (now - last_notified).total_seconds() >= _RUNNER_ESCALATION_REPEAT_SECONDS:
+                should_escalate = True
+
+        if not should_escalate:
+            continue
+
+        _runner_escalation_last_notified[alert.dedupe_key] = now
+        try:
+            import asyncio as _asyncio
+            from app.notification_dispatch import dispatch_external_notification
+
+            _asyncio.ensure_future(  # noqa: RUF006
+                dispatch_external_notification(
+                    alert.project_id,
+                    "RUNNER_DEACTIVATED",
+                    {
+                        "runner_id": alert.dedupe_key.split(":", 1)[-1],
+                        "title": alert.title,
+                        "message": alert.message,
+                        "age_seconds": int(age_s),
+                        "occurrence_count": alert.occurrence_count or 1,
+                        "escalation": True,
+                    },
+                )
+            )
+            dispatched += 1
+        except Exception as _ne:
+            logger.warning("[NOTIFY] Runner escalation dispatch failed: %s", _ne)
+
+    return dispatched
+
+
+async def _maybe_create_runner_degraded_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    consecutive_failures: int = 0,
+    seconds_since_last_success: "int | None" = None,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner is degraded.
+
+    A degraded runner has a recent heartbeat but is failing every job it claims
+    (``consecutive_failures >= threshold``). Distinct from the deactivated alert:
+    the runner is still CONNECTED and heartbeating, but its jobs are silently
+    failing — a false-green that the operator panel's ``device_status="degraded"``
+    flag exposes but that previously raised no push notification.
+
+    Deduplicated on ``runner.degraded:{runner_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. The alert
+    clears automatically when the runner completes a successful job
+    (``consecutive_failures`` drops to 0) and the degraded-runner sweep calls
+    :func:`_resolve_runner_degraded_alert`. Returns ``True`` when a NEW alert
+    was created (and the notification dispatched), else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    title = f"Fleet runner degraded: {runner_label}"
+    if seconds_since_last_success is not None:
+        success_desc = (
+            f" Last successful job "
+            f"{_fmt_duration_seconds(seconds_since_last_success)} ago."
+        )
+    else:
+        success_desc = " No successful job recorded."
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) is "
+        f"heartbeating normally but has failed {consecutive_failures} consecutive "
+        f"job{'s' if consecutive_failures != 1 else ''}.{success_desc} "
+        f"Check the runner's logs for errors. The alert clears automatically when "
+        f"the runner completes a job successfully."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_DEGRADED_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_degraded_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_DEGRADED",
+                {
+                    "runner_id": str(runner_id),
+                    "runner_label": runner_label,
+                    "consecutive_failures": consecutive_failures,
+                    "seconds_since_last_success": seconds_since_last_success,
+                    "title": alert.title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_DEGRADED dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_runner_degraded_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-degraded alert for a runner that recovered.
+
+    The companion to :func:`_maybe_create_runner_degraded_alert`. Called from the
+    degraded-runner sweep when ``consecutive_job_failures`` drops below the
+    threshold (the runner completed a successful job). Mirrors
+    :func:`_resolve_runner_deactivated_alert`. Returns the number of alerts
+    dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_degraded_dedupe_key(runner_id)
     result = await session.execute(
         select(Alert).where(
             Alert.project_id == project_id,

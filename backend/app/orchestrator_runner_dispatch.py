@@ -1102,6 +1102,109 @@ async def _deactivate_stale_runners(session: AsyncSession) -> None:
             )
 
 
+# Consecutive-failure count at which a live runner is considered degraded.
+# Mirrors admin_runners._FAILURE_STREAK_DEGRADED_THRESHOLD (both must stay in sync).
+_RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
+
+
+async def _check_degraded_runners(session: AsyncSession) -> None:
+    """Detect runners that are heartbeating but failing every job, and alert/resolve.
+
+    Queries active runners with recent heartbeats and ``consecutive_job_failures``
+    >= :data:`_RUNNER_DEGRADED_FAILURE_THRESHOLD`. For each degraded runner, calls
+    :func:`~app.alert_dispatch._maybe_create_runner_degraded_alert` to raise (or
+    dedup) a WARNING alert. Then resolves alerts for runners that have recovered.
+
+    Called from the orchestrator's monitoring loop at the same 300s cadence as the
+    stale-runner deactivation sweep.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_runner_degraded_alert,
+        _resolve_runner_degraded_alert,
+        _RUNNER_DEGRADED_EVENT_TYPE,
+    )
+    from app.models import Alert
+
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+
+    # 1. Alert for each actively-degraded runner.
+    degraded_runners = (
+        await session.execute(
+            select(LocalRunner).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+                LocalRunner.consecutive_job_failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+            )
+        )
+    ).scalars().all()
+
+    degraded_runner_ids: set[uuid.UUID] = set()
+    for runner in degraded_runners:
+        degraded_runner_ids.add(runner.id)
+        seconds_since_last_success = (
+            max(0, int((now - runner.last_successful_job_at).total_seconds()))
+            if runner.last_successful_job_at is not None
+            else None
+        )
+        try:
+            await _maybe_create_runner_degraded_alert(
+                session,
+                project_id=runner.project_id,
+                runner_id=runner.id,
+                hostname=runner.hostname,
+                consecutive_failures=runner.consecutive_job_failures or 0,
+                seconds_since_last_success=seconds_since_last_success,
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create degraded alert for runner %s", runner.id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after degraded-alert create failed for %s",
+                    runner.id,
+                )
+
+    # 2. Resolve degraded alerts for runners that have recovered.
+    # Only check runners that HAVE an open degraded alert to avoid querying every
+    # non-degraded runner.
+    open_degraded_keys = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_DEGRADED_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+
+    for project_id_row, dedupe_key in open_degraded_keys:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in degraded_runner_ids:
+            continue  # Still degraded — keep the alert.
+        try:
+            await _resolve_runner_degraded_alert(session, project_id_row, runner_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve degraded alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after degraded-alert resolve failed for %s",
+                    runner_id,
+                )
+
+
 def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
     try:
         stamped_at = datetime.fromisoformat(str(raw))
