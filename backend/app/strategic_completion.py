@@ -3880,6 +3880,68 @@ def _compute_model_gc_telemetry(project: Project, task: Task) -> dict:
     }
 
 
+async def _apply_qualify_request_post_commit(
+    request: object,
+    *,
+    task_id: "uuid.UUID",
+    project_id: "uuid.UUID",
+    path: str,
+    session_factory=None,
+) -> None:
+    """Post-commit: run the best-effort ``qualify_request`` side-effect on a fresh session.
+
+    STRUCTURAL INVARIANT (docs/concurrency.md; ``_process_post_commit`` — "release
+    the lock before slow GitHub calls"): the ``qualify_request`` handler does
+    minutes of external GitHub I/O — the CI-compliance scan in
+    ``ci_compliance.ensure_current_ci_compliance`` (which reads the capped module
+    set at the integration-branch HEAD) plus the candidate-SHA resolution in
+    ``release_qualifier.run_qualification``. That MUST NOT run while the strategic
+    completion holds the Project ``FOR UPDATE`` row lock (acquired up front by
+    ``_process_post_commit`` via ``lock_project_then_task``) and its DB connection.
+
+    Running it under the lock idled the completion's connection across the
+    multi-minute scan until Cloud SQL closed it mid-flush (``UPDATE project SET
+    ci_compliance`` → asyncpg ``InterfaceError: connection is closed``), poisoning
+    the completion session so its commit raised ``PendingRollbackError``. The
+    completion handler classified that as a transient error and requeued the WHOLE
+    agent job — re-running a 5–24 min architecture review up to ``max_retries``
+    times before giving up as FAILED, even though the agent's design-doc write had
+    already landed each time.
+
+    ``run_qualification`` is self-defending — it takes its own ``ReleaseVersion``
+    ``FOR UPDATE`` lock and resolves its GitHub I/O outside that lock — so it
+    needs no lock held by this caller. So the qualify side-effect runs here, AFTER
+    the completion has durably committed and released its Project lock, on a
+    dedicated fresh session. It is best-effort: any failure (connection death,
+    GitHub error) is logged and swallowed — the durable completion already
+    committed, so a failure here can never requeue the task or discard the
+    agent's work.
+    """
+    if not request or not isinstance(request, dict):
+        return
+    from app.database import AsyncSessionLocal
+
+    factory = session_factory or AsyncSessionLocal
+    try:
+        async with factory() as fresh:
+            project = await fresh.get(Project, project_id)
+            task = await fresh.get(Task, task_id)
+            if project is None or task is None:
+                return
+            await _apply_qualify_request(request, task, project, fresh, path=path)
+            await fresh.commit()
+    except Exception:
+        logger.warning(
+            "[STRATEGIC_COMPLETION] _apply_qualify_request_post_commit: qualify_request "
+            "side-effect failed for task %s project %s (%s path) — non-fatal; the "
+            "strategic completion already committed durably, task NOT requeued",
+            task_id,
+            project_id,
+            path,
+            exc_info=True,
+        )
+
+
 async def _maybe_retry_workday_auto_start(
     project_id: "uuid.UUID",
     *,
@@ -4311,8 +4373,16 @@ async def _handle_strategic_completion(
         # sanitized {reason} dict under ``QUALIFY_REQUEST_CONTEXT_KEY``. When the
         # open ReleaseVersion is in ``stabilize`` this kicks off the release
         # qualifier.
+        # qualify_request is a best-effort side-effect that does minutes of GitHub
+        # I/O (CI-compliance scan + run_qualification). Per the "release the lock
+        # before slow GitHub calls" invariant it must NOT run under the Project
+        # FOR UPDATE lock _process_post_commit holds — doing so idled this
+        # session's connection across the scan until Cloud SQL closed it,
+        # poisoning the commit below (PendingRollbackError) and requeuing the
+        # whole agent job. Captured here; applied post-commit on a fresh session.
         _qr_ctx = (task.context or {}).get(QUALIFY_REQUEST_CONTEXT_KEY)
-        await _apply_qualify_request(_qr_ctx, task, project, session, path="api")
+        _qr_task_id = task.id
+        _qr_project_id = project.id
         # Apply new_version_goal if the agent supplied one via the API. Same
         # transport as qualify_request: the ``set_problem_model`` endpoint lifts
         # the field out of the problem_model JSON (ProblemModel extra="forbid")
@@ -4344,6 +4414,13 @@ async def _handle_strategic_completion(
                 exc_info=True,
             )
         await session.commit()
+        # qualify_request runs AFTER the lock-release commit, on its own fresh
+        # session, so its slow GitHub I/O never holds this completion's Project
+        # lock / connection and a failure here can never requeue the durably-
+        # completed task (see _apply_qualify_request_post_commit).
+        await _apply_qualify_request_post_commit(
+            _qr_ctx, task_id=_qr_task_id, project_id=_qr_project_id, path="api"
+        )
         # Post-commit: the live strategic ops already emitted per-write
         # `strategic_updated` events during execution; here we close the cycle.
         from app.strategic_events import emit_strategic_cycle_completed
@@ -6024,8 +6101,12 @@ async def _handle_strategic_completion(
     await _apply_version_phase_decision(
         _vpd_parsed, task, project, session, path="fallback"
     )
+    # See _apply_qualify_request_post_commit: the qualify_request side-effect does
+    # slow GitHub I/O and must run AFTER this path's lock-release commit, on a
+    # fresh session — never under the completion's Project lock. Captured here.
     _qr_parsed = parsed.get("qualify_request")
-    await _apply_qualify_request(_qr_parsed, task, project, session, path="fallback")
+    _qr_task_id_fb = task.id
+    _qr_project_id_fb = task.project_id
 
     # Update cycle history with final outcome
     # Audit W2: cycle outcome lives on the StrategicCycle row.
@@ -6340,6 +6421,12 @@ async def _handle_strategic_completion(
     await (
         session.commit()
     )  # Single commit: vision + directions + messages + task status
+    # qualify_request runs post-commit on its own fresh session (see
+    # _apply_qualify_request_post_commit) so its slow GitHub I/O never holds this
+    # completion's Project lock / connection.
+    await _apply_qualify_request_post_commit(
+        _qr_parsed, task_id=_qr_task_id_fb, project_id=_qr_project_id_fb, path="fallback"
+    )
     # Post-commit: notify the admin UI of every strategist output this
     # legacy-parse path wrote, then close the cycle. Tiny refetch signals.
     from app.strategic_events import (

@@ -9240,6 +9240,103 @@ async def test_qualify_request_flows_end_to_end(client, db_session, mocker):
 
 
 @pytest.mark.asyncio
+async def test_qualify_request_side_effect_failure_does_not_break_durable_write(
+    client, db_session, mocker
+):
+    """STRUCTURAL regression (ci_compliance connection-death wedge).
+
+    The qualify_request side-effect does minutes of external GitHub I/O
+    (CI-compliance scan + run_qualification). It used to run INSIDE the
+    completion / set_problem_model transaction, under the Project ``FOR UPDATE``
+    lock — so the idle DB connection died mid-scan (asyncpg
+    ``connection is closed`` on ``UPDATE project SET ci_compliance``), poisoned
+    the session, and the commit raised ``PendingRollbackError``. The handler
+    classified that as transient and requeued the WHOLE agent job, re-running a
+    5–24 min review up to ``max_retries`` times before failing — even though the
+    agent's design-doc write had already landed.
+
+    The fix runs the qualify side-effect AFTER the durable commit, on an isolated
+    fresh session, fail-open. This test simulates the side-effect blowing up the
+    exact way the connection death did and asserts the durable problem_model
+    write still commits and the agent gets a 200 — never a 500 / requeue.
+    """
+    from unittest.mock import AsyncMock
+    from app.auth import create_agent_token
+    from app.models import TaskStatus
+    from app import release_version as rv
+    from app import strategic_cycle
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    # Stand in for the connection-death poison: the qualify side-effect raises a
+    # disconnect-class error. Patched at the module global so the post-commit
+    # wrapper's ``await _apply_qualify_request(...)`` hits it.
+    boom = mocker.patch(
+        "app.strategic_completion._apply_qualify_request",
+        new_callable=AsyncMock,
+        side_effect=RuntimeError(
+            "(sqlalchemy.dialects.postgresql.asyncpg.InterfaceError) connection is "
+            "closed [SQL: UPDATE project SET ci_compliance=$1 WHERE project.id = $2]"
+        ),
+    )
+
+    project = Project(
+        name="QR-ISOLATE",
+        user_id="u1",
+        vision={"purpose": "test", "revision": 1},
+        directions=[],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    rv.set_version_phase(version, "stabilize", reasoning="hardening")
+    db_session.add(version)
+    cycle = await strategic_cycle.create(db_session, project_id=project.id)
+    await db_session.commit()
+
+    task = Task(
+        project_id=project.id,
+        status=TaskStatus.IN_PROGRESS,
+        vm_instance_id="vm-qr-iso",
+        payloads=[
+            {"type": "strategic_review", "prompt": "review", "vision": {"revision": 1}}
+        ],
+        context={"strategic_cycle_id": cycle.id},
+        strategic_cycle_id=cycle.id,
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+
+    token = create_agent_token(str(task.id), "vm-qr-iso", task_type="strategic_review")
+    resp = await client.post(
+        "/api/agent/strategic",
+        json={
+            "task_id": str(task.id),
+            "op": "set_problem_model",
+            "data": {
+                "intent": {"purpose": "Ship it", "current_focus": "qualify"},
+                "capabilities": [],
+                "gaps": [],
+                "qualify_request": {"reason": "release-ready"},
+            },
+        },
+        headers={"x-agent-token": token},
+    )
+
+    # The durable problem_model write survived even though the qualify side-effect
+    # raised a connection-death error — no 500, no requeue.
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["qualify_request_received"] is True
+    await db_session.refresh(project)
+    assert (project.problem_model or {}).get("intent", {}).get("purpose") == "Ship it"
+    # The side-effect ran POST-commit (on the isolated fresh session) and its
+    # failure was swallowed rather than propagated to the durable write.
+    boom.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_qualify_request_skipped_when_version_not_in_stabilize(
     client, db_session, mocker
 ):

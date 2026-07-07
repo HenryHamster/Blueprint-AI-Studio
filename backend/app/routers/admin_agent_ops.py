@@ -3476,7 +3476,7 @@ async def strategic_operation(
             VERSION_PHASE_DECISION_CONTEXT_KEY,
             _apply_new_acceptance_criteria,
             _apply_new_version_goal,
-            _apply_qualify_request,
+            _apply_qualify_request_post_commit,
             _apply_version_phase_decision,
             extract_new_version_goal,
             extract_qualify_request,
@@ -3628,14 +3628,19 @@ async def strategic_operation(
         session.add(task)
         # Apply synchronously within this handler so resident sessions (where the
         # task stays open for the entire conversation) get immediate effect rather
-        # than waiting for task completion. The apply helpers only call
+        # than waiting for task completion. These apply helpers only call
         # session.add(); the single commit below persists everything atomically.
+        # qualify_request is the exception: it does minutes of GitHub I/O
+        # (CI-compliance scan + run_qualification) and MUST NOT run under the
+        # Project FOR UPDATE lock held by this endpoint — doing so idled the
+        # connection until Cloud SQL closed it, poisoning the commit. It is
+        # applied post-commit on a fresh session below (see
+        # _apply_qualify_request_post_commit).
         await _apply_version_phase_decision(
             version_phase_decision, task, project, session, path="api_inline"
         )
-        await _apply_qualify_request(
-            qualify_request, task, project, session, path="api_inline"
-        )
+        _qr_task_id = task.id
+        _qr_project_id = project.id
         await _apply_new_version_goal(
             new_version_goal, task, project, session, path="api_inline"
         )
@@ -3658,6 +3663,16 @@ async def strategic_operation(
         await _emit_updated(
             STRATEGIC_KIND_PROBLEM_MODEL,
             problem_model_changed=True,
+        )
+        # qualify_request runs AFTER the commit that released the Project lock, on
+        # its own fresh session, so its slow GitHub I/O never idles this request's
+        # locked connection (which would poison the commit and 500 the agent). The
+        # agent still awaits it here, preserving synchronous semantics.
+        await _apply_qualify_request_post_commit(
+            qualify_request,
+            task_id=_qr_task_id,
+            project_id=_qr_project_id,
+            path="api_inline",
         )
         logger.info(
             f"[STRATEGIC API] problem_model updated for project {project.id} "
