@@ -19,11 +19,12 @@ import {
 import { writePlaybookHelper, writeMessagesHelper, writeSymbolsHelper, retryPostShellFn } from '../prompt.js';
 import { AGENT_TOKEN_FILE_ENV, GITHUB_TOKEN_FILE_ENV, agentTokenShellFn } from '../token-file.js';
 
-export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
+export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai' | 'deepseek';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
 export type OutputMode = 'claude-stream-json' | 'codex-jsonl' | 'text';
 
 const ZAI_ANTHROPIC_BASE_URL = 'https://api.z.ai/api/anthropic';
+const DEEPSEEK_ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic';
 
 const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode, readonly string[]>>>> = {
   anthropic: {
@@ -106,15 +107,28 @@ const RATE_LIMIT_PATTERNS: Readonly<Record<ProviderName, Partial<Record<AuthMode
       'api usage exhausted',
     ],
   },
+  deepseek: {
+    api_key: [
+      'rate limit exceeded',
+      'rate_limit',
+      'too many requests',
+      'api error: rate limit',
+      'api error: 429',
+      'status 429',
+      'quota exceeded',
+      'api usage exhausted',
+      'concurrency limit',
+    ],
+  },
 } as const;
 
 function normalizeProvider(raw: string | undefined): ProviderName {
-  if (raw === 'openai' || raw === 'gemini' || raw === 'zai') return raw;
+  if (raw === 'openai' || raw === 'gemini' || raw === 'zai' || raw === 'deepseek') return raw;
   return 'anthropic';
 }
 
 function normalizeAuthMode(raw: string | undefined, provider: ProviderName): AuthMode {
-  if (provider === 'zai') return 'api_key';
+  if (provider === 'zai' || provider === 'deepseek') return 'api_key';
   if (provider === 'gemini' && raw === 'service_account') return raw;
   if (raw === 'api_key' || raw === 'oauth') return raw;
   if (provider === 'gemini') return 'api_key';
@@ -169,7 +183,7 @@ export function refreshRuntimeState(): void {
  * native fan-out primitive available" — detect availability, never assume.
  */
 export function providerSupportsNativeSubagents(provider: ProviderName = PROVIDER): boolean {
-  return provider === 'anthropic' || provider === 'zai';
+  return provider === 'anthropic' || provider === 'zai' || provider === 'deepseek';
 }
 
 export function providerAutoInjectsClaudeMd(provider: ProviderName = PROVIDER): boolean {
@@ -267,6 +281,14 @@ const AUTH_FAILURE_PATTERNS: Readonly<Record<ProviderName, readonly string[]>> =
     'missing api key',
     'x-api-key header is required',
     'invalid x-api-key',
+  ],
+  deepseek: [
+    'api key not valid',
+    'invalid deepseek api key',
+    'missing api key',
+    'x-api-key header is required',
+    'invalid x-api-key',
+    'authentication fails',
   ],
 } as const;
 
@@ -508,6 +530,9 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
     'ZAI_API_KEY',
     'ZAI_ANTHROPIC_BASE_URL',
     'ZAI_BASE_URL',
+    'DEEPSEEK_API_KEY',
+    'DEEPSEEK_ANTHROPIC_BASE_URL',
+    'DEEPSEEK_BASE_URL',
     'OPENAI_API_KEY',
     'CODEX_API_KEY',
     'CODEX_HOME',
@@ -542,8 +567,22 @@ function buildBaseCliEnv(provider: ProviderName = PROVIDER): Record<string, stri
     if (env.ZAI_API_KEY) {
       env.ANTHROPIC_API_KEY = env.ZAI_API_KEY;
       env.ANTHROPIC_AUTH_TOKEN = env.ZAI_API_KEY;
+    } else {
+      delete env.ANTHROPIC_API_KEY;
+      delete env.ANTHROPIC_AUTH_TOKEN;
     }
-    const baseUrl = env.ANTHROPIC_BASE_URL || env.ZAI_ANTHROPIC_BASE_URL || env.ZAI_BASE_URL || ZAI_ANTHROPIC_BASE_URL;
+    const baseUrl = env.ZAI_ANTHROPIC_BASE_URL || env.ZAI_BASE_URL || env.ANTHROPIC_BASE_URL || ZAI_ANTHROPIC_BASE_URL;
+    env.ANTHROPIC_BASE_URL = baseUrl.replace(/\/+$/, '');
+  }
+  if (provider === 'deepseek') {
+    if (env.DEEPSEEK_API_KEY) {
+      env.ANTHROPIC_API_KEY = env.DEEPSEEK_API_KEY;
+      env.ANTHROPIC_AUTH_TOKEN = env.DEEPSEEK_API_KEY;
+    } else {
+      delete env.ANTHROPIC_API_KEY;
+      delete env.ANTHROPIC_AUTH_TOKEN;
+    }
+    const baseUrl = env.DEEPSEEK_ANTHROPIC_BASE_URL || env.DEEPSEEK_BASE_URL || env.ANTHROPIC_BASE_URL || DEEPSEEK_ANTHROPIC_BASE_URL;
     env.ANTHROPIC_BASE_URL = baseUrl.replace(/\/+$/, '');
   }
   return env;
@@ -577,7 +616,7 @@ function appendBoundedTail(current: string, chunk: string, maxBytes: number): st
 }
 
 export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: AuthMode = AUTH_MODE): ProviderRunner {
-  if (provider === 'zai') authMode = 'api_key';
+  if (provider === 'zai' || provider === 'deepseek') authMode = 'api_key';
   const baseEnv = buildBaseCliEnv(provider);
   if (provider === 'openai') {
     return {
@@ -655,17 +694,24 @@ export function getProviderRunner(provider: ProviderName = PROVIDER, authMode: A
     };
   }
   const isZai = provider === 'zai';
-  const claudeDisplayName = isZai ? 'Z.AI GLM (Claude compat)' : 'Claude Code';
+  const isDeepSeek = provider === 'deepseek';
+  const claudeDisplayName = isZai
+    ? 'Z.AI GLM (Claude compat)'
+    : isDeepSeek
+      ? 'DeepSeek (Claude compat)'
+      : 'Claude Code';
   return {
-    provider: isZai ? 'zai' : 'anthropic',
+    provider: isZai ? 'zai' : isDeepSeek ? 'deepseek' : 'anthropic',
     authMode,
     displayName: claudeDisplayName,
     credentialSummary: () => {
       if (isZai) return 'Using ZAI_API_KEY via the Anthropic-compatible endpoint';
+      if (isDeepSeek) return 'Using DEEPSEEK_API_KEY via the Anthropic-compatible endpoint';
       return baseEnv.CLAUDE_CODE_OAUTH_TOKEN ? 'Using OAuth token for Claude Code auth' : 'Using ANTHROPIC_API_KEY as fallback auth';
     },
     missingCredentials: () => {
-      if (isZai) return (baseEnv.ZAI_API_KEY || baseEnv.ANTHROPIC_API_KEY) ? [] : ['ZAI_API_KEY'];
+      if (isZai) return baseEnv.ZAI_API_KEY ? [] : ['ZAI_API_KEY'];
+      if (isDeepSeek) return baseEnv.DEEPSEEK_API_KEY ? [] : ['DEEPSEEK_API_KEY'];
       return (baseEnv.CLAUDE_CODE_OAUTH_TOKEN || baseEnv.ANTHROPIC_API_KEY) ? [] : ['CLAUDE_CODE_OAUTH_TOKEN or ANTHROPIC_API_KEY'];
     },
     buildRunCommand: (_prompt, model, effort, disallowedTools) => {

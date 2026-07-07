@@ -1,4 +1,4 @@
-export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai';
+export type ProviderName = 'anthropic' | 'openai' | 'gemini' | 'zai' | 'deepseek';
 export type AuthMode = 'oauth' | 'api_key' | 'service_account';
 
 // One entry of the backend-published task-capability contract (the
@@ -127,7 +127,7 @@ export interface ProviderCatalogEntry {
 // generic record until the schema-driven renderer consumes it.
 export type ProviderSettingsBag = Record<string, unknown>;
 
-// { "anthropic": {...}, "openai": {...}, "gemini": {...} }
+// { "anthropic": {...}, "openai": {...}, "gemini": {...}, "zai": {...}, ... }
 export type ProviderSettingsDefaults = Partial<Record<ProviderName, ProviderSettingsBag>>;
 
 // { "review": { "anthropic": { effort: "high" } }, ... }

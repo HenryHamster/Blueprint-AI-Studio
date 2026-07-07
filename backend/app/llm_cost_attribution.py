@@ -28,6 +28,7 @@ from app.models import (
 #   OpenAI    — https://openai.com/api/pricing
 #   Gemini    — https://ai.google.dev/gemini-api/docs/pricing
 #   Z.AI      — https://docs.z.ai/guides/overview/pricing
+#   DeepSeek  — https://api-docs.deepseek.com/quick_start/pricing
 #
 # Gemini tasks estimate token counts from prompt/result char lengths (4 chars ≈ 1 token)
 # since the Gemini CLI outputMode='text' path has no structured usage block. The estimates
@@ -67,6 +68,9 @@ LLM_TOKEN_PRICING: dict[tuple[str, str], tuple[float, float]] = {
     ("gemini", "gemini-3.1-flash-lite-preview"): (0.10e-6, 0.40e-6),
     # Z.AI GLM-5.2 API (docs.z.ai/guides/overview/pricing, 2026-06).
     ("zai", "glm-5.2"): (1.40e-6, 4.40e-6),
+    # DeepSeek V4 API cache-miss list rates (api-docs.deepseek.com, 2026-07).
+    ("deepseek", "deepseek-v4-flash"): (0.14e-6, 0.28e-6),
+    ("deepseek", "deepseek-v4-pro"): (0.435e-6, 0.87e-6),
 }
 
 # Provider/model combos priced at a proxy rate (closest GA equivalent or published
@@ -102,19 +106,26 @@ def _price_llm_attempt(
     cache_read_input_tokens: int,
     input_rate: float,
     output_rate: float,
+    *,
+    provider: str | None = None,
 ) -> float:
-    """Price one attempt's tokens, charging each Anthropic input class truthfully.
+    """Price one attempt's tokens, charging Anthropic cache classes truthfully.
 
     ``input_tokens`` is the INCLUSIVE input total (uncached + cache-creation +
-    cache-read). The uncached remainder is priced at ``input_rate``, cache-creation
-    at :data:`CACHE_CREATION_INPUT_RATE_MULTIPLIER` x that rate, and cache-read at
-    :data:`CACHE_READ_INPUT_RATE_MULTIPLIER` x. When the attempt carries no cache
-    breakdown the sub-counts are ``0``, so this reduces to
+    cache-read). Anthropic's cache-creation/read multipliers apply only to
+    Anthropic rows; other providers keep the inclusive input priced at the base
+    rate until provider-specific cache pricing is modeled. When the attempt
+    carries no cache breakdown the sub-counts are ``0``, so this reduces to
     ``input_tokens * input_rate + output_tokens * output_rate`` — byte-for-byte
     the legacy valuation, which is the required fallback for pre-tracking rows.
     """
-    cc = max(0, int(cache_creation_input_tokens))
-    cr = max(0, int(cache_read_input_tokens))
+    provider_key = (provider or "").lower()
+    if provider_key == "anthropic":
+        cc = max(0, int(cache_creation_input_tokens))
+        cr = max(0, int(cache_read_input_tokens))
+    else:
+        cc = 0
+        cr = 0
     uncached = max(0, int(input_tokens) - cc - cr)
     return (
         uncached * input_rate
@@ -149,6 +160,7 @@ def _compute_llm_cost_per_merged_pr(tasks: list[Task]) -> float | None:
                         cache_read,
                         input_rate,
                         output_rate,
+                        provider=provider,
                     )
         if is_merged_completion(t):
             merged += 1
@@ -373,6 +385,7 @@ def compute_llm_cost_breakdown(tasks: list[Task]) -> Dict[str, Any]:
                     cache_read,
                     input_rate,
                     output_rate,
+                    provider=provider,
                 )
                 priced_combos.add(key)
                 task_had_priced = True
@@ -621,6 +634,7 @@ def _task_llm_cost(task: Task) -> tuple[float, bool]:
                 cache_read,
                 input_rate,
                 output_rate,
+                provider=key[0],
             )
         else:
             any_unpriced = True
@@ -883,6 +897,7 @@ def compute_llm_cost_by_task_type(tasks: list[Task]) -> list[Dict[str, Any]]:
                     cache_read,
                     input_rate,
                     output_rate,
+                    provider=provider,
                 )
             else:
                 cost = 0.0
