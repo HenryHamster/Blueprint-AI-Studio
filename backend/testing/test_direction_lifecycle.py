@@ -4830,3 +4830,52 @@ async def test_paused_churn_recommended_direction_surfaces_to_operator(db_sessio
     stat = next(s for s in stats if s["id"] == "d-churn-attn")
     assert stat["churn_retirement_recommended"] is True
     assert "zombie loop" in stat["churn_retirement_recommended_reason"]
+
+
+def test_retired_diagnoses_archive_dedups_by_direction_id():
+    """retired_diagnoses_archive deduplicates by direction_id: appending the same
+    direction twice keeps only the latest entry."""
+    from app.research_direction_state import _append_archived_diagnosis
+
+    doc = {"retired_diagnoses_archive": []}
+    direction = {
+        "id": "d-dedup-test",
+        "research_context": "## Eviction Summary\nFirst diagnosis for d-dedup-test.",
+    }
+
+    # First append: add the direction to the archive
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+    assert len(doc["retired_diagnoses_archive"]) == 1
+    first_entry = doc["retired_diagnoses_archive"][0]
+    assert first_entry["direction_id"] == "d-dedup-test"
+    assert "First diagnosis" in first_entry["diagnosis"]
+
+    # Second append with same direction_id: should deduplicate, not append
+    direction["research_context"] = "## Eviction Summary\nUpdated diagnosis for d-dedup-test."
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+
+    # Archive should still have only 1 entry (deduplicated), with updated content
+    assert len(doc["retired_diagnoses_archive"]) == 1
+    updated_entry = doc["retired_diagnoses_archive"][0]
+    assert updated_entry["direction_id"] == "d-dedup-test"
+    assert "Updated diagnosis" in updated_entry["diagnosis"]
+
+    # Append a different direction: should add a new entry
+    direction2 = {
+        "id": "d-dedup-test-2",
+        "research_context": "## Eviction Summary\nDiagnosis for a different direction.",
+    }
+    _append_archived_diagnosis(doc, direction2, "d-dedup-test-2")
+    assert len(doc["retired_diagnoses_archive"]) == 2
+    assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test"
+    assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test-2"
+
+    # Append to first direction again: should still keep only 1 entry for d-dedup-test,
+    # now at the end (moved by dedup+append)
+    direction["research_context"] = "## Eviction Summary\nThird update for d-dedup-test."
+    _append_archived_diagnosis(doc, direction, "d-dedup-test")
+    assert len(doc["retired_diagnoses_archive"]) == 2
+    # After dedup+append, d-dedup-test is now at the end
+    assert doc["retired_diagnoses_archive"][0]["direction_id"] == "d-dedup-test-2"
+    assert doc["retired_diagnoses_archive"][1]["direction_id"] == "d-dedup-test"
+    assert "Third update" in doc["retired_diagnoses_archive"][1]["diagnosis"]

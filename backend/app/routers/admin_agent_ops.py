@@ -1535,15 +1535,17 @@ async def strategic_operation(
                     d["context"] = ctx
                 if rationale:
                     notes = d.get("notes", [])
-                    notes.append(
-                        {
-                            "text": f"Strategic update: {rationale}",
-                            "added_at": _utcnow().isoformat(),
-                        }
-                    )
-                    d["notes"] = _cap_list(
-                        notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
-                    )
+                    note_text = f"Strategic update: {rationale}"
+                    if not any(n.get("text") == note_text for n in notes):
+                        notes.append(
+                            {
+                                "text": note_text,
+                                "added_at": _utcnow().isoformat(),
+                            }
+                        )
+                        d["notes"] = _cap_list(
+                            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+                        )
                 if isinstance(raw_dedup_reasoning, dict):
                     dr: dict = {}
                     closest = raw_dedup_reasoning.get("closest_directions")
@@ -1836,15 +1838,17 @@ async def strategic_operation(
             )
         matched_direction["status"] = "expired"
         notes = matched_direction.get("notes", [])
-        notes.append(
-            {
-                "text": f"Retired by strategic review: {rationale}",
-                "added_at": now_iso,
-            }
-        )
-        matched_direction["notes"] = _cap_list(
-            notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
-        )
+        note_text = f"Retired by strategic review: {rationale}"
+        if not any(n.get("text") == note_text for n in notes):
+            notes.append(
+                {
+                    "text": note_text,
+                    "added_at": now_iso,
+                }
+            )
+            matched_direction["notes"] = _cap_list(
+                notes, STRATEGIC_NOTES_HISTORY_MAX, "notes", warnings
+            )
         _captured_retired_dir = dict(matched_direction)
         _captured_retire_id = str(dir_id)
         def _apply_retire(fresh: list) -> list:

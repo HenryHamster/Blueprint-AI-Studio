@@ -1245,7 +1245,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove deferred_unsynced version %s "
                 "(now synced — qualification spawned)",
@@ -1273,7 +1272,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove error version %s "
                 "(transient error cleared — qualification spawned)",
@@ -1306,7 +1304,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove infra_failure version %s "
                 "(transient infra cleared — qualification spawned)",
@@ -1425,7 +1422,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove not_promoted version %s "
                 "(blockers resolved and HEAD advanced — qualification spawned)",
@@ -1485,7 +1481,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove promotion_failed version %s "
                 "(re-qualification spawned after automain advanced)",
@@ -1549,7 +1544,6 @@ async def sweep_stuck_qualifications(
             )
             continue
         if redriven:
-            finalized += 1
             logger.info(
                 "[RELEASE_QUALIFIER] sweep re-drove dry_run version %s "
                 "(promotion enabled — re-qualification spawned)",

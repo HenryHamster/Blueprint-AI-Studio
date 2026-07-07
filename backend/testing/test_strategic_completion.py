@@ -19027,6 +19027,100 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
     )
 
 
+@pytest.mark.asyncio
+async def test_retire_direction_note_not_duplicated_on_reprocess(db_session, mocker):
+    """Fallback retire_direction must not append the same note twice on a retry.
+
+    Simulates the post-commit-pending re-entry: _handle_strategic_completion is
+    called twice with the same retire_direction op (same rationale, same direction
+    id).  The retirement note must appear exactly once in the direction's notes list.
+    """
+    import json
+    from unittest.mock import AsyncMock
+    from app.strategic_completion import _handle_strategic_completion
+
+    mocker.patch("app.alert_dispatch._create_strategic_alert", new_callable=AsyncMock)
+    mocker.patch(
+        "app.strategic_completion._maybe_retry_workday_auto_start",
+        new_callable=AsyncMock,
+    )
+
+    project = Project(
+        name="NoteDedup",
+        user_id="u-note-dedup",
+        vision={"purpose": "test", "revision": 0},
+        directions=[
+            {
+                "id": "d-dedup",
+                "text": "Direction to retire",
+                "status": "active",
+                "priority": "medium",
+                "paths": [],
+                "added_at": "2026-01-01T00:00:00",
+                "research_history": [],
+                "notes": [],
+            }
+        ],
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    rationale = "Completed all objectives"
+    logs = json.dumps(
+        {
+            "vision": {"purpose": "test", "revision": 1, "success_criteria": []},
+            "direction_operations": [
+                {
+                    "op": "retire_direction",
+                    "direction_id": "d-dedup",
+                    "rationale": rationale,
+                }
+            ],
+        }
+    )
+
+    def _make_task():
+        return Task(
+            project_id=project.id,
+            payloads=[
+                {"type": "strategic_review", "prompt": "review", "vision": {"revision": 0}}
+            ],
+            context={},
+        )
+
+    # First call — simulates the original run
+    task1 = _make_task()
+    db_session.add(task1)
+    await db_session.commit()
+    await db_session.refresh(task1)
+    await _handle_strategic_completion(task1, logs, db_session)
+
+    # Second call — simulates the post-commit-pending retry with a new task
+    # but identical op payload (same direction id, same rationale)
+    task2 = _make_task()
+    db_session.add(task2)
+    await db_session.commit()
+    await db_session.refresh(task2)
+    await _handle_strategic_completion(task2, logs, db_session)
+
+    await db_session.refresh(project)
+    retired = next(
+        (d for d in (project.directions or []) if d.get("id") == "d-dedup"), None
+    )
+    assert retired is not None, "d-dedup must still be present in directions"
+    assert retired["status"] == "retired", (
+        f"d-dedup must be retired; got status={retired.get('status')}"
+    )
+    retire_notes = [
+        n for n in (retired.get("notes") or [])
+        if n.get("text") == f"Retired by strategic review: {rationale}"
+    ]
+    assert len(retire_notes) == 1, (
+        f"Retirement note must appear exactly once (dedup); found {len(retire_notes)}: {retire_notes}"
+    )
+
+
 def test_self_reflection_log_dedups_replayed_cycle():
     """Replaying the same cycle (post-commit-pending recovery) must not duplicate
     self_reflection_log entries. Dedup is by cycle_task_id to prevent bloated token

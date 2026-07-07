@@ -5512,20 +5512,22 @@ async def _handle_strategic_completion(
                             )
 
                             _reset_outcome_detection_state(d)
-                        # Record rationale as a note
+                        # Record rationale as a note (dedup: skip if same text already present)
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append(
-                                {
-                                    "text": f"Strategic update: {rationale}",
-                                    "added_at": _utcnow().isoformat(),
-                                }
-                            )
-                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(
-                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                            note_text = f"Strategic update: {rationale}"
+                            if not any(n.get("text") == note_text for n in notes):
+                                notes.append(
+                                    {
+                                        "text": note_text,
+                                        "added_at": _utcnow().isoformat(),
+                                    }
                                 )
-                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                                if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                    logger.warning(
+                                        f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                    )
+                                d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         if _gap_changed_fb or d.get("status") != _pre_status_fb:
                             _pending_gap_reconciles.append(
                                 (
@@ -5573,17 +5575,19 @@ async def _handle_strategic_completion(
                         )
                         if rationale:
                             notes = d.get("notes", [])
-                            notes.append(
-                                {
-                                    "text": f"Retired by strategic review: {rationale}",
-                                    "added_at": _utcnow().isoformat(),
-                                }
-                            )
-                            if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
-                                logger.warning(
-                                    f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                            note_text = f"Retired by strategic review: {rationale}"
+                            if not any(n.get("text") == note_text for n in notes):
+                                notes.append(
+                                    {
+                                        "text": note_text,
+                                        "added_at": _utcnow().isoformat(),
+                                    }
                                 )
-                            d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
+                                if len(notes) > STRATEGIC_NOTES_HISTORY_MAX:
+                                    logger.warning(
+                                        f"[STRATEGIC] Task {task.id}: dropping {len(notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {dir_id}"
+                                    )
+                                d["notes"] = notes[-STRATEGIC_NOTES_HISTORY_MAX:]
                         _delta_mutated[str(dir_id)] = d
                         ops_applied += 1
                         retires_applied += 1

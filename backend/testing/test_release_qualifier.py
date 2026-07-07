@@ -5042,10 +5042,11 @@ class TestChallengedVsUnchallengedTelemetry:
 
         # 3 challenged verdicts with binding synthesis shape (as produced by
         # _compute_challenge_synthesis_from_binding_verdicts after a real merge-test).
-        # Verdict A: 1 refuted, 0 excluded
-        # Verdict B: 2 refuted, 1 excluded
-        # Verdict C: 0 refuted, 0 excluded
-        # Total refuted = 3, n = 3 → challenge_refuted_rate = 1.0
+        # Verdict A: confirmed=1, refuted=1, uncertain=0, excluded=0
+        # Verdict B: confirmed=1, refuted=2, uncertain=0, excluded=1
+        # Verdict C: confirmed=1, refuted=0, uncertain=0, excluded=0
+        # Total refuted = 3, total reviewed = (1+1+0)+(1+2+0)+(1+0+0) = 6
+        # → challenge_refuted_rate = 3/6 = 0.5
         # exclusion_count = 1 (only B has excluded_findings_count > 0) → exclusion_rate = 1/3
         def _make_binding_verdict(
             refuted_count, excluded_findings_count, sha="abc1234"
@@ -5087,8 +5088,13 @@ class TestChallengedVsUnchallengedTelemetry:
         assert ch["sample_size"] == 3
 
         # challenge_refuted_count/rate: sum of refuted_count across challenged verdicts
+        # divided by total findings reviewed (confirmed + refuted + uncertain)
+        # Verdict A: 1+1+0=2 total reviewed
+        # Verdict B: 1+2+0=3 total reviewed
+        # Verdict C: 1+0+0=1 total reviewed
+        # Rate = (1+2+0) / (2+3+1) = 3/6 = 0.5
         assert ch["challenge_refuted_count"] == 3
-        assert ch["challenge_refuted_rate"] == pytest.approx(3 / 3, abs=1e-4)
+        assert ch["challenge_refuted_rate"] == pytest.approx(3 / 6, abs=1e-4)
 
         # exclusion_rate is driven by excluded_findings_count, not refuted_count
         assert ch["exclusion_count"] == 1
@@ -17780,7 +17786,7 @@ async def test_sweep_redrives_deferred_unsynced_when_now_synced(db_session, mock
     )
     await db_session.commit()
 
-    assert count == 1
+    assert count == 0
     await db_session.refresh(version)
     # Deferral cleared → qualification actually started.
     assert version.last_qualification["status"] == "pending"
@@ -17929,7 +17935,7 @@ async def test_sweep_redrives_transient_sha_error_version(db_session, mocker):
     )
     await db_session.commit()
 
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -18083,7 +18089,7 @@ async def test_sweep_error_redrive_allows_versions_with_many_lifetime_attempts(
     await db_session.commit()
 
     # The version MUST have been re-driven despite high lifetime attempts.
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -18170,7 +18176,7 @@ async def test_sweep_redrives_infra_failure_version(db_session, mocker):
     )
     await db_session.commit()
 
-    assert count >= 1
+    assert count == 0
     await db_session.refresh(version)
     assert version.last_qualification["status"] == "pending"
 
@@ -32500,8 +32506,8 @@ async def test_sweep_promotes_dry_run_candidate_when_promotion_enabled(
         session_factory=_shared_session_factory(db_session),
     )
 
-    # At least the dry_run re-drive must have contributed to the finalized count.
-    assert count >= 1
+    # Re-drives do not contribute to the finalized count.
+    assert count == 0
 
 
 # ---------------------------------------------------------------------------
@@ -32779,6 +32785,102 @@ async def test_sweep_initial_qualification_wired(db_session, mocker):
 
     assert count >= 1
     run_qual_mock.assert_called()
+
+
+# Named acceptance test: test_sweep_finalized_count_excludes_redrives
+@pytest.mark.asyncio
+async def test_sweep_finalized_count_excludes_redrives(db_session, mocker):
+    """Named acceptance test: the finalized count from sweep_stuck_qualifications
+    excludes versions that are redriven (spawn new qualifications) and only counts
+    versions that are genuinely finalized from a stuck pending state.
+
+    Regression: finalized counter was incorrectly incremented for redrives,
+    inflating the '[REAPER] Finalized N stuck release qualification(s)' metric.
+    """
+    from datetime import datetime, timedelta
+    from app import shared_state
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    # Create project and version 1.
+    project, version1 = await _make_project_and_version(db_session, phase="stabilize")
+
+    # Version 1: stuck pending with both children completed — will be genuinely finalized.
+    audit_task1, smoke_task1 = await _seed_pending_qualification(
+        db_session,
+        project,
+        version1,
+        audit_status=TaskStatus.COMPLETED,
+        smoke_status=TaskStatus.COMPLETED,
+    )
+    db_session.add(
+        Artifact(
+            task_id=audit_task1.id,
+            artifact_type=ArtifactType.RELEASE_AUDIT_REPORT,
+            logs=json.dumps(
+                {
+                    "audit_score": 1.0,
+                    "test_erosion": {
+                        "deleted_test_files": [],
+                        "assertion_delta": 0,
+                        "test_count_delta": 0,
+                    },
+                }
+            ),
+        )
+    )
+    db_session.add(
+        Artifact(
+            task_id=smoke_task1.id,
+            artifact_type=ArtifactType.SMOKETEST_RESULT,
+            logs=json.dumps(
+                {
+                    "passed": True,
+                    "tests": [{"name": "a", "status": "pass"}],
+                    "suites": {"startup": {"passed": True}},
+                }
+            ),
+        )
+    )
+
+    # Version 2: in deferred_unsynced state — will be redriven.
+    version2 = await rv.open_version(db_session, project.id, version_number=2)
+    rv.set_version_phase(version2, "stabilize", reasoning="test setup")
+    version2.last_qualification = {
+        "status": "deferred_unsynced",
+        "candidate_sha": "redrive0" * 5 + "00000",
+        "first_deferred_at": (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=3)).isoformat(),
+    }
+    db_session.add(version2)
+    await db_session.commit()
+
+    # Mock GitHub: main is NOW absorbed into the candidate (back-merge landed).
+    mocker.patch("app.github.get_branch_sha", new=_branch_sha_mock())
+    mocker.patch(
+        "app.release_qualifier._is_target_absorbed", new=AsyncMock(return_value=True)
+    )
+
+    # Run the sweep: version1 will be genuinely finalized, version2 will be redriven.
+    count = await rq.sweep_stuck_qualifications(
+        db_session, session_factory=_shared_session_factory(db_session)
+    )
+    await db_session.commit()
+
+    # The count should be 1 — only the genuine finalization, not the redrive.
+    assert count == 1, (
+        f"Expected finalized count of 1 (only genuine finalization), "
+        f"but got {count}. This indicates redrives are incorrectly counted "
+        f"in the finalized counter."
+    )
+
+    # Verify the first version is now finalized.
+    await db_session.refresh(version1)
+    assert version1.last_qualification["status"] == "dry_run"
+
+    # Verify the second version was redriven (deferral cleared, qualification spawned).
+    await db_session.refresh(version2)
+    assert version2.last_qualification["status"] == "pending"
+    assert len(await _audit_tasks(db_session, project.id)) == 2
 
 
 # Named acceptance test: test_fire_initial_qualification_if_coverage_complete

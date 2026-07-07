@@ -15942,8 +15942,10 @@ class TestVersionLifecycleChallengedVsUnchallenged:
         assert ch["insufficient_sample"] is False
         assert ch["sample_size"] == 3
         # 3 verdicts × 2 refuted_count each = 6 total refuted
+        # Each verdict: confirmed=1, refuted=2, uncertain=0 → 3 total reviewed per verdict
+        # Total reviewed = 3 × 3 = 9, Rate = 6/9 ≈ 0.667
         assert ch["challenge_refuted_count"] == 6
-        assert abs(ch["challenge_refuted_rate"] - round(6 / 3, 4)) < 1e-4
+        assert abs(ch["challenge_refuted_rate"] - round(6 / 9, 4)) < 1e-4
         # Unchallenged cohort absent — insufficient_sample, no challenge_refuted keys
         assert tel["unchallenged"]["insufficient_sample"] is True
         assert "challenge_refuted_count" not in tel["unchallenged"]

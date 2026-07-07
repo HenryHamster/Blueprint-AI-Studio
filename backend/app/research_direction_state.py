@@ -134,8 +134,10 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
     """Archive a direction's diagnosis when it is completed/retired.
 
     Extracts the diagnosis summary from the direction's research_context and appends
-    it to doc['retired_diagnoses_archive']. Maintains FIFO list capped at
-    _ARCHIVED_DIAGNOSES_CAP entries, each truncated to _DIAGNOSIS_MAX_CHARS.
+    it to doc['retired_diagnoses_archive']. Deduplicates by direction_id: if an entry
+    with the same direction_id already exists, replaces it instead of appending.
+    Maintains FIFO list capped at _ARCHIVED_DIAGNOSES_CAP entries, each truncated
+    to _DIAGNOSIS_MAX_CHARS.
 
     Operates on the doc dict in place so it can be called inside
     with_design_doc_locked (which passes the freshly-locked dict).
@@ -146,6 +148,10 @@ def _append_archived_diagnosis(doc: dict, direction: dict, direction_id: str) ->
         return
     diagnosis = diagnosis.strip()[:_DIAGNOSIS_MAX_CHARS]
     archive = list(doc.get("retired_diagnoses_archive") or [])
+
+    # Deduplicate by direction_id: remove existing entry if present
+    archive = [e for e in archive if e.get("direction_id") != direction_id]
+
     archive.append(
         {
             "direction_id": direction_id,

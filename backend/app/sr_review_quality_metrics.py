@@ -646,13 +646,16 @@ def compute_review_quality_metrics(terminal_tasks: List[Task]) -> Dict[str, Any]
         dismissals = sum(
             1 for t in review_tasks if (t.context or {}).get("review_dismissed")
         )
-        misses = sum(
-            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
-        )
         approvals = sum(
             1
             for t in review_tasks
             if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
+        misses = sum(
+            1
+            for t in review_tasks
+            if (t.context or {}).get("user_caught_issues")
+            and (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
         )
         review_accuracy = {
             "total_reviews": total,

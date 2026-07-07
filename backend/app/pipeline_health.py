@@ -935,13 +935,16 @@ async def compute_pipeline_health_summary(
         dismissals = sum(
             1 for t in review_tasks if (t.context or {}).get("review_dismissed")
         )
-        misses = sum(
-            1 for t in review_tasks if (t.context or {}).get("user_caught_issues")
-        )
         total_approvals = sum(
             1
             for t in review_tasks
             if (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
+        )
+        misses = sum(
+            1
+            for t in review_tasks
+            if (t.context or {}).get("user_caught_issues")
+            and (t.context or {}).get("blueprint_review_verdict") == "APPROVE"
         )
         precision = round(1 - (overrides + dismissals) / total_reviews, 2)
         recall = round(1 - misses / total_approvals, 2) if total_approvals > 0 else None
