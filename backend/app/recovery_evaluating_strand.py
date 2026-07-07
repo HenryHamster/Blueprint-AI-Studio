@@ -28,6 +28,7 @@ take effect.
 import contextlib
 import logging
 from datetime import datetime
+from app.time_utils import _utcnow
 
 from app import services
 from app.landed_signal import mark_landed_on_integration
@@ -233,7 +234,7 @@ async def _handle_rollup_lost_marker(task, ctx, session):
     _lm_last_checked_at = ctx.get("_lost_marker_checked_at")
     _lm_recheck_due = not _lm_last_checked_at or (
         (
-            datetime.utcnow() - datetime.fromisoformat(_lm_last_checked_at)
+            _utcnow() - datetime.fromisoformat(_lm_last_checked_at)
         ).total_seconds()
         > _LM_RECHECK_INTERVAL_S
     )
@@ -304,7 +305,7 @@ async def _handle_rollup_lost_marker(task, ctx, session):
 
             task.context = {
                 **ctx,
-                "_lost_marker_checked_at": datetime.utcnow().isoformat(),
+                "_lost_marker_checked_at": _utcnow().isoformat(),
             }
             flag_modified(task, "context")
             session.add(task)
