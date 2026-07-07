@@ -16108,3 +16108,91 @@ async def test_apply_post_spawn_state_outcome_progress_and_findings_idempotent_o
     assert oph_second == oph_first, (
         "outcome_progress_history entries differ on retry"
     )
+
+
+async def test_note_apply_is_idempotent_on_replay(db_session):
+    """Direction notes must not duplicate when apply_post_spawn_state is replayed.
+
+    When apply_post_spawn_state is called twice with the same direction_notes (post-commit
+    retry scenario), the _apply_notes callback must not append duplicate notes with the same
+    text and added_by_task. The dedup check must examine existing notes before appending.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-note-replay"
+    direction = {
+        **_active_direction(direction_id, "Test direction for note replay"),
+        "research_history": [],
+        "notes": [],
+    }
+    project = _Project(
+        name="Note Apply Idempotency Test",
+        user_id="test-user-note-idem-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Prepare direction notes to be appended
+    note_text = "Test direction annotation from research completion"
+    direction_notes = [
+        {
+            "direction_id": direction_id,
+            "description": note_text,
+        }
+    ]
+
+    _call_args = (
+        db_session,
+        task,
+        [],                 # findings
+        [],                 # child_tasks
+        [],                 # deduplicated
+        [],                 # insights
+        direction_notes,    # direction_notes with the test note
+        [],                 # direction_proposals
+        0,                  # hash_dedup_count
+        0,                  # word_overlap_count
+        0,                  # file_overlap_count
+        0,                  # evidence_overlap_count
+        0,                  # type_filtered_count
+        0,                  # empty_prompt_count
+        "research-branch",
+        "main",
+        0,                  # research_depth
+        None,               # parent_research_task_id
+    )
+
+    # First call: adds a note to the direction
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    notes_first = project.directions[0].get("notes", [])
+    matching_notes_first = [n for n in notes_first if n.get("text") == note_text]
+    assert len(matching_notes_first) == 1, (
+        f"Expected 1 matching note after first call, got {len(matching_notes_first)}. "
+        f"All notes: {notes_first}"
+    )
+    assert matching_notes_first[0]["added_by_task"] == str(task.id)
+
+    # Second call: simulate post-commit retry — same task, same direction_notes
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    notes_second = project.directions[0].get("notes", [])
+    matching_notes_second = [n for n in notes_second if n.get("text") == note_text]
+    assert len(matching_notes_second) == 1, (
+        f"Expected 1 matching note after retry (idempotent), got {len(matching_notes_second)}. "
+        f"apply_post_spawn_state duplicated the direction note on post-commit retry. "
+        f"All notes: {notes_second}"
+    )
+    assert matching_notes_second[0]["added_by_task"] == str(task.id)

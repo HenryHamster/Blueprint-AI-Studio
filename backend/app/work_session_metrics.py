@@ -200,8 +200,8 @@ WORK_SESSION_METRIC_SPECS: tuple[WorkSessionMetricSpec, ...] = (
         {"surface": "runtime", "section": "devices"},
         "runner_liveness_window",
         denominator_kind="path",
-        denominator_path="runtime.local_runner.strategic_runner_count",
-        denominator_label="Strategic-capable local runners",
+        denominator_path="runtime.local_runner.readiness_capable_runner_count",
+        denominator_label="readiness-capable local runners",
     ),
     WorkSessionMetricSpec(
         "runtime.local_runner_holds",

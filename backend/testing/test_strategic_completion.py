@@ -1491,6 +1491,7 @@ class TestRecordRetiredDirectionMemory:
         assert len(vision["_recently_retired_directions"]) == 2
 
 
+
 class TestCheckGapRespawnBlock:
     def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):
         retired_at = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()

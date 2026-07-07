@@ -1162,7 +1162,14 @@ async def apply_post_spawn_state(
                         for _d in dirs:
                             if _d.get("id") == _target_id:
                                 _notes = list(_d.get("notes") or [])
-                                _notes.append(_note_entry)
+                                # Dedup: only append if no existing note has the same text and added_by_task
+                                _note_text = _note_entry.get("text", "")
+                                _note_task = _note_entry.get("added_by_task")
+                                if not any(
+                                    n.get("text") == _note_text and n.get("added_by_task") == _note_task
+                                    for n in _notes
+                                ):
+                                    _notes.append(_note_entry)
                                 if len(_notes) > STRATEGIC_NOTES_HISTORY_MAX:
                                     logger.warning(
                                         f"[RESEARCH] Task {task.id}: dropping {len(_notes) - STRATEGIC_NOTES_HISTORY_MAX} oldest notes on direction {_target_id}"

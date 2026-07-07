@@ -65,8 +65,8 @@ def test_work_session_metric_definition_keeps_dynamic_context():
     local_ready = build_work_session_metric("runtime.local_strategic_ready", 1)
     assert local_ready["definition"]["denominator"] == {
         "kind": "path",
-        "path": "runtime.local_runner.strategic_runner_count",
-        "label": "Strategic-capable local runners",
+        "path": "runtime.local_runner.readiness_capable_runner_count",
+        "label": "readiness-capable local runners",
     }
 
     stale_context = build_work_session_metric(
