@@ -7329,7 +7329,13 @@ async def _spawn_strategic_review(
             ),
             "user_last_active_at": user_last_active_at,
             "self_reflection_log": (project.self_reflection_log or [])[-5:],
-            "is_self_repo": bool(project.is_self_repo),
+            # De-gated from the raw project.is_self_repo column to the deploy-repo
+            # predicate: the strategist's self-improvement framing (modify your own
+            # prompts/schemas/orchestration) keys off this field, so it must follow
+            # deploy identity like every other migrated backend gate. Falls back to
+            # is_self_repo verbatim on deployments with no stamped identity, so this
+            # cannot regress unstamped deployments or tests.
+            "is_self_repo": project_is_deploy_repo(project),
             # Machine-checkable g-generality retirement signal: set when a
             # create/fix/refactor task has merged on this external project for
             # the first time.  Absent (no key) for self-repo and projects with

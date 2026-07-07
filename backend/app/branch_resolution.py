@@ -1121,6 +1121,19 @@ def _is_blueprint_self_repo(project) -> bool:
     """
     if getattr(project, "is_self_repo", False):
         return True
+    return _project_repo_is_blueprint(project)
+
+
+def _project_repo_is_blueprint(project) -> bool:
+    """True when *project*'s GitHub repo is a known Blueprint alias.
+
+    Classifies purely by repo identity — it deliberately does NOT read the raw
+    ``is_self_repo`` flag.  The canonical ``"blueprint"`` task-branch namespace
+    is owned by the actual Blueprint repo (the aliases below), not by any
+    project that merely happens to carry ``is_self_repo=True``; a non-Blueprint
+    self-hosted repo must keep its own slug-derived namespace rather than being
+    misrouted under ``blueprint/...``.
+    """
     github_repo = getattr(project, "github_repo", "") or ""
     return github_repo.lower() in _BLUEPRINT_REPO_ALIASES
 
@@ -1136,8 +1149,8 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         slugified ``github_repo`` for everything else.  Mirrors
         ``_derive_task_branch_namespace`` in ``admin_onboard.py``.
       * **Corrective overwrite (incident 2026-05-26..28):** if the project is
-        the Blueprint self-repo (by flag or by historical alias —
-        ``BlueprintAIStudio``) but the persisted namespace differs from
+        the Blueprint self-repo (by historical alias — ``BlueprintAIStudio``)
+        but the persisted namespace differs from
         ``"blueprint"``, force-overwrite it.  The agent always pushes to
         ``blueprint/...``; an out-of-sync orchestrator-side namespace makes
         every merge-conflict fix-spawn try to clone a nonexistent branch.
@@ -1179,7 +1192,7 @@ async def backfill_task_branch_namespace(session, project_id=None) -> dict:
         build_config = project.build_config or {}
         current_ns = build_config.get("task_branch_namespace") or ""
         github_repo = getattr(project, "github_repo", "") or ""
-        is_blueprint = _is_blueprint_self_repo(project)
+        is_blueprint = _project_repo_is_blueprint(project)
 
         if is_blueprint:
             expected_ns = "blueprint"

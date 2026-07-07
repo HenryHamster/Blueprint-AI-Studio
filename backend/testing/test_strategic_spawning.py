@@ -3110,6 +3110,74 @@ async def test_spawn_strategic_review_enable_self_improvement_decoupled_from_is_
     assert task_flag.payloads[0]["enable_self_improvement"] is True
 
 
+@pytest.mark.asyncio
+async def test_spawn_strategic_review_is_self_repo_follows_deploy_identity(
+    db_session, monkeypatch
+):
+    """The agent-facing ``is_self_repo`` payload field keys off the deploy-repo
+    predicate, not the raw ``project.is_self_repo`` column.
+
+    This is the self-improvement-framing consumer: the strategic agent gates the
+    "modify your own prompts/schemas/orchestration" block on this field, so it
+    must classify by deploy identity like every other migrated backend gate.
+    When a deploy identity is stamped, the field follows repo identity even when
+    the raw column disagrees.
+    """
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+
+    # Repo matches the deploy identity but the raw column is False → payload True
+    # (deploy identity is authoritative, overriding the mis-set column).
+    project_match = _make_project(
+        github_owner="acme",
+        github_repo="widget",
+        is_self_repo=False,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_match)
+    await db_session.commit()
+    await db_session.refresh(project_match)
+    await _seed_legacy_cycles(db_session, project_match)
+
+    spawned = await _spawn_strategic_review(project_match, db_session)
+    assert spawned is True
+    task_match = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_match.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert task_match.payloads[0]["is_self_repo"] is True
+
+    # Repo does NOT match the deploy identity but the raw column is True → payload
+    # False (a stale is_self_repo flag no longer grants self-improvement framing).
+    project_mismatch = _make_project(
+        github_owner="other",
+        github_repo="proj",
+        is_self_repo=True,
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project_mismatch)
+    await db_session.commit()
+    await db_session.refresh(project_mismatch)
+    await _seed_legacy_cycles(db_session, project_mismatch)
+
+    spawned2 = await _spawn_strategic_review(project_mismatch, db_session)
+    assert spawned2 is True
+    task_mismatch = (
+        (
+            await db_session.execute(
+                select(Task).where(Task.project_id == project_mismatch.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert task_mismatch.payloads[0]["is_self_repo"] is False
+
+
 # ── Additional _spawn_design_doc_update tests ─────────────────────────────────
 
 

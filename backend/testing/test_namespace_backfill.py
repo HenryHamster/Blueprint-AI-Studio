@@ -68,15 +68,17 @@ class TestBackfillTaskBranchNamespace:
         assert project.build_config["task_branch_namespace"] == "existing"
 
     @pytest.mark.asyncio
-    async def test_self_repo_always_gets_blueprint(self):
-        """Self-repo projects always get 'blueprint' regardless of github_repo."""
+    async def test_non_blueprint_self_repo_gets_slug(self):
+        """A project with is_self_repo=True but a non-Blueprint github_repo is
+        classified by repo identity, not by the flag, so it gets the slug-derived
+        namespace rather than 'blueprint'."""
         project = _project(github_repo="SomeOtherRepo", is_self_repo=True)
         session = _make_session([project])
 
         summary = await backfill_task_branch_namespace(session)
 
         assert summary["namespace_filled"] == 1
-        assert project.build_config["task_branch_namespace"] == "blueprint"
+        assert project.build_config["task_branch_namespace"] == "someotherrepo"
 
     @pytest.mark.asyncio
     async def test_blueprintaistudio_repo_alias_gets_blueprint_even_when_flag_false(self):
@@ -94,10 +96,10 @@ class TestBackfillTaskBranchNamespace:
         assert project.build_config["task_branch_namespace"] == "blueprint"
 
     @pytest.mark.asyncio
-    async def test_self_repo_with_stale_namespace_is_corrected(self):
-        """Self-repo project with a stale non-``"blueprint"`` namespace is
-        force-overwritten on backfill — without this corrective path the
-        idempotent skip silently preserved the bug indefinitely."""
+    async def test_non_blueprint_self_repo_with_existing_namespace_is_skipped(self):
+        """A project with is_self_repo=True but a non-Blueprint github_repo and
+        an existing non-'blueprint' namespace is left untouched — classification
+        is by repo identity, so the corrective overwrite path never fires."""
         project = _project(
             is_self_repo=True,
             build_config={"task_branch_namespace": "blueprintaistudio"},
@@ -106,10 +108,10 @@ class TestBackfillTaskBranchNamespace:
 
         summary = await backfill_task_branch_namespace(session)
 
-        assert summary["namespace_corrected"] == 1
-        assert summary["namespace_skipped"] == 0
+        assert summary["namespace_corrected"] == 0
+        assert summary["namespace_skipped"] == 1
         assert summary["namespace_filled"] == 0
-        assert project.build_config["task_branch_namespace"] == "blueprint"
+        assert project.build_config["task_branch_namespace"] == "blueprintaistudio"
 
     @pytest.mark.asyncio
     async def test_blueprintaistudio_alias_with_stale_namespace_is_corrected(self):
