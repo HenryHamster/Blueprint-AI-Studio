@@ -65,6 +65,13 @@ export interface ResidentTurnResult {
   sentOperatorMessage: boolean;
   /** the underlying process exited (or was closed) before/while this turn ran */
   processGone: boolean;
+  /** wall-clock ms from sendTurn() call to the first streamed text token; null when
+   *  no text arrived (tool-only or empty turn, or interrupted before first token). */
+  ttftMs: number | null;
+  /** total wall-clock ms from sendTurn() call to the turn resolving (settleTurn). */
+  turnMs: number;
+  /** number of tool_use calls that fired during this turn. */
+  toolCallCount: number;
 }
 
 export interface ResidentSessionEvent {
@@ -141,6 +148,12 @@ interface ActiveTurn {
   forceTimer: NodeJS.Timeout | null;
   hardTimer: NodeJS.Timeout | null;
   interruptTimer: NodeJS.Timeout | null;
+  /** monotonic ms timestamp captured at sendTurn() call (for latency accounting). */
+  startedAtMs: number;
+  /** ms timestamp of the first streamed text token; null until text arrives. */
+  firstTokenAtMs: number | null;
+  /** count of tool_use calls observed so far this turn. */
+  toolCallCount: number;
 }
 
 /**
@@ -242,6 +255,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     // assistant text was surfaced, still show the operator the final reply.
     if (!t.streamedText && finalText) emit({ kind: 'text', text: finalText });
     armIdleCeiling();
+    const nowMs = Date.now();
+    const turnMs = nowMs - t.startedAtMs;
+    const ttftMs = t.firstTokenAtMs !== null ? t.firstTokenAtMs - t.startedAtMs : null;
     t.resolve({
       resultText: finalText,
       interrupted: t.interrupted,
@@ -251,6 +267,9 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       sawToolUse: t.sawToolUse,
       sentOperatorMessage: t.sentOperatorMessage,
       processGone,
+      ttftMs,
+      turnMs,
+      toolCallCount: t.toolCallCount,
     });
     resolveIdleWaiters();
   };
@@ -335,11 +354,20 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
           // live (avoid showing the reply twice); otherwise surface it.
           if (t && t.sawDeltaThisMessage) { t.sawDeltaThisMessage = false; break; }
           emit({ kind: 'text', text: ev.text });
-          if (t) { t.streamedText = true; t.accumulated += ev.text; }
+          if (t) {
+            t.streamedText = true;
+            t.accumulated += ev.text;
+            if (t.firstTokenAtMs === null) t.firstTokenAtMs = Date.now();
+          }
         } else {
           // Incremental delta.
           emit({ kind: 'text', text: ev.text });
-          if (t) { t.streamedText = true; t.sawDeltaThisMessage = true; t.accumulated += ev.text; }
+          if (t) {
+            t.streamedText = true;
+            t.sawDeltaThisMessage = true;
+            t.accumulated += ev.text;
+            if (t.firstTokenAtMs === null) t.firstTokenAtMs = Date.now();
+          }
         }
         break;
       }
@@ -355,6 +383,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         const t = activeTurn;
         if (t) {
           t.sawToolUse = true;
+          t.toolCallCount += 1;
           if (isStrategicMutation(ev.command)) t.appliedStrategicOp = true;
           // A `./messages send` is only a CONFIRMED durable reply once its
           // tool_result comes back without an error — track the pending id and
@@ -499,7 +528,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
       return Promise.resolve({
         resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
         appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
-        processGone: true,
+        processGone: true, ttftMs: null, turnMs: 0, toolCallCount: 0,
       });
     }
     if (activeTurn) {
@@ -513,6 +542,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
     const stallTimeoutMs = typeof opts?.stallTimeoutMs === 'number' && Number.isFinite(opts.stallTimeoutMs)
       ? Math.max(turnTimeoutMs, opts.stallTimeoutMs)
       : turnTimeoutMs;
+    const startedAtMs = Date.now();
     return new Promise<ResidentTurnResult>((resolve) => {
       const turn: ActiveTurn = {
         resolve, resultText: '', accumulated: '', streamedText: false,
@@ -521,6 +551,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         interrupted: false, timedOut: false, hardTimedOut: false, sawDeltaThisMessage: false,
         stallTimeoutMs,
         stallTimer: null, forceTimer: null, hardTimer: null, interruptTimer: null,
+        startedAtMs, firstTokenAtMs: null, toolCallCount: 0,
       };
       activeTurn = turn;
       try {
@@ -532,7 +563,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
         resolve({
           resultText: '', interrupted: false, timedOut: false, hardTimedOut: false,
           appliedStrategicOp: false, sawToolUse: false, sentOperatorMessage: false,
-          processGone: !alive,
+          processGone: !alive, ttftMs: null, turnMs: Date.now() - startedAtMs, toolCallCount: 0,
         });
         return;
       }

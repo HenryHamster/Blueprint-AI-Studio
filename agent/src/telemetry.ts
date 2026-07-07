@@ -369,3 +369,78 @@ export function resetFormatComplianceTelemetry(): void {
 export function estimateTokensFromChars(chars: number): number {
   return Math.ceil(chars / 4);
 }
+
+// ── Per-resident-session turn latency telemetry ───────────────────────────────
+// Rolling per-kind (operator / autonomous) latency accumulators. Included in
+// every session heartbeat so the backend can persist a turn-latency summary on
+// the session blob for operator-visible observability.
+
+interface ResidentTurnKindStats {
+  count: number;
+  totalTurnMs: number;
+  maxTurnMs: number;
+  totalTtftMs: number;
+  ttftCount: number;
+  interruptedCount: number;
+  totalToolCalls: number;
+}
+
+const _emptyKindStats = (): ResidentTurnKindStats => ({
+  count: 0, totalTurnMs: 0, maxTurnMs: 0, totalTtftMs: 0,
+  ttftCount: 0, interruptedCount: 0, totalToolCalls: 0,
+});
+
+let _residentTurnStats: Record<'operator' | 'autonomous', ResidentTurnKindStats> = { // @per-role
+  operator: _emptyKindStats(),
+  autonomous: _emptyKindStats(),
+};
+
+export interface ResidentTurnLatencyRecord {
+  kind: 'operator' | 'autonomous';
+  turnMs: number;
+  ttftMs: number | null;
+  interrupted: boolean;
+  toolCallCount: number;
+}
+
+/** Record one completed resident turn's latency metrics. */
+export function recordResidentTurnLatency(record: ResidentTurnLatencyRecord): void {
+  const s = _residentTurnStats[record.kind];
+  s.count += 1;
+  if (Number.isFinite(record.turnMs) && record.turnMs >= 0) {
+    s.totalTurnMs += record.turnMs;
+    if (record.turnMs > s.maxTurnMs) s.maxTurnMs = record.turnMs;
+  }
+  if (record.ttftMs !== null && Number.isFinite(record.ttftMs) && record.ttftMs >= 0) {
+    s.totalTtftMs += record.ttftMs;
+    s.ttftCount += 1;
+  }
+  if (record.interrupted) s.interruptedCount += 1;
+  if (Number.isFinite(record.toolCallCount) && record.toolCallCount > 0) {
+    s.totalToolCalls += record.toolCallCount;
+  }
+}
+
+/** Build a per-kind summary object from accumulated stats. Returns null when no turns have been recorded. */
+export function getResidentTurnLatencyTelemetry(): {
+  operator: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number };
+  autonomous: { count: number; mean_turn_ms: number | null; max_turn_ms: number; mean_ttft_ms: number | null; interrupted_count: number; total_tool_calls: number };
+} | null {
+  const op = _residentTurnStats.operator;
+  const au = _residentTurnStats.autonomous;
+  if (op.count === 0 && au.count === 0) return null;
+  const summarize = (s: ResidentTurnKindStats) => ({
+    count: s.count,
+    mean_turn_ms: s.count > 0 ? Math.round(s.totalTurnMs / s.count) : null,
+    max_turn_ms: s.maxTurnMs,
+    mean_ttft_ms: s.ttftCount > 0 ? Math.round(s.totalTtftMs / s.ttftCount) : null,
+    interrupted_count: s.interruptedCount,
+    total_tool_calls: s.totalToolCalls,
+  });
+  return { operator: summarize(op), autonomous: summarize(au) };
+}
+
+/** Reset resident turn latency accumulators between roles. */
+export function resetResidentTurnLatencyTelemetry(): void {
+  _residentTurnStats = { operator: _emptyKindStats(), autonomous: _emptyKindStats() };
+}

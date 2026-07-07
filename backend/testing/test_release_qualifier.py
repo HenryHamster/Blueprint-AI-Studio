@@ -33019,3 +33019,139 @@ async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker)
         )
     ).scalars().all()
     assert len(alerts) == 1
+
+
+# ===========================================================================
+# full-suite-drift-sentinel admin endpoint
+# ===========================================================================
+
+
+async def _make_project_with_owner(db_session, owner_id: str = "test-user-123"):
+    """Create a project with the given user as owner (ProjectMember row included)."""
+    from app.models import ProjectMember  # noqa: PLC0415
+
+    project = Project(
+        name="Sentinel-Test",
+        user_id=owner_id,
+        github_owner="acme",
+        github_repo="widget",
+        integration_branch="automain",
+        promotion_target="main",
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    member = ProjectMember(project_id=project.id, user_id=owner_id, role="owner")
+    db_session.add(member)
+    await db_session.commit()
+    return project
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_get_default_off(db_session, client):
+    """GET returns enabled=False and is_default=True when flag is absent."""
+    project = await _make_project_with_owner(db_session)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel"
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is False
+    assert body["is_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_patch_enable_disable(db_session, client):
+    """PATCH toggles full_suite_drift_sentinel_enabled and GET reflects the change."""
+    project = await _make_project_with_owner(db_session)
+
+    # Enable the sentinel.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": True},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is True
+    assert body["is_default"] is False
+
+    # GET now reflects the enabled state.
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel"
+    )
+    assert resp.status_code == 200
+    assert resp.json()["full_suite_drift_sentinel_enabled"] is True
+
+    # Disable the sentinel — is_default returns to True (key removed).
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": False},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["full_suite_drift_sentinel_enabled"] is False
+    assert body["is_default"] is True
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_patch_validation(db_session, client):
+    """PATCH rejects non-boolean and missing-key bodies with 422."""
+    project = await _make_project_with_owner(db_session)
+
+    # Missing required field.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={},
+    )
+    assert resp.status_code == 422
+
+    # Non-boolean value.
+    resp = await client.patch(
+        f"/api/admin/projects/{project.id}/full-suite-drift-sentinel",
+        json={"full_suite_drift_sentinel_enabled": "yes"},
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_full_suite_drift_sentinel_sweep_uses_build_config(db_session, mocker):
+    """Sweep evaluates sentinel only when build_config flag is True.
+
+    Verifies that enabling via build_config causes _check_full_suite_drift_sentinel
+    to call compute_promotion_ci_green_gate (the dispatch entrypoint), while
+    a disabled flag is a no-op.
+    """
+    from unittest.mock import AsyncMock  # noqa: PLC0415
+    from app.release_qualifier_sweep import _check_full_suite_drift_sentinel  # noqa: PLC0415
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+
+    gate_mock = mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "dispatched",
+                "head_sha": "aabbccdd" * 5,
+                "run_id": 42,
+            }
+        ),
+    )
+
+    # Flag OFF — gate must NOT be called.
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is False
+    gate_mock.assert_not_called()
+
+    # Enable via build_config (as the new endpoint would do).
+    project.build_config = {"full_suite_drift_sentinel_enabled": True}
+    db_session.add(project)
+    await db_session.commit()
+
+    result = await _check_full_suite_drift_sentinel(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+    assert result is True
+    gate_mock.assert_called_once()

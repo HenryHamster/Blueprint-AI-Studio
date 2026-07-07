@@ -38,9 +38,17 @@ ledger under-counts, without ever mutating a ``CompletionDebtEntry`` row),
 ``rollup_child_landing_credit``, ``near_cap_size_warning`` (scans capped
 backend modules for files at >=95% of their size cap, pre-classified with the
 chronic-offender policy, so decomposition can be staged before a hard breach),
-and ``problem_model_duplicate_id_sweep`` (scans id-keyed problem_model JSONB
+``problem_model_duplicate_id_sweep`` (scans id-keyed problem_model JSONB
 collections for duplicate ids, flagging per-project when
-``len(items) > len({item["id"] for item in items})``).
+``len(items) > len({item["id"] for item in items})``),
+``direction_cumulative_merge_invariant`` (combines research_history +
+history_aggregate lifetime totals and flags structural violations such as
+verified > merged or proven > declared), ``first_attempt_rate_denominator_coverage``
+(checks that a sufficient fraction of terminal create/refactor tasks carry
+``_first_attempt_succeeded`` so the FA-rate denominator is representative), and
+``sr_catch_rate_cache_freshness`` (checks that each project's persisted
+``sr_catch_rate_trends`` cache is within the staleness window so operators see
+up-to-date catch-rate trends).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -1824,6 +1832,330 @@ async def check_problem_model_duplicate_id_sweep(
                     delta=0,
                     subject=pid,
                     detail="all id-keyed collections have unique ids",
+                )
+            )
+    return results
+
+
+@register_check(
+    "direction_cumulative_merge_invariant",
+    "Combine research_history + history_aggregate lifetime totals and flag "
+    "structural violations (verified > merged, proven > verified or declared).",
+)
+async def check_direction_cumulative_merge_invariant(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: the combined lifetime merge totals (active research_history +
+    evicted history_aggregate) must satisfy proven ≤ verified ≤ merged and
+    proven ≤ declared. A violation indicates a counter was written inconsistently
+    across eviction, recompute, or stranding patches. Flag-only: never mutates any
+    direction data. Bounded to ``max_projects`` projects.
+    """
+    from app.direction_outcomes import proven_merged_count, verified_merged_count
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.directions).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="direction_cumulative_merge_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    any_checked = False
+    checked_pids: set = set()
+    for project_id, directions in projects:
+        pid = str(project_id)
+        for d in directions or []:
+            h = d.get("research_history") or []
+            agg = d.get("history_aggregate") or {}
+            if not h and not agg:
+                continue
+            any_checked = True
+            checked_pids.add(pid)
+            h_merged = sum(int(e.get("prs_merged") or 0) for e in h)
+            h_verified = sum(verified_merged_count(e) for e in h)
+            h_proven = sum(proven_merged_count(e) for e in h)
+            h_declared = sum(int(e.get("acceptance_declared_merged") or 0) for e in h)
+            a_merged = int(agg.get("total_prs_merged") or 0)
+            # Legacy fallback in aggregate mirrors _fold_evicted_into_aggregate.
+            a_verified = int(agg.get("total_verified_prs_merged") or a_merged)
+            a_proven = int(agg.get("total_acceptance_proven_merged") or 0)
+            a_declared = int(agg.get("total_acceptance_declared_merged") or 0)
+            lt_merged = h_merged + a_merged
+            lt_verified = h_verified + a_verified
+            lt_proven = h_proven + a_proven
+            lt_declared = h_declared + a_declared
+            viols: List[str] = []
+            if lt_verified > lt_merged:
+                viols.append(f"verified ({lt_verified}) > merged ({lt_merged})")
+            if lt_proven > lt_verified:
+                viols.append(f"proven ({lt_proven}) > verified ({lt_verified})")
+            if lt_declared > 0 and lt_proven > lt_declared:
+                viols.append(f"proven ({lt_proven}) > declared ({lt_declared})")
+            if viols:
+                results.append(
+                    CheckResult(
+                        check="direction_cumulative_merge_invariant",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=lt_merged,
+                        ground_truth=lt_verified,
+                        delta=len(viols),
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"direction {d.get('id', 'unknown')}: "
+                            + "; ".join(viols[:2])
+                        ),
+                    )
+                )
+
+    if not any_checked:
+        return [
+            CheckResult(
+                check="direction_cumulative_merge_invariant",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no directions with research_history or history_aggregate found",
+            )
+        ]
+
+    flagged_pids = {r.subject for r in results if r.flagged}
+    for pid in checked_pids - flagged_pids:
+        results.append(
+            CheckResult(
+                check="direction_cumulative_merge_invariant",
+                status=CheckStatus.OK,
+                delta=0,
+                subject=pid,
+                detail="all direction lifetime merge-counter invariants consistent",
+            )
+        )
+    return results
+
+
+_FA_ELIGIBLE_TYPES: frozenset = frozenset({"create", "refactor"})
+_FA_MIN_SAMPLE: int = 5
+_FA_LOW_COVERAGE_THRESHOLD: float = 0.5
+
+
+@register_check(
+    "first_attempt_rate_denominator_coverage",
+    "Sample recent terminal create/refactor tasks and flag projects where <50% "
+    "carry _first_attempt_succeeded, making the FA-rate denominator unreliable.",
+)
+async def check_first_attempt_rate_denominator_coverage(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: every terminal create/refactor task that went through the
+    standard PR-review pipeline should carry ``_first_attempt_succeeded`` in its
+    context. When coverage drops below ``_FA_LOW_COVERAGE_THRESHOLD``, the FA rate
+    is computed over an unrepresentative subset of eligible tasks and silently
+    under-samples. Bounded to ``max_projects`` projects; within each project, at
+    most ``sample_limit`` terminal tasks are considered; skips projects with fewer
+    than ``_FA_MIN_SAMPLE`` eligible tasks.
+    """
+    from app.models import Project, Task, TaskStatus
+
+    cutoff = ctx.now.replace(tzinfo=None) - timedelta(days=ctx.window_days)
+    projects = (
+        await ctx.session.execute(select(Project.id).limit(ctx.max_projects))
+    ).all()
+
+    if not projects:
+        return [
+            CheckResult(
+                check="first_attempt_rate_denominator_coverage",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for (project_id,) in projects:
+        pid = str(project_id)
+        tasks = (
+            await ctx.session.execute(
+                select(Task)
+                .where(
+                    Task.project_id == project_id,
+                    Task.status.in_((TaskStatus.COMPLETED, TaskStatus.FAILED)),
+                    Task.created_at >= cutoff,
+                )
+                .order_by(Task.created_at.desc())
+                .limit(ctx.sample_limit)
+            )
+        ).scalars().all()
+
+        total = 0
+        measured = 0
+        for t in tasks:
+            ttype = (t.first_payload or {}).get("type", "")
+            if ttype not in _FA_ELIGIBLE_TYPES:
+                continue
+            total += 1
+            if "_first_attempt_succeeded" in (t.context or {}):
+                measured += 1
+        if total < _FA_MIN_SAMPLE:
+            results.append(
+                CheckResult(
+                    check="first_attempt_rate_denominator_coverage",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail=f"insufficient sample ({total} < {_FA_MIN_SAMPLE})",
+                )
+            )
+            continue
+        coverage = round(measured / total, 3)
+        if coverage < _FA_LOW_COVERAGE_THRESHOLD:
+            results.append(
+                CheckResult(
+                    check="first_attempt_rate_denominator_coverage",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=measured,
+                    ground_truth=total,
+                    delta=total - measured,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"{measured}/{total} ({int(coverage * 100)}%) terminal "
+                        "create/refactor tasks carry _first_attempt_succeeded; "
+                        "FA-rate denominator covers <50% of eligible tasks"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="first_attempt_rate_denominator_coverage",
+                    status=CheckStatus.OK,
+                    self_reported=measured,
+                    ground_truth=total,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"{measured}/{total} eligible tasks carry "
+                        f"_first_attempt_succeeded ({int(coverage * 100)}% coverage)"
+                    ),
+                )
+            )
+    return results
+
+
+@register_check(
+    "sr_catch_rate_cache_freshness",
+    "Check that design_doc['sr_catch_rate_trends']['computed_at'] is within the "
+    "staleness window so operators see current catch-rate trends.",
+)
+async def check_sr_catch_rate_cache_freshness(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: the persisted ``sr_catch_rate_trends`` cache must have been
+    computed within ``_SR_TREND_STALENESS_DAYS`` days. A stale cache means
+    operators read catch-rate trends that do not reflect recent task outcomes.
+    The check does NOT recompute the trends (that is expensive); it only validates
+    the ``computed_at`` timestamp against the known staleness threshold.
+
+    Bounded to ``max_projects`` projects. Projects without any
+    ``sr_catch_rate_trends`` cache are skipped (the cache is optional).
+    """
+    from app.models import Project
+    from app.sr_review_quality_metrics import _SR_TREND_STALENESS_DAYS
+    from app.time_utils import _to_naive_utc
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.design_doc).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="sr_catch_rate_cache_freshness",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    stale_threshold = timedelta(days=_SR_TREND_STALENESS_DAYS)
+    results: List[CheckResult] = []
+    for project_id, design_doc in projects:
+        pid = str(project_id)
+        trends = (design_doc or {}).get("sr_catch_rate_trends") or {}
+        if not trends:
+            results.append(
+                CheckResult(
+                    check="sr_catch_rate_cache_freshness",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no sr_catch_rate_trends cache present",
+                )
+            )
+            continue
+        computed_at_str = trends.get("computed_at")
+        if not computed_at_str:
+            results.append(
+                CheckResult(
+                    check="sr_catch_rate_cache_freshness",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="sr_catch_rate_trends cache has no computed_at timestamp",
+                )
+            )
+            continue
+        try:
+            computed_at = _to_naive_utc(datetime.fromisoformat(str(computed_at_str)))
+        except (ValueError, TypeError):
+            results.append(
+                CheckResult(
+                    check="sr_catch_rate_cache_freshness",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail=f"sr_catch_rate_trends.computed_at unparseable: {str(computed_at_str)[:40]}",
+                )
+            )
+            continue
+        age = ctx.now.replace(tzinfo=None) - computed_at
+        if age > stale_threshold:
+            results.append(
+                CheckResult(
+                    check="sr_catch_rate_cache_freshness",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=int(age.total_seconds() // 3600),
+                    ground_truth=int(stale_threshold.total_seconds() // 3600),
+                    delta=int((age - stale_threshold).total_seconds() // 3600),
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"sr_catch_rate_trends cache is {age.days}d old "
+                        f"(>{_SR_TREND_STALENESS_DAYS}d staleness threshold); "
+                        "operators see outdated catch-rate trends"
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="sr_catch_rate_cache_freshness",
+                    status=CheckStatus.OK,
+                    self_reported=int(age.total_seconds() // 3600),
+                    ground_truth=int(stale_threshold.total_seconds() // 3600),
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"sr_catch_rate_trends cache is {age.days}d old "
+                        f"(within {_SR_TREND_STALENESS_DAYS}d threshold)"
+                    ),
                 )
             )
     return results

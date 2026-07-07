@@ -166,6 +166,9 @@ def test_registry_contains_initial_checks():
         "rollup_child_landing_credit",
         "near_cap_size_warning",
         "problem_model_duplicate_id_sweep",
+        "direction_cumulative_merge_invariant",
+        "first_attempt_rate_denominator_coverage",
+        "sr_catch_rate_cache_freshness",
     } <= names
 
 
@@ -1570,3 +1573,234 @@ async def test_problem_model_dup_id_is_flag_only(db):
     await db.refresh(project)
     # Collection unchanged — both duplicates still present.
     assert len(project.problem_model["pending_user_confirmation"]) == 2
+
+
+# --- Check: direction_cumulative_merge_invariant ----------------------------
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_flags_verified_exceeds_merged(db):
+    """A direction where lifetime verified > merged must be flagged."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-inv-001",
+            "research_history": [
+                {
+                    "task_id": "bbbbbbbb-0000-0000-0000-000000000001",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 3,  # violates: verified (3) > merged (2)
+                }
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "direction_cumulative_merge_invariant"
+    assert f.delta >= 1
+    assert "verified" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_ok_when_consistent(db):
+    """A direction with internally-consistent lifetime totals returns OK."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-ok-001",
+            "research_history": [
+                {
+                    "task_id": "cccccccc-0000-0000-0000-000000000001",
+                    "prs_merged": 5,
+                    "verified_prs_merged": 4,
+                    "acceptance_proven_merged": 2,
+                    "acceptance_declared_merged": 3,
+                }
+            ],
+            "history_aggregate": {
+                "total_prs_merged": 10,
+                "total_verified_prs_merged": 9,
+                "total_acceptance_proven_merged": 3,
+                "total_acceptance_declared_merged": 5,
+            },
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_direction_cumulative_merge_invariant_skips_no_directions(db):
+    """A project with no directions or empty research_history returns SKIPPED."""
+    await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_direction_cumulative_merge_invariant(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: first_attempt_rate_denominator_coverage -------------------------
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_flags_low_coverage(db):
+    """When <50% of eligible tasks have _first_attempt_succeeded, FLAGGED."""
+    project = await _project(db)
+    now = _utcnow()
+    # 8 eligible tasks, only 2 have the flag → 25% coverage < 50% threshold
+    for i in range(8):
+        ctx_data = {"_first_attempt_succeeded": True} if i < 2 else {}
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context=ctx_data,
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "first_attempt_rate_denominator_coverage"
+    assert f.self_reported == 2
+    assert f.ground_truth == 8
+    assert f.delta == 6
+    assert "_first_attempt_succeeded" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_ok_when_high_coverage(db):
+    """When >=50% of eligible tasks have _first_attempt_succeeded, OK."""
+    project = await _project(db)
+    now = _utcnow()
+    for i in range(6):
+        ctx_data = {"_first_attempt_succeeded": i < 5}  # 5/6 = 83%
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context=ctx_data,
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_fa_rate_denominator_skips_non_eligible_types(db):
+    """research/review/strategic tasks do not count toward FA coverage."""
+    project = await _project(db)
+    now = _utcnow()
+    for ttype in ("research", "review", "strategic"):
+        db.add(Task(
+            project_id=project.id,
+            payloads=[{"type": ttype}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - timedelta(days=1),
+            context={},
+        ))
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=now, mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_first_attempt_rate_denominator_coverage(ctx)
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: sr_catch_rate_cache_freshness -----------------------------------
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_flags_stale_cache(db):
+    """A sr_catch_rate_trends cache older than _SR_TREND_STALENESS_DAYS must be flagged."""
+    from app.sr_review_quality_metrics import _SR_TREND_STALENESS_DAYS
+    project = await _project(db)
+    stale_date = (_utcnow() - timedelta(days=_SR_TREND_STALENESS_DAYS + 2)).isoformat()
+    project.design_doc = {"sr_catch_rate_trends": {"computed_at": stale_date, "categories": {}}}
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "design_doc")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged, got {results}"
+    f = flagged[0]
+    assert f.check == "sr_catch_rate_cache_freshness"
+    assert "stale" in f.detail or "old" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_ok_when_fresh(db):
+    """A recently-computed sr_catch_rate_trends cache returns OK."""
+    project = await _project(db)
+    fresh_date = (_utcnow() - timedelta(hours=12)).isoformat()
+    project.design_doc = {"sr_catch_rate_trends": {"computed_at": fresh_date, "categories": {}}}
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "design_doc")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    assert all(not r.flagged for r in results)
+    assert any(r.status == CheckStatus.OK for r in results)
+
+
+@pytest.mark.asyncio
+async def test_sr_cache_freshness_skips_when_no_cache(db):
+    """A project without sr_catch_rate_trends returns SKIPPED."""
+    await _project(db)
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_sr_catch_rate_cache_freshness(ctx)
+    assert all(r.status == CheckStatus.SKIPPED for r in results)

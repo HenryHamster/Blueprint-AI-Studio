@@ -3764,3 +3764,99 @@ async def test_heartbeat_handled_ids_only_affect_own_session(db_session):
     # The unscoped message is NOT marked handled (different session_id / None).
     fresh_msg = await db_session.get(ProjectMessage, unscoped_msg.id)
     assert fresh_msg is not None and fresh_msg.status == "open"
+
+
+# ---------------------------------------------------------------------------
+# turn_latency_summary — heartbeat persists rolling latency telemetry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_persists_turn_latency_summary(db_session):
+    """A heartbeat carrying ``turn_latency_summary`` stores it on the session blob."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    latency = {
+        "operator": {
+            "count": 2, "mean_turn_ms": 1500, "max_turn_ms": 2000,
+            "mean_ttft_ms": 300, "interrupted_count": 0, "total_tool_calls": 4,
+        },
+        "autonomous": {
+            "count": 3, "mean_turn_ms": 5000, "max_turn_ms": 8000,
+            "mean_ttft_ms": None, "interrupted_count": 1, "total_tool_calls": 6,
+        },
+    }
+
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        turn_latency_summary=latency,
+    )
+
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_turn_latency_summary")
+    assert isinstance(stored, dict), f"Expected dict, got {stored!r}"
+    assert stored["operator"]["count"] == 2
+    assert stored["operator"]["mean_turn_ms"] == 1500
+    assert stored["autonomous"]["count"] == 3
+    assert stored["autonomous"]["interrupted_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_turn_latency_summary_is_liveness_ok(db_session):
+    """A heartbeat without ``turn_latency_summary`` (liveness-only) succeeds and
+    leaves any pre-existing ``_turn_latency_summary`` on the blob untouched."""
+    project = await _make_project_with_member(db_session)
+    await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    snap = await start_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    # First heartbeat: persist a summary.
+    latency = {
+        "operator": {
+            "count": 1, "mean_turn_ms": 1000, "max_turn_ms": 1000,
+            "mean_ttft_ms": 200, "interrupted_count": 0, "total_tool_calls": 2,
+        },
+        "autonomous": {
+            "count": 0, "mean_turn_ms": None, "max_turn_ms": 0,
+            "mean_ttft_ms": None, "interrupted_count": 0, "total_tool_calls": 0,
+        },
+    }
+    project = await db_session.get(Project, project.id)
+    await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=True,
+        turn_latency_summary=latency,
+    )
+
+    # Second heartbeat: no summary (liveness only).
+    project = await db_session.get(Project, project.id)
+    result = await renew_resident_session_lease(
+        db_session, project,
+        session_id=snap["session_id"],
+        task_id=snap["task_id"],
+        progress=False,
+    )
+    assert result["stop_requested"] is False
+
+    # The blob still has the first summary (liveness heartbeat did not erase it).
+    fresh = await db_session.get(Project, project.id)
+    blob = read_resident_session(fresh.vision)
+    assert blob is not None
+    stored = blob.get("_turn_latency_summary")
+    assert isinstance(stored, dict)
+    assert stored["operator"]["count"] == 1

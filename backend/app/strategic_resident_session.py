@@ -1933,6 +1933,7 @@ async def renew_resident_session_lease(
     note: str | None = None,
     message_cursor: str | None = None,
     handled_message_ids: list[str] | None = None,
+    turn_latency_summary: dict | None = None,
 ) -> dict[str, Any]:
     """Renew the continuation lease from a resident-agent heartbeat.
 
@@ -2200,6 +2201,10 @@ async def renew_resident_session_lease(
         # high-water mark rather than re-delivering already-answered messages.
         if message_cursor:
             updated["_message_cursor"] = message_cursor
+        # Persist the rolling per-kind turn-latency summary for operator-visible
+        # observability. Bounded to a simple dict; ignored when absent/None.
+        if isinstance(turn_latency_summary, dict):
+            updated["_turn_latency_summary"] = turn_latency_summary
         vision[RESIDENT_SESSION_KEY] = updated
 
     await with_vision_locked(session, project.id, _renew, skip_locked=False)
@@ -2362,6 +2367,7 @@ class ResidentSessionHeartbeatRequest(BaseModel):
     note: str | None = None
     message_cursor: str | None = None
     handled_message_ids: list[str] | None = None
+    turn_latency_summary: dict | None = None
 
 
 @router.post("/projects/{project_id}/strategic-session/heartbeat")
@@ -2392,4 +2398,5 @@ async def resident_session_heartbeat(
         note=payload.note,
         message_cursor=payload.message_cursor,
         handled_message_ids=payload.handled_message_ids,
+        turn_latency_summary=payload.turn_latency_summary,
     )
