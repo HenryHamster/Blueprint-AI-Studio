@@ -1,0 +1,54 @@
+# Blueprint local fleet runner — systemd --user unit template
+#
+# INSTALL (Linux / WSL):
+#   1. Copy this file to ~/.config/systemd/user/blueprint-runner.service
+#      (replacing /path/to/workspace with your actual repo checkout path)
+#   2. Edit ExecStart to point to the correct python3 and local_runner.py path.
+#   3. Edit EnvironmentFile to point to ~/.blueprint/runner.env (see below).
+#   4. Reload and enable:
+#        systemctl --user daemon-reload
+#        systemctl --user enable --now blueprint-runner.service
+#   5. Enable linger so the service starts at boot even without a login session:
+#        loginctl enable-linger $USER
+#
+# ENVIRONMENT FILE (~/.blueprint/runner.env):
+#   Create this file (chmod 0600) with your runner credentials:
+#     BLUEPRINT_ORCHESTRATOR_URL=https://your-orchestrator.example.com
+#     BLUEPRINT_RUNNER_TOKEN=<token from admin UI — saved automatically on first run>
+#
+#   After the first successful start BLUEPRINT_RUNNER_TOKEN is persisted to
+#   ~/.blueprint/runner_token, so you can omit it from runner.env on restarts.
+#
+# RESTART-ON-CRASH:
+#   Restart=on-failure causes systemd to restart the runner whenever it exits
+#   non-zero.  The runner calls os._exit(1) (via _die()) on fatal conditions
+#   (revoked token, supervisor-detected fatal errors) so systemd sees a non-zero
+#   exit and restarts automatically.  Normal SIGTERM shutdown exits 0 and is NOT
+#   restarted (Restart=on-failure, not Restart=always).
+#
+# VIEWING LOGS:
+#   journalctl --user -u blueprint-runner.service -f
+
+[Unit]
+Description=Blueprint local fleet runner
+Documentation=https://github.com/your-org/your-repo/blob/main/docs/runner-install.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /path/to/workspace/scripts/local_runner.py
+Restart=on-failure
+RestartSec=5
+# Load credentials and config from a 0600 file outside the repo.
+EnvironmentFile=-%h/.blueprint/runner.env
+# Redirect stdout/stderr into the systemd journal (view with journalctl --user).
+StandardOutput=journal
+StandardError=journal
+# Propagate SIGTERM cleanly so the runner shuts down gracefully before systemd
+# sends SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

@@ -183,6 +183,60 @@ def _die(reason: str, code: int = 1) -> None:
     os._exit(code)
 
 
+# ── Credential persistence ────────────────────────────────────────────────────
+
+def _credential_dir() -> str:
+    """Directory for the persisted runner credential file.
+
+    Defaults to ``~/.blueprint/``. Override via ``BLUEPRINT_CREDENTIAL_DIR`` for
+    testing or non-standard installs.
+    """
+    return os.environ.get("BLUEPRINT_CREDENTIAL_DIR", "").strip() or os.path.expanduser("~/.blueprint")
+
+
+def _credential_path() -> str:
+    """Full path to the persisted runner token file."""
+    return os.path.join(_credential_dir(), "runner_token")
+
+
+def _save_runner_token(token: str) -> None:
+    """Persist the runner token to a 0600-permission credential file.
+
+    Writes atomically (temp file + rename) so a concurrent reader never sees a
+    partial write. Silent best-effort — a write failure must not abort startup
+    when the runner already authenticated via the env-var token.
+    """
+    path = _credential_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=os.path.dirname(path))
+        try:
+            os.write(fd, token.encode())
+        finally:
+            os.close(fd)
+        os.chmod(tmp_path, 0o600)
+        os.rename(tmp_path, path)
+    except Exception as exc:
+        print(
+            f"[runner] WARNING: could not persist runner token to {path}: {exc}",
+            flush=True,
+        )
+
+
+def _load_runner_token() -> str | None:
+    """Read the persisted runner token from the credential file.
+
+    Returns None if the file does not exist, is empty, or cannot be read.
+    """
+    path = _credential_path()
+    try:
+        with open(path) as f:
+            token = f.read().strip()
+        return token or None
+    except OSError:
+        return None
+
+
 def _hostname() -> str | None:
     """Best-effort host name for this runner, sent on every heartbeat.
 
@@ -1805,8 +1859,9 @@ def _preflight(
     token_valid = False
     token_401 = False
     ping_error: str | None = None
+    enrolled_max_concurrent: int | None = None
     try:
-        status, _ = _post(
+        status, ping_body = _post(
             f"{orchestrator_url}/api/runner/heartbeat",
             token,
             {
@@ -1821,6 +1876,10 @@ def _preflight(
         orchestrator_ok = True
         if status in (200, 204):
             token_valid = True
+            if isinstance(ping_body, dict):
+                raw_emc = ping_body.get("enrolled_max_concurrent")
+                if isinstance(raw_emc, int) and raw_emc > 0:
+                    enrolled_max_concurrent = raw_emc
         elif status == 401:
             token_401 = True
     except Exception as exc:
@@ -1928,6 +1987,7 @@ def _preflight(
         "gpu_caps": gpu_caps,
         "workspace_writable": ws_writable,
         "setup_ok": setup_ok,
+        "enrolled_max_concurrent": enrolled_max_concurrent,
     }
 
 
@@ -2042,7 +2102,35 @@ def main() -> None:
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
-    token = _require_env("BLUEPRINT_RUNNER_TOKEN")
+    token = os.environ.get("BLUEPRINT_RUNNER_TOKEN", "").strip()
+    if token:
+        # Persist for future restarts so re-enrolling after a reboot is unnecessary.
+        _save_runner_token(token)
+    else:
+        token = _load_runner_token() or ""
+        if not token:
+            cred_path = _credential_path()
+            print(
+                "ERROR: BLUEPRINT_RUNNER_TOKEN is not set and no saved credential was found.",
+                file=sys.stderr,
+            )
+            print(
+                "  Set it:   export BLUEPRINT_RUNNER_TOKEN=<token>",
+                file=sys.stderr,
+            )
+            print(
+                "  Re-enroll: create a runner in the admin UI (Settings → Runners) to get a new token.",
+                file=sys.stderr,
+            )
+            print(
+                f"  (credential file checked: {cred_path})",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(
+            f"[runner] token loaded from credential file ({_credential_path()})",
+            flush=True,
+        )
     orchestrator_url = _require_env("BLUEPRINT_ORCHESTRATOR_URL").rstrip("/")
     agent_binary = _locate_agent_binary()
 
@@ -2160,6 +2248,17 @@ def main() -> None:
     elif not result["token_valid"]:
         print("ERROR: initial heartbeat rejected the runner token.", file=sys.stderr)
         sys.exit(1)
+
+    enrolled_max_concurrent = result.get("enrolled_max_concurrent")
+    if enrolled_max_concurrent is not None and max_concurrent != enrolled_max_concurrent:
+        print(
+            f"[runner] WARNING: BLUEPRINT_RUNNER_MAX_CONCURRENT={max_concurrent} disagrees "
+            f"with the server-enrolled preset max_concurrent={enrolled_max_concurrent}. "
+            f"The orchestrator uses the server-side limit; set "
+            f"BLUEPRINT_RUNNER_MAX_CONCURRENT={enrolled_max_concurrent} to match the "
+            f"enrollment and avoid claiming more (or fewer) tasks than declared.",
+            flush=True,
+        )
 
     if not (agent_claimable or compute_claimable):
         print(

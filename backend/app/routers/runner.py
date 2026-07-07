@@ -400,7 +400,11 @@ async def heartbeat(
                 "[RUNNERS] Failed to resolve runner-deactivated alert for %s",
                 runner_id,
             )
-    return {"ok": True, "last_seen_at": runner.last_seen_at.isoformat()}
+    return {
+        "ok": True,
+        "last_seen_at": runner.last_seen_at.isoformat(),
+        "enrolled_max_concurrent": caps.get("max_concurrent"),
+    }
 
 
 class ComputeJobReportRequest(BaseModel):
