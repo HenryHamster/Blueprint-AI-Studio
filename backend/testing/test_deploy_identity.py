@@ -13,6 +13,7 @@ import pytest
 from app.deploy_identity import (
     _parse_owner_repo,
     deploy_repo_identity,
+    project_is_deploy_repo,
     project_matches_deploy_identity,
 )
 
@@ -104,6 +105,60 @@ def test_project_match_does_not_read_is_self_repo(monkeypatch):
     monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
     project = _Proj(github_owner="other", github_repo="proj", is_self_repo=True)
     assert project_matches_deploy_identity(project) is False
+
+
+# ── project_is_deploy_repo classifier ───────────────────────────────────────
+#
+# The reliable "is this the repo this deployment serves?" predicate the
+# non-bootstrap identity/observability read-sites route through: deploy identity
+# is authoritative when stamped, else it falls back to is_self_repo so behavior
+# is preserved on deployments that have not stamped their identity.
+
+
+def _clear_deploy_identity(monkeypatch):
+    monkeypatch.delenv("DEPLOY_REPO_IDENTITY", raising=False)
+    from app.runtime_config_state import runtime_config
+
+    monkeypatch.setitem(runtime_config, "deploy_repo_identity", None)
+
+
+def test_deploy_repo_falls_back_to_is_self_repo_true(monkeypatch):
+    # No deploy identity configured → fall back to the is_self_repo flag.
+    _clear_deploy_identity(monkeypatch)
+    project = _Proj(github_owner="acme", github_repo="widget", is_self_repo=True)
+    assert project_is_deploy_repo(project) is True
+
+
+def test_deploy_repo_falls_back_to_is_self_repo_false(monkeypatch):
+    _clear_deploy_identity(monkeypatch)
+    project = _Proj(github_owner="acme", github_repo="widget", is_self_repo=False)
+    assert project_is_deploy_repo(project) is False
+
+
+def test_deploy_repo_fallback_handles_project_without_flag(monkeypatch):
+    # Missing attribute degrades to False, never raises.
+    _clear_deploy_identity(monkeypatch)
+    assert project_is_deploy_repo(object()) is False
+
+
+def test_deploy_repo_uses_identity_when_configured(monkeypatch):
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    project = _Proj(github_owner="acme", github_repo="widget", is_self_repo=False)
+    # Identity matches even though is_self_repo is False → classified as deploy repo.
+    assert project_is_deploy_repo(project) is True
+
+
+def test_deploy_repo_identity_overrides_misset_is_self_repo(monkeypatch):
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    # is_self_repo misset True but the repo is NOT the deploy identity → False.
+    project = _Proj(github_owner="other", github_repo="proj", is_self_repo=True)
+    assert project_is_deploy_repo(project) is False
+
+
+def test_deploy_repo_accepts_preresolved_identity():
+    project = _Proj(github_owner="acme", github_repo="widget", is_self_repo=False)
+    assert project_is_deploy_repo(project, ("acme", "widget")) is True
+    assert project_is_deploy_repo(project, ("acme", "other")) is False
 
 
 # ── Startup lifecycle observability tests ────────────────────────────────────

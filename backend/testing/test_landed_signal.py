@@ -164,6 +164,58 @@ async def test_first_autonomous_improvement_not_stamped_for_self_repo(db_session
     assert (project.build_config or {}).get("first_autonomous_improvement_at") is None
 
 
+def test_first_autonomous_improvement_skips_deploy_identity_repo(monkeypatch):
+    """A repo matching the stamped deploy identity is treated as the deploy's
+    own repo and skipped, even when is_self_repo is False."""
+    from app.onboarding_proof import stamp_first_autonomous_improvement
+
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    project = Project(
+        name="deploy repo",
+        user_id="test-user",
+        is_self_repo=False,
+        github_owner="acme",
+        github_repo="widget",
+    )
+    task = Task(
+        project_id=project.id,
+        title="create task",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.EVALUATING,
+    )
+
+    stamp_first_autonomous_improvement(task, project)
+
+    assert (project.build_config or {}).get("first_autonomous_improvement_at") is None
+
+
+def test_first_autonomous_improvement_stamped_when_identity_mismatch(monkeypatch):
+    """is_self_repo misset True but the repo is NOT the deploy identity → the
+    external-improvement milestone is stamped (identity is authoritative)."""
+    from app.onboarding_proof import stamp_first_autonomous_improvement
+
+    monkeypatch.setenv("DEPLOY_REPO_IDENTITY", "acme/widget")
+    project = Project(
+        name="external repo misflagged",
+        user_id="test-user",
+        is_self_repo=True,
+        github_owner="other",
+        github_repo="proj",
+    )
+    task = Task(
+        project_id=project.id,
+        title="fix task",
+        payloads=[{"type": "fix"}],
+        status=TaskStatus.EVALUATING,
+    )
+
+    stamp_first_autonomous_improvement(task, project)
+
+    assert (
+        project.build_config or {}
+    ).get("first_autonomous_improvement_at") is not None
+
+
 @pytest.mark.asyncio
 async def test_first_autonomous_improvement_not_stamped_for_migrate_task(db_session):
     """A migrate task (not in the code-change set) does not stamp the milestone."""

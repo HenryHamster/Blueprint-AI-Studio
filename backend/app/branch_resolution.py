@@ -13,6 +13,7 @@ from typing import Any, Dict
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
+from app.deploy_identity import project_is_deploy_repo
 from app.runtime_config_state import runtime_config
 
 logger = logging.getLogger(__name__)
@@ -1021,13 +1022,16 @@ async def backfill_branch_columns(session, project_id=None) -> dict:
 
         # Self-repo: leave NULL as-is. The live resolver treats the self-repo's
         # unset integration branch as automain without silently rewriting the
-        # column behind the operator's back.
-        if project.is_self_repo and need_integration:
+        # column behind the operator's back. Classify via the deploy-repo
+        # predicate (deploy identity when stamped, else the is_self_repo
+        # fallback) so a misset flag can't misroute the deploy's own repo.
+        is_deploy_repo = project_is_deploy_repo(project)
+        if is_deploy_repo and need_integration:
             summary["self_repo_skipped"] += 1
             need_integration = False
 
         # Self-repo promotion_target: no GitHub round-trip needed.
-        if project.is_self_repo and need_promotion:
+        if is_deploy_repo and need_promotion:
             project.promotion_target = "main"
             flag_modified(project, "promotion_target")
             session.add(project)

@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
 from app.broadcast import broadcast_to_project
+from app.deploy_identity import project_is_deploy_repo
 from app.models import Alert, AlertSeverity, Project, _utcnow
 
 
@@ -260,7 +261,7 @@ def project_alert_domain_enabled(project: Project | None, domain: str) -> bool:
     configured = _configured_alert_domains(project)
     if domain in configured:
         return bool(configured[domain].get("enabled", False))
-    return bool(getattr(project, "is_self_repo", False)) and domain in SELF_REPO_DEFAULT_DOMAINS
+    return project_is_deploy_repo(project) and domain in SELF_REPO_DEFAULT_DOMAINS
 
 
 def should_emit_project_alert(
@@ -453,8 +454,7 @@ def serialize_project_alert_domains(project: Project) -> dict[str, Any]:
     for domain, meta in sorted(ALERT_DOMAIN_DEFINITIONS.items()):
         configured_value = configured.get(domain)
         default_enabled = domain == CORE_ALERT_DOMAIN or (
-            bool(getattr(project, "is_self_repo", False))
-            and domain in SELF_REPO_DEFAULT_DOMAINS
+            project_is_deploy_repo(project) and domain in SELF_REPO_DEFAULT_DOMAINS
         )
         enabled = (
             bool(configured_value.get("enabled"))

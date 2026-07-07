@@ -42,7 +42,10 @@ from app.models import (
     ProjectMessage,
     SystemMaturity,
 )
-from app.deploy_identity import project_matches_deploy_identity
+from app.deploy_identity import (
+    project_is_deploy_repo,
+    project_matches_deploy_identity,
+)
 from app.resource_envelope import resolve_project_require_local_runner
 from app.payload_schemas import pack_under_budget, validate_internal_payload
 from app.strategic_payload_compaction import (
@@ -3793,15 +3796,16 @@ async def _bootstrap_pending(project: Project, session: AsyncSession) -> bool:
     """Return True if a repo_bootstrap task is still in-flight for this project,
     or if an automatic recovery attempt is scheduled but not yet due.
 
-    False for self-repo projects and for projects whose bootstrap has already
-    completed (``bootstrap_completed_at`` is set).  A terminal bootstrap
+    False for the deploy's own repo (``project_is_deploy_repo``) and for
+    projects whose bootstrap has already completed (``bootstrap_completed_at``
+    is set).  A terminal bootstrap
     (FAILED / COMPLETED / …) with no pending recovery also returns False so a
     permanently degraded bootstrap never deadlocks autonomous spawning.
     """
     from app.repo_bootstrap import _parse_recovery_at
 
     _build_cfg = project.build_config or {}
-    if _build_cfg.get("bootstrap_completed_at") or project.is_self_repo:
+    if _build_cfg.get("bootstrap_completed_at") or project_is_deploy_repo(project):
         return False
     pending = (
         await session.execute(

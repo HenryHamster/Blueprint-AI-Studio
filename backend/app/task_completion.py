@@ -42,6 +42,7 @@ from app.models import (
     TaskHistory,
     TaskStatus,
 )
+from app.deploy_identity import project_is_deploy_repo
 from app.repo_bootstrap import (
     BOOTSTRAP_RECOVERY_MAX_ATTEMPTS,
     coerce_recovery_attempts,
@@ -4875,9 +4876,10 @@ async def _seed_bootstrap_playbook_commands(
 
     Called from within a project_lock block; uses with_design_doc_locked for the
     write so the invariant guard stays satisfied. Idempotent: skips keys that
-    already exist. Only runs for non-self-repo projects with confirmed command memory.
+    already exist. Only runs for external (non deploy-repo) projects with
+    confirmed command memory.
     """
-    if getattr(project, "is_self_repo", False):
+    if project_is_deploy_repo(project):
         return
     if not build_config.get("bootstrap_command_memory_complete"):
         return

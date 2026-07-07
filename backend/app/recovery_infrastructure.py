@@ -19,6 +19,7 @@ from sqlalchemy import func, or_
 from sqlmodel import select
 
 from app import services
+from app.deploy_identity import project_is_external_repo_clause
 from app.models import Project
 from app.time_utils import _utcnow
 
@@ -117,7 +118,9 @@ async def _try_bootstrap_spawn_advisory_lock(session, project_id: object) -> boo
 async def _sweep_bootstrap_recovery() -> None:
     """Enqueue one repo_bootstrap task for each eligible unbootstrapped project.
 
-    Eligible projects are: external (not is_self_repo), non-empty
+    Eligible projects are: external — NOT the deploy's own repo, per
+    ``project_is_external_repo_clause`` (``is_self_repo`` plus a deploy-identity
+    match that hardens the filter against a misset flag) — non-empty
     (repo_is_empty falsy), no bootstrap_completed_at, and no currently-active
     (QUEUED/PROVISIONING/IN_PROGRESS) repo_bootstrap task.
 
@@ -146,7 +149,7 @@ async def _sweep_bootstrap_recovery() -> None:
             result = await session.execute(
                 select(Project)
                 .where(
-                    Project.is_self_repo.is_(False),
+                    project_is_external_repo_clause(),
                     Project.archived.is_(False),
                     Project.build_config["bootstrap_completed_at"]
                     .as_string()
