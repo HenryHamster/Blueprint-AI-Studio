@@ -87,6 +87,13 @@ _repo_installation_token_cache: dict[str, tuple[str, float]] = {}
 # _github_token_cache_lock pattern in github_token_resolver.
 _repo_installation_token_lock = asyncio.Lock()
 
+# Separate cache and lock for read-scoped tokens (contents:read only).
+# Kept isolated from the write-token cache so a read token can never be
+# returned to a write caller and a write token can never be served to the
+# read-only endpoint.
+_repo_installation_read_token_cache: dict[str, tuple[str, float]] = {}
+_repo_installation_read_token_lock = asyncio.Lock()
+
 
 def invalidate_repo_installation_token_cache(owner: str, repo: str) -> None:
     """Drop a repo's cached installation token, forcing a re-mint on next use.
@@ -97,6 +104,81 @@ def invalidate_repo_installation_token_cache(owner: str, repo: str) -> None:
     removed = _repo_installation_token_cache.pop(f"{owner}/{repo}", None)
     if removed:
         logger.info(f"[GITHUB] Invalidated cached install token for {owner}/{repo}")
+
+
+def invalidate_repo_installation_read_token_cache(owner: str, repo: str) -> None:
+    """Drop a repo's cached read-scoped installation token, forcing a re-mint on next use.
+
+    Called alongside invalidate_repo_installation_token_cache on 401 responses so
+    both caches stay consistent after a token revocation. Safe no-op if nothing is cached.
+    """
+    removed = _repo_installation_read_token_cache.pop(f"{owner}/{repo}", None)
+    if removed:
+        logger.info(f"[GITHUB] Invalidated cached read install token for {owner}/{repo}")
+
+
+async def get_repo_installation_read_token(owner: str, repo: str) -> str | None:
+    """Return a read-scoped (contents:read) installation token for the repo.
+
+    Uses a dedicated cache and lock that is completely separate from the
+    write-token cache, ensuring read and write tokens are never mixed.
+    """
+    if not GITHUB_APP_ID or not GITHUB_PRIVATE_KEY:
+        return None
+
+    from app import github as _gh
+
+    cache_key = f"{owner}/{repo}"
+
+    cached_token = _repo_installation_read_token_cache.get(cache_key)
+    if (
+        cached_token
+        and (time.monotonic() - cached_token[1]) < _INSTALLATION_TOKEN_TTL_SECONDS
+    ):
+        return cached_token[0]
+
+    async with _repo_installation_read_token_lock:
+        cached_token = _repo_installation_read_token_cache.get(cache_key)
+        if (
+            cached_token
+            and (time.monotonic() - cached_token[1]) < _INSTALLATION_TOKEN_TTL_SECONDS
+        ):
+            return cached_token[0]
+
+        cached = _installation_id_cache.get(cache_key)
+        installation_id: str | None = None
+        if cached and time.time() - cached[1] < _INSTALLATION_ID_TTL_SECONDS:
+            installation_id = cached[0]
+
+        if installation_id is None:
+            app_jwt = _gh.generate_github_app_jwt()
+            headers = {
+                "Authorization": f"Bearer {app_jwt}",
+                "Accept": "application/vnd.github.v3+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            }
+            resp = await _github_request(
+                "GET",
+                f"https://api.github.com/repos/{owner}/{repo}/installation",
+                headers,
+            )
+            if resp.status_code != 200:
+                logger.warning(
+                    f"No GitHub App installation found for {owner}/{repo}: {resp.status_code}"
+                )
+                _installation_id_cache.pop(cache_key, None)
+                return None
+            installation_id = str(resp.json()["id"])
+            _installation_id_cache[cache_key] = (installation_id, time.time())
+
+        token = await _gh.generate_installation_access_token(
+            installation_id,
+            repositories=[repo],
+            permissions={"contents": "read"},
+        )
+        if token:
+            _repo_installation_read_token_cache[cache_key] = (token, time.monotonic())
+        return token
 
 
 async def get_repo_installation_token(owner: str, repo: str) -> str | None:
@@ -269,10 +351,16 @@ async def get_github_user(user_token: str) -> dict:
 
 
 async def generate_installation_access_token(
-    installation_id: str, repositories: list[str] | None = None
+    installation_id: str,
+    repositories: list[str] | None = None,
+    permissions: dict | None = None,
 ) -> str:
     """
     Exchanges the GitHub App JWT for a short-lived Installation Access Token.
+
+    Pass ``permissions`` to downscope the token (e.g. ``{"contents": "read"}``).
+    When ``permissions`` is None the token inherits all permissions granted to
+    the installation.
     """
     app_jwt = generate_github_app_jwt()
 
@@ -282,9 +370,11 @@ async def generate_installation_access_token(
         "X-GitHub-Api-Version": "2022-11-28",
     }
 
-    payload = {}
+    payload: dict = {}
     if repositories:
         payload["repositories"] = repositories
+    if permissions is not None:
+        payload["permissions"] = permissions
 
     try:
         response = await _github_request(

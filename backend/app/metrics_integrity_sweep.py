@@ -1251,14 +1251,22 @@ async def check_completion_debt_completeness(
                 verdict = entry.get("verdict") if isinstance(entry, dict) else None
                 if verdict in _CONTINUE_VERDICTS:
                     expected.append((pid, f"capability_trial:{pid}:{cap_name}"))
-        # No-CI gate obligation: a live fall-open to an UNVERIFIED merge
-        # (``merge_gate_runtime.last_unverified_reason`` set) owes a debt row.
-        # Canonical key mirrors the recorder in
-        # ci_resolution.record_no_ci_gate_runtime:  f"no_ci_gate:{project_id}"
+        # No-CI gate obligation: a live fall-open to an UNVERIFIED merge owes a
+        # debt row. last_unverified_reason is a PERMANENT stamp — it is never
+        # cleared by a subsequent verified run (see ci_resolution.record_no_ci_gate_runtime).
+        # Use recent_outcomes to determine liveness: if the most recent gate outcome
+        # was verified, the gate is now functioning and the obligation is not active.
         if isinstance(merge_gate_runtime, dict) and merge_gate_runtime.get(
             "last_unverified_reason"
         ):
-            expected.append((pid, f"no_ci_gate:{pid}"))
+            is_live = True
+            recent_outcomes = merge_gate_runtime.get("recent_outcomes")
+            if isinstance(recent_outcomes, list) and recent_outcomes:
+                last = recent_outcomes[-1]
+                if isinstance(last, dict) and last.get("verified"):
+                    is_live = False
+            if is_live:
+                expected.append((pid, f"no_ci_gate:{pid}"))
 
     if not expected:
         return [

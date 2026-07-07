@@ -161,8 +161,6 @@ async def backfill_landed_rollup_merge_credit(
                 rollup_id, session
             )
             if not stamped:
-                # Already backfilled / nothing merge-eligible to credit — the
-                # idempotent no-op. Don't commit or recompute.
                 continue
 
             # Snapshot each distinct direction's representative descendant by

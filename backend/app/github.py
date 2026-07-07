@@ -587,9 +587,13 @@ async def _github_request_uncoalesced(
                 if _repo_m:
                     from app.github_auth import (
                         invalidate_repo_installation_token_cache,
+                        invalidate_repo_installation_read_token_cache,
                     )
 
                     invalidate_repo_installation_token_cache(
+                        _repo_m.group(1), _repo_m.group(2)
+                    )
+                    invalidate_repo_installation_read_token_cache(
                         _repo_m.group(1), _repo_m.group(2)
                     )
             if response.status_code < 500 or attempt == max_retries - 1:
@@ -1113,12 +1117,15 @@ async def commit_file_changes(
 from app.github_auth import (  # noqa: F401
     generate_github_app_jwt,
     get_repo_installation_token,
+    get_repo_installation_read_token,
     exchange_oauth_code,
     get_app_info,
     get_user_installations,
     get_github_user,
     generate_installation_access_token,
     validate_fine_grained_pat,
+    invalidate_repo_installation_token_cache,
+    invalidate_repo_installation_read_token_cache,
     _INSTALLATION_ID_TTL_SECONDS,
     _installation_id_cache,
 )

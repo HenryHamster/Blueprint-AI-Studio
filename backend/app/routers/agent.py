@@ -683,8 +683,8 @@ async def agent_git_read_token(
     git remote credential fresh (resident needs `git fetch origin` for
     automain verification; it never pushes — push credentials are per-task).
 
-    Uses `get_repo_installation_token` (cached 50 min per repo) so a warm
-    cache costs zero GitHub API calls.
+    Uses `get_repo_installation_read_token` (contents:read scoped, cached 50 min
+    per repo) so a warm cache costs zero GitHub API calls.
 
     Authorization is at parity with `/refresh-token`: both mint a fresh
     credential, so both require the JWT's task to still be the same-VM active
@@ -699,8 +699,8 @@ async def agent_git_read_token(
     repo = project.github_repo
     if not owner or not repo:
         raise HTTPException(status_code=422, detail="project_has_no_github_repo")
-    from app.github_auth import get_repo_installation_token
-    gh_token = await get_repo_installation_token(owner, repo)
+    from app.github_auth import get_repo_installation_read_token
+    gh_token = await get_repo_installation_read_token(owner, repo)
     if not gh_token:
         raise HTTPException(status_code=502, detail="github_token_unavailable")
     return {"token": gh_token, "owner": owner, "repo": repo}

@@ -12,6 +12,8 @@ Coverage:
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session
@@ -1575,3 +1577,149 @@ async def test_get_open_completion_debt_completed_linked_task_is_dispose_ready(d
     assert "linked_tasks" in item
     lt = item["linked_tasks"][0]
     assert lt["status"] == "COMPLETED"
+
+
+@pytest.mark.asyncio
+async def test_bound_detail_preserves_structure_when_truncating(db_session):
+    """Structure-preserving truncation: linked_tasks survive while oversized old entries are trimmed.
+
+    Regression test for audit finding 3a1f5a73a782512e: when detail encoding exceeds
+    _MAX_DETAIL_BYTES and linked_tasks is the oversized element, _bound_detail trims
+    the oldest linked_tasks entries (dropping from the front) rather than collapsing
+    the whole dict — keeping the list shape so link_task_to_debt can keep appending.
+    Other keys (e.g. description) survive unchanged.
+    """
+    project = Project(name="StructurePreserve", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # The oversized element is the first linked_tasks entry (large note). _bound_detail
+    # drops from the front (oldest first) until encoded size fits within _MAX_DETAIL_BYTES,
+    # so task-1 is dropped and task-2 survives.
+    large_note = "x" * 5000
+    await cd.arecord_completion_debt(
+        db_session,
+        dedupe_key="test:structure_preserve",
+        kind=cd.KIND_NO_CI_GATE,
+        title="Test structure preservation",
+        project_id=project.id,
+        detail={
+            "description": "Short description",
+            "linked_tasks": [
+                {"task_id": "task-1", "note": large_note},  # oversized — dropped as oldest
+                {"task_id": "task-2"},                      # small — survives
+            ],
+        },
+    )
+    await db_session.commit()
+
+    # Retrieve the entry to verify detail was bounded.
+    entry = (
+        await db_session.execute(
+            select(CompletionDebtEntry).where(
+                CompletionDebtEntry.dedupe_key == "test:structure_preserve"
+            )
+        )
+    ).scalar_one()
+
+    # _bound_detail trims the oldest linked_tasks entries; dict structure is preserved.
+    detail = entry.detail
+    assert detail is not None, "detail should not be None"
+    assert isinstance(detail, dict), "detail should be a dict"
+    assert "linked_tasks" in detail, (
+        "linked_tasks must be preserved in dict structure after truncation"
+    )
+    assert isinstance(detail["linked_tasks"], list), (
+        "linked_tasks must remain a list"
+    )
+    # task-1 (oversized, oldest) is dropped; task-2 (small, newest) survives.
+    assert len(detail["linked_tasks"]) == 1, (
+        "oversized oldest entry must be trimmed, leaving only the newest"
+    )
+    assert detail["linked_tasks"][0]["task_id"] == "task-2", (
+        "newest (smallest) linked_task must survive trimming"
+    )
+    assert detail.get("description") == "Short description", (
+        "small string fields must be preserved"
+    )
+    assert detail.get("_linked_tasks_trimmed") == 1, (
+        "number of trimmed linked_tasks entries must be recorded"
+    )
+    # Encoded size must be within bounds.
+    encoded = json.dumps(detail, default=str)
+    assert len(encoded) <= cd._MAX_DETAIL_BYTES, (
+        f"detail must fit in _MAX_DETAIL_BYTES; got {len(encoded)}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_bound_detail_preserves_linked_tasks_through_link_and_truncate_cycle(
+    db_session,
+):
+    """Linking a task to a debt entry must preserve prior linked_tasks across truncations.
+
+    Tests the concrete scenario from audit finding 3a1f5a73a782512e: repeated
+    link_task_to_debt calls must not destroy prior task links even if the detail
+    grows large enough to trigger truncation.
+    """
+    project = Project(name="LinkAndTruncate", user_id="u")
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Create entry with large detail that's already near truncation threshold.
+    entry = CompletionDebtEntry(
+        project_id=project.id,
+        kind=cd.KIND_NO_CI_GATE,
+        title="No-CI gate fell open",
+        detail={
+            "reason": "degraded_test_suite",
+            "large_context": "c" * 3000,  # Near the truncation threshold.
+        },
+    )
+    db_session.add(entry)
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    # First link should add task-1 to linked_tasks.
+    await cd.link_task_to_debt(
+        db_session, entry.id, project_id=project.id, task_id="task-1", note="first"
+    )
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    detail_after_first_link = entry.detail
+    linked_after_first = (detail_after_first_link or {}).get("linked_tasks", [])
+    assert len(linked_after_first) == 1
+    assert linked_after_first[0]["task_id"] == "task-1"
+    assert linked_after_first[0]["note"] == "first"
+
+    # Second link adds task-2; must preserve task-1 even if detail is truncated.
+    await cd.link_task_to_debt(
+        db_session, entry.id, project_id=project.id, task_id="task-2", note="second"
+    )
+    await db_session.commit()
+    await db_session.refresh(entry)
+
+    detail_after_second_link = entry.detail
+    linked_after_second = (detail_after_second_link or {}).get("linked_tasks", [])
+    assert len(linked_after_second) == 2, (
+        "both task links must be preserved; structure-preserving bounding must keep linked_tasks intact"
+    )
+    task_ids = [x.get("task_id") for x in linked_after_second]
+    assert task_ids == ["task-1", "task-2"], (
+        "task order must be preserved and no task lost to truncation"
+    )
+    assert linked_after_second[0]["note"] == "first", (
+        "first task note must still be present"
+    )
+    assert linked_after_second[1]["note"] == "second", (
+        "second task note must still be present"
+    )
+
+    # Verify the detail is still bounded.
+    encoded = json.dumps(detail_after_second_link, default=str)
+    assert len(encoded) <= cd._MAX_DETAIL_BYTES, (
+        f"detail must fit in _MAX_DETAIL_BYTES even after multiple links; got {len(encoded)}"
+    )

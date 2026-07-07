@@ -15,6 +15,7 @@ vi.mock('../git-credential.js', () => ({
 import {
   computeRefreshDelayMs, isBootstrapToken,
   initTokenModule,
+  scheduleProactiveTokenRefresh, stopProactiveTokenRefresh,
   scheduleGithubTokenRefresh, stopGithubTokenRefresh,
 } from './agent-token.js';
 import * as agentTokenModule from './agent-token.js';
@@ -116,6 +117,46 @@ describe('isBootstrapToken', () => {
     const payload = Buffer.from(JSON.stringify({ sub: 'test' })).toString('base64url');
     const token = `${header}.${payload}.sig`;
     expect(isBootstrapToken(token, now)).toBe(false);
+  });
+});
+
+// ── scheduleProactiveTokenRefresh / stopProactiveTokenRefresh ─────────────────
+
+describe('scheduleProactiveTokenRefresh / stopProactiveTokenRefresh lifecycle', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: () => {},
+    });
+    stopProactiveTokenRefresh();
+  });
+  afterEach(() => {
+    stopProactiveTokenRefresh();
+    vi.useRealTimers();
+  });
+
+  it('calling scheduleProactiveTokenRefresh twice replaces the previous timer (no orphan)', () => {
+    const now = 1_000_000_000_000;
+    const expSec1 = Math.floor(now / 1000) + 3600;
+    const expSec2 = Math.floor(now / 1000) + 7200;
+
+    scheduleProactiveTokenRefresh(mockJwtWithExp(expSec1));
+    const first = agentTokenModule.tokenRefreshTimer;
+    scheduleProactiveTokenRefresh(mockJwtWithExp(expSec2));
+    const second = agentTokenModule.tokenRefreshTimer;
+    // The second call must replace the first — no orphaned timers.
+    expect(second).not.toBeNull();
+    expect(second).not.toBe(first);
+  });
+
+  it('stopProactiveTokenRefresh is a no-op when no timer is running', () => {
+    expect(agentTokenModule.tokenRefreshTimer).toBeNull();
+    expect(() => { stopProactiveTokenRefresh(); }).not.toThrow();
+    expect(agentTokenModule.tokenRefreshTimer).toBeNull();
   });
 });
 

@@ -26,6 +26,8 @@ function cfg(): TokenModuleConfig {
 }
 
 export let tokenRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+// Generation number to detect stale reschedules during warm-VM task rotation.
+let _proactiveTokenRefreshGen = 0;
 
 function decodeJwtExp(token: string): number | null {
   try {
@@ -93,6 +95,11 @@ export function scheduleProactiveTokenRefresh(token: string): void {
   // refresh schedule per warm-VM rotation.
   stopProactiveTokenRefresh();
 
+  // Increment generation so any in-flight refresh from a prior task
+  // won't reschedule itself and overwrite this task's timer during rotation.
+  _proactiveTokenRefreshGen++;
+  const currentGen = _proactiveTokenRefreshGen;
+
   const { getToken, log } = cfg();
 
   // Bootstrap detection: if holding a long bootstrap JWT, fire a one-time
@@ -103,6 +110,11 @@ export function scheduleProactiveTokenRefresh(token: string): void {
     log(`Proactive token refresh: bootstrap token detected — early confirmation refresh in ${BOOTSTRAP_CONFIRMATION_DELAY_MS / 1000}s`);
     tokenRefreshTimer = setTimeout(() => {
       void (async () => {
+        // Skip if a new schedule has taken over during task rotation.
+        if (_proactiveTokenRefreshGen !== currentGen) {
+          log('Proactive token refresh: generation mismatch (task rotated), skipping reschedule');
+          return;
+        }
         log('Proactive token refresh: bootstrap confirmation refresh firing');
         const ok = await tryRefreshToken();
         if (ok) {
@@ -113,6 +125,7 @@ export function scheduleProactiveTokenRefresh(token: string): void {
         // Regardless of success/failure, reschedule from the current token's
         // real exp. On success AGENT_TOKEN is now the short-TTL token; on
         // failure it stays the bootstrap token and the normal cadence retries.
+        // Generation check protects against reschedule during rotation.
         scheduleProactiveTokenRefresh(getToken());
       })();
     }, BOOTSTRAP_CONFIRMATION_DELAY_MS);
@@ -123,6 +136,11 @@ export function scheduleProactiveTokenRefresh(token: string): void {
   log(`Proactive token refresh: next refresh in ${Math.round(delay / 1000)}s`);
   tokenRefreshTimer = setTimeout(() => {
     void (async () => {
+      // Skip if a new schedule has taken over during task rotation.
+      if (_proactiveTokenRefreshGen !== currentGen) {
+        log('Proactive token refresh: generation mismatch (task rotated), skipping reschedule');
+        return;
+      }
       log('Proactive token refresh: refreshing agent JWT before expiry');
       const ok = await tryRefreshToken();
       if (ok) {

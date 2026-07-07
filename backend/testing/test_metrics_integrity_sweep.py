@@ -1002,6 +1002,53 @@ async def test_completion_debt_resolved_row_flagged(db):
 
 
 @pytest.mark.asyncio
+async def test_completion_debt_no_ci_gate_not_flagged_when_recent_verified_run(db):
+    """last_unverified_reason is a permanent stamp (never cleared by verified runs).
+    When the most recent gate outcome in recent_outcomes is verified, the obligation
+    is no longer live and must NOT be flagged as an under-count."""
+    project = await _project(db)
+    project.merge_gate_runtime = {
+        "last_unverified_reason": "verify_setup_failed",
+        "last_unverified_at": "2026-01-01T00:00:00",
+        "recent_outcomes": [
+            {"at": "2026-01-01T00:00:00", "verified": False, "reason": "verify_setup_failed"},
+            # Most recent: verified run — gate is now functioning, obligation not live.
+            {"at": "2026-06-01T00:00:00", "verified": True, "reason": None},
+        ],
+    }
+    flag_modified(project, "merge_gate_runtime")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    # Must NOT be flagged — the most recent gate outcome was verified.
+    assert not _flagged_for(results, str(project.id))
+
+
+@pytest.mark.asyncio
+async def test_completion_debt_no_ci_gate_still_flagged_when_last_outcome_unverified(db):
+    """When the most recent recent_outcomes entry is still unverified, the obligation
+    is live and must be flagged even if there was an earlier verified run."""
+    project = await _project(db)
+    project.merge_gate_runtime = {
+        "last_unverified_reason": "verify_setup_failed",
+        "recent_outcomes": [
+            {"at": "2026-01-01T00:00:00", "verified": True, "reason": None},
+            # Most recent: unverified — obligation is still live.
+            {"at": "2026-06-01T00:00:00", "verified": False, "reason": "verify_setup_failed"},
+        ],
+    }
+    flag_modified(project, "merge_gate_runtime")
+    db.add(project)
+    await db.commit()
+
+    results = await mis.check_completion_debt_completeness(_ctx(db))
+    pid_flags = _flagged_for(results, str(project.id))
+    assert len(pid_flags) == 1
+    assert f"no_ci_gate:{project.id}" in pid_flags[0].detail
+
+
+@pytest.mark.asyncio
 async def test_completion_debt_inconclusive_over_bounds(db):
     for _ in range(3):
         await _project(db)
@@ -1283,6 +1330,103 @@ async def test_rollup_child_landing_credit_ignores_unmerged_rollup_parent(db):
     assert all(not r.flagged for r in results)
     statuses = {r.status for r in results}
     assert CheckStatus.FLAGGED not in statuses
+
+
+@pytest.mark.asyncio
+async def test_rollup_child_landing_credit_samples_newest_by_created_at(db):
+    """Verify the sweep samples by created_at (newest first), not by Task.id (uuid-random).
+
+    Creates more rollup tasks than sample_limit. The oldest rollup pairs are properly
+    credited (OK). The newest pair has a landed parent but an un-credited child (FLAGGED).
+    With created_at ordering the newest tasks are sampled and the flag is detected.
+    """
+    from datetime import timedelta as td
+
+    project = await _project(db)
+    now = _utcnow()
+    sample_limit = 4
+
+    # 3 old OK rollup pairs (6 tasks): parent landed, child stamped — no flag.
+    for i in range(3):
+        old_pr = 100 + i
+        parent_old = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=200 - i * 4),
+            context={
+                "_is_rollup_review": True,
+                "rollup_pr_number": old_pr,
+                "landed_on_integration": True,
+                "pr_merged": True,
+            },
+        )
+        db.add(parent_old)
+        await db.commit()
+        await db.refresh(parent_old)
+        child_old = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            created_at=now - td(hours=200 - i * 4 - 1),
+            context={
+                "rollup_pr_number": old_pr,
+                "pr_merged": True,
+                "landed_on_integration": True,
+            },
+        )
+        db.add(child_old)
+        await db.commit()
+
+    # 1 new FLAGGED pair (2 tasks): parent landed, child missing landing stamp.
+    # Most recent created_at — must be picked by created_at-ordered sampling.
+    new_rollup_pr = 200
+    parent_new = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_at=now - td(hours=5),
+        context={
+            "_is_rollup_review": True,
+            "rollup_pr_number": new_rollup_pr,
+            "landed_on_integration": True,
+            "pr_merged": True,
+        },
+    )
+    db.add(parent_new)
+    await db.commit()
+    await db.refresh(parent_new)
+    child_new = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        created_at=now - td(hours=4),
+        context={
+            "rollup_pr_number": new_rollup_pr,
+            "pr_merged": True,
+            "landed_on_integration": False,  # under-credited
+        },
+    )
+    db.add(child_new)
+    await db.commit()
+
+    # 8 tasks total; sample_limit=4 picks the 4 newest by created_at:
+    # child_new (now-4h), parent_new (now-5h), and the 2 newest old tasks.
+    # The new FLAGGED pair is guaranteed in the sample → FLAGGED.
+    ctx = SweepContext(
+        session=db,
+        now=now,
+        mode="observe",
+        max_projects=25,
+        sample_limit=sample_limit,
+        window_days=14,
+    )
+    results = await mis.check_rollup_child_landing_credit(ctx)
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) >= 1, (
+        f"expected flagged result for newest under-credited child, got {results}"
+    )
+    assert flagged[0].delta >= 1
 
 
 @pytest.mark.asyncio

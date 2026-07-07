@@ -848,6 +848,58 @@ async def test_stop_helper_drives_task_terminal_and_releases_lease(db_session):
 
 
 @pytest.mark.asyncio
+async def test_stop_task_context_write_is_locked_and_merging(db_session):
+    """stop_resident_session acquires the project row lock BEFORE the task row
+    lock (canonical Project→Task order) and writes task.context as a locked
+    read-modify-write via task_lock(populate_existing=True) rather than via a
+    stale identity-map snapshot.
+
+    Concretely: a context key committed by a prior strategic-API call must
+    survive the stop's failure_category stamp — if the write used a stale
+    identity-map copy instead of a fresh locked read, the pre-committed key would
+    be silently dropped (lost update).  Clears v22 audit keys e1909456333ceda5
+    (Project/Task lock-order inversion) and 8784112825bb8d87 (unlocked context
+    write)."""
+    project = await _make_project_with_member(db_session)
+    task = await _make_strategic_review_task(db_session, project)
+    await _make_live_local_runner(db_session, project)
+    await start_resident_session(db_session, project, operator_user_id=TEST_USER_ID)
+
+    # Commit a context key that simulates a concurrent strategic-API write that
+    # landed AFTER the session was started but BEFORE the stop runs.
+    await db_session.refresh(task)
+    ctx = dict(task.context or {})
+    ctx["_strategic_api_called"] = 2
+    task.context = ctx
+    flag_modified(task, "context")
+    db_session.add(task)
+    await db_session.commit()
+
+    project = await db_session.get(Project, project.id)
+    snapshot = await stop_resident_session(
+        db_session, project, operator_user_id=TEST_USER_ID
+    )
+
+    assert snapshot["status"] == "ended"
+    assert snapshot["stop_requested"] is True
+
+    # Task driven terminal with failure_category set.
+    refreshed = await db_session.get(Task, task.id)
+    assert refreshed.status == TaskStatus.CANCELLED
+    assert refreshed.context.get("failure_category") == "ADMIN_CANCEL"
+    # Pre-existing context key must survive — locked read-modify-write, not a
+    # stale-snapshot overwrite.
+    assert refreshed.context.get("_strategic_api_called") == 2, (
+        "stop_resident_session lost a pre-existing task context key — "
+        "context write must be a locked read-modify-write"
+    )
+
+    # Continuation lease released (vision mutation still committed correctly).
+    fresh_project = await db_session.get(Project, project.id)
+    assert STRATEGIC_LOCAL_CONTINUATION_KEY not in (fresh_project.vision or {})
+
+
+@pytest.mark.asyncio
 async def test_stop_endpoint(client: AsyncClient, db_session, enable_strategic_session_flag):
     project = await _make_project_with_member(db_session)
     task = await _make_strategic_review_task(db_session, project)

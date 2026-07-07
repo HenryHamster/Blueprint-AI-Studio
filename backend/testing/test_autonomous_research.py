@@ -3412,6 +3412,82 @@ async def test_spawn_research_observe_mode_allows_initiative_over_budget(
 
 
 @pytest.mark.asyncio
+async def test_spawn_research_fails_closed_in_enforce_mode_when_snapshot_unavailable(
+    db_session, mocker
+):
+    """Enforce mode blocks spawn when budget snapshot calculation fails."""
+    project = Project(
+        name="Budget Snapshot Failure Enforce",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-snapshot-fail-enforce")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+
+    # Mock compute_autonomous_spawn_budget_snapshot to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database unavailable"),
+    )
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        # In enforce mode, the spawn should be blocked when snapshot fails
+        assert len(result.scalars().all()) == 0
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+
+@pytest.mark.asyncio
+async def test_spawn_research_fails_open_in_observe_mode_when_snapshot_unavailable(
+    db_session, mocker
+):
+    """Observe mode allows spawn even when budget snapshot calculation fails."""
+    project = Project(
+        name="Budget Snapshot Failure Observe",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-snapshot-fail-observe")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "observe"
+
+    # Mock compute_autonomous_spawn_budget_snapshot to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database unavailable"),
+    )
+
+    try:
+        await _spawn_research_task(project, db_session)
+
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        # In observe mode, the spawn should succeed despite snapshot failure
+        spawned_tasks = result.scalars().all()
+        assert len(spawned_tasks) == 1
+        assert spawned_tasks[0].first_payload["type"] == "research"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+
+
+@pytest.mark.asyncio
 async def test_spawn_periodic_task_enforce_mode_uses_runtime_categories(
     db_session,
 ):

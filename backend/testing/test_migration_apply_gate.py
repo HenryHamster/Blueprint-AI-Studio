@@ -15,7 +15,10 @@ fail-safe / determinism cases that need no scratch DB run everywhere.
 
 import asyncio
 import contextlib
+import io
 import os
+import tarfile
+import tempfile
 from unittest.mock import AsyncMock
 
 import pytest
@@ -24,6 +27,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
 
 from app.migration_apply_gate import (
+    _safe_tar_extractall,
     ephemeral_postgres_database,
     run_migration_apply_gate,
 )
@@ -644,3 +648,57 @@ async def test_default_path_blocks_when_candidate_code_needs_missing_migration(
     assert "missing migration" in detail
     assert "computejob" in detail
     reflect_scratch_drift.assert_not_called()
+
+
+# --- _safe_tar_extractall path-traversal guard tests -----------------------
+
+
+def _make_tar_bytes(members: list[tuple[str, bytes]]) -> bytes:
+    """Build an in-memory tar archive with the given (name, content) members."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        for name, content in members:
+            info = tarfile.TarInfo(name=name)
+            info.size = len(content)
+            tar.addfile(info, io.BytesIO(content))
+    return buf.getvalue()
+
+
+def test_safe_tar_extractall_normal_member():
+    """Legitimate archive members are extracted correctly."""
+    data = _make_tar_bytes([("subdir/file.txt", b"hello")])
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+            _safe_tar_extractall(tar, tmp)
+        extracted = os.path.join(tmp, "subdir", "file.txt")
+        assert os.path.isfile(extracted)
+        with open(extracted, "rb") as fh:
+            assert fh.read() == b"hello"
+
+
+def test_safe_tar_extractall_blocks_path_traversal():
+    """Members with path-traversal names (../../etc) must be rejected."""
+    # Build archive with a traversal member manually — tarfile.open(mode='w')
+    # accepts any name, allowing us to craft a malicious archive.
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="../../evil.txt")
+        payload = b"pwned"
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    data = buf.getvalue()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tar:
+            # Both code paths (3.11.4+ filter and legacy manual check) must
+            # reject the traversal — either by raising or by not writing the
+            # file outside the destination.
+            try:
+                _safe_tar_extractall(tar, tmp)
+            except Exception:
+                # Acceptable: filter raised (e.g. tarfile.OutsideDestinationError)
+                # or manual check raised ValueError.
+                pass
+            # Either way, the payload must not have escaped the destination.
+            evil_path = os.path.abspath(os.path.join(tmp, "../../evil.txt"))
+            assert not os.path.exists(evil_path)

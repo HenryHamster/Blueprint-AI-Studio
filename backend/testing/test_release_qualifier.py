@@ -33021,6 +33021,126 @@ async def test_drift_sentinel_deduplicates_alert_on_same_sha(db_session, mocker)
     assert len(alerts) == 1
 
 
+@pytest.mark.asyncio
+async def test_finalize_logs_completion_debt_snapshot_fetch_failure(db_session, mocker, caplog):
+    """Finalize logs when completion-debt snapshot fetch fails, then continues."""
+    from app import shared_state
+    import logging
+    from importlib import import_module as original_import
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Create a mock that raises an exception only when trying to import
+    # completion_debt, but falls back to normal behavior for other modules.
+    def mock_import_module(name, *args, **kwargs):
+        if "completion_debt" in name:
+            raise RuntimeError("completion_debt module not available")
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=mock_import_module)
+
+    with caplog.at_level(logging.WARNING, logger="app.release_qualifier"):
+        result = await rq._finalize_qualification(
+            db_session,
+            version,
+            _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN),
+        )
+
+    # Should log the completion-debt failure.
+    assert any(
+        "completion-debt snapshot fetch failed" in record.message
+        for record in caplog.records
+    ), f"Expected warning about completion-debt snapshot, got: {[r.message for r in caplog.records]}"
+
+    # Finalize should proceed and produce a verdict.
+    assert result["status"] in ("promoted", "not_promoted", "dry_run")
+
+
+@pytest.mark.asyncio
+async def test_finalize_logs_actionable_open_count_failure(db_session, mocker, caplog):
+    """Finalize logs when actionable-open count fails, then continues."""
+    from app import shared_state
+    import logging
+    from importlib import import_module as original_import
+
+    shared_state.runtime_config["promotion_enabled"] = False
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session,
+        project,
+        version,
+        audit_logs={
+            "audit_score": 0.9,
+            "test_erosion": {
+                "deleted_test_files": [],
+                "assertion_delta": 5,
+                "test_count_delta": 2,
+            },
+        },
+        smoke_logs={
+            "passed": True,
+            "tests": [{"name": "a", "status": "pass"}],
+            "suites": {"startup": {"passed": True}},
+        },
+    )
+
+    # Mock the completion_debt module to return a valid debt dict.
+    mock_cd_mod = AsyncMock()
+    mock_cd_mod.get_open_completion_debt = AsyncMock(
+        return_value={"open_count": 5, "total_blocked": 1}
+    )
+
+    def mock_import_module(name, *args, **kwargs):
+        if "completion_debt" in name:
+            return mock_cd_mod
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=mock_import_module)
+
+    # Mock the actionable-open count function to raise an exception.
+    mocker.patch(
+        "app.release_qualifier._count_project_actionable_open_completion_debt",
+        new=AsyncMock(side_effect=RuntimeError("Count failed")),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="app.release_qualifier"):
+        result = await rq._finalize_qualification(
+            db_session,
+            version,
+            _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN),
+        )
+
+    # Should log the actionable-open count failure.
+    assert any(
+        "completion-debt actionable-open count" in record.message
+        for record in caplog.records
+    ), f"Expected warning about actionable-open count, got: {[r.message for r in caplog.records]}"
+
+    # Finalize should proceed and produce a verdict.
+    assert result["status"] in ("promoted", "not_promoted", "dry_run")
+
+
 # ===========================================================================
 # full-suite-drift-sentinel admin endpoint
 # ===========================================================================

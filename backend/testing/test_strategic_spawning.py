@@ -2694,6 +2694,85 @@ async def test_strategic_spawn_budget_guard_fails_open_in_observe_mode(
 
 
 @pytest.mark.asyncio
+async def test_default_autonomous_spawn_ceiling_parity_with_main(db_session, mocker):
+    """Default global autonomous spawn cap restores parity with main (50/hr).
+
+    Verify that the default max_global_autonomous_tasks_per_hour is 50, not 500,
+    so that default deployments respect the same ceiling as main without requiring
+    enforce mode. This guards against the 10x relaxation regression (872eacdf).
+    """
+    from app.autonomous_spawn_budget import (
+        DEFAULT_AUTONOMOUS_BACKSTOP_TASKS_PER_HOUR,
+        autonomous_spawn_budget_config_from_runtime,
+    )
+
+    # Verify the constant is correct.
+    assert DEFAULT_AUTONOMOUS_BACKSTOP_TASKS_PER_HOUR == 50, (
+        f"DEFAULT_AUTONOMOUS_BACKSTOP_TASKS_PER_HOUR should be 50 for main parity, "
+        f"got {DEFAULT_AUTONOMOUS_BACKSTOP_TASKS_PER_HOUR}"
+    )
+
+    # Verify runtime_config default matches.
+    config = autonomous_spawn_budget_config_from_runtime(_shared_state.runtime_config)
+    assert config.global_cap == 50, (
+        f"Default global_cap should be 50 for main parity, got {config.global_cap}"
+    )
+
+    # Verify strategic review respects the default global ceiling in observe mode.
+    _patch_spawning_deps(mocker)
+    mocker.patch(
+        "app.task_lifecycle._has_active_strategic_task",
+        new=AsyncMock(return_value=False),
+    )
+
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cap-test",
+                "status": "active",
+                "text": "Cap test direction",
+                "priority": "medium",
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    budget_source = _make_project(vision={"purpose": "budget source"})
+    db_session.add_all([project, budget_source])
+    await db_session.commit()
+    await db_session.refresh(project)
+    await db_session.refresh(budget_source)
+    await _seed_legacy_cycles(db_session, project)
+
+    # Fill the global cap with ORCHESTRATOR tasks.
+    for i in range(50):
+        db_session.add(
+            Task(
+                project_id=budget_source.id,
+                title=f"Budget task {i}",
+                payloads=[{"type": "research"}],
+                status=TaskStatus.COMPLETED,
+                created_by="ORCHESTRATOR",
+                created_at=datetime.now(timezone.utc) - timedelta(minutes=5),
+            )
+        )
+    await db_session.commit()
+
+    # Attempt spawn with global cap exhausted (using default observe mode).
+    spawned = await _spawn_strategic_review(
+        project,
+        db_session,
+        apply_spawn_budget_guard=True,
+    )
+
+    # Spawn should be blocked by the global cap in observe mode.
+    assert spawned is False, "Spawn should be blocked when global cap (50) is exhausted"
+    result = await db_session.execute(
+        select(Task).where(Task.project_id == project.id)
+    )
+    assert result.scalars().all() == []
+
+
+@pytest.mark.asyncio
 async def test_spawn_design_doc_update_proceeds_when_no_active_strategic(db_session):
     """_spawn_design_doc_update returns True and creates a task when no strategic task is active."""
     project = _make_project(vision={"purpose": "test purpose"})
