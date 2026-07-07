@@ -56,7 +56,11 @@ closure; an indeterminate (None) check NEVER flags), and
 ``capability_claim_reconciliation`` (re-verifies each working/partial capability's
 ``backing_paths`` against HEAD via the same tri-state helper and flags capabilities
 whose EVERY declared backing path was definitely removed; indeterminate (None)
-and planned capabilities are NEVER flagged).
+and planned capabilities are NEVER flagged), and
+``merged_pr_count_consistency`` (recomputes merged-PR counts with the canonical
+rollup-aware definition — excluding rollup-parent task ids — and flags any project
+where the naive count (used by llm_cost_per_merged_pr and merge_rate totals)
+exceeds the canonical count; the delta is the rollup double-count).
 
 Config knobs (runtime_config, operator-settable via PATCH /api/admin/settings):
 
@@ -2883,4 +2887,149 @@ async def check_capability_claim_reconciliation(
                 detail="no working/partial capabilities with backing_paths in any project",
             )
         ]
+    return results
+
+
+@register_check(
+    "merged_pr_count_consistency",
+    "Recompute merged-PR counts with the canonical rollup-aware definition and "
+    "flag projects where the naive count (llm_cost_per_merged_pr / merge_rate) "
+    "exceeds the canonical count; delta is the rollup double-count.",
+)
+async def check_merged_pr_count_consistency(ctx: SweepContext) -> List[CheckResult]:
+    """Ground truth: the CANONICAL merged-PR count excludes rollup-parent task ids
+    so that a rollup landing that credits the parent and all its children is not
+    double-counted. This matches ``efficiency_snapshot._cost_and_merges``.
+
+    The NAIVE count (used by ``llm_cost_attribution._compute_llm_cost_per_merged_pr``
+    and the ``merge_rate`` totals in ``compute_llm_cost_breakdown``) increments for
+    every ``is_merged_completion(t)`` including rollup parents, inflating the
+    denominator when rollup tasks are present in the window.
+
+    When ``naive > canonical`` the project is flagged with:
+    - ``self_reported`` = naive count (what the LLM-cost / merge_rate axes see)
+    - ``ground_truth`` = canonical count (rollup-parent-excluded)
+    - ``delta`` = rollup double-count (number of extra merges from rollup parents)
+
+    If the loaded task volume hits the sample cap the ground truth cannot be
+    trusted as complete — returns ``INCONCLUSIVE`` instead of a partial delta.
+
+    Bounded to the most-recent ``sample_limit`` COMPLETED tasks; groups per project.
+    Flag-only in every mode — never writes to the tasks it audits.
+    """
+    from app.efficiency_snapshot import _rollup_parent_ids
+    from app.landed_signal import is_merged_completion
+    from app.models import Task, TaskStatus
+
+    tasks = (
+        await ctx.session.execute(
+            select(Task)
+            .where(Task.status == TaskStatus.COMPLETED)
+            # Order by created_at, NOT Task.id: task ids are uuid4 (non-monotonic),
+            # so id.desc() yields a quasi-random subset instead of the most recent
+            # tasks — new rollup regressions would land outside the sample with
+            # ~uniform probability and go unaudited. Matches the recency ordering
+            # used by the other DB checks in this module.
+            .order_by(Task.created_at.desc())
+            .limit(ctx.sample_limit + 1)
+        )
+    ).scalars().all()
+
+    if len(tasks) > ctx.sample_limit:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.INCONCLUSIVE,
+                subject="global",
+                detail=(
+                    f"terminal-task volume exceeds sample_limit={ctx.sample_limit}; "
+                    "cannot recompute within bounds"
+                ),
+            )
+        ]
+
+    if not tasks:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no completed tasks in sample window",
+            )
+        ]
+
+    # Group by project.
+    by_project: Dict[str, List[Task]] = {}
+    for t in tasks:
+        by_project.setdefault(str(t.project_id), []).append(t)
+
+    results: List[CheckResult] = []
+    any_merged = False
+
+    for pid, proj_tasks in sorted(by_project.items()):
+        proj_parent_ids = _rollup_parent_ids(proj_tasks)
+        naive = sum(1 for t in proj_tasks if is_merged_completion(t))
+        canonical = sum(
+            1 for t in proj_tasks
+            if is_merged_completion(t) and t.id not in proj_parent_ids
+        )
+
+        if naive == 0:
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.SKIPPED,
+                    subject=pid,
+                    detail="no merged completions in sample window",
+                )
+            )
+            continue
+
+        any_merged = True
+
+        if naive > canonical:
+            delta = naive - canonical
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.FLAGGED,
+                    self_reported=naive,
+                    ground_truth=canonical,
+                    delta=delta,
+                    severity="warn",
+                    subject=pid,
+                    detail=(
+                        f"llm_cost_per_merged_pr and merge_rate totals over-count "
+                        f"merged PRs by {delta}: {naive} naive vs {canonical} "
+                        "canonical (rollup-parent-excluded). The delta equals the "
+                        "number of rollup-parent tasks counted as extra merges."
+                    ),
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    check="merged_pr_count_consistency",
+                    status=CheckStatus.OK,
+                    self_reported=naive,
+                    ground_truth=canonical,
+                    delta=0,
+                    subject=pid,
+                    detail=(
+                        f"naive={naive} == canonical={canonical}; "
+                        "no rollup double-count detected in sample window"
+                    ),
+                )
+            )
+
+    if not any_merged and not results:
+        return [
+            CheckResult(
+                check="merged_pr_count_consistency",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no merged completions in sample window",
+            )
+        ]
+
     return results

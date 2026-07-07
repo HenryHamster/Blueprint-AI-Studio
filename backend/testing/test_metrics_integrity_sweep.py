@@ -174,6 +174,7 @@ def test_registry_contains_initial_checks():
         "evidence_claim_reconciliation",
         "saturated_direction_with_nonmerge_productivity",
         "capability_claim_reconciliation",
+        "merged_pr_count_consistency",
     } <= names
 
 
@@ -3026,3 +3027,142 @@ def test_registry_contains_capability_claim_reconciliation():
     """The new check must be registered in the global registry."""
     names = {c.name for c in registered_checks()}
     assert "capability_claim_reconciliation" in names
+
+
+# --- Check: merged_pr_count_consistency --------------------------------------
+
+
+def _mpc_ctx(db, **kwargs):
+    return SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode=kwargs.get("mode", "observe"),
+        max_projects=kwargs.get("max_projects", 25),
+        sample_limit=kwargs.get("sample_limit", 200),
+        window_days=kwargs.get("window_days", 14),
+    )
+
+
+async def _merged_task(db, project, *, parent_task_id=None) -> Task:
+    """A COMPLETED merged task; optionally a rollup parent (has children pointing at it)."""
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={"landed_on_integration": True, "pr_merged": True},
+        parent_task_id=parent_task_id,
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+async def _unmerged_task(db, project) -> Task:
+    """A COMPLETED but unmerged task."""
+    t = Task(
+        project_id=project.id,
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context={},
+    )
+    db.add(t)
+    await db.commit()
+    await db.refresh(t)
+    return t
+
+
+def test_registry_contains_merged_pr_count_consistency():
+    names = {c.name for c in registered_checks()}
+    assert "merged_pr_count_consistency" in names
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_flags_rollup_double_count(db):
+    """Rollup parent + children all merged → naive=3, canonical=2, delta=1."""
+    project = await _project(db)
+
+    # Seed a rollup parent and two children. The parent task will be identified
+    # as a parent because other tasks carry parent_task_id pointing at it.
+    parent = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent.id)
+    await _merged_task(db, project, parent_task_id=parent.id)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    f = flagged[0]
+    assert f.check == "merged_pr_count_consistency"
+    # naive = 3 (parent + 2 children), canonical = 2 (children only)
+    assert f.self_reported == 3
+    assert f.ground_truth == 2
+    assert f.delta == 1
+    assert f.severity == "warn"
+    assert f.subject == str(project.id)
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_ok_when_no_rollup_parents(db):
+    """Two independent merged tasks with no parent links → OK, delta=0."""
+    project = await _project(db)
+    await _merged_task(db, project)
+    await _merged_task(db, project)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    assert all(not r.flagged for r in results), results
+    ok = [r for r in results if r.status == CheckStatus.OK]
+    assert len(ok) == 1
+    assert ok[0].delta == 0
+    assert ok[0].self_reported == 2
+    assert ok[0].ground_truth == 2
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_skips_when_no_merged_tasks(db):
+    """Completed but unmerged tasks → SKIPPED."""
+    project = await _project(db)
+    await _unmerged_task(db, project)
+    await _unmerged_task(db, project)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    assert all(not r.flagged for r in results), results
+    assert any(r.status == CheckStatus.SKIPPED for r in results)
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_is_flag_only(db):
+    """The check must never mutate any audited task row."""
+    project = await _project(db)
+    parent = await _merged_task(db, project)
+    child = await _merged_task(db, project, parent_task_id=parent.id)
+
+    before_parent_ctx = dict(parent.context or {})
+    before_child_ctx = dict(child.context or {})
+
+    await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+
+    await db.refresh(parent)
+    await db.refresh(child)
+    assert parent.context == before_parent_ctx
+    assert child.context == before_child_ctx
+
+
+@pytest.mark.asyncio
+async def test_merged_pr_count_consistency_multiple_parents_inflates_delta(db):
+    """Two rollup parents each with children → delta=2."""
+    project = await _project(db)
+
+    parent1 = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent1.id)
+
+    parent2 = await _merged_task(db, project)
+    await _merged_task(db, project, parent_task_id=parent2.id)
+
+    results = await mis.check_merged_pr_count_consistency(_mpc_ctx(db))
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, results
+    f = flagged[0]
+    # naive=4 (2 parents + 2 children), canonical=2 (children only)
+    assert f.self_reported == 4
+    assert f.ground_truth == 2
+    assert f.delta == 2

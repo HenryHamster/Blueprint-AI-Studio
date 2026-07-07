@@ -4178,11 +4178,18 @@ async def _finalize_qualification(
             _completion_debt_scoring_snapshot["project_actionable_open"] = (
                 _project_actionable_open
             )
-    _debt_pressure_score: float | None = (
-        _score_completion_debt_pressure(_completion_debt_scoring_snapshot)
-        if _completion_debt_scoring_snapshot is not None
-        else None
-    )
+    if _completion_debt_scoring_snapshot is not None:
+        _debt_pressure_score: float | None = _score_completion_debt_pressure(
+            _completion_debt_scoring_snapshot
+        )
+    elif _resolve_completion_debt_weight_mode() == "enforce":
+        # In enforce mode a failed debt-snapshot read must NOT inflate confidence
+        # by silently dropping the (1 - w_debt) down-scaling inside
+        # compute_composite.  Use 0.0 (maximum-debt worst case) so the composite
+        # is still bounded correctly instead of being quietly over-scored.
+        _debt_pressure_score = 0.0
+    else:
+        _debt_pressure_score = None
 
     composite = compute_composite(
         ci_green=ci_green,

@@ -2043,7 +2043,12 @@ async def _update_direction_research_outcomes(
         research_task_obj is not None and research_task_obj.status == TaskStatus.FAILED
     )
     sd_staging_only = sum(
-        1 for ct in child_tasks_rows if is_merged_completion(ct) and rollup_failed
+        1
+        for ct in child_tasks_rows
+        if rollup_failed
+        and ct.status == TaskStatus.COMPLETED
+        and has_merge_unblock_signal(ct)
+        and not is_merged_completion(ct)
     )
     entry["stage_dropout"] = {
         "tasks_failed_code_error": sd_code_error,

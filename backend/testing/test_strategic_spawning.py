@@ -11494,6 +11494,70 @@ async def test_rolling_rates_exclude_rollup_children(db_session):
 
 
 @pytest.mark.asyncio
+async def test_window_merge_rate_population_consistent_with_rollup_children(db_session):
+    """Both numerator and denominator of merge_rate count only root tasks.
+
+    When a rollup parent and its children all complete in the same window,
+    the merge_rate denominator ('finished') must count only root tasks,
+    consistent with the numerator ('merged'). If the denominator included
+    rollup children, the rate would be artificially deflated: 1 root merged
+    over 3 total (parent + 2 children) = 33% instead of 1 root over 1 root = 100%.
+    """
+    project = _make_project(vision={"purpose": "test"})
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Rollup parent — merged to integration branch
+    parent = Task(
+        project_id=project.id,
+        title="Rollup parent",
+        description="rollup",
+        payloads=[{"type": "create"}],
+        vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+        status=TaskStatus.COMPLETED,
+        created_by="ORCHESTRATOR",
+        context={"pr_merged": True},
+    )
+    db_session.add(parent)
+    await db_session.flush()
+
+    # Two rollup children — each merged to staging only
+    for i in range(2):
+        child = Task(
+            project_id=project.id,
+            title=f"Child fix {i}",
+            description="child",
+            payloads=[{"type": "create"}],
+            vm_instance_id=f"agent-vm-{uuid.uuid4().hex}",
+            status=TaskStatus.COMPLETED,
+            created_by="ORCHESTRATOR",
+            parent_task_id=parent.id,
+            context={"pr_merged": True},
+        )
+        db_session.add(child)
+    await db_session.commit()
+
+    result = await _build_recent_interventions(project, db_session)
+    rates = result["rolling_rates"]
+
+    # merged should be 1 (root parent only)
+    assert rates["last_7d"]["merged"] == 1, (
+        f"Expected 1 merged (root task only), got {rates['last_7d']['merged']}"
+    )
+    # finished should also be 1 (root parent only), NOT 3 (parent + 2 children)
+    assert rates["last_7d"]["finished"] == 1, (
+        f"Expected 1 finished (root task only), got {rates['last_7d']['finished']}. "
+        "Denominator must exclude rollup children for consistent merge_rate."
+    )
+    # merge_rate should be 1.0 (100%), NOT 0.333 (33%)
+    assert rates["last_7d"]["merge_rate"] == 1.0, (
+        f"Expected 100% merge_rate, got {rates['last_7d']['merge_rate'] * 100}%. "
+        "Rate is deflated when denominator counts rollup children."
+    )
+
+
+@pytest.mark.asyncio
 async def test_active_counts_include_old_inflight_tasks_outside_lookback(db_session):
     """Current in-flight work is counted even when the task predates the lookback window."""
     project = _make_project(

@@ -9644,3 +9644,97 @@ async def test_compute_experiment_spend_included_in_direction_cost_rollup(
         f"running ComputeJob should not inflate estimated_cost_usd, "
         f"got {entry2['estimated_cost_usd']!r}"
     )
+
+
+@pytest.mark.asyncio
+async def test_tasks_merged_staging_only_counts_staged_not_landed_children(
+    db_session: AsyncSession,
+):
+    """tasks_merged_staging_only counts merges to staging-only, not landed on integration.
+
+    When a research task FAILED, we need to track how many of its children merged
+    to a staging/rollup branch but did NOT land on the integration branch. This is
+    distinct from children that fully landed on integration (landed_on_integration=True).
+
+    The metric should count children with:
+    - status == COMPLETED
+    - pr_merged=True (merged somewhere, possibly staging)
+    - NOT landed_on_integration (or marked as non-merge)
+
+    It should NOT count children that:
+    - Fully landed on integration (is_merged_completion returns True)
+    - Never merged at all
+    """
+    direction_id = "d-staging-only"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    # Mark the research task as FAILED so staging-only should be counted
+    research_task.status = TaskStatus.FAILED
+    await db_session.flush()
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=4)
+    ]
+    await db_session.flush()
+
+    # Child 1: merged to staging only (pr_merged=True, landed_on_integration=False)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="staging-only-1",
+    )
+
+    # Child 2: another staging-only merge (pr_merged=True, landed_on_integration=False)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": False},
+        title="staging-only-2",
+    )
+
+    # Child 3: fully landed on integration (should NOT count as staging-only)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True},
+        title="fully-landed",
+    )
+
+    # Child 4: never merged at all (should NOT count)
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={},  # no pr_merged
+        title="no-merge",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # tasks_merged_staging_only should count only the 2 staging-only merges
+    assert entry["stage_dropout"]["tasks_merged_staging_only"] == 2, (
+        f"expected 2 staging-only merges, got {entry['stage_dropout']['tasks_merged_staging_only']}"
+    )
+    # Verify prs_merged only counts fully-landed merges (not staging-only)
+    assert entry["prs_merged"] == 1, (
+        f"expected 1 fully-landed merge, got {entry['prs_merged']}"
+    )

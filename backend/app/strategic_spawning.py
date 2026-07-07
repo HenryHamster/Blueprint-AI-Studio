@@ -2758,7 +2758,7 @@ async def _build_recent_interventions(
     _TERMINAL = (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
 
     def _window_counts(tasks: list[Task], since: datetime) -> dict[str, Any]:
-        """Count *terminal* tasks that reached their final state within the window.
+        """Count *terminal* root tasks that reached their final state within the window.
 
         Filtering by terminal-updated-in-window instead of created-in-window
         avoids the in-flight bias that would otherwise make short windows
@@ -2769,6 +2769,11 @@ async def _build_recent_interventions(
         biggest victims. "merged/finished" answers the operator question
         "of the work that landed or failed in this window, what fraction
         succeeded?" — the number they actually want to read.
+
+        Both numerator (merged) and denominator (finished) count only root tasks
+        (parent_task_id is None), excluding rollup children whose pr_merged status
+        reflects integration into a staging branch, not the integration branch itself.
+        This ensures the merge_rate reflects the actual integration-landing rate.
         """
         from app.time_utils import _to_naive_utc
 
@@ -2786,15 +2791,19 @@ async def _build_recent_interventions(
             updated_at = _to_naive_utc(t.updated_at) or created_at
             if not updated_at or (since_naive and updated_at < since_naive):
                 continue
+            # Count only root tasks (parent_task_id is None). Rollup children should
+            # not be counted in the denominator: their pr_merged=True means they landed
+            # on a staging branch, not the integration branch, so they are not actual
+            # integration-landing work. Both numerator and denominator must count the
+            # same population for a valid merge_rate calculation.
+            if t.parent_task_id is not None:
+                continue
             finished += 1
-            # Count only integration-landed merges: root tasks (parent_task_id is None)
-            # whose PR merged directly to the integration branch. Child tasks (rollup
-            # members) have pr_merged=True when their PR lands on the rollup staging
-            # branch — not on the integration branch — so they must not be counted here.
+            # Count only integration-landed merges: root tasks whose PR merged
+            # directly to the integration branch.
             if (
                 t.status == TaskStatus.COMPLETED
                 and (t.context or {}).get("pr_merged")
-                and t.parent_task_id is None
             ):
                 merged += 1
         rate = round(merged / finished, 3) if finished > 0 else None

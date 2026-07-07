@@ -33409,6 +33409,128 @@ async def test_finalize_logs_completion_debt_snapshot_fetch_failure(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_enforce_mode_debt_read_failure_does_not_inflate_confidence(
+    db_session, mocker
+):
+    """NAMED ACCEPTANCE TEST — enforce mode debt-read failure must not inflate confidence.
+
+    When completion_debt_weight_mode='enforce' and the debt-snapshot fetch raises,
+    _finalize_qualification must NOT silently drop the (1 - w_debt) down-scaling
+    that compute_composite applies in enforce mode.  Without the fix, a None
+    debt_pressure_score causes compute_composite to skip the scaling entirely,
+    producing confidence == existing_confidence instead of the correctly bounded
+    (1 - w_debt) * existing_confidence + w_debt * debt_pressure value.
+
+    Verified by comparing:
+      - enforce_confidence_fail: confidence when debt fetch raises (post-fix = 0.0 pressure)
+      - enforce_confidence_clean: confidence when debt fetch returns zero debt (pressure = 1.0)
+
+    Post-fix: the failed-read path MUST produce confidence <= the zero-debt
+    clean path, because 0.0 pressure pulls confidence down via the blend.
+    Pre-fix: the failed-read path produced confidence > the clean path because
+    the down-scaling was silently skipped.
+    """
+    from app import shared_state
+    from importlib import import_module as original_import
+
+    _enforce_weight = 0.15  # DEFAULT_ENFORCE_COMPLETION_DEBT_WEIGHT
+
+    def _make_cfg():
+        return {
+            "promotion_enabled": False,
+            "completion_debt_weight_mode": "enforce",
+            "promotion_threshold": 0.90,
+            "promotion_weights": {
+                "audit": 0.40,
+                "test_erosion": 0.30,
+                "smoketest": 0.30,
+            },
+        }
+
+    _good_audit = {
+        "audit_score": 0.92,
+        "findings": [],
+        "test_erosion": {
+            "deleted_test_files": [],
+            "assertion_delta": 0,
+            "test_count_delta": 0,
+        },
+    }
+    _good_smoke = {
+        "passed": True,
+        "tests": [{"name": "s", "status": "pass"}],
+        "suites": {"startup": {"passed": True}},
+    }
+
+    # --- Arm 1: debt snapshot fetch raises --------------------------------
+    mocker.patch.dict(shared_state.runtime_config, _make_cfg(), clear=False)
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session, project, version, audit_logs=_good_audit, smoke_logs=_good_smoke
+    )
+
+    def _fail_import(name, *args, **kwargs):
+        if "completion_debt" in name:
+            raise RuntimeError("simulated debt-module failure")
+        return original_import(name, *args, **kwargs)
+
+    mocker.patch("importlib.import_module", new=_fail_import)
+
+    _ci_pre_gates = _clean_finalize_pre_gates(rq._CI_GREEN, ci_green=True)
+
+    result_fail = await rq._finalize_qualification(
+        db_session,
+        version,
+        _pre_gates=_ci_pre_gates,
+    )
+    enforce_confidence_fail = result_fail["confidence"]
+
+    # --- Arm 2: debt snapshot succeeds with zero open debt ----------------
+    # Reset the mock so the real module is importable again.
+    mocker.stopall()
+    mocker.patch.dict(shared_state.runtime_config, _make_cfg(), clear=False)
+
+    project2, version2 = await _make_project_and_version(db_session, phase="stabilize")
+    await _seed_qualification_children(
+        db_session, project2, version2, audit_logs=_good_audit, smoke_logs=_good_smoke
+    )
+
+    # Empty debt snapshot → pressure = 1.0 (no open items).
+    _mock_cd_zero = MagicMock()
+    _mock_cd_zero.get_open_completion_debt = AsyncMock(return_value={"total_open": 0})
+    mocker.patch.dict("sys.modules", {"app.completion_debt": _mock_cd_zero})
+    mocker.patch("app.release_qualifier.promote", new=AsyncMock())
+
+    result_clean = await rq._finalize_qualification(
+        db_session,
+        version2,
+        _pre_gates=_clean_finalize_pre_gates(rq._CI_GREEN, ci_green=True),
+    )
+    enforce_confidence_clean = result_clean["confidence"]
+
+    # Post-fix: a failed read is treated as maximum debt (pressure=0.0), so its
+    # confidence must be STRICTLY LESS than the clean zero-debt run (pressure=1.0).
+    assert enforce_confidence_fail < enforce_confidence_clean, (
+        f"Enforce-mode debt-read failure inflated confidence: "
+        f"fail={enforce_confidence_fail} should be < clean={enforce_confidence_clean}. "
+        f"The (1 - w_debt) down-scaling was skipped when debt fetch raised."
+    )
+
+    # The failed-read confidence must equal the formula for 0.0 pressure:
+    # (1 - w_debt) * existing_confidence + w_debt * 0.0
+    # existing_confidence with a clean zero-debt (pressure=1.0) equals
+    # (1 - w_debt) * existing_confidence + w_debt * 1.0, so:
+    # failed_confidence = clean_confidence - w_debt (the pure-debt term drops)
+    assert enforce_confidence_fail == pytest.approx(
+        enforce_confidence_clean - _enforce_weight, abs=1e-3
+    ), (
+        f"Failed-read confidence {enforce_confidence_fail} does not match expected "
+        f"formula: clean {enforce_confidence_clean} - weight {_enforce_weight}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_finalize_logs_actionable_open_count_failure(db_session, mocker, caplog):
     """Finalize logs when actionable-open count fails, then continues."""
     from app import shared_state
