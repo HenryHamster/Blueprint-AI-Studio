@@ -1113,6 +1113,11 @@ def _is_blueprint_self_repo(project) -> bool:
     Catches both the correctly-flagged case (``is_self_repo=True``) and the
     historically-broken case where ``is_self_repo`` is misset False but the
     GitHub repo name is a known Blueprint alias.
+
+    INTENTIONALLY EXEMPT from deploy-identity de-gating: this is_self_repo read
+    is a deliberate fallback for namespace-alias resolution (GitHub name matching),
+    not deploy-level observability. Must remain as-is to preserve historical
+    incident recovery for misset is_self_repo flags (2026-05-26..28).
     """
     if getattr(project, "is_self_repo", False):
         return True

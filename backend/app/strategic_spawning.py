@@ -2151,6 +2151,9 @@ _STRATEGIC_REVIEW_SCHEMA: dict[str, dict] = {
     "research_mode": {"priority": "critical"},
     "project_name": {"priority": "critical"},
     "base_branch": {"priority": "critical"},
+    # Non-behavioral schema key registration for serialized payload field (not a
+    # self-repo gate). Exempt from deploy-identity de-gating: registering the
+    # priority tier of the packed is_self_repo field, not reading project.is_self_repo.
     "is_self_repo": {"priority": "critical"},
     "enable_self_improvement": {"priority": "critical"},
     "model": {"priority": "critical"},
