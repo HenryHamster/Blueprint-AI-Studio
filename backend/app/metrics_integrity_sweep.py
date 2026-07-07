@@ -2625,3 +2625,103 @@ async def check_evidence_claim_reconciliation(
             )
         ]
     return results
+
+
+@register_check(
+    "saturated_direction_with_nonmerge_productivity",
+    "Detect directions marked possibly_saturated that carry recent non-merge "
+    "productive outcomes (verified merges, acceptance evidence) — flags the "
+    "self-reported stale saturation state.",
+)
+async def check_saturated_direction_with_nonmerge_productivity(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Ground truth: a direction marked possibly_saturated should not simultaneously
+    carry evidence of recent non-merge productive outcomes (verification verdicts,
+    acceptance evidence). When this contradiction exists, the saturation flag is
+    stale — productivity has been recorded but not credited by the classifier.
+
+    Non-merge productivity indicators in research_history:
+    - verified_prs_merged > 0 (CI-verified merge verdicts)
+    - acceptance_proven_merged > 0 (proof evidence accumulated)
+    - acceptance_verified_merged > 0 (verified acceptance evidence)
+
+    These are "non-merge" outcomes in the sense that the productivity does not
+    come from newly-spawned child tasks, but from verification / proof cycles
+    on existing direction state — exactly the pattern the fix (#13378) credits.
+
+    Flag-only: never mutates direction data. Bounded to max_projects projects.
+    """
+    from app.models import Project
+
+    projects = (
+        await ctx.session.execute(
+            select(Project.id, Project.directions).limit(ctx.max_projects)
+        )
+    ).all()
+    if not projects:
+        return [
+            CheckResult(
+                check="saturated_direction_with_nonmerge_productivity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no projects to audit",
+            )
+        ]
+
+    results: List[CheckResult] = []
+    for project_id, directions in projects:
+        pid = str(project_id)
+        for d in directions or []:
+            if not d.get("possibly_saturated"):
+                continue
+
+            # Check for non-merge productive outcomes in recent research_history
+            history = d.get("research_history") or []
+            has_nonmerge_outcome = False
+            detail_parts: List[str] = []
+
+            for entry in history:
+                verified = int(entry.get("verified_prs_merged") or 0)
+                acceptance_proven = int(entry.get("acceptance_proven_merged") or 0)
+                acceptance_verified = int(entry.get("acceptance_verified_merged") or 0)
+
+                if verified > 0 or acceptance_proven > 0 or acceptance_verified > 0:
+                    has_nonmerge_outcome = True
+                    if verified > 0:
+                        detail_parts.append(f"verified={verified}")
+                    if acceptance_proven > 0:
+                        detail_parts.append(f"proven={acceptance_proven}")
+                    if acceptance_verified > 0:
+                        detail_parts.append(f"verified_evidence={acceptance_verified}")
+                    break  # Found at least one; enough to flag
+
+            if has_nonmerge_outcome:
+                direction_id = d.get("id", "unknown")
+                results.append(
+                    CheckResult(
+                        check="saturated_direction_with_nonmerge_productivity",
+                        status=CheckStatus.FLAGGED,
+                        self_reported=1,
+                        ground_truth=0,
+                        delta=1,
+                        severity="warn",
+                        subject=pid,
+                        detail=(
+                            f"direction {direction_id} marked possibly_saturated but has "
+                            f"recent non-merge productive outcomes: {', '.join(detail_parts[:2])}"
+                        ),
+                    )
+                )
+
+    if not results:
+        return [
+            CheckResult(
+                check="saturated_direction_with_nonmerge_productivity",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no saturated directions with non-merge productivity found",
+            )
+        ]
+
+    return results

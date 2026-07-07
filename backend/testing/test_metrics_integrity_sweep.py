@@ -172,6 +172,7 @@ def test_registry_contains_initial_checks():
         "acceptance_window_sub_scores_invariant",
         "undeclared_test_cochange_coverage_split",
         "evidence_claim_reconciliation",
+        "saturated_direction_with_nonmerge_productivity",
     } <= names
 
 
@@ -2614,3 +2615,184 @@ async def test_evidence_claim_reconciliation_skips_gaps_without_refs(db):
         r.status == CheckStatus.SKIPPED and "no gaps carry" in r.detail
         for r in results
     )
+
+
+# --- Check: saturated_direction_with_nonmerge_productivity -------------------
+
+
+@pytest.mark.asyncio
+async def test_flags_saturated_direction_with_recorded_nonmerge_productivity(db):
+    """A direction marked possibly_saturated but with recent non-merge productive
+    outcomes (verified merges, acceptance evidence) is flagged — the saturation
+    marker is stale or productivity was not properly credited.
+
+    This is the named acceptance test validating that the guard check detects
+    when the self-reported saturation state diverges from actual recorded
+    productivity, the regression class that the fix (#13378) closes.
+    """
+    project = await _project(db)
+
+    # Create a direction marked possibly_saturated with recent non-merge productivity.
+    # Non-merge productivity: verified merges + acceptance evidence without new tasks.
+    project.directions = [
+        {
+            "id": "d-saturated-productive",
+            "possibly_saturated": True,
+            "last_cycle_productive": False,  # marked unproductive
+            "consecutive_unproductive_cycles": 4,  # multiple consecutive unproductive
+            "research_history": [
+                {
+                    "task_id": "xxxxxxxx-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 1,  # CI-verified merge verdict
+                    "acceptance_proven_merged": 1,  # acceptance evidence recorded
+                    "tasks_created": 0,  # but no child tasks spawned (non-merge productivity)
+                },
+                {
+                    "task_id": "xxxxxxxx-0000-0000-0000-000000000002",
+                    "verified_prs_merged": 0,
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    # Run the check.
+    ctx = SweepContext(
+        session=db,
+        now=_utcnow(),
+        mode="observe",
+        max_projects=25,
+        sample_limit=200,
+        window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # Verify the check flags this contradiction.
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1, f"expected 1 flagged result, got {results}"
+    f = flagged[0]
+    assert f.check == "saturated_direction_with_nonmerge_productivity"
+    assert f.status == CheckStatus.FLAGGED
+    assert f.subject == str(project.id)
+    assert f.delta == 1  # one flagged direction
+    assert "possibly_saturated" in f.detail
+    assert "verified" in f.detail or "proven" in f.detail
+    assert "d-saturated-productive" in f.detail
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_ok_when_no_productivity(db):
+    """A direction marked possibly_saturated with no recorded productivity → OK.
+
+    The saturation flag is consistent with the recorded state when no
+    non-merge outcomes exist in the recent history.
+    """
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-truly-saturated",
+            "possibly_saturated": True,
+            "research_history": [
+                {
+                    "task_id": "yyyyyyyy-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 0,  # no verification
+                    "acceptance_proven_merged": 0,  # no acceptance evidence
+                    "tasks_created": 0,  # no child tasks
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # No contradiction → not flagged.
+    assert all(not r.flagged for r in results)
+    # Should be SKIPPED since the direction is saturated but has no productivity.
+    skipped = [r for r in results if r.status == CheckStatus.SKIPPED]
+    assert len(skipped) == 1
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_skips_non_saturated(db):
+    """Directions not marked possibly_saturated are skipped — they are not audited."""
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-active",
+            "possibly_saturated": False,  # not saturated
+            "research_history": [
+                {
+                    "verified_prs_merged": 3,  # has productivity
+                    "acceptance_proven_merged": 2,
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    # Non-saturated directions are not audited — result is SKIPPED.
+    assert len(results) == 1
+    assert results[0].status == CheckStatus.SKIPPED
+    assert "no saturated directions" in results[0].detail
+
+
+@pytest.mark.asyncio
+async def test_saturated_direction_with_nonmerge_productivity_checks_acceptance_verified(db):
+    """A saturated direction with acceptance_verified_merged > 0 is flagged.
+
+    Acceptance evidence (both proven and verified) counts as non-merge
+    productivity that contradicts the saturation flag.
+    """
+    project = await _project(db)
+    project.directions = [
+        {
+            "id": "d-saturated-verified-acceptance",
+            "possibly_saturated": True,
+            "research_history": [
+                {
+                    "task_id": "zzzzzzzz-0000-0000-0000-000000000001",
+                    "verified_prs_merged": 0,  # no merge verification
+                    "acceptance_verified_merged": 2,  # verified acceptance evidence
+                    "tasks_created": 0,
+                },
+            ],
+        }
+    ]
+    from sqlalchemy.orm.attributes import flag_modified
+    flag_modified(project, "directions")
+    db.add(project)
+    await db.commit()
+
+    ctx = SweepContext(
+        session=db, now=_utcnow(), mode="observe",
+        max_projects=25, sample_limit=200, window_days=14,
+    )
+    results = await mis.check_saturated_direction_with_nonmerge_productivity(ctx)
+
+    flagged = [r for r in results if r.flagged]
+    assert len(flagged) == 1
+    f = flagged[0]
+    assert "possibly_saturated" in f.detail
+    assert "verified_evidence" in f.detail or "acceptance" in f.detail.lower()

@@ -53,7 +53,7 @@ from app.task_evaluators import (
     spawn_finding_challenge,
     spawn_forward_quality_grader,
 )
-from app.research_completion import _is_high_stakes_finding
+from app.research_completion import _is_high_stakes_finding, _compute_direction_productivity
 from app.time_utils import _utcnow
 
 
@@ -16396,3 +16396,83 @@ async def test_zero_children_note_idempotent_on_replay(db_session):
         f"All notes: {notes_second}"
     )
     assert matching_notes_second[0].get("added_by_task") == str(task.id)
+
+
+class TestVerificationOnlyCycleProductivity:
+    """_compute_direction_productivity: verification-only cycles are credited productive."""
+
+    def test_verification_only_cycle_credited_productive_short_refractory(self):
+        """A cycle with only non-spawning findings and zero child tasks is productive.
+
+        Prevents live-verification sweeps and metadata-only research cycles from
+        incurring the extended unproductive refractory window (90-240 min) when they
+        confirmed system state without spawning implementation tasks.
+        """
+        from app.direction_refractory import (
+            resolve_direction_refractory_minutes,
+            stamp_direction_refractory,
+        )
+
+        direction_id = "dir-verify-only"
+        direction = {
+            "id": direction_id,
+            "last_cycle_productive": False,
+            "consecutive_unproductive_cycles": 2,
+        }
+
+        # Simulate: agent produced only design_doc_observation findings (no child tasks)
+        productive = _compute_direction_productivity(
+            direction_id=direction_id,
+            tasks_by_dir={},  # no child tasks spawned
+            current_direction_id=direction_id,
+            has_non_spawn_findings=True,  # but non-spawning findings exist
+        )
+
+        assert productive is True, (
+            "A verification-only cycle (non-spawning findings, zero child tasks) "
+            "must be credited productive to avoid an extended refractory window"
+        )
+
+        # Applying the productive verdict should reset the consecutive counter and
+        # produce the short productive cooldown (default 45 min), not the extended
+        # 90-240 min unproductive window.
+        direction["last_cycle_productive"] = True
+        direction["consecutive_unproductive_cycles"] = 0
+        stamp_direction_refractory(direction)
+
+        refractory_minutes = resolve_direction_refractory_minutes(direction)
+        # productive_direction_cooldown_minutes defaults to 45
+        assert refractory_minutes == _pytest.approx(45.0), (
+            f"Expected productive cooldown ~45 min, got {refractory_minutes:.1f} min. "
+            "Verification-only cycles must not receive the extended unproductive window."
+        )
+
+    def test_zero_tasks_zero_non_spawn_findings_is_unproductive(self):
+        """A cycle with no findings of any kind is not productive (existing behavior)."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-1",
+            tasks_by_dir={},
+            current_direction_id="dir-1",
+            has_non_spawn_findings=False,
+        )
+        assert productive is False
+
+    def test_spawned_tasks_make_cycle_productive_regardless_of_non_spawn(self):
+        """Spawning child tasks makes the cycle productive (existing behavior preserved)."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-1",
+            tasks_by_dir={"dir-1": 2},
+            current_direction_id="dir-1",
+            has_non_spawn_findings=False,
+        )
+        assert productive is True
+
+    def test_non_spawn_findings_do_not_credit_other_directions(self):
+        """Non-spawning findings for current_direction_id do not credit a sibling direction."""
+        productive = _compute_direction_productivity(
+            direction_id="dir-other",
+            tasks_by_dir={},
+            current_direction_id="dir-primary",
+            has_non_spawn_findings=True,
+        )
+        assert productive is False

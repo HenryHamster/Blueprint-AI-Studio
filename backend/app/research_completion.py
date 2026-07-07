@@ -934,6 +934,26 @@ _NON_SPAWNING_FINDING_TYPES = frozenset(
     }
 )
 
+def _compute_direction_productivity(
+    direction_id: str,
+    tasks_by_dir: dict[str, int],
+    current_direction_id: str | None,
+    has_non_spawn_findings: bool,
+) -> bool:
+    """Return True when a direction's research cycle should be credited productive.
+
+    A cycle is productive when it spawns >=1 child task for that direction OR
+    when it produces non-spawning findings (verification/metadata types such as
+    design_doc_observation, direction_note, or direction_proposal) for the
+    current direction.  Crediting verification-only cycles prevents live-verification
+    sweeps and concluded design/research cycles from incurring the longer unproductive
+    refractory window.
+    """
+    if tasks_by_dir.get(direction_id, 0) > 0:
+        return True
+    return has_non_spawn_findings and direction_id == current_direction_id
+
+
 # Research findings only seed a reproduce-on-HEAD verdict when the finding is an
 # explicit defect claim. Other finding types (feature/improvement/refactor/etc.)
 # keep the legacy "no verdict" semantics so merged implementation work still
@@ -5849,6 +5869,15 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
     if touched_dir_ids:
 
         _productivity_task_id = str(task.id)
+        # Verification-only cycles produce non-spawning findings (design_doc_observation,
+        # direction_note, direction_proposal, etc.) with zero child tasks.  These are still
+        # productive — the agent confirmed system state or updated direction metadata.
+        # direction_proposals and direction_notes were split out of findings at line 1761.
+        _has_non_spawn_findings = bool(
+            direction_proposals
+            or direction_notes
+            or any(f.get("type") in _NON_SPAWNING_FINDING_TYPES for f in findings)
+        )
 
         def _update_productivity(dirs: list) -> None:
             for d in dirs:
@@ -5857,7 +5886,9 @@ async def _handle_research_completion(task: Task, logs: str, session: AsyncSessi
                     if d.get("_last_productivity_task_id") == _productivity_task_id:
                         continue
                     d["_last_productivity_task_id"] = _productivity_task_id
-                    productive = tasks_by_dir.get(did, 0) > 0
+                    productive = _compute_direction_productivity(
+                        did, tasks_by_dir, current_direction_id, _has_non_spawn_findings
+                    )
                     d["last_cycle_productive"] = productive
                     if productive:
                         d["consecutive_unproductive_cycles"] = 0
