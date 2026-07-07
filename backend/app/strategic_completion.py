@@ -3365,7 +3365,10 @@ def record_retired_direction_memory(
         _bounded = str(outcome).strip()[:_RETIRED_OUTCOME_CHAR_CAP]
         if _bounded:
             entry["outcome"] = _bounded
-    existing = list(vision.get("_recently_retired_directions") or [])
+    existing = [
+        e for e in (vision.get("_recently_retired_directions") or [])
+        if not entry["id"] or e.get("id") != entry["id"]
+    ]
     existing.append(entry)
     vision["_recently_retired_directions"] = existing[-_RETIRED_MEMORY_CAP:]
 

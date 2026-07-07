@@ -2205,6 +2205,72 @@ async def test_scope_breakdown_avg_expansion_ratio(db_session: AsyncSession):
 
 
 @pytest.mark.asyncio
+async def test_avg_expansion_ratio_merged_counts_only_merged(db_session: AsyncSession):
+    """avg_expansion_ratio_merged must reflect only merged tasks, not all completed.
+
+    A merged task (pr_merged=True) and a non-merged completed task (no pr_merged,
+    i.e. a rejected/no-op completion) with different expansion ratios must produce:
+      - avg_expansion_ratio_merged == mean over the merged task only
+      - avg_expansion_ratio (general) == mean over both completed tasks
+    """
+    direction_id = "d-expand-merged-only"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=2)
+    ]
+    await db_session.flush()
+
+    # Merged task: 1 related file, 4 changed files → ratio 4.0
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "scope": "small",
+            "related_files": ["a.py"],
+            "_pr_changed_files": ["a.py", "b.py", "c.py", "d.py"],
+        },
+        payloads=[{"type": "create"}],
+        title="merged-task",
+    )
+    # Non-merged completed task (rejected/no-op): 1 related file, 2 changed → ratio 2.0
+    # pr_merged absent → is_merged_completion returns False → must NOT count in _merged avg
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "scope": "small",
+            "related_files": ["x.py"],
+            "_pr_changed_files": ["x.py", "y.py"],
+        },
+        payloads=[{"type": "create"}],
+        title="non-merged-task",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    sb = project.directions[0]["research_history"][0]["scope_breakdown"]
+    # _merged only counts the merged task (ratio 4.0)
+    assert sb["small"]["avg_expansion_ratio_merged"] == 4.0
+    # general avg_expansion_ratio covers both completed tasks: (4.0 + 2.0) / 2 = 3.0
+    assert sb["small"]["avg_expansion_ratio"] == 3.0
+
+
+@pytest.mark.asyncio
 async def test_expansion_ratio_excludes_test_files(db_session: AsyncSession):
     """Test files in _pr_changed_files must not inflate the expansion ratio.
 

@@ -15996,3 +15996,115 @@ async def test_apply_post_spawn_state_research_history_idempotent_on_retry(db_se
         f"History: {history_second}"
     )
     assert history_second[0]["task_id"] == str(task.id)
+
+
+async def test_apply_post_spawn_state_outcome_progress_and_findings_idempotent_on_retry(db_session):
+    """Calling apply_post_spawn_state twice with same task_id must not duplicate
+    outcome_progress_history or recent_findings_evidence entries.
+
+    The fix wraps recent_findings_evidence and record_outcome_progress_snapshot
+    inside the task_id guard (research_direction_state.py line 898) so they are
+    only updated when the task_id is new. A post-commit retry with the same task
+    must leave outcome_progress_history and recent_findings_evidence with the same
+    entries as a single call — no duplicate cycle_index snapshot and no duplicated
+    finding evidence.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_finding, _make_research_task
+
+    direction_id = "d-idem-outcome-prog-retry"
+    direction = {
+        **_active_direction(direction_id, "Outcome progress idempotency test"),
+        "research_history": [],
+        "recent_findings_evidence": [],
+        "outcome_progress_history": [],
+    }
+    project = _Project(
+        name="Outcome Progress Idempotency Test",
+        user_id="test-user-outcome-prog-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    # Create finding with claims and sources so recent_findings_evidence populates
+    finding = _make_finding(title="Test Finding", direction_id=direction_id)
+    finding["claims"] = ["claim1", "claim2"]
+    finding["sources"] = [{"type": "file", "ref": "test.py:10"}]
+    deduplicated = [(0, finding, "test-hash")]
+
+    _call_args = (
+        db_session,
+        task,
+        [finding],      # findings
+        [],             # child_tasks (no children spawned, findings deduped)
+        deduplicated,   # deduplicated
+        [],             # insights
+        [],             # direction_notes
+        [],             # direction_proposals
+        1,              # hash_dedup_count
+        0,              # word_overlap_count
+        0,              # file_overlap_count
+        0,              # evidence_overlap_count
+        0,              # type_filtered_count
+        0,              # empty_prompt_count
+        "research-branch",
+        "main",
+        0,              # research_depth
+        None,           # parent_research_task_id
+    )
+
+    # First call: populate outcome_progress_history and recent_findings_evidence
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    dir_first = project.directions[0]
+    rfe_first = list(dir_first.get("recent_findings_evidence", []))
+    oph_first = list(dir_first.get("outcome_progress_history", []))
+    hist_first = list(dir_first.get("research_history", []))
+
+    # Record snapshots for comparison (independent of whether populated)
+    rfe_first_len = len(rfe_first)
+    oph_first_len = len(oph_first)
+    hist_first_len = len(hist_first)
+
+    # Second call: simulate post-commit retry — same task, same findings
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    dir_second = project.directions[0]
+    rfe_second = list(dir_second.get("recent_findings_evidence", []))
+    oph_second = list(dir_second.get("outcome_progress_history", []))
+    hist_second = list(dir_second.get("research_history", []))
+
+    # Verify idempotency: all three append-only lists must not grow on retry
+    assert len(hist_second) == hist_first_len, (
+        f"research_history duplicated on retry: "
+        f"expected {hist_first_len} entries, got {len(hist_second)}"
+    )
+    assert len(rfe_second) == rfe_first_len, (
+        f"recent_findings_evidence duplicated on retry: "
+        f"expected {rfe_first_len} entries, got {len(rfe_second)}. "
+        f"Before: {rfe_first}, After: {rfe_second}"
+    )
+    assert len(oph_second) == oph_first_len, (
+        f"outcome_progress_history duplicated on retry: "
+        f"expected {oph_first_len} entries, got {len(oph_second)}. "
+        f"Before: {oph_first}, After: {oph_second}"
+    )
+
+    # Verify entries are identical (not just same count)
+    assert rfe_second == rfe_first, (
+        "recent_findings_evidence entries differ on retry"
+    )
+    assert oph_second == oph_first, (
+        "outcome_progress_history entries differ on retry"
+    )

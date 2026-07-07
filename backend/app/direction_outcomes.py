@@ -2002,6 +2002,8 @@ async def _update_direction_research_outcomes(
     SCOPE_RANK = {"small": 0, "medium": 1, "large": 2}
     expansion_sums: dict = {}
     expansion_counts: dict = {}
+    expansion_merged_sums: dict = {}
+    expansion_merged_counts: dict = {}
     expansion_failed_sums: dict = {}
     expansion_failed_counts: dict = {}
     cplx_merged_sum: dict = {}
@@ -2131,6 +2133,13 @@ async def _update_direction_research_outcomes(
         prod_changed = [f for f in changed if not _is_test_file(f)]
         if related and prod_changed:
             ratio = len(prod_changed) / len(related)
+            if is_merged_completion(ct):
+                expansion_merged_sums[scope] = (
+                    expansion_merged_sums.get(scope, 0.0) + ratio
+                )
+                expansion_merged_counts[scope] = (
+                    expansion_merged_counts.get(scope, 0) + 1
+                )
             if ct.status == TaskStatus.COMPLETED:
                 expansion_sums[scope] = expansion_sums.get(scope, 0.0) + ratio
                 expansion_counts[scope] = expansion_counts.get(scope, 0) + 1
@@ -2146,9 +2155,14 @@ async def _update_direction_research_outcomes(
                 )
     for scope_key, count in expansion_counts.items():
         if count > 0:
-            avg = round(expansion_sums[scope_key] / count, 2)
-            scope_breakdown[scope_key]["avg_expansion_ratio"] = avg
-            scope_breakdown[scope_key]["avg_expansion_ratio_merged"] = avg
+            scope_breakdown[scope_key]["avg_expansion_ratio"] = round(
+                expansion_sums[scope_key] / count, 2
+            )
+    for scope_key, count in expansion_merged_counts.items():
+        if count > 0:
+            scope_breakdown[scope_key]["avg_expansion_ratio_merged"] = round(
+                expansion_merged_sums[scope_key] / count, 2
+            )
     for scope_key, count in expansion_failed_counts.items():
         if count > 0:
             _ensure_scope(scope_key)

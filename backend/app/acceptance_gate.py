@@ -195,18 +195,18 @@ def _paths_match(changed: str, declared: str) -> bool:
 
 
 def _merge_was_test_verified(task: Task) -> bool:
-    """Whether the merge was gated by a REAL test verdict (no fall-open).
+    """Whether the merge was gated by a REAL test verdict (fail-closed).
 
     The no-CI merge gate stamps ``review_loop["unverified_merge_reason"]`` when
-    it legitimately "falls open" and merges WITHOUT running real tests. Absence
-    of that reason means a real CI / test verdict gated the merge — i.e. a
-    ``named_test`` that ran green did so under genuine verification. Mirrors the
-    ``"verified"`` arm of :func:`app.landed_signal.merge_verification_status`
-    without requiring the task to already be a terminal merged completion.
+    it legitimately "falls open" and merges WITHOUT running real tests. Presence
+    of that reason (or an absent/malformed review_loop) means the merge was NOT
+    test-verified — returns False. Only returns True when review_loop is a dict
+    AND ``unverified_merge_reason`` is absent or empty, meaning a real CI / test
+    verdict gated the merge.
     """
     review_loop = (task.context or {}).get(REVIEW_LOOP_KEY)
     if not isinstance(review_loop, dict):
-        return True
+        return False
     reason = review_loop.get(UNVERIFIED_MERGE_REASON_KEY)
     return not (isinstance(reason, str) and reason)
 

@@ -3563,6 +3563,49 @@ async def test_spawn_periodic_task_enforce_mode_uses_runtime_categories(
         _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
 
 
+@pytest.mark.asyncio
+async def test_periodic_spawn_fails_closed_on_budget_snapshot_error_in_enforce_mode(
+    db_session, mocker
+):
+    """Periodic spawn fails CLOSED (blocks spawn) on budget snapshot error when mode==enforce."""
+    project = Project(
+        name="Periodic Budget Error",
+        user_id="test-user-123",
+        autonomous_enabled=True,
+        directions=[_active_direction("d-periodic-budget-error")],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    original_mode = _shared_state.runtime_config["autonomous_spawn_budget_mode"]
+    original_periodic = _shared_state.runtime_config.get("autonomous_periodic_tasks")
+    _shared_state.runtime_config["autonomous_spawn_budget_mode"] = "enforce"
+    _shared_state.runtime_config["autonomous_periodic_tasks"] = {
+        **(original_periodic or {}),
+        "review": {"enabled": True, "interval_hours": 1},
+    }
+
+    # Mock the budget snapshot computation to raise an exception
+    mocker.patch(
+        "app.autonomous_research.compute_autonomous_spawn_budget_snapshot",
+        side_effect=Exception("Database connection failed"),
+    )
+
+    try:
+        await _spawn_periodic_task(project, "review", db_session)
+
+        # Verify no task was spawned (failed closed)
+        result = await db_session.execute(
+            select(Task).where(Task.project_id == project.id)
+        )
+        assert len(result.scalars().all()) == 0, "Expected no task to be spawned when snapshot fails in enforce mode"
+    finally:
+        _shared_state.runtime_config["autonomous_spawn_budget_mode"] = original_mode
+        _shared_state.runtime_config["autonomous_periodic_tasks"] = original_periodic
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 5. _handle_research_completion — Depth Guard
 # ─────────────────────────────────────────────────────────────────────────────

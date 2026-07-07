@@ -245,6 +245,14 @@ def mark_landed_on_integration(task: Task) -> None:
     This is the canonical write for a *real* integration-branch merge. Callers
     that need the integration-vs-promotion-target guard should use
     :func:`apply_merged_landed_signal` instead, which routes through here.
+
+    Also records the code-task acceptance verdict when the task declared
+    acceptance evidence, so every integration-landing path (rollup propagation,
+    PR verification, backfill) produces a verdict — not only the
+    ``apply_merged_landed_signal`` path. Fail-safe: a verdict-recording failure
+    is logged and swallowed so it can never undo a real merge landing. Lazy
+    import avoids the module-load cycle (``acceptance_gate`` imports this module
+    for its constants).
     """
     ctx = {
         **(task.context or {}),
@@ -253,6 +261,16 @@ def mark_landed_on_integration(task: Task) -> None:
     }
     ctx.pop(NON_MERGE_UNBLOCK_REASON_KEY, None)
     task.context = ctx
+    try:
+        from app.acceptance_gate import record_code_acceptance_verdict
+
+        record_code_acceptance_verdict(task)
+    except Exception:  # noqa: BLE001 — verdict recording must never undo a real merge
+        logger.warning(
+            "[LANDED] code-acceptance verdict recording failed for task %s",
+            getattr(task, "id", None),
+            exc_info=True,
+        )
 
 
 def mark_unblocked_non_merge(task: Task, *, reason: str) -> None:
@@ -357,22 +375,8 @@ def apply_merged_landed_signal(
         )
     if landed_on_integration:
         mark_landed_on_integration(task)
-        # Augment the merge with the code-task acceptance gate: when the task
-        # DECLARED acceptance evidence, evaluate it now (the changed files and
-        # merge-verification reason are both on the task) and stamp the verdict
-        # durably so success scoring can consume it. Fail-safe: no declaration =>
-        # no key written, scoring unchanged. Lazy import avoids a module cycle
-        # (acceptance_gate imports this module for its constants).
-        try:
-            from app.acceptance_gate import record_code_acceptance_verdict
-
-            record_code_acceptance_verdict(task)
-        except Exception:  # noqa: BLE001 — gating must never undo a real merge
-            logger.warning(
-                "[LANDED] code-acceptance verdict recording failed for task %s",
-                getattr(task, "id", None),
-                exc_info=True,
-            )
+        # Note: record_code_acceptance_verdict is now called inside
+        # mark_landed_on_integration so every landing path records the verdict.
         try:
             from app.capability_proof import record_capability_proof
 

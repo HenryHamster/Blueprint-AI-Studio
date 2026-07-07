@@ -50,8 +50,14 @@ def _make_code_task(
     context: dict = {}
     if changed_files is not None:
         context["_pr_changed_files"] = changed_files
+    # Set review_loop to indicate verification state: presence without unverified_reason
+    # means verified (real test verdict gated merge); presence with unverified_reason
+    # means unverified (no-CI merge gate fell open).
     if unverified_reason is not None:
         context[REVIEW_LOOP_KEY] = {UNVERIFIED_MERGE_REASON_KEY: unverified_reason}
+    elif acceptance_evidence is not None and acceptance_evidence.get("kind") == "named_test":
+        # named_test requires verification; set empty review_loop to indicate verified
+        context[REVIEW_LOOP_KEY] = {}
     return Task(
         project_id=uuid.uuid4(),
         title="code task",
@@ -1428,3 +1434,74 @@ def test_aggregate_invariant_coverage_never_exceeds_bounds():
         # detectable evidence of the bug.
         if coverage is not None and declared <= total:
             assert coverage <= 1.0
+
+
+def test_missing_review_loop_not_scored_as_proven():
+    """Missing/malformed review_loop fails closed: unverified merge not scored as proven.
+
+    The _merge_was_test_verified helper must fail closed when review_loop context
+    is absent or malformed (like all other evidence checks in the module), NOT
+    return True and give an unverified merge a free pass to proven scoring.
+    An absent review_loop means we cannot attest the merge was verified —
+    the safe default is unverified.
+    """
+    # Case 1: completely missing review_loop context
+    task_no_context = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,  # Context dict has no review_loop at all
+    )
+    # Explicitly clear the context to simulate no review_loop key
+    task_no_context.context = {"_pr_changed_files": task_no_context.context["_pr_changed_files"]}
+
+    verdict_no_context = evaluate_code_acceptance(task_no_context)
+    # Missing review_loop should fail closed: NOT proven, not satisfied for named_test
+    assert verdict_no_context.declared is True
+    assert verdict_no_context.satisfied is False
+    assert verdict_no_context.proven is False
+    assert "did not run green" in verdict_no_context.reason
+
+    # Case 2: malformed review_loop (not a dict)
+    task_malformed = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason=None,
+    )
+    task_malformed.context[REVIEW_LOOP_KEY] = "not a dict"  # Malformed
+
+    verdict_malformed = evaluate_code_acceptance(task_malformed)
+    assert verdict_malformed.declared is True
+    assert verdict_malformed.satisfied is False
+    assert verdict_malformed.proven is False
+    assert "did not run green" in verdict_malformed.reason
+
+    # Case 3: with explicit unverified_reason (control — should already fail)
+    task_explicit_unverified = _make_code_task(
+        acceptance_evidence={
+            "kind": "named_test",
+            "test_path": "backend/testing/test_widget.py",
+        },
+        changed_files=["backend/app/widget.py", "backend/testing/test_widget.py"],
+        unverified_reason="no_runnable_suite",  # Explicit fall-open
+    )
+
+    verdict_explicit = evaluate_code_acceptance(task_explicit_unverified)
+    assert verdict_explicit.declared is True
+    assert verdict_explicit.satisfied is False
+    assert verdict_explicit.proven is False
+
+    # All three (missing, malformed, explicit unverified) fail closed identically
+    # when a named_test is declared with a real changed seam.
+    record_code_acceptance_verdict(task_no_context)
+    record_code_acceptance_verdict(task_malformed)
+    record_code_acceptance_verdict(task_explicit_unverified)
+
+    assert acceptance_blocks_success(task_no_context.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+    assert acceptance_blocks_success(task_malformed.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True
+    assert acceptance_blocks_success(task_explicit_unverified.context[CODE_ACCEPTANCE_VERDICT_KEY]) is True

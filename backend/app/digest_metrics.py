@@ -3086,8 +3086,15 @@ def compute_digest_cost_economics(
         for ttype in _type_cost
         if _type_merges.get(ttype, 0) > 0
     }
+    # Compute median excluding the typeless bucket ("unknown") so retirement
+    # thresholds are based on real task types, not phantom untyped tasks.
+    _type_cpms_for_median = {
+        ttype: cpm for ttype, cpm in _type_cpms.items() if ttype != "unknown"
+    }
     median_cpm_by_type = (
-        round(statistics.median(list(_type_cpms.values())), 4) if _type_cpms else None
+        round(statistics.median(list(_type_cpms_for_median.values())), 4)
+        if _type_cpms_for_median
+        else None
     )
     cost_per_merge_by_type = {
         ttype: {

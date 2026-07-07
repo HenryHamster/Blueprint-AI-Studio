@@ -1470,6 +1470,26 @@ class TestRecordRetiredDirectionMemory:
         assert entry["reason"] == "strategic_superseded"
         assert entry["outcome"] == "superseded by d-successor"
 
+    def test_recently_retired_directions_deduped_by_id(self):
+        """A retry/replay calling record_retired_direction_memory with the same
+        direction ID must not produce a duplicate entry — the existing entry is
+        replaced by the latest one so cap slots aren't wasted on the same direction."""
+        vision: dict = {}
+        d = {"id": "d-dup", "text": "database optimization cache", "research_history": [{"prs_merged": 1}]}
+        record_retired_direction_memory(vision, d, reason="strategic_retire")
+        # Second call for the same direction (simulating a retry/replay)
+        record_retired_direction_memory(vision, d, reason="auto_completed")
+        entries = vision["_recently_retired_directions"]
+        assert len(entries) == 1, f"Expected 1 entry after dedup, got {len(entries)}"
+        # The latest call wins; its reason should be persisted
+        assert entries[0]["id"] == "d-dup"
+        assert entries[0]["reason"] == "auto_completed"
+
+        # Distinct IDs must each get their own slot
+        d2 = {"id": "d-other", "text": "unrelated other direction"}
+        record_retired_direction_memory(vision, d2, reason="strategic_retire")
+        assert len(vision["_recently_retired_directions"]) == 2
+
 
 class TestCheckGapRespawnBlock:
     def _make_entry(self, *, direction_id="d-abc", text_tokens=None, gap_id=None, days_ago=1):

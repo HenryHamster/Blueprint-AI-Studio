@@ -489,14 +489,38 @@ def test_merge_vision_agent_only_change_takes_agent():
 
 
 def test_append_rejected_edits_caps_list():
-    vision = {vision_merge.REJECTED_EDITS_KEY: [{"x": i} for i in range(50)]}
-    new = [{"x": 100}, {"x": 101}]
+    # Use realistic entries with distinct field/kind/agent_value fingerprints.
+    existing = [
+        {"field": f"f{i}", "kind": "replace", "agent_value": f"v{i}", "at": "t"}
+        for i in range(50)
+    ]
+    vision = {vision_merge.REJECTED_EDITS_KEY: existing}
+    new = [
+        {"field": "f_new_a", "kind": "replace", "agent_value": "va", "at": "t2"},
+        {"field": "f_new_b", "kind": "replace", "agent_value": "vb", "at": "t2"},
+    ]
     vision_merge.append_rejected_edits(vision, new)
     assert (
         len(vision[vision_merge.REJECTED_EDITS_KEY]) == vision_merge.REJECTED_EDITS_MAX
     )
     # Newest at the end.
-    assert vision[vision_merge.REJECTED_EDITS_KEY][-1] == {"x": 101}
+    assert vision[vision_merge.REJECTED_EDITS_KEY][-1] == new[-1]
+
+
+def test_append_rejected_edits_dedup():
+    """Same field/kind/agent_value fingerprint is dropped; distinct fingerprints are kept."""
+    dup_entry = {"field": "purpose", "kind": "replace", "agent_value": "old", "at": "t1"}
+    vision = {vision_merge.REJECTED_EDITS_KEY: [dup_entry]}
+    # A replay of the same logical rejection (same fingerprint, different timestamp).
+    replay = {"field": "purpose", "kind": "replace", "agent_value": "old", "at": "t2"}
+    # A genuinely new rejection with a different agent_value.
+    new_entry = {"field": "purpose", "kind": "replace", "agent_value": "new", "at": "t2"}
+    vision_merge.append_rejected_edits(vision, [replay, new_entry])
+    result = vision[vision_merge.REJECTED_EDITS_KEY]
+    # replay is dropped; new_entry is kept; original is preserved.
+    assert len(result) == 2
+    assert result[0] == dup_entry
+    assert result[1] == new_entry
 
 
 # --- end-to-end: cycle row updates through spawn + completion --------------

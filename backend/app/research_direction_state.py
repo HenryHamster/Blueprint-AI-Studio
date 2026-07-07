@@ -895,39 +895,42 @@ async def apply_post_spawn_state(
                                 f"{_af_consec} consecutive scope-empty cycles (task {task.id})"
                             )
 
+                    # Guard against duplicate appends on post-commit retry: only update
+                    # recent_findings_evidence and outcome_progress_history if this is a
+                    # new task_id (same guard as research_history above).
+                    if entry.get("task_id") not in existing_task_ids:
+                        _evicted_out: list = []
+                        d["research_context"] = _build_research_context(
+                            prior_context=d.get("research_context"),
+                            finding_titles=finding_titles_by_dir.get(did, [])[:5],
+                            key_finding_descriptions=finding_descriptions_by_dir.get(
+                                did, []
+                            )[:5],
+                            finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
+                            finding_claims=finding_claims_by_dir.get(did, [])[:5],
+                            finding_sources=finding_sources_by_dir.get(did, [])[:5],
+                            cycle_insights=[i["summary"][:200] for i in insights[:3]],
+                            history_entry=entry,
+                            prior_history=d.get("research_history", [])[:-1],
+                            evicted_out=_evicted_out,
+                        )
+                        _append_evicted_findings(d, _evicted_out)
+                        prior_rfe = list(d.get("recent_findings_evidence") or [])
+                        cur_rfe = build_recent_findings_evidence(
+                            finding_titles=finding_titles_by_dir.get(did, []),
+                            finding_claims=finding_claims_by_dir.get(did, []),
+                            finding_sources=finding_sources_by_dir.get(did, []),
+                        )
+                        d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
 
-                    _evicted_out: list = []
-                    d["research_context"] = _build_research_context(
-                        prior_context=d.get("research_context"),
-                        finding_titles=finding_titles_by_dir.get(did, [])[:5],
-                        key_finding_descriptions=finding_descriptions_by_dir.get(
-                            did, []
-                        )[:5],
-                        finding_scopes=finding_scopes_by_dir.get(did, [])[:5],
-                        finding_claims=finding_claims_by_dir.get(did, [])[:5],
-                        finding_sources=finding_sources_by_dir.get(did, [])[:5],
-                        cycle_insights=[i["summary"][:200] for i in insights[:3]],
-                        history_entry=entry,
-                        prior_history=d.get("research_history", [])[:-1],
-                        evicted_out=_evicted_out,
-                    )
-                    _append_evicted_findings(d, _evicted_out)
-                    prior_rfe = list(d.get("recent_findings_evidence") or [])
-                    cur_rfe = build_recent_findings_evidence(
-                        finding_titles=finding_titles_by_dir.get(did, []),
-                        finding_claims=finding_claims_by_dir.get(did, []),
-                        finding_sources=finding_sources_by_dir.get(did, []),
-                    )
-                    d["recent_findings_evidence"] = (prior_rfe + cur_rfe)[-5:]
+                        # Record the per-cycle outcome-progress snapshot (bounded) so the
+                        # advisory scaffolding detector can spot directions that keep
+                        # merging PRs without advancing their stated success_evidence.
+                        from app.strategic_completion import (
+                            record_outcome_progress_snapshot,
+                        )
 
-                    # Record the per-cycle outcome-progress snapshot (bounded) so the
-                    # advisory scaffolding detector can spot directions that keep
-                    # merging PRs without advancing their stated success_evidence.
-                    from app.strategic_completion import (
-                        record_outcome_progress_snapshot,
-                    )
-
-                    record_outcome_progress_snapshot(d)
+                        record_outcome_progress_snapshot(d)
 
                     # Auto-complete if saturated and proven by merged PRs.
                     # Require >= 3 merged PRs for the PROVEN route (retires a
