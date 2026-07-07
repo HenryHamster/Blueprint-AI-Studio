@@ -70,13 +70,13 @@ _RECUT_MISSING_BASE_BLOCKER_KIND = "cross-base re-cut base missing"
 # investigate / strategic) only order work — a dependency of that kind never
 # propagates code into the dependent's base, so it is ordering-only.
 _CODE_PRODUCING_TASK_TYPES = frozenset(
-    {"create", "fix", "refactor", "migrate", "docs", "deps", "qa", "modify", ""}
+    {"create", "fix", "refactor", "migrate", "docs", "deps", "qa", ""}
 )
 
 # Dependent task types that exist specifically to TRANSFORM another task's
-# output: a modify / fix / refactor that ``depends_on`` a code-producing task is,
+# output: a fix / refactor that ``depends_on`` a code-producing task is,
 # by virtue of that edge, changing the dependency's code.
-_OUTPUT_TRANSFORMING_TASK_TYPES = frozenset({"fix", "modify", "refactor"})
+_OUTPUT_TRANSFORMING_TASK_TYPES = frozenset({"fix", "refactor"})
 
 
 def _task_type(task: Task) -> str:
@@ -107,7 +107,7 @@ def is_genuine_code_dependency(dependent: Task, dependency: Task) -> bool:
 
          (a) file-overlap between the two tasks' production target files
              (``related_files`` with test files excluded), OR
-         (b) the dependent being a modify / fix / refactor that exists to change
+         (b) the dependent being a fix / refactor that exists to change
              the dependency's output — the ``depends_on`` edge from such a task
              to a code-producing task IS that relationship. This holds UNLESS
              both sides declare files that provably do NOT overlap (in which case
@@ -127,7 +127,7 @@ def is_genuine_code_dependency(dependent: Task, dependency: Task) -> bool:
     # (a) overlapping production target files == a real code relationship.
     if dependent_files & dependency_files:
         return True
-    # (b) a modify/fix/refactor dependent transforms the dependency's output.
+    # (b) a fix/refactor dependent transforms the dependency's output.
     if _task_type(dependent) in _OUTPUT_TRANSFORMING_TASK_TYPES:
         # When both sides declare files that provably do not overlap, there is no
         # code relationship — treat as ordering-only. When either side omits its

@@ -10264,3 +10264,112 @@ def test_landed_rate_denominator_excludes_pr_ineligible():
     assert opus_row is not None, "review tasks' model must appear in by_model"
     assert opus_row["pr_eligible_run_count"] == 0
     assert opus_row["landed_rate"] is None
+
+
+def test_landed_rate_denominator_excludes_read_only_task_types():
+    """landed_rate denominator excludes every READ_ONLY_TASK_TYPE.
+
+    READ_ONLY_TASK_TYPES are structurally incapable of landing a PR, so
+    including them in the denominator deflates landed_rate in exactly the
+    high-cost effort tiers operators scrutinize.
+
+    This test exercises the production fix directly: pr_eligible_run_count
+    (ci_and_review tasks only) is the denominator, not run_count.  It also
+    verifies that the _resolved_models rows (per-model within an effort tier)
+    carry pr_eligible_run_count so the by_effort model breakdown is
+    self-consistent.
+
+    Scenario:
+      - 2 merged create tasks (PR-eligible, medium effort)
+      - 1 each of review, research, plan, strategic_review (read-only, high)
+
+    Expected:
+      - totals.run_count == 6
+      - totals.pr_eligible_run_count == 2
+      - totals.landed_rate == 1.0 (2 landed / 2 pr-eligible)
+      - by_effort[medium].pr_eligible_run_count == 2
+      - resolved_models rows for read-only model have pr_eligible_run_count == 0
+    """
+    import uuid
+    from app.efficiency_snapshot import compute_effort_model_efficiency
+    from app.models import TaskStatus
+    from app.task_capabilities import READ_ONLY_TASK_TYPES
+
+    project_id = uuid.uuid4()
+
+    create_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={"pr_merged": True},
+            payloads=[{"type": "create", "effort": "medium"}],
+            provider="anthropic",
+            model="claude-sonnet-4-6",
+        )
+        for _ in range(2)
+    ]
+
+    # Sample four distinct read-only task types to verify none enter the
+    # pr_eligible denominator regardless of which specific type they are.
+    read_only_sample = ["review", "research", "plan", "strategic_review"]
+    assert all(t in READ_ONLY_TASK_TYPES for t in read_only_sample), (
+        "test fixture uses types that must be in READ_ONLY_TASK_TYPES"
+    )
+    read_only_tasks = [
+        make_task(
+            project_id=project_id,
+            status=TaskStatus.COMPLETED,
+            context={},
+            payloads=[{"type": task_type, "effort": "high"}],
+            provider="anthropic",
+            model="claude-opus-4-8",
+        )
+        for task_type in read_only_sample
+    ]
+
+    result = compute_effort_model_efficiency(create_tasks + read_only_tasks)
+
+    totals = result["totals"]
+    assert totals["run_count"] == 6
+    assert totals["pr_eligible_run_count"] == 2, (
+        f"only create tasks are PR-eligible; got {totals['pr_eligible_run_count']}"
+    )
+    assert totals["landed_count"] == 2
+    assert totals["landed_rate"] == 1.0, (
+        f"landed_rate must divide by pr_eligible_run_count (2), got {totals['landed_rate']}"
+    )
+
+    # Per-effort breakdown: medium bucket should have both creates, zero read-only.
+    by_effort_map = {row["effort"]: row for row in result["by_effort"]}
+    medium_row = by_effort_map.get("medium")
+    assert medium_row is not None
+    assert medium_row["pr_eligible_run_count"] == 2
+    assert medium_row["landed_rate"] == 1.0
+
+    # Per-model rows within the medium effort bucket carry pr_eligible_run_count.
+    medium_models = {
+        (r["provider"], r["model"]): r
+        for r in medium_row.get("resolved_models", [])
+    }
+    sonnet_em = medium_models.get(("anthropic", "claude-sonnet-4-6"))
+    assert sonnet_em is not None, "create-task model must appear in medium resolved_models"
+    assert sonnet_em["pr_eligible_run_count"] == 2, (
+        f"resolved_models row must expose pr_eligible_run_count; got {sonnet_em}"
+    )
+
+    # high effort bucket: all read-only → pr_eligible_run_count == 0 → landed_rate is None.
+    high_row = by_effort_map.get("high")
+    assert high_row is not None
+    assert high_row["pr_eligible_run_count"] == 0
+    assert high_row["landed_rate"] is None
+
+    # Per-model rows in the high bucket: the read-only model has pr_eligible == 0.
+    high_models = {
+        (r["provider"], r["model"]): r
+        for r in high_row.get("resolved_models", [])
+    }
+    opus_em = high_models.get(("anthropic", "claude-opus-4-8"))
+    assert opus_em is not None
+    assert opus_em["pr_eligible_run_count"] == 0, (
+        f"read-only model must have pr_eligible_run_count=0; got {opus_em}"
+    )

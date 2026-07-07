@@ -1504,9 +1504,11 @@ def compute_effort_model_efficiency(
             if verified:
                 mb["verified_landed_count"] += 1
             em = effort_models[effort].setdefault(
-                key, {"run_count": 0, "landed_count": 0}
+                key, {"run_count": 0, "landed_count": 0, "pr_eligible_run_count": 0}
             )
             em["run_count"] += 1
+            if pr_eligible:
+                em["pr_eligible_run_count"] += 1
             if landed:
                 em["landed_count"] += 1
 
@@ -1527,6 +1529,7 @@ def compute_effort_model_efficiency(
                 "provider": prov,
                 "model": mdl,
                 "run_count": int(v["run_count"]),
+                "pr_eligible_run_count": int(v.get("pr_eligible_run_count", 0)),
                 "landed_count": int(v["landed_count"]),
                 "priced": (prov, mdl) in priced_model_keys,
             }

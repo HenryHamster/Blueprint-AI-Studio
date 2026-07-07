@@ -10757,3 +10757,48 @@ def test_spawn_budget_partition_is_exhaustive():
     assert union == all_types, (
         f"partition union {sorted(union)} != all task types {sorted(all_types)}"
     )
+
+
+def test_orchestrator_health_task_type_vocab_is_registry_known():
+    """orchestrator_health hand-maintained type sets must contain only registry-known types.
+
+    Drift class: a type name removed from TaskType can silently linger in these
+    frozensets (e.g., 'modify' was never registered but appeared in
+    _CODE_PRODUCING_TASK_TYPES and _OUTPUT_TRANSFORMING_TASK_TYPES).  This guard
+    catches that at PR time rather than silently at runtime.
+
+    The empty-string sentinel in _CODE_PRODUCING_TASK_TYPES is intentional — it
+    is the normalized form for a default-create task whose payload carries no
+    explicit type — and is therefore excluded from the registry check.
+    """
+    from app.task_capabilities import ALL_TASK_TYPES
+    import app.orchestrator_health as _oh
+
+    covered_sets = {
+        "_CODE_PRODUCING_TASK_TYPES": _oh._CODE_PRODUCING_TASK_TYPES,
+        "_OUTPUT_TRANSFORMING_TASK_TYPES": _oh._OUTPUT_TRANSFORMING_TASK_TYPES,
+    }
+    for set_name, type_set in covered_sets.items():
+        unknown = {t for t in type_set if t and t not in ALL_TASK_TYPES}
+        assert not unknown, (
+            f"orchestrator_health.{set_name} contains unregistered task type(s): "
+            f"{sorted(unknown)}.  Either add the type to TaskType in task_capabilities.py "
+            "or remove the stale literal from the frozenset."
+        )
+
+
+def test_orchestrator_health_vocab_guard_catches_injected_fake_type():
+    """Self-test: the vocab guard above must catch a deliberately injected fake type.
+
+    Verifies the guard is live — not accidentally vacuous — by constructing a
+    patched frozenset that contains a fake type and asserting the guard logic
+    raises.
+    """
+    from app.task_capabilities import ALL_TASK_TYPES
+
+    fake_set = frozenset({"create", "fix", "__nonexistent_type__"})
+    unknown = {t for t in fake_set if t and t not in ALL_TASK_TYPES}
+    assert unknown == {"__nonexistent_type__"}, (
+        "Guard logic failed to detect the injected fake type '__nonexistent_type__'. "
+        "The standing vocab check would silently pass on real drift."
+    )

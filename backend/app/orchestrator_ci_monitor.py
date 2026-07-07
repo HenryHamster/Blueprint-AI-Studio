@@ -2426,7 +2426,15 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 from app import ci_resolution as _blk_ci_res
 
                 _block_proj = (
-                    await session.get(Project, ci_task.project_id)
+                    (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    )
+                    .scalars()
+                    .first()
                     if ci_task.project_id
                     else None
                 )
@@ -2505,11 +2513,13 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
             # ci_loop marker prevents re-alerting across polls.
             if _unverified_merge_reason:
                 if _block_proj is None and ci_task.project_id:
-                    from app.models import Project as _NTProject
-
-                    _block_proj = await session.get(
-                        _NTProject, ci_task.project_id
-                    )
+                    _block_proj = (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    ).scalars().first()
                 from app import ci_resolution as _nt_ci_res
 
                 if _nt_ci_res.should_block_no_test_unverified_merge(
@@ -2604,7 +2614,15 @@ async def _monitor_evaluating_tasks(session: AsyncSession) -> None:
                 from app import ci_resolution
 
                 _rt_proj = (
-                    await session.get(Project, ci_task.project_id)
+                    (
+                        await session.execute(
+                            select(Project)
+                            .where(Project.id == ci_task.project_id)
+                            .with_for_update()
+                        )
+                    )
+                    .scalars()
+                    .first()
                     if ci_task.project_id
                     else None
                 )
