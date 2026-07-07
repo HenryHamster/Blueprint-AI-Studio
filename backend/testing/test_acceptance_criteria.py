@@ -4423,3 +4423,252 @@ async def test_acceptance_window_recompute_is_idempotent(db_session):
     assert first == 1
     assert second == 0, "Second run must be idempotent (0 new rows)"
     assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
+
+
+# ---------------------------------------------------------------------------
+# record_metrics_integrity_coverage_evidence
+# ---------------------------------------------------------------------------
+
+
+def test_metrics_integrity_sweep_evidence_marks_covered():
+    """A ``metrics_integrity_sweep`` evidence row is covering on its own."""
+    assert (
+        ac.compute_criterion_coverage(
+            [_make_evidence("metrics_integrity_sweep", detail={"ticks": 5})]
+        )
+        == "covered"
+    )
+
+
+def test_names_metrics_integrity_sweep_matches_and_rejects():
+    """The signal-name matcher recognises data-integrity / metrics-integrity text."""
+    assert ac._names_metrics_integrity_sweep("data integrity sweep is operating")
+    assert ac._names_metrics_integrity_sweep("data-integrity signal verified")
+    assert ac._names_metrics_integrity_sweep("metrics integrity check")
+    assert ac._names_metrics_integrity_sweep("metrics-integrity mechanism is live")
+    assert ac._names_metrics_integrity_sweep("metrics_integrity_sweep runs in observe mode")
+    assert not ac._names_metrics_integrity_sweep("acceptance_window_fraction non-zero")
+    assert not ac._names_metrics_integrity_sweep(None)
+    assert not ac._names_metrics_integrity_sweep("")
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_records_when_sweep_ran(db_session):
+    """When the sweep has run (ticks > 0 in observability), the recorder writes one
+    covering evidence row for the data-integrity criterion and coverage flips to covered."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityCoverage")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep running in observe mode",
+        created_by="operator",
+    )
+
+    # Before any sweep tick: no evidence, criterion uncovered.
+    summary_before = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_before["covered"] == 0
+    assert summary_before["uncovered"] == 1
+
+    # Simulate the sweep having run — nothing recorded yet because ticks == 0.
+    recorded_no_tick = await ac.record_metrics_integrity_coverage_evidence(
+        db_session, version
+    )
+    assert recorded_no_tick == 0, "Must not record evidence when ticks == 0"
+
+    # Inject a synthetic observability tick (mirrors what run_metrics_integrity_sweep does).
+    from datetime import datetime, timezone
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1, f"Expected 1 covering row; got {recorded}"
+
+    evidence = await ac.get_evidence_for_criterion(db_session, criterion.id)
+    assert len(evidence) == 1
+    row = evidence[0]
+    assert row.source_kind == "metrics_integrity_sweep"
+    assert row.detail["ticks"] == 1
+    assert row.detail["mode"] == "observe"
+
+    # After: the criterion flips to covered.
+    summary_after = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary_after["covered"] == 1
+    assert summary_after["uncovered"] == 0
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_via_direction_mapping(db_session):
+    """A criterion whose own text is generic is still covered when it is mapped to
+    a Direction whose text names the metrics-integrity signal (rule b)."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityViaDirection")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="c-1a3ec09d tracked outcome",  # generic text, not itself a match
+        created_by="operator",
+    )
+    dir_row = Direction(
+        project_id=project.id,
+        direction_key="d-mis",
+        data={
+            "id": "d-mis",
+            "text": "metrics_integrity_sweep operating in observe mode",
+            "status": "active",
+        },
+        text="metrics_integrity_sweep operating in observe mode",
+        status="active",
+        criterion_keys=[criterion.criterion_key],
+    )
+    db_session.add(dir_row)
+    await db_session.commit()
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["covered"] == 1
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_nothing_when_no_ticks(db_session):
+    """When the sweep has never run (ticks == 0), the recorder returns 0."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityNoTicks")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep is operating",
+        created_by="operator",
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 0, "Must record nothing when ticks == 0"
+    summary = await ac.get_version_coverage_summary(db_session, version.id)
+    assert summary["uncovered"] == 1
+    assert summary["covered"] == 0
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_no_over_cover(db_session):
+    """An unrelated active criterion must NOT receive metrics-integrity evidence."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityNoOverCover")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    target = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="metrics-integrity sweep is active",
+        created_by="operator",
+    )
+    unrelated = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="all CI checks pass on every merge",
+        created_by="operator",
+    )
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    recorded = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert recorded == 1, "Only the target criterion should receive evidence"
+
+    target_evidence = await ac.get_evidence_for_criterion(db_session, target.id)
+    unrelated_evidence = await ac.get_evidence_for_criterion(db_session, unrelated.id)
+    assert len(target_evidence) == 1
+    assert len(unrelated_evidence) == 0, "Unrelated criterion must NOT be covered"
+
+    mis._reset_observability_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_metrics_integrity_coverage_evidence_is_idempotent(db_session):
+    """Running the recorder twice records at most one row (stable per-version source_id)."""
+    import app.metrics_integrity_sweep as mis
+    from app import release_version as rv
+    from datetime import datetime, timezone
+
+    mis._reset_observability_for_tests()
+
+    project = await _make_project(db_session, "MetricsIntegrityIdempotent")
+    version = await rv.open_version(db_session, project.id, version_number=1)
+    await db_session.commit()
+
+    criterion = await ac.create_criterion(
+        db_session,
+        project_id=project.id,
+        release_version_id=version.id,
+        text="data-integrity sweep operating",
+        created_by="operator",
+    )
+
+    mis._OBSERVABILITY.record_tick(
+        now=datetime.now(timezone.utc),
+        mode="observe",
+        results=[],
+        enrolled=0,
+    )
+
+    first = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    second = await ac.record_metrics_integrity_coverage_evidence(db_session, version)
+    assert first == 1
+    assert second == 0, "Second run must be idempotent (0 new rows)"
+    assert len(await ac.get_evidence_for_criterion(db_session, criterion.id)) == 1
+
+    mis._reset_observability_for_tests()

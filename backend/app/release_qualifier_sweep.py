@@ -348,6 +348,7 @@ async def _reconcile_if_criterion_coverage_now_complete(
         backfill_direction_merge_evidence,
         get_version_coverage_summary,
         record_acceptance_window_coverage_evidence,
+        record_metrics_integrity_coverage_evidence,
     )
     from app.models import Direction
 
@@ -441,6 +442,28 @@ async def _reconcile_if_criterion_coverage_now_complete(
                         "recorded %d acceptance-window recompute evidence row(s) on v%d "
                         "(total=%d covered=%d after recompute)",
                         window_recorded,
+                        version.version_number,
+                        total,
+                        covered,
+                    )
+
+                # Record covering evidence for the data-integrity criterion when
+                # the standing metrics-integrity sweep has run at least once in
+                # observe mode (ticks > 0). Mirrors the acceptance-window pattern:
+                # the sweep's observability confirms the mechanism is operating and
+                # the evidence row closes the coverage gate without operator action.
+                mis_recorded = await record_metrics_integrity_coverage_evidence(
+                    session, version
+                )
+                if mis_recorded:
+                    coverage = await get_version_coverage_summary(session, version.id)
+                    total = int(coverage.get("total") or 0)
+                    covered = int(coverage.get("covered") or 0)
+                    logger.info(
+                        "[RELEASE_QUALIFIER] reconcile criterion_coverage_now_complete: "
+                        "recorded %d metrics-integrity sweep evidence row(s) on v%d "
+                        "(total=%d covered=%d after mis-sweep evidence)",
+                        mis_recorded,
                         version.version_number,
                         total,
                         covered,

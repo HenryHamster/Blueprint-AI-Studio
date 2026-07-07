@@ -130,6 +130,41 @@ def _names_acceptance_window_metric(text: str | None) -> bool:
     return any(marker in lowered for marker in _ACCEPTANCE_WINDOW_CRITERION_MARKERS)
 
 
+#: ``source_kind`` for metrics-integrity-sweep coverage evidence. Written
+#: only by :func:`record_metrics_integrity_coverage_evidence` when the
+#: standing metrics-integrity sweep has completed at least one tick in
+#: observe or enforce mode; recognised as covering by
+#: :func:`_evidence_proves_covered`.
+METRICS_INTEGRITY_EVIDENCE_KIND = "metrics_integrity_sweep"
+
+# Markers that identify a criterion (or the Direction it is mapped to) as tracking
+# the data-integrity / metrics-integrity-sweep signal. Kept as a tight, specific
+# set so sweep evidence is attached ONLY to criteria whose success condition
+# genuinely IS this signal — never blanket-applied to every active criterion.
+# No hardcoded criterion key: the engine stays project-agnostic.
+_METRICS_INTEGRITY_CRITERION_MARKERS: tuple[str, ...] = (
+    "data integrity",
+    "data-integrity",
+    "metrics integrity",
+    "metrics-integrity",
+    "metrics_integrity",
+)
+
+
+def _names_metrics_integrity_sweep(text: str | None) -> bool:
+    """True when *text* names the data-integrity / metrics-integrity-sweep signal.
+
+    Case-insensitive substring test against ``_METRICS_INTEGRITY_CRITERION_MARKERS``.
+    Used to resolve — at runtime, from durable criterion/direction text — which
+    criteria the metrics-integrity sweep evidence may cover, so unrelated
+    criteria are never falsely satisfied.
+    """
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in _METRICS_INTEGRITY_CRITERION_MARKERS)
+
+
 def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     """Whether a single evidence record satisfies the 'covered' condition.
 
@@ -144,6 +179,10 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     when the version's acceptance-window aggregate re-scores genuinely non-zero
     (``write_total > 0`` and ``verified > 0``), so its mere presence already
     encodes a populated, non-false-zero denominator.
+    ``metrics_integrity_sweep`` is covered on its own; it is recorded by
+    :func:`record_metrics_integrity_coverage_evidence` only when the standing
+    sweep has completed at least one tick (``ticks > 0``) in observe or enforce
+    mode, so its presence encodes that the mechanism is actively operating.
     All other source_kinds are not sufficient on their own.
     """
     if e.source_kind == "reachability":
@@ -151,6 +190,8 @@ def _evidence_proves_covered(e: CriterionEvidence) -> bool:
     if e.source_kind == "operator_attestation":
         return True
     if e.source_kind == ACCEPTANCE_WINDOW_EVIDENCE_KIND:
+        return True
+    if e.source_kind == METRICS_INTEGRITY_EVIDENCE_KIND:
         return True
     if e.source_kind == "task_merge":
         return isinstance(e.detail, dict) and e.detail.get("proven") is True
@@ -892,6 +933,162 @@ async def record_acceptance_window_coverage_evidence(
     except Exception:
         logger.exception(
             "record_acceptance_window_coverage_evidence: failed for version %s",
+            getattr(version, "id", None),
+        )
+        return 0
+
+
+async def _resolve_metrics_integrity_criteria(
+    session: AsyncSession,
+    version: Any,
+) -> list[VersionAcceptanceCriterion]:
+    """Return the active criteria on *version* whose success condition IS the
+    data-integrity / metrics-integrity-sweep signal.
+
+    Targeting rule (least-invasive, no schema change): an active criterion on the
+    version qualifies when EITHER
+
+      (a) its own text names the metrics-integrity sweep signal
+          (see :func:`_names_metrics_integrity_sweep`), OR
+      (b) it is mapped — via ``Direction.criterion_keys`` — to a Direction whose
+          text names that signal.
+
+    This is deliberately conservative: when neither rule matches any criterion the
+    result is empty and NO evidence is recorded. Blanket-covering every active
+    criterion would falsely satisfy the promotion gate for unrelated criteria, so
+    the recorder must err toward covering FEWER.
+    """
+    result = await session.execute(
+        select(VersionAcceptanceCriterion).where(
+            VersionAcceptanceCriterion.release_version_id == version.id,
+            VersionAcceptanceCriterion.status == "active",
+        )
+    )
+    active = list(result.scalars().all())
+    if not active:
+        return []
+    by_key = {c.criterion_key: c for c in active}
+    targets: dict[uuid.UUID, VersionAcceptanceCriterion] = {}
+
+    # Rule (a): the criterion's own text names the signal.
+    for crit in active:
+        if _names_metrics_integrity_sweep(crit.text):
+            targets[crit.id] = crit
+
+    # Rule (b): the criterion is mapped to a direction whose text names the signal.
+    dir_result = await session.execute(
+        select(Direction).where(Direction.project_id == version.project_id)
+    )
+    for direction in dir_result.scalars().all():
+        direction_text = direction.text
+        if not direction_text and isinstance(direction.data, dict):
+            direction_text = direction.data.get("text")
+        if not _names_metrics_integrity_sweep(direction_text):
+            continue
+        for key in direction.criterion_keys or []:
+            crit = by_key.get(key)
+            if crit is not None:
+                targets[crit.id] = crit
+
+    return list(targets.values())
+
+
+async def record_metrics_integrity_coverage_evidence(
+    session: AsyncSession,
+    version: Any,
+) -> int:
+    """Record covering ``metrics_integrity_sweep`` evidence when the standing
+    metrics-integrity sweep has completed at least one tick in observe or enforce
+    mode.
+
+    Checks the in-process observability snapshot
+    (:func:`app.metrics_integrity_sweep.get_metrics_integrity_observability`) —
+    the same data exposed via ``GET /api/admin/metrics-integrity``. When
+    ``ticks > 0`` — i.e. the sweep has run at least once — it records ONE
+    covering evidence row per TARGET data-integrity criterion (see
+    :func:`_resolve_metrics_integrity_criteria`) with the audited tick counts in
+    ``detail`` (ticks, checks_run, mode). When ``ticks == 0`` it records NOTHING:
+    the sweep has not run yet in this process and must not be papered over.
+
+    Idempotent: the evidence ``source_id`` is stable per version, so the dedup
+    unique index turns repeated reconcile/qualify sweeps into no-ops. Best-effort:
+    every failure is logged and swallowed so it never raises into the sweep or
+    qualification path.
+
+    Returns the number of evidence rows newly recorded.
+    """
+    try:
+        from app.metrics_integrity_sweep import get_metrics_integrity_observability
+
+        obs = get_metrics_integrity_observability()
+        ticks = int(obs.get("ticks") or 0)
+        if ticks <= 0:
+            logger.info(
+                "record_metrics_integrity_coverage_evidence: sweep has not run yet "
+                "(ticks=0) — recording nothing (version_id=%s)",
+                getattr(version, "id", None),
+            )
+            return 0
+
+        targets = await _resolve_metrics_integrity_criteria(session, version)
+        if not targets:
+            logger.info(
+                "record_metrics_integrity_coverage_evidence: no active criterion "
+                "names the metrics-integrity signal on version %s — recording nothing",
+                getattr(version, "id", None),
+            )
+            return 0
+
+        last_tick = obs.get("last_tick") or {}
+        detail: dict[str, Any] = {
+            "ticks": ticks,
+            "checks_run": int(obs.get("checks_run") or 0),
+            "mode": last_tick.get("mode", obs.get("last_tick_at") and "observe"),
+            "last_tick_at": obs.get("last_tick_at"),
+        }
+        # Stable per-version source_id so the dedup unique index makes repeated
+        # reconcile/qualify sweeps a no-op (idempotency contract).
+        source_id = f"metrics_integrity_sweep:v{version.version_number}"
+
+        # Batch-load the already-present rows to skip duplicates without an N+1
+        # probe per criterion.
+        target_ids = [c.id for c in targets]
+        already_present: set[uuid.UUID] = set()
+        ev_result = await session.execute(
+            select(CriterionEvidence).where(
+                CriterionEvidence.criterion_id.in_(target_ids),
+                CriterionEvidence.source_kind == METRICS_INTEGRITY_EVIDENCE_KIND,
+                CriterionEvidence.source_id == source_id,
+            )
+        )
+        for ev in ev_result.scalars().all():
+            already_present.add(ev.criterion_id)
+
+        recorded = 0
+        for crit in targets:
+            if crit.id in already_present:
+                continue
+            await record_evidence(
+                session,
+                criterion_id=crit.id,
+                project_id=version.project_id,
+                source_kind=METRICS_INTEGRITY_EVIDENCE_KIND,
+                source_id=source_id,
+                detail=detail,
+            )
+            recorded += 1
+        logger.info(
+            "record_metrics_integrity_coverage_evidence: version=%s targets=%d "
+            "recorded=%d (ticks=%d)",
+            getattr(version, "id", None),
+            len(targets),
+            recorded,
+            ticks,
+        )
+        return recorded
+    except Exception:
+        logger.exception(
+            "record_metrics_integrity_coverage_evidence: failed for version %s",
             getattr(version, "id", None),
         )
         return 0
