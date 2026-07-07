@@ -1477,6 +1477,72 @@ async def test_get_open_completion_debt_linked_task_missing_yields_unknown(db_se
     assert lt["status"] == "unknown"
 
 
+def test_bound_detail_trims_oldest_linked_tasks_preserving_shape():
+    """_bound_detail preserves dict shape when trimming an oversized linked_tasks list.
+
+    Pre-fix, _bound_detail collapsed the whole dict to a flat truncated preview
+    when bytes exceeded _MAX_DETAIL_BYTES, so every subsequent link_task_to_debt
+    call found no linked_tasks list and restarted from empty. The fix trims only
+    the linked_tasks list (oldest-first), keeping all other keys intact.
+    """
+    import json as _json
+
+    from app.completion_debt import _MAX_DETAIL_BYTES, _bound_detail
+
+    # Build a detail dict with recorder metadata plus enough linked_tasks entries
+    # to push over _MAX_DETAIL_BYTES (each entry is ~75 bytes; 80 entries ≈ 6000 B).
+    recorder_meta = "important-recorder-metadata"
+    detail = {
+        "recorder_key": recorder_meta,
+        "description": "A meaningful description to preserve",
+        "linked_tasks": [
+            {"task_id": f"task-{i:04d}-aaaa-bbbb-cccc-ddddeeeeffff", "note": f"entry {i}"}
+            for i in range(80)
+        ],
+    }
+    assert len(_json.dumps(detail, default=str)) > _MAX_DETAIL_BYTES, (
+        "test setup: input must exceed _MAX_DETAIL_BYTES"
+    )
+
+    result = _bound_detail(detail)
+
+    # Must return a dict (shape preserved), NOT the flat _truncated preview.
+    assert isinstance(result, dict)
+    assert "_truncated" not in result, (
+        "overflow with a trimmable linked_tasks must NOT collapse to the flat preview; "
+        "pre-fix code returned _truncated=True, so every subsequent link_task_to_debt "
+        "call restarted from empty"
+    )
+
+    # Recorder metadata keys survive the trim.
+    assert result.get("recorder_key") == recorder_meta, (
+        "recorder_key must be preserved through the linked_tasks trim"
+    )
+    assert "description" in result, "description key must be preserved"
+
+    # linked_tasks remains a list (shape intact).
+    remaining = result.get("linked_tasks")
+    assert isinstance(remaining, list), "linked_tasks must remain a list after trim"
+    assert 1 <= len(remaining) < 80, "some entries trimmed; at least one kept"
+
+    # Most-recent entry (index 79) survives; oldest (index 0) is dropped.
+    surviving_ids = {x.get("task_id") for x in remaining}
+    assert "task-0079-aaaa-bbbb-cccc-ddddeeeeffff" in surviving_ids, (
+        "most-recent linked_task must be preserved"
+    )
+    assert "task-0000-aaaa-bbbb-cccc-ddddeeeeffff" not in surviving_ids, (
+        "oldest linked_task must be dropped when trimming"
+    )
+
+    # Trimmed result must fit within the byte limit.
+    assert len(_json.dumps(result, default=str)) <= _MAX_DETAIL_BYTES
+
+    # Trim count observability marker is set.
+    assert result.get("_linked_tasks_trimmed", 0) > 0, (
+        "_linked_tasks_trimmed must be set when entries were dropped"
+    )
+
+
 @pytest.mark.asyncio
 async def test_get_open_completion_debt_completed_linked_task_is_dispose_ready(db_session):
     """Snapshot flags a COMPLETED linked task so the strategist knows to dispose the debt."""

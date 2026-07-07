@@ -236,6 +236,8 @@ export function scheduleGithubTokenRefresh(
       // silently disable its proactive refresh.
       if (githubRefreshGeneration === myGeneration) {
         scheduleGithubTokenRefresh(taskId, workspace, owner, repo, isReadOnly);
+      } else {
+        log('GitHub token refresh: generation superseded during refresh — not re-arming');
       }
     })();
   }, GITHUB_TOKEN_REFRESH_MS);

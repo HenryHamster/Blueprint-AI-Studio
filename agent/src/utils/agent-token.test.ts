@@ -232,4 +232,38 @@ describe('scheduleGithubTokenRefresh refresh callback (no token in remote URL)',
     expect(vi.mocked(writeGitTokenFile)).not.toHaveBeenCalled();
     expect(vi.mocked(setupGitCredentialHelper)).not.toHaveBeenCalled();
   });
+
+  it('stale generation refresh does not re-arm after teardown', async () => {
+    // Simulate the race the generation-stamp guard exists for: a refresh
+    // callback is mid-flight (fetch not yet resolved) when the task tears
+    // down / a warm-VM rotation calls stopGithubTokenRefresh(). The in-flight
+    // callback must NOT reschedule itself once it resumes, because its
+    // captured generation is now stale.
+    // The fetch mock fires teardown (stopGithubTokenRefresh) the instant the
+    // in-flight refresh dispatches its request — mirroring a task teardown /
+    // warm-VM rotation landing while the callback is still awaiting the
+    // network response, before it gets to its trailing reschedule check.
+    vi.stubGlobal('fetch', vi.fn(() => {
+      stopGithubTokenRefresh();
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve({ data: { token: FRESH_TOKEN } }) });
+    }));
+
+    const logSpy = vi.fn();
+    initTokenModule({
+      getOrchestratorUrl: () => 'http://test-orchestrator',
+      getHeaders: () => ({ 'X-Agent-Token': 'test-token' }),
+      getToken: () => 'test-token',
+      setToken: () => {},
+      log: logSpy,
+    });
+
+    scheduleGithubTokenRefresh('task-stale', '/tmp/ws', 'owner', 'repo', false);
+    await vi.advanceTimersByTimeAsync(GITHUB_TOKEN_REFRESH_MS);
+
+    expect(vi.mocked(fetch)).toHaveBeenCalledTimes(1);
+    expectCalledWith(logSpy, 'GitHub token refresh: generation superseded during refresh — not re-arming');
+
+    // The stale-generation callback must NOT have re-armed a new timer.
+    expect(agentTokenModule.githubTokenRefreshTimer).toBeNull();
+  });
 });

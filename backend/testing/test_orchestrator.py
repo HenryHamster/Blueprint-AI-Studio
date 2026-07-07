@@ -162,6 +162,37 @@ async def test_ci_monitor_extraction_contract(db_session, mocker):
     assert refreshed.status == TaskStatus.EVALUATING
 
 
+# ── Contention quarantine bound ───────────────────────────────────────────────
+
+
+def test_dispatch_prep_contention_quarantine_threshold_is_bounded():
+    """DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD must exist and be a bounded int.
+
+    Pre-fix: no threshold constant existed — a task hitting persistent contention
+    retried every leader cycle forever (no streak counter, no quarantine escape).
+    The fix adds a bounded threshold so a stuck task is quarantined after
+    DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD consecutive contention cycles,
+    matching the poison-task quarantine that handles other dispatch-prep failures.
+    """
+    from app.orchestrator import (
+        DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD,
+        _dispatch_prep_contention_streak,
+    )
+
+    assert isinstance(DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD, int), (
+        "threshold must be an int"
+    )
+    assert DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD >= 1, (
+        "threshold=0 would quarantine every single contention hit — disabling transient recovery"
+    )
+    assert DISPATCH_PREP_CONTENTION_QUARANTINE_THRESHOLD <= 1000, (
+        "threshold must be bounded; a value > 1000 defeats the runaway-loop guard"
+    )
+    assert isinstance(_dispatch_prep_contention_streak, dict), (
+        "_dispatch_prep_contention_streak must be a dict for per-task streak tracking"
+    )
+
+
 # ── Main-loop sleep selection (WI-4: gate fast cycle on dispatch progress) ───
 
 
