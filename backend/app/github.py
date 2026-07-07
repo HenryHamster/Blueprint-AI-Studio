@@ -160,6 +160,12 @@ RATE_LIMIT_FAST_FAIL_THRESHOLD_S = 5
 GITHUB_BUDGET_ALERT_FRACTION = float(os.getenv("GITHUB_BUDGET_ALERT_FRACTION", "0.20"))
 _last_budget_alert_window: int | None = None
 
+# Deferrable consumers (CI failure-detail fan-out, workflow-run diagnostics) skip
+# their expensive multi-call fan-out when the install bucket falls to this floor.
+# Lower than GROUNDING_QUOTA_RESERVE (500) — diagnostics are less critical than
+# existence checks, but still leaves headroom for promotion/merge ops.
+DEFERRABLE_QUOTA_FLOOR = 300
+
 
 def _relevant_bucket(url: str, headers: dict | None) -> dict:
     """Identify which shared_state bucket a request belongs to.
@@ -340,6 +346,26 @@ def _post_github_budget_alert(remaining: int, limit: int, reset_ts: int) -> None
         pass
     except Exception as e:  # noqa: BLE001
         logger.warning(f"[GITHUB] budget alert webhook dispatch skipped: {e}")
+
+
+def _deferrable_quota_active() -> bool:
+    """Whether deferrable consumers should skip diagnostic fan-out.
+
+    True only when the install bucket has been observed below DEFERRABLE_QUOTA_FLOOR
+    with a reset still in the future. An unobserved bucket (remaining is None)
+    never gates — only gate on observed evidence, not boot-time unknowns.
+    """
+    import app.shared_state as _ss
+
+    q = _ss.github_quota
+    remaining = q.get("remaining")
+    if remaining is None or remaining >= DEFERRABLE_QUOTA_FLOOR:
+        return False
+    reset_at = q.get("reset_at")
+    if reset_at is not None and int(reset_at) <= int(time.time()):
+        # Window already rolled over; stale low reading is meaningless.
+        return False
+    return True
 
 
 def _synthetic_rate_limited_response(bucket: dict) -> httpx.Response:

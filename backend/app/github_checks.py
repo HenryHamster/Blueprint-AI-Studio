@@ -55,6 +55,13 @@ def _github_request(*args, **kwargs):
     return _gh._github_request(*args, **kwargs)
 
 
+def _deferrable_quota_active() -> bool:
+    """Delegate to app.github._deferrable_quota_active at call time."""
+    from app import github as _gh
+
+    return _gh._deferrable_quota_active()
+
+
 # GitHub-generated setup-phase step names. These are emitted by GitHub Actions
 # for every job (repo-agnostic, not workflow config). A job whose *only* failed
 # steps are these failed during infra setup — container/runner init, before any
@@ -360,6 +367,19 @@ async def get_check_runs(
     # setup steps (infra flake). failed_run_ids: the workflow run(s) to re-run.
     setup_phase_failure = False
     failed_run_ids: list[int] = []
+    if failed_names and _deferrable_quota_active():
+        logger.warning(
+            "[CI LOGS] quota floor active — skipping failure-detail fan-out for %s",
+            ref[:8] if ref else ref,
+        )
+        return {
+            "status": agg_status,
+            "conclusion": agg_conclusion,
+            "details": details,
+            "failed_logs": "",
+            "setup_phase_failure": False,
+            "failed_run_ids": [],
+        }
     if failed_names:
         log_lines = []
 
@@ -613,6 +633,12 @@ async def get_workflow_run_for_sha(
         "Accept": "application/vnd.github.v3+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
+    if _deferrable_quota_active():
+        logger.warning(
+            "[GITHUB] get_workflow_run_for_sha: quota floor active — returning None for %s",
+            head_sha[:8] if head_sha else head_sha,
+        )
+        return None
     response = await _github_request(
         "GET",
         f"https://api.github.com/repos/{owner}/{repo}/actions/workflows/"

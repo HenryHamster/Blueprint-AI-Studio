@@ -4768,4 +4768,125 @@ async def test_off_backend_burn_resets_on_window_rollover(mocker):
     _ss.github_quota["limit"] = 5000
     _update_quota_state(4999, 5000, 9003700, bucket_name="install")
     assert _ss.github_off_backend_estimate["cumulative_this_window"] == 0
+
     assert _ss.github_off_backend_estimate["_last_remaining"] == 4999
+
+
+
+# ─── DEFERRABLE_QUOTA_FLOOR tests ────────────────────────────────────────────
+
+
+def test_deferrable_quota_active_false_when_unobserved():
+    """_deferrable_quota_active returns False when remaining is None (boot-time
+    safety: an unobserved bucket must never gate consumers)."""
+    import app.shared_state as _ss
+    from app.github import _deferrable_quota_active
+
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+    assert _deferrable_quota_active() is False
+
+
+def test_deferrable_quota_active_false_when_above_floor():
+    """_deferrable_quota_active returns False when remaining is at or above
+    DEFERRABLE_QUOTA_FLOOR — the floor only gates when the bucket is genuinely low."""
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, _deferrable_quota_active
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR,
+            "limit": 5000,
+            "reset_at": int(_time.time()) + 3600,
+        }
+    )
+    assert _deferrable_quota_active() is False
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+def test_deferrable_quota_active_false_when_window_expired():
+    """_deferrable_quota_active returns False when the reset window has already
+    passed — a stale low reading from a previous window must not block callers."""
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, _deferrable_quota_active
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR - 50,
+            "limit": 5000,
+            "reset_at": int(_time.time()) - 1,  # already expired
+        }
+    )
+    assert _deferrable_quota_active() is False
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
+
+
+@pytest.mark.asyncio
+async def test_deferrable_consumers_respect_quota_reserve_floor(mocker):
+    """get_check_runs() and get_workflow_run_for_sha() skip their diagnostic
+    fan-out (job-log fetches, workflow-run lookup) when the install-bucket
+    remaining falls below DEFERRABLE_QUOTA_FLOOR with a reset still pending.
+    Status and conclusion are still derived from the check-run listing.
+    get_workflow_run_for_sha() returns None without firing any API call.
+    """
+    import time as _time
+
+    import app.shared_state as _ss
+    from app.github import DEFERRABLE_QUOTA_FLOOR, get_check_runs, get_workflow_run_for_sha
+
+    _ss.github_quota.update(
+        {
+            "remaining": DEFERRABLE_QUOTA_FLOOR - 50,
+            "limit": 5000,
+            "reset_at": int(_time.time()) + 3600,
+        }
+    )
+
+    check_runs_payload = {
+        "check_runs": [
+            {
+                "id": 999,
+                "name": "Backend Tests",
+                "status": "completed",
+                "conclusion": "failure",
+            }
+        ]
+    }
+    request_calls: list[tuple[str, str]] = []
+
+    async def mock_request(method, url, *args, **kwargs):
+        request_calls.append((method, url))
+        return MockResponse(200, check_runs_payload, links={})
+
+    mocker.patch("httpx.AsyncClient.request", side_effect=mock_request)
+
+    result = await get_check_runs("token", "owner", "repo", "deadbeef1234")
+
+    # Status and conclusion are still derived from the check-run listing data.
+    assert result["status"] == "completed"
+    assert result["conclusion"] == "failure"
+    assert len(result["details"]) == 1
+
+    # Diagnostic fan-out was skipped entirely under the quota floor.
+    assert result["failed_logs"] == ""
+    assert result["setup_phase_failure"] is False
+    assert result["failed_run_ids"] == []
+
+    # Only the single check-runs listing call was made — no workflow/job requests.
+    assert len(request_calls) == 1, (
+        f"Expected 1 API call (check-runs listing), got {len(request_calls)}: {request_calls}"
+    )
+
+    # get_workflow_run_for_sha returns None without making any API call.
+    request_calls.clear()
+    wf_result = await get_workflow_run_for_sha("token", "owner", "repo", "deadbeef1234")
+    assert wf_result is None
+    assert len(request_calls) == 0, (
+        f"Expected 0 API calls from get_workflow_run_for_sha, got {len(request_calls)}: {request_calls}"
+    )
+
+    # Cleanup to avoid contaminating sibling tests.
+    _ss.github_quota.update({"remaining": None, "limit": None, "reset_at": None})
