@@ -1248,8 +1248,16 @@ def append_self_reflection(
 ) -> list[dict]:
     """Append a reflection entry to the project's self-reflection log,
     enforcing :data:`SELF_REFLECTION_LOG_MAX`. Returns the new list ready
-    for JSONB persistence."""
+    for JSONB persistence.
+
+    Deduplicates by cycle_task_id to prevent re-appending identical entries
+    when the strategic-completion handler is replayed from a saved payload."""
     log = list(log_raw or [])
+    # Dedup: skip if an entry with the same cycle_task_id already exists
+    if entry.cycle_task_id and any(
+        e.get("cycle_task_id") == entry.cycle_task_id for e in log
+    ):
+        return log
     log.append(entry.model_dump())
     if len(log) > SELF_REFLECTION_LOG_MAX:
         log = log[-SELF_REFLECTION_LOG_MAX:]

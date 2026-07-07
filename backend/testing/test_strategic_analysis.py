@@ -256,6 +256,98 @@ def test_multiple_directions_aggregate():
     assert len(result["directions"]) == 2
 
 
+def test_success_rate_clamped_when_pr_ineligible_failures_exceed_total_failed():
+    """Genuinely-cancelled PR-ineligible tasks must not drive success_rate > 1.0.
+
+    total_failed sums each cycle's ``tasks_failed`` (TaskStatus.FAILED only),
+    while type_breakdown[*]['failed'] counts FAILED *plus* genuinely-cancelled
+    tasks. Subtracting the broader PR-ineligible failure count from the stricter
+    total can go negative; the fix clamps the eligible-failure count at zero and
+    the emitted rate at 1.0 so no impossible success_rate reaches strategic eval.
+    """
+    directions = [
+        {
+            "id": "dir-A",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 3,
+                    # No FAILED tasks this cycle...
+                    "tasks_failed": 0,
+                    # ...but one genuinely-cancelled read-only 'research' task,
+                    # which type_breakdown counts as a failure.
+                    "type_breakdown": {
+                        "research": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                },
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    assert result["overall"]["merged"] == 3
+    assert result["overall"]["failed"] == 0
+    # Pre-fix this emitted 1.5 (3 / max(3 + (0 - 1), 1) = 3/2). Must be clamped.
+    assert result["overall"]["success_rate"] == 1.0
+
+
+def test_success_rate_excludes_retired_direction_pr_ineligible_failures():
+    """Retired directions must not contribute to total_failed_pr_ineligible.
+
+    total_merged/total_failed only sum over active/expired/paused directions.
+    A retired direction with windowed research_history must not have its
+    PR-ineligible failures subtracted from a total_failed that never included
+    them, which would silently inflate success_rate toward 1.0.
+    """
+    directions = [
+        {
+            "id": "dir-active",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 4,
+                    "tasks_failed": 2,
+                    "type_breakdown": {},
+                },
+            ],
+        },
+        {
+            "id": "dir-retired",
+            "status": "retired",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 0,
+                    "tasks_failed": 0,
+                    # This PR-ineligible failure must NOT be subtracted
+                    # from total_failed, because this direction is retired
+                    # and contributed 0 to total_merged/total_failed.
+                    "type_breakdown": {
+                        "research": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                },
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    # Only active direction contributes: 4 merged, 2 failed → 4/(4+2) = 0.667
+    # If the retired direction's PR-ineligible failure was (wrongly) subtracted:
+    #   total_failed_pr_ineligible=1, total_failed_pr_eligible=max(2-1,0)=1,
+    #   success_rate=4/(4+1)=0.8 — incorrect silent inflation.
+    assert result["overall"]["merged"] == 4
+    assert result["overall"]["failed"] == 2
+    assert result["overall"]["success_rate"] == round(4 / (4 + 2), 2)
+
+
 # ---------------------------------------------------------------------------
 # 6. operator_rejection_rate — only when rejected > 0
 # ---------------------------------------------------------------------------
@@ -3579,4 +3671,102 @@ def test_retired_directions_summary_memory_surfaces_outcome():
     assert entry["id"] == "d-pruned-with-merges"
     assert entry["cycles"] == 5
     assert entry["prs_merged"] == 3
+
+
+def test_retired_directions_summary_cost_per_merge_includes_aggregate_cost():
+    """cost_per_merge reflects lifetime cost including folded history_aggregate spend.
+
+    A direction with empty research_history (all cycles evicted) and
+    history_aggregate.total_estimated_cost_usd=10.0 should yield a
+    cost_per_merge that reflects the aggregate cost, not 0.
+    """
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-evicted-cost",
+                "text": "direction with evicted cost",
+                "status": "retired",
+                "retired_at": "2026-06-01T00:00:00",
+                "research_history": [],
+                "history_aggregate": {
+                    "total_cycles": 5,
+                    "total_prs_merged": 2,
+                    "total_verified_prs_merged": 2,
+                    "total_estimated_cost_usd": 10.0,
+                },
+            }
+        ]
+    )
+    result = _build_retired_directions_summary(project)
+    assert len(result) == 1
+    entry = result[0]
+    # 10.0 / 2 merges = 5.0
+    assert entry.get("cost_per_merge") == 5.0, (
+        f"expected cost_per_merge=5.0 from aggregate, got {entry.get('cost_per_merge')!r}"
+    )
     assert entry["status"] == "retired"
+
+
+# ---------------------------------------------------------------------------
+# success_rate denominator: PR-eligible vs PR-ineligible tasks
+# ---------------------------------------------------------------------------
+
+
+def test_success_rate_same_population_denominator():
+    """success_rate should count only PR-eligible failed tasks in denominator.
+
+    Demonstrates that a portfolio with PR-eligible success and PR-ineligible
+    failures (e.g., failed read-only audits) must not deflate the success_rate
+    by mixing per-PR numerator with all-tasks denominator.
+
+    Portfolio:
+    - dir-1: 2 merged PRs + 1 security_audit task failed (PR-ineligible)
+    - dir-2: 1 merged PR + 2 research tasks failed (PR-ineligible)
+
+    Expected: success_rate = 3 merged / (3 + 0 pr_eligible_failed) = 1.0
+    Bug (before fix): success_rate = 3 / (3 + 3) = 0.5 (deflated)
+    """
+    directions = [
+        {
+            "id": "dir-1",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 2,
+                    "verified_prs_merged": 2,
+                    "tasks_failed": 1,
+                    "type_breakdown": {
+                        "security_audit": {"created": 1, "merged": 0, "failed": 1},
+                    },
+                }
+            ],
+        },
+        {
+            "id": "dir-2",
+            "status": "active",
+            "research_history": [
+                {
+                    "timestamp": "2026-01-01T00:00:00",
+                    "prs_merged": 1,
+                    "verified_prs_merged": 1,
+                    "tasks_failed": 2,
+                    "type_breakdown": {
+                        "research": {"created": 2, "merged": 0, "failed": 2},
+                    },
+                }
+            ],
+        },
+    ]
+    project = _make_project(directions=directions)
+    result = _build_outcome_evaluation(
+        project, (project.vision or {}).get("_strategic_cycle_history") or []
+    )
+
+    # Both dirs have only PR-ineligible failures, so portfolio has:
+    # - 3 total merged PRs
+    # - 0 PR-eligible failed tasks
+    # → success_rate should be 3 / (3 + 0) = 1.0
+    assert result["overall"]["merged"] == 3
+    assert result["overall"]["failed"] == 3  # raw count includes all tasks
+    assert result["overall"]["success_rate"] == 1.0  # only counts PR-eligible failures

@@ -1454,6 +1454,7 @@ async def _update_direction_research_outcomes(
         }
         entry["estimated_cost_usd"] = round(cycle_cost_total, 4)
 
+    entry["tasks_created"] = len(child_tasks_rows)
     entry["tasks_completed"] = sum(
         1 for ct in child_tasks_rows if ct.status == TaskStatus.COMPLETED
     )

@@ -19025,3 +19025,39 @@ async def test_fallback_directions_write_preserves_concurrent_add(db_session, mo
     assert retired is not None and retired["status"] == "retired", (
         f"d-retire must be retired after fallback retire_direction; got {retired}"
     )
+
+
+def test_self_reflection_log_dedups_replayed_cycle():
+    """Replaying the same cycle (post-commit-pending recovery) must not duplicate
+    self_reflection_log entries. Dedup is by cycle_task_id to prevent bloated token
+    consumption and recurrence hallucination when identical entries are re-appended."""
+    from app.problem_model import SelfReflectionEntry, append_self_reflection
+    from app.time_utils import _utcnow
+
+    cycle_task_id = "t-12345"
+    now = _utcnow().isoformat()
+
+    # Create an entry for this cycle
+    entry = SelfReflectionEntry(
+        ts=now,
+        cycle_task_id=cycle_task_id,
+        what_was_hard="Missing context on async patterns",
+        missing_context="",
+        proposed_self_improvement="Add async examples to prompt",
+    )
+
+    # First append: log should have 1 entry
+    log = append_self_reflection(None, entry)
+    assert len(log) == 1, f"Expected 1 entry after first append, got {len(log)}"
+    assert log[0]["cycle_task_id"] == cycle_task_id
+
+    # Replay: append identical entry again (same cycle_task_id, same task_id)
+    log = append_self_reflection(log, entry)
+    assert len(log) == 1, (
+        f"Dedup must prevent duplicate: expected 1 entry after replay, got {len(log)}. "
+        "This can happen when post-commit-pending recovery re-appends from saved payload."
+    )
+
+    # Verify the entry is unchanged
+    assert log[0]["cycle_task_id"] == cycle_task_id
+    assert log[0]["what_was_hard"] == "Missing context on async patterns"

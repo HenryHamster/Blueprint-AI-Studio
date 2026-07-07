@@ -3034,3 +3034,74 @@ async def test_digest_direction_progress_budget_alert_stamped_in_db_and_idempote
     assert dispatch_mock.await_count == 0, (
         "BUDGET_EXCEEDED fired again despite _budget_alerted=True in DB"
     )
+
+
+@pytest.mark.asyncio
+async def test_conversion_rate_not_deflated_without_type_breakdown(
+    client: AsyncClient, db_session
+):
+    """Conversion rate is correctly computed even when type_breakdown is not yet written.
+
+    During the (potentially multi-hour) execution window before the first finding task
+    reaches terminal status, type_breakdown has not been written to the entry. Without
+    this fix, the PR-ineligible task reduction would be skipped (since type_breakdown is
+    missing), causing conversion_rate to be deflated by including tasks that can never
+    open PRs (research, investigate, audit, memo) in the denominator.
+
+    This test verifies that conversion_rate is computed correctly using tasks_created
+    directly, even when type_breakdown is absent (fresh/ongoing cycle).
+    """
+    recent_ts = (_utcnow() - timedelta(hours=1)).isoformat()
+
+    project = make_project(
+        directions=[
+            {
+                "id": "dir-fresh",
+                "text": "Direction with fresh cycle (no type_breakdown yet)",
+                "status": "active",
+                "research_history": [
+                    {
+                        "timestamp": recent_ts,
+                        # 2 verified PRs merged from this cycle
+                        "prs_merged": 2,
+                        "verified_prs_merged": 2,
+                        # 5 total finding tasks created (mix of create, research, audit, memo)
+                        # But type_breakdown is NOT yet written (empty) because no tasks have
+                        # reached terminal status yet.
+                        "tasks_created": 5,
+                        # type_breakdown is missing — this is the key test case
+                        # (fresh cycle where finding tasks are still executing)
+                        # Don't set type_breakdown at all
+                    }
+                ],
+            }
+        ]
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    db_session.add(
+        make_task(
+            project_id=project.id,
+            title="Research task",
+            status=TaskStatus.COMPLETED,
+            payloads=[{"type": "research"}],
+            context={"direction_id": "dir-fresh"},
+        )
+    )
+    await db_session.commit()
+
+    response = await client.get(f"/api/admin/digest?project_id={project.id}&hours=24")
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data["direction_progress"]) == 1
+    dp = data["direction_progress"][0]
+    # With type_breakdown missing, conversion_rate should use tasks_created directly.
+    # 2 verified PRs / 5 tasks created = 0.4
+    # This is more accurate than an inflated rate computed without the PR-ineligible reduction.
+    assert dp["prs_merged"] == 2
+    assert dp["verified_prs_merged"] == 2
+    assert dp["pr_eligible_tasks_created"] == 5
+    assert dp["conversion_rate"] == 0.4  # 2 / 5, not deflated

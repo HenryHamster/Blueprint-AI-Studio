@@ -217,6 +217,10 @@ _HISTORY_AGG_DEFAULTS = {
     # established acceptance-coverage consumers) and reused here.
     "total_acceptance_verified_merged": 0,
     "total_acceptance_verified_write_merged": 0,
+    # Lifetime estimated spend folded from evicted cycles. Legacy-0 fallback on
+    # eviction: pre-attribution entries have no recorded cost and contribute 0,
+    # matching the existing legacy-0 convention for other aggregate keys.
+    "total_estimated_cost_usd": 0.0,
 }
 
 _DECOMP_AGG_DEFAULTS = {
@@ -595,6 +599,13 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
             outcome_kind_breakdown,
             ev.get("outcome_kind_breakdown") or _fallback_outcome_kind_breakdown(ev),
         )
+        # Legacy-0 fallback: pre-attribution entries have no estimated_cost_usd.
+        try:
+            agg["total_estimated_cost_usd"] += max(
+                0.0, float(ev.get("estimated_cost_usd") or 0.0)
+            )
+        except (TypeError, ValueError):
+            pass
         if not agg["first_cycle_at"] and ev.get("timestamp"):
             agg["first_cycle_at"] = ev["timestamp"]
         for scope, stats in (ev.get("scope_breakdown") or {}).items():

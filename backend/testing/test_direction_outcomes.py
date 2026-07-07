@@ -986,9 +986,10 @@ async def test_conversion_rate_division_by_zero(db_session: AsyncSession):
 
     await db_session.refresh(project)
     entry = project.directions[0]["research_history"][0]
-    # Even with tasks_created=0, the merge still counts in verified_prs_merged.
+    # Even with a single task_created, the merge still counts in verified_prs_merged.
+    # tasks_created reflects all child tasks created (1 in this case).
     assert entry["verified_prs_merged"] == 1
-    assert entry["tasks_created"] == 0
+    assert entry["tasks_created"] == 1
 
 
 def test_verified_merged_count_helper():
@@ -9115,6 +9116,59 @@ def test_evicted_delta_field_lists_stay_in_sync():
                 f"breakdown['{kind}']['{status}']: aggregate={agg_bd[kind].get(status)!r}, "
                 f"snapshot={val!r} — fold must carry breakdown per kind/status"
             )
+
+
+# _fold_evicted_into_aggregate: estimated_cost_usd folding
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_estimated_cost_usd_folded_into_history_aggregate():
+    """estimated_cost_usd from evicted cycles accumulates in total_estimated_cost_usd.
+
+    Evicting a cycle with estimated_cost_usd=5.0 must produce
+    agg["total_estimated_cost_usd"]==5.0.  A second legacy entry without
+    the field contributes 0 (legacy-0 fallback).
+    """
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    evicted = [
+        {
+            "timestamp": "2025-01-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "estimated_cost_usd": 5.0,
+        },
+        {
+            # Legacy entry: no estimated_cost_usd key — contributes 0
+            "timestamp": "2025-02-01T00:00:00",
+            "tasks_created": 3,
+            "prs_merged": 2,
+        },
+    ]
+    agg = _fold_evicted_into_aggregate(None, evicted)
+
+    assert agg["total_estimated_cost_usd"] == 5.0
+
+
+def test_fold_evicted_estimated_cost_accumulates_on_prior_agg():
+    """Folding more cycles adds to a pre-existing total_estimated_cost_usd."""
+    from app.direction_metrics import _fold_evicted_into_aggregate
+
+    prior = {
+        "total_cycles": 1,
+        "total_estimated_cost_usd": 3.0,
+    }
+    evicted = [
+        {
+            "timestamp": "2025-03-01T00:00:00",
+            "tasks_created": 2,
+            "prs_merged": 1,
+            "estimated_cost_usd": 2.0,
+        }
+    ]
+    agg = _fold_evicted_into_aggregate(prior, evicted)
+
+    assert agg["total_estimated_cost_usd"] == 5.0  # 3.0 + 2.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
