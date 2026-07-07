@@ -19,8 +19,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 from sqlmodel import select
 
-from app.direct_llm_client import get_anthropic_api_key
-from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
+from app.inline_llm import (
+    call_inline_llm_json,
+    inline_llm_unavailable_reason,
+    resolve_inline_llm_settings,
+)
 from app.models import Project, Task, _utcnow
 from app.playbook_capacity import maybe_archive_for_capacity, _mark_stale_review_entries
 from app.time_utils import _to_naive_utc
@@ -291,13 +294,6 @@ async def categorize_review_issues_llm(issues: list[dict]) -> dict[str, list[dic
             ]
         )
 
-    api_key = get_anthropic_api_key()
-    if not api_key:
-        logger.info(
-            "categorize_review_issues_llm: no ANTHROPIC_API_KEY, using keyword fallback"
-        )
-        return _keyword_from_flat(issues)
-
     valid_cats = sorted(_VALID_CATEGORIES)
     prompt = (
         "You are a code-review classifier. Categorise each issue below into exactly one of "
@@ -370,7 +366,7 @@ async def cache_first_attempt_classification(
     """Run LLM categoriser (keyword fallback inside) and cache result in task_context."""
     if (
         os.environ.get("DISABLE_LLM_REVIEW_CATEGORIZATION", "").strip() == "1"
-        or not get_anthropic_api_key()
+        or inline_llm_unavailable_reason("review_categorize")
     ):
         method = "keyword"
         buckets = _keyword_from_flat(issues)

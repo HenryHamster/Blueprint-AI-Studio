@@ -525,6 +525,11 @@ describe('providerAutoInjectsClaudeMd', () => {
     const { providerAutoInjectsClaudeMd } = await import('./runners.js');
     expect(providerAutoInjectsClaudeMd('zai')).toBe(false);
   });
+
+  it('returns false for deepseek', async () => {
+    const { providerAutoInjectsClaudeMd } = await import('./runners.js');
+    expect(providerAutoInjectsClaudeMd('deepseek')).toBe(false);
+  });
 });
 
 describe('drainJsonChunks — recordLlmTokens nested guard', () => {

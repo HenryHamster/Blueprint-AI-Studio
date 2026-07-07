@@ -50,8 +50,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm.attributes import flag_modified
 
 from app.broadcast import broadcast_to_project
-from app.direct_llm_client import DIRECT_LLM_MODEL, get_anthropic_api_key
-from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
+from app.direct_llm_client import DIRECT_LLM_MODEL
+from app.inline_llm import (
+    call_inline_llm_json,
+    inline_llm_unavailable_reason,
+    resolve_inline_llm_settings,
+)
 from app.json_extract import _extract_json_object
 from app.schemas import sanitize_rpc_diagnostic
 from app.knowledge_query import (
@@ -1836,10 +1840,8 @@ def _build_compute_analysis_prompt(
     )
 
 
-async def _call_compute_analysis_llm(
-    api_key: str, prompt: str
-) -> dict[str, Any] | None:
-    """Call the Anthropic API for the analysis, with a single JSON-parse retry.
+async def _call_compute_analysis_llm(prompt: str) -> dict[str, Any] | None:
+    """Call the configured inline LLM for the analysis, with a single JSON-parse retry.
 
     Returns the parsed JSON object on success, or ``None`` on a persistent parse
     error or any API failure. The explicit analysis caller reports that as
@@ -1877,20 +1879,20 @@ async def _analyze_compute_experiment_with_llm(
     if os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1":
         logger.info("[COMPUTE] LLM analysis disabled via env for task %s", task.id)
         return None, "analysis-disabled"
-    api_key = get_anthropic_api_key()
-    if not api_key:
-        logger.info(
-            "[COMPUTE] LLM analysis skipped for task %s: ANTHROPIC_API_KEY not set "
-            "(precondition-not-met); analysis unavailable",
-            task.id,
-        )
-        return None, "precondition-not-met"
     if resolve_inline_llm_settings("compute_analysis").disabled:
         logger.info(
             "[COMPUTE] LLM analysis disabled via runtime config for task %s",
             task.id,
         )
         return None, "analysis-disabled"
+    unavailable = inline_llm_unavailable_reason("compute_analysis")
+    if unavailable:
+        logger.info(
+            "[COMPUTE] LLM analysis skipped for task %s: %s",
+            task.id,
+            unavailable,
+        )
+        return None, "precondition-not-met"
 
     evidence = await _gather_compute_evidence(
         task,
@@ -1910,7 +1912,7 @@ async def _analyze_compute_experiment_with_llm(
         evidence=evidence,
         fallback=fallback,
     )
-    document = await _call_compute_analysis_llm(api_key, prompt)
+    document = await _call_compute_analysis_llm(prompt)
     if document is None:
         return None, "llm-error"
     return _ground_and_assemble_compute_analysis(
@@ -2656,13 +2658,14 @@ async def answer_compute_experiment_question(
     grounding_miss, and fallback_reason. Declines honestly when evidence is insufficient
     or the LLM is unavailable. Never persists any data — purely ephemeral Q&A.
     """
-    api_key = get_anthropic_api_key()
     if (
         os.environ.get(_DISABLE_LLM_COMPUTE_ANALYSIS_ENV, "").strip() == "1"
-        or not api_key
         or resolve_inline_llm_settings("compute_qa").disabled
     ):
         return _qa_unavailable("llm-disabled")
+    unavailable = inline_llm_unavailable_reason("compute_qa")
+    if unavailable:
+        return _qa_unavailable(unavailable)
     evidence = await _gather_compute_evidence(
         task,
         logs=logs,

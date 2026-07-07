@@ -9,7 +9,7 @@ None if healthy.
 import logging
 import os
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Any, Optional
 
 import app.shared_state as _shared_state
 from app.database import AsyncSessionLocal
@@ -18,6 +18,7 @@ from app.max_plan_pool import (
     _account_available_for_model,
     _account_by_id,
     infer_provider_for_model,
+    provider_selection_mode,
 )
 from app.models import LLMProviderName, Task
 from app.providers.registry import get_provider
@@ -36,12 +37,14 @@ _PROVIDER_DEP_KEYS = {
     LLMProviderName.OPENAI.value: "openai_api",
     LLMProviderName.GEMINI.value: "gemini_api",
     LLMProviderName.ZAI.value: "zai_api",
+    LLMProviderName.DEEPSEEK.value: "deepseek_api",
 }
 _RAW_PROVIDER_ENV_VARS = {
     LLMProviderName.ANTHROPIC.value: ("ANTHROPIC_API_KEY",),
     LLMProviderName.OPENAI.value: ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_HOME"),
     LLMProviderName.GEMINI.value: ("GEMINI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"),
     LLMProviderName.ZAI.value: ("ZAI_API_KEY",),
+    LLMProviderName.DEEPSEEK.value: ("DEEPSEEK_API_KEY",),
 }
 
 
@@ -135,52 +138,77 @@ def _has_raw_provider_credentials(provider_name: str) -> bool:
     )
 
 
+def _ordered_provider_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    ordered: list[str] = []
+    for provider_name in raw:
+        normalized = _normalized_provider_name(provider_name)
+        if normalized and normalized not in ordered:
+            ordered.append(normalized)
+    return ordered
+
+
+def _add_provider_candidates(
+    providers: list[str], primary: set[str], all_candidates: set[str]
+) -> None:
+    if not providers:
+        return
+    primary.add(providers[0])
+    all_candidates.update(providers)
+
+
 def _dispatch_provider_sets() -> tuple[set[str], set[str]]:
     runtime_config = _shared_state.runtime_config
     primary: set[str] = set()
     all_candidates: set[str] = set()
 
-    provider_preferences = runtime_config.get("task_type_provider_preference", {})
-    if isinstance(provider_preferences, dict):
-        for providers in provider_preferences.values():
-            if not isinstance(providers, list):
+    unified_present = False
+    for routing_key in ("category_routing", "task_type_routing"):
+        routing = runtime_config.get(routing_key, {})
+        if not isinstance(routing, dict):
+            continue
+        for entry in routing.values():
+            if not isinstance(entry, dict):
                 continue
-            ordered = []
-            for provider_name in providers:
-                normalized = _normalized_provider_name(provider_name)
-                if normalized and normalized not in ordered:
-                    ordered.append(normalized)
-            if ordered:
-                primary.add(ordered[0])
-                all_candidates.update(ordered)
+            providers = _ordered_provider_list(entry.get("providers"))
+            if providers:
+                unified_present = True
+                _add_provider_candidates(providers, primary, all_candidates)
 
-    model_preferences = runtime_config.get("task_type_model_preferences", {})
-    if isinstance(model_preferences, dict):
-        for prefs in model_preferences.values():
-            if not isinstance(prefs, list):
-                continue
-            ordered = []
-            for pref in prefs:
-                if not isinstance(pref, dict):
+    if not unified_present:
+        provider_preferences = runtime_config.get("task_type_provider_preference", {})
+        if isinstance(provider_preferences, dict):
+            for providers in provider_preferences.values():
+                _add_provider_candidates(
+                    _ordered_provider_list(providers), primary, all_candidates
+                )
+
+        model_preferences = runtime_config.get("task_type_model_preferences", {})
+        if isinstance(model_preferences, dict):
+            for prefs in model_preferences.values():
+                if not isinstance(prefs, list):
                     continue
-                normalized = _normalized_provider_name(pref.get("provider"))
-                if normalized and normalized not in ordered:
-                    ordered.append(normalized)
-            if ordered:
-                primary.add(ordered[0])
-                all_candidates.update(ordered)
+                ordered = []
+                for pref in prefs:
+                    if not isinstance(pref, dict):
+                        continue
+                    normalized = _normalized_provider_name(pref.get("provider"))
+                    if normalized and normalized not in ordered:
+                        ordered.append(normalized)
+                _add_provider_candidates(ordered, primary, all_candidates)
 
-    task_type_models = runtime_config.get("task_type_models", {})
-    if isinstance(task_type_models, dict):
-        for model_name in task_type_models.values():
-            if not isinstance(model_name, str):
-                continue
-            normalized = _normalized_provider_name(
-                infer_provider_for_model(model_name.strip(), runtime_config)
-            )
-            if normalized:
-                primary.add(normalized)
-                all_candidates.add(normalized)
+        task_type_models = runtime_config.get("task_type_models", {})
+        if isinstance(task_type_models, dict):
+            for model_name in task_type_models.values():
+                if not isinstance(model_name, str):
+                    continue
+                normalized = _normalized_provider_name(
+                    infer_provider_for_model(model_name.strip(), runtime_config)
+                )
+                if normalized:
+                    primary.add(normalized)
+                    all_candidates.add(normalized)
 
     if not primary and not all_candidates:
         primary.add(LLMProviderName.ANTHROPIC.value)
@@ -191,9 +219,71 @@ def _dispatch_provider_sets() -> tuple[set[str], set[str]]:
 
 def _dispatch_relevant_providers() -> set[str]:
     primary, all_candidates = _dispatch_provider_sets()
-    if _shared_state.runtime_config.get("cross_provider_fallback_enabled", False):
+    mode = provider_selection_mode(_shared_state.runtime_config)
+    if mode in ("balanced", "preferred"):
         return all_candidates
     return primary
+
+
+def _settings_model_for_effort(provider_name: str, effort: Any) -> str | None:
+    if not isinstance(effort, str) or not effort.strip():
+        return None
+    matrix = _shared_state.runtime_config.get("provider_settings_by_effort", {})
+    if not isinstance(matrix, dict):
+        return None
+    per_provider = matrix.get(provider_name)
+    if not isinstance(per_provider, dict):
+        return None
+    bag = per_provider.get(effort.strip())
+    if not isinstance(bag, dict):
+        return None
+    model = bag.get("model")
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
+def _configured_primary_model(provider_name: str) -> str | None:
+    runtime_config = _shared_state.runtime_config
+    model_preferences = runtime_config.get("task_type_model_preferences", {})
+    if isinstance(model_preferences, dict):
+        for prefs in model_preferences.values():
+            if not isinstance(prefs, list):
+                continue
+            for pref in prefs:
+                if not isinstance(pref, dict):
+                    continue
+                normalized = _normalized_provider_name(pref.get("provider"))
+                model = pref.get("model")
+                if (
+                    normalized == provider_name
+                    and isinstance(model, str)
+                    and model.strip()
+                ):
+                    return model.strip()
+
+    task_type_models = runtime_config.get("task_type_models", {})
+    if isinstance(task_type_models, dict):
+        for model_name in task_type_models.values():
+            if not isinstance(model_name, str) or not model_name.strip():
+                continue
+            normalized = _normalized_provider_name(
+                infer_provider_for_model(model_name.strip(), runtime_config)
+            )
+            if normalized == provider_name:
+                return model_name.strip()
+
+    for routing_key in ("task_type_routing", "category_routing"):
+        routing = runtime_config.get(routing_key, {})
+        if not isinstance(routing, dict):
+            continue
+        for entry in routing.values():
+            if not isinstance(entry, dict):
+                continue
+            if provider_name not in _ordered_provider_list(entry.get("providers")):
+                continue
+            model = _settings_model_for_effort(provider_name, entry.get("effort"))
+            if model:
+                return model
+    return None
 
 
 def _provider_rate_limit_bursting(provider_name: str) -> bool:
@@ -229,7 +319,9 @@ def get_provider_health_snapshot(provider_name: str | LLMProviderName) -> dict:
     dispatch_relevant = normalized in relevant_providers
     configured = dispatch_relevant or bool(accounts) or raw_credentials
     primary_model = (
-        provider.tier_to_model("opus", _shared_state.runtime_config) or _OPUS_MODEL
+        _configured_primary_model(normalized)
+        or provider.tier_to_model("opus", _shared_state.runtime_config)
+        or _OPUS_MODEL
     )
 
     enabled_accounts = [account for account in accounts if account.get("enabled", True)]
@@ -334,9 +426,8 @@ def get_dispatch_health_snapshot(ext: dict) -> dict:
 
     return {
         "status": status,
-        "fallback_enabled": bool(
-            _shared_state.runtime_config.get("cross_provider_fallback_enabled", False)
-        ),
+        "fallback_enabled": provider_selection_mode(_shared_state.runtime_config)
+        in ("balanced", "preferred"),
         "required_providers": relevant_providers,
         "available_providers": available,
         "degraded_providers": degraded,

@@ -570,6 +570,11 @@ def resolve_task_provider_settings(
     return provider.validate_settings(merged)
 
 
+def _settings_bag_model(settings: Mapping[str, Any] | None) -> str | None:
+    model = settings.get("model") if isinstance(settings, Mapping) else None
+    return model.strip() if isinstance(model, str) and model.strip() else None
+
+
 def _account_runtime_ready(acct: dict) -> bool:
     provider = (
         _normalize_provider_name(acct.get("provider"))
@@ -1627,7 +1632,7 @@ def _db_account_runtime_ready(acct: Any) -> bool:
         ):
             return bool(acct.oauth_token)
         if (
-            provider == LLMProviderName.ZAI.value
+            provider in (LLMProviderName.ZAI.value, LLMProviderName.DEEPSEEK.value)
             and auth_mode == LLMAuthMode.API_KEY.value
         ):
             return bool(acct.secret_blob_ref)
@@ -2540,9 +2545,12 @@ async def select_llm_runtime_for_task(
     )
     intended_model = explicit_model
     if intended_model is None and intended_provider:
-        intended_model = get_provider(intended_provider).tier_to_model(
-            quality_tier, runtime_config
+        intended_settings = resolve_task_provider_settings(
+            task, runtime_config, intended_provider
         )
+        intended_model = _settings_bag_model(
+            intended_settings
+        ) or get_provider(intended_provider).tier_to_model(quality_tier, runtime_config)
 
     # Balanced mode: pool all listed providers' accounts and pick globally by
     # (health, -load). An explicit per-task provider/model still pins the
@@ -2555,9 +2563,7 @@ async def select_llm_runtime_for_task(
             pre_settings = resolve_task_provider_settings(
                 task, runtime_config, provider_name
             )
-            bag_model = (
-                pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
-            )
+            bag_model = _settings_bag_model(pre_settings)
             if isinstance(bag_model, str) and bag_model:
                 model = bag_model
             else:
@@ -2607,9 +2613,7 @@ async def select_llm_runtime_for_task(
         pre_settings = resolve_task_provider_settings(
             task, runtime_config, provider_name
         )
-        bag_model = (
-            pre_settings.get("model") if isinstance(pre_settings, Mapping) else None
-        )
+        bag_model = _settings_bag_model(pre_settings)
         if explicit_model and (
             explicit_provider is None or provider_name == explicit_provider
         ):
@@ -2717,8 +2721,18 @@ async def select_llm_runtime_for_task(
     if provider_preference:
         fallback_provider = provider_preference[0]
         provider = get_provider(fallback_provider)
-        fallback_model = explicit_model or provider.tier_to_model(
-            quality_tier, runtime_config
+        fallback_settings = resolve_task_provider_settings(
+            task, runtime_config, fallback_provider
+        )
+        fallback_model = (
+            explicit_model
+            or _settings_bag_model(fallback_settings)
+            or provider.tier_to_model(quality_tier, runtime_config)
+        )
+        fallback_auth_mode = (
+            LLMAuthMode.API_KEY.value
+            if set(provider.supported_auth_modes) == {LLMAuthMode.API_KEY}
+            else LLMAuthMode.OAUTH.value
         )
         _record_routing_fallback(
             task,
@@ -2730,13 +2744,11 @@ async def select_llm_runtime_for_task(
         )
         return LLMSelectionResult(
             provider=fallback_provider,
-            auth_mode=LLMAuthMode.OAUTH.value,
+            auth_mode=fallback_auth_mode,
             model=fallback_model,
             quality_tier=quality_tier,
             account=None,
-            settings=resolve_task_provider_settings(
-                task, runtime_config, fallback_provider
-            ),
+            settings=fallback_settings,
         )
 
     return None

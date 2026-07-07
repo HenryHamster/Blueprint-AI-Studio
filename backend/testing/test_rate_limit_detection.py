@@ -13,7 +13,6 @@ message mentioning "billing". See RATE_LIMIT_PATTERNS in max_plan_pool.py.
 """
 
 from unittest.mock import MagicMock
-from datetime import timezone
 
 import pytest
 
@@ -607,7 +606,7 @@ def test_normalize_agent_category_parse_failed_without_rate_limit_is_code_error(
 @pytest.mark.asyncio
 async def test_db_account_was_rate_limited_active_cooldown(monkeypatch):
     """Returns True when DB record shows an active cooldown window."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from unittest.mock import AsyncMock, MagicMock
     from app.max_plan_pool import db_account_was_rate_limited
     from app.models import MaxPlanAccount
@@ -644,7 +643,7 @@ async def test_db_account_was_rate_limited_active_cooldown(monkeypatch):
 @pytest.mark.asyncio
 async def test_db_account_was_rate_limited_expired_cooldown(monkeypatch):
     """Returns False when DB record shows an expired cooldown window."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from unittest.mock import AsyncMock, MagicMock
     from app.max_plan_pool import db_account_was_rate_limited
     from app.models import MaxPlanAccount
@@ -793,7 +792,7 @@ async def test_db_pool_wide_cooldown_mixed_rate_limited_and_credentialless(monke
     still be classified as RATE_LIMIT blocked. Mirrors the in-memory classifier:
     if no enabled account is potentially usable AND at least one has an active
     rate-limit entry, the failure is a rate-limit, not an AGENT_TIMEOUT."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import MaxPlanAccount
 
@@ -830,7 +829,7 @@ async def test_db_pool_wide_cooldown_returns_false_when_account_potentially_usab
     """A healthy enabled account with credentials and no rate-limit entries means
     the pool is NOT pool-wide rate-limited — even if a sibling account is in
     active cooldown. The healthy account can pick up the next task."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import MaxPlanAccount
 
@@ -864,7 +863,7 @@ async def test_db_pool_wide_cooldown_returns_false_when_account_potentially_usab
 async def test_db_pool_wide_cooldown_treats_zai_secret_blob_as_runtime_ready(
     monkeypatch,
 ):
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
 
@@ -894,6 +893,42 @@ async def test_db_pool_wide_cooldown_treats_zai_secret_blob_as_runtime_ready(
     _mock_db_pool(monkeypatch, [rl_acct, healthy_zai])
 
     assert await db_pool_wide_rate_limit_cooldown(providers=["zai"]) is False
+
+
+@pytest.mark.asyncio
+async def test_db_pool_wide_cooldown_treats_deepseek_secret_blob_as_runtime_ready(
+    monkeypatch,
+):
+    from datetime import datetime, timedelta, timezone
+    from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
+    from app.models import LLMAuthMode, LLMProviderName, MaxPlanAccount
+
+    rl_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    rl_acct = MaxPlanAccount(
+        user_id="u",
+        name="rl",
+        oauth_token="tok-rl",
+        rate_limit_state={
+            "disabled_models": {
+                "claude-sonnet-4-6": {
+                    "at": rl_at.isoformat(),
+                    "hits": 1,
+                    "kind": "rate_limit",
+                }
+            }
+        },
+    )
+    healthy_deepseek = MaxPlanAccount(
+        user_id="u",
+        name="deepseek",
+        provider=LLMProviderName.DEEPSEEK,
+        auth_mode=LLMAuthMode.API_KEY,
+        secret_blob_ref="projects/test/secrets/deepseek/versions/1",
+        rate_limit_state=None,
+    )
+    _mock_db_pool(monkeypatch, [rl_acct, healthy_deepseek])
+
+    assert await db_pool_wide_rate_limit_cooldown(providers=["deepseek"]) is False
 
 
 @pytest.mark.asyncio
@@ -929,7 +964,7 @@ async def test_db_pool_wide_cooldown_returns_false_when_only_expired_entries(
     """All accounts have stale (expired) rate-limit entries but no active cooldown
     and no usable accounts → the pool is "unavailable" but not actively rate-limited.
     Must return False so the failure isn't misclassified as RATE_LIMIT."""
-    from datetime import datetime, timedelta
+    from datetime import datetime, timedelta, timezone
     from app.max_plan_pool import db_pool_wide_rate_limit_cooldown
     from app.models import MaxPlanAccount
 

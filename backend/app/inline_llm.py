@@ -1,4 +1,4 @@
-"""Shared helpers for the backend's small inline Anthropic calls."""
+"""Shared helpers for the backend's small inline Anthropic-compatible calls."""
 
 from __future__ import annotations
 
@@ -9,7 +9,11 @@ import os
 import re
 from typing import Any
 
-from app.direct_llm_client import call_direct_llm, get_anthropic_api_key
+from app.direct_llm_client import (
+    DIRECT_LLM_MODEL,
+    call_direct_llm,
+    get_anthropic_api_key,
+)
 from app.shared_state import runtime_config
 
 logger = logging.getLogger(__name__)
@@ -20,28 +24,40 @@ INLINE_LLM_PURPOSES = (
     "compute_draft",
     "review_categorize",
 )
+INLINE_LLM_PROVIDERS = frozenset({"anthropic", "deepseek", "zai"})
+
+DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL = "https://api.deepseek.com/anthropic"
+DEFAULT_ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 
 _INLINE_LLM_DEFAULTS: dict[str, dict[str, Any]] = {
     "compute_qa": {
-        "model": "claude-haiku-4-5-20251001",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": None,
         "timeout_seconds": 30.0,
         "max_tokens": 800,
         "disabled": False,
     },
     "compute_analysis": {
-        "model": "claude-haiku-4-5-20251001",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": None,
         "timeout_seconds": 30.0,
         "max_tokens": 2000,
         "disabled": False,
     },
     "compute_draft": {
-        "model": "claude-haiku-4-5-20251001",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": None,
         "timeout_seconds": 30.0,
         "max_tokens": 2000,
         "disabled": False,
     },
     "review_categorize": {
-        "model": "claude-haiku-4-5-20251001",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": None,
         "timeout_seconds": 10.0,
         "max_tokens": 512,
         "disabled": False,
@@ -55,29 +71,83 @@ _INLINE_LLM_ENV_KILL_SWITCHES = {
     "review_categorize": "DISABLE_LLM_REVIEW_CATEGORIZATION",
 }
 
-_INLINE_LLM_FIELDS = frozenset({"model", "timeout_seconds", "max_tokens", "disabled"})
+_INLINE_LLM_FIELDS = frozenset(
+    {"provider", "model", "base_url", "timeout_seconds", "max_tokens", "disabled"}
+)
 
 
 @dataclass(frozen=True)
 class InlineLLMSettings:
+    provider: str
     model: str
+    base_url: str | None
     timeout_seconds: float
     max_tokens: int
     disabled: bool
+
+
+@dataclass(frozen=True)
+class InlineLLMTarget:
+    provider: str
+    api_key: str
+    model: str
+    base_url: str | None
+
+
+def _default_base_url(provider: str) -> str | None:
+    if provider == "deepseek":
+        return DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+    if provider == "zai":
+        return DEFAULT_ZAI_ANTHROPIC_BASE_URL
+    return None
+
+
+def _default_model(provider: str) -> str:
+    if provider == "deepseek":
+        return "deepseek-v4-flash"
+    if provider == "zai":
+        return "glm-5.2"
+    return DIRECT_LLM_MODEL
+
+
+def _provider_from_model(model: str) -> str | None:
+    if model.startswith("claude-"):
+        return "anthropic"
+    if model.startswith("deepseek-"):
+        return "deepseek"
+    if model.startswith("glm-"):
+        return "zai"
+    return None
 
 
 def _coerce_inline_llm_bag(raw: Any) -> dict[str, Any]:
     if not isinstance(raw, dict):
         return {}
     bag: dict[str, Any] = {}
+    provider = raw.get("provider")
+    if isinstance(provider, str) and provider.strip():
+        normalized_provider = provider.strip().lower()
+        if normalized_provider in INLINE_LLM_PROVIDERS:
+            bag["provider"] = normalized_provider
     model = raw.get("model")
     if isinstance(model, str) and model.strip():
         bag["model"] = model.strip()
+    base_url = raw.get("base_url")
+    if isinstance(base_url, str) and base_url.strip():
+        bag["base_url"] = base_url.strip().rstrip("/")
     timeout = raw.get("timeout_seconds")
-    if isinstance(timeout, (int, float)) and not isinstance(timeout, bool) and timeout > 0:
+    if (
+        isinstance(timeout, (int, float))
+        and not isinstance(timeout, bool)
+        and timeout > 0
+    ):
         bag["timeout_seconds"] = float(timeout)
     max_tokens = raw.get("max_tokens")
-    if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+    if (
+        isinstance(max_tokens, int)
+        and not isinstance(max_tokens, bool)
+        and max_tokens > 0
+    ):
         bag["max_tokens"] = int(max_tokens)
     disabled = raw.get("disabled")
     if isinstance(disabled, bool):
@@ -91,7 +161,9 @@ def _merge_inline_llm_settings(
 ) -> InlineLLMSettings:
     if isinstance(base, InlineLLMSettings):
         base_map = {
+            "provider": base.provider,
             "model": base.model,
+            "base_url": base.base_url,
             "timeout_seconds": base.timeout_seconds,
             "max_tokens": base.max_tokens,
             "disabled": base.disabled,
@@ -99,11 +171,32 @@ def _merge_inline_llm_settings(
     else:
         base_map = base
     bag = _coerce_inline_llm_bag(override)
+    base_provider = str(base_map.get("provider") or "anthropic")
+    explicit_model = "model" in bag
+    explicit_provider = "provider" in bag
+    provider = str(bag.get("provider") or base_provider)
+    model = str(bag["model"]) if explicit_model else str(base_map["model"])
+    if not explicit_provider and explicit_model:
+        provider = _provider_from_model(model) or provider
+    elif explicit_provider and not explicit_model and provider != base_provider:
+        model = _default_model(provider)
+    if "base_url" in bag:
+        base_url = bag["base_url"]
+    elif provider == base_provider:
+        base_url = base_map.get("base_url")
+    else:
+        base_url = None
     return InlineLLMSettings(
-        model=str(bag.get("model") or base_map["model"]),
-        timeout_seconds=float(bag.get("timeout_seconds") or base_map["timeout_seconds"]),
+        provider=provider,
+        model=model,
+        base_url=str(base_url) if isinstance(base_url, str) and base_url else None,
+        timeout_seconds=float(
+            bag.get("timeout_seconds") or base_map["timeout_seconds"]
+        ),
         max_tokens=int(bag.get("max_tokens") or base_map["max_tokens"]),
-        disabled=bool(bag.get("disabled")) if "disabled" in bag else bool(base_map["disabled"]),
+        disabled=bool(bag.get("disabled"))
+        if "disabled" in bag
+        else bool(base_map["disabled"]),
     )
 
 
@@ -113,7 +206,9 @@ def resolve_inline_llm_settings(purpose: str) -> InlineLLMSettings:
     config = runtime_config.get("inline_llm")
     if not isinstance(config, dict):
         config = {}
-    settings = _merge_inline_llm_settings(_INLINE_LLM_DEFAULTS[purpose], config.get("default"))
+    settings = _merge_inline_llm_settings(
+        _INLINE_LLM_DEFAULTS[purpose], config.get("default")
+    )
     return _merge_inline_llm_settings(settings, config.get(purpose))
 
 
@@ -133,11 +228,32 @@ def validate_inline_llm_runtime_config(raw: Any) -> dict[str, dict[str, Any]]:
         cleaned_bag: dict[str, Any] = {}
         extra = sorted(str(key) for key in bag if str(key) not in _INLINE_LLM_FIELDS)
         if extra:
-            raise ValueError(f"inline_llm[{purpose}] has unknown keys: {', '.join(extra)}")
+            raise ValueError(
+                f"inline_llm[{purpose}] has unknown keys: {', '.join(extra)}"
+            )
         model = bag.get("model")
+        provider = bag.get("provider")
+        if provider is not None:
+            if (
+                not isinstance(provider, str)
+                or provider.strip().lower() not in INLINE_LLM_PROVIDERS
+            ):
+                raise ValueError(
+                    f"inline_llm[{purpose}].provider must be one of {sorted(INLINE_LLM_PROVIDERS)}"
+                )
+            cleaned_bag["provider"] = provider.strip().lower()
+        base_url = bag.get("base_url")
+        if base_url is not None:
+            if not isinstance(base_url, str) or not base_url.strip():
+                raise ValueError(
+                    f"inline_llm[{purpose}].base_url must be a non-empty string"
+                )
+            cleaned_bag["base_url"] = base_url.strip().rstrip("/")
         if model is not None:
             if not isinstance(model, str) or not model.strip():
-                raise ValueError(f"inline_llm[{purpose}].model must be a non-empty string")
+                raise ValueError(
+                    f"inline_llm[{purpose}].model must be a non-empty string"
+                )
             cleaned_bag["model"] = model.strip()
         timeout = bag.get("timeout_seconds")
         if timeout is not None:
@@ -195,15 +311,87 @@ def _env_kill_switch_enabled(purpose: str) -> bool:
     return os.environ.get(_INLINE_LLM_ENV_KILL_SWITCHES[purpose], "").strip() == "1"
 
 
+def _inline_llm_target(settings: InlineLLMSettings) -> InlineLLMTarget:
+    if settings.provider == "deepseek":
+        base_url = (
+            os.environ.get("DEEPSEEK_ANTHROPIC_BASE_URL", "").strip()
+            or os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+            or settings.base_url
+            or DEFAULT_DEEPSEEK_ANTHROPIC_BASE_URL
+        )
+        api_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if api_key:
+            return InlineLLMTarget(
+                provider="deepseek",
+                api_key=api_key,
+                model=settings.model,
+                base_url=base_url.rstrip("/"),
+            )
+        anthropic_key = get_anthropic_api_key()
+        if anthropic_key:
+            return InlineLLMTarget(
+                provider="anthropic",
+                api_key=anthropic_key,
+                model=DIRECT_LLM_MODEL,
+                base_url=None,
+            )
+        return InlineLLMTarget(
+            provider="deepseek",
+            api_key="",
+            model=settings.model,
+            base_url=base_url.rstrip("/"),
+        )
+    if settings.provider == "zai":
+        base_url = (
+            os.environ.get("ZAI_ANTHROPIC_BASE_URL", "").strip()
+            or os.environ.get("ZAI_BASE_URL", "").strip()
+            or settings.base_url
+            or DEFAULT_ZAI_ANTHROPIC_BASE_URL
+        )
+        api_key = os.environ.get("ZAI_API_KEY", "").strip()
+        if api_key:
+            return InlineLLMTarget(
+                provider="zai",
+                api_key=api_key,
+                model=settings.model,
+                base_url=base_url.rstrip("/"),
+            )
+        anthropic_key = get_anthropic_api_key()
+        if anthropic_key:
+            return InlineLLMTarget(
+                provider="anthropic",
+                api_key=anthropic_key,
+                model=DIRECT_LLM_MODEL,
+                base_url=None,
+            )
+        return InlineLLMTarget(
+            provider="zai",
+            api_key="",
+            model=settings.model,
+            base_url=base_url.rstrip("/"),
+        )
+    return InlineLLMTarget(
+        provider="anthropic",
+        api_key=get_anthropic_api_key(),
+        model=settings.model,
+        base_url=settings.base_url,
+    )
+
+
 def _inline_llm_unavailable_reason(purpose: str) -> str:
     if _env_kill_switch_enabled(purpose):
         return "env-disabled"
     settings = resolve_inline_llm_settings(purpose)
     if settings.disabled:
         return "config-disabled"
-    if not get_anthropic_api_key():
-        return "no-api-key"
+    target = _inline_llm_target(settings)
+    if not target.api_key:
+        return f"no-{settings.provider}-api-key"
     return ""
+
+
+def inline_llm_unavailable_reason(purpose: str) -> str:
+    return _inline_llm_unavailable_reason(purpose)
 
 
 async def call_inline_llm_json(
@@ -222,26 +410,33 @@ async def call_inline_llm_json(
         return None
 
     settings = resolve_inline_llm_settings(purpose)
-    api_key = get_anthropic_api_key()
-    payload_messages = messages if messages is not None else [{"role": "user", "content": prompt}]
+    target = _inline_llm_target(settings)
+    payload_messages = (
+        messages if messages is not None else [{"role": "user", "content": prompt}]
+    )
 
     for attempt in range(2):
         try:
             raw = await call_direct_llm(
-                api_key,
+                target.api_key,
                 messages=payload_messages,
                 max_tokens=settings.max_tokens,
                 timeout=settings.timeout_seconds,
-                model=settings.model,
+                model=target.model,
                 system=system,
+                base_url=target.base_url,
             )
             data = _parse_inline_llm_json(raw)
-            if not isinstance(data, dict) or any(key not in data for key in required_keys):
+            if not isinstance(data, dict) or any(
+                key not in data for key in required_keys
+            ):
                 raise ValueError("inline LLM response missing required keys")
             return data
         except (json.JSONDecodeError, KeyError, ValueError, IndexError) as exc:
             if attempt == 0:
-                logger.info("[INLINE_LLM] %s parse error %s, retrying once", purpose, exc)
+                logger.info(
+                    "[INLINE_LLM] %s parse error %s, retrying once", purpose, exc
+                )
                 continue
             logger.info("[INLINE_LLM] %s parse error on retry; unavailable", purpose)
             return None

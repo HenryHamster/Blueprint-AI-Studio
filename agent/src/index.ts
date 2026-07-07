@@ -441,6 +441,9 @@ const MANAGED_LLM_ENV_KEYS = [
   'ZAI_API_KEY',
   'ZAI_ANTHROPIC_BASE_URL',
   'ZAI_BASE_URL',
+  'DEEPSEEK_API_KEY',
+  'DEEPSEEK_ANTHROPIC_BASE_URL',
+  'DEEPSEEK_BASE_URL',
   'OPENAI_API_KEY',
   'CODEX_API_KEY',
   'CODEX_HOME',
@@ -1618,7 +1621,7 @@ export async function pollForNextRole(opts: PollForNextRoleOptions): Promise<Pol
 // execution-mode constants (PROVIDER, AUTH_MODE, LLM_EXECUTION_MODE,
 // LLM_CLI_TRANSLATION in providers/runners.ts) are FROZEN at import from the
 // boot /etc/agent.env, and the provider secret material (CLAUDE_CODE_OAUTH_TOKEN,
-// ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ZAI_API_KEY, GEMINI_API_KEY,
+// ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, ZAI_API_KEY, DEEPSEEK_API_KEY, GEMINI_API_KEY,
 // CODEX_HOME, ...) lives in the process env +
 // on-disk credential files written at boot. So when the backend warm-claims a
 // task that resolves to a DIFFERENT LLM account, a JWT-only rotation cannot
