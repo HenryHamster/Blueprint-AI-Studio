@@ -251,12 +251,12 @@ def _compute_fresh_reviewer_effectiveness(
         for t in code_change_tasks
         if (t.context or {}).get("_self_review_outcome", {}).get("reviewer_findings")
     ]
+    # Baseline excludes clean-reviewed tasks (where reviewer pass ran but found nothing).
+    # Only include tasks where no reviewer pass ran at all.
     tasks_without_reviewer = [
         t
         for t in code_change_tasks
-        if not (t.context or {})
-        .get("_self_review_outcome", {})
-        .get("reviewer_findings")
+        if "_self_review_outcome" not in (t.context or {})
     ]
 
     def _fa_rate(tasks: List[Task]) -> "float | None":

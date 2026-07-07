@@ -15822,3 +15822,153 @@ async def test_sub_research_note_append_is_idempotent_on_replay(db_session):
         f"Sub_research_notes contain duplicate sub_task_ids: {subtask_ids}. "
         "Replay must be idempotent."
     )
+
+
+class TestResearchHistoryIdempotency:
+    """Verify that research_history entries are idempotent on post-commit retry."""
+
+    def _make_task(self, task_id, direction_id="d-test-retry"):
+        """Create a mock failed research task."""
+        task = MagicMock()
+        task.id = task_id
+        task.project_id = uuid.uuid4()
+        task.context = {
+            "failure_category": "CODE_ERROR",
+            "direction_id": direction_id,
+        }
+        task.latest_status_message = "CODE_ERROR: something went wrong"
+        task.first_payload = {"type": "research"}
+        return task
+
+    def _make_session(self):
+        """Create a mock async session."""
+        session = AsyncMock()
+        session.add = MagicMock()
+        return session
+
+    def _make_project(self, direction_id="d-test-retry"):
+        """Create a mock project with a direction."""
+        project = MagicMock()
+        project.directions = [
+            {
+                "id": direction_id,
+                "research_history": [],
+                "consecutive_unproductive_cycles": 0,
+            }
+        ]
+        return project
+
+    def _run(self, project, coro):
+        """Run coro with with_directions_locked patched to call mutate_fn on project.directions."""
+        import asyncio
+        from unittest.mock import patch
+
+        async def _mock_wdl(session, project_id, mutate_fn):
+            mutate_fn(project.directions)
+
+        with patch("app.research_completion.with_directions_locked", _mock_wdl):
+            asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_research_history_append_idempotent_on_retry(self):
+        """Calling _record_failure twice with same task_id must not duplicate entries."""
+        from app.research_completion import _record_research_task_failure
+
+        task_id = uuid.uuid4()
+        task = self._make_task(task_id)
+        project = self._make_project()
+        session = self._make_session()
+
+        # First call: record the failure
+        self._run(project, _record_research_task_failure(task, session))
+        history_first = project.directions[0]["research_history"]
+        assert len(history_first) == 1, f"Expected 1 entry after first call, got {len(history_first)}"
+        assert history_first[0]["task_id"] == str(task_id)
+
+        # Second call: simulate post_commit_pending retry — record the same failure again
+        self._run(project, _record_research_task_failure(task, session))
+        history_second = project.directions[0]["research_history"]
+
+        # Verify idempotency: still exactly one entry
+        assert len(history_second) == 1, (
+            f"Expected 1 entry after retry (idempotent), got {len(history_second)}. "
+            f"History: {history_second}. Retry duplicated the entry."
+        )
+        # Verify it's the same entry
+        assert history_second[0]["task_id"] == str(task_id)
+        # Verify the entry still has the failure_category
+        assert history_second[0]["failure_category"] == "CODE_ERROR"
+
+
+async def test_apply_post_spawn_state_research_history_idempotent_on_retry(db_session):
+    """Calling apply_post_spawn_state twice with the same task_id must not duplicate history entries.
+
+    The idempotency guard at research_direction_state.py:667-675 checks existing_task_ids
+    (including evicted aggregate entries) before appending. A second call with the same task
+    (post-commit retry scenario) must leave exactly one research_history entry.
+    """
+    from app.research_direction_state import apply_post_spawn_state
+    from test_autonomous_research import _active_direction, _make_research_task
+
+    direction_id = "d-idem-apply-retry"
+    direction = {
+        **_active_direction(direction_id, "Idempotency retry test direction"),
+        "research_history": [],
+    }
+    project = _Project(
+        name="Apply Post Spawn Idempotency Test",
+        user_id="test-user-idem-apss-1",
+        autonomous_enabled=True,
+        directions=[direction],
+        vision={"purpose": "test"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    task = await _make_research_task(project, direction, db_session)
+    task.context = {**(task.context or {}), "direction_id": direction_id}
+    db_session.add(task)
+    await db_session.commit()
+
+    _call_args = (
+        db_session,
+        task,
+        [],    # findings
+        [],    # child_tasks
+        [],    # deduplicated
+        [],    # insights
+        [],    # direction_notes
+        [],    # direction_proposals
+        0,     # hash_dedup_count
+        0,     # word_overlap_count
+        0,     # file_overlap_count
+        0,     # evidence_overlap_count
+        0,     # type_filtered_count
+        0,     # empty_prompt_count
+        "research-branch",
+        "main",
+        0,     # research_depth
+        None,  # parent_research_task_id
+    )
+
+    # First call: adds a research_history entry for this task
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    history_first = project.directions[0].get("research_history", [])
+    assert len(history_first) == 1, (
+        f"Expected 1 entry after first call, got {len(history_first)}"
+    )
+    assert history_first[0]["task_id"] == str(task.id)
+
+    # Second call: simulate post-commit retry — same task, same args
+    await apply_post_spawn_state(*_call_args)
+    await db_session.refresh(project)
+
+    history_second = project.directions[0].get("research_history", [])
+    assert len(history_second) == 1, (
+        f"Expected 1 entry after retry (idempotent), got {len(history_second)}. "
+        f"apply_post_spawn_state duplicated the research_history entry on post-commit retry. "
+        f"History: {history_second}"
+    )
+    assert history_second[0]["task_id"] == str(task.id)

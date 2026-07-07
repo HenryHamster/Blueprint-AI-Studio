@@ -7580,6 +7580,157 @@ async def test_spawn_gate_metrics_preserved_for_untagged_cycles(
 
 
 @pytest.mark.asyncio
+async def test_spawn_gate_merge_rate_excludes_pr_ineligible(db_session: AsyncSession):
+    """Spawn-gate merge-rate denominators exclude PR-ineligible task types.
+
+    PR-ineligible children (research, web_research, design, plan, compute_experiment)
+    can never satisfy is_merged_completion, so including them in the spawn-gate
+    challenged/unchallenged denominators silently deflates both rates with never-merging
+    children. This is particularly harmful for challenged cohort: high-stakes findings
+    are more likely to be challenged AND route to a PR-ineligible plan child, so the
+    challenged cohort becomes enriched with never-merging children and its rate is
+    deflated harder — making the adversarial spawn gate look less effective than it is.
+
+    Fix: exclude PR-ineligible types from challenged_children and unchallenged_children
+    lists, mirroring the scope_breakdown filter already in place.
+    """
+    direction_id = "d-sg-pr-ineligible"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=6)
+    ]
+    await db_session.flush()
+
+    # Challenged PR-eligible task (create) that merges
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-create-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+
+    # Challenged PR-eligible task (fix) that does NOT merge
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-fix-not-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "fix", "scope": "small"}],
+    )
+
+    # Challenged PR-ineligible task (plan) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-plan-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "plan", "scope": "medium"}],
+    )
+
+    # Challenged PR-ineligible task (research) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="challenged-research-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": True,
+        },
+        payloads=[{"type": "research"}],
+    )
+
+    # Unchallenged PR-eligible task (create) that merges
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-create-merged",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+            "pr_merged": True,
+            "landed_on_integration": True,
+        },
+        payloads=[{"type": "create", "scope": "small"}],
+    )
+
+    # Unchallenged PR-ineligible task (web_research) that should be EXCLUDED from spawn-gate denominator
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        title="unchallenged-web-research-not-counted",
+        context={
+            "direction_id": direction_id,
+            "research_spawn_gate_challenged": False,
+        },
+        payloads=[{"type": "web_research"}],
+    )
+
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Verify that PR-ineligible tasks are excluded from denominators:
+    # - challenged_spawned: 1 (only challenged-create-merged + challenged-fix-not-merged, NOT plan/research)
+    # - challenged_merged: 1 (only challenged-create-merged)
+    # - challenged_merge_rate: 1/1 = 1.0 (proof the plan/research are excluded)
+    assert entry["research_spawn_gate_challenged_spawned"] == 2, (
+        "challenged_spawned should count only PR-eligible children, "
+        "excluding plan and research"
+    )
+    assert entry["research_spawn_gate_challenged_merged"] == 1
+    assert entry["research_spawn_gate_challenged_merge_rate"] == 0.5, (
+        "challenged merge rate should be 1 merged / 2 spawned (create+fix), "
+        "excluding plan and research which can never merge"
+    )
+
+    # Verify unchallenged metrics also exclude PR-ineligible:
+    # - unchallenged_spawned: 1 (only unchallenged-create-merged, NOT web_research)
+    # - unchallenged_merged: 1 (only unchallenged-create-merged)
+    # - unchallenged_merge_rate: 1.0
+    assert entry["research_spawn_gate_unchallenged_spawned"] == 1, (
+        "unchallenged_spawned should count only PR-eligible children, "
+        "excluding web_research"
+    )
+    assert entry["research_spawn_gate_unchallenged_merged"] == 1
+    assert entry["research_spawn_gate_unchallenged_merge_rate"] == 1.0
+
+
+@pytest.mark.asyncio
 async def test_scope_breakdown_skips_ineligible_task_types(db_session: AsyncSession):
     """scope_breakdown excludes web_research, design, and compute_experiment children.
 

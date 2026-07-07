@@ -5941,6 +5941,15 @@ async def _record_research_task_failure(task: Task, session: AsyncSession) -> No
             return
         _found = True
         history = target.get("research_history", [])
+        # Guard against duplicate task_ids on post-commit retry: if this task_id
+        # is already in the history, skip the append to ensure idempotency.
+        existing_task_ids = {e.get("task_id") for e in history}
+        agg = target.get("history_aggregate") or {}
+        for _ev in (agg.get("evicted_findings") or []):
+            if _ev.get("task_id"):
+                existing_task_ids.add(_ev.get("task_id"))
+        if entry.get("task_id") in existing_task_ids:
+            return
         new_history = [*history, entry]
         # Share the existing eviction/aggregate rule: keep last 10, aggregate older entries
         if len(new_history) > 10:

@@ -662,7 +662,17 @@ async def apply_post_spawn_state(
                     if no_findings_cycle and not titles:
                         entry["no_findings"] = True
                     # Keep last 10 history entries; aggregate evicted entries to preserve lifetime stats
-                    new_history = history + [entry]
+                    # Guard against duplicate task_ids on post-commit retry: if this task_id
+                    # is already in the history, skip the append to ensure idempotency.
+                    existing_task_ids = {e.get("task_id") for e in history}
+                    agg = d.get("history_aggregate") or {}
+                    for _ev in (agg.get("evicted_findings") or []):
+                        if _ev.get("task_id"):
+                            existing_task_ids.add(_ev.get("task_id"))
+                    if entry.get("task_id") not in existing_task_ids:
+                        new_history = history + [entry]
+                    else:
+                        new_history = history
                     if len(new_history) > 10:
                         d["history_aggregate"] = _fold_evicted_into_aggregate(
                             d.get("history_aggregate"), new_history[:-10]

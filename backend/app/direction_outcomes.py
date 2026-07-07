@@ -1613,29 +1613,38 @@ async def _update_direction_research_outcomes(
     # (new multi-direction mode). In legacy mode (untagged children), all
     # children in child_tasks_rows already match this direction, so skip the
     # redundant filter that would exclude all untagged children.
+    # ALSO exclude PR-ineligible task types (read-only tasks that can never open
+    # a PR): they cannot satisfy is_merged_completion, so including them in the
+    # denominator silently deflates both challenged and unchallenged merge rates
+    # with never-merging children. The scope_breakdown section already applies
+    # this same filter for scope conversion rates, proving the intended convention.
     if has_tagged_children:
         challenged_children = [
             ct
             for ct in child_tasks_rows
             if (ct.context or {}).get("research_spawn_gate_challenged") is True
             and (ct.context or {}).get("direction_id") == direction_id
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
         unchallenged_children = [
             ct
             for ct in child_tasks_rows
             if not (ct.context or {}).get("research_spawn_gate_challenged")
             and (ct.context or {}).get("direction_id") == direction_id
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
     else:
         challenged_children = [
             ct
             for ct in child_tasks_rows
             if (ct.context or {}).get("research_spawn_gate_challenged") is True
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
         unchallenged_children = [
             ct
             for ct in child_tasks_rows
             if not (ct.context or {}).get("research_spawn_gate_challenged")
+            and (ct.first_payload or {}).get("type") not in PR_INELIGIBLE_TASK_TYPES
         ]
     challenged_spawned = len(challenged_children)
     unchallenged_spawned = len(unchallenged_children)

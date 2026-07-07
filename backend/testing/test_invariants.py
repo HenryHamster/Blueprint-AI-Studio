@@ -10577,3 +10577,42 @@ def test_no_deprecated_datetime_utcnow_calls():
         "datetime and avoids the Python 3.12 DeprecationWarning.\n\n"
         "Offending files:\n" + "\n".join(violating_files)
     )
+
+
+def test_spawn_budget_partition_is_exhaustive():
+    """Assert that the autonomous spawn-budget partition is exhaustive and disjoint.
+
+    Every task type must be in exactly one of INITIATIVE or SERVICING partition,
+    with no gaps. Live spawn paths exist for memo, repo_bootstrap, and investigate,
+    so all three must be classified to prevent the initiative cap from silently
+    under-binding due to 'other' bucket spillover.
+    """
+    from app.task_capabilities import (
+        ALL_TASK_TYPES,
+        AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES,
+        AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES,
+    )
+
+    initiative = AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES
+    servicing = AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES
+
+    # Disjoint: no overlap between partitions
+    overlap = initiative & servicing
+    assert not overlap, (
+        f"initiative and servicing partitions overlap: {sorted(overlap)}. "
+        "Each task type must be in exactly one partition."
+    )
+
+    # Exhaustive: union covers all task types with no gaps
+    union = initiative | servicing
+    all_types = frozenset(ALL_TASK_TYPES)
+    missing = all_types - union
+    assert not missing, (
+        f"task types missing from both partitions: {sorted(missing)}. "
+        "All task types must be classified as either initiative or servicing."
+    )
+
+    # Verify union exactly equals all types (redundant but explicit check)
+    assert union == all_types, (
+        f"partition union {sorted(union)} != all task types {sorted(all_types)}"
+    )

@@ -924,6 +924,9 @@ AUTONOMOUS_SPAWN_INITIATIVE_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.web_research.value,
         TaskType.design.value,
         TaskType.compute_experiment.value,
+        TaskType.investigate.value,
+        TaskType.memo.value,
+        TaskType.repo_bootstrap.value,
         *STRATEGIC_TASK_TYPES,
     }
 )
@@ -945,6 +948,7 @@ AUTONOMOUS_SPAWN_SERVICING_TASK_TYPES: frozenset[str] = frozenset(
         TaskType.release_audit.value,
         TaskType.release_audit_challenge.value,
         TaskType.release_merge_grade.value,
+        TaskType.self_audit.value,
     }
 )
 # Map of strategic task-type value -> its declared two-phase-cycle ordering
