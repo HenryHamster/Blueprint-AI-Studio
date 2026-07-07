@@ -1404,6 +1404,7 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
     """
     from app.alert_dispatch import (
         _maybe_create_runner_degraded_alert,
+        _maybe_escalate_runner_degraded_alerts,
         _resolve_runner_degraded_alert,
         _RUNNER_DEGRADED_EVENT_TYPE,
     )
@@ -1488,13 +1489,27 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
                     runner_id,
                 )
 
-    # 3. Fleet-level rollup: raise or resolve the per-project "no healthy runner" alert.
+    # 3. Escalate degraded alerts that have been open too long: re-page on the
+    # persisted 1h-then-4h cadence and flip WARNING→ERROR past the age threshold.
+    # Runs after the resolve step (2) so recovered runners' alerts are already
+    # dismissed and never escalate — same flap-suppression the deactivated path
+    # gets for free. Best-effort; a failure must not abort the rest of the sweep.
+    try:
+        await _maybe_escalate_runner_degraded_alerts(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep degraded-runner escalations")
+        try:
+            await session.rollback()
+        except Exception:
+            logger.exception("[RUNNERS] rollback after degraded escalation sweep failed")
+
+    # 4. Fleet-level rollup: raise or resolve the per-project "no healthy runner" alert.
     try:
         await _check_fleet_no_healthy_runner(session, degraded_runner_ids)
     except Exception:
         logger.exception("[RUNNERS] Failed to sweep fleet-no-healthy-runner alerts")
 
-    # 4. Proactive low-disk alert: runners reporting disk below the floor.
+    # 5. Proactive low-disk alert: runners reporting disk below the floor.
     try:
         await _check_low_disk_runners(session)
     except Exception:

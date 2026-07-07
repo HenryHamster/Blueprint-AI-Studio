@@ -2207,6 +2207,141 @@ async def _resolve_runner_degraded_alert(
     return len(open_alerts)
 
 
+async def _maybe_escalate_runner_degraded_alerts(session: AsyncSession) -> int:
+    """Re-page and escalate degraded-runner alerts that have been open too long.
+
+    The initial WARNING notification fires once on creation (via
+    :func:`_maybe_create_runner_degraded_alert`, with retry semantics). Without
+    this sweep a runner that keeps silently failing every job for hours produces
+    exactly ONE push and is never surfaced again — a false-green that ages
+    indefinitely, unlike a fully-down runner which the deactivated escalation
+    pair re-pages and raises to ERROR. This function gives degraded alerts the
+    same aging treatment: called periodically (every 300s from
+    :func:`~app.orchestrator_runner_dispatch._check_degraded_runners`), for each
+    open, unacknowledged ``runner.degraded:*`` alert it
+
+    * **re-notifies** via a follow-up ``RUNNER_DEGRADED`` external notification
+      (marked ``escalation=True`` with the alert age) once the alert has been
+      open past :data:`_RUNNER_ESCALATION_FIRST_SECONDS` (1h), then repeats every
+      :data:`_RUNNER_ESCALATION_REPEAT_SECONDS` (4h); and
+    * **escalates severity** WARNING → ERROR (bumping the occurrence count and
+      updating the title) once the alert has aged past the configurable
+      escalation threshold (``runner_escalation_age_seconds``, default 4h).
+
+    Re-page cadence is persisted in :data:`Alert.last_escalated_at` so it survives
+    an orchestrator restart, and :data:`Alert.acknowledged_at` suppresses further
+    re-pages exactly as the deactivated sweep documents. Flap suppression is
+    natural: a runner that recovers has its degraded alert dismissed by
+    :func:`_resolve_runner_degraded_alert`, so this sweep finds nothing to
+    escalate. Distinct from the deactivated escalation path — separate event type,
+    separate dedupe key, separate rows — the two failure modes stay separate.
+    Commits once per pass; best-effort dispatch never crashes the sweep. Returns
+    the count of escalation notifications dispatched.
+    """
+    now = _utcnow()
+    threshold = int(
+        _runtime_config.get(
+            "runner_escalation_age_seconds", _RUNNER_ESCALATION_AGE_SECONDS_DEFAULT
+        )
+    )
+    open_alerts = (
+        await session.execute(
+            select(Alert).where(
+                Alert.event_type == _RUNNER_DEGRADED_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).scalars().all()
+
+    dispatched = 0
+    updated = False
+    for alert in open_alerts:
+        if alert.dedupe_key is None:
+            continue
+        # Operator acknowledgement suppresses further re-pages/escalation until the
+        # runner recovers (the alert auto-resolves then). Mirrors the deactivated
+        # sweep (alert_dispatch.py) and is restart-safe: acknowledged_at is
+        # persisted, so a process restart cannot cause an acknowledged alert to
+        # re-page.
+        if alert.acknowledged_at is not None:
+            continue
+        age_s = (now - alert.created_at).total_seconds()
+        runner_id_str = alert.dedupe_key.split(":", 1)[-1]
+
+        changed = False
+        # Severity flip WARNING → ERROR once the alert has aged past the threshold.
+        # Evaluated independently of the re-page cadence so the runner is raised to
+        # ERROR at the threshold even if the next re-page tick is not yet due. The
+        # severity guard makes this fire exactly once per alert.
+        if alert.severity == AlertSeverity.WARNING and age_s >= threshold:
+            existing_label = (
+                alert.title.split(":", 1)[-1].strip()
+                if ":" in alert.title
+                else f"runner {runner_id_str[:8]}"
+            )
+            alert.severity = AlertSeverity.ERROR
+            alert.title = f"Fleet runner degraded — escalated: {existing_label}"
+            changed = True
+
+        # Re-page cadence, persisted in last_escalated_at (survives restart). None
+        # means the sweep has never paged this alert — fire the first re-page after
+        # _RUNNER_ESCALATION_FIRST_SECONDS (1h), then every
+        # _RUNNER_ESCALATION_REPEAT_SECONDS (4h) thereafter.
+        should_repage = False
+        if alert.last_escalated_at is None:
+            if age_s >= _RUNNER_ESCALATION_FIRST_SECONDS:
+                should_repage = True
+        elif (now - alert.last_escalated_at).total_seconds() >= _RUNNER_ESCALATION_REPEAT_SECONDS:
+            should_repage = True
+
+        if should_repage:
+            alert.last_escalated_at = now
+            alert.occurrence_count = int(alert.occurrence_count or 1) + 1
+            alert.last_seen_at = now
+            changed = True
+            try:
+                import asyncio as _asyncio
+                from app.notification_dispatch import dispatch_external_notification
+
+                _asyncio.ensure_future(  # noqa: RUF006
+                    dispatch_external_notification(
+                        alert.project_id,
+                        "RUNNER_DEGRADED",
+                        {
+                            "runner_id": runner_id_str,
+                            "title": alert.title,
+                            "message": alert.message,
+                            "age_seconds": int(age_s),
+                            "occurrence_count": alert.occurrence_count or 1,
+                            "escalation": True,
+                        },
+                    )
+                )
+                dispatched += 1
+            except Exception as _ne:
+                logger.warning(
+                    "[NOTIFY] Runner degraded escalation dispatch failed: %s", _ne
+                )
+
+        if changed:
+            session.add(alert)
+            updated = True
+            await broadcast_to_project(
+                str(alert.project_id),
+                "alert_updated",
+                {
+                    "alert_id": str(alert.id),
+                    "severity": getattr(alert.severity, "value", alert.severity),
+                    "title": alert.title,
+                },
+            )
+
+    if updated:
+        await session.commit()
+
+    return dispatched
+
+
 _LOCAL_RUNNER_HOLD_ALERT_TITLE = "Compute hold: require-local runner offline"
 
 

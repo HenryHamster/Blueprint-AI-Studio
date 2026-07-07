@@ -22,8 +22,11 @@ from app.alert_dispatch import (
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
     _maybe_create_runner_deactivated_alert,
+    _maybe_create_runner_degraded_alert,
     _maybe_create_unverified_merge_alert,
     _maybe_escalate_runner_deactivated_alerts,
+    _maybe_escalate_runner_degraded_alerts,
+    _resolve_runner_degraded_alert,
     _runner_escalation_last_notified,
     _runner_outage_escalated_keys,
 )
@@ -608,6 +611,248 @@ async def test_runner_escalation_cadence_survives_restart(db_session, mocker):
     assert (
         dispatched_after_restart == 0
     ), "After restart, cadence should survive — should not re-notify within 4h window"
+
+
+# ── runner-degraded escalation cadence persistence ──────────────────────────
+
+
+async def _runner_degraded_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == "runner.degraded",
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+async def _make_open_degraded_alert(db_session, project, *, runner_id, age_hours):
+    """Create an open degraded alert aged ``age_hours`` in the past (created_at)."""
+    created = await _maybe_create_runner_degraded_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-degraded-01",
+        consecutive_failures=3,
+        seconds_since_last_success=900,
+    )
+    assert created is True
+    alerts = await _runner_degraded_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert alert.last_escalated_at is None, "sweep has not run; last_escalated_at None"
+    alert.created_at = _utcnow() - _timedelta(hours=age_hours)
+    db_session.add(alert)
+    await db_session.commit()
+    await db_session.refresh(alert)
+    return alert
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_cadence_survives_restart(db_session, mocker):
+    """Degraded re-page cadence persists across orchestrator restart.
+
+    Mirrors ``test_runner_escalation_cadence_survives_restart`` for the degraded
+    path: a degraded alert aged past the 1h first threshold re-pages on the first
+    sweep and stamps ``last_escalated_at``; a second sweep — even after clearing
+    in-memory escalation state (simulating a restart) — must NOT re-page again
+    inside the 4h repeat window, because the cadence lives in the persisted
+    ``last_escalated_at`` column, not in memory.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    # Aged 2h: past the 1h first-re-page threshold, but below the 4h severity-flip
+    # threshold so severity stays WARNING (isolates the cadence behaviour).
+    alert = await _make_open_degraded_alert(
+        db_session, project, runner_id=runner_id, age_hours=2
+    )
+
+    dispatch.reset_mock()
+    dispatched_before = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert dispatched_before == 1, "First sweep should re-page after 1h"
+    assert dispatch.call_count == 1
+    # Confirm the follow-up page carries the escalation marker.
+    _args, _kwargs = dispatch.call_args
+    assert _args[1] == "RUNNER_DEGRADED"
+    assert _args[2]["escalation"] is True
+
+    await db_session.refresh(alert)
+    assert alert.last_escalated_at is not None, "last_escalated_at set after re-page"
+    assert alert.severity == AlertSeverity.WARNING, "under 4h: no severity flip yet"
+
+    # Simulate orchestrator restart: the degraded path keeps NO in-memory cadence
+    # state (last_escalated_at is the source of truth). Clearing the deactivated
+    # in-memory dicts here documents that no degraded state depends on them.
+    _runner_escalation_last_notified.clear()
+    _runner_outage_escalated_keys.clear()
+
+    dispatch.reset_mock()
+    dispatched_after_restart = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert (
+        dispatched_after_restart == 0
+    ), "After restart, cadence should survive — no re-page inside the 4h window"
+    assert dispatch.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_flips_warning_to_error(db_session, mocker):
+    """A degraded alert aged past the 4h threshold flips WARNING→ERROR and broadcasts."""
+    bcast = mocker.patch(
+        "app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock
+    )
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    # Aged 5h: past both the 1h re-page threshold and the 4h severity threshold.
+    alert = await _make_open_degraded_alert(
+        db_session, project, runner_id=runner_id, age_hours=5
+    )
+    bcast.reset_mock()
+
+    dispatched = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert dispatched == 1
+
+    await db_session.refresh(alert)
+    assert alert.severity == AlertSeverity.ERROR, "aged past 4h → escalate to ERROR"
+    assert "escalated" in alert.title.lower()
+    assert alert.occurrence_count == 2, "occurrence bumped on re-page"
+
+    # Severity flip must broadcast an alert_updated so the operator UI reflects it.
+    updated_calls = [
+        c for c in bcast.await_args_list if c.args[1] == "alert_updated"
+    ]
+    assert updated_calls, "flip must broadcast alert_updated"
+    assert updated_calls[-1].args[2]["severity"] == AlertSeverity.ERROR.value
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_suppressed_when_acknowledged(db_session, mocker):
+    """An acknowledged degraded alert is never re-paged or escalated."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    # Aged 6h: would both re-page and flip if not acknowledged.
+    alert = await _make_open_degraded_alert(
+        db_session, project, runner_id=runner_id, age_hours=6
+    )
+    alert.acknowledged_at = _utcnow()
+    db_session.add(alert)
+    await db_session.commit()
+
+    dispatch.reset_mock()
+    dispatched = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert dispatched == 0, "acknowledged alert must not re-page"
+    assert dispatch.call_count == 0
+
+    await db_session.refresh(alert)
+    assert alert.severity == AlertSeverity.WARNING, "acknowledged alert must not flip"
+    assert alert.last_escalated_at is None
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_noop_when_resolved(db_session, mocker):
+    """A recovered (dismissed) degraded alert is not escalated — flap suppression."""
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+    await _make_open_degraded_alert(
+        db_session, project, runner_id=runner_id, age_hours=6
+    )
+    # Runner recovers: the degraded alert is dismissed.
+    resolved = await _resolve_runner_degraded_alert(db_session, project.id, runner_id)
+    assert resolved == 1
+
+    dispatch.reset_mock()
+    dispatched = await _maybe_escalate_runner_degraded_alerts(db_session)
+    assert dispatched == 0, "dismissed alert must not escalate"
+    assert dispatch.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_degraded_escalation_via_check_degraded_runners(db_session, mocker):
+    """Integration: a still-degraded runner re-pages through _check_degraded_runners."""
+    from app.models import LocalRunner
+    from app.orchestrator_runner_dispatch import _check_degraded_runners
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    dispatch = mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner = LocalRunner(
+        project_id=project.id,
+        token_hash="hash-degraded-esc",
+        status="active",
+        last_seen_at=_utcnow(),
+        consecutive_job_failures=3,
+        capabilities={"task_types": "all"},
+    )
+    db_session.add(runner)
+    await db_session.commit()
+
+    # First sweep creates the WARNING degraded alert.
+    await _check_degraded_runners(db_session)
+    alerts = await _runner_degraded_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+
+    # Age it past the 1h re-page threshold.
+    alert.created_at = _utcnow() - _timedelta(hours=2)
+    db_session.add(alert)
+    await db_session.commit()
+
+    dispatch.reset_mock()
+    # Runner still degraded → sweep re-pages via the escalation step.
+    await _check_degraded_runners(db_session)
+    escalation_calls = [
+        c for c in dispatch.call_args_list
+        if c.args[1] == "RUNNER_DEGRADED" and c.args[2].get("escalation") is True
+    ]
+    assert escalation_calls, "still-degraded runner should re-page through the sweep"
+
+    await db_session.refresh(alert)
+    assert alert.last_escalated_at is not None
 
 
 # ── Fleet-level no-healthy-runner aggregate alert ────────────────────────────
