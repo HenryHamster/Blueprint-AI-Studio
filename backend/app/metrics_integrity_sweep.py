@@ -2186,6 +2186,147 @@ async def check_acceptance_window_sub_scores_invariant(
 
 
 @register_check(
+    "undeclared_test_cochange_coverage_split",
+    "Report the split between undeclared merges with inferrable test co-change "
+    "coverage vs bare-undeclared (no test files or no production files), providing "
+    "visibility into whether agents are already shipping tests.",
+)
+async def check_undeclared_test_cochange_coverage_split(
+    ctx: SweepContext,
+) -> List[CheckResult]:
+    """Observe-only metric: split of undeclared merges by inferred test co-change.
+
+    Ground truth: among recent COMPLETED tasks with a PR artifact (landed merges)
+    that carry NO explicit acceptance verdict, count the split between:
+      - inferred_test_cochange: CI-verified merge with both test + production files
+      - bare_undeclared: all other undeclared (either no test files or no prod files)
+
+    Reports metrics only, never flags. Answers whether agents are shipping tests
+    (high inferred fraction) or tests are genuinely absent (all bare-undeclared).
+    Bounded to the most recent ``sample_limit`` PR-artifact COMPLETED tasks.
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        _is_test_path,
+        _context_merge_verification_status,
+    )
+    from app.landed_signal import has_landed_signal
+    from app.models import Artifact, ArtifactType, Task, TaskStatus
+
+    # Bounded: newest PR-artifact task ids first, capped at the sample limit.
+    pr_task_id_rows = (
+        await ctx.session.execute(
+            select(Artifact.task_id)
+            .where(Artifact.artifact_type == ArtifactType.PULL_REQUEST)
+            .order_by(Artifact.created_at.desc())
+            .limit(ctx.sample_limit)
+        )
+    ).all()
+    pr_task_ids = [row[0] for row in pr_task_id_rows]
+    if not pr_task_ids:
+        return [
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no PR-artifact tasks in sample window",
+            )
+        ]
+
+    tasks = (
+        await ctx.session.execute(
+            select(Task).where(
+                Task.id.in_(pr_task_ids),
+                Task.status == TaskStatus.COMPLETED,
+            )
+        )
+    ).scalars().all()
+
+    # Filter to landed tasks with no explicit acceptance verdict (undeclared).
+    undeclared_tasks: List[Task] = []
+    for t in tasks:
+        if not has_landed_signal(t):
+            continue
+        recorded = (t.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
+        if isinstance(recorded, dict):
+            # Explicit verdict recorded — not undeclared.
+            continue
+        undeclared_tasks.append(t)
+
+    if not undeclared_tasks:
+        return [
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.SKIPPED,
+                subject="global",
+                detail="no landed undeclared merges in sample window",
+            )
+        ]
+
+    # Classify each undeclared task: does it have inferred test co-change?
+    # Per-project counters for split.
+    per_project_split: Dict[str, Dict[str, int]] = {}
+
+    for t in undeclared_tasks:
+        pid = str(t.project_id)
+        if pid not in per_project_split:
+            per_project_split[pid] = {
+                "inferred_test_cochange": 0,
+                "bare_undeclared": 0,
+            }
+
+        # Check merge verification status.
+        if _context_merge_verification_status(t.context) != "verified":
+            # No-CI gate fall-open: not verified, so no inferred test co-change.
+            per_project_split[pid]["bare_undeclared"] += 1
+            continue
+
+        # Verified merge: check for test + production files.
+        changed = t.context.get("_pr_changed_files") if t.context else None
+        if not isinstance(changed, list):
+            # No changed files recorded: bare undeclared.
+            per_project_split[pid]["bare_undeclared"] += 1
+            continue
+
+        str_paths = [p for p in changed if isinstance(p, str) and p.strip()]
+        has_test = any(_is_test_path(p) for p in str_paths)
+        has_prod = any(not _is_test_path(p) for p in str_paths)
+
+        if has_test and has_prod:
+            per_project_split[pid]["inferred_test_cochange"] += 1
+        else:
+            per_project_split[pid]["bare_undeclared"] += 1
+
+    # Report per project.
+    results: List[CheckResult] = []
+    for pid in sorted(per_project_split.keys()):
+        counts = per_project_split[pid]
+        inferred = counts["inferred_test_cochange"]
+        bare = counts["bare_undeclared"]
+        total = inferred + bare
+
+        # Observe-only: report the split with OK status (never flagged).
+        # Use self_reported for inferred count, ground_truth for bare count.
+        results.append(
+            CheckResult(
+                check="undeclared_test_cochange_coverage_split",
+                status=CheckStatus.OK,
+                self_reported=inferred,
+                ground_truth=bare,
+                delta=total,
+                subject=pid,
+                detail=(
+                    f"undeclared merges: {inferred} with inferred test co-change "
+                    f"(verified + test + prod files), {bare} bare-undeclared "
+                    f"({inferred + bare} total)"
+                ),
+            )
+        )
+
+    return results
+
+
+@register_check(
     "sr_catch_rate_cache_freshness",
     "Check that design_doc['sr_catch_rate_trends']['computed_at'] is within the "
     "staleness window so operators see current catch-rate trends.",

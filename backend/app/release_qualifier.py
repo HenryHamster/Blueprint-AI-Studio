@@ -2706,7 +2706,10 @@ async def _compute_acceptance_window_aggregate(
     denominator and numerator are both restricted to WRITE_TASK_TYPES so the
     fraction reflects the population that can actually declare acceptance evidence
     (non-write tasks such as research/review/plan/audit can never enter the
-    ``proven``/``satisfied_unproven`` buckets). A None fraction means no
+    ``proven`` / ``satisfied_unproven`` / ``inferred_test_cochange`` buckets). A
+    verified merge is one whose acceptance context lands in any of those three
+    buckets — including undeclared merges that co-changed a test and a
+    production file under genuine CI (``inferred_test_cochange``). A None fraction means no
     write-task merges landed in the window — distinct from a genuine 0-coverage
     failure.
 
@@ -2744,7 +2747,7 @@ async def _compute_acceptance_window_aggregate(
         1
         for task in rows_write
         if classify_merged_acceptance_context(task.context or {})
-        in {"proven", "satisfied_unproven"}
+        in {"proven", "satisfied_unproven", "inferred_test_cochange"}
     )
     fraction = (verified / total) if total > 0 else None
     return {

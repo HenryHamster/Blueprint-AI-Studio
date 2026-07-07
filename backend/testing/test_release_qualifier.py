@@ -29220,6 +29220,73 @@ async def test_acceptance_window_aggregate_legacy_no_verdict_counted(db_session)
 
 
 @pytest.mark.asyncio
+async def test_acceptance_window_fraction_counts_inferred_test_cochange(db_session):
+    """Undeclared merges that co-changed a test + production file under genuine CI
+    are counted as verified, so the window fraction is non-zero.
+
+    This is the retirement-metric proof for the inferred_test_cochange bucket: a
+    merged WRITE task with NO code_acceptance_verdict, but whose
+    ``_pr_changed_files`` records both a test file and a non-test production file
+    and whose merge was CI-verified (no fall-open reason), lands in the
+    ``inferred_test_cochange`` bucket and is now inside the window's verified
+    numerator. A sibling merge that shipped the SAME verified CI but only a
+    production file (no test) stays ``undeclared`` and is excluded — proving the
+    numerator discriminates genuine test co-change from bare undeclared merges,
+    rather than blanket-counting every legacy merge.
+    """
+    from app.acceptance_gate import (
+        CODE_ACCEPTANCE_VERDICT_KEY,
+        classify_merged_acceptance_context,
+    )
+
+    project, version = await _make_project_and_version(db_session)
+
+    inferred_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": [
+            "backend/app/release_qualifier.py",
+            "backend/testing/test_release_qualifier.py",
+        ],
+    }
+    # No verdict key: the merge is genuinely undeclared, upgraded only by inference.
+    assert CODE_ACCEPTANCE_VERDICT_KEY not in inferred_ctx
+    assert classify_merged_acceptance_context(inferred_ctx) == "inferred_test_cochange"
+
+    inferred_task = Task(
+        project_id=project.id,
+        title="inferred-cochange",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=inferred_ctx,
+    )
+    # Same verified CI, production-only diff → stays undeclared (excluded).
+    bare_ctx = {
+        "pr_merged": True,
+        "landed_on_integration": True,
+        "_pr_changed_files": ["backend/app/release_qualifier.py"],
+    }
+    assert classify_merged_acceptance_context(bare_ctx) == "undeclared"
+    bare_task = Task(
+        project_id=project.id,
+        title="bare-undeclared",
+        payloads=[{"type": "create"}],
+        status=TaskStatus.COMPLETED,
+        context=bare_ctx,
+    )
+    db_session.add(inferred_task)
+    db_session.add(bare_task)
+    await db_session.commit()
+
+    agg = await rq._compute_acceptance_window_aggregate(db_session, version)
+    # Two write-task merges landed; only the genuine test-cochange one is verified.
+    assert agg["acceptance_window_total"] == 2
+    assert agg["acceptance_window_verified"] == 1
+    # The retirement metric is now non-zero (was a false 0/N before the bucket).
+    assert agg["acceptance_window_fraction"] == pytest.approx(0.5)
+
+
+@pytest.mark.asyncio
 async def test_acceptance_window_aggregate_fraction_none_when_empty(db_session):
     """When no tasks land in the version window, fraction is None (not 0 or NaN)."""
     _project, version = await _make_project_and_version(db_session)

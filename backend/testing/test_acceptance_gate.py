@@ -22,8 +22,10 @@ from app.acceptance_gate import (
     CRITERION_OPS,
     acceptance_blocks_success,
     acceptance_is_proven,
+    acceptance_counts_as_verified_context,
     acceptance_was_declared,
     classify_merged_acceptance,
+    classify_merged_acceptance_context,
     coerce_number,
     criterion_met,
     evaluate_code_acceptance,
@@ -682,6 +684,7 @@ def test_satisfied_soft_kinds_bucket_as_satisfied_unproven_not_proven():
     assert aggregate == {
         "proven": 1,
         "satisfied_unproven": 1,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -708,6 +711,133 @@ def test_malformed_recorded_verdict_buckets_as_malformed():
 
     aggregate = summarize_version_acceptance_aggregate([task])
     assert aggregate["malformed"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# inferred_test_cochange — undeclared merges upgraded from PR co-change signal
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _inferred_ctx(
+    changed_files: list[str] | None, unverified_reason: str | None = None
+) -> dict:
+    """A landed, undeclared context with the given changed files / merge reason."""
+    ctx: dict = {"pr_merged": True, "landed_on_integration": True}
+    if changed_files is not None:
+        ctx["_pr_changed_files"] = changed_files
+    if unverified_reason is not None:
+        ctx[REVIEW_LOOP_KEY] = {UNVERIFIED_MERGE_REASON_KEY: unverified_reason}
+    return ctx
+
+
+def test_undeclared_verified_test_and_prod_cochange_is_inferred():
+    """Verified merge, no verdict, test + non-test prod file → inferred_test_cochange."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ]
+    )
+    assert classify_merged_acceptance_context(ctx) == "inferred_test_cochange"
+    # It still counts as verified merged work (at least as strong as undeclared).
+    assert acceptance_counts_as_verified_context(ctx) is True
+
+
+def test_undeclared_test_only_diff_is_not_inferred():
+    """A test-only diff has no production seam to exercise → stays undeclared."""
+    ctx = _inferred_ctx(
+        [
+            "backend/testing/test_acceptance_gate.py",
+            "backend/testing/test_release_qualifier.py",
+        ]
+    )
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+
+
+def test_undeclared_prod_only_diff_is_not_inferred():
+    """A production-only diff shipped no test → stays undeclared."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/app/release_qualifier.py",
+        ]
+    )
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+
+
+def test_undeclared_empty_changed_files_is_not_inferred():
+    """No changed-file signal at all → stays undeclared (fail-safe)."""
+    assert classify_merged_acceptance_context(_inferred_ctx([])) == "undeclared"
+    assert classify_merged_acceptance_context(_inferred_ctx(None)) == "undeclared"
+
+
+def test_benign_unverified_test_cochange_is_not_inferred():
+    """A benign fall-open means CI did not run — test presence is moot → undeclared."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="no_detectable_test_command",
+    )
+    assert classify_merged_acceptance_context(ctx) == "undeclared"
+
+
+def test_degraded_unverified_test_cochange_stays_degraded():
+    """A degraded fall-open overrides inference → merged_unverified_degraded."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+        unverified_reason="verify_setup_failed",
+    )
+    assert (
+        classify_merged_acceptance_context(ctx) == "merged_unverified_degraded"
+    )
+
+
+def test_declared_verdict_wins_over_inferred_cochange():
+    """An explicit recorded verdict is classified on its own axis, never inferred."""
+    ctx = _inferred_ctx(
+        [
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ]
+    )
+    ctx[CODE_ACCEPTANCE_VERDICT_KEY] = {
+        "satisfied": True,
+        "proven": True,
+        "kind": "named_test",
+    }
+    assert classify_merged_acceptance_context(ctx) == "proven"
+
+
+def test_inferred_bucket_summarized_and_counts_verified():
+    """The aggregate exposes the inferred bucket and it is a distinct 7th key."""
+    inferred = _make_code_task(
+        changed_files=[
+            "backend/app/acceptance_gate.py",
+            "backend/testing/test_acceptance_gate.py",
+        ],
+    )
+    inferred.context["pr_merged"] = True
+    inferred.context["landed_on_integration"] = True
+    assert classify_merged_acceptance(inferred) == "inferred_test_cochange"
+
+    aggregate = summarize_version_acceptance_aggregate([inferred])
+    assert aggregate == {
+        "proven": 0,
+        "satisfied_unproven": 0,
+        "inferred_test_cochange": 1,
+        "declared_unsatisfied": 0,
+        "undeclared": 0,
+        "merged_unverified_degraded": 0,
+        "malformed": 0,
+        "total": 1,
+        "proven_rate": 0.0,
+        "satisfied_rate": 0.0,
+    }
     assert aggregate["proven"] == 0
     assert aggregate["satisfied_unproven"] == 0
     assert aggregate["proven_rate"] == 0.0

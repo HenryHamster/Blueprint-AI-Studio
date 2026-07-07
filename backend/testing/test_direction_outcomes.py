@@ -4580,6 +4580,7 @@ def test_fold_evicted_acceptance_aggregates_survive_eviction():
             "prs_merged": 4,
             "acceptance_proven_merged": 1,
             "acceptance_declared_merged": 3,
+            "acceptance_inferred_merged": 1,
             "acceptance_merged_write_total": 4,
         },
     ]
@@ -4587,6 +4588,7 @@ def test_fold_evicted_acceptance_aggregates_survive_eviction():
 
     assert agg["total_acceptance_proven_merged"] == 1
     assert agg["total_acceptance_declared_merged"] == 3
+    assert agg["total_acceptance_inferred_merged"] == 1
     assert agg["total_acceptance_merged_write_total"] == 4
 
 
@@ -6019,6 +6021,97 @@ async def test_declaration_coverage_none_when_no_merged_write_tasks(
     assert entry["acceptance_merged_write_total"] == 0
 
 
+@pytest.mark.asyncio
+async def test_acceptance_inferred_merged_counts_verified_test_cochange(
+    db_session: AsyncSession,
+):
+    """acceptance_inferred_merged counts undeclared WRITE merges upgraded to the
+    inferred_test_cochange bucket, and those merges still count as verified.
+
+    A verified-CI merge with no verdict but test + production co-change is
+    inferred (counted); a production-only undeclared merge stays undeclared (not
+    counted); a declared proven merge is proven (never inferred). All three are
+    verified merges, so verified_prs_merged credits all three while
+    acceptance_inferred_merged isolates only the inferred one.
+    """
+    direction_id = "d-inferred"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [
+        _make_direction(direction_id, research_task_id, tasks_created=3)
+    ]
+    await db_session.flush()
+
+    # (1) Undeclared + verified CI + test/prod co-change → inferred_test_cochange.
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/direction_outcomes.py",
+                "backend/testing/test_direction_outcomes.py",
+            ],
+        },
+        title="inferred-cochange",
+    )
+    # (2) Undeclared, production-only diff → stays undeclared (NOT inferred).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "_pr_changed_files": ["backend/app/direction_outcomes.py"],
+        },
+        title="bare-undeclared",
+    )
+    # (3) Declared proven named_test → proven (never inferred).
+    await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={
+            "pr_merged": True,
+            "code_acceptance_verdict": {
+                "satisfied": True,
+                "proven": True,
+                "kind": "named_test",
+            },
+        },
+        title="proven-named-test",
+    )
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+
+    await db_session.refresh(project)
+    entry = project.directions[0]["research_history"][0]
+
+    # Only the genuine test-cochange merge is inferred.
+    assert entry["acceptance_inferred_merged"] == 1
+    # It did not leak into the declared or proven counts.
+    assert entry["acceptance_declared_merged"] == 1
+    assert entry["acceptance_proven_merged"] == 1
+    # All three merges are verified (inferred, undeclared, and proven buckets).
+    assert entry["prs_merged"] == 3
+    assert entry["verified_prs_merged"] == 3
+    assert entry["acceptance_merged_write_total"] == 3
+    # inferred + declared never exceeds the merged-write population.
+    assert acceptance_metric_invariant_violations(entry) == []
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Acceptance-evidence metric invariant guard
 #
@@ -6124,6 +6217,28 @@ _ACCEPT_SCENARIOS: dict[str, dict] = {
         "declared": False,
         "verified": True,
     },
+    # Undeclared write merge upgraded by inference: verified CI, NO verdict, but the
+    # PR co-changed a test file + a non-test production file → inferred_test_cochange.
+    # Counts as verified (verified_prs_merged / verified_write) but never
+    # declared/proven, and is recorded in the distinct acceptance_inferred_merged
+    # aggregate.
+    "inferred": {
+        "context": {
+            "pr_merged": True,
+            "_pr_changed_files": [
+                "backend/app/direction_outcomes.py",
+                "backend/testing/test_direction_outcomes.py",
+            ],
+        },
+        "type": "create",
+        "write": True,
+        "merged": True,
+        "proven": False,
+        "consumed": False,
+        "declared": False,
+        "verified": True,
+        "inferred": True,
+    },
     # Degraded-verification write merge: not verified, not declared, not proven.
     "degraded": {
         "context": {
@@ -6161,6 +6276,7 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
     declared = sum(1 for r in merged_write if r["declared"])
     proven = sum(1 for r in merged_write if r["proven"])
     consumed = sum(1 for r in merged_write if r.get("consumed"))
+    inferred = sum(1 for r in merged_write if r.get("inferred"))
     verified_write = sum(1 for r in merged_write if r["verified"])
     verified = sum(1 for r in merged if r["verified"])
     prs_merged = len(merged)
@@ -6169,6 +6285,7 @@ def _expected_acceptance_aggregates(mix: list[str]) -> dict:
         "acceptance_proven_merged": proven,
         "acceptance_consumed_merged": consumed,
         "acceptance_declared_merged": declared,
+        "acceptance_inferred_merged": inferred,
         "acceptance_verified_write_merged": verified_write,
         "acceptance_merged_write_total": mw,
         "verified_prs_merged": verified,
@@ -6222,6 +6339,7 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
             "soft",
             "declared_unsat",
             "undeclared",
+            "inferred",
             "degraded",
             "readonly",
         ],
@@ -6241,6 +6359,8 @@ async def _run_mix(db_session: AsyncSession, direction_id: str, mix: list[str]) 
             "soft",
             "declared_unsat",
             "undeclared",
+            "inferred",
+            "inferred",
             "degraded",
             "readonly",
             "readonly",
@@ -6293,6 +6413,16 @@ async def test_acceptance_metric_invariants_hold_across_mixes(
         <= entry["acceptance_proven_merged"]
         <= entry["verified_prs_merged"]
         <= entry["prs_merged"]
+    )
+    # inferred_test_cochange is a subset of merged-write and disjoint from declared.
+    assert (
+        0
+        <= entry["acceptance_inferred_merged"]
+        <= entry["acceptance_merged_write_total"]
+    )
+    assert (
+        entry["acceptance_inferred_merged"] + entry["acceptance_declared_merged"]
+        <= entry["acceptance_merged_write_total"]
     )
 
 
@@ -6372,6 +6502,25 @@ def test_acceptance_metric_invariant_violations_detects_drift():
     # merged-write drifts above prs_merged.
     assert acceptance_metric_invariant_violations(
         {**clean, "acceptance_merged_write_total": 5}
+    )
+    # inferred drifts negative.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": -1}
+    )
+    # inferred drifts above merged-write.
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": 4}
+    )
+    # inferred + declared drift above merged-write (they are disjoint subsets).
+    assert acceptance_metric_invariant_violations(
+        {**clean, "acceptance_inferred_merged": 2}
+    )
+    # A consistent inferred subset (inferred + declared <= merged-write) is clean.
+    assert (
+        acceptance_metric_invariant_violations(
+            {**clean, "acceptance_inferred_merged": 1}
+        )
+        == []
     )
     # coverage no longer equals declared / merged-write.
     assert acceptance_metric_invariant_violations(

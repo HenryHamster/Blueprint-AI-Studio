@@ -123,6 +123,7 @@ CODE_ACCEPTANCE_VERDICT_KEY = "code_acceptance_verdict"
 ACCEPTANCE_AGGREGATE_BUCKETS: tuple[str, ...] = (
     "proven",
     "satisfied_unproven",
+    "inferred_test_cochange",
     "declared_unsatisfied",
     "undeclared",
     "merged_unverified_degraded",
@@ -535,6 +536,24 @@ def classify_merged_acceptance_context(context: Mapping[str, Any] | None) -> str
         return "merged_unverified_degraded"
     recorded = (context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY)
     if not isinstance(recorded, dict):
+        # No explicit declaration. Infer verified test co-change from the signals
+        # the merge already carries: a CI-VERIFIED merge (no fall-open reason)
+        # whose PR changed at least one test file AND at least one non-test
+        # production file is stronger evidence than a bare undeclared merge — CI
+        # genuinely gated the change and tests shipped alongside it. This mirrors
+        # the named_test gate's (2)+(3) conditions (verified merge + a production
+        # seam for the test to exercise) minus the declaration linking the test
+        # to the claim, so it is deliberately a distinct, weaker bucket than
+        # satisfied_unproven. A benign/degraded fall-open (CI did not actually
+        # run) does NOT qualify — test presence is moot without verification.
+        if _context_merge_verification_status(context) == "verified":
+            changed = (context or {}).get("_pr_changed_files")
+            if isinstance(changed, list):
+                str_paths = [p for p in changed if isinstance(p, str) and p.strip()]
+                has_test = any(_is_test_path(p) for p in str_paths)
+                has_prod = any(not _is_test_path(p) for p in str_paths)
+                if has_test and has_prod:
+                    return "inferred_test_cochange"
         return "undeclared"
     if acceptance_blocks_success(recorded):
         return "declared_unsatisfied"
@@ -550,13 +569,14 @@ def acceptance_counts_as_verified_context(
 ) -> bool:
     """Whether a landed task context still counts as verified merged work.
 
-    Verified merges include the strict proven, soft satisfied-unproven, and
-    undeclared buckets. Degraded, explicitly unsatisfied, and malformed rows do
-    not count.
+    Verified merges include the strict proven, soft satisfied-unproven,
+    inferred test-cochange, and undeclared buckets. Degraded, explicitly
+    unsatisfied, and malformed rows do not count.
     """
     return classify_merged_acceptance_context(context) in {
         "proven",
         "satisfied_unproven",
+        "inferred_test_cochange",
         "undeclared",
     }
 
@@ -785,6 +805,9 @@ def classify_merged_acceptance(task: Task) -> str:
       * ``proven`` — non-degraded merge with strict machine-checked proof;
       * ``satisfied_unproven`` — non-degraded merge with soft satisfied
         declared acceptance;
+      * ``inferred_test_cochange`` — non-degraded, CI-verified merge with no
+        declaration whose PR co-changed a test file and a non-test production
+        file (inferred evidence, weaker than a declared satisfied acceptance);
       * ``declared_unsatisfied`` — non-degraded merge with declared evidence
         that failed;
       * ``undeclared`` — non-degraded merge with no recorded declaration;

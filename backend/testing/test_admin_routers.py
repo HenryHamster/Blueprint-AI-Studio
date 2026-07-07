@@ -15490,6 +15490,7 @@ class TestVersionLifecycleAcceptanceAggregate:
         assert current["acceptance_aggregate"] == {
             "proven": 0,
             "satisfied_unproven": 0,
+            "inferred_test_cochange": 0,
             "declared_unsatisfied": 0,
             "undeclared": 0,
             "merged_unverified_degraded": 0,
@@ -24169,7 +24170,7 @@ class TestGetReleaseVersionSummary:
     async def test_summary_acceptance_aggregate_buckets_present(
         self, client: AsyncClient, db_session
     ):
-        """acceptance_aggregate includes the standard six buckets plus total."""
+        """acceptance_aggregate includes the standard acceptance buckets plus total."""
         project = await _make_project(db_session)
         version = ReleaseVersion(
             project_id=project.id,

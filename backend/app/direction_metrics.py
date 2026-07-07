@@ -178,6 +178,11 @@ _HISTORY_AGG_DEFAULTS = {
     "total_acceptance_proven_merged": 0,
     "total_acceptance_consumed_merged": 0,
     "total_acceptance_declared_merged": 0,
+    # Lifetime count of undeclared merges upgraded to the inferred_test_cochange
+    # bucket (verified CI + test/prod co-change, no stamped verdict). Folded so
+    # directions past the eviction window keep the inferred-coverage signal.
+    # Disjoint from total_acceptance_declared_merged by construction.
+    "total_acceptance_inferred_merged": 0,
     "total_acceptance_merged_write_total": 0,
     "total_prs_rejected": 0,
     "total_tasks_failed": 0,
@@ -553,6 +558,9 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         agg["total_acceptance_declared_merged"] += ev.get(
             "acceptance_declared_merged", 0
         )
+        agg["total_acceptance_inferred_merged"] += ev.get(
+            "acceptance_inferred_merged", 0
+        )
         agg["total_acceptance_merged_write_total"] += ev.get(
             "acceptance_merged_write_total", 0
         )
@@ -690,6 +698,7 @@ def build_evicted_cycle_snapshot(entry: dict[str, Any]) -> dict[str, Any]:
         "acceptance_proven_merged": int(entry.get("acceptance_proven_merged") or 0),
         "acceptance_consumed_merged": int(entry.get("acceptance_consumed_merged") or 0),
         "acceptance_declared_merged": int(entry.get("acceptance_declared_merged") or 0),
+        "acceptance_inferred_merged": int(entry.get("acceptance_inferred_merged") or 0),
         "acceptance_merged_write_total": int(
             entry.get("acceptance_merged_write_total") or 0
         ),

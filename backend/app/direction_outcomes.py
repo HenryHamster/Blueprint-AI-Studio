@@ -36,6 +36,7 @@ from app.acceptance_gate import (
     acceptance_is_proven,
     acceptance_was_declared,
     classify_merged_acceptance,
+    classify_merged_acceptance_context,
 )
 from app.landed_signal import (
     LANDED_ON_INTEGRATION_KEY,
@@ -307,6 +308,10 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
       * proven ⊆ verified ⊆ merged
         (0 ≤ acceptance_proven_merged ≤ verified_prs_merged ≤ prs_merged)
       * declared ⊆ merged          (acceptance_declared_merged ≤ prs_merged)
+      * inferred ⊆ merged-write, disjoint from declared
+        (0 ≤ acceptance_inferred_merged ≤ acceptance_merged_write_total and
+         acceptance_inferred_merged + acceptance_declared_merged
+         ≤ acceptance_merged_write_total)
       * coverage identity          (acceptance_declaration_coverage ==
         round(declared / merged-write, 3), or None ⇔ merged-write == 0)
 
@@ -320,11 +325,14 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
     proven = proven_merged_count(entry)
     consumed = consumed_merged_count(entry)
     declared = int(entry.get("acceptance_declared_merged") or 0)
+    inferred = int(entry.get("acceptance_inferred_merged") or 0)
     verified = verified_merged_count(entry)
     prs_merged = int(entry.get("prs_merged") or 0)
 
     if proven < 0:
         violations.append(f"proven ({proven}) is negative")
+    if inferred < 0:
+        violations.append(f"inferred ({inferred}) is negative")
     if consumed < 0:
         violations.append(f"consumed ({consumed}) is negative")
     if consumed > proven:
@@ -398,6 +406,19 @@ def acceptance_metric_invariant_violations(entry: dict) -> list[str]:
         if verified_write > verified:
             violations.append(
                 f"verified-write ({verified_write}) exceeds verified ({verified})"
+            )
+        # inferred_test_cochange merges are a subset of merged-write, and are
+        # disjoint from declared merges (the classifier only infers when no
+        # verdict dict is present), so declared + inferred also cannot exceed the
+        # merged-write population.
+        if inferred > merged_write:
+            violations.append(
+                f"inferred ({inferred}) exceeds merged-write ({merged_write})"
+            )
+        if inferred + declared > merged_write:
+            violations.append(
+                f"inferred + declared ({inferred + declared}) exceeds "
+                f"merged-write ({merged_write})"
             )
         if merged_write <= 0:
             if coverage is not None:
@@ -619,6 +640,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
         "consumer": "direction_lifecycle.py / admin.py (cumulative spend), strategic_analysis.py"
     },
     # --- Terminal task counts ---
+    "tasks_created": {
+        "consumer": "direction_metrics.py (total_tasks_created + momentum/conversion), anomaly_detection.py, claim_task_helpers.py, digest_direction_progress.py (conversion denominator)"
+    },
     "tasks_completed": {
         "consumer": "direction_metrics.py, strategic_completion.py, research_completion.py"
     },
@@ -678,6 +702,9 @@ RESEARCH_HISTORY_METRIC_MANIFEST: dict[str, dict] = {
     },
     "acceptance_declared_merged": {
         "consumer": "digest_direction_progress.py (declaration coverage), strategic_spawning.py, direction_metrics.py (total_acceptance_declared_merged)"
+    },
+    "acceptance_inferred_merged": {
+        "consumer": "direction_metrics.py (total_acceptance_inferred_merged lifetime fold + build_evicted_cycle_snapshot), acceptance_metric_invariant_violations (this module, inferred-ordering guard)"
     },
     "acceptance_merged_write_total": {
         "consumer": "digest_direction_progress.py + strategic_spawning.py (coverage denominator), direction_metrics.py (total_acceptance_merged_write_total)"
@@ -1538,11 +1565,12 @@ async def _update_direction_research_outcomes(
     #
     # The shared acceptance classifier keeps the direction window and release
     # window in sync: the verified buckets (strict proven + satisfied_unproven
-    # + undeclared) still count as verified, while degraded, explicitly
-    # unsatisfied, and malformed rows stay out.
+    # + inferred_test_cochange + undeclared) still count as verified, while
+    # degraded, explicitly unsatisfied, and malformed rows stay out.
     aggregate_buckets = {
         "proven": 0,
         "satisfied_unproven": 0,
+        "inferred_test_cochange": 0,
         "declared_unsatisfied": 0,
         "undeclared": 0,
         "merged_unverified_degraded": 0,
@@ -1553,19 +1581,26 @@ async def _update_direction_research_outcomes(
     entry["verified_prs_merged"] = (
         aggregate_buckets["proven"]
         + aggregate_buckets["satisfied_unproven"]
+        + aggregate_buckets["inferred_test_cochange"]
         + aggregate_buckets["undeclared"]
     )
     # verified_autonomous_prs_merged: the honest basis for the retirement-
     # eligibility milestone (compute_direction_autonomy_state). A merge counts
     # here only when it is BOTH autonomous (no operator intervention) AND lands
     # in one of the same verified acceptance buckets as verified_prs_merged
-    # (proven + satisfied_unproven + undeclared). Degraded-unverified and
+    # (proven + satisfied_unproven + inferred_test_cochange + undeclared).
+    # Degraded-unverified and
     # acceptance-unsatisfied autonomous merges are excluded, so by construction
     # verified_autonomous_prs_merged <= autonomous_prs_merged and
     # <= verified_prs_merged. Confirmed-stranded merges are already absent from
     # _merged_rows (is_merged_completion returns False when landed_on_integration
     # is explicitly False), so they never inflate this count on a full recompute.
-    _VERIFIED_ACCEPTANCE_BUCKETS = ("proven", "satisfied_unproven", "undeclared")
+    _VERIFIED_ACCEPTANCE_BUCKETS = (
+        "proven",
+        "satisfied_unproven",
+        "inferred_test_cochange",
+        "undeclared",
+    )
     entry["verified_autonomous_prs_merged"] = sum(
         1
         for ct in _merged_rows
@@ -1611,6 +1646,12 @@ async def _update_direction_research_outcomes(
     #   * acceptance_declared_merged — merges that DECLARED any acceptance
     #     evidence at plan time (acceptance_was_declared, i.e. a verdict was
     #     stamped). Undeclared / legacy merges are excluded.
+    #   * acceptance_inferred_merged — undeclared merges upgraded to the
+    #     inferred_test_cochange bucket: no verdict was stamped, but the PR
+    #     co-changed a test file and a non-test production file under genuine CI.
+    #     Disjoint from acceptance_declared_merged by construction (the classifier
+    #     only infers when no verdict dict is present), so declared + inferred are
+    #     non-overlapping subsets of the merged-write population.
     #   * acceptance_declaration_coverage — declared / merged-write, the fraction
     #     of merged code work that committed to forward evidence. None when no
     #     merged write task exists (no denominator), never retro-failing legacy
@@ -1639,6 +1680,12 @@ async def _update_direction_research_outcomes(
         1
         for ct in _merged_write_rows
         if acceptance_was_declared((ct.context or {}).get(CODE_ACCEPTANCE_VERDICT_KEY))
+    )
+    entry["acceptance_inferred_merged"] = sum(
+        1
+        for ct in _merged_write_rows
+        if classify_merged_acceptance_context(ct.context or {})
+        == "inferred_test_cochange"
     )
     _merged_write_count = len(_merged_write_rows)
     # Persist the coverage denominator so lifetime/window coverage can be
@@ -2489,6 +2536,7 @@ async def _update_direction_research_outcomes(
         ("acceptance_proven_merged", "total_acceptance_proven_merged"),
         ("acceptance_consumed_merged", "total_acceptance_consumed_merged"),
         ("acceptance_declared_merged", "total_acceptance_declared_merged"),
+        ("acceptance_inferred_merged", "total_acceptance_inferred_merged"),
         ("acceptance_merged_write_total", "total_acceptance_merged_write_total"),
     )
 

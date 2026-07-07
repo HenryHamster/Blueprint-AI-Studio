@@ -170,6 +170,7 @@ def test_registry_contains_initial_checks():
         "first_attempt_rate_denominator_coverage",
         "sr_catch_rate_cache_freshness",
         "acceptance_window_sub_scores_invariant",
+        "undeclared_test_cochange_coverage_split",
         "evidence_claim_reconciliation",
     } <= names
 
@@ -416,6 +417,159 @@ async def test_criterion_merge_evidence_gap_skips_with_no_qualifying_tasks(db):
     results = await mis.check_criterion_merge_evidence_gap(ctx)
     assert len(results) == 1
     assert results[0].status == CheckStatus.SKIPPED
+
+
+# --- Check: undeclared_test_cochange_coverage_split --------------------------
+
+
+@pytest.mark.asyncio
+async def test_undeclared_test_cochange_coverage_split():
+    """Report the split of undeclared merges: inferred test co-change vs bare.
+
+    A real merge-test verdict gating a CI-verified merge with both test and
+    production files changed represents inferred test co-change (agents shipping
+    tests). A bare-undeclared merge has either no test files or no production
+    files. The check observes and reports the split per project.
+    """
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///:memory:",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    async with engine.begin() as conn:
+        await conn.run_sync(SQLModel.metadata.create_all)
+    Session = sessionmaker(
+        bind=engine,
+        class_=AsyncSession,
+        autocommit=False,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    async with Session() as db:
+        project = await _project(db)
+
+        # Case 1: Verified merge with both test and production files → inferred.
+        t_inferred = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                # CI-verified (no unverified_merge_reason): passes the verified check.
+                # Both test and production files changed.
+                "_pr_changed_files": [
+                    "backend/testing/test_foo.py",  # test file
+                    "backend/app/foo.py",            # production file
+                ],
+            },
+        )
+        db.add(t_inferred)
+        await db.commit()
+        await db.refresh(t_inferred)
+        art_inferred = Artifact(
+            task_id=t_inferred.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_inferred)
+        await db.commit()
+
+        # Case 2: Verified merge but only test files (no production) → bare.
+        t_only_test = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": ["backend/testing/test_bar.py"],  # only test
+            },
+        )
+        db.add(t_only_test)
+        await db.commit()
+        await db.refresh(t_only_test)
+        art_only_test = Artifact(
+            task_id=t_only_test.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_only_test)
+        await db.commit()
+
+        # Case 3: Verified merge but only production files (no test) → bare.
+        t_only_prod = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                "_pr_changed_files": ["backend/app/baz.py"],  # only production
+            },
+        )
+        db.add(t_only_prod)
+        await db.commit()
+        await db.refresh(t_only_prod)
+        art_only_prod = Artifact(
+            task_id=t_only_prod.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_only_prod)
+        await db.commit()
+
+        # Case 4: No-CI gate fall-open (unverified merge) → bare (cannot infer).
+        t_unverified = Task(
+            project_id=project.id,
+            payloads=[{"type": "create"}],
+            status=TaskStatus.COMPLETED,
+            context={
+                "landed_on_integration": True,
+                "pr_merged": True,
+                # Unverified merge: has unverified_merge_reason in review_loop.
+                "review_loop": {"unverified_merge_reason": "ci_setup_failed"},
+                "_pr_changed_files": [
+                    "backend/testing/test_fallopen.py",
+                    "backend/app/fallopen.py",
+                ],
+            },
+        )
+        db.add(t_unverified)
+        await db.commit()
+        await db.refresh(t_unverified)
+        art_unverified = Artifact(
+            task_id=t_unverified.id, artifact_type=ArtifactType.PULL_REQUEST
+        )
+        db.add(art_unverified)
+        await db.commit()
+
+        # Run the check.
+        ctx = SweepContext(
+            session=db,
+            now=_utcnow(),
+            mode="observe",
+            max_projects=25,
+            sample_limit=200,
+            window_days=14,
+        )
+        results = await mis.check_undeclared_test_cochange_coverage_split(ctx)
+
+        # Expect exactly one result per project (since all tasks are in one project).
+        assert len(results) >= 1, f"expected at least one result, got {results}"
+        pid = str(project.id)
+        per_project_results = [r for r in results if r.subject == pid]
+        assert len(per_project_results) == 1, f"expected one result for project {pid}"
+
+        result = per_project_results[0]
+        assert result.check == "undeclared_test_cochange_coverage_split"
+        assert result.status == CheckStatus.OK  # Observe-only, never flagged
+
+        # Result metrics:
+        # - self_reported = count with inferred test co-change (1: t_inferred)
+        # - ground_truth = count bare-undeclared (3: t_only_test, t_only_prod, t_unverified)
+        # - delta = total (4)
+        assert result.self_reported == 1, f"expected 1 inferred, got {result.self_reported}"
+        assert result.ground_truth == 3, f"expected 3 bare, got {result.ground_truth}"
+        assert result.delta == 4, f"expected delta=4 total, got {result.delta}"
+        assert "inferred test co-change" in result.detail
+        assert "bare-undeclared" in result.detail
+
+    await engine.dispose()
 
 
 # --- Check: playbook_confirmation_integrity ---------------------------------
