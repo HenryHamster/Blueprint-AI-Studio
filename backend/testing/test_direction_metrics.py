@@ -11,6 +11,8 @@ work, while staying additive and fail-safe over legacy / read-only data:
   - _agg_proof_weighted_merged: pre-contract verified merges keep full credit.
 """
 
+import pytest
+
 from app.direction_metrics import (
     _PROOF_WEIGHT_DECLARED_UNPROVEN,
     _PROOF_WEIGHT_UNDECLARED,
@@ -148,3 +150,40 @@ class TestAggProofWeightedMerged:
             "total_acceptance_declared_merged": 5,
         }
         assert _agg_proof_weighted_merged(agg) == 5.0
+
+
+class TestFoldDecompositionDenominator:
+    """A None-rate decomposition plan must not inflate subtask_count_sum.
+
+    subtask_count_sum is the weighted-average DENOMINATOR consumed by
+    spawn_calibration's scope-upgrade suppression. A plan whose
+    subtask_merge_rate is None (subtasks exist but no merged/failed-nc
+    outcome yet) contributes no numerator, so it must contribute no
+    denominator either — otherwise the weighted merge-rate is biased down.
+    """
+
+    def test_none_rate_plan_excluded_from_denominator(self):
+        evicted = [
+            {
+                "timestamp": "2025-01-01T00:00:00",
+                "decomposition_quality": [
+                    {"subtask_count": 4, "subtask_merge_rate": 0.5},
+                    {"subtask_count": 6, "subtask_merge_rate": None},
+                    {"subtask_count": 2, "subtask_merge_rate": 1.0},
+                ],
+            }
+        ]
+        agg = _fold_evicted_into_aggregate(None, evicted)
+        dq = agg["decomposition_quality"]
+        # total_decompositions counts ALL folded plans (it is a counter, not a
+        # denominator), so the None-rate plan is still counted here.
+        assert dq["total_decompositions"] == 3
+        # ...but the None-rate plan (count=6) is excluded from the denominator.
+        assert dq["subtask_count_sum"] == 6  # 4 + 2, NOT 4 + 6 + 2
+        # Numerator only accrues from numeric-rate plans: 0.5*4 + 1.0*2 = 4.0
+        assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(4.0)
+        # The resulting weighted average reflects only numeric-rate plans.
+        weighted_avg = (
+            dq["subtask_merge_rate_weighted_sum"] / dq["subtask_count_sum"]
+        )
+        assert weighted_avg == pytest.approx(4.0 / 6)

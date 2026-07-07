@@ -10720,7 +10720,9 @@ def test_fold_evicted_preserves_scope_and_decomposition():
 
     dq = agg["decomposition_quality"]
     assert dq["total_decompositions"] == 3
-    assert dq["subtask_count_sum"] == 11  # 4 + 2 + 5
+    # The middle plan has subtask_merge_rate=None, so it is excluded from the
+    # weighted-average denominator: only the numeric-rate plans count (4 + 5).
+    assert dq["subtask_count_sum"] == 9  # 4 + 5 (None-rate plan excluded)
     assert dq["cross_module_count_sum"] == 3  # 1 + 0 + 2
     # Only entries with a non-null rate contribute: 0.5*4 + 0.8*5 = 6.0
     assert dq["subtask_merge_rate_weighted_sum"] == pytest.approx(6.0)

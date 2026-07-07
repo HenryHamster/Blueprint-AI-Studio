@@ -173,6 +173,53 @@ def test_dedup_and_stable_sort(tmp_path):
     ]
 
 
+def test_indirectly_reached_module_via_app_importer(tmp_path):
+    """A test that imports a router (not the changed module directly) is selected.
+
+    This covers the include_router pattern: logic helper ``mylib`` is imported by
+    ``routers/my_router`` which is what the test file references. Changing ``mylib``
+    must surface ``test_via_router.py`` even though it never mentions ``mylib``.
+    """
+    root = str(tmp_path)
+    _make_tree(root)
+    # The logic module being changed — no test references it directly.
+    _write(root, "backend/app/mylib.py", "def helper(): pass\n")
+    # A router that imports the changed module.
+    _write(
+        root,
+        "backend/app/routers/my_router.py",
+        "from app.mylib import helper\n\ndef route(): return helper()\n",
+    )
+    # Test file references only the router, not mylib.
+    _write(
+        root,
+        "backend/testing/test_via_router.py",
+        "from app.routers import my_router\n\ndef test_x(): assert my_router.route()\n",
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/mylib.py"], root)
+    assert result == ["backend/testing/test_via_router.py"]
+
+
+def test_indirect_expansion_does_not_double_count_direct_reference(tmp_path):
+    """A test that directly imports a changed module is listed exactly once."""
+    root = str(tmp_path)
+    _make_tree(root)
+    _write(root, "backend/app/mylib.py", "def helper(): pass\n")
+    # Router imports mylib; test imports BOTH mylib AND the router.
+    _write(
+        root,
+        "backend/app/routers/my_router.py",
+        "from app.mylib import helper\n",
+    )
+    _write(
+        root,
+        "backend/testing/test_double.py",
+        "from app.mylib import helper\nfrom app.routers import my_router\n",
+    )
+    result = impacted_tests.resolve_impacted(["backend/app/mylib.py"], root)
+    assert result == ["backend/testing/test_double.py"]
+
+
 def test_missing_testing_dir_is_graceful(tmp_path):
     root = str(tmp_path)
     # No backend/testing at all — the scan must be skipped, not raise.

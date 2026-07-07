@@ -2432,6 +2432,74 @@ async def test_cost_fields_use_recorded_spend_over_proxy(db_session):
 
 
 @pytest.mark.asyncio
+async def test_cost_per_merged_pr_folds_evicted_aggregate_cost(db_session):
+    """cost_per_merged_pr folds the evicted-aggregate cost into the numerator.
+
+    A direction older than the 10-cycle window has cost-bearing cycles that
+    aged out into history_aggregate. The merge DENOMINATOR already folds in
+    agg.total_prs_merged; the cost NUMERATOR must fold in
+    agg.total_estimated_cost_usd too, otherwise cost-per-merge is understated.
+    This is the parity contract: strategic_spawning and strategic_analysis must
+    report an EQUAL cost_per_merged_pr for the same direction data.
+    """
+    from app.routers.admin_analytics import ON_DEMAND_RATE
+    from app.strategic_analysis import _entry_cost_usd
+    from app.direction_metrics import canonical_cost_per_merged_pr
+
+    history = [
+        {"prs_merged": 2, "tasks_created": 4, "avg_time_to_merge_hours": 1.5},
+        {"prs_merged": 1, "tasks_created": 2, "avg_time_to_merge_hours": 2.0},
+    ]
+    history_aggregate = {
+        "total_cycles": 8,
+        "total_prs_merged": 5,
+        "total_estimated_cost_usd": 12.34,
+    }
+    project = _make_project(
+        directions=[
+            {
+                "id": "d-cost-evicted",
+                "status": "active",
+                "text": "Direction with evicted cost + merges",
+                "priority": "medium",
+                "research_history": history,
+                "history_aggregate": history_aggregate,
+            }
+        ],
+        vision={"purpose": "test purpose"},
+    )
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+    await _seed_legacy_cycles(db_session, project)
+
+    spawned = await _spawn_strategic_review(project, db_session)
+    assert spawned is True
+
+    result = await db_session.execute(select(Task).where(Task.project_id == project.id))
+    tasks = result.scalars().all()
+    payload = tasks[0].payloads[0]
+    d_stat = next(
+        s for s in payload["directions_summary"] if s["id"] == "d-cost-evicted"
+    )
+
+    # Lifetime numerator = window cost + evicted-aggregate cost.
+    window_cost = sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history)
+    expected_cost = round(window_cost + 12.34, 2)
+    # Lifetime denominator = window merges + evicted-aggregate merges.
+    total_merged = (2 + 1) + 5
+    expected_cpm = canonical_cost_per_merged_pr(expected_cost, total_merged)
+
+    assert d_stat["estimated_cost_usd"] == expected_cost
+    assert d_stat["cost_per_merged_pr"] == expected_cpm
+    # Parity contract: dropping the folded aggregate cost would understate it.
+    window_only_cpm = canonical_cost_per_merged_pr(
+        round(window_cost, 2), total_merged
+    )
+    assert d_stat["cost_per_merged_pr"] > window_only_cpm
+
+
+@pytest.mark.asyncio
 async def test_tasks_failed_infra_includes_history_aggregate(db_session):
     """tasks_failed_infra aggregates from both research_history and history_aggregate."""
     project = _make_project(

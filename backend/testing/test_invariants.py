@@ -10677,6 +10677,26 @@ class TestRouteContractOwnership:
             + "\n".join(f"  • {v}" for v in violations)
         )
 
+    def test_route_contract_registry_is_populated(self):
+        """The registry must contain at least one entry beyond the seed entry.
+
+        This prevents the guard from being silently hollowed out by removing
+        entries; any PR that drops the registry below the minimum must update
+        this threshold with justification.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        _MINIMUM_REGISTERED_ENDPOINTS = 3
+        assert len(registry) >= _MINIMUM_REGISTERED_ENDPOINTS, (
+            f"route_contract_owners.json has only {len(registry)} registered "
+            f"endpoint(s); the guard requires at least {_MINIMUM_REGISTERED_ENDPOINTS}. "
+            "Add entries for admin endpoints whose response-shape contracts live in "
+            "more than one test file, or lower the threshold with justification."
+        )
 
 
 def test_no_deprecated_datetime_utcnow_calls():

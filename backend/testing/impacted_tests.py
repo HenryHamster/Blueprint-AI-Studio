@@ -107,6 +107,37 @@ def module_reference_patterns(dotted: str) -> "list[re.Pattern]":
     return pats
 
 
+def _find_app_importers(changed_module: str, repo_root: str) -> "list[str]":
+    """Return dotted names of app modules that directly import ``changed_module``.
+
+    Scans every ``backend/app/**/*.py`` file using the same reference patterns as
+    the test-file scan. Used to surface tests that exercise an indirectly-reached
+    module (e.g. a logic helper imported by a router that a test imports).
+    """
+    app_dir = os.path.join(repo_root, "backend", "app")
+    if not os.path.isdir(app_dir):
+        return []
+    patterns = module_reference_patterns(changed_module)
+    importers: "list[str]" = []
+    for dirpath, _dirs, filenames in os.walk(app_dir):
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            abs_path = os.path.join(dirpath, fname)
+            rel = os.path.relpath(abs_path, repo_root).replace(os.sep, "/")
+            importer = app_module_for_path(rel)
+            if importer is None or importer == changed_module:
+                continue
+            try:
+                with open(abs_path, encoding="utf-8", errors="replace") as fh:
+                    content = fh.read()
+            except OSError:
+                continue
+            if any(pat.search(content) for pat in patterns):
+                importers.append(importer)
+    return importers
+
+
 def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
     """Compute the impacted ``backend/testing/test_*.py`` set (sorted, deduped).
 
@@ -132,6 +163,14 @@ def resolve_impacted(changed_paths, repo_root: str) -> "list[str]":
             changed_modules.append(dotted)
 
     if changed_modules and os.path.isdir(testing_dir):
+        # One-hop expansion: app modules that import a changed module are also
+        # relevant — tests referencing the importer are indirectly impacted.
+        seen_mods: "set[str]" = set(changed_modules)
+        for mod in list(changed_modules):
+            for importer in _find_app_importers(mod, repo_root):
+                if importer not in seen_mods:
+                    seen_mods.add(importer)
+                    changed_modules.append(importer)
         pattern_sets = [module_reference_patterns(mod) for mod in changed_modules]
         for name in os.listdir(testing_dir):
             if not (name.startswith("test_") and name.endswith(".py")):

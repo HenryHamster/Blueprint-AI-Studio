@@ -637,10 +637,17 @@ def _fold_evicted_into_aggregate(prev_agg: dict | None, evicted: list[dict]) -> 
         for qd in ev.get("decomposition_quality") or []:
             dq["total_decompositions"] += 1
             count = qd.get("subtask_count") or 0
-            dq["subtask_count_sum"] += count
             dq["cross_module_count_sum"] += qd.get("cross_module_count") or 0
             rate = qd.get("subtask_merge_rate")
+            # Only plans that contribute to the weighted-average NUMERATOR may
+            # contribute to its DENOMINATOR. A None-rate plan (subtasks exist
+            # but no merged/failed-not-classified outcome yet) would otherwise
+            # inflate subtask_count_sum without any numerator, biasing the
+            # weighted merge-rate downward. This mirrors the live-history
+            # consumers in spawn_calibration.py, which only add a plan's weight
+            # to `total` when its rate is numeric.
             if isinstance(rate, (int, float)) and count > 0:
+                dq["subtask_count_sum"] += count
                 dq["subtask_merge_rate_weighted_sum"] += float(rate) * count
     normalized_generalized = _normalize_aggregate_generalized_state(agg)
     agg["total_generalized_successes"] = normalized_generalized[

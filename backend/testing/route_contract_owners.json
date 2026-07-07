@@ -4,5 +4,29 @@
     "search_pattern": "/api/agent/projects/[^\"']+/tasks(?![/\\w])",
     "exempt_tests": ["test_list_tasks_includes_children_inline"],
     "notes": "Flat-list contract (count, data, ordering, visibility filtering) for the agent tasks list endpoint. test_list_tasks_includes_children_inline in test_agent_strategic_fetch.py is exempt because it tests the children inline field — a different response aspect — rather than duplicating the flat-list contract."
+  },
+  "GET /api/admin/projects/{project_id}/compute-jobs": {
+    "owner": "test_admin_compute_jobs.py",
+    "search_pattern": "/api/admin/projects/[^\"']+/compute-jobs",
+    "exempt_tests": [],
+    "notes": "Compute-job listing response shape (compute_jobs array, vm_phase, provisioning_cause, pagination) owned here. Tests in test_admin_routers.py TestComputeJobsPanel are class methods invisible to the scanner and cover narrower field-level assertions."
+  },
+  "GET /api/admin/activity": {
+    "owner": "test_admin_activity.py",
+    "search_pattern": "/api/admin/activity",
+    "exempt_tests": [
+      "test_activity_basic",
+      "test_activity_since_filter",
+      "test_activity_limit",
+      "test_activity_failed_includes_failure_class_and_taxonomy",
+      "test_activity_requires_auth"
+    ],
+    "notes": "Activity feed response shape (pr_impact_annotations, failure_class, artifact fields) owned here. The five test_digest.py functions are pre-existing co-located tests that exercise the same endpoint from the digest angle and are exempted to preserve their coverage."
+  },
+  "GET /api/admin/pipeline-efficiency": {
+    "owner": "test_admin_pipeline_observability.py",
+    "search_pattern": "/api/admin/pipeline-efficiency",
+    "exempt_tests": [],
+    "notes": "Pipeline efficiency snapshot response shape owned here. No other test file references this endpoint."
   }
 }

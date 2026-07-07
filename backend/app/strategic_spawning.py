@@ -4850,8 +4850,17 @@ def _build_direction_stats(
         from app.routers.admin_analytics import ON_DEMAND_RATE
         from app.strategic_analysis import _entry_cost_usd
 
+        # Include evicted cycles folded into history_aggregate so the lifetime
+        # cost numerator is not truncated at the 10-cycle eviction window — the
+        # denominator (total_merged) already folds in the evicted aggregate, so
+        # a window-only numerator would understate cost for aged directions.
+        # Mirror strategic_analysis.summarize_direction_outcomes exactly.
+        try:
+            agg_cost = max(0.0, float(agg.get("total_estimated_cost_usd") or 0.0))
+        except (TypeError, ValueError):
+            agg_cost = 0.0
         estimated_cost_usd = round(
-            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history), 2
+            sum(_entry_cost_usd(h, ON_DEMAND_RATE) for h in history) + agg_cost, 2
         )
         if estimated_cost_usd > 0:
             stat_entry["estimated_cost_usd"] = estimated_cost_usd

@@ -75,10 +75,11 @@ const SAFE_FACTORY_HELPER_MODULES_BY_TAIL = new Map([
   ['firebase', 'test/firebase-mock-complete'],
   ['usePoller', 'test/poller-mock-complete'],
   ['strategicStateApi', 'test/strategic-state-api-mock-complete'],
+  ['useEfficiencySnapshot', 'test/useEfficiencySnapshot-mock-complete'],
 ]);
 
 // The module "tails" (final path segment) that the inline scanner guards.
-const GUARDED_TAILS = new Set(['api', 'firebase', 'usePoller', 'strategicStateApi']);
+const GUARDED_TAILS = new Set(['api', 'firebase', 'usePoller', 'strategicStateApi', 'useEfficiencySnapshot']);
 
 // Current legacy api full-replacement mocks are allowed so the guard can block
 // new inline api factories without forcing a large migration in this change.
@@ -827,6 +828,7 @@ describe('mock-factory-export-coverage', () => {
       ['./firebase-mock-complete', 'createFirebaseMock', '../firebase', 'firebase-mock-complete.ts'],
       ['./poller-mock-complete', 'createPollerMock', '../hooks/usePoller', 'poller-mock-complete.ts'],
       ['./strategic-state-api-mock-complete', 'createStrategicStateApiMock', '../strategicStateApi', 'strategic-state-api-mock-complete.ts'],
+      ['./useEfficiencySnapshot-mock-complete', 'createUseEfficiencySnapshotMock', '../hooks/useEfficiencySnapshot', 'useEfficiencySnapshot-mock-complete.ts'],
     ];
 
     // Collect source module runtime exports for use in both tier 1 and tier 2.
