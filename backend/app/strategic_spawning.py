@@ -13,6 +13,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import load_only
 from sqlmodel import select
@@ -3876,9 +3877,63 @@ async def _strategic_spawn_budget_guard(
                 "scope": "global",
                 "category": spawn_category,
             }
+        # Non-enforce (off/observe): the categorized budget guard is advisory,
+        # but a snapshot failure must NOT remove the hard cross-project ceiling
+        # entirely. Mirror the sibling raw COUNT(*) backstop in
+        # autonomous_research._spawn_research_task so a snapshot error degrades to
+        # the same coarse global rate limit rather than failing fully open.
+        try:
+            global_max = _runtime_config.get(
+                "max_global_autonomous_tasks_per_hour",
+                _runtime_config.get("max_autonomous_tasks_per_hour", 12) * 10,
+            )
+            one_hour_ago = _utcnow() - timedelta(hours=1)
+            global_recent = (
+                await session.execute(
+                    select(func.count())
+                    .select_from(Task)
+                    .where(
+                        Task.created_by == "ORCHESTRATOR",
+                        Task.created_at >= one_hour_ago,
+                    )
+                )
+            ).scalar() or 0
+        except Exception as count_exc:  # noqa: BLE001 - fallback count failed too
+            logger.warning(
+                "[AUTONOMOUS] Spawn budget snapshot AND raw fallback count "
+                "failed (mode=%s); failing open: snapshot=%s count=%s",
+                mode,
+                exc,
+                count_exc,
+            )
+            return None
+        if global_recent >= global_max:
+            logger.warning(
+                "[AUTONOMOUS] Spawn budget snapshot failed (mode=%s); raw "
+                "COUNT(*) fallback ceiling reached: %s/%s tasks/hour",
+                mode,
+                global_recent,
+                global_max,
+            )
+            return {
+                "guard": "global_rate_limit_exceeded",
+                "reason": (
+                    "Autonomous spawn-budget snapshot unavailable; raw global "
+                    f"backstop reached: {global_recent}/{global_max} tasks/hour"
+                ),
+                "current": global_recent,
+                "limit": global_max,
+                "headroom": max(0, global_max - global_recent),
+                "mode": mode,
+                "scope": "global",
+                "category": spawn_category,
+            }
         logger.warning(
-            "[AUTONOMOUS] Spawn budget calculation failed open (mode=%s): %s",
+            "[AUTONOMOUS] Spawn budget calculation failed open (mode=%s); raw "
+            "fallback ceiling not reached (%s/%s): %s",
             mode,
+            global_recent,
+            global_max,
             exc,
         )
         return None

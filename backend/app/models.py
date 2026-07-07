@@ -325,6 +325,7 @@ class LLMProviderName(str, Enum):
     OPENAI = "openai"
     GEMINI = "gemini"
     ZAI = "zai"
+    DEEPSEEK = "deepseek"
 
 
 class LLMAuthMode(str, Enum):

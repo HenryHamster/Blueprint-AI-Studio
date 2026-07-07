@@ -370,9 +370,40 @@ class TestAgentSecretManifest:
         assert manifest["env"]["AUTH_MODE"] == "api_key"
         assert manifest["env"]["LLM_MODEL"] == "glm-5.2"
         assert manifest["env"]["ZAI_API_KEY"] == "zai-test-key"
+        assert (
+            manifest["env"]["ZAI_ANTHROPIC_BASE_URL"]
+            == "https://example.test/anthropic"
+        )
         assert manifest["env"]["ANTHROPIC_API_KEY"] == "zai-test-key"
         assert manifest["env"]["ANTHROPIC_AUTH_TOKEN"] == "zai-test-key"
         assert manifest["env"]["ANTHROPIC_BASE_URL"] == "https://example.test/anthropic"
+        assert manifest["files"] == []
+
+    def test_build_agent_secret_manifest_maps_deepseek_to_claude_compat_env(self):
+        task_id = uuid.uuid4()
+        manifest = compute.build_agent_secret_manifest(
+            vm_instance_id="vm-deepseek",
+            task_id=task_id,
+            oauth_token="deepseek-test-key",
+            task_type="ops",
+            provider="deepseek",
+            auth_mode="api_key",
+            model="deepseek-v4-flash",
+            provider_metadata={"anthropic_base_url": "https://example.test/deepseek/"},
+            provider_settings={"model": "deepseek-v4-flash", "effort": "low"},
+        )
+
+        assert manifest["env"]["PROVIDER"] == "deepseek"
+        assert manifest["env"]["AUTH_MODE"] == "api_key"
+        assert manifest["env"]["LLM_MODEL"] == "deepseek-v4-flash"
+        assert manifest["env"]["DEEPSEEK_API_KEY"] == "deepseek-test-key"
+        assert (
+            manifest["env"]["DEEPSEEK_ANTHROPIC_BASE_URL"]
+            == "https://example.test/deepseek"
+        )
+        assert manifest["env"]["ANTHROPIC_API_KEY"] == "deepseek-test-key"
+        assert manifest["env"]["ANTHROPIC_AUTH_TOKEN"] == "deepseek-test-key"
+        assert manifest["env"]["ANTHROPIC_BASE_URL"] == "https://example.test/deepseek"
         assert manifest["files"] == []
 
     def test_build_agent_secret_manifest_includes_provider_metadata_backed_files(self):

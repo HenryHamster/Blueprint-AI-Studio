@@ -166,6 +166,10 @@ _PROVIDER_AUTH_ENDPOINT_MARKERS = {
         "gemini",
         "google generative",
     ),
+    "deepseek": (
+        "api.deepseek.com",
+        "deepseek",
+    ),
 }
 
 _PROVIDER_AUTH_STRONG_MARKERS = {
@@ -193,6 +197,12 @@ _PROVIDER_AUTH_STRONG_MARKERS = {
         "api_key_invalid",
         "permission_denied",
         "unauthenticated",
+    ),
+    "deepseek": (
+        "invalid deepseek api key",
+        "x-api-key header is required",
+        "invalid x-api-key",
+        "missing api key",
     ),
 }
 

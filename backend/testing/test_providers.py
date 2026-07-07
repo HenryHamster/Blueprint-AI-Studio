@@ -13,6 +13,7 @@ def test_registry_lists_expected_providers():
         LLMProviderName.OPENAI,
         LLMProviderName.GEMINI,
         LLMProviderName.ZAI,
+        LLMProviderName.DEEPSEEK,
     }
 
 
@@ -107,6 +108,7 @@ def test_zai_provider_uses_claude_compat_secret_material():
 
     material = provider.secret_material("zai-test-key", LLMAuthMode.API_KEY, {})
     assert material.env["ZAI_API_KEY"] == "zai-test-key"
+    assert material.env["ZAI_ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
     assert material.env["ANTHROPIC_API_KEY"] == "zai-test-key"
     assert material.env["ANTHROPIC_AUTH_TOKEN"] == "zai-test-key"
     assert material.env["ANTHROPIC_BASE_URL"] == "https://api.z.ai/api/anthropic"
@@ -119,6 +121,7 @@ def test_zai_provider_accepts_base_url_metadata_override():
         LLMAuthMode.API_KEY,
         {"anthropic_base_url": "https://example.test/anthropic/"},
     )
+    assert material.env["ZAI_ANTHROPIC_BASE_URL"] == "https://example.test/anthropic"
     assert material.env["ANTHROPIC_BASE_URL"] == "https://example.test/anthropic"
 
 
@@ -133,6 +136,52 @@ def test_zai_provider_translates_settings_to_claude_cli_args():
         "glm-5.2",
         "--effort",
         "high",
+        "--permission-mode",
+        "bypassPermissions",
+    )
+
+
+def test_deepseek_provider_uses_claude_compat_secret_material():
+    provider = get_provider(LLMProviderName.DEEPSEEK)
+    result = provider.validate_secret("deepseek-test-key", LLMAuthMode.API_KEY, {})
+    assert result.secret == "deepseek-test-key"
+
+    material = provider.secret_material("deepseek-test-key", LLMAuthMode.API_KEY, {})
+    assert material.env["DEEPSEEK_API_KEY"] == "deepseek-test-key"
+    assert (
+        material.env["DEEPSEEK_ANTHROPIC_BASE_URL"]
+        == "https://api.deepseek.com/anthropic"
+    )
+    assert material.env["ANTHROPIC_API_KEY"] == "deepseek-test-key"
+    assert material.env["ANTHROPIC_AUTH_TOKEN"] == "deepseek-test-key"
+    assert material.env["ANTHROPIC_BASE_URL"] == "https://api.deepseek.com/anthropic"
+
+
+def test_deepseek_provider_accepts_base_url_metadata_override():
+    provider = get_provider(LLMProviderName.DEEPSEEK)
+    material = provider.secret_material(
+        "deepseek-test-key",
+        LLMAuthMode.API_KEY,
+        {"anthropic_base_url": "https://example.test/deepseek/"},
+    )
+    assert (
+        material.env["DEEPSEEK_ANTHROPIC_BASE_URL"]
+        == "https://example.test/deepseek"
+    )
+    assert material.env["ANTHROPIC_BASE_URL"] == "https://example.test/deepseek"
+
+
+def test_deepseek_provider_translates_settings_to_claude_cli_args():
+    provider = get_provider(LLMProviderName.DEEPSEEK)
+    translation = provider.settings_to_cli(
+        {"model": "deepseek-v4-flash", "effort": "low"},
+        auth_mode=LLMAuthMode.API_KEY,
+    )
+    assert translation.args == (
+        "--model",
+        "deepseek-v4-flash",
+        "--effort",
+        "low",
         "--permission-mode",
         "bypassPermissions",
     )

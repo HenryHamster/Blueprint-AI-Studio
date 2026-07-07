@@ -1617,24 +1617,13 @@ async def stop_resident_session(
             commit=False,
         )
 
-    # Drive the resident task terminal (instant reclaim). Only touch a live task.
-    task_id = (blob or {}).get("task_id")
-    cancelled_task_id: uuid.UUID | None = None
-    if task_id:
-        try:
-            task = await session.get(Task, uuid.UUID(str(task_id)))
-        except (ValueError, TypeError):
-            task = None
-        if task is not None and task.status in _LIVE_TASK_STATUSES:
-            task.status = TaskStatus.CANCELLED
-            task.latest_status_message = "Resident strategic session stopped by operator"
-            ctx = dict(task.context or {})
-            ctx["failure_category"] = ADMIN_CANCEL
-            task.context = ctx
-            flag_modified(task, "context")
-            session.add(task)
-            cancelled_task_id = task.id
-
+    # Canonical Project→Task lock order (one change fixes the AB-BA deadlock,
+    # context lost-update, and double-completion findings). The heartbeat mirror
+    # takes the project lock (with_vision_locked) THEN this task's row lock; the
+    # prior stop code mutated + session.add-ed the task BEFORE with_vision_locked,
+    # so autoflush locked the task row first (Task→Project, the opposing order).
+    # Ending the blob first and locking the task only while the project lock is
+    # still held makes stop strictly Project→Task, so neither path can deadlock.
     def _release_and_end(vision: dict[str, Any]) -> None:
         # Release the continuation lease (the resident session is over) and mark
         # the session blob ended, in one locked read-modify-write.
@@ -1654,6 +1643,43 @@ async def stop_resident_session(
         vision[RESIDENT_SESSION_KEY] = ended
 
     await with_vision_locked(session, project.id, _release_and_end, skip_locked=False)
+
+    # Drive the resident task terminal under the TASK row lock, held with the
+    # project lock from above. Re-read FRESH inside the lock (task_lock uses
+    # populate_existing) to fix two hazards of the prior unlocked session.get:
+    # (1) context lost-update — the failure_category merge reads the CURRENT
+    #     context, so it can't clobber a concurrent strategic-API commit's
+    #     _strategic_api_* markers (that writer must take the project lock we hold
+    #     first, so it can't reach the task lock); (2) double-completion — status
+    #     is re-checked, so a task that already went terminal on its own is left
+    #     to the normal post-commit pipeline (mark_phase2_completed has no guard).
+    cancelled_task_id: uuid.UUID | None = None
+    task_id = (blob or {}).get("task_id")
+    resident_task_uuid: uuid.UUID | None = None
+    if task_id:
+        try:
+            resident_task_uuid = uuid.UUID(str(task_id))
+        except (ValueError, TypeError):
+            resident_task_uuid = None
+    if resident_task_uuid is not None:
+        async with task_lock(
+            session, resident_task_uuid, skip_locked=False
+        ) as locked_task:
+            if (
+                locked_task is not None
+                and locked_task.status in _LIVE_TASK_STATUSES
+            ):
+                locked_task.status = TaskStatus.CANCELLED
+                locked_task.latest_status_message = (
+                    "Resident strategic session stopped by operator"
+                )
+                ctx = dict(locked_task.context or {})
+                ctx["failure_category"] = ADMIN_CANCEL
+                locked_task.context = ctx
+                flag_modified(locked_task, "context")
+                session.add(locked_task)
+                cancelled_task_id = locked_task.id
+
     await session.commit()
     await session.refresh(project)
     logger.info(
@@ -2239,6 +2265,13 @@ async def renew_resident_session_lease(
                         .where(
                             ProjectMessage.project_id == project.id,
                             ProjectMessage.id.in_(safe_ids),
+                            # Strictly own-session: legacy/cadence NULL-session
+                            # rows are project-wide standing messages (e.g.
+                            # BUG_REPORTs) that a single session's heartbeat must
+                            # NOT resolve — the poll delivers them for visibility
+                            # only. Enforced invariant (test_heartbeat_handled_ids
+                            # _only_affect_own_session) and mirrored by
+                            # session_message_handoff's never-touch-unstamped rule.
                             ProjectMessage.resident_session_id == session_id,
                             ProjectMessage.status == "open",
                         )

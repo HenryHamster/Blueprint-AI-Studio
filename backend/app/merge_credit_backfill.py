@@ -32,7 +32,15 @@ descendants via :func:`app.direction_outcomes.refresh_direction_outcomes_after_m
 Because propagation and recompute are both idempotent (already-landed children
 are skipped and yield an empty stamped list), the sweep converges: once every
 landed rollup's children are stamped it becomes a cheap no-op, and it also
-self-heals any FUTURE stranding the forward path misses.
+self-heals any FUTURE stranding the forward path misses. The per-tick project
+and rollup batches advance through the FULL history via rotating keyset cursors
+(see ``_project_backfill_cursor`` / ``_rollup_backfill_cursors``): the ordered
+ids are random UUIDs, so without progression the rows beyond a single batch —
+projects past the project batch, landed rollups past the rollup batch — would be
+starved forever and the sweep could NOT converge on a large fleet/history. With
+the cursors every project and every landed rollup is eventually visited across
+ticks, and each cursor wraps back to the start once it reaches the end, so the
+wrap re-scans everything and preserves the continuous self-heal above.
 """
 
 import logging
@@ -54,6 +62,20 @@ logger = logging.getLogger(__name__)
 # but cap the worst case on a project with a long rollup history.
 _MERGE_CREDIT_BACKFILL_PROJECT_BATCH = 25
 _MERGE_CREDIT_BACKFILL_ROLLUP_BATCH = 50
+
+# Rotating keyset cursors so successive ticks advance through the FULL
+# project/rollup history instead of re-selecting the same first-N rows every
+# time. The ordered ids are random UUIDs (Project.id / Task.id are uuid4 PKs),
+# so without progression every row beyond the per-tick batch would be starved
+# forever and the sweep could not converge on a large fleet/history. Each cursor
+# is the last id of the batch just processed; a short (< batch) page means the
+# end of the ordered set was reached, so the cursor wraps back to the start
+# (None for projects, key removed for a project's rollup scan) and the next tick
+# re-scans from the beginning — the wrap is what keeps the sweep's continuous
+# self-heal of future stranding intact. Leader-process memory only; a leader
+# restart harmlessly restarts every scan from the beginning.
+_project_backfill_cursor = None
+_rollup_backfill_cursors: dict = {}
 
 # Rollup-parent context markers. Mirrors _is_rollup_parent_awaiting_merge's
 # identification (_is_rollup_review=True and/or rollup_pr_number present) — but
@@ -88,8 +110,12 @@ async def backfill_landed_rollup_merge_credit(
 ) -> int:
     """Backfill under-credited children of landed rollups for one project.
 
-    Finds up to *rollup_limit* landed rollup parents in *project_id*, re-stamps
-    their under-credited descendants by membership via the existing propagation
+    Finds up to *rollup_limit* landed rollup parents in *project_id* — a
+    ROTATING keyset window (``_rollup_backfill_cursors``) that advances past the
+    previous window on each successive call and wraps to the start on reaching
+    the end, so the whole rollup history is covered across calls rather than the
+    first *rollup_limit* rows being re-selected forever — re-stamps their
+    under-credited descendants by membership via the existing propagation
     helper, and recomputes each affected direction's outcomes. Returns the total
     number of descendant tasks newly stamped ``landed_on_integration=True`` this
     call (0 once the project has fully converged — the steady-state no-op).
@@ -102,23 +128,31 @@ async def backfill_landed_rollup_merge_credit(
         _propagate_landed_to_staging_merged_descendants,
     )
 
+    rollup_cursor = _rollup_backfill_cursors.get(project_id)
+    rollup_query = select(Task.id).where(
+        Task.project_id == project_id,
+        Task.archived.is_(False),
+        landed_signal_predicate(session),
+        _rollup_parent_predicate(session),
+    )
+    if rollup_cursor is not None:
+        # Resume past the previous window (keyset pagination over the ordered id).
+        rollup_query = rollup_query.where(Task.id > rollup_cursor)
     rollup_ids = list(
         (
             await session.execute(
-                select(Task.id)
-                .where(
-                    Task.project_id == project_id,
-                    Task.archived.is_(False),
-                    landed_signal_predicate(session),
-                    _rollup_parent_predicate(session),
-                )
-                .order_by(Task.id)
-                .limit(rollup_limit)
+                rollup_query.order_by(Task.id).limit(rollup_limit)
             )
         )
         .scalars()
         .all()
     )
+    # Advance the per-project cursor so the NEXT call resumes past this window;
+    # a short page means the end of the ordered set, so wrap to the start.
+    if len(rollup_ids) < rollup_limit:
+        _rollup_backfill_cursors.pop(project_id, None)
+    else:
+        _rollup_backfill_cursors[project_id] = rollup_ids[-1]
 
     total_stamped = 0
     for rollup_id in rollup_ids:
@@ -191,24 +225,38 @@ async def _sweep_merge_credit_backfill() -> None:
     """Leader-cycle sweep: backfill merge credit for landed rollups.
 
     Runs on a modest cadence (~600s). Iterates active (non-archived) projects,
-    bounded per tick, and heals each independently — a failure on one project is
+    bounded per tick and advancing a rotating cursor across ticks so no project
+    is starved, and heals each independently — a failure on one project is
     logged and skipped without blocking others. Best-effort/non-fatal, mirroring
     :func:`app.recovery_infrastructure._sweep_lane_baseline_backfill`.
     """
+    global _project_backfill_cursor
     try:
         async with services.AsyncSessionLocal() as session:
+            project_query = select(Project.id).where(Project.archived.is_(False))
+            if _project_backfill_cursor is not None:
+                # Resume past the previous batch (keyset pagination over the id).
+                project_query = project_query.where(
+                    Project.id > _project_backfill_cursor
+                )
             project_ids = list(
                 (
                     await session.execute(
-                        select(Project.id)
-                        .where(Project.archived.is_(False))
-                        .order_by(Project.id)
-                        .limit(_MERGE_CREDIT_BACKFILL_PROJECT_BATCH)
+                        project_query.order_by(Project.id).limit(
+                            _MERGE_CREDIT_BACKFILL_PROJECT_BATCH
+                        )
                     )
                 )
                 .scalars()
                 .all()
             )
+
+        # Advance the cursor so the next tick resumes past this batch; a short
+        # page means the end of the project list, so wrap back to the start.
+        if len(project_ids) < _MERGE_CREDIT_BACKFILL_PROJECT_BATCH:
+            _project_backfill_cursor = None
+        else:
+            _project_backfill_cursor = project_ids[-1]
 
         total = 0
         for project_id in project_ids:

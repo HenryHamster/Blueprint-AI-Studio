@@ -8,13 +8,17 @@ from app.failure_classification import RATE_LIMIT, classify_failure
 from app.max_plan_pool import (
     _account_by_id,
     _max_plan_pools,
+    apply_task_llm_runtime_context,
     clear_task_llm_runtime_context,
     select_llm_runtime_for_task,
 )
+from app.llm_cost_attribution import compute_llm_cost_breakdown
+from app.models import TaskStatus
 from app.orchestrator import (
     _resolve_env_runtime_fallback,
     _sync_task_payload_runtime_fields,
 )
+from testing.factories import make_task
 
 
 def _translation_args(env: dict) -> list[str]:
@@ -935,6 +939,113 @@ async def test_selection_payload_and_manifest_agree_for_model_fallback(
     assert args[args.index("-m") + 1] == "gemini-2.5-pro"
 
 
+@pytest.mark.asyncio
+async def test_no_account_deepseek_ops_env_fallback_uses_settings_model(
+    clean_runtime_pool, monkeypatch
+):
+    from app.compute_manifest import build_agent_secret_manifest
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-env-key")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    runtime_config = {
+        "provider_selection_mode": "preferred",
+        "provider_tier_model_map": {
+            "deepseek": {
+                "opus": "deepseek-v4-pro",
+                "sonnet": "deepseek-v4-pro",
+                "haiku": "deepseek-v4-flash",
+            }
+        },
+        "task_type_categories": {"ops": ["ops"]},
+        "category_routing": {
+            "ops": {"providers": ["deepseek", "anthropic"], "effort": "low"}
+        },
+        "provider_settings_by_effort": {
+            "deepseek": {
+                "low": {"model": "deepseek-v4-flash", "effort": "low"},
+                "max": {"model": "deepseek-v4-pro", "effort": "max"},
+            }
+        },
+    }
+    task = _task(payload={"type": "ops"})
+
+    selection = await select_llm_runtime_for_task(
+        user_id=_TEST_USER,
+        task=task,
+        runtime_config=runtime_config,
+    )
+
+    assert selection is not None
+    assert selection.account is None
+    assert selection.provider == "deepseek"
+    assert selection.auth_mode == "api_key"
+    assert selection.model == "deepseek-v4-flash"
+    assert selection.settings == {"model": "deepseek-v4-flash", "effort": "low"}
+
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider=selection.provider,
+            model=selection.model,
+            execution_mode=selection.execution_mode,
+            task=task,
+            runtime_config=runtime_config,
+        )
+    )
+    task.context = apply_task_llm_runtime_context(
+        task.context,
+        account_id=None,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        execution_mode=execution_mode,
+    )
+    changed = _sync_task_payload_runtime_fields(
+        task,
+        model=model,
+        execution_mode=execution_mode,
+    )
+    manifest = build_agent_secret_manifest(
+        vm_instance_id="agent-vm-deepseek-env",
+        task_id=uuid.uuid4(),
+        oauth_token=secret,
+        provider=provider,
+        auth_mode=auth_mode,
+        model=model,
+        provider_metadata=metadata,
+        provider_settings=selection.settings,
+    )
+
+    assert changed is True
+    assert secret == "deepseek-env-key"
+    assert task.context["llm_model"] == "deepseek-v4-flash"
+    assert task.payloads[0]["model"] == "deepseek-v4-flash"
+    assert manifest["env"]["LLM_MODEL"] == "deepseek-v4-flash"
+    assert json.loads(manifest["env"]["LLM_SETTINGS"])["model"] == (
+        "deepseek-v4-flash"
+    )
+    args = _translation_args(manifest["env"])
+    assert args[args.index("--model") + 1] == "deepseek-v4-flash"
+
+    cost_task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        payloads=[{"type": "ops", "model": model}],
+        provider=provider,
+        model=model,
+        api_call_summary={
+            "llm_call_count": 1,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 500,
+        },
+    )
+    breakdown = compute_llm_cost_breakdown([cost_task])
+    by_model = {(row["provider"], row["model"]): row for row in breakdown["by_model"]}
+    assert ("deepseek", "deepseek-v4-flash") in by_model
+    assert ("deepseek", "deepseek-v4-pro") not in by_model
+    assert breakdown["totals"]["total_cost_usd"] > 0
+
+
 def test_resolve_env_runtime_fallback_prefers_openai_env(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "sk-test-openai")
 
@@ -1006,9 +1117,95 @@ def test_resolve_env_runtime_fallback_reads_zai_anthropic_compat_env(monkeypatch
     assert auth_mode == "api_key"
     assert model == "glm-5.2"
     assert execution_mode is None
-    assert metadata == {
-        "anthropic_base_url": "https://api.z.ai/api/anthropic/"
-    }
+    assert metadata == {"anthropic_base_url": "https://api.z.ai/api/anthropic/"}
+
+
+def test_resolve_env_runtime_fallback_rejects_zai_generic_anthropic_key_without_base_url(
+    monkeypatch,
+):
+    for env_name in (
+        "ZAI_API_KEY",
+        "ZAI_ANTHROPIC_BASE_URL",
+        "ZAI_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-provider-key")
+
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="zai",
+            model=None,
+            execution_mode=None,
+            task=_task(payload={"type": "create"}),
+            runtime_config={},
+        )
+    )
+
+    assert secret is None
+    assert provider == "zai"
+    assert auth_mode is None
+    assert model == "glm-5.2"
+    assert execution_mode is None
+    assert metadata == {}
+
+
+def test_resolve_env_runtime_fallback_reads_deepseek_anthropic_compat_env(monkeypatch):
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "deepseek-compat-token")
+    monkeypatch.setenv(
+        "DEEPSEEK_ANTHROPIC_BASE_URL", "https://api.deepseek.com/anthropic/"
+    )
+
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="deepseek",
+            model=None,
+            execution_mode=None,
+            task=_task(payload={"type": "ops"}),
+            runtime_config={},
+        )
+    )
+
+    assert secret == "deepseek-compat-token"
+    assert provider == "deepseek"
+    assert auth_mode == "api_key"
+    assert model == "deepseek-v4-flash"
+    assert execution_mode is None
+    assert metadata == {"anthropic_base_url": "https://api.deepseek.com/anthropic/"}
+
+
+def test_resolve_env_runtime_fallback_rejects_deepseek_generic_anthropic_key_without_base_url(
+    monkeypatch,
+):
+    for env_name in (
+        "DEEPSEEK_API_KEY",
+        "DEEPSEEK_ANTHROPIC_BASE_URL",
+        "DEEPSEEK_BASE_URL",
+        "ANTHROPIC_AUTH_TOKEN",
+        "ANTHROPIC_BASE_URL",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "wrong-provider-key")
+
+    secret, provider, auth_mode, model, execution_mode, metadata = (
+        _resolve_env_runtime_fallback(
+            provider="deepseek",
+            model=None,
+            execution_mode=None,
+            task=_task(payload={"type": "ops"}),
+            runtime_config={},
+        )
+    )
+
+    assert secret is None
+    assert provider == "deepseek"
+    assert auth_mode is None
+    assert model == "deepseek-v4-flash"
+    assert execution_mode is None
+    assert metadata == {}
 
 
 def test_resolve_env_runtime_fallback_reads_gemini_service_account(
@@ -1098,6 +1295,7 @@ def test_runtime_fallback_seam_no_circular_import_and_identical_symbols():
         "openai": "gpt-5.4",
         "gemini": "gemini-2.5-pro",
         "zai": "glm-5.2",
+        "deepseek": "deepseek-v4-flash",
     }
 
 

@@ -76,7 +76,18 @@ def _bound_title(title: Any) -> str:
 
 
 def _bound_detail(detail: Any) -> dict | None:
-    """Return a size-bounded, JSON-serializable metadata dict (or ``None``)."""
+    """Return a size-bounded, JSON-serializable metadata dict (or ``None``).
+
+    Bounding is STRUCTURE-PRESERVING for the growing ``linked_tasks`` list: when
+    the serialized detail exceeds :data:`_MAX_DETAIL_BYTES`, the oversized
+    ``linked_tasks`` list is trimmed (dropping the oldest records, always keeping
+    the most-recent one) rather than collapsing the whole dict.  This keeps the
+    recorder metadata and the ``linked_tasks`` list SHAPE intact so repeated
+    :func:`link_task_to_debt` calls keep finding a list to append to instead of
+    restarting from empty.  Only detail with no trimmable ``linked_tasks`` list
+    (a pathologically large recorder payload) falls back to the flat truncated
+    preview.
+    """
     if detail is None:
         return None
     if not isinstance(detail, dict):
@@ -87,6 +98,25 @@ def _bound_detail(detail: Any) -> dict | None:
         return {"_note": "detail-unserializable"}
     if len(encoded) <= _MAX_DETAIL_BYTES:
         return dict(detail)
+
+    # Over budget. Prefer a structure-preserving trim: shrink the unbounded
+    # ``linked_tasks`` list (drop oldest first) while keeping every other key —
+    # recorder metadata and the list itself — so subsequent link_task_to_debt
+    # calls still see a list to append to.  json.dumps here cannot raise since
+    # the full detail already serialized above and ``bounded`` is a subset.
+    linked = detail.get("linked_tasks")
+    if isinstance(linked, list) and linked:
+        bounded = dict(detail)
+        trimmed = list(linked)
+        while True:
+            bounded["linked_tasks"] = trimmed
+            if (
+                len(json.dumps(bounded, default=str)) <= _MAX_DETAIL_BYTES
+                or len(trimmed) <= 1
+            ):
+                return bounded
+            trimmed = trimmed[1:]  # drop the oldest linked record and retry
+
     return {
         "_truncated": True,
         "_original_bytes": len(encoded),

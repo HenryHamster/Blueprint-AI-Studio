@@ -17,19 +17,13 @@ from sqlmodel import select
 CriterionLinkClassification = Literal["valid", "dangling", "inactive"]
 RetiredDirectionOutcome = Literal["landed", "success_evidence_met", "abandoned"]
 
-_SUCCESS_REASON_MARKERS = (
-    "success",
-    "success_evidence",
-    "success evidence",
-    "evidence met",
-    "already met",
-    "completed",
-    "delivered",
-    "landed",
-    "merged",
-)
+# Positive success-signal words. Matched as WHOLE tokens (word boundaries), not
+# raw substrings, so a literally-negating word such as "unmerged" (token !=
+# "merged") never reads as success. Multi-word markers like "evidence met" /
+# "already met" reduce to the "met" token, which is included here.
 _SUCCESS_REASON_TOKENS = frozenset(
     {
+        "success",
         "complete",
         "completed",
         "delivered",
@@ -38,6 +32,24 @@ _SUCCESS_REASON_TOKENS = frozenset(
         "met",
     }
 )
+# Words that negate a nearby success token, so phrases like "success evidence
+# NOT met" and "PRs UNmerged" / "un-merged" are not classified as success. "un"
+# catches hyphen-split forms ("un-merged" -> ["un", "merged"]); a fused
+# "unmerged" is already safe because whole-token matching never equals "merged".
+_NEGATION_TOKENS = frozenset(
+    {
+        "not",
+        "no",
+        "never",
+        "without",
+        "failed",
+        "fail",
+        "unmet",
+        "un",
+    }
+)
+# Tokens on either side of a success token that are scanned for a negation.
+_NEGATION_WINDOW = 3
 
 
 def classify_retired_direction_outcome(
@@ -52,14 +64,23 @@ def classify_retired_direction_outcome(
     records the softer "success_evidence_met" outcome. Everything else is treated
     as abandoned/stopped work so callers do not mistake a generic retirement for
     delivered work.
+
+    The success-language scan is NEGATION-AWARE: a success token only counts when
+    no negating word ("not"/"no"/"un-"/"failed"/"unmet"/"without" ...) sits within
+    ``_NEGATION_WINDOW`` tokens of it. This keeps a FAILED prior direction —
+    "success evidence not met", "PRs unmerged" — from being reported to the
+    strategist as delivered work. Ambiguous negations bias toward "abandoned",
+    the safe default (never over-report success).
     """
     if isinstance(prs_merged, int) and prs_merged > 0:
         return "landed"
-    reason_l = (reason or "").strip().lower()
-    if any(marker in reason_l for marker in _SUCCESS_REASON_MARKERS):
-        return "success_evidence_met"
-    reason_tokens = frozenset(re.findall(r"[a-z0-9]+", reason_l))
-    if reason_tokens & _SUCCESS_REASON_TOKENS:
+    tokens = re.findall(r"[a-z0-9]+", (reason or "").lower())
+    for i, tok in enumerate(tokens):
+        if tok not in _SUCCESS_REASON_TOKENS:
+            continue
+        window = tokens[max(0, i - _NEGATION_WINDOW) : i + _NEGATION_WINDOW + 1]
+        if any(w in _NEGATION_TOKENS for w in window):
+            continue  # negated ("not met", "un merged") — not a success signal
         return "success_evidence_met"
     return "abandoned"
 

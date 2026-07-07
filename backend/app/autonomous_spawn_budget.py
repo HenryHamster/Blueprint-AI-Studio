@@ -281,10 +281,23 @@ async def compute_autonomous_spawn_budget_snapshot(
         "other": {},
     }
 
+    # Project only the JSON the classifier actually reads instead of the whole
+    # ``payloads``/``context`` JSONB columns. ``context`` accretes multi-hundred-KB
+    # agent state over a task's lifetime, and this snapshot runs on HOT spawn paths
+    # (every idle-research tick per project, every guarded strategic spawn) over ALL
+    # ORCHESTRATOR tasks in the trailing hour — at the 500/hr backstop a full-column
+    # fetch dragged tens of MB per check. The classifier needs only payloads[0] (its
+    # ``type`` plus servicing-lineage key PRESENCE) and three small context keys, so
+    # pull exactly those. The whole first payload element is projected (rather than
+    # rebuilt key-by-key) to preserve the ``key in payload`` presence semantics in
+    # _has_servicing_lineage; context is read only via ``.get()``/isinstance, so a
+    # slim three-key context dict is behaviourally exact.
     result = await session.execute(
         select(
-            Task.payloads,
-            Task.context,
+            Task.payloads[0],
+            Task.context["pr_number"],
+            Task.context["review_loop"],
+            Task.context["spawned_by"],
             Task.parent_task_id,
             Task.depends_on,
         ).where(
@@ -293,16 +306,28 @@ async def compute_autonomous_spawn_budget_snapshot(
             Task.created_at <= window_end,
         )
     )
-    for payloads, context, parent_task_id, depends_on in result.all():
-        payload = _first_payload(payloads)
+    for (
+        first_payload,
+        ctx_pr_number,
+        ctx_review_loop,
+        ctx_spawned_by,
+        parent_task_id,
+        depends_on,
+    ) in result.all():
+        payload = first_payload if isinstance(first_payload, dict) else {}
         task_type = str(payload.get("type") or "").strip()
+        context = {
+            "pr_number": ctx_pr_number,
+            "review_loop": ctx_review_loop,
+            "spawned_by": ctx_spawned_by,
+        }
         category = classify_autonomous_spawn_budget_category(
             task_type=task_type,
             config=config,
             parent_task_id=parent_task_id,
             depends_on=depends_on,
             payload=payload,
-            context=context if isinstance(context, dict) else {},
+            context=context,
         )
         counts[category] += 1
         bucket = task_type_counts[category]

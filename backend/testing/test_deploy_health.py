@@ -1328,10 +1328,11 @@ def test_check_provider_api_health_openai_down_when_no_account_can_dispatch(mock
     }
     mocker.patch.object(_hcp, "_account_by_id", {"acct-openai": account})
     mocker.patch.object(_hcp, "_account_available_for_model", return_value=False)
-    _shared_state.runtime_config["task_type_provider_preference"] = {
-        "create": ["openai"]
+    _shared_state.runtime_config["category_routing"] = {
+        "_default": {"providers": ["openai"], "effort": "medium"}
     }
-    _shared_state.runtime_config["cross_provider_fallback_enabled"] = False
+    _shared_state.runtime_config["task_type_routing"] = {}
+    _shared_state.runtime_config["provider_selection_mode"] = "exclusive"
 
     ext = {"errors": {}, "provider_health": {}}
     assert _hcp.check_provider_api_health(ext, "openai") == "openai_api"
@@ -1340,12 +1341,13 @@ def test_check_provider_api_health_openai_down_when_no_account_can_dispatch(mock
 
 
 def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fallback_available():
-    _shared_state.runtime_config["task_type_provider_preference"] = {
-        "create": ["anthropic", "openai"]
+    _shared_state.runtime_config["category_routing"] = {
+        "_default": {"providers": ["anthropic", "openai"], "effort": "medium"}
     }
+    _shared_state.runtime_config["task_type_routing"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {}
     _shared_state.runtime_config["task_type_models"] = {}
-    _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
+    _shared_state.runtime_config["provider_selection_mode"] = "preferred"
 
     ext = {
         "provider_health": {
@@ -1363,6 +1365,8 @@ def test_get_dispatch_health_snapshot_degrades_when_primary_provider_down_but_fa
 
 
 def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_provider():
+    _shared_state.runtime_config["category_routing"] = {}
+    _shared_state.runtime_config["task_type_routing"] = {}
     _shared_state.runtime_config["task_type_provider_preference"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {}
     _shared_state.runtime_config["task_type_models"] = {"create": "gpt-5.4"}
@@ -1382,12 +1386,13 @@ def test_get_dispatch_health_snapshot_uses_task_type_models_to_infer_required_pr
 
 def test_get_dispatch_health_snapshot_down_when_all_providers_down():
     """When every relevant provider is down, dispatch status must be 'down' (not 'degraded')."""
-    _shared_state.runtime_config["task_type_provider_preference"] = {
-        "create": ["anthropic", "openai"]
+    _shared_state.runtime_config["category_routing"] = {
+        "_default": {"providers": ["anthropic", "openai"], "effort": "medium"}
     }
+    _shared_state.runtime_config["task_type_routing"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {}
     _shared_state.runtime_config["task_type_models"] = {}
-    _shared_state.runtime_config["cross_provider_fallback_enabled"] = True
+    _shared_state.runtime_config["provider_selection_mode"] = "preferred"
 
     ext = {
         "provider_health": {
@@ -1405,6 +1410,8 @@ def test_get_dispatch_health_snapshot_down_when_all_providers_down():
 
 def test_get_dispatch_health_snapshot_uses_task_type_model_preferences():
     """task_type_model_preferences (category routing) contributes to required providers."""
+    _shared_state.runtime_config["category_routing"] = {}
+    _shared_state.runtime_config["task_type_routing"] = {}
     _shared_state.runtime_config["task_type_provider_preference"] = {}
     _shared_state.runtime_config["task_type_model_preferences"] = {
         "create": [{"provider": "openai", "model": "gpt-5"}]
@@ -1423,6 +1430,58 @@ def test_get_dispatch_health_snapshot_uses_task_type_model_preferences():
     assert "openai" in snapshot["required_providers"]
     assert "openai" in snapshot["available_providers"]
     assert snapshot["status"] == "ok"
+
+
+def test_get_dispatch_health_snapshot_uses_category_routing_candidates():
+    _shared_state.runtime_config["category_routing"] = {
+        "_default": {"providers": ["zai", "anthropic", "openai"], "effort": "medium"},
+        "ops": {"providers": ["deepseek", "anthropic"], "effort": "low"},
+    }
+    _shared_state.runtime_config["task_type_routing"] = {}
+    _shared_state.runtime_config["task_type_provider_preference"] = {}
+    _shared_state.runtime_config["task_type_model_preferences"] = {}
+    _shared_state.runtime_config["task_type_models"] = {}
+    _shared_state.runtime_config["provider_selection_mode"] = "preferred"
+
+    ext = {
+        "provider_health": {
+            "anthropic": {"status": "ok"},
+            "deepseek": {"status": "ok"},
+            "openai": {"status": "ok"},
+            "zai": {"status": "ok"},
+        }
+    }
+
+    snapshot = _hcp.get_dispatch_health_snapshot(ext)
+
+    assert snapshot["status"] == "ok"
+    assert snapshot["fallback_enabled"] is True
+    assert set(snapshot["required_providers"]) == {
+        "anthropic",
+        "deepseek",
+        "openai",
+        "zai",
+    }
+
+
+def test_get_provider_health_snapshot_uses_category_effort_model_for_deepseek(
+    mocker,
+):
+    mocker.patch.dict(os.environ, {}, clear=True)
+    mocker.patch.object(_hcp, "_account_by_id", {})
+    _shared_state.runtime_config["category_routing"] = {
+        "ops": {"providers": ["deepseek", "anthropic"], "effort": "low"},
+    }
+    _shared_state.runtime_config["task_type_routing"] = {}
+    _shared_state.runtime_config["provider_settings_by_effort"] = {
+        "deepseek": {"low": {"model": "deepseek-v4-flash", "effort": "low"}}
+    }
+    _shared_state.runtime_config["provider_selection_mode"] = "preferred"
+
+    snapshot = _hcp.get_provider_health_snapshot("deepseek")
+
+    assert snapshot["primary_model"] == "deepseek-v4-flash"
+    assert snapshot["dispatch_relevant"] is True
 
 
 # ── Tests: check_github_health (passive + active modes) ───────────────────────

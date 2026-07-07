@@ -7,7 +7,14 @@ via spawn_task/spawn_fix, as well as transitive descendants of those tasks
 Auth/scoping follows the same ``_resolve_agent_project`` pattern used in
 ``agent_strategic_fetch``: the agent JWT carries the calling task-id, and we
 confirm the calling task belongs to the requested project (cross-project access
-returns 404, not 403, to prevent project enumeration).
+returns 404, not 403, to prevent project enumeration). The trust boundary is
+PER-PROJECT, not per-agent-role: any active task-scoped agent JWT whose calling
+task lives in the project — not only the strategic agent's — passes this gate,
+and can therefore list strategist-spawned tasks and read their PR URLs and the
+compact ERROR_LOG summary. There is no additional strategist-authorship check on
+the *caller*; this matches the same-project trust boundary the rest of the
+``agent_*`` fetch surface relies on. (The strategist-lineage filter below
+governs which tasks are *returned*, not which agents may call.)
 
 Tasks are visible when (a) created_by == 'STRATEGIC_AGENT', or (b) reachable
 via parent_task_id links from a STRATEGIC_AGENT root within the same project.
@@ -157,10 +164,13 @@ async def agent_get_task(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ) -> dict[str, Any]:
-    """Return status and outcome for a single task visible to the strategic agent.
+    """Return status and outcome for a single strategist-lineage task in this project.
 
-    Visible tasks include any STRATEGIC_AGENT-authored task and any transitive
-    descendant reachable via parent_task_id within the same project (bounded to
+    Callable by any task-scoped agent JWT whose calling task belongs to
+    ``project_id`` — the gate is per-project, not per-agent-role (see the module
+    docstring); it is not restricted to the strategic agent. Visible tasks
+    include any STRATEGIC_AGENT-authored task and any transitive descendant
+    reachable via parent_task_id within the same project (bounded to
     _ANCESTOR_WALK_MAX_DEPTH generations). Returns 404 when the task does not
     exist, does not belong to this project, or has no STRATEGIC_AGENT ancestor
     (prevents cross-type enumeration). Response includes parent_task_id so the
@@ -241,8 +251,11 @@ async def agent_list_tasks(
     session: AsyncSession = Depends(get_session),
     token: dict = Depends(verify_agent_token),
 ) -> dict[str, Any]:
-    """List recent tasks visible to the strategic agent for a project.
+    """List recent strategist-lineage tasks for a project.
 
+    Callable by any task-scoped agent JWT whose calling task belongs to
+    ``project_id`` — the gate is per-project, not per-agent-role (see the module
+    docstring); it is not restricted to the strategic agent.
     Returns STRATEGIC_AGENT-authored tasks and their transitive descendants
     (children spawned by the orchestrator on behalf of the strategist), ordered
     by ``created_at`` descending (most recent first), capped at ``limit``

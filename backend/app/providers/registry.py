@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.models import LLMProviderName
 from app.providers.anthropic import AnthropicProvider
 from app.providers.base import LLMProvider
+from app.providers.deepseek import DeepSeekProvider
 from app.providers.gemini import GeminiProvider
 from app.providers.openai import OpenAIProvider
 from app.providers.zai import ZaiProvider
@@ -12,6 +13,7 @@ _PROVIDERS: dict[LLMProviderName, LLMProvider] = {
     LLMProviderName.OPENAI: OpenAIProvider(),
     LLMProviderName.GEMINI: GeminiProvider(),
     LLMProviderName.ZAI: ZaiProvider(),
+    LLMProviderName.DEEPSEEK: DeepSeekProvider(),
 }
 
 

@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import case
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
@@ -101,6 +102,12 @@ _OPEN_MESSAGE_EXCERPT_MAX_CHARS = 800  # per-message content excerpt cap
 _CRITICAL_OPEN_MESSAGE_TYPES = (
     MessageType.BUG_REPORT.value,
     MessageType.BLOCKER.value,
+)
+# Same critical types as ORM enum members, for DB-side ordering (the tuple above
+# holds string ``.value``s used against the projected message dicts).
+_CRITICAL_OPEN_MESSAGE_DB_TYPES = (
+    MessageType.BUG_REPORT,
+    MessageType.BLOCKER,
 )
 _OPERATOR_CONTEXT_MESSAGE_FETCH_LIMIT = 30
 _OPERATOR_CONTEXT_REQUESTS_KEEP = 6
@@ -514,10 +521,19 @@ async def _fetch_open_messages(
     Queries messages whose status is open DIRECTLY (backed by
     ``ix_projectmessage_project_status``), independent of the capped
     conversation_thread, so an OPEN BUG_REPORT/BLOCKER stays visible to the
-    strategist until it is fixed or explicitly resolved no matter how many newer
-    messages have accumulated. The result is size-bounded: at most *limit*
-    messages, priority-ordered so BUG_REPORT/BLOCKER and oldest-open items
-    survive, with per-message excerpts capped.
+    strategist until it is fixed or explicitly resolved. The DB fetch orders
+    critical types (BUG_REPORT/BLOCKER) FIRST within its
+    ``_OPEN_MESSAGES_FETCH_LIMIT`` row window, so a freshly-filed critical is
+    still fetched even when a large open backlog (>200 rows) would otherwise push
+    it past an oldest-first window and out of sight entirely. The result is then
+    size-bounded: at most *limit* messages, priority-ordered so BUG_REPORT/BLOCKER
+    and oldest-open items survive, with per-message excerpts capped, and finally
+    returned in oldest-open chronological order for a stable read.
+
+    Note: the ``open_message_count`` scalar callers derive from this feed reflects
+    the packed/bounded feed depth, not a full COUNT(*) (see
+    ``payload_schemas.StrategicReviewPayload.open_message_count`` — it may
+    under-report past the window but is always >= what packing surfaces).
 
     Shared by every strategic spawn path (strategic_review + design_doc_update)
     so the open-message access pattern stops drifting apart. Each row carries
@@ -529,13 +545,20 @@ async def _fetch_open_messages(
     # and the strategist should not act on them again. Messages with status
     # "resolved" are terminal and also excluded. This filter is sufficient:
     # no extra clause is needed to exclude linked messages.
+    # Critical types (BUG_REPORT/BLOCKER) sort first so they are always inside the
+    # fetch window regardless of age — a newly-filed critical past a >200-row open
+    # backlog would otherwise never be fetched under a pure oldest-first window.
+    _critical_first = case(
+        (ProjectMessage.message_type.in_(_CRITICAL_OPEN_MESSAGE_DB_TYPES), 0),
+        else_=1,
+    )
     result = await session.execute(
         select(ProjectMessage)
         .where(
             ProjectMessage.project_id == project_id,
             ProjectMessage.status == "open",
         )
-        .order_by(ProjectMessage.created_at.asc())
+        .order_by(_critical_first, ProjectMessage.created_at.asc())
         .limit(_OPEN_MESSAGES_FETCH_LIMIT)
     )
     messages = [
@@ -549,6 +572,11 @@ async def _fetch_open_messages(
         }
         for m in result.scalars().all()
     ]
+    # The DB fetch ordered criticals first (window-inclusion guarantee above);
+    # re-sort into oldest-open chronological order here so the packed feed still
+    # reads as a stable chronological inbox — critical-priority SURVIVAL under the
+    # size bound is handled independently by _bound_open_messages.
+    messages.sort(key=lambda msg: msg.get("created_at") or "")
     return _bound_open_messages(messages, limit)
 
 

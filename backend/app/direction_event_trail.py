@@ -19,6 +19,18 @@ The public helpers are:
 
 Both helpers swallow all exceptions (``log.warning``) so a transient write
 failure can never break the authoritative direction upsert or sync.
+
+Retention: the ``DirectionEvent`` table is intentionally append-only with no
+GC/TTL sweep. Growth is bounded to GENUINE lifecycle transitions — an
+unchanged-status upsert no-ops (see ``maybe_record_direction_event``), so a
+project accretes rows only proportional to real create/status_changed/pruned
+events, which is slow even on long-lived projects. Rows are removed with their
+project via the ``project`` FK CASCADE. A dedicated retention subsystem is
+deliberately out of scope here; ``snapshot_data`` is stored in full (not
+size-capped) BECAUSE ``latest_direction_snapshot`` reconstructs the whole
+direction dict from it after the live row is pruned, so trimming snapshots would
+break that recovery path. Revisit only if event-row volume becomes a measured
+storage/query problem.
 """
 
 from __future__ import annotations

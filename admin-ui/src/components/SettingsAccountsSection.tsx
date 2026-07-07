@@ -3,7 +3,7 @@ import { AlertTriangle, ChevronDown, ChevronUp, FileDown, GitBranch, HelpCircle,
 import { parseTimestamp, timeAgo } from '../utils/time';
 import type { AccountMutationResult, AccountMutationReturn, AccountUpdatePayload, AuthMode, MaxPlanAccount, ProviderCatalogEntry, ProviderName } from '../types/settings';
 
-const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'zai', 'openai', 'gemini'];
+const PROVIDER_ORDER: ProviderName[] = ['anthropic', 'zai', 'deepseek', 'openai', 'gemini'];
 
 // Availability snapshot keys the BACKEND owns on provider_metadata. The edit
 // dialog never lets the operator touch these directly; when an operator edits
@@ -27,6 +27,7 @@ const FALLBACK_AUTH_MODES: Record<ProviderName, AuthMode[]> = {
   openai: ['api_key', 'oauth'],
   gemini: ['api_key', 'service_account'],
   zai: ['api_key'],
+  deepseek: ['api_key'],
 };
 
 const METADATA_HINTS: Record<string, { label: string; placeholder: string }> = {
@@ -89,6 +90,13 @@ const CREDENTIAL_GUIDES: Record<string, CredentialGuide> = {
     summary: 'Z.AI GLM through the Claude-compatible endpoint.',
     steps: [
       'Go to https://docs.z.ai and create an API key for your Z.AI account.',
+      'Paste the API key here. Blueprint maps it to Claude Code via `ANTHROPIC_BASE_URL` automatically.',
+    ],
+  },
+  'deepseek:api_key': {
+    summary: 'DeepSeek through the Claude-compatible endpoint.',
+    steps: [
+      'Go to https://platform.deepseek.com and create an API key for your DeepSeek account.',
       'Paste the API key here. Blueprint maps it to Claude Code via `ANTHROPIC_BASE_URL` automatically.',
     ],
   },
@@ -837,6 +845,8 @@ function AccountAddForm({
       ? 'Gemini API key'
       : newAccountProvider === 'zai'
       ? 'Z.AI API key'
+      : newAccountProvider === 'deepseek'
+      ? 'DeepSeek API key'
       : newAccountProvider === 'openai'
       ? 'OpenAI API key'
       : newAccountAuthMode === 'api_key'
