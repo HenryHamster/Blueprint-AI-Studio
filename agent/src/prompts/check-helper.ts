@@ -780,10 +780,11 @@ if touches backend/; then
     # cannot fit Docker build + Postgres sidecar + full pytest suite +
     # agent + Claude subprocess in memory. The full suite OOMs (exit
     # 137) during the mandatory pre-PR gate (53ef061b, b150b4d6, b15b6813
-    # all died this way 2026-05-05). Standalone runs the 3 invariant
-    # files (security, pipeline, invariants) which catch file-size
-    # breaches, security regressions, and basic pipeline assertions —
-    # the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
+    # all died this way 2026-05-05). Standalone runs the ~10-file
+    # invariant set (security, pipeline, invariants, audit-finding-class,
+    # admin-auth, metric-manifest + emitter-inventory contracts) which
+    # catches file-size breaches, security regressions, and basic pipeline
+    # and contract assertions — the rest is CI's job. \`set -o pipefail\` so the harness's non-zero
     # exit propagates through \`| tail\` (same rationale as the agent
     # vitest line above — the outer pipefail does not reach a fresh bash -c).
     run "backend pytest" bash -c 'set -o pipefail; bash scripts/test-backend.sh --standalone --no-postgres 2>&1 | tail -200'

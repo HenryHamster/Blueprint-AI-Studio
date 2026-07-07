@@ -1212,19 +1212,25 @@ async def _get_or_create_residual_case(
     session: AsyncSession,
     project_id: uuid.UUID,
     fingerprint: str,
+    with_lock: bool = False,
 ) -> ResidualRemediationCase:
     """Return the case row for (project_id, fingerprint), creating it if
     missing. The UNIQUE(project_id, fingerprint) added in 0054 means one
     row per fingerprint. Caller is responsible for the surrounding commit.
+
+    When with_lock=True, acquires a row-level write lock to prevent
+    concurrent read-modify-write races on counters (e.g., audit_defer_count).
     """
     from sqlmodel import select
 
-    result = await session.execute(
-        select(ResidualRemediationCase).where(
-            ResidualRemediationCase.project_id == project_id,
-            ResidualRemediationCase.fingerprint == fingerprint,
-        )
+    stmt = select(ResidualRemediationCase).where(
+        ResidualRemediationCase.project_id == project_id,
+        ResidualRemediationCase.fingerprint == fingerprint,
     )
+    if with_lock:
+        stmt = stmt.with_for_update()
+
+    result = await session.execute(stmt)
     case = result.scalars().first()
     if case is None:
         case = ResidualRemediationCase(
@@ -1247,7 +1253,7 @@ async def post_residual_fix_spawned_message(
     Also transitions the case row to REMEDIATING and stamps last_spawned_*
     so the next idle-tick spawn-dedup query sees the in-flight attempt.
     """
-    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
     case.status = ResidualCaseStatus.REMEDIATING
     case.last_spawned_task_id = task_id
     case.last_spawned_at = _utcnow()
@@ -1331,14 +1337,14 @@ async def post_residual_fix_result_message(
         # Don't touch the failure counter or status — wait for the human
         # gate. The case stays REMEDIATING.
         if pr_number is not None:
-            case = await _get_or_create_residual_case(session, project_id, fingerprint)
+            case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
             case.last_spawned_pr_number = pr_number
             case.updated_at = _utcnow()
             session.add(case)
         return msg
 
     try:
-        case = await _get_or_create_residual_case(session, project_id, fingerprint)
+        case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
         if pr_number is not None:
             case.last_spawned_pr_number = pr_number
         case.updated_at = _utcnow()
@@ -1678,7 +1684,7 @@ async def close_residual_case_resolved(
     auto-resolve threshold. Distinct from MERGED (PR-driven close) and from
     CLOSED_ORGANICALLY (legacy reaper close of ACTIVE rows).
     """
-    case = await _get_or_create_residual_case(session, project_id, fingerprint)
+    case = await _get_or_create_residual_case(session, project_id, fingerprint, with_lock=True)
     case.status = ResidualCaseStatus.RESOLVED
     case.updated_at = _utcnow()
     session.add(case)

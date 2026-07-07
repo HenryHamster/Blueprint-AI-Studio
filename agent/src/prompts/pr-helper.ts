@@ -221,8 +221,9 @@ if printf '%s\\n' "$_CHG_GATE" | grep -q '^backend/'; then
   WITH_TESTS=1
 fi
 ` : ''}
-# 1. Run ./check as gate (lint always; tests on main branch when --with-tests
-#    OR on review-fix path that touches backend changes).
+# 1. Run ./check as gate (lint always; tests when --with-tests, or forced on
+#    when the backend merge gate applies (self-repo/promotion-target/LTS
+#    branch) and the diff touches backend/ — see the WITH_TESTS=1 block above).
 # Branch on WITH_TESTS instead of expanding an array. Older bash + set -u
 # aborts on an empty array expansion, so just call ./check directly.
 if [ "$WITH_TESTS" = "1" ]; then

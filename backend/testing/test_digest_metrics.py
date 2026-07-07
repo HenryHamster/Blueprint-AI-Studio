@@ -3971,6 +3971,51 @@ def test_duplicate_foundation_signal_ignores_non_write_tasks():
     assert result["candidates"] == []
 
 
+def test_duplicate_foundation_signal_includes_qa_docs_deps():
+    """QA/docs/deps write-tasks that produce PRs ARE included in duplicate-foundation
+    detection (not limited to SR code-change types create/fix/refactor/migrate)."""
+    from app.digest_metrics import compute_duplicate_foundation_signal
+
+    files = ["app/foundation.py", "app/db.py"]
+    p_a, p_b, p_c, p_d, p_e = uuid4(), uuid4(), uuid4(), uuid4(), uuid4()
+
+    # Each task gets a unique parent so they're all flagged as cross-parent duplicates
+    qa_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_a,
+        payloads=[{"type": "qa", "related_files": files}],
+    )
+    create_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_b,
+        payloads=[{"type": "create", "related_files": files}],
+    )
+    docs_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_c,
+        payloads=[{"type": "docs", "related_files": files}],
+    )
+    fix_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_d,
+        payloads=[{"type": "fix", "related_files": files}],
+    )
+    deps_task = make_task(
+        status=TaskStatus.IN_PROGRESS,
+        parent_task_id=p_e,
+        payloads=[{"type": "deps", "related_files": files}],
+    )
+
+    result = compute_duplicate_foundation_signal([qa_task, create_task, docs_task, fix_task, deps_task])
+
+    # With 5 tasks all sharing the same files and different parents, we get C(5,2) = 10 pairs
+    assert result["total"] == 10
+    # All candidates should have strong overlap (all share identical files)
+    for cand in result["candidates"]:
+        assert cand["overlap_ratio"] == 1.0
+        assert cand["shared_files"] == ["app/db.py", "app/foundation.py"]
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Section: Foundation Convergence Predicate Tests
 # ══════════════════════════════════════════════════════════════════════════════

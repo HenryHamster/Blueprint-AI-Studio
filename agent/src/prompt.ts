@@ -1056,7 +1056,7 @@ const BLUEPRINT_CHECK_INTRO = `- \`./check\` — runs lint/build for the stacks 
   browser-mode \`npm run test:viewport\` gate, not the jsdom-only
   \`npm run test:run\` suite.
 - \`./check test\` — same plus a **lightweight standalone backend test
-  pass** (3 invariant files, ~30s). This VM is 8 GB; the FULL Docker
+  pass** (~10 invariant/contract files, ~30s). This VM is 8 GB; the FULL Docker
   + Postgres pytest suite OOMs (exit 137) here. CI runs the full suite
   on the PR after \`./pr open\`, so this local gate is just a smoke
   check — file-size guardrails, security regs, pipeline invariants.
