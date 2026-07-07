@@ -425,16 +425,24 @@ async def get_all_tasks(
             if a.artifact_type == ArtifactType.GIT_COMMIT and a.commit_hash:
                 commit_map[tid] = {"commit_hash": a.commit_hash, "repo_url": a.repo_url}
 
-        # Fetch logs columns separately to avoid loading large blobs in the main query
-        logs_stmt = (
-            select(Artifact)
-            .options(
-                load_only(
-                    Artifact.task_id,
-                    Artifact.artifact_type,
-                    Artifact.logs,
-                    raiseload=True,
-                )
+        # Fetch logs columns separately to avoid loading large blobs in the main query.
+        # A per-(task_id, artifact_type) ROW_NUMBER() window keeps only the most-recent
+        # row of each type per task, so a few high-activity tasks with many ERROR_LOG /
+        # MERGE_TEST_RESULT rows can't exhaust a global budget and starve other tasks.
+        _logs_rn = (
+            func.row_number()
+            .over(
+                partition_by=[Artifact.task_id, Artifact.artifact_type],
+                order_by=Artifact.created_at.desc(),
+            )
+            .label("rn")
+        )
+        _ranked_logs = (
+            select(
+                Artifact.task_id,
+                Artifact.artifact_type,
+                Artifact.logs,
+                _logs_rn,
             )
             .where(
                 Artifact.task_id.in_(task_ids),
@@ -446,16 +454,17 @@ async def get_all_tasks(
                     ]
                 ),
             )
-            .order_by(Artifact.created_at.asc())
+            .subquery()
         )
-        logs_artifacts = (await session.execute(logs_stmt)).scalars().all()
+        logs_stmt = select(_ranked_logs).where(_ranked_logs.c.rn == 1)
+        logs_artifacts = (await session.execute(logs_stmt)).all()
         for a in logs_artifacts:
             tid = str(a.task_id)
-            if a.artifact_type == ArtifactType.ERROR_LOG and a.logs:
+            if a.artifact_type == ArtifactType.ERROR_LOG and a.logs and tid not in logs_map:
                 logs_map[tid] = a.logs[:2000]
-            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs:
+            if a.artifact_type == ArtifactType.RESEARCH_FINDINGS and a.logs and tid not in research_artifact_logs_map:
                 research_artifact_logs_map[tid] = a.logs[:100000]
-            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs:
+            if a.artifact_type == ArtifactType.MERGE_TEST_RESULT and a.logs and tid not in merge_test_map:
                 try:
                     parsed = await asyncio.to_thread(json.loads, a.logs[:100000])
                     if isinstance(parsed, dict):
@@ -1713,11 +1722,12 @@ async def get_task(
             commit_hash = a.commit_hash
             repo_url = a.repo_url
 
-    # Fetch full task history (all entries, not capped at 10)
+    # Fetch task history capped at 200 most recent entries
     history_stmt = (
         select(TaskHistory)
         .where(TaskHistory.task_id == tid)
         .order_by(TaskHistory.timestamp.desc())
+        .limit(200)
     )
     all_history = (await session.execute(history_stmt)).scalars().all()
     history = [

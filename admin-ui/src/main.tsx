@@ -17,7 +17,7 @@ function LoadTimingReporter() {
       fetch('/api/admin/ui-load-timing', {
         method: 'POST',
         headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ surface, page_ready_ms: ms }),
+        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'first_commit' }),
       }).catch(() => {})
     }).catch(() => {})
   }, [])

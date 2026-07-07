@@ -1857,12 +1857,13 @@ async def record_ui_load_timing(
     is retained for cross-test compatibility.
     """
     surface = str(payload.get("surface") or "unknown")[:64]
+    sample_type = str(payload.get("sample_type") or "first_commit")[:32]
     ms_raw = payload.get("page_ready_ms")
     if not isinstance(ms_raw, (int, float)) or ms_raw < 0 or ms_raw > 600_000:
         raise HTTPException(status_code=400, detail="page_ready_ms must be a non-negative number ≤600000")
     ms = int(ms_raw)
     now = _utcnow()
-    sample_row = UiLoadTimingSample(surface=surface, page_ready_ms=ms, recorded_at=now)
+    sample_row = UiLoadTimingSample(surface=surface, page_ready_ms=ms, sample_type=sample_type, recorded_at=now)
     session.add(sample_row)
     # Trim oldest rows beyond cap (keep newest _UI_TIMING_MAX_PER_SURFACE)
     cutoff_sq = (
@@ -1893,8 +1894,8 @@ async def get_ui_load_timing(
 ) -> Dict[str, Any]:
     """Return recent admin-UI initial-load timing samples grouped by surface.
 
-    Each surface entry is a list of {ts, page_ready_ms} objects ordered
-    oldest-first (up to 200 per surface).  Persisted across restarts.
+    Each surface entry is a list of {ts, page_ready_ms, sample_type} objects
+    ordered oldest-first (up to 200 per surface).  Persisted across restarts.
     """
     rows = (
         await session.execute(
@@ -1904,6 +1905,6 @@ async def get_ui_load_timing(
     surfaces: Dict[str, List[Dict[str, Any]]] = {}
     for row in rows:
         surfaces.setdefault(row.surface, []).append(
-            {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms}
+            {"ts": row.recorded_at.isoformat(), "page_ready_ms": row.page_ready_ms, "sample_type": row.sample_type}
         )
     return {"surfaces": surfaces}

@@ -1079,6 +1079,25 @@ export async function fetchStrategicSession(
   return res.json() as Promise<StrategicSessionResponse>;
 }
 
+export async function fetchStrategicConversation(
+  projectId: string,
+  includeMessageId?: string | null,
+  signal?: AbortSignal,
+): Promise<{ conversation: StrategicSessionConversation }> {
+  const params = new URLSearchParams();
+  if (includeMessageId) params.set('include_message_id', includeMessageId);
+  const query = params.toString();
+  const res = await apiFetch(
+    `/api/admin/projects/${encodeURIComponent(projectId)}/strategic-conversation${query ? `?${query}` : ''}`,
+    undefined,
+    2,
+    30000,
+    signal,
+  );
+  if (!res.ok) throw new Error(`Failed to fetch Strategic conversation: ${res.status}`);
+  return res.json() as Promise<{ conversation: StrategicSessionConversation }>;
+}
+
 export async function createStrategicSessionMessage(
   projectId: string,
   payload: StrategicSessionMessageCreate,

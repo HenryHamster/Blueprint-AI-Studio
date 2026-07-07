@@ -622,6 +622,38 @@ async def test_ui_load_timing_round_trip(client, db_session):
     assert len(samples) == 1
     assert samples[0]["page_ready_ms"] == 1234
     assert "ts" in samples[0]
+    assert samples[0]["sample_type"] == "first_commit"
+
+
+@pytest.mark.asyncio
+async def test_ui_load_timing_sample_type_persisted(client, db_session):
+    """sample_type is persisted and returned in GET; defaults to 'first_commit' when omitted."""
+    import app.routers.admin_pipeline_observability as obs_mod
+
+    with obs_mod._UI_TIMING_LOCK:
+        obs_mod._UI_TIMING_SAMPLES.clear()
+
+    # Post with explicit sample_type="data_ready"
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "chat_timing", "page_ready_ms": 500, "sample_type": "data_ready"},
+    )
+    assert resp.status_code == 200
+
+    # Post without sample_type — should default to "first_commit"
+    resp = await client.post(
+        "/api/admin/ui-load-timing",
+        json={"surface": "chat_timing", "page_ready_ms": 600},
+    )
+    assert resp.status_code == 200
+
+    resp = await client.get("/api/admin/ui-load-timing")
+    assert resp.status_code == 200
+    samples = resp.json()["surfaces"]["chat_timing"]
+    assert len(samples) == 2
+    types = {s["sample_type"] for s in samples}
+    assert "data_ready" in types
+    assert "first_commit" in types
 
 
 @pytest.mark.asyncio

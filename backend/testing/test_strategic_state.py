@@ -2548,6 +2548,96 @@ async def test_strategic_session_conversation_resolves_message_selected_refs(
 
 
 @pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_returns_conversation_envelope(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation wraps the transcript in {conversation: ...}."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(minutes=10)
+    messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if i % 2 == 0 else "strategic",
+            content=f"conv row {i:02d}",
+            created_at=base_time + timedelta(minutes=i),
+        )
+        for i in range(3)
+    ]
+    db_session.add_all(messages)
+    await db_session.commit()
+
+    resp = await client.get(f"/api/admin/projects/{project.id}/strategic-conversation")
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert "conversation" in body
+    conversation = body["conversation"]
+    assert "items" in conversation
+    contents = [item["content"] for item in conversation["items"]]
+    assert contents == ["conv row 00", "conv row 01", "conv row 02"]
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_enforces_member_access(
+    client: AsyncClient, db_session
+):
+    """GET /strategic-conversation returns 404 when the caller is not a project member."""
+    # Create a project owned by a different user so TEST_USER_ID has no membership
+    other_project = Project(
+        name="Other Project",
+        user_id="other-user-999",
+    )
+    db_session.add(other_project)
+    await db_session.commit()
+    await db_session.refresh(other_project)
+
+    resp = await client.get(
+        f"/api/admin/projects/{other_project.id}/strategic-conversation"
+    )
+
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.asyncio
+async def test_strategic_conversation_endpoint_passes_include_message_id(
+    client: AsyncClient, db_session
+):
+    """include_message_id= on the lightweight endpoint surfaces an older message."""
+    project = await _make_project(db_session)
+    base_time = _utcnow() - timedelta(hours=2)
+    older = ProjectMessage(
+        project_id=project.id,
+        message_type=MessageType.NOTE,
+        from_type="strategic",
+        content="older targeted message",
+        created_at=base_time,
+    )
+    newer_messages = [
+        ProjectMessage(
+            project_id=project.id,
+            message_type=MessageType.NOTE,
+            from_type="user" if i % 2 == 0 else "strategic",
+            content=f"newer row {i:02d}",
+            created_at=base_time + timedelta(minutes=i + 1),
+        )
+        for i in range(5)
+    ]
+    db_session.add_all([older, *newer_messages])
+    await db_session.commit()
+    await db_session.refresh(older)
+
+    resp = await client.get(
+        f"/api/admin/projects/{project.id}/strategic-conversation"
+        f"?include_message_id={older.id}"
+    )
+
+    assert resp.status_code == 200, resp.text
+    ids = [item["id"] for item in resp.json()["conversation"]["items"]]
+    assert ids[0] == str(older.id)
+
+
+@pytest.mark.asyncio
 async def test_strategic_session_create_persists_project_session(
     client: AsyncClient, db_session
 ):

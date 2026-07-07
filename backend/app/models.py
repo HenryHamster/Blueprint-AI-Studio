@@ -4631,6 +4631,7 @@ class UiLoadTimingSample(SQLModel, table=True):
     id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
     surface: str = Field(sa_column=Column(String(64), nullable=False, index=True))
     page_ready_ms: int = Field(sa_column=Column(Integer, nullable=False))
+    sample_type: str = Field(default="first_commit", sa_column=Column(String(32), nullable=False))
     recorded_at: datetime = Field(
         default_factory=_utcnow,
         sa_column=Column(NaiveUTCDateTime, nullable=False, server_default=func.now()),

@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { auth } from '../firebase';
+import { auth, getIdToken } from '../firebase';
 import { apiFetch, API_BASE_URL, authHeaders, type StrategicRefreshMarker } from '../api';
 import type { StrategicCycleProgress, StrategicCycleCompletion, StrategicSessionDelta } from '../hooks/useLogViewer';
 import { parseTimestamp, timeAgo } from '../utils/time';
@@ -32,7 +32,7 @@ import { useDirectionForm } from '../hooks/useDirectionForm';
 import { DirectionsAddForm } from './DirectionsAddForm';
 import {
   createStrategicSessionMessage,
-  fetchStrategicSession,
+  fetchStrategicConversation,
   type StrategicContextPackageDescriptor,
   type StrategicMessageTarget,
   type StrategicStateResponse,
@@ -1199,7 +1199,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
     try {
       if (conversationMode) {
         const includeMessageId = getStrategicSessionIncludeMessageId(selectedProjectId, targetMessageId);
-        const session = await fetchStrategicSession(selectedProjectId, includeMessageId);
+        const result = await fetchStrategicConversation(selectedProjectId, includeMessageId);
         const currentIncludeMessageId = getStrategicSessionIncludeMessageId(
           selectedProjectIdRef.current,
           targetMessageIdRef.current,
@@ -1212,7 +1212,7 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
           return;
         }
         lastStrategicSessionTargetFetchRef.current = includeMessageId;
-        const sessionMessages = session.conversation?.items ?? [];
+        const sessionMessages = result.conversation?.items ?? [];
         sessionMessages.forEach(m => seenMessageIdsRef.current.add(m.id));
         hasInitiallyLoadedRef.current = true;
         setMessages(prev => {
@@ -1329,6 +1329,23 @@ export function MessagesPanel({ selectedProjectId, githubRepo, defaultBranch, on
   }, [conversationMode, getStrategicSessionIncludeMessageId, selectedProjectId, onMessageCountChange, searchQuery, targetMessageId, usesStrategicReadModel]);
 
   usePoller(fetchMessages, { intervalMs: DEFAULT_POLL_MS, deps: [fetchMessages] });
+
+  // Record data-ready timing when initial load completes (once per surface entry)
+  const initialLoadDoneRef = useRef(false);
+  useEffect(() => {
+    if (loading || initialLoadDoneRef.current) return;
+    initialLoadDoneRef.current = true;
+    const ms = Math.round(performance.now());
+    const surface = (window.location.hash.replace(/^#\/?/, '').split('/')[0] || 'chat').slice(0, 64);
+    getIdToken().then(token => {
+      if (!token) return;
+      fetch('/api/admin/ui-load-timing', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ surface, page_ready_ms: ms, sample_type: 'data_ready' }),
+      }).catch(() => {});
+    }).catch(() => {});
+  }, [loading]);
 
   useEffect(() => {
     if (!realtimeRefreshSignal || realtimeRefreshSignal === lastRealtimeRefreshSignalRef.current) return;

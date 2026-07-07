@@ -1407,6 +1407,33 @@ async def get_project_strategic_session(
     )
 
 
+@router.get("/projects/{project_id}/strategic-conversation")
+@limiter.limit("60/minute")
+async def get_project_strategic_conversation(
+    request: Request,  # noqa: ARG001
+    project_id: uuid.UUID,
+    include_message_id: uuid.UUID | None = Query(None),
+    session: AsyncSession = Depends(get_session),
+    current_user: dict = Depends(get_current_user),
+):
+    """Return the conversation transcript only — no full strategic-state assembly.
+
+    Lighter-weight alternative to GET /strategic-session for polling the
+    conversation in the chat surface.  Runs only _recent_session_conversation
+    instead of the full read-model assembly.
+    """
+    await _get_user_project_with_role(
+        project_id, current_user["user_id"], session, "member"
+    )
+    conversation = await _recent_session_conversation(
+        session,
+        project_id,
+        context_package=None,
+        include_message_id=include_message_id,
+    )
+    return {"conversation": conversation}
+
+
 @router.post("/projects/{project_id}/strategic-session")
 @limiter.limit("30/minute")
 async def upsert_project_strategic_session(
