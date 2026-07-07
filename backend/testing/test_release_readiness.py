@@ -366,6 +366,45 @@ class TestPromotionCiGreenGate:
         assert gate["run_id"] == 13
 
     @pytest.mark.asyncio
+    async def test_completed_cancelled_without_dispatch_maps_to_no_signal(
+        self, db_session, mocker
+    ):
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(
+            mocker,
+            run={"run_id": 14, "status": "completed", "conclusion": "cancelled"},
+            head_sha="deadbeef",
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=False
+        )
+        assert gate["gate_state"] == "no_signal"
+        assert gate["run_id"] == 14
+        assert gate["head_sha"] == "deadbeef"
+        disp.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_completed_cancelled_with_dispatch_redispatches(
+        self, db_session, mocker
+    ):
+        """A cancelled run with dispatch=True must trigger a fresh dispatch."""
+        project, _ = await _make_project_and_version(db_session)
+        disp = _patch_gate_github(
+            mocker,
+            run={"run_id": 15, "status": "completed", "conclusion": "cancelled"},
+            head_sha="cafe5678",
+        )
+        gate = await compute_promotion_ci_green_gate(
+            db_session, project.id, dispatch=True
+        )
+        assert gate["gate_state"] == "dispatched"
+        assert gate["head_sha"] == "cafe5678"
+        disp.assert_awaited_once()
+        args = disp.await_args.args
+        assert args[3] == "ci.yml"
+        assert args[4] == "automain"
+
+    @pytest.mark.asyncio
     async def test_no_run_with_dispatch_maps_to_dispatched(self, db_session, mocker):
         project, _ = await _make_project_and_version(db_session)
         disp = _patch_gate_github(mocker, run=None, head_sha="cafe1234")

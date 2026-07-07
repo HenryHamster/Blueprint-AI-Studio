@@ -402,10 +402,10 @@ export function resolveBaseBranch(
   task: Record<string, unknown>,
   fallback = 'main',
 ): string {
-  const fromPayload = strVal(payload.base_branch);
+  const fromPayload = strVal(payload.base_branch).trim();
   if (fromPayload) return fromPayload;
   const meta = task.project_metadata as Record<string, unknown> | undefined;
-  const fromMeta = strVal(meta?.integration_branch);
+  const fromMeta = strVal(meta?.integration_branch).trim();
   if (fromMeta) return fromMeta;
   return fallback;
 }

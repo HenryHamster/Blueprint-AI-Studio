@@ -1164,7 +1164,8 @@ async def compute_promotion_ci_green_gate(
       * ``pending``    — a run for HEAD is queued / in_progress (not yet concluded)
       * ``red``        — a run for HEAD concluded non-success
       * ``dispatched`` — no run existed for HEAD, so one was just dispatched
-      * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD
+      * ``no_signal``  — ``dispatch=False`` and no run exists for HEAD, or a
+                         cancelled run exists with ``dispatch=False``
       * ``unavailable``— GitHub creds / HEAD / API unavailable (or an error occurred)
 
     When ``dispatch=True`` and there is no run for the current HEAD, dispatches a
@@ -1226,24 +1227,40 @@ async def compute_promotion_ci_green_gate(
                         html_url=html_url,
                         reason="ci.yml run for integration HEAD concluded success",
                     )
+                if conclusion == "cancelled":
+                    if not dispatch:
+                        return _promotion_ci_gate_verdict(
+                            "no_signal",
+                            head_sha=head_sha,
+                            run_id=run_id,
+                            html_url=html_url,
+                            reason=(
+                                "ci.yml run for integration HEAD was cancelled "
+                                "(read-only gate, no run dispatched)"
+                            ),
+                        )
+                    # dispatch=True: treat the cancelled run as absent and
+                    # fall through to the dispatch block below.
+                else:
+                    return _promotion_ci_gate_verdict(
+                        "red",
+                        head_sha=head_sha,
+                        run_id=run_id,
+                        html_url=html_url,
+                        reason=(
+                            "ci.yml run for integration HEAD concluded "
+                            f"{conclusion or 'non-success'}"
+                        ),
+                    )
+            else:
+                # queued / in_progress / waiting / requested — a run is in flight.
                 return _promotion_ci_gate_verdict(
-                    "red",
+                    "pending",
                     head_sha=head_sha,
                     run_id=run_id,
                     html_url=html_url,
-                    reason=(
-                        "ci.yml run for integration HEAD concluded "
-                        f"{conclusion or 'non-success'}"
-                    ),
+                    reason=f"ci.yml run for integration HEAD is {status_ or 'in flight'}",
                 )
-            # queued / in_progress / waiting / requested — a run is in flight.
-            return _promotion_ci_gate_verdict(
-                "pending",
-                head_sha=head_sha,
-                run_id=run_id,
-                html_url=html_url,
-                reason=f"ci.yml run for integration HEAD is {status_ or 'in flight'}",
-            )
 
         # No run exists for the current HEAD.
         if not dispatch:

@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+from sqlalchemy import select
 from sqlalchemy.orm.attributes import flag_modified
 
 from app import release_version
@@ -647,8 +648,85 @@ async def _redrive_promotion_failed_qualification(
                     redrive_session, version, gate.get("head_sha")
                 )
                 await redrive_session.commit()
+            elif gate_state == "red":
+                # A completed ci.yml run concluded failure on the integration HEAD.
+                # Raise a dedup-keyed Alert and spawn harvest remediation so the
+                # failure gets a fix task WITHOUT consuming a requalify attempt.
+                # A repeated sweep at the same red HEAD is a no-op (dedup guard).
+                head_sha = gate.get("head_sha") or ""
+                dedupe_key = f"preflight_ci:red:{version.project_id}:{head_sha}"
+                existing = (
+                    (
+                        await redrive_session.execute(
+                            select(Alert).where(
+                                Alert.project_id == version.project_id,
+                                Alert.dedupe_key == dedupe_key,
+                                Alert.dismissed_at.is_(None),
+                            )
+                        )
+                    )
+                    .scalars()
+                    .first()
+                )
+                if existing is not None:
+                    await redrive_session.rollback()
+                else:
+                    project = await redrive_session.get(Project, version.project_id)
+                    run_url = gate.get("html_url") or str(gate.get("run_id") or "")
+                    redrive_session.add(
+                        Alert(
+                            project_id=version.project_id,
+                            severity=AlertSeverity.ERROR,
+                            title=(
+                                f"Preflight CI red on integration branch "
+                                f"({head_sha[:8] if head_sha else '?'})"
+                            ),
+                            message=(
+                                f"Promotion-failed preflight: ci.yml concluded failure "
+                                f"for integration HEAD "
+                                f"{head_sha[:12] if head_sha else '?'}."
+                                + (f" Run: {run_url}." if run_url else "")
+                                + " Harvest remediation spawning."
+                            ),
+                            dedupe_key=dedupe_key,
+                        )
+                    )
+                    # Snapshot plain scalars before commit to avoid MissingGreenlet
+                    # errors when ORM attributes are accessed post-flush.
+                    _proj_id = version.project_id
+                    _ver_id = version.id
+                    _ver_num = version.version_number
+                    _harvest_kw: dict | None = None
+                    if project is not None:
+                        from app.release_reconciliation import (
+                            _harvest_promotion_ci_failures,
+                            promotion_ci_selfheal_enabled,
+                        )
+                        _intbranch, _ = release_qualifier._lts_branch_names(project)
+                        _harvest_kw = dict(
+                            project_id=_proj_id,
+                            version_id=_ver_id,
+                            version_number=_ver_num,
+                            owner=project.github_owner or "",
+                            repo=project.github_repo or "",
+                            ci_source_sha=head_sha,
+                            integration_branch=_intbranch,
+                            auto_remediation_config=(
+                                (project.design_doc or {}).get("_auto_remediation") or {}
+                            ),
+                            selfheal_enabled=promotion_ci_selfheal_enabled(project),
+                        )
+                    await redrive_session.commit()
+                    logger.warning(
+                        "[RELEASE_QUALIFIER] sweep: v%d preflight CI red HEAD %s "
+                        "— alert raised, harvest spawning",
+                        _ver_num,
+                        head_sha[:8] if head_sha else "?",
+                    )
+                    if _harvest_kw is not None:
+                        await _harvest_promotion_ci_failures(**_harvest_kw)
             else:
-                # pending / red / dispatched / unavailable — nothing to persist.
+                # pending / dispatched / unavailable — nothing to persist.
                 await redrive_session.rollback()
             return False
 

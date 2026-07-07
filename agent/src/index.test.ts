@@ -69,7 +69,7 @@ vi.mock('ws', () => ({
 }));
 
 // ── Imports (after mocks are registered) ─────────────────────────────────────
-import { strVal, sanitize, validateBranchName, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
+import { strVal, sanitize, validateBranchName, resolveBaseBranch, readHandlerOutput, testFixLoop, errorFingerprint, captureTestBaseline, RateLimitError, NoProgressTimeoutError, setupWorkspace, registerSizeCapMergeDriver, pushAndCreatePR, condensedAnalysisSections, matchesRateLimit, matchesAuthFailure, matchesVmConfigMissing, VmConfigMissingError, missingVmProviderConfigFiles, parseFailingTests, parseFailingTestsFromVitestJson, extractPytestSelectorsFromOutput, normalizePytestSelectorForRunner, buildTargetedPytestRunners, recordToolUse, snapshotToolTrace, extractInvestigatedFiles, clearToolTrace, appendToLogBuffer, snapshotLogBuffer, clearLogBuffer, replayLogBufferRateLimited, getProviderRunner, providerSupportsNativeSubagents, parseLLMCliTranslation, execFileAsync, runProviderAgent, persistAndPostStatus, _consumePendingParkDirectiveForTesting, continueWarmContinuation, parseStaleResultFile, markStaleResultFailure, shouldAbandonStaleResult, pollForNextRole, bootstrapPoolMode, refreshRuntimeState, _resetTelemetryForTesting, _setRoleClaimTimestampForTesting, _getFirstToolUseAtForTesting, _setWarmStartForTesting, _setHandlerDurationForTesting, _setAgentRuntimeFingerprintForTesting, readAgentSourceSha, _setAgentSourceShaForTesting, _startHeartbeatForTesting, _stopHeartbeatForTesting, _buildHeartbeatStatusForTesting, apiPost, apiGet, apiRequest, getAgentToken, ClaudeTimeoutError, detectLoopDivergence, fetchVmImageIdentity, recordLlmCallStart, recordLlmTokens, getLlmTelemetry, resetLlmTelemetry, estimateTokensFromChars, deriveTaskBranch, resolveTaskBranchNamespace, TASK_TYPE_BRANCH_PREFIX, codexStreamHasTurnCompleted, computeRefreshDelayMs, isBootstrapToken, isTaskNoLongerActiveError, postTerminalStatusSync, GracefulShutdownSignal, _isCancelRequestedForTesting, _resetCancelRequestedForTesting, _setCancelRequestedForTesting, resetPerRoleModuleState, _getWarmStartForTesting, _getJobModeForTesting, _setJobModeForTesting, setCurrentPromptFingerprint, getCurrentPromptFingerprint, performWarmRetarget, __setWarmRetargetDepsForTesting, MATERIALIZE_SCRIPT_PATH, _setAgentTokenForTesting, _resetCredentialStateForTesting, _captureBootCredentialSnapshotForTesting, _captureBootProviderConfigPresenceForTesting, _materializeClaimCredentialStateForTesting, _getActiveCredentialStateSourceForTesting, ensureTaskCapabilityContractLoaded, __resetTaskCapabilityContractLoadedForTesting, _crashReportForTesting, cloneWithRetry, main, resolveCredentialsFromSecretVersion, type SecretManifest, type FailureCategory } from './index.js';
 import { prepareWorkspaceForRole, resetWorkspacePrepOutcome } from './workspacePrep.js';
 import { jaccardSimilarity } from './utils/diff-detection.js';
 import {
@@ -557,6 +557,33 @@ describe('validateBranchName', () => {
 
   it('throws on backtick character', () => {
     expect(() => validateBranchName('feat`cmd`', 'branch')).toThrow('Invalid branch');
+  });
+});
+
+// ── resolveBaseBranch ────────────────────────────────────────────────────────
+describe('resolveBaseBranch', () => {
+  it('prefers payload.base_branch over project_metadata.integration_branch', () => {
+    expect(resolveBaseBranch({ base_branch: 'feature/x' }, { project_metadata: { integration_branch: 'develop' } })).toBe('feature/x');
+  });
+
+  it('falls back to project_metadata.integration_branch when payload has no base_branch', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: 'develop' } })).toBe('develop');
+  });
+
+  it('falls back to "main" when neither payload nor metadata has a branch', () => {
+    expect(resolveBaseBranch({}, {})).toBe('main');
+  });
+
+  it('trims whitespace from payload.base_branch', () => {
+    expect(resolveBaseBranch({ base_branch: '  main  ' }, {})).toBe('main');
+  });
+
+  it('trims whitespace from integration_branch and falls through on whitespace-only value', () => {
+    expect(resolveBaseBranch({}, { project_metadata: { integration_branch: '  ' } })).toBe('main');
+  });
+
+  it('accepts custom fallback when no branch configured', () => {
+    expect(resolveBaseBranch({}, {}, 'master')).toBe('master');
   });
 });
 
@@ -2773,6 +2800,7 @@ describe('failure category classification', () => {
       .mockResolvedValueOnce({
         ok: false,
         status: 403,
+        headers: { get: () => null },
         text: () => Promise.resolve('Forbidden'),
       }),
     );
@@ -4723,7 +4751,7 @@ describe('main pool-mode startup ordering', () => {
       }
       if (url.endsWith('/api/agent/claim')) {
         events.push('claim-replay');
-        return Promise.resolve({ status: 400, ok: false, text: () => Promise.resolve('claim replay stopped test') });
+        return Promise.resolve({ status: 400, ok: false, headers: { get: () => null }, text: () => Promise.resolve('claim replay stopped test') });
       }
       throw new Error(`unexpected fetch ${url}`);
     });

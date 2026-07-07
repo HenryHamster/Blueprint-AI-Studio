@@ -132,7 +132,8 @@
     "research_direction_state.py": 1750,
     "dep_lifecycle.py": 800,
     "routers/admin_health.py": 1750,
-    "metrics_integrity_sweep.py": 2050
+    "metrics_integrity_sweep.py": 2050,
+    "release_readiness.py": 1750
   },
   "agent": {
     "index.ts": 4600,

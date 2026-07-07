@@ -51,6 +51,10 @@ vi.mock('./VersionLifecyclePanel', () => ({
   ),
 }));
 
+vi.mock('./CompletionDebtPanel', () => ({
+  CompletionDebtPanel: () => <div>completion debt</div>,
+}));
+
 vi.mock('./RuntimeAccountsPanel', () => ({
   RuntimeAccountsPanel: () => <div data-testid="runtime-accounts-panel">account monitor</div>,
 }));

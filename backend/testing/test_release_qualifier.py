@@ -31088,9 +31088,9 @@ async def test_redrive_promotion_failed_spawns_qualification(db_session, mocker)
 async def test_redrive_promotion_failed_defers_when_ci_gate_not_green(
     db_session, mocker
 ):
-    """When the full-suite CI green gate is NOT green (e.g. red), the re-driver
-    must return False WITHOUT calling run_qualification — no audit is burned and
-    no circuit-breaker attempt is consumed."""
+    """When the full-suite CI green gate is in a transient non-green state (e.g.
+    pending), the re-driver must return False WITHOUT calling run_qualification —
+    no audit is burned and no circuit-breaker attempt is consumed."""
     from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
 
     project, version = await _make_project_and_version(db_session, phase="stabilize")
@@ -31112,9 +31112,9 @@ async def test_redrive_promotion_failed_defers_when_ci_gate_not_green(
         "app.release_readiness.compute_promotion_ci_green_gate",
         new=AsyncMock(
             return_value={
-                "gate_state": "red",
+                "gate_state": "pending",
                 "head_sha": "face" * 10,
-                "reason": "ci.yml run for integration HEAD concluded failure",
+                "reason": "ci.yml run for integration HEAD is in progress",
             }
         ),
     )
@@ -31132,6 +31132,140 @@ async def test_redrive_promotion_failed_defers_when_ci_gate_not_green(
     # The read-only gate check runs with dispatch=False (no run is triggered here).
     gate.assert_awaited_once()
     assert gate.await_args.kwargs.get("dispatch") is False
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_red_ci_alerts_and_harvests(
+    db_session, mocker
+):
+    """When the preflight gate concludes red, the re-driver must raise a
+    dedup-keyed Alert and call _harvest_promotion_ci_failures WITHOUT calling
+    run_qualification (no requalify attempt consumed) and return False."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+    from sqlalchemy import select as _select
+
+    HEAD_SHA = "deadbeef" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": HEAD_SHA,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 99,
+                "html_url": "https://github.com/runs/99",
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    run_qual = mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    result = await _redrive_promotion_failed_qualification(
+        version.id, session_factory=_shared_session_factory(db_session)
+    )
+
+    assert result is False
+    run_qual.assert_not_awaited()
+
+    # An Alert with a dedupe key must have been created.
+    alert = (
+        await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().first()
+    assert alert is not None
+    assert HEAD_SHA[:8] in alert.title
+    assert alert.dedupe_key is not None
+    assert "preflight_ci:red:" in alert.dedupe_key
+
+    # Harvest was called once with the version_id (promotion-tagged) and HEAD SHA.
+    harvest_mock.assert_awaited_once()
+    kw = harvest_mock.await_args.kwargs
+    assert kw["ci_source_sha"] == HEAD_SHA
+    assert kw["version_id"] == version.id
+
+
+@pytest.mark.asyncio
+async def test_redrive_promotion_failed_red_ci_deduplicates_on_same_sha(
+    db_session, mocker
+):
+    """A second sweep at the same red HEAD must NOT create a second Alert or call
+    harvest again — the dedup guard prevents double-spawn."""
+    from app.release_qualifier_sweep import _redrive_promotion_failed_qualification
+    from sqlalchemy import select as _select
+
+    HEAD_SHA = "cafebabe" * 5
+
+    project, version = await _make_project_and_version(db_session, phase="stabilize")
+    version.last_qualification = {
+        "status": "promotion_failed",
+        "candidate_sha": HEAD_SHA,
+        "error": "required_check_failed",
+        "promotion_failure_count": 1,
+    }
+    db_session.add(version)
+    await db_session.commit()
+    await db_session.refresh(version)
+
+    mocker.patch(
+        "app.release_readiness.compute_requalification_readiness",
+        new=AsyncMock(return_value={"requalification_ready": True}),
+    )
+    mocker.patch(
+        "app.release_readiness.compute_promotion_ci_green_gate",
+        new=AsyncMock(
+            return_value={
+                "gate_state": "red",
+                "head_sha": HEAD_SHA,
+                "run_id": 7,
+                "reason": "ci.yml concluded failure",
+            }
+        ),
+    )
+    mocker.patch(
+        "app.release_qualifier.run_qualification",
+        new=AsyncMock(return_value={"status": "spawned"}),
+    )
+    harvest_mock = mocker.patch(
+        "app.release_reconciliation._harvest_promotion_ci_failures",
+        new=AsyncMock(return_value=None),
+    )
+
+    factory = _shared_session_factory(db_session)
+    # First sweep — creates the Alert and calls harvest.
+    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+    # Second sweep at the same SHA — must be a no-op.
+    await _redrive_promotion_failed_qualification(version.id, session_factory=factory)
+
+    alerts = (
+        await db_session.execute(
+            _select(Alert).where(Alert.project_id == project.id)
+        )
+    ).scalars().all()
+    assert len(alerts) == 1, "dedup guard must prevent a second Alert for the same SHA"
+    assert harvest_mock.await_count == 1, "harvest must be called only once per SHA"
 
 
 @pytest.mark.asyncio
