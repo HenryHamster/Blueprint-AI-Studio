@@ -3699,6 +3699,31 @@ async def claim_task(
                 "[AGENT] Failed to inject sr_recent_miss_examples (non-critical)"
             )
 
+    # Inject pre-computed SR vs fresh-reviewer disagreements. Stored by
+    # compute_sr_reviewer_disagreements into design_doc["sr_reviewer_disagreements"].
+    # Shape: project_context.sr_reviewer_disagreements =
+    #   {window_days, disagreements: [{category, task_type, count, examples?}]}
+    if task_type in CODE_REVIEW_GATED_TASK_TYPES and project_for_playbook:
+        try:
+            _disagreements_raw = (project_for_playbook.design_doc or {}).get(
+                "sr_reviewer_disagreements"
+            )
+            if (
+                isinstance(_disagreements_raw, dict)
+                and isinstance(_disagreements_raw.get("disagreements"), list)
+                and _disagreements_raw["disagreements"]
+            ):
+                if "project_context" not in response:
+                    response["project_context"] = {}
+                response["project_context"]["sr_reviewer_disagreements"] = {
+                    "window_days": _disagreements_raw.get("window_days", 30),
+                    "disagreements": _disagreements_raw["disagreements"],
+                }
+        except Exception:
+            logger.exception(
+                "[AGENT] Failed to inject sr_reviewer_disagreements (non-critical)"
+            )
+
     # Inject scoped architecture context for create/fix/refactor tasks
     if task_type in ("create", "fix", "refactor") and project_for_playbook:
         design_doc = project_for_playbook.design_doc or {}

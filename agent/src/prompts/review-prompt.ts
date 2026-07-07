@@ -156,32 +156,54 @@ ${checks.join('\n')}
 - A command you CANNOT run (tool missing, install/build failure, API 401/403, sandbox limit) is an environment condition, never a code defect, and is NOT grounds for REQUEST_CHANGES.`;
 }
 
-export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
-  return `Review the changes thoroughly using this checklist:
-
-**Correctness & Logic:**
+// Per-lens checklist text used by buildLensScopedChecklistSection.
+// Each panel_review lens agent receives only its own section so it does not
+// re-read the full four-section list it was explicitly told to ignore.
+const LENS_CHECKLIST_ITEMS: Record<string, string> = {
+  correctness: `**Correctness & Logic:**
 - Does the code correctly implement what the original task asked for?
 - Are there edge cases, null/undefined handling, or off-by-one errors?
 - Are async operations properly awaited? Are errors properly handled?
-- Do any database queries have N+1 problems or missing indexes?
-
-**Security:**
+- Do any database queries have N+1 problems or missing indexes?`,
+  security: `**Security:**
 - Are user inputs validated and sanitized before use?
 - Are there SQL injection, XSS, path traversal, or command injection risks?
 - Are secrets/tokens exposed in logs, responses, or error messages?
-- Are authorization checks present on new endpoints?
-
-**Code Quality:**
+- Are authorization checks present on new endpoints?`,
+  code_quality: `**Code Quality:**
 - Is the code readable and following existing patterns in the codebase?
 - Are there obvious performance issues (unnecessary loops, redundant DB calls)?
 - Does the change break any existing interfaces or contracts?
-- Are type annotations correct (TypeScript/Python)?
-
-**Test Coverage:**
+- Are type annotations correct (TypeScript/Python)?`,
+  test_coverage: `**Test Coverage:**
 - Are there tests for the new/changed behavior? (A genuinely missing test for new behavior is a blockable defect.)
-- Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)
+- Do the changes look likely to break existing tests by reasoning about the diff? (CI runs the full suite as the authoritative gate — do not re-run it yourself or block on a test run you couldn't perform; flag only a specific case the diff clearly breaks.)`,
+};
+
+export function buildReviewChecklistSection(buildConfig?: BuildConfig, baseBranch?: string): string {
+  return `Review the changes thoroughly using this checklist:
+
+${LENS_CHECKLIST_ITEMS.correctness}
+
+${LENS_CHECKLIST_ITEMS.security}
+
+${LENS_CHECKLIST_ITEMS.code_quality}
+
+${LENS_CHECKLIST_ITEMS.test_coverage}
 
 ${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
+}
+
+// Returns a checklist section scoped to a single panel_review lens. The lens
+// agent only receives its own dimension's bullets so it is not prompted to
+// judge dimensions explicitly outside its scope. Falls back to the full
+// checklist for unrecognised lens IDs to avoid silent regressions.
+export function buildLensScopedChecklistSection(lensId: string, buildConfig?: BuildConfig, baseBranch?: string): string {
+  const lensSection = LENS_CHECKLIST_ITEMS[lensId];
+  if (!lensSection) {
+    return buildReviewChecklistSection(buildConfig, baseBranch);
+  }
+  return `Review the changes through your lens using this checklist:\n\n${lensSection}\n\n${buildTypeCheckInstructions(buildConfig, baseBranch)}`;
 }
 
 export function buildReviewSeverityGuideSection(): string {

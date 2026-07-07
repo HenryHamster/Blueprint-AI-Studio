@@ -321,6 +321,30 @@ describe('formatProjectContext — SR vs Fresh-Reviewer Disagreements with examp
       formatProjectContext({ sr_reviewer_disagreements: { disagreements: [] } }, 'create'),
     ).not.toContain('SR vs Fresh-Reviewer Disagreements');
   });
+
+  it('places SR vs Fresh-Reviewer Disagreements after FP calibration when both are present', () => {
+    const ctx = {
+      self_review_catch_rate: {
+        categories: {
+          security: {
+            miss_rate: 0.05,
+            false_positive_rate: 0.8,
+            sr_flag_sample_size: 15,
+          },
+        },
+      },
+      sr_reviewer_disagreements: {
+        window_days: 30,
+        disagreements: [{ category: 'correctness', task_type: 'create', count: 2 }],
+      },
+    };
+    const result = formatProjectContext(ctx, 'create');
+    expect(result).toContain('### Self-Review False-Positive Calibration');
+    expect(result).toContain('### SR vs Fresh-Reviewer Disagreements');
+    const fpIdx = result.indexOf('### Self-Review False-Positive Calibration');
+    const disagreementsIdx = result.indexOf('### SR vs Fresh-Reviewer Disagreements');
+    expect(fpIdx).toBeLessThan(disagreementsIdx);
+  });
 });
 
 describe('formatSrCatchRateForSrPrompt', () => {
