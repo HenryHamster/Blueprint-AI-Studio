@@ -2262,6 +2262,242 @@ async def _maybe_create_local_runner_hold_alert(
     return True
 
 
+_FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE = "runner.fleet_no_healthy"
+
+
+def _fleet_no_healthy_runner_dedupe_key(project_id: "uuid.UUID | str") -> str:
+    return f"{_FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE}:{project_id}"
+
+
+async def _maybe_create_fleet_no_healthy_runner_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    offline_count: int,
+    degraded_count: int,
+) -> bool:
+    """Create a deduplicated ERROR alert when ALL runners for a project are unhealthy.
+
+    Fires when a project has registered runners but none are currently healthy
+    (active + heartbeat within liveness window + consecutive failures below
+    threshold). This is distinct from individual runner-deactivated /
+    runner-degraded alerts: it signals the catastrophic case where the entire
+    self-hosted fleet is down, not just one runner.
+
+    Deduplicated on ``runner.fleet_no_healthy:{project_id}`` via
+    :func:`create_project_alert_if_allowed` so repeated sweep passes bump the
+    occurrence count rather than creating duplicate rows. Returns ``True`` when a
+    NEW alert was created (and the notification dispatched), else ``False``.
+    The alert auto-resolves when :func:`_resolve_fleet_no_healthy_runner_alert`
+    is called once a healthy runner is detected.
+    """
+    total = offline_count + degraded_count
+    title = "All fleet runners offline or degraded"
+    parts = []
+    if offline_count:
+        parts.append(f"{offline_count} offline")
+    if degraded_count:
+        parts.append(f"{degraded_count} degraded")
+    health_desc = f" ({', '.join(parts)})" if parts else ""
+    message = (
+        f"All {total} registered runner{'s' if total != 1 else ''} for this "
+        f"project are unhealthy{health_desc}. No self-hosted capacity is "
+        f"available — tasks will fall back to cloud dispatch or be held. Bring "
+        f"at least one runner back online to restore self-hosted capacity. The "
+        f"alert clears automatically when a healthy runner is detected."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_FLEET_NO_HEALTHY_RUNNER_EVENT_TYPE,
+        severity=AlertSeverity.ERROR,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_fleet_no_healthy_runner_dedupe_key(project_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.ERROR.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    try:
+        import asyncio as _asyncio
+        from app.notification_dispatch import dispatch_external_notification
+
+        _asyncio.ensure_future(  # noqa: RUF006
+            dispatch_external_notification(
+                project_id,
+                "RUNNER_FLEET_OFFLINE",
+                {
+                    "offline_count": offline_count,
+                    "degraded_count": degraded_count,
+                    "title": title,
+                },
+            )
+        )
+    except Exception as _ne:
+        logger.warning("[NOTIFY] RUNNER_FLEET_OFFLINE dispatch setup failed: %s", _ne)
+    return True
+
+
+async def _resolve_fleet_no_healthy_runner_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+) -> int:
+    """Dismiss any open fleet-no-healthy-runner alert once a healthy runner recovers.
+
+    The companion to :func:`_maybe_create_fleet_no_healthy_runner_alert`. Called
+    when a project is found to have at least one healthy runner (active + recent
+    heartbeat + not degraded). Mirrors :func:`_resolve_runner_deactivated_alert`.
+    Returns the number of alerts dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _fleet_no_healthy_runner_dedupe_key(project_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
+_RUNNER_LOW_DISK_EVENT_TYPE = "runner.low_disk"
+
+
+def _runner_low_disk_dedupe_key(runner_id: "uuid.UUID | str") -> str:
+    return f"{_RUNNER_LOW_DISK_EVENT_TYPE}:{runner_id}"
+
+
+async def _maybe_create_runner_low_disk_alert(
+    session: AsyncSession,
+    *,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+    hostname: "str | None" = None,
+    disk_free_bytes: int,
+    threshold_bytes: int,
+) -> bool:
+    """Create a deduplicated WARNING alert when a runner's free disk is low.
+
+    Fires when a live runner reports ``disk_free_bytes`` below ``threshold_bytes``
+    during the orchestrator's degraded-runner sweep. Surfaces the capacity risk
+    before jobs start failing due to disk exhaustion.
+
+    Deduplicated on ``runner.low_disk:{runner_id}`` so repeated sweep passes
+    bump the occurrence count rather than creating duplicate rows. The alert
+    clears automatically when :func:`_resolve_runner_low_disk_alert` is called
+    once disk recovers above the threshold. Returns ``True`` when a NEW alert
+    was created, else ``False``.
+    """
+    runner_label = hostname or f"runner {str(runner_id)[:8]}"
+    free_gb = disk_free_bytes / (1024 ** 3)
+    threshold_gb = threshold_bytes / (1024 ** 3)
+    title = f"Fleet runner low disk: {runner_label}"
+    message = (
+        f"Self-hosted fleet runner {runner_label} ({str(runner_id)[:8]}) has "
+        f"only {free_gb:.1f} GB of free disk space, below the "
+        f"{threshold_gb:.1f} GB threshold. Low disk may cause job failures. "
+        f"Free up disk space to restore healthy operation. The alert clears "
+        f"automatically when free disk recovers above the threshold."
+    )[:1000]
+
+    alert, created, _decision = await create_project_alert_if_allowed(
+        session,
+        project_id=project_id,
+        event_type=_RUNNER_LOW_DISK_EVENT_TYPE,
+        severity=AlertSeverity.WARNING,
+        title=title,
+        message=message,
+        source="orchestrator",
+        dedupe_key=_runner_low_disk_dedupe_key(runner_id),
+        broadcast=False,
+    )
+    if alert is None:
+        return False
+    await session.commit()
+    if not created:
+        return False
+    await broadcast_to_project(
+        str(project_id),
+        "alert_created",
+        {
+            "alert_id": str(alert.id),
+            "severity": AlertSeverity.WARNING.value,
+            "title": alert.title,
+            "domain": alert.domain,
+            "event_type": alert.event_type,
+        },
+    )
+    return True
+
+
+async def _resolve_runner_low_disk_alert(
+    session: AsyncSession,
+    project_id: "uuid.UUID",
+    runner_id: "uuid.UUID | str",
+) -> int:
+    """Dismiss any open runner-low-disk alert for a runner whose disk has recovered.
+
+    The companion to :func:`_maybe_create_runner_low_disk_alert`. Called from
+    the degraded-runner sweep when a runner's ``disk_free_bytes`` rises back
+    above the threshold (or it stops reporting disk). Mirrors
+    :func:`_resolve_runner_degraded_alert`. Returns the number of alerts
+    dismissed (0 or 1 in practice).
+    """
+    dedupe_key = _runner_low_disk_dedupe_key(runner_id)
+    result = await session.execute(
+        select(Alert).where(
+            Alert.project_id == project_id,
+            Alert.dedupe_key == dedupe_key,
+            Alert.dismissed_at.is_(None),
+        )
+    )
+    open_alerts = result.scalars().all()
+    if not open_alerts:
+        return 0
+    now = _utcnow()
+    for alert in open_alerts:
+        alert.dismissed_at = now
+        session.add(alert)
+    await session.commit()
+    for alert in open_alerts:
+        await broadcast_to_project(
+            str(project_id),
+            "alert_dismissed",
+            {"alert_id": str(alert.id), "title": alert.title},
+        )
+    return len(open_alerts)
+
+
 async def _create_strategic_alert(
     project_id: "uuid.UUID",
     session: AsyncSession,

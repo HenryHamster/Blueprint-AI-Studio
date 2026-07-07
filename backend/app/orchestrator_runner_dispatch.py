@@ -1184,6 +1184,205 @@ async def _sweep_runner_deactivated_escalations(session: AsyncSession) -> None:
 # Mirrors admin_runners._FAILURE_STREAK_DEGRADED_THRESHOLD (both must stay in sync).
 _RUNNER_DEGRADED_FAILURE_THRESHOLD = 3
 
+# Default free-disk floor (bytes) below which a live runner is considered low-disk.
+# 1 GB — configurable at runtime via ``runner_low_disk_threshold_bytes``.
+_RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT = 1_073_741_824  # 1 GiB
+
+
+async def _check_low_disk_runners(session: AsyncSession) -> None:
+    """Detect live runners whose free disk has fallen below the floor and alert/resolve.
+
+    Queries active runners with a recent heartbeat; for those reporting
+    ``disk_free_bytes`` below the configurable threshold, calls
+    :func:`~app.alert_dispatch._maybe_create_runner_low_disk_alert` to raise (or
+    dedup) a WARNING alert. Resolves alerts for runners whose disk has recovered.
+
+    Called from :func:`_check_degraded_runners` so it shares the same 300s cadence
+    as the other health sweeps.
+    """
+    from app.alert_dispatch import (
+        _RUNNER_LOW_DISK_EVENT_TYPE,
+        _maybe_create_runner_low_disk_alert,
+        _resolve_runner_low_disk_alert,
+    )
+    from app.models import Alert
+
+    threshold = int(
+        _runtime_config.get(
+            "runner_low_disk_threshold_bytes", _RUNNER_LOW_DISK_THRESHOLD_BYTES_DEFAULT
+        )
+    )
+
+    cutoff = _utcnow() - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+    active_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.hostname,
+                LocalRunner.capabilities,
+            ).where(
+                LocalRunner.status == "active",
+                LocalRunner.last_seen_at.is_not(None),
+                LocalRunner.last_seen_at >= cutoff,
+            )
+        )
+    ).all()
+
+    low_disk_runner_ids: set[uuid.UUID] = set()
+    for runner_id, project_id, hostname, capabilities in active_rows:
+        disk_free = (capabilities or {}).get("disk_free_bytes")
+        if disk_free is None:
+            continue
+        if int(disk_free) < threshold:
+            low_disk_runner_ids.add(runner_id)
+            try:
+                await _maybe_create_runner_low_disk_alert(
+                    session,
+                    project_id=project_id,
+                    runner_id=runner_id,
+                    hostname=hostname,
+                    disk_free_bytes=int(disk_free),
+                    threshold_bytes=threshold,
+                )
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] Failed to create low-disk alert for runner %s", runner_id
+                )
+                try:
+                    await session.rollback()
+                except Exception:
+                    logger.exception(
+                        "[RUNNERS] rollback after low-disk alert create failed for %s",
+                        runner_id,
+                    )
+
+    # Resolve alerts for runners whose disk has recovered (or that stopped reporting).
+    open_low_disk = (
+        await session.execute(
+            select(Alert.project_id, Alert.dedupe_key).where(
+                Alert.event_type == _RUNNER_LOW_DISK_EVENT_TYPE,
+                Alert.dismissed_at.is_(None),
+            )
+        )
+    ).all()
+    for project_id_row, dedupe_key in open_low_disk:
+        if not dedupe_key:
+            continue
+        try:
+            runner_id = uuid.UUID(dedupe_key.split(":", 1)[-1])
+        except (ValueError, IndexError):
+            continue
+        if runner_id in low_disk_runner_ids:
+            continue
+        try:
+            await _resolve_runner_low_disk_alert(session, project_id_row, runner_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve low-disk alert for runner %s", runner_id
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after low-disk alert resolve failed for %s",
+                    runner_id,
+                )
+
+
+async def _check_fleet_no_healthy_runner(
+    session: AsyncSession,
+    degraded_runner_ids: set[uuid.UUID],
+) -> None:
+    """Raise or resolve the per-project fleet-no-healthy-runner aggregate alert.
+
+    A project's self-hosted fleet is considered fully unhealthy when it has at
+    least one registered runner but NONE are currently healthy (active + heartbeat
+    within the liveness window + consecutive failures below the degraded threshold).
+    When that condition holds, one deduplicated ERROR alert fires per project so
+    the catastrophic outage is paged distinctly from an individual runner death.
+    The alert auto-resolves when a healthy runner is detected.
+
+    Called from :func:`_check_degraded_runners` with the set of runner IDs that
+    are currently degraded (computed in the same sweep pass), so the fleet check
+    does not re-query active/degraded runners.
+    """
+    from app.alert_dispatch import (
+        _maybe_create_fleet_no_healthy_runner_alert,
+        _resolve_fleet_no_healthy_runner_alert,
+    )
+
+    now = _utcnow()
+    cutoff = now - timedelta(seconds=_RUNNER_LIVENESS_SECONDS)
+
+    # Single pass over all registered runners to classify per-project health.
+    all_rows = (
+        await session.execute(
+            select(
+                LocalRunner.id,
+                LocalRunner.project_id,
+                LocalRunner.status,
+                LocalRunner.last_seen_at,
+            )
+        )
+    ).all()
+
+    projects_with_runners: set[uuid.UUID] = set()
+    projects_with_healthy: set[uuid.UUID] = set()
+    offline_by_project: dict[uuid.UUID, int] = {}
+    degraded_by_project: dict[uuid.UUID, int] = {}
+
+    for runner_id, project_id, status, last_seen_at in all_rows:
+        projects_with_runners.add(project_id)
+        is_live = (
+            status == "active"
+            and last_seen_at is not None
+            and last_seen_at > cutoff
+        )
+        if is_live and runner_id not in degraded_runner_ids:
+            projects_with_healthy.add(project_id)
+        elif is_live:
+            degraded_by_project[project_id] = degraded_by_project.get(project_id, 0) + 1
+        else:
+            offline_by_project[project_id] = offline_by_project.get(project_id, 0) + 1
+
+    for project_id in projects_with_runners - projects_with_healthy:
+        try:
+            await _maybe_create_fleet_no_healthy_runner_alert(
+                session,
+                project_id=project_id,
+                offline_count=offline_by_project.get(project_id, 0),
+                degraded_count=degraded_by_project.get(project_id, 0),
+            )
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to create fleet-no-healthy alert for project %s",
+                project_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after fleet alert create failed for project %s",
+                    project_id,
+                )
+
+    for project_id in projects_with_healthy:
+        try:
+            await _resolve_fleet_no_healthy_runner_alert(session, project_id)
+        except Exception:
+            logger.exception(
+                "[RUNNERS] Failed to resolve fleet-no-healthy alert for project %s",
+                project_id,
+            )
+            try:
+                await session.rollback()
+            except Exception:
+                logger.exception(
+                    "[RUNNERS] rollback after fleet alert resolve failed for project %s",
+                    project_id,
+                )
+
 
 async def _check_degraded_runners(session: AsyncSession) -> None:
     """Detect runners that are heartbeating but failing every job, and alert/resolve.
@@ -1281,6 +1480,18 @@ async def _check_degraded_runners(session: AsyncSession) -> None:
                     "[RUNNERS] rollback after degraded-alert resolve failed for %s",
                     runner_id,
                 )
+
+    # 3. Fleet-level rollup: raise or resolve the per-project "no healthy runner" alert.
+    try:
+        await _check_fleet_no_healthy_runner(session, degraded_runner_ids)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep fleet-no-healthy-runner alerts")
+
+    # 4. Proactive low-disk alert: runners reporting disk below the floor.
+    try:
+        await _check_low_disk_runners(session)
+    except Exception:
+        logger.exception("[RUNNERS] Failed to sweep low-disk runner alerts")
 
 
 def _parse_local_runner_hold_timestamp(raw: object) -> datetime | None:
