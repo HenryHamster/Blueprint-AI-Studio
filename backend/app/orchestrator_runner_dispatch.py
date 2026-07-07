@@ -82,6 +82,7 @@ class RunnerDispatchSnapshot(NamedTuple):
     id: uuid.UUID
     project_id: uuid.UUID
     capabilities: dict
+    consecutive_job_failures: int = 0
 
 
 def _runner_handles_task_type(
@@ -219,6 +220,7 @@ async def _load_active_runners_cache(
                     LocalRunner.id,
                     LocalRunner.project_id,
                     LocalRunner.capabilities,
+                    LocalRunner.consecutive_job_failures,
                 ).where(
                     LocalRunner.status == "active",
                     LocalRunner.last_seen_at.is_not(None),
@@ -230,10 +232,10 @@ async def _load_active_runners_cache(
         logger.exception("[RUNNERS] Failed to load active-runner cache")
         return {}
     outstanding_compute_by_runner = await _load_runner_compute_job_assignments(
-        session, [runner_id for runner_id, _project_id, _capabilities in rows]
+        session, [runner_id for runner_id, _project_id, _capabilities, _failures in rows]
     )
     by_project: dict[uuid.UUID, list[RunnerDispatchSnapshot]] = {}
-    for runner_id, project_id, capabilities in rows:
+    for runner_id, project_id, capabilities, consecutive_job_failures in rows:
         caps = dict(capabilities or {})
         heartbeat_jobs = caps.get("active_compute_job_ids") or []
         merged_job_ids: list[str] = []
@@ -251,6 +253,7 @@ async def _load_active_runners_cache(
             id=runner_id,
             project_id=project_id,
             capabilities=caps,
+            consecutive_job_failures=consecutive_job_failures or 0,
         )
         by_project.setdefault(project_id, []).append(snapshot)
     return by_project
@@ -565,11 +568,15 @@ def _select_eligible_runner(
         )
         if preferred is not None:
             return preferred
-    return min(
-        eligible,
-        key=lambda r: _runner_active_work_count(r)
-        + runner_pins_this_cycle.get(r.id, 0),
-    )
+    # Deprioritize degraded runners (consecutive_job_failures at threshold) so
+    # healthy runners are always preferred; degraded runners remain eligible as
+    # a fallback so they can receive a job and reset their failure streak.
+    def _dispatch_sort_key(r: "LocalRunner | RunnerDispatchSnapshot") -> tuple:
+        failures = getattr(r, "consecutive_job_failures", 0) or 0
+        is_degraded = int(failures >= _RUNNER_DEGRADED_FAILURE_THRESHOLD)
+        return (is_degraded, _runner_active_work_count(r) + runner_pins_this_cycle.get(r.id, 0))
+
+    return min(eligible, key=_dispatch_sort_key)
 
 
 def _build_compute_launch_kwargs(

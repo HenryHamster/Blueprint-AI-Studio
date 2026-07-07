@@ -298,6 +298,72 @@ def reset_max_plan_pool():
     _account_by_id.update(orig_by_id)
 
 
+# ── Degraded-runner dispatch deprioritization ─────────────────────────────────
+
+
+def test_degraded_runner_deprioritized_in_dispatch():
+    """A degraded runner (consecutive_job_failures >= threshold) is sorted last
+    in _select_eligible_runner so healthy runners are always preferred.
+
+    The degraded runner must still appear as a fallback: when it is the only
+    candidate, it must be selected (preserving recovery opportunity).
+
+    Pre-fix: _load_active_runners_cache never loaded consecutive_job_failures,
+    so all runners looked equally healthy to the dispatcher.
+    """
+    from app.orchestrator_runner_dispatch import (
+        _RUNNER_DEGRADED_FAILURE_THRESHOLD,
+        _select_eligible_runner,
+        RunnerDispatchSnapshot,
+    )
+
+    project_id = uuid.uuid4()
+    caps_all = {"task_types": "all"}
+
+    healthy = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=0,
+    )
+    degraded = RunnerDispatchSnapshot(
+        id=uuid.uuid4(),
+        project_id=project_id,
+        capabilities=caps_all,
+        consecutive_job_failures=_RUNNER_DEGRADED_FAILURE_THRESHOLD,
+    )
+
+    cache = {project_id: [degraded, healthy]}
+
+    # When both are available, the healthy runner wins.
+    selected = _select_eligible_runner(
+        active_runners_cache=cache,
+        project_id=project_id,
+        task_type="create",
+        accelerator=None,
+        runner_pins_this_cycle={},
+    )
+    assert selected is not None
+    assert selected.id == healthy.id, (
+        "healthy runner must be preferred over degraded runner"
+    )
+
+    # When only the degraded runner is present, it must still be selected
+    # so it can receive a job and reset its failure streak.
+    cache_degraded_only = {project_id: [degraded]}
+    selected_fallback = _select_eligible_runner(
+        active_runners_cache=cache_degraded_only,
+        project_id=project_id,
+        task_type="create",
+        accelerator=None,
+        runner_pins_this_cycle={},
+    )
+    assert selected_fallback is not None
+    assert selected_fallback.id == degraded.id, (
+        "degraded runner must still be selected when it is the only candidate"
+    )
+
+
 # ── Fixture: reset circuit breaker state for a project ───────────────────────
 
 
