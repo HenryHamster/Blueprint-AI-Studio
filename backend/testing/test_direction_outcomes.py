@@ -9115,3 +9115,124 @@ def test_evicted_delta_field_lists_stay_in_sync():
                 f"breakdown['{kind}']['{status}']: aggregate={agg_bd[kind].get(status)!r}, "
                 f"snapshot={val!r} — fold must carry breakdown per kind/status"
             )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ComputeJob spend included in direction cost rollup
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_compute_experiment_spend_included_in_direction_cost_rollup(
+    db_session: AsyncSession,
+):
+    """ComputeJob.final_cost_usd is folded into estimated_cost_usd.
+
+    A compute_experiment task's real spend lives on the ComputeJob ledger
+    while the monitoring task's VM cost is ~$0. Without folding ComputeJob
+    spend, the direction's estimated_cost_usd is silently deflated and the
+    cost-budget auto-pause gate never fires for compute-heavy directions.
+    """
+    from app.models import ComputeJob, ComputeJobStatus
+
+    direction_id = "d-compute-cost"
+    project = await _create_project(db_session, directions=[])
+    research_task = await _make_research_task(db_session, project.id)
+    research_task_id = str(research_task.id)
+
+    project.directions = [_make_direction(direction_id, research_task_id, tasks_created=2)]
+    await db_session.flush()
+
+    # A compute_experiment child task with no VM cost (~$0 vm_runtime_cost_usd).
+    compute_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"direction_id": direction_id},
+        payloads=[{"type": "compute_experiment"}],
+        title="compute-exp",
+    )
+
+    # A regular create child with a small VM cost.
+    regular_child = await _create_child_task(
+        db_session,
+        research_task.id,
+        project.id,
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True, "landed_on_integration": True, "direction_id": direction_id},
+        payloads=[{"type": "create", "scope": "small"}],
+        title="regular-create",
+    )
+
+    # Attach a terminal ComputeJob with final_cost_usd to the compute child.
+    compute_job = ComputeJob(
+        project_id=project.id,
+        task_id=compute_child.id,
+        backend="gcp",
+        status=ComputeJobStatus.SUCCEEDED,
+        final_cost_usd=3.75,
+    )
+    db_session.add(compute_job)
+
+    # Give the regular child a small vm_runtime_cost via attempt_history so
+    # cost_by_provider_model is non-empty from VM costs alone.
+    regular_child.attempt_history = [
+        {
+            "vm_runtime_cost_usd": 0.10,
+            "provider": "anthropic",
+            "model": "claude-sonnet-4-6",
+        }
+    ]
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+
+    entry = project.directions[0]["research_history"][0]
+
+    # estimated_cost_usd must include both VM cost and ComputeJob spend.
+    assert "estimated_cost_usd" in entry
+    assert entry["estimated_cost_usd"] == pytest.approx(3.85, abs=0.001), (
+        f"expected estimated_cost_usd ≈ 3.85 (0.10 vm + 3.75 compute), "
+        f"got {entry['estimated_cost_usd']!r}"
+    )
+
+    # cost_by_provider_model must carry a 'compute|substrate' bucket.
+    cbpm = entry.get("cost_by_provider_model") or {}
+    assert "compute|substrate" in cbpm, (
+        f"cost_by_provider_model missing 'compute|substrate' bucket: {cbpm!r}"
+    )
+    assert cbpm["compute|substrate"] == pytest.approx(3.75, abs=0.001)
+
+    # Non-terminal ComputeJobs (still running) must NOT be counted.
+    from app.models import ComputeJobStatus as CJS
+
+    running_job = ComputeJob(
+        project_id=project.id,
+        task_id=compute_child.id,
+        backend="gcp",
+        status=CJS.RUNNING,
+        final_cost_usd=99.0,  # not yet finalized
+    )
+    db_session.add(running_job)
+    await db_session.flush()
+
+    await _update_direction_research_outcomes(
+        project_id=project.id,
+        direction_id=direction_id,
+        research_task_id=research_task_id,
+        session=db_session,
+    )
+    await db_session.refresh(project)
+    entry2 = project.directions[0]["research_history"][0]
+    # Running job's cost must not be included.
+    assert entry2["estimated_cost_usd"] == pytest.approx(3.85, abs=0.001), (
+        f"running ComputeJob should not inflate estimated_cost_usd, "
+        f"got {entry2['estimated_cost_usd']!r}"
+    )

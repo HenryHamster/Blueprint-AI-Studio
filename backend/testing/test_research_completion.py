@@ -4122,6 +4122,30 @@ class TestRecordResearchTaskFailureScopeEmpty:
         assert called_with == [task.project_id]
         session.get.assert_not_called()
 
+    def test_research_failure_recording_is_idempotent_per_task(self):
+        """Re-running the same failed task must not append duplicate history entries
+        or double-count consecutive_unproductive_cycles."""
+        from app.research_completion import _record_research_task_failure
+
+        task = self._make_task("CODE_ERROR")
+        project = self._make_project(consecutive_unproductive=1)
+
+        # First call — records normally.
+        self._run(project, _record_research_task_failure(task, self._make_session()))
+        direction = project.directions[0]
+        assert len(direction.get("research_history", [])) == 1
+        assert direction.get("consecutive_unproductive_cycles") == 2
+
+        # Second call with same task — must be a no-op.
+        self._run(project, _record_research_task_failure(task, self._make_session()))
+        direction = project.directions[0]
+        assert len(direction.get("research_history", [])) == 1, (
+            "Duplicate history entry appended on replay"
+        )
+        assert direction.get("consecutive_unproductive_cycles") == 2, (
+            "consecutive_unproductive_cycles double-counted on replay"
+        )
+
 
 class TestTrimFindingForMemo:
     """_trim_finding_for_memo: bounds a dropped finding for memo embedding."""

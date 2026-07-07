@@ -1826,6 +1826,7 @@ async def update_agent_status(
                             # into task.context; pass them through so quota-exhausted accounts get
                             # the flat 24h cooldown and server-provided retry hints are honored.
                             _rl_ctx = task.context or {}
+                            _rl_task_type = (task.first_payload or {}).get("type") or None
                             await disable_account_model(
                                 acct_id,
                                 model,
@@ -1833,6 +1834,7 @@ async def update_agent_status(
                                     "rate_limit_retry_after_seconds"
                                 ),
                                 kind=_rl_ctx.get("rate_limit_kind") or "rate_limit",
+                                task_type=_rl_task_type,
                             )
                         # EXTERNAL_API: don't disable account (transient outage)
 
@@ -3098,7 +3100,8 @@ async def update_agent_status(
                     _acct_id_outcome = get_task_llm_account_id(task)
                     if _acct_id_outcome:
                         try:
-                            await record_task_outcome(_acct_id_outcome, success=False)
+                            _task_type_outcome = (task.first_payload or {}).get("type") or None
+                            await record_task_outcome(_acct_id_outcome, success=False, task_type=_task_type_outcome)
                         except Exception as _outcome_err:
                             logger.warning(
                                 f"[AGENT_STATUS] record_task_outcome failed for {_acct_id_outcome}: {_outcome_err}"

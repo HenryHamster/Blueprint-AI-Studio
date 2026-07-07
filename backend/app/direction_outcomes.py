@@ -45,6 +45,8 @@ from app.landed_signal import (
 from app.models import (
     Artifact,
     ArtifactType,
+    ComputeJob,
+    ComputeJobStatus,
     Project,
     Task,
     TaskStatus,
@@ -1418,6 +1420,34 @@ async def _update_direction_research_outcomes(
                 cost_by_provider_model.get(bucket_key, 0.0) + t_cost
             )
             cycle_cost_total += t_cost
+
+    # Include ComputeJob.final_cost_usd for compute_experiment tasks. These tasks
+    # run on compute substrate rather than a VM, so their real spend lives on the
+    # ComputeJob ledger while the monitoring task's vm_runtime_cost is ~$0. Without
+    # this the direction's estimated_cost_usd is silently deflated, causing the
+    # cost-budget auto-pause gate to never fire on compute-heavy directions.
+    _child_ids = [ct.id for ct in child_tasks_rows]
+    if _child_ids:
+        _compute_terminal_statuses = {
+            ComputeJobStatus.SUCCEEDED,
+            ComputeJobStatus.FAILED,
+            ComputeJobStatus.CANCELLED,
+            ComputeJobStatus.TIMED_OUT,
+        }
+        _cj_stmt = select(ComputeJob.final_cost_usd).where(
+            ComputeJob.task_id.in_(_child_ids),
+            ComputeJob.final_cost_usd.is_not(None),
+            ComputeJob.status.in_(_compute_terminal_statuses),
+        )
+        _cj_rows = (await session.execute(_cj_stmt)).scalars().all()
+        for _cj_cost in _cj_rows:
+            _cost = float(_cj_cost)
+            if _cost > 0:
+                cost_by_provider_model["compute|substrate"] = (
+                    cost_by_provider_model.get("compute|substrate", 0.0) + _cost
+                )
+                cycle_cost_total += _cost
+
     if cost_by_provider_model:
         entry["cost_by_provider_model"] = {
             k: round(v, 4) for k, v in cost_by_provider_model.items()

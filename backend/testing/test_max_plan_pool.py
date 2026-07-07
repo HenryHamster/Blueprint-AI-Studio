@@ -20,6 +20,7 @@ from app.max_plan_pool import (
     _HEALTH_SCORE_DISQUALIFY_THRESHOLD,
     _HEALTH_WINDOW_SECONDS,
     _LATENCY_MIN_SAMPLES,
+    _OUTCOME_EVENTS_CAP,
     _OUTCOME_WINDOW_SECONDS,
     _QUARANTINE_COOLDOWN_SECONDS,
     _QUOTA_EXHAUSTED_COOLDOWN_SECONDS,
@@ -3104,3 +3105,58 @@ class TestGetTaskLlmAccountId:
 
         task = Task(project_id=uuid.uuid4(), llm_account_id=None, context={})
         assert get_task_llm_account_id(task) is None
+
+
+# ── typed success-rate failure outcomes + cardinality cap ────────────────────
+
+
+class TestTypedSuccessRateFailureOutcomes:
+    """Failure outcome_events must carry task_type so typed rates include them.
+    The event list must also be capped at _OUTCOME_EVENTS_CAP entries."""
+
+    async def test_typed_success_rate_includes_failure_outcomes_and_caps_events(self):
+        """record_task_outcome and disable_account_model persist task_type on failure
+        events so _compute_success_rate_7d_for_type counts them.  The list is also
+        capped at _OUTCOME_EVENTS_CAP to bound JSONB size."""
+        acct_id = "a"
+        acct = _acct(id=acct_id)
+        _account_by_id[acct_id] = acct
+
+        now = _utcnow()
+
+        # Seed 3 successful "create" events directly.
+        acct["outcome_events"] = [
+            {"at": now - timedelta(hours=i + 1), "success": True, "task_type": "create"}
+            for i in range(3)
+        ]
+
+        # Record a CODE_ERROR failure for "create" via record_task_outcome.
+        from app.max_plan_pool import record_task_outcome
+
+        await record_task_outcome(acct_id, success=False, task_type="create")
+
+        # The failure must appear in the typed rate (3 success + 1 fail = 0.75).
+        rate = _compute_success_rate_7d_for_type(acct, "create", now=_utcnow())
+        assert rate is not None, "failure without task_type is invisible to typed rate"
+        assert rate == 3 / 4
+
+        # Record a rate-limit failure via disable_account_model with task_type.
+        with patch("app.max_plan_pool._persist_rate_limit_state"):
+            await disable_account_model(acct_id, OPUS, kind="rate_limit", task_type="create")
+
+        # Now 3 success + 2 failures = 0.6.
+        rate2 = _compute_success_rate_7d_for_type(acct, "create", now=_utcnow())
+        assert rate2 is not None
+        assert rate2 == 3 / 5
+
+        # Cardinality cap: flood beyond _OUTCOME_EVENTS_CAP.
+        acct["outcome_events"] = [
+            {"at": now - timedelta(minutes=i), "success": True, "task_type": "create"}
+            for i in range(_OUTCOME_EVENTS_CAP + 50)
+        ]
+        # The serialization path must cap the blob at _OUTCOME_EVENTS_CAP entries.
+        from app.max_plan_pool import _build_rate_limit_state_blob
+
+        blob = _build_rate_limit_state_blob(acct)
+        assert blob is not None
+        assert len(blob.get("outcome_events", [])) <= _OUTCOME_EVENTS_CAP
