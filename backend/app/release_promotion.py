@@ -2071,6 +2071,29 @@ async def _record_promotion_success(
             exc,
         )
 
+    # Best-effort: auto-supersede still-open, non-bug-class operator messages that
+    # belong to versions now at least two releases behind the freshly-opened one.
+    # Runs in its OWN session (the promotion's own writes ride the caller's later
+    # commit and are not yet durable) and can NEVER abort the promotion — mode-
+    # gated, default observe. Mirrors the lane-baseline / staged-activation blocks.
+    try:
+        from app.message_supersession import run_supersession_on_version_close
+
+        await run_supersession_on_version_close(
+            project_id=version.project_id,
+            closed_version_number=version.version_number,
+            closed_version_opened_at=version.opened_at,
+            terminal_status="promoted",
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — supersession must not abort promotion
+        logger.warning(
+            "[RELEASE_QUALIFIER] message supersession failed after v%d "
+            "promotion (non-fatal): %s",
+            version.version_number,
+            exc,
+        )
+
     return {
         "status": "promoted",
         "promoted_sha": effective_sha,

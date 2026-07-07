@@ -1748,4 +1748,26 @@ async def abandon_current_version(
             exc,
         )
 
+    # Best-effort: auto-supersede still-open, non-bug-class operator messages that
+    # belong to versions now at least two releases behind the freshly-opened one.
+    # Runs in its OWN session and can NEVER abort the cut — mode-gated, default
+    # observe. Mirrors the lane-baseline / staged-activation best-effort blocks.
+    try:
+        from app.message_supersession import run_supersession_on_version_close
+
+        await run_supersession_on_version_close(
+            project_id=project_id,
+            closed_version_number=locked.version_number,
+            closed_version_opened_at=locked.opened_at,
+            terminal_status="abandoned",
+            now=now,
+        )
+    except Exception as exc:  # noqa: BLE001 — supersession must not abort the cut
+        logger.warning(
+            "[RELEASE_VERSION] abandon: message supersession failed after v%d "
+            "cut (non-fatal): %s",
+            locked.version_number,
+            exc,
+        )
+
     return locked, next_version

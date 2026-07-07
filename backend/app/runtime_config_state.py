@@ -216,6 +216,36 @@ runtime_config: Dict = {
     "metrics_integrity_sweep_window_days": int(
         os.getenv("METRICS_INTEGRITY_SWEEP_WINDOW_DAYS", "14")
     ),
+    # --- Message supersession lane (auto-resolve stale operator messages) ---
+    # When a release version reaches a terminal state (promoted/abandoned), the
+    # promotion/abandon path auto-resolves still-open, non-bug-class operator
+    # messages that were created strictly before the closing version's window
+    # (i.e. from a version at least min_versions_back back) AND older than
+    # min_age_days. Mode mirrors metrics_integrity_sweep_mode exactly:
+    #   off     — never supersede.
+    #   observe — measure the would-be resolutions + log, mutate nothing (default).
+    #   enforce — stamp the eligible messages resolved.
+    # Unresolved BUG_REPORT/BLOCKER messages are ALWAYS left open (a bug does not
+    # become fixed just because a version promoted).
+    "message_supersession_mode": os.getenv(
+        "MESSAGE_SUPERSESSION_MODE", "observe"
+    ).lower()
+    if os.getenv("MESSAGE_SUPERSESSION_MODE", "observe").lower()
+    in ("off", "observe", "enforce")
+    else "observe",
+    # A message must be at least this many days old to be superseded (safety margin).
+    "message_supersession_min_age_days": int(
+        os.getenv("MESSAGE_SUPERSESSION_MIN_AGE_DAYS", "14")
+    ),
+    # A message must belong to a version at least this many versions behind the
+    # current open version (2 => never touch the current or immediately-prior one).
+    "message_supersession_min_versions_back": int(
+        os.getenv("MESSAGE_SUPERSESSION_MIN_VERSIONS_BACK", "2")
+    ),
+    # Upper bound on messages resolved per version close (runaway-batch backstop).
+    "message_supersession_max_resolve": int(
+        os.getenv("MESSAGE_SUPERSESSION_MAX_RESOLVE", "500")
+    ),
     # --- Completion-debt pressure signal graduation gate ---
     # Operator-facing graduation knob for blending the qualification debt-pressure
     # signal into the promotion composite (release_qualifier._load_policy →
@@ -1223,6 +1253,9 @@ _DORMANT_MODE_KNOBS = {
     "metrics_integrity_sweep_mode": (
         "Metrics-integrity sweep recomputing counters but not enrolling drift findings"
     ),
+    "message_supersession_mode": (
+        "Message supersession measuring stale-message backlog but not resolving them"
+    ),
     "autonomous_spawn_budget_mode": (
         "Autonomous spawn-budget mode observe-only pending dedicated rollout"
     ),
@@ -1971,6 +2004,30 @@ async def sync_runtime_config_from_state(state) -> list[str]:
                             _mi_val = int(config_json[_mi_int_key])
                             if _mi_val > 0:
                                 _set(_mi_int_key, _mi_val)
+                        except (TypeError, ValueError):
+                            pass
+                # Message supersession: mode + bounded numeric margins. Persisted
+                # so an operator enable/tune survives a Cloud Run restart and
+                # reaches the leader across instances (mirrors the metrics-integrity
+                # sweep knobs above).
+                if "message_supersession_mode" in config_json:
+                    raw_mode = (
+                        str(config_json["message_supersession_mode"] or "")
+                        .strip()
+                        .lower()
+                    )
+                    if raw_mode in ("off", "observe", "enforce"):
+                        _set("message_supersession_mode", raw_mode)
+                for _ms_int_key in (
+                    "message_supersession_min_age_days",
+                    "message_supersession_min_versions_back",
+                    "message_supersession_max_resolve",
+                ):
+                    if _ms_int_key in config_json:
+                        try:
+                            _ms_val = int(config_json[_ms_int_key])
+                            if _ms_val > 0:
+                                _set(_ms_int_key, _ms_val)
                         except (TypeError, ValueError):
                             pass
                 # Resident strategic session (dead-man's-switch safety + resident
