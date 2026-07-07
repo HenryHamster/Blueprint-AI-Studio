@@ -157,7 +157,8 @@ interface ActiveTurn {
 }
 
 /**
- * Start a resident Claude session. Requires the Claude provider (anthropic/zai);
+ * Start a resident Claude session. Requires a Claude-compatible provider
+ * (anthropic/zai/deepseek);
  * throws for codex/gemini, whose CLIs do not expose the bidirectional stream-json
  * input mode this depends on.
  */
@@ -176,7 +177,7 @@ export function startResidentClaudeSession(opts: ResidentSessionOptions = {}): R
   const base = runner.buildRunCommand('', opts.model, opts.effort, opts.disallowedTools);
   if (base.outputMode !== 'claude-stream-json') {
     throw new Error(
-      `resident session requires the Claude provider (anthropic/zai); got ${runner.provider}/${base.outputMode}`,
+      `resident session requires a Claude-compatible provider (anthropic/zai/deepseek); got ${runner.provider}/${base.outputMode}`,
     );
   }
   // Clone the one-shot args and append bidirectional streaming input. The one-shot

@@ -1476,6 +1476,42 @@ async def test_llm_cost_prices_cache_classes_separately(db_session):
     assert row["total_cost_usd"] == pytest.approx(expected)
 
 
+def test_llm_cost_prices_non_anthropic_cache_subcounts_at_base_rate():
+    input_rate, output_rate = LLM_TOKEN_PRICING[("deepseek", "deepseek-v4-flash")]
+    task = make_task(
+        status=TaskStatus.COMPLETED,
+        context={"pr_merged": True},
+        api_call_summary={
+            "llm_call_count": 1,
+            "total_input_tokens": 1000,
+            "total_output_tokens": 400,
+            "total_cache_creation_input_tokens": 200,
+            "total_cache_read_input_tokens": 300,
+        },
+        provider="deepseek",
+        model="deepseek-v4-flash",
+    )
+
+    expected = round(1000 * input_rate + 400 * output_rate, 6)
+    anthropic_cache_math = round(
+        500 * input_rate
+        + 200 * input_rate * CACHE_CREATION_INPUT_RATE_MULTIPLIER
+        + 300 * input_rate * CACHE_READ_INPUT_RATE_MULTIPLIER
+        + 400 * output_rate,
+        6,
+    )
+
+    breakdown = compute_llm_cost_breakdown([task])
+    totals = breakdown["totals"]
+    row = breakdown["by_model"][0]
+
+    assert totals["total_cache_creation_input_tokens"] == 200
+    assert totals["total_cache_read_input_tokens"] == 300
+    assert totals["total_cost_usd"] == pytest.approx(expected)
+    assert row["total_cost_usd"] == pytest.approx(expected)
+    assert totals["total_cost_usd"] != pytest.approx(anthropic_cache_math)
+
+
 @pytest.mark.asyncio
 async def test_llm_cost_without_cache_breakdown_falls_back_to_base_rate(db_session):
     """A row WITHOUT the cache breakdown prices the full inclusive input at the

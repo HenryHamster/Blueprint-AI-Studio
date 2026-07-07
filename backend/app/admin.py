@@ -25,8 +25,11 @@ from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.orm import load_only
 
 from app.database import get_session, resolve_async_engine, resolve_dialect_name
-from app.direct_llm_client import get_anthropic_api_key
-from app.inline_llm import call_inline_llm_json, resolve_inline_llm_settings
+from app.inline_llm import (
+    call_inline_llm_json,
+    inline_llm_unavailable_reason,
+    resolve_inline_llm_settings,
+)
 from app.shared_state import (
     derive_task_branch as _derive_task_branch,
     backfill_branch_columns,
@@ -2746,13 +2749,12 @@ def _coerce_draft(raw: dict) -> ComputeExperimentDraft:
 
 
 async def _call_draft_llm(
-    api_key: str,
     idea: str,
     github_repo: str | None,
     base_branch: str | None,
     prior_draft: dict | None = None,
 ) -> dict | None:
-    """Call Anthropic to produce a draft compute-experiment contract. Returns dict or None."""
+    """Call inline LLM to produce a draft compute-experiment contract. Returns dict or None."""
     context_parts = [f"Research idea: {idea}"]
     if github_repo:
         context_parts.append(f"Repository: {github_repo}")
@@ -2788,7 +2790,7 @@ async def compute_experiment_draft(
     """Return a structured draft compute-experiment launch contract from a plain-language idea.
 
     Pure read-only: does NOT persist anything, does NOT launch a task or compute job.
-    Calls Anthropic to produce the draft; degrades gracefully when the key is absent or the call fails.
+    Calls the configured inline LLM to produce the draft; degrades gracefully when the key is absent or the call fails.
     """
     if os.environ.get(_DISABLE_DRAFT_LLM_ENV, "").strip() == "1":
         return ComputeExperimentDraft(
@@ -2796,19 +2798,24 @@ async def compute_experiment_draft(
             notes="Draft LLM is disabled via environment configuration.",
         )
 
-    api_key = get_anthropic_api_key()
-    if not api_key:
-        return ComputeExperimentDraft(
-            draft_available=False,
-            notes="Draft generation is unavailable: ANTHROPIC_API_KEY is not configured.",
-        )
     if resolve_inline_llm_settings("compute_draft").disabled:
         return ComputeExperimentDraft(
             draft_available=False,
             notes="Draft LLM is disabled via environment configuration.",
         )
+    unavailable = inline_llm_unavailable_reason("compute_draft")
+    if unavailable:
+        return ComputeExperimentDraft(
+            draft_available=False,
+            notes=f"Draft generation is unavailable: {unavailable}.",
+        )
 
-    raw = await _call_draft_llm(api_key, payload.idea, payload.github_repo, payload.base_branch, payload.prior_draft)
+    raw = await _call_draft_llm(
+        payload.idea,
+        payload.github_repo,
+        payload.base_branch,
+        prior_draft=payload.prior_draft,
+    )
     if raw is None:
         return ComputeExperimentDraft(
             draft_available=False,

@@ -1,11 +1,13 @@
-"""Direct Anthropic API call helpers shared across admin, knowledge_completion, and review_learning.
+"""Direct Anthropic-compatible API call helpers shared across backend inline LLM users.
 
 Each call site manages its own disable-env checks, api-key availability checks,
 retry-on-parse-error logic, and caller-specific fallback semantics. This module
 centralises the three pieces that are byte-for-byte identical across all three
 sites: the hardcoded model constant, ANTHROPIC_API_KEY env reading, and
-AsyncAnthropic client construction + messages.create invocation.
+AsyncAnthropic client construction + messages.create invocation. ``base_url``
+lets callers target Anthropic-compatible providers such as DeepSeek.
 """
+
 from __future__ import annotations
 
 import os
@@ -28,6 +30,7 @@ async def call_direct_llm(
     timeout: float,
     model: str = DIRECT_LLM_MODEL,
     system: str | None = None,
+    base_url: str | None = None,
 ) -> str:
     """Construct an AsyncAnthropic client and make one messages.create call.
 
@@ -37,7 +40,10 @@ async def call_direct_llm(
     """
     import anthropic as _anthropic  # noqa: PLC0415 — lazy so module is importable without anthropic installed
 
-    client = _anthropic.AsyncAnthropic(api_key=api_key)
+    client_kwargs = {"api_key": api_key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    client = _anthropic.AsyncAnthropic(**client_kwargs)
     kwargs: dict = dict(
         model=model,
         max_tokens=max_tokens,
@@ -47,4 +53,9 @@ async def call_direct_llm(
     if system is not None:
         kwargs["system"] = system
     resp = await client.messages.create(**kwargs)
-    return resp.content[0].text.strip()
+    text_parts: list[str] = []
+    for block in resp.content:
+        text = getattr(block, "text", None)
+        if isinstance(text, str) and text:
+            text_parts.append(text)
+    return "\n".join(text_parts).strip()

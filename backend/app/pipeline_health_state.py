@@ -412,6 +412,8 @@ external_health: Dict = {
     "anthropic_api": True,
     "openai_api": True,
     "gemini_api": True,
+    "zai_api": True,
+    "deepseek_api": True,
     "dispatch_api": True,
     "gcp": True,
     "db": True,

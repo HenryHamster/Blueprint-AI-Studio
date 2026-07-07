@@ -70,7 +70,7 @@ function MergeGradeGateSettings() {
   );
 }
 
-const EXTERNAL_DEP_ORDER = ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'zai_api', 'openai_api', 'gemini_api', 'gcp'] as const;
+const EXTERNAL_DEP_ORDER = ['github_api', 'db', 'dispatch_api', 'anthropic_api', 'zai_api', 'deepseek_api', 'openai_api', 'gemini_api', 'gcp'] as const;
 
 const EXTERNAL_DEP_LABELS: Record<string, string> = {
   github_api: 'GitHub',
@@ -78,6 +78,7 @@ const EXTERNAL_DEP_LABELS: Record<string, string> = {
   dispatch_api: 'Dispatch',
   anthropic_api: 'Anthropic',
   zai_api: 'Z.AI',
+  deepseek_api: 'DeepSeek',
   openai_api: 'OpenAI',
   gemini_api: 'Gemini',
   gcp: 'GCP',

@@ -434,6 +434,11 @@ runtime_config: Dict = {
             "sonnet": "glm-5.2",
             "haiku": "glm-5.2",
         },
+        "deepseek": {
+            "opus": "deepseek-v4-pro",
+            "sonnet": "deepseek-v4-pro",
+            "haiku": "deepseek-v4-flash",
+        },
     },
     # Task-type categories group related types so one routing entry covers
     # the whole group. Every task type listed here falls under the matching
@@ -450,7 +455,7 @@ runtime_config: Dict = {
     # concrete settings bag (including model).
     "category_routing": {
         "_default": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["zai", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "strategic": {
@@ -458,7 +463,7 @@ runtime_config: Dict = {
             "effort": "max",
         },
         "build": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["zai", "anthropic", "openai", "gemini"],
             "effort": "medium",
         },
         "review": {
@@ -466,7 +471,7 @@ runtime_config: Dict = {
             "effort": "high",
         },
         "ops": {
-            "providers": ["anthropic", "zai", "openai", "gemini"],
+            "providers": ["deepseek", "anthropic", "zai", "openai", "gemini"],
             "effort": "low",
         },
     },
@@ -485,7 +490,7 @@ runtime_config: Dict = {
     #   "preferred" — strict ordering; try each provider in list order, only
     #                 fall through when the earlier provider has no capacity.
     #   "exclusive" — first listed provider only; never fall back cross-provider.
-    "provider_selection_mode": "balanced",
+    "provider_selection_mode": "preferred",
     # Deploy-level identity: the ``"owner/repo"`` of the GitHub repo THIS
     # deployment was built from. Determines which project's Cloud Run serving
     # signals (backend_revision / agent_image artifact providers) and live
@@ -507,6 +512,7 @@ runtime_config: Dict = {
         "openai": {},
         "gemini": {},
         "zai": {},
+        "deepseek": {},
     },
     # Per-provider effort matrix. Each cell is a settings bag (validated by
     # the provider's settings_schema) and typically pins a model + the
@@ -567,6 +573,12 @@ runtime_config: Dict = {
             "medium": {"model": "glm-5.2", "effort": "medium"},
             "high": {"model": "glm-5.2", "effort": "high"},
             "max": {"model": "glm-5.2", "effort": "max"},
+        },
+        "deepseek": {
+            "low": {"model": "deepseek-v4-flash", "effort": "low"},
+            "medium": {"model": "deepseek-v4-pro", "effort": "medium"},
+            "high": {"model": "deepseek-v4-pro", "effort": "high"},
+            "max": {"model": "deepseek-v4-pro", "effort": "max"},
         },
     },
     "inline_llm": {},
@@ -1388,6 +1400,115 @@ SCOPE_AWARE_RETRY_BUDGETS: Dict[str, Dict[str, int]] = {
 }
 
 
+def _copy_default_provider_matrix(provider: str) -> dict[str, dict[str, Any]]:
+    raw = runtime_config.get("provider_settings_by_effort", {}).get(provider, {})
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        str(level): dict(bag)
+        for level, bag in raw.items()
+        if isinstance(level, str) and isinstance(bag, dict)
+    }
+
+
+def _insert_provider_once(providers: list[Any], provider: str, index: int) -> None:
+    if provider in providers:
+        return
+    providers.insert(max(0, min(index, len(providers))), provider)
+
+
+def _insert_provider_after(
+    providers: list[Any], provider: str, after_provider: str
+) -> None:
+    if provider in providers:
+        return
+    try:
+        index = providers.index(after_provider) + 1
+    except ValueError:
+        index = len(providers)
+    providers.insert(index, provider)
+
+
+def _ensure_route_defaults(
+    category_routing: dict[str, Any], category: str
+) -> dict[str, Any]:
+    entry = category_routing.get(category)
+    if not isinstance(entry, dict):
+        default_entry = runtime_config["category_routing"].get(category) or {}
+        entry = {
+            "providers": list(default_entry.get("providers") or []),
+            "effort": default_entry.get("effort") or "medium",
+        }
+        category_routing[category] = entry
+    providers = entry.get("providers")
+    if not isinstance(providers, list) or not providers:
+        default_entry = runtime_config["category_routing"].get(category) or {}
+        entry["providers"] = list(default_entry.get("providers") or [])
+    if not isinstance(entry.get("effort"), str) or not entry.get("effort"):
+        default_entry = runtime_config["category_routing"].get(category) or {}
+        entry["effort"] = default_entry.get("effort") or "medium"
+    return entry
+
+
+def _backfill_provider_runtime_defaults(config: Dict[str, Any]) -> None:
+    """Add provider defaults introduced after the settings-bag migration.
+
+    This is intentionally additive. Existing provider order is preserved unless
+    a new provider is absent, so a future operator patch does not fight this
+    backfill on every DB->memory sync.
+    """
+    tier_map = config.setdefault("provider_tier_model_map", {})
+    if isinstance(tier_map, dict):
+        for provider in ("zai", "deepseek"):
+            defaults = runtime_config.get("provider_tier_model_map", {}).get(provider)
+            if not isinstance(defaults, dict):
+                continue
+            target = tier_map.setdefault(provider, {})
+            if isinstance(target, dict):
+                for tier, model in defaults.items():
+                    target.setdefault(tier, model)
+
+    defaults_map = config.setdefault("provider_settings_defaults", {})
+    if isinstance(defaults_map, dict):
+        for provider in ("zai", "deepseek"):
+            defaults_map.setdefault(provider, {})
+
+    effort_matrix = config.setdefault("provider_settings_by_effort", {})
+    if isinstance(effort_matrix, dict):
+        for provider in ("zai", "deepseek"):
+            defaults = _copy_default_provider_matrix(provider)
+            target = effort_matrix.setdefault(provider, {})
+            if not isinstance(target, dict):
+                effort_matrix[provider] = defaults
+                continue
+            for effort, bag in defaults.items():
+                target.setdefault(effort, dict(bag))
+
+    category_routing = config.setdefault("category_routing", {})
+    if isinstance(category_routing, dict):
+        for category in ("_default", "strategic", "build", "review", "ops"):
+            route = _ensure_route_defaults(category_routing, category)
+            providers = route.get("providers")
+            if not isinstance(providers, list):
+                continue
+            if len(providers) <= 1:
+                continue
+            if category in ("_default", "build"):
+                _insert_provider_once(providers, "zai", 0)
+            elif category == "ops":
+                _insert_provider_once(providers, "deepseek", 0)
+                _insert_provider_after(providers, "zai", "anthropic")
+            elif category in ("strategic", "review"):
+                _insert_provider_after(providers, "zai", "anthropic")
+
+    if config.get("provider_selection_mode") not in (
+        "balanced",
+        "preferred",
+        "exclusive",
+    ):
+        config["provider_selection_mode"] = runtime_config["provider_selection_mode"]
+
+
 def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
     """Translate legacy routing/effort keys to the unified shape in-place.
 
@@ -1402,6 +1523,16 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     No-op when new keys are already present. Safe to call on every sync.
     """
+    had_unified_provider_config = any(
+        key in config
+        for key in (
+            "category_routing",
+            "task_type_routing",
+            "provider_settings_by_effort",
+            "provider_settings_defaults",
+        )
+    )
+
     # Step 1: collapse preferences + profiles into category_routing.
     if "category_routing" not in config:
         legacy_pref = config.get("provider_preference_by_category") or {}
@@ -1437,7 +1568,7 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if "_default" not in cat_routing:
             default_providers = (
                 legacy_pref.get("_default") if isinstance(legacy_pref, dict) else None
-            ) or ["anthropic", "zai", "openai", "gemini"]
+            ) or ["zai", "anthropic", "openai", "gemini"]
             cat_routing["_default"] = {
                 "providers": list(default_providers),
                 "effort": default_effort,
@@ -1478,6 +1609,9 @@ def _migrate_legacy_provider_config(config: Dict[str, Any]) -> Dict[str, Any]:
                     matrix.setdefault(provider, {})[level] = dict(bag)
             if matrix:
                 config["provider_settings_by_effort"] = matrix
+
+    if had_unified_provider_config:
+        _backfill_provider_runtime_defaults(config)
 
     return config
 

@@ -99,6 +99,7 @@ class ZaiProvider(LLMProvider):
         return SecretMaterial(
             env={
                 "ZAI_API_KEY": key,
+                "ZAI_ANTHROPIC_BASE_URL": _anthropic_base_url(provider_metadata),
                 "ANTHROPIC_API_KEY": key,
                 "ANTHROPIC_AUTH_TOKEN": key,
                 "ANTHROPIC_BASE_URL": _anthropic_base_url(provider_metadata),

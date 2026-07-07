@@ -136,6 +136,9 @@ beforeEach(() => {
   delete process.env.ZAI_API_KEY;
   delete process.env.ZAI_ANTHROPIC_BASE_URL;
   delete process.env.ZAI_BASE_URL;
+  delete process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_ANTHROPIC_BASE_URL;
+  delete process.env.DEEPSEEK_BASE_URL;
   delete process.env.OPENAI_API_KEY;
   delete process.env.CODEX_API_KEY;
   delete process.env.CODEX_HOME;
@@ -438,16 +441,20 @@ describe('sanitize', () => {
     expect(sanitize('AGENT_SECRET_TOKEN=abc')).toBe('AGENT_SECRET_TOKEN=abc');
   });
 
-  it('redacts provider API key env vars (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
+  it('redacts provider API key env vars (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN, OPENAI_API_KEY, GEMINI_API_KEY, ZAI_API_KEY, DEEPSEEK_API_KEY, CLAUDE_CODE_OAUTH_TOKEN)', () => {
     expect(sanitize('ANTHROPIC_API_KEY=sk-ant-api03-secretkey123')).toBe('ANTHROPIC_API_KEY=***');
     expect(sanitize('ANTHROPIC_AUTH_TOKEN=plain-zai-token')).toBe('ANTHROPIC_AUTH_TOKEN=***');
     expect(sanitize('OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123')).toBe('OPENAI_API_KEY=***');
     expect(sanitize('GEMINI_API_KEY=AIzaSyabcdefghijklmnop')).toBe('GEMINI_API_KEY=***');
     expect(sanitize('ZAI_API_KEY=plain-zai-token')).toBe('ZAI_API_KEY=***');
     expect(sanitize('ZAI_API_KEY="plain-zai-token"')).toBe('ZAI_API_KEY=***');
+    expect(sanitize('DEEPSEEK_API_KEY=plain-deepseek-token')).toBe('DEEPSEEK_API_KEY=***');
+    expect(sanitize('DEEPSEEK_API_KEY="plain-deepseek-token"')).toBe('DEEPSEEK_API_KEY=***');
     const zaiJsonOut = sanitize('{"ZAI_API_KEY":"plain-zai-token","ANTHROPIC_AUTH_TOKEN":"anthropic-secret-token"}');
     expect(zaiJsonOut).not.toContain('plain-zai-token');
     expect(zaiJsonOut).not.toContain('anthropic-secret-token');
+    const deepseekJsonOut = sanitize('{"DEEPSEEK_API_KEY":"plain-deepseek-token"}');
+    expect(deepseekJsonOut).not.toContain('plain-deepseek-token');
     // CLAUDE_CODE_OAUTH_TOKEN: the oauth_token sub-pattern fires first, normalising the suffix to lowercase
     const oauthOut = sanitize('CLAUDE_CODE_OAUTH_TOKEN=some-long-oauth-token-value-here');
     expect(oauthOut).toContain('***');
@@ -1619,6 +1626,10 @@ describe('matchesRateLimit', () => {
     expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'zai', 'api_key')).toBe(true);
   });
 
+  it('detects DeepSeek API-key rate limits when provider/auth are supplied', () => {
+    expect(matchesRateLimit('Too many requests: rate_limit exceeded', 'deepseek', 'api_key')).toBe(true);
+  });
+
   it('detects Gemini API-key quota metric bodies', () => {
     const msg = "Quota exceeded for quota metric 'GenerateRequests'. Please retry in 39.8s.";
     expect(matchesRateLimit(msg, 'gemini', 'api_key')).toBe(true);
@@ -1733,6 +1744,10 @@ describe('matchesAuthFailure', () => {
 
   it('detects Z.AI invalid-key failures for the zai provider', () => {
     expect(matchesAuthFailure('invalid z.ai api key', 'zai')).toBe(true);
+  });
+
+  it('detects DeepSeek invalid-key failures for the deepseek provider', () => {
+    expect(matchesAuthFailure('invalid deepseek api key', 'deepseek')).toBe(true);
   });
 
   it('does not classify a rate-limit body as an auth failure', () => {
@@ -1937,6 +1952,93 @@ describe('provider runner prompt transport', () => {
     expect(command.env.ANTHROPIC_AUTH_TOKEN).toBe('zai-test-key');
     expect(command.env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
     expect(runner.missingCredentials()).toEqual([]);
+  });
+
+  it('does not reuse a generic Anthropic key for Z.AI', () => {
+    process.env.PROVIDER = 'zai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'glm-5.2', 'high');
+
+    expect(runner.missingCredentials()).toEqual(['ZAI_API_KEY']);
+    expect(command.env.ZAI_API_KEY).toBeUndefined();
+    expect(command.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(command.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://api.z.ai/api/anthropic');
+  });
+
+  it('prefers provider-specific Z.AI base URL over stale generic Anthropic base URL', () => {
+    process.env.PROVIDER = 'zai';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.ZAI_API_KEY = 'zai-test-key';
+    process.env.ZAI_ANTHROPIC_BASE_URL = 'https://proxy.test/zai/';
+    process.env.ANTHROPIC_BASE_URL = 'https://stale.test/anthropic/';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'glm-5.2', 'high');
+
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://proxy.test/zai');
+  });
+
+  it('uses Claude Code with the Anthropic-compatible endpoint for DeepSeek', () => {
+    process.env.PROVIDER = 'deepseek';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'deepseek-v4-flash', 'low');
+
+    expect(runner.provider).toBe('deepseek');
+    expect(runner.authMode).toBe('api_key');
+    expect(providerSupportsNativeSubagents('deepseek')).toBe(true);
+    expect(command.command).toBe('claude');
+    expect(command.outputMode).toBe('claude-stream-json');
+    expect(command.promptInput).toBe('stdin-file');
+    expect(command.displayName).toBe('DeepSeek (Claude compat)');
+    expect(command.args).toContain('--model');
+    expect(command.args).toContain('deepseek-v4-flash');
+    expect(command.args).toContain('--effort');
+    expect(command.args).toContain('low');
+    expect(command.env.DEEPSEEK_API_KEY).toBe('deepseek-test-key');
+    expect(command.env.ANTHROPIC_API_KEY).toBe('deepseek-test-key');
+    expect(command.env.ANTHROPIC_AUTH_TOKEN).toBe('deepseek-test-key');
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
+    expect(runner.missingCredentials()).toEqual([]);
+  });
+
+  it('does not reuse a generic Anthropic key for DeepSeek', () => {
+    process.env.PROVIDER = 'deepseek';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.ANTHROPIC_API_KEY = 'anthropic-test-key';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'deepseek-v4-flash', 'low');
+
+    expect(runner.missingCredentials()).toEqual(['DEEPSEEK_API_KEY']);
+    expect(command.env.DEEPSEEK_API_KEY).toBeUndefined();
+    expect(command.env.ANTHROPIC_API_KEY).toBeUndefined();
+    expect(command.env.ANTHROPIC_AUTH_TOKEN).toBeUndefined();
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic');
+  });
+
+  it('prefers provider-specific DeepSeek base URL over stale generic Anthropic base URL', () => {
+    process.env.PROVIDER = 'deepseek';
+    process.env.AUTH_MODE = 'oauth';
+    process.env.DEEPSEEK_API_KEY = 'deepseek-test-key';
+    process.env.DEEPSEEK_ANTHROPIC_BASE_URL = 'https://proxy.test/deepseek/';
+    process.env.ANTHROPIC_BASE_URL = 'https://stale.test/anthropic/';
+    refreshRuntimeState();
+
+    const runner = getProviderRunner();
+    const command = runner.buildRunCommand('prompt body', 'deepseek-v4-flash', 'low');
+
+    expect(command.env.ANTHROPIC_BASE_URL).toBe('https://proxy.test/deepseek');
   });
 });
 

@@ -26,8 +26,8 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert "create" in body["task_type_categories"]["build"]
     # _default routing is the global allow-list + effort fallback.
     assert body["category_routing"]["_default"]["providers"] == [
-        "anthropic",
         "zai",
+        "anthropic",
         "openai",
         "gemini",
     ]
@@ -45,6 +45,9 @@ async def test_get_settings_includes_provider_scaffolding(client):
     assert (
         body["provider_settings_by_effort"]["openai"]["low"]["model"] == "gpt-5.4-mini"
     )
+    assert body["provider_settings_by_effort"]["deepseek"]["low"]["model"] == (
+        "deepseek-v4-flash"
+    )
     assert "service_account" in body["providers"]["gemini"]["auth_modes"]
     assert body["providers"]["gemini"]["auth_modes"]["service_account"][
         "required_metadata_fields"
@@ -57,11 +60,54 @@ async def test_get_provider_catalog_route_returns_provider_schema(client):
     assert res.status_code == 200
     body = res.json()
     assert "providers" in body
-    assert set(body["providers"].keys()) == {"anthropic", "openai", "gemini", "zai"}
+    assert set(body["providers"].keys()) == {
+        "anthropic",
+        "openai",
+        "gemini",
+        "zai",
+        "deepseek",
+    }
     assert "oauth" in body["providers"]["openai"]["auth_modes"]
     assert list(body["providers"]["zai"]["auth_modes"].keys()) == ["api_key"]
+    assert list(body["providers"]["deepseek"]["auth_modes"].keys()) == ["api_key"]
     # Schema for the settings bag is exposed per provider.
     assert body["providers"]["anthropic"]["settings_schema"]["type"] == "object"
+
+
+def test_migrate_legacy_provider_config_backfills_zai_and_deepseek_defaults():
+    from app.runtime_config_state import _migrate_legacy_provider_config
+
+    config = {
+        "category_routing": {
+            "_default": {
+                "providers": ["anthropic", "openai", "gemini"],
+                "effort": "medium",
+            },
+            "ops": {"providers": ["anthropic", "openai"], "effort": "low"},
+        },
+        "provider_tier_model_map": {
+            "anthropic": {
+                "opus": "claude-opus-4-8",
+                "sonnet": "claude-sonnet-4-6",
+                "haiku": "claude-haiku-4-5-20251001",
+            }
+        },
+        "provider_settings_by_effort": {},
+    }
+
+    migrated = _migrate_legacy_provider_config(config)
+
+    assert migrated["category_routing"]["_default"]["providers"][0] == "zai"
+    assert migrated["category_routing"]["ops"]["providers"][0] == "deepseek"
+    assert "zai" in migrated["category_routing"]["ops"]["providers"]
+    assert migrated["provider_selection_mode"] == "preferred"
+    assert migrated["provider_tier_model_map"]["deepseek"]["haiku"] == (
+        "deepseek-v4-flash"
+    )
+    assert migrated["provider_settings_by_effort"]["deepseek"]["low"]["model"] == (
+        "deepseek-v4-flash"
+    )
+    assert migrated["provider_settings_defaults"]["deepseek"] == {}
 
 
 async def test_patch_settings_accepts_routing_and_matrix(client):
