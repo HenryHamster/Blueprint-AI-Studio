@@ -10677,6 +10677,54 @@ class TestRouteContractOwnership:
             + "\n".join(f"  • {v}" for v in violations)
         )
 
+    def test_route_contract_owners_are_valid(self):
+        """Each endpoint's owner file must exist and contain the search_pattern.
+
+        This meta-integrity check prevents silent rot: a stale/typo'd owner file
+        path or a drifted search_pattern that no longer matches its endpoint
+        is caught at merge time.
+        """
+        import json
+
+        registry_path = BACKEND_ROOT / "testing" / "route_contract_owners.json"
+        with open(registry_path) as f:
+            registry = json.load(f)
+
+        testing_dir = BACKEND_ROOT / "testing"
+        errors: list[str] = []
+
+        for endpoint, config in registry.items():
+            owner_file: str = config["owner"]
+            search_pattern: str = config["search_pattern"]
+
+            owner_path = testing_dir / owner_file
+            if not owner_path.exists():
+                errors.append(
+                    f"Endpoint '{endpoint}': owner file '{owner_file}' does not exist "
+                    f"at {owner_path}"
+                )
+                continue
+
+            owner_content = owner_path.read_text()
+            try:
+                compiled = re.compile(search_pattern)
+            except re.error as exc:
+                errors.append(
+                    f"Endpoint '{endpoint}': invalid search_pattern regex: {exc}"
+                )
+                continue
+
+            if not compiled.search(owner_content):
+                errors.append(
+                    f"Endpoint '{endpoint}': search_pattern does not match any content "
+                    f"in owner file '{owner_file}'. Pattern: {search_pattern}"
+                )
+
+        assert not errors, (
+            "Route contract ownership registry has invalid entries:\n"
+            + "\n".join(f"  • {e}" for e in errors)
+        )
+
     def test_route_contract_registry_is_populated(self):
         """The registry must contain at least one entry beyond the seed entry.
 
