@@ -1991,9 +1991,12 @@ async def _maybe_escalate_runner_deactivated_alerts(session: AsyncSession) -> in
     for more than :data:`_RUNNER_ESCALATION_FIRST_SECONDS` (1h), then re-escalates
     every :data:`_RUNNER_ESCALATION_REPEAT_SECONDS` (4h).
 
-    Escalation state is tracked in :data:`_runner_escalation_last_notified`
-    (ephemeral; clears on restart — best-effort, the initial delivery already has
-    retry semantics). Returns the count of escalation notifications dispatched.
+    Escalation cadence is persisted in :data:`Alert.last_escalated_at` so the cadence
+    survives orchestrator restart. Born-ERROR alerts (had_active_work=True) and
+    escalated-to-ERROR alerts (had_active_work=False) are both re-notified if
+    unacknowledged, unless the alert was escalated by the singular
+    _maybe_escalate_runner_deactivated_alert path. Returns the count of escalation
+    notifications dispatched.
     """
     now = _utcnow()
     open_alerts = (
@@ -2027,18 +2030,26 @@ async def _maybe_escalate_runner_deactivated_alerts(session: AsyncSession) -> in
         if alert.dedupe_key in _runner_outage_escalated_keys:
             continue
         age_s = (now - alert.created_at).total_seconds()
-        last_notified = _runner_escalation_last_notified.get(alert.dedupe_key)
-
+        # Use alert.last_escalated_at for escalation cadence tracking (persisted;
+        # survives restart). None means the sweep has never paged for this alert —
+        # fire the first re-page after _RUNNER_ESCALATION_FIRST_SECONDS (1h).
+        # last_seen_at is NOT used here: alert_policy sets it on creation and bumps
+        # it on every dedup re-fire, so it is never None for real alerts.
         should_escalate = False
-        if last_notified is None and age_s >= _RUNNER_ESCALATION_FIRST_SECONDS:
-            should_escalate = True
-        elif last_notified is not None:
-            if (now - last_notified).total_seconds() >= _RUNNER_ESCALATION_REPEAT_SECONDS:
+        if alert.last_escalated_at is None:
+            if age_s >= _RUNNER_ESCALATION_FIRST_SECONDS:
+                should_escalate = True
+        else:
+            if (now - alert.last_escalated_at).total_seconds() >= _RUNNER_ESCALATION_REPEAT_SECONDS:
                 should_escalate = True
 
         if not should_escalate:
             continue
 
+        # Persist escalation cadence in alert.last_escalated_at (survives restart)
+        alert.last_escalated_at = now
+        session.add(alert)
+        # Update in-memory dict for same-process, same-tick re-entry (best-effort)
         _runner_escalation_last_notified[alert.dedupe_key] = now
         try:
             import asyncio as _asyncio
@@ -2061,6 +2072,9 @@ async def _maybe_escalate_runner_deactivated_alerts(session: AsyncSession) -> in
             dispatched += 1
         except Exception as _ne:
             logger.warning("[NOTIFY] Runner escalation dispatch failed: %s", _ne)
+
+    if dispatched > 0:
+        await session.commit()
 
     return dispatched
 
@@ -2191,6 +2205,61 @@ async def _resolve_runner_degraded_alert(
             {"alert_id": str(alert.id), "title": alert.title},
         )
     return len(open_alerts)
+
+
+_LOCAL_RUNNER_HOLD_ALERT_TITLE = "Compute hold: require-local runner offline"
+
+
+async def _maybe_create_local_runner_hold_alert(
+    task: "Task",
+    session: AsyncSession,
+    *,
+    held_seconds: int,
+    timeout_seconds: int,
+) -> bool:
+    """Create a deduplicated WARNING alert for an aging require-local compute hold.
+
+    Fires when a ``compute_experiment`` task has been QUEUED waiting for a
+    self-hosted runner longer than the early-warning threshold, but before the
+    6h hard-fail timeout. Surfaces the stranded hold so the operator learns the
+    hardware is offline in minutes rather than waiting for the terminal failure.
+
+    Deduplicated on ``(task_id, title, dismissed_at IS NULL)`` so repeated sweep
+    passes raise exactly ONE alert per hold episode. The caller commits after this
+    returns ``True``. Returns ``False`` when the alert already exists (dedup hit).
+    """
+    existing = await session.execute(
+        select(Alert).where(
+            Alert.task_id == task.id,
+            Alert.dismissed_at.is_(None),
+            Alert.title == _LOCAL_RUNNER_HOLD_ALERT_TITLE,
+        )
+    )
+    if existing.scalars().first() is not None:
+        return False
+    held_str = _fmt_duration_seconds(held_seconds)
+    remaining_str = _fmt_duration_seconds(timeout_seconds)
+    msg = (
+        f"A require-local compute experiment has been waiting {held_str} for a "
+        f"self-hosted runner with none online — the task will hard-fail in "
+        f"~{remaining_str} if no runner comes online. Bring the runner back "
+        f"online or requeue the task without require_local_runner to use cloud "
+        f"compute."
+    )[:1000]
+    alert = Alert(
+        project_id=task.project_id,
+        severity=AlertSeverity.WARNING,
+        title=_LOCAL_RUNNER_HOLD_ALERT_TITLE,
+        message=msg,
+        task_id=task.id,
+    )
+    session.add(alert)
+    await broadcast_to_project(
+        str(task.project_id),
+        "alert_created",
+        {"alert_id": str(alert.id), "severity": "WARNING", "title": alert.title},
+    )
+    return True
 
 
 async def _create_strategic_alert(

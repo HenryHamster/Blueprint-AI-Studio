@@ -101,6 +101,20 @@ See `scripts/runner_isolation.py` for the full decision tables
    blueprint-runner start
    ```
 
+5. **Install as a durable service** (survives logout/reboot — recommended once
+   `check` is green):
+   ```bash
+   blueprint-runner install --token <token>
+   ```
+   This renders the systemd `--user` unit from the shipped template with the real
+   paths for *this* checkout, writes it to
+   `~/.config/systemd/user/blueprint-runner.service`, runs `daemon-reload` +
+   `enable --now`, and turns on `loginctl enable-linger` so the runner starts at
+   boot with no active login session. Remove it with `blueprint-runner uninstall`.
+   (WSL2 note: on Windows reboot the WSL distro is not auto-started; launch the
+   distro once — e.g. open a WSL terminal or `wsl.exe -d <distro>` — and linger
+   brings the runner up from there.)
+
 ### Expected `--check` output
 
 ```
@@ -212,26 +226,14 @@ The token was revoked or is invalid. Re-enroll via **Fleet → Enroll runner**.
    blueprint-runner start --token <token>
    ```
 
-   To keep the runner alive across reboots, use a systemd user service:
-   ```ini
-   # ~/.config/systemd/user/blueprint-runner.service
-   [Unit]
-   Description=Blueprint fleet runner
-   After=network-online.target
-
-   [Service]
-   ExecStart=blueprint-runner start
-   Environment=BLUEPRINT_RUNNER_TOKEN=<token>
-   Restart=on-failure
-   RestartSec=10
-
-   [Install]
-   WantedBy=default.target
-   ```
+   To keep the runner alive across reboots, install it as a durable service —
+   one command renders the unit, enables it, and turns on boot persistence:
    ```bash
-   systemctl --user daemon-reload
-   systemctl --user enable --now blueprint-runner
+   blueprint-runner install --token <token>
    ```
+   This is a systemd `--user` unit + `loginctl enable-linger` (starts at boot with
+   no login session). Uninstall with `blueprint-runner uninstall`. See §7 of
+   `docs/runner-install.md` for details and the token-persistence model.
 
 ### Expected `--check` output
 
@@ -345,6 +347,18 @@ kernel admin has enabled unprivileged user namespaces.
    # Restrict to specific GPU indices (e.g. GPUs 0 and 1 only)
    BLUEPRINT_RUNNER_GPU_INDICES=0,1 BLUEPRINT_RUNNER_TOKEN=<token> blueprint-runner start
    ```
+
+5. **Install as a durable service.** On a shared, multi-tenant box, prefer a
+   **system** unit so the runner is boot-persistent and not tied to any one
+   operator's login session:
+   ```bash
+   sudo blueprint-runner install --system --token <token>
+   ```
+   This writes `/etc/systemd/system/blueprint-runner.service` with
+   `WantedBy=multi-user.target` and `User=$USER`, so no `enable-linger` is needed.
+   Put `BLUEPRINT_RUNNER_GPU_INDICES` in `~/.blueprint/runner.env` if you restrict
+   GPUs. On a single-operator box use the default `--user` install (no `--system`,
+   no sudo). Uninstall with `sudo blueprint-runner uninstall --system`.
 
 #### Expected `--check` output (bwrap✓, apptainer present)
 
@@ -504,6 +518,16 @@ opt-in for prod-parity read-only agent runs.
    ```bash
    BLUEPRINT_RUNNER_GPU_INDICES=2,3 blueprint-runner start --token <token>
    ```
+
+5. **Install as a durable service.** For a single-operator lab server, the
+   default `--user` install is simplest; for a shared server use `--system`:
+   ```bash
+   blueprint-runner install --token <token>            # per-operator (systemd --user + linger)
+   sudo blueprint-runner install --system --token <token>   # shared server (boot-persistent)
+   ```
+   Persistent knobs (`BLUEPRINT_RUNNER_GPU_INDICES`, `BLUEPRINT_AGENT_BACKEND`,
+   etc.) belong in `~/.blueprint/runner.env`, which the installed unit loads.
+   Uninstall with `blueprint-runner uninstall` (add `--system` for the system unit).
 
 ### Expected `--check` output (full capabilities, 4 GPUs)
 

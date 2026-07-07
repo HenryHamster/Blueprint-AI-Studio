@@ -47,6 +47,7 @@ link_cmd blueprint-runner
 case ":$PATH:" in
   *":$BIN_DIR:"*)
     ok "~/.local/bin is already on PATH — 'blueprint' and 'blueprint-runner' are ready."
+    info "To run the runner durably: 'blueprint-runner install --token <token>' (systemd service; add --system on shared boxes)."
     ;;
   *)
     warn "~/.local/bin is NOT on your PATH."

@@ -7,9 +7,11 @@ the operator can act from the alert alone. Mirrors the broadcast-mock pattern in
 test_alerts.py (patch ``app.alert_dispatch.broadcast_to_project``).
 """
 
-import pytest
+import uuid as _uuid_module
+from datetime import timedelta as _timedelta
 from unittest.mock import AsyncMock
 
+import pytest
 from sqlmodel import select as sql_select
 
 from app.alert_dispatch import (
@@ -19,9 +21,14 @@ from app.alert_dispatch import (
     _maybe_create_blocked_escalation_alert,
     _maybe_create_migration_slot_contention_alert,
     _maybe_create_pool_payoff_alert,
+    _maybe_create_runner_deactivated_alert,
     _maybe_create_unverified_merge_alert,
+    _maybe_escalate_runner_deactivated_alerts,
+    _runner_escalation_last_notified,
+    _runner_outage_escalated_keys,
 )
 from app.models import Alert, AlertSeverity
+from app.time_utils import _utcnow
 from testing.factories import make_project, make_task
 
 
@@ -514,3 +521,90 @@ async def test_migration_slot_contention_alert_dedups_on_stable_title(
     await db_session.commit()
     assert second == 0
     assert len(await _slot_alerts(db_session, project.id)) == 1
+
+
+# ── runner-deactivated escalation cadence persistence ───────────────────────
+
+
+async def _runner_deactivated_alerts(db_session, project_id):
+    stmt = sql_select(Alert).where(
+        Alert.project_id == project_id,
+        Alert.event_type == "runner.deactivated",
+    )
+    return (await db_session.execute(stmt)).scalars().all()
+
+
+@pytest.mark.asyncio
+async def test_runner_escalation_cadence_survives_restart(db_session, mocker):
+    """Verify that runner-outage re-page cadence persists across orchestrator restart.
+
+    The 1h-then-every-4h escalation cadence is tracked using alert.last_escalated_at
+    so that after restart, the periodic sweep correctly respects the cadence instead of
+    immediately re-paging every alert older than 1h.
+
+    Exercises the real production path: alert is created with last_seen_at=now (set by
+    alert_policy) and last_escalated_at=None (never escalated by sweep). The sweep must
+    use last_escalated_at — NOT last_seen_at — to decide when to first re-page.
+    """
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+    mocker.patch("app.alert_dispatch._send_webhook_notification", new_callable=AsyncMock)
+    mocker.patch(
+        "app.notification_dispatch.dispatch_external_notification",
+        new_callable=AsyncMock,
+    )
+
+    project = make_project()
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    runner_id = _uuid_module.uuid4()
+
+    # Create initial runner-deactivated alert (WARNING severity, idle runner).
+    # alert_policy sets last_seen_at=now at creation; last_escalated_at starts None.
+    created = await _maybe_create_runner_deactivated_alert(
+        db_session,
+        project_id=project.id,
+        runner_id=runner_id,
+        hostname="runner-01",
+        had_active_work=False,
+        seconds_since_last_seen=600,
+    )
+    assert created is True
+
+    # Fetch the alert and verify initial state
+    alerts = await _runner_deactivated_alerts(db_session, project.id)
+    assert len(alerts) == 1
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    # Confirm production state: last_seen_at is set (by alert_policy), last_escalated_at
+    # is None (sweep has not run yet). Do NOT null out last_seen_at — that state never
+    # occurs in production and would mask the cadence bug this test guards against.
+    assert alert.last_seen_at is not None, "alert_policy always sets last_seen_at on create"
+    assert alert.last_escalated_at is None, "sweep has not run; last_escalated_at should be None"
+
+    # Simulate time passage: set created_at to 2 hours ago so age >= 1h threshold
+    now = _utcnow()
+    alert.created_at = now - _timedelta(hours=2)
+    db_session.add(alert)
+    await db_session.commit()
+
+    # First sweep: should dispatch notification (age >= 1h, last_escalated_at is None)
+    dispatched_before = await _maybe_escalate_runner_deactivated_alerts(db_session)
+    assert dispatched_before == 1, "First sweep should dispatch after 1h"
+
+    # Refresh to get updated state — last_escalated_at should now be set
+    await db_session.refresh(alert)
+    first_last_escalated = alert.last_escalated_at
+    assert first_last_escalated is not None, "last_escalated_at should be set after first notification"
+
+    # Simulate orchestrator restart: clear in-memory escalation dicts
+    _runner_escalation_last_notified.clear()
+    _runner_outage_escalated_keys.clear()
+
+    # Second sweep (immediately after restart): should NOT dispatch again
+    # because last_escalated_at has preserved the cadence
+    dispatched_after_restart = await _maybe_escalate_runner_deactivated_alerts(db_session)
+    assert (
+        dispatched_after_restart == 0
+    ), "After restart, cadence should survive — should not re-notify within 4h window"

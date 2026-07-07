@@ -2623,6 +2623,15 @@ class Alert(SQLModel, table=True):
         default=None,
         sa_column=Column(NaiveUTCDateTime, nullable=True),
     )
+    # Persisted escalation cadence for the periodic re-page sweep
+    # (_maybe_escalate_runner_deactivated_alerts). None = never escalated by the
+    # sweep (first re-page fires after _RUNNER_ESCALATION_FIRST_SECONDS); set to
+    # now() after each sweep dispatch so cadence survives orchestrator restart.
+    # Distinct from last_seen_at, which alert_policy owns for dedup tracking.
+    last_escalated_at: datetime | None = Field(
+        default=None,
+        sa_column=Column(NaiveUTCDateTime, nullable=True),
+    )
 
     __table_args__ = (
         Index("ix_alert_task_id_dismissed", "task_id", "dismissed_at"),

@@ -1,30 +1,23 @@
-# Blueprint local fleet runner — systemd --user unit template
+# Blueprint local fleet runner — systemd --user unit TEMPLATE
 #
-# INSTALL (Linux / WSL):
-#   1. Copy this file to ~/.config/systemd/user/blueprint-runner.service
-#      (replacing /path/to/workspace with your actual repo checkout path)
-#   2. Edit ExecStart to point to the correct python3 and local_runner.py path.
-#   3. Edit EnvironmentFile to point to ~/.blueprint/runner.env (see below).
-#   4. Reload and enable:
-#        systemctl --user daemon-reload
-#        systemctl --user enable --now blueprint-runner.service
-#   5. Enable linger so the service starts at boot even without a login session:
-#        loginctl enable-linger $USER
+# This is a TEMPLATE, not a ready-to-use unit. Do NOT hand-edit and copy it.
+# `blueprint-runner install` renders it (substituting @PYTHON@, @LOCAL_RUNNER@,
+# and @ENV_FILE@ with the real absolute paths resolved on this host), writes the
+# result to ~/.config/systemd/user/blueprint-runner.service, and runs
+# daemon-reload + enable --now + loginctl enable-linger for you. Uninstall with
+# `blueprint-runner uninstall`.
 #
-# ENVIRONMENT FILE (~/.blueprint/runner.env):
-#   Create this file (chmod 0600) with your runner credentials:
-#     BLUEPRINT_ORCHESTRATOR_URL=https://your-orchestrator.example.com
-#     BLUEPRINT_RUNNER_TOKEN=<token from admin UI — saved automatically on first run>
-#
-#   After the first successful start BLUEPRINT_RUNNER_TOKEN is persisted to
-#   ~/.blueprint/runner_token, so you can omit it from runner.env on restarts.
+# ENVIRONMENT FILE (@ENV_FILE@ — defaults to ~/.blueprint/runner.env):
+#   Optional 0600 file with runner config (the leading `-` means "ignore if
+#   absent"). After the first successful start BLUEPRINT_RUNNER_TOKEN is
+#   persisted to ~/.blueprint/runner_token, so the service picks the token up
+#   from there on every subsequent start with nothing baked into this unit.
 #
 # RESTART-ON-CRASH:
-#   Restart=on-failure causes systemd to restart the runner whenever it exits
-#   non-zero.  The runner calls os._exit(1) (via _die()) on fatal conditions
-#   (revoked token, supervisor-detected fatal errors) so systemd sees a non-zero
-#   exit and restarts automatically.  Normal SIGTERM shutdown exits 0 and is NOT
-#   restarted (Restart=on-failure, not Restart=always).
+#   Restart=on-failure restarts the runner whenever it exits non-zero. The
+#   runner calls os._exit(1) (via _die()) on fatal conditions (revoked token,
+#   supervisor-detected fatal errors), so systemd sees a non-zero exit and
+#   restarts automatically. Normal SIGTERM shutdown exits 0 and is NOT restarted.
 #
 # VIEWING LOGS:
 #   journalctl --user -u blueprint-runner.service -f
@@ -37,11 +30,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /path/to/workspace/scripts/local_runner.py
+ExecStart=@PYTHON@ @LOCAL_RUNNER@
 Restart=on-failure
 RestartSec=5
-# Load credentials and config from a 0600 file outside the repo.
-EnvironmentFile=-%h/.blueprint/runner.env
+# Load credentials and config from a 0600 file outside the repo (`-` = optional).
+EnvironmentFile=-@ENV_FILE@
 # Redirect stdout/stderr into the systemd journal (view with journalctl --user).
 StandardOutput=journal
 StandardError=journal

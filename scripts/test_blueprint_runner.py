@@ -45,6 +45,36 @@ class ResolveTokenTests(unittest.TestCase):
             self.assertIsNone(br.resolve_token(None))
             self.assertIsNone(br.resolve_token("   "))
 
+    def test_resolve_token_falls_back_to_persisted_credential_file(self):
+        # When both CLI and env are absent, read from persisted credential file.
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_load_persisted_token", return_value="persisted-token"):
+            self.assertEqual(br.resolve_token(None), "persisted-token")
+
+    def test_cli_flag_wins_over_persisted_credential(self):
+        # CLI flag takes priority over persisted file.
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "_load_persisted_token", return_value="persisted-token"):
+            self.assertEqual(br.resolve_token("flag-token"), "flag-token")
+
+    def test_env_wins_over_persisted_credential(self):
+        # Env var takes priority over persisted file.
+        with patch.dict("os.environ", {"BLUEPRINT_RUNNER_TOKEN": "env-token"}, clear=True), \
+             patch.object(br, "_load_persisted_token", return_value="persisted-token"):
+            self.assertEqual(br.resolve_token(None), "env-token")
+
+    def test_credential_dir_override_is_honored(self):
+        # BLUEPRINT_CREDENTIAL_DIR must be respected by the real _load_persisted_token
+        # (not just the mock) so non-standard installs find their token.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            token_path = os.path.join(tmpdir, "runner_token")
+            with open(token_path, "w") as f:
+                f.write("override-token\n")
+            with patch.dict("os.environ", {"BLUEPRINT_CREDENTIAL_DIR": tmpdir,
+                                           "BLUEPRINT_RUNNER_TOKEN": ""}, clear=True):
+                self.assertEqual(br.resolve_token(None), "override-token")
+
 
 class PrerequisiteTests(unittest.TestCase):
     def test_all_ok_when_node_new_enough_and_claude_present(self):
@@ -488,6 +518,285 @@ class MainDockerAgentWiringTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         ens.assert_called_once()
         self.assertEqual(ens.call_args.kwargs["pull_ref"], "registry.io/agent:1")
+
+
+def _systemctl_recorder(*, fail_on=None, record=None):
+    """Fake ``_run`` for systemd/loginctl calls that dispatches on argv.
+
+    NO real systemd is ever invoked. ``record`` (a list) captures every argv.
+    ``fail_on`` maps a subcommand keyword (e.g. ``"is-active"``, ``"enable"``,
+    ``"daemon-reload"``, ``"enable-linger"``) to the returncode it should yield;
+    everything else returns rc 0. ``is-system-running`` returns rc 0 by default so
+    _systemd_available() reads the manager as reachable.
+    """
+    fail_on = fail_on or {}
+
+    def run(argv, **kwargs):
+        if record is not None:
+            record.append(list(argv))
+        joined = " ".join(argv)
+        rc = 0
+        for needle, code in fail_on.items():
+            if needle in joined:
+                rc = code
+                break
+        return MagicMock(returncode=rc, stdout="", stderr="")
+
+    return run
+
+
+class RenderUnitTests(unittest.TestCase):
+    def test_user_template_substitutes_all_tokens(self):
+        text = br.render_unit(
+            br._USER_SERVICE_TEMPLATE,
+            {
+                "@PYTHON@": "/opt/py/bin/python3",
+                "@LOCAL_RUNNER@": "/home/me/repo/scripts/local_runner.py",
+                "@ENV_FILE@": "/home/me/.blueprint/runner.env",
+            },
+        )
+        self.assertIn("ExecStart=/opt/py/bin/python3 /home/me/repo/scripts/local_runner.py", text)
+        self.assertIn("EnvironmentFile=-/home/me/.blueprint/runner.env", text)
+        # No leftover @…@ placeholder survives.
+        self.assertEqual(re.findall(r"@[A-Z_]+@", text), [])
+        # Hardening directives are preserved from the template.
+        for directive in ("Restart=on-failure", "RestartSec=5", "KillSignal=SIGTERM",
+                          "TimeoutStopSec=30", "WantedBy=default.target"):
+            self.assertIn(directive, text)
+
+    def test_system_template_substitutes_user_and_wantedby(self):
+        text = br.render_unit(
+            br._SYSTEM_SERVICE_TEMPLATE,
+            {
+                "@PYTHON@": "/usr/bin/python3",
+                "@LOCAL_RUNNER@": "/srv/repo/scripts/local_runner.py",
+                "@ENV_FILE@": "/root/.blueprint/runner.env",
+                "@USER@": "dgxops",
+                "@WANTED_BY@": "multi-user.target",
+            },
+        )
+        self.assertIn("User=dgxops", text)
+        self.assertIn("WantedBy=multi-user.target", text)
+        self.assertEqual(re.findall(r"@[A-Z_]+@", text), [])
+        self.assertIn("KillSignal=SIGTERM", text)
+
+    def test_leftover_placeholder_raises(self):
+        with self.assertRaises(ValueError):
+            br.render_unit(
+                br._SYSTEM_SERVICE_TEMPLATE,
+                {"@PYTHON@": "/usr/bin/python3"},  # @LOCAL_RUNNER@ etc. left unsubstituted
+            )
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="bp_install_")
+        self.unit_path = os.path.join(self.tmp, "systemd", "blueprint-runner.service")
+        self.env_path = os.path.join(self.tmp, "cred", "runner.env")
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def _patch_paths(self):
+        return [
+            patch.object(br, "_user_unit_path", return_value=self.unit_path),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+
+    def test_install_renders_and_enables_systemd_user_unit(self):
+        """REQUIRED acceptance test: --user install renders real paths, writes the
+        user unit, and issues daemon-reload + enable --now + enable-linger."""
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        patches = self._patch_paths()
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=False, token="seed-token", url="https://orch.example", _run=run
+            )
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0)
+        # Unit written to the user path with REAL substituted paths.
+        self.assertTrue(os.path.isfile(self.unit_path))
+        unit_text = Path(self.unit_path).read_text()
+        self.assertIn(sys.executable, unit_text)
+        self.assertIn(br._LOCAL_RUNNER, unit_text)
+        self.assertTrue(br._LOCAL_RUNNER.endswith("local_runner.py"))
+        # No leftover placeholder and no stale hardcoded workspace path.
+        self.assertEqual(re.findall(r"@[A-Z_]+@", unit_text), [])
+        self.assertNotIn("/path/to/workspace", unit_text)
+
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("systemctl --user daemon-reload" in j for j in joined))
+        self.assertTrue(any("systemctl --user enable --now blueprint-runner.service" in j for j in joined))
+        self.assertTrue(any(
+            j.startswith("loginctl enable-linger") for j in joined
+        ), f"enable-linger must be issued; calls={joined}")
+
+        # The token/url were seeded into the 0600 env file (not baked into the unit).
+        env_text = Path(self.env_path).read_text()
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL=https://orch.example", env_text)
+        self.assertIn("BLUEPRINT_RUNNER_TOKEN=seed-token", env_text)
+        self.assertNotIn("seed-token", unit_text)
+        self.assertEqual(os.stat(self.env_path).st_mode & 0o777, 0o600)
+
+    def test_system_install_uses_system_path_and_skips_linger(self):
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        sys_unit = os.path.join(self.tmp, "etc", "blueprint-runner.service")
+        patches = [
+            patch.object(br, "_system_unit_path", return_value=sys_unit),
+            patch.object(br, "_env_file_path", return_value=self.env_path),
+            patch.object(br, "_install_user", return_value="dgxops"),
+            patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"),
+        ]
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(system=True, token=None, url="https://o.example", _run=run)
+        finally:
+            for p in patches:
+                p.stop()
+
+        self.assertEqual(rc, 0)
+        unit_text = Path(sys_unit).read_text()
+        self.assertIn("User=dgxops", unit_text)
+        self.assertIn("WantedBy=multi-user.target", unit_text)
+        joined = [" ".join(c) for c in calls]
+        # System scope: no `--user`, and NO linger.
+        self.assertTrue(any("systemctl daemon-reload" in j for j in joined))
+        self.assertTrue(any("systemctl enable --now blueprint-runner.service" in j for j in joined))
+        self.assertFalse(any("enable-linger" in j for j in joined),
+                         "system install must NOT call enable-linger")
+        # Token omitted → env file has URL but no token line.
+        env_text = Path(self.env_path).read_text()
+        self.assertIn("BLUEPRINT_ORCHESTRATOR_URL=https://o.example", env_text)
+        self.assertNotIn("BLUEPRINT_RUNNER_TOKEN", env_text)
+
+    def test_enable_failure_returns_nonzero(self):
+        run = _systemctl_recorder(fail_on={"enable --now": 1})
+        patches = self._patch_paths()
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(system=False, token="t", url="https://o", _run=run)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(rc, 1)
+
+    def test_verify_failure_returns_nonzero(self):
+        # daemon-reload/enable succeed but the unit never becomes active.
+        run = _systemctl_recorder(fail_on={"is-active": 3})
+        patches = self._patch_paths()
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(system=False, token="t", url="https://o", _run=run)
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(rc, 1)
+
+    def test_missing_systemd_fails_actionably(self):
+        run = _systemctl_recorder()
+        with patch.object(br.shutil, "which", return_value=None):
+            rc = br.do_install(system=False, token="t", url="https://o", _run=run)
+        self.assertEqual(rc, 1)
+
+    def test_dry_run_touches_nothing(self):
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        patches = self._patch_paths()
+        for p in patches:
+            p.start()
+        try:
+            rc = br.do_install(
+                system=False, token="t", url="https://o", dry_run=True, _run=run,
+            )
+        finally:
+            for p in patches:
+                p.stop()
+        self.assertEqual(rc, 0)
+        # No unit written, no env seeded, and only the availability probe ran.
+        self.assertFalse(os.path.exists(self.unit_path))
+        self.assertFalse(os.path.exists(self.env_path))
+        self.assertFalse(any("daemon-reload" in " ".join(c) for c in calls))
+        self.assertFalse(any("enable" in " ".join(c) for c in calls))
+
+
+class UninstallTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="bp_uninstall_")
+        self.unit_path = os.path.join(self.tmp, "blueprint-runner.service")
+
+    def tearDown(self):
+        import shutil as _sh
+        _sh.rmtree(self.tmp, ignore_errors=True)
+
+    def test_disables_and_removes_present_unit(self):
+        Path(self.unit_path).write_text("[Unit]\n")
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            rc = br.do_uninstall(system=False, _run=run)
+        self.assertEqual(rc, 0)
+        self.assertFalse(os.path.exists(self.unit_path))  # unit file removed
+        joined = [" ".join(c) for c in calls]
+        self.assertTrue(any("disable --now blueprint-runner.service" in j for j in joined))
+        self.assertTrue(any("daemon-reload" in j for j in joined))
+
+    def test_idempotent_when_nothing_installed(self):
+        # No unit file on disk → clean report, rc 0, no daemon-reload needed.
+        calls = []
+        run = _systemctl_recorder(record=calls)
+        with patch.object(br, "_user_unit_path", return_value=self.unit_path), \
+             patch.object(br.shutil, "which", return_value="/usr/bin/systemctl"):
+            rc = br.do_uninstall(system=False, _run=run)
+        self.assertEqual(rc, 0)
+        self.assertFalse(any("daemon-reload" in " ".join(c) for c in calls))
+
+
+class InstallUninstallMainRoutingTests(unittest.TestCase):
+    def test_install_routed_to_do_install(self):
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "do_install", return_value=0) as inst:
+            rc = br.main(["install", "--token", "tok"])
+        self.assertEqual(rc, 0)
+        inst.assert_called_once()
+        self.assertFalse(inst.call_args.kwargs["system"])
+        self.assertEqual(inst.call_args.kwargs["token"], "tok")
+
+    def test_install_system_flag_forwarded(self):
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "do_install", return_value=0) as inst:
+            br.main(["install", "--system"])
+        self.assertTrue(inst.call_args.kwargs["system"])
+
+    def test_install_without_token_still_routes(self):
+        # Unlike start/check, install does not require a token (persisted-file path).
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "do_install", return_value=0) as inst:
+            rc = br.main(["install"])
+        self.assertEqual(rc, 0)
+        self.assertIsNone(inst.call_args.kwargs["token"])
+
+    def test_uninstall_routed_to_do_uninstall(self):
+        with patch.dict("os.environ", {}, clear=True), \
+             patch.object(br, "do_uninstall", return_value=0) as uninst:
+            rc = br.main(["uninstall", "--system"])
+        self.assertEqual(rc, 0)
+        uninst.assert_called_once()
+        self.assertTrue(uninst.call_args.kwargs["system"])
 
 
 def _resolve_admin_ui_src_root() -> str | None:

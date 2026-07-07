@@ -42,61 +42,71 @@ cat ~/.blueprint/runner_token
 
 ---
 
-## 3. Install as a systemd --user service (Linux / WSL)
+## 3. Install as a durable service (one command)
 
-A systemd `--user` unit runs under your own account without root, starts at login
-(or at boot with linger enabled), and restarts the runner automatically if it exits
-non-zero.
+`blueprint-runner install` replaces the old copy-edit-reload dance. It **renders**
+the systemd unit from the shipped template (`scripts/blueprint-runner.service`)
+with the real absolute paths resolved on *this* host — the current Python
+interpreter, this checkout's `local_runner.py`, and the `~/.blueprint/runner.env`
+credential file — writes it to the right location, enables it, and turns on boot
+persistence. There is nothing to hand-edit and no per-device special-casing.
 
-### 3a. Copy and edit the unit file
+### 3a. Default: systemd `--user` install
 
-```bash
-mkdir -p ~/.config/systemd/user
-cp scripts/blueprint-runner.service ~/.config/systemd/user/blueprint-runner.service
-```
-
-Edit `~/.config/systemd/user/blueprint-runner.service` and update `ExecStart` to
-use the **absolute path** to `local_runner.py`:
-
-```ini
-ExecStart=/usr/bin/python3 /home/yourname/workspace/scripts/local_runner.py
-```
-
-### 3b. Create the environment file
+Runs under your own account without root; boot-persistent via linger.
 
 ```bash
-mkdir -p ~/.blueprint
-chmod 0700 ~/.blueprint
-cat > ~/.blueprint/runner.env <<'EOF'
-BLUEPRINT_ORCHESTRATOR_URL=https://your-orchestrator.example.com
-# BLUEPRINT_RUNNER_TOKEN is optional after the first run — the runner reads it
-# from ~/.blueprint/runner_token automatically.
-EOF
-chmod 0600 ~/.blueprint/runner.env
+blueprint-runner install --token <token>
 ```
 
-### 3c. Enable and start
+This does all of the following for you:
+
+- renders `~/.config/systemd/user/blueprint-runner.service` from the template
+  (real `ExecStart=<python3> <abs path>/local_runner.py`, no placeholders);
+- seeds `~/.blueprint/runner.env` (mode `0600`) with the orchestrator URL and, if
+  you passed `--token`, the token — so the very first boot connects with no manual
+  step. After that first start the token is persisted to `~/.blueprint/runner_token`
+  and read from there, so it need not stay in the env file;
+- runs `systemctl --user daemon-reload` and `systemctl --user enable --now
+  blueprint-runner.service`;
+- runs `loginctl enable-linger "$USER"` so the runner starts at boot even with no
+  active login session;
+- verifies the unit is **active** and **enabled** and prints the `journalctl`
+  follow command — it returns non-zero (and does not claim success) if any step
+  fails.
+
+Omit `--token` if you have already started the runner once and it persisted a
+token to `~/.blueprint/runner_token`; the service will read it from there.
+Override the URL with `--url` when you point at a non-production orchestrator.
+
+### 3b. Shared boxes: `--system` install
+
+On a multi-tenant machine (e.g. a shared DGX) prefer a **system** unit so the
+runner is boot-persistent and not tied to any one operator's login session:
 
 ```bash
-systemctl --user daemon-reload
-systemctl --user enable --now blueprint-runner.service
+sudo blueprint-runner install --system --token <token>
 ```
 
-### 3d. Enable linger (start at boot without a login session)
+This writes `/etc/systemd/system/blueprint-runner.service` with
+`WantedBy=multi-user.target` and `User=$USER` (no linger needed — the system
+target provides boot persistence).
 
-By default, user services only run while your session is active. Enable linger so
-the runner starts at system boot even if you are not logged in:
+### 3c. Preview or uninstall
 
 ```bash
-loginctl enable-linger "$USER"
+blueprint-runner install --dry-run --token <token>   # print the rendered unit + commands, touch nothing
+blueprint-runner uninstall                           # stop, disable, and remove the --user unit
+sudo blueprint-runner uninstall --system             # remove the system unit
 ```
 
-To verify:
+`uninstall` is idempotent (uninstalling when nothing is installed reports cleanly)
+and never deletes your credential files under `~/.blueprint`.
 
-```bash
-loginctl show-user "$USER" | grep Linger
-# Linger=yes
-```
+> **No systemd?** On a host with no systemd manager (a bare container, a
+> non-systemd init), `install` fails with an actionable message and prints the
+> equivalent `nohup`/`tmux` command to run the runner under your own supervisor
+> instead of crashing.
 
 ---
 

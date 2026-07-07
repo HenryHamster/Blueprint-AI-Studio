@@ -9745,3 +9745,61 @@ class TestRunnerDispatchExtractionContract:
         )
         assert orch._runner_active_work_count(busy) == 3
         assert rd._runner_active_work_count(busy) == 3
+
+
+@pytest.mark.asyncio
+async def test_held_require_local_compute_alerts_before_timeout(db_session, mocker):
+    """A compute_experiment held for require_local longer than the early-warning
+    threshold emits a WARNING alert before the 6h timeout while the task stays QUEUED.
+    A second sweep pass must not create a duplicate (dedup by title + task_id).
+    """
+    from sqlmodel import select
+    from app.models import Alert, AlertSeverity
+    from app.orchestrator_runner_dispatch import (
+        _fail_stale_local_runner_holds,
+        _LOCAL_RUNNER_HOLD_ALERT_SECONDS,
+    )
+
+    mocker.patch("app.alert_dispatch.broadcast_to_project", new_callable=AsyncMock)
+
+    project = make_project(name="RequireLocal Compute Hold Alert", user_id=_TEST_USER)
+    db_session.add(project)
+    await db_session.commit()
+    await db_session.refresh(project)
+
+    # Stamp the hold well past the early-warning threshold but under the 6h timeout.
+    held_since = _utcnow() - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS + 60)
+    task = make_task(
+        project_id=project.id,
+        title="stranded compute",
+        status=TaskStatus.QUEUED,
+        payloads=[{"type": "compute_experiment"}],
+        context={"awaiting_local_runner_since": held_since.isoformat()},
+    )
+    db_session.add(task)
+    await db_session.commit()
+    await db_session.refresh(task)
+    task_id = task.id
+
+    failed_count = await _fail_stale_local_runner_holds(db_session)
+
+    # Task must remain QUEUED — the 6h timeout has not elapsed.
+    refreshed = await db_session.get(Task, task_id)
+    assert refreshed.status == TaskStatus.QUEUED
+    assert failed_count == 0
+
+    # A WARNING alert must have been created for the stranded hold.
+    alerts = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts) == 1, f"Expected 1 early-warning alert, got {len(alerts)}"
+    alert = alerts[0]
+    assert alert.severity == AlertSeverity.WARNING
+    assert "local runner" in alert.title.lower()
+
+    # Re-running the sweep must not create a duplicate (title+task_id dedup).
+    await _fail_stale_local_runner_holds(db_session)
+    alerts2 = (
+        await db_session.execute(select(Alert).where(Alert.task_id == task_id))
+    ).scalars().all()
+    assert len(alerts2) == 1, "Second sweep pass must not duplicate the alert"

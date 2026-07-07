@@ -70,6 +70,11 @@ _RUNNER_LIVENESS_SECONDS = 300
 # runner up well within it.
 _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS = 6 * 3600
 
+# Early-warning threshold: emit a proactive WARNING alert when a require-local
+# compute_experiment hold has waited past this window but before the 6h hard
+# timeout — so the operator learns the hardware is offline in minutes, not hours.
+_LOCAL_RUNNER_HOLD_ALERT_SECONDS = 15 * 60  # 15 minutes
+
 
 class RunnerDispatchSnapshot(NamedTuple):
     """Session-independent view of a live local runner used during dispatch."""
@@ -1434,6 +1439,33 @@ async def _fail_stale_local_runner_holds(session: AsyncSession) -> int:
             continue
         cutoff = strategic_cutoff if is_strategic_hold else compute_cutoff
         if stamped_at > cutoff:
+            # Within the full wait window — keep holding. For compute holds, emit a
+            # proactive early-warning alert once the hold passes the shorter threshold
+            # so the operator learns the hardware is offline in minutes, not 6h.
+            if is_compute_hold:
+                alert_cutoff = now - timedelta(seconds=_LOCAL_RUNNER_HOLD_ALERT_SECONDS)
+                if stamped_at <= alert_cutoff:
+                    from app.alert_dispatch import _maybe_create_local_runner_hold_alert
+
+                    held_secs = int((now - stamped_at).total_seconds())
+                    remaining_secs = max(
+                        0, _LOCAL_RUNNER_WAIT_TIMEOUT_SECONDS - held_secs
+                    )
+                    try:
+                        created = await _maybe_create_local_runner_hold_alert(
+                            task,
+                            session,
+                            held_seconds=held_secs,
+                            timeout_seconds=remaining_secs,
+                        )
+                        if created:
+                            await session.commit()
+                    except Exception:
+                        logger.exception(
+                            "[RUNNERS] Failed to create early hold alert for task %s",
+                            task.id,
+                        )
+                        await session.rollback()
             continue  # within the wait window — keep holding
 
         if is_strategic_hold:

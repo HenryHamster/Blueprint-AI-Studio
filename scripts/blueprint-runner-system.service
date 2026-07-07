@@ -1,0 +1,52 @@
+# Blueprint local fleet runner — systemd SYSTEM unit TEMPLATE
+#
+# This is a TEMPLATE, not a ready-to-use unit. Do NOT hand-edit and copy it.
+# `blueprint-runner install --system` renders it (substituting @PYTHON@,
+# @LOCAL_RUNNER@, @ENV_FILE@, @USER@, and @WANTED_BY@ with the real values
+# resolved on this host), writes the result to
+# /etc/systemd/system/blueprint-runner.service, and runs daemon-reload +
+# enable --now for you. A system unit is boot-persistent via WantedBy=
+# multi-user.target with no user-linger needed — prefer it on shared boxes
+# (e.g. a DGX) where the runner should not depend on one operator's login
+# session. Uninstall with `blueprint-runner uninstall --system` (needs sudo).
+#
+# ENVIRONMENT FILE (@ENV_FILE@):
+#   Optional 0600 file with runner config (the leading `-` means "ignore if
+#   absent"). After the first successful start BLUEPRINT_RUNNER_TOKEN is
+#   persisted to the runner's ~/.blueprint/runner_token, so the service picks
+#   the token up from there on every subsequent start with nothing baked into
+#   this unit.
+#
+# RESTART-ON-CRASH:
+#   Restart=on-failure restarts the runner whenever it exits non-zero. The
+#   runner calls os._exit(1) (via _die()) on fatal conditions (revoked token,
+#   supervisor-detected fatal errors), so systemd sees a non-zero exit and
+#   restarts automatically. Normal SIGTERM shutdown exits 0 and is NOT restarted.
+#
+# VIEWING LOGS:
+#   journalctl -u blueprint-runner.service -f
+
+[Unit]
+Description=Blueprint local fleet runner
+Documentation=https://github.com/your-org/your-repo/blob/main/docs/runner-install.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+ExecStart=@PYTHON@ @LOCAL_RUNNER@
+Restart=on-failure
+RestartSec=5
+# Load credentials and config from a 0600 file outside the repo (`-` = optional).
+EnvironmentFile=-@ENV_FILE@
+# Redirect stdout/stderr into the systemd journal (view with journalctl).
+StandardOutput=journal
+StandardError=journal
+# Propagate SIGTERM cleanly so the runner shuts down gracefully before systemd
+# sends SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=@WANTED_BY@
